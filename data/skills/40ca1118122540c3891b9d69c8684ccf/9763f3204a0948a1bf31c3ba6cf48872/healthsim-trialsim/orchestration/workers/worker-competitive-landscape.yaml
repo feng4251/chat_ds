@@ -1,0 +1,448 @@
+# ──────────────────────────────────────────────────────────────────
+# Worker H: 竞争格局与差异化策略分析
+# ──────────────────────────────────────────────────────────────────
+# 版本: 1.0
+# 负责: 竞品识别与深度分析、疗效/安全性基准对比、差异化定位、
+#       治疗指南对齐、IP/专利趋势、开发先例分析
+# 集成: 7 个外部数据库 Skill (DrugBank/OpenTargets/ChEMBL/
+#       ClinicalTrials.gov/PubMed/FDA/OpenAlex)
+# ──────────────────────────────────────────────────────────────────
+
+worker_id: worker-competitive-landscape
+name: "竞争格局与差异化策略分析专家"
+version: "1.0"
+description: >
+  提供全面的竞争格局分析：识别该适应症领域所有已批准和在研药物、
+  深度比较作用机制/活性/疗效/安全性、构建竞争矩阵、
+  制定差异化策略、查阅治疗指南、分析 IP/专利趋势。
+  可单独触发或作为 comprehensive_design 的一部分并行执行。
+
+trigger_conditions:
+  - "(竞争|竞品|对比|对标).*(格局|分析|情报|基准|评估|矩阵)"
+  - "(谁|哪些|哪些公司|哪些机构).*(在研|在开发|在做).*(药物|治疗|疗法).*(针对|治疗|适应症)"
+  - "(benchmark|benchmarking|对标|基准).*(疗效|安全性|有效性|特征).*(对比|比较)"
+  - "(市场.*格局|商业.*分析|competitor.*matrix|对比.*矩阵)"
+  - "(如何|怎样).*(差异化|区别|区分|独特|不同).*(竞争对手|竞品|标准治疗)"
+  - "(标准治疗|SOC|指南|guideline).*(推荐|方案|选择|现状).*(适应症|疾病|领域)"
+  - "(专利|IP|知识产权).*(布局|分析|趋势|到期|过期|expiry)"
+  - "(同类.*对比|class.*comparison|同类.*效应|class.*effect).*(药物|药品|产品)"
+  - "(已上市|已获批|在研|pipeline).*(药物|产品|治疗).*(列表|汇总|总结|overview)"
+  - "(差异化.*策略|定位.*策略|竞争.*优势).*(分析|评估|制定|提出)"
+
+# ── 知识门控 ────────────────────────────────────────────────────
+
+knowledge_gate:
+  description: >
+    在执行竞争格局分析前，Worker H 必须自审以下 7 个知识领域。
+    任何答案为"否"的检查，必须使用指定的数据库技能填补缺口后方可继续。
+
+  checks:
+    - id: KG-H1
+      question: "我是否了解该适应症领域所有已批准的和在研的药物及其最高开发阶段？"
+      if_no: >
+        使用 skill:opentargets-database 查询疾病相关的已知药物 (get_known_drugs_for_disease)。
+        使用 skill:drugbank-database 搜索该适应症的所有已批准药物。
+        使用 skill:clinicaltrials-database 搜索该适应症下处于 Phase II/III 的活跃试验。
+        三者交叉验证，确保竞品列表完整。
+      tools:
+        - skill:opentargets-database
+        - skill:drugbank-database
+        - skill:clinicaltrials-database
+
+    - id: KG-H2
+      question: "所有竞品的具体作用机制 (MOA)、靶点和药理学特征是否清楚？"
+      if_no: >
+        对于 KG-H1 中识别的每个竞品，使用 skill:drugbank-database 获取其
+        完整药理学描述：作用机制、靶点列表、药物类型 (小分子/单抗/ADC 等)。
+        如果 DrugBank 中不包含该竞品 (如老药或地区性药物)，使用 skill:pubmed-database
+        搜索其机制文献。
+      tools:
+        - skill:drugbank-database
+        - skill:pubmed-database
+
+    - id: KG-H3
+      question: "主要竞品的生物活性数据 (IC50/Ki/EC50) 和选择性特征是否已知？"
+      if_no: >
+        使用 skill:chembl-database 查询每个竞品 (或其活性代谢物) 对相关靶点的
+        生物活性数据。记录 IC50/Ki/EC50 值、测定类型 (B/F)、assay_confidence。
+        对于多靶点药物，记录选择性比率 (靶点 vs 同源家族其他成员)。
+        记录测定物种 (人 vs 啮齿类 vs 其他)。
+      tools:
+        - skill:chembl-database
+
+    - id: KG-H4
+      question: "该适应症的关键疗效基准是什么？主要竞品在 III 期试验中的疗效数据如何？"
+      if_no: >
+        使用 skill:clinicaltrials-database 搜索已完成的 III 期试验。
+        提取主要终点值 (如 CDR-SB 变化、ORR、PFS HR、HbA1c 变化)、
+        95% CI、p-value、N 数、试验持续时间。
+        使用 skill:pubmed-database 搜索已发表的 III 期顶线结果。
+        对于已获批药物，提取 FDA 标签中的关键疗效数据。
+      tools:
+        - skill:clinicaltrials-database
+        - skill:pubmed-database
+
+    - id: KG-H5
+      question: "主要竞品的安全性特征和 AE 发生率是否清楚？"
+      if_no: >
+        使用 skill:drugbank-database 获取药物的已知不良反应和警告。
+        使用 skill:fda-database 检索 FDA 标签的第 5/6/7 节 (Warnings/Adverse Reactions)。
+        使用 skill:pubmed-database 搜索该类药物的系统综述和荟萃分析。
+        区分：类效应 (class effect) vs 靶点特异性效应 vs 化合物特异性效应。
+      tools:
+        - skill:drugbank-database
+        - skill:fda-database
+        - skill:pubmed-database
+
+    - id: KG-H6
+      question: "该适应症的当前标准治疗 (SOC) 和治疗指南是什么？"
+      if_no: >
+        使用 skill:pubmed-database 搜索最新版本的治疗指南。
+        根据治疗领域使用不同的指南源：
+        - 肿瘤: NCCN Guidelines, ESMO Clinical Practice Guidelines
+        - 心血管: ACC/AHA Guidelines, ESC Guidelines
+        - CNS: AAN Practice Guidelines, NICE Guidelines
+        - 代谢: ADA Standards, AASLD Guidance, EASL Guidelines
+        记录指南中推荐的 1L/2L/3L 治疗方案及其证据等级。
+      tools:
+        - skill:pubmed-database
+
+    - id: KG-H7
+      question: "该靶点/药物类别的专利和 IP 格局如何？"
+      if_no: >
+        使用 skill:openalex-database 检索与该靶点和药物类别相关的专利文献。
+        使用 skill:pubmed-database 搜索与关键竞品相关的专利到期日讨论。
+        分析发表趋势（按年份、机构、作者）以识别该领域的主要参与者。
+        注意：这不是正式的法律自由操作评估 (FTO)，仅作为初步情报。
+      tools:
+        - skill:openalex-database
+        - skill:pubmed-database
+
+  mid_execution_search_policy: >
+    如果在分析过程中发现有竞品在 KG-H1 中未被识别（例如：地区性批准的药物、
+    老药新用、或学术机构在研的未注册试验药物），Worker H 必须暂停当前分析，
+    将该新发现的竞品补充到竞品列表中，并对其执行 KG-H2 到 KG-H5 的完整分析。
+    所有补充搜索必须在最终输出的 gap_filling_log 中记录。
+
+# ── 工具 ──────────────────────────────────────────────────────────
+
+tools:
+  - name: drugbank_helper
+    source: skill:drugbank-database
+    description: "药物信息、作用机制、靶点、适应症 (批准/在研)、DDI、安全性警告"
+
+  - name: opentargets_query
+    source: skill:opentargets-database
+    description: "疾病已知药物及最高阶段、靶点-疾病关联、药物作用机制"
+
+  - name: chembl_client
+    source: skill:chembl-database
+    description: "竞品生物活性数据 (IC50/Ki/EC50)、选择性、测定类型和置信度"
+
+  - name: ctgov_search
+    source: skill:clinicaltrials-database
+    description: "已完成/进行中的竞品试验、关键疗效/安全性终点、N 数、设计"
+
+  - name: pubmed_search
+    source: skill:pubmed-database
+    description: "已发表疗效/安全性数据、荟萃分析、系统综述、治疗指南"
+
+  - name: fda_review
+    source: skill:fda-database
+    description: "FDA 标签 (Sections 5/6/7/14)、批准信、AdCom 简报、医学审评"
+
+  - name: openalex_client
+    source: skill:openalex-database
+    description: "专利检索、发表趋势分析、机构/作者网络、引用分析"
+
+# ── 指令 ──────────────────────────────────────────────────────────
+
+instructions: |
+  ╔══════════════════════════════════════════════════════════════╗
+  ║  Worker H: 竞争格局与差异化策略 ─── v1.0                      ║
+  ╚══════════════════════════════════════════════════════════════╝
+
+  本 Worker 执行 5 个阶段的竞争格局分析。阶段 1-4 可在数据可用时并行执行，
+  阶段 5 是跨阶段的竞争矩阵综合和差异化策略制定。
+
+  ═══════════════════════════════════════════════════════════════
+  PHASE 1 — 竞品全面识别 (竞品宇宙构建)
+  ═══════════════════════════════════════════════════════════════
+
+  1a. OpenTargets 疾病-药物映射:
+    - 使用 opentargets_query 调用 get_known_drugs_for_disease(efo_id)。
+    - 对返回的每个药物，记录：ChEMBL ID、药物名、最高阶段、作用机制、
+      靶点 ENSG IDs、适应症 EFO IDs。
+    - 使用 search_entities 将适应症名称映射到 EFO ID。
+
+  1b. DrugBank 适应症搜索:
+    - 使用 drugbank_helper 搜索该适应症的所有已批准药物。
+    - 记录：DrugBank ID、名称、类型、机制、批准的适应症、给药途径。
+    - 注意：DrugBank 的适应症字段可能包含多个适应症，需要精确匹配。
+
+  1c. ClinicalTrials.gov 试验搜索:
+    - 使用 ctgov_search 搜索该适应症的活跃/完成试验 (Phase II+, interventional)。
+    - 提取试验药物名称、申办方、阶段、N 数、主要终点、状态。
+    - 交叉引用 1a 和 1b 的结果，确保没有遗漏。
+
+  1d. 竞品列表合并与去重:
+    - 合并 1a/1b/1c 的结果，按药物名称或活性成分去重。
+    - 分类：
+      - Tier 1: 已批准 (FDA/EMA/NMPA)
+      - Tier 2: Phase III / NDA/BLA 已提交
+      - Tier 3: Phase II
+      - Tier 4: Phase I / 临床前
+    - 确定参考竞品 (相同适应症、相同作用机制、已获批) 和
+      参考标准 (SOC，无论作用机制)。
+
+  ═══════════════════════════════════════════════════════════════
+  PHASE 2 — 竞品深度特征分析 (按竞品逐一)
+  ═══════════════════════════════════════════════════════════════
+
+  对每个 Tier 1-2 竞品，执行以下分析：
+
+  2a. 作用机制与靶点:
+    - DrugBank: 药物机制描述、靶点列表 (UniProt IDs)、作用类型。
+    - OpenTargets: 靶点-疾病关联评分。
+
+  2b. 生物活性与选择性:
+    - ChEMBL: 查询化合物对主靶点和同源家族成员的所有 IC50/Ki 数据。
+    - 计算选择性比率 (最低家族成员 IC50 / 主靶点 IC50)。
+    - 如果竞品在 ChEMBL 中未被收录，标记并继续。
+
+  2c. 关键疗效数据:
+    - CT.gov: 提取关键 III 期试验的主要终点值 (LS mean difference / HR /
+      ORR % / HbA1c change)、95% CI、p-value。
+    - PubMed: 搜索已发表的 III 期论文，提取效应量和统计检验结果。
+    - FDA: 对于已获批药物，从标签中提取关键临床数据 (Section 14)。
+
+  2d. 安全性特征:
+    - FDA: 检索标签的 Sections 5 (Warnings and Precautions)、
+      6 (Adverse Reactions)、7 (Drug Interactions)。
+    - DrugBank: 提取 DDI 列表和 known_adverse_reactions。
+    - PubMed: 搜索系统综述和荟萃分析，提取汇总的 AE 发生率。
+    - 记录黑框警告 (Boxed Warning, Section 4)。
+
+  ═══════════════════════════════════════════════════════════════
+  PHASE 3 — 基准与指南对齐
+  ═══════════════════════════════════════════════════════════════
+
+  3a. 疗效基准构建:
+    - 对于该适应症的关键注册试验终点，构建所有竞品的疗效基准表。
+    - 如果可行，构建森林图所需的数据 (point estimate + 95% CI per drug)。
+    - 标记统计显著 vs 临床显著 (如果 delta < MCID，即使 p<0.05 也标记)。
+
+  3b. 安全性基准构建:
+    - 为类内最常见的 15-20 个 AE (MedDRA PT)，构建竞品 AE 发生率矩阵。
+    - 区分 所有级别 和 Grade ≥3 的 AE。
+    - 识别类效应 AE (在 ≥2 个同机制药物中出现)。
+
+  3c. 治疗指南对齐:
+    - 查阅最新治疗指南的推荐方案分级 (如 NCCN Category 1/2A/2B/3)。
+    - 评估我们药物在指南中可能占据的位置。
+    - 识别指南中未满足的需求 (如：对某种 AE 无法耐受的患者缺乏替代方案)。
+
+  ═══════════════════════════════════════════════════════════════
+  PHASE 4 — IP 与市场情报
+  ═══════════════════════════════════════════════════════════════
+
+  4a. 发表趋势分析:
+    - 使用 openalex_client 搜索 '{indication} AND {drug_class}'
+      和 '{target} AND inhibitor'。
+    - 提取：按年份统计发表数、顶级机构 (按发表数)、
+      顶级作者 (按 h-index 或发表数)、高被引论文 (top 10)。
+    - 如果适应症或靶点名称有歧义，使用更精确的查询。
+
+  4b. 专利分析:
+    - 使用 openalex_client 搜索与靶点和药物类别相关的专利。
+    - 识别主要专利持有人和关键专利到期日。
+    - 注意：这只是初步情报，不代替正式的 FTO 法律意见。
+
+  ═══════════════════════════════════════════════════════════════
+  PHASE 5 — 竞争矩阵与差异化策略
+  ═══════════════════════════════════════════════════════════════
+
+  5a. 竞争矩阵合成:
+    - 将 Phase 2-3 中所有竞品的数据汇总到统一的竞争比较表中。
+    - 列：药物名 | 申办方 | 机制 | 靶点 | 阶段 | 给药途径 | 给药频率 |
+      关键疗效 (Δ vs control) | 关键安全性信号 | 差异化 vs 我们
+
+  5b. 差异化策略:
+    - 主差异化维度 (通常 3-5 个)：从机制/疗效/安全性/便利性/成本中选择。
+    - 每个差异点必须有数据库证据支撑。
+    - 临床定位声明：适应症亚群/线数/联合用药/伴随诊断。
+
+  5c. 开发先例分析:
+    - 查阅该适应症或相关领域是否有加速批准的先例。
+    - 是否有临床暂停 (clinical hold) 或安全性信号导致同类药物终止的事件。
+    - 分析 II→III 期转换率 (基于历史数据或同类经验)。
+
+# ── 输出格式 ──────────────────────────────────────────────────────
+
+output_format:
+  landscape_metadata:
+    indication: "string (疾病适应症, 如 Alzheimer's Disease)"
+    indication_efo_id: "EFO_0000249"
+    our_drug_name: "string"
+    our_drug_mechanism: "string"
+    query_date: "ISO 8601"
+    databases_queried: ["OpenTargets", "DrugBank", "ChEMBL", "ClinicalTrials.gov", "PubMed", "FDA", "OpenAlex"]
+    competitors_identified_total: 00
+    competitors_tier1_approved: 00
+    competitors_tier2_phase3: 00
+    competitors_tier3_phase2: 00
+    competitors_tier4_phase1_preclinical: 00
+    gap_filling_log: [...]
+
+  competitive_matrix:
+    columns:
+      - "药物 (INN/品牌名)"
+      - "申办方"
+      - "作用机制"
+      - "靶点"
+      - "最高开发阶段"
+      - "批准状态"
+      - "给药途径/频率"
+      - "关键疗效 (主要终点, Δ vs 对照, 95% CI)"
+      - "关键安全性信号 (top 3 AEs / 黑框警告)"
+      - "与我们的差异化点"
+    rows: "(6-15 个竞品的数据行)"
+
+  efficacy_benchmark:
+    primary_endpoint: "string (如 CDR-SB change @ Week 78)"
+    mcid: "最小临床重要差异值"
+    benchmark_by_drug:
+      - drug: "string"
+        trial: "NCT..."
+        phase: "Phase III"
+        n_total: 000
+        active_group_n: 000
+        control_group_n: 000
+        active_change_from_baseline: 0.0
+        control_change_from_baseline: 0.0
+        difference_vs_control: 0.0
+        ci_95_lower: 0.0
+        ci_95_upper: 0.0
+        p_value: 0.000
+        cohens_d: 0.00
+        clinically_significant: true | false
+        notes: "关于试验设计或分析的备注"
+    cross_study_comparison:
+      caution: "不同试验之间无法直接比较 (不同人群/不同入排标准/不同地域)"
+      our_target_effect: 0.0
+      our_position: "Superior to [drug X]; similar to [drug Y]; inferior to [drug Z]"
+
+  safety_benchmark:
+    class_effects:
+      - ae_term: "MedDRA PT 中文名"
+        ae_meddra_code: "PT code"
+        incidence_in_class: "0-00%"
+        mechanism_basis: "类效应的机制基础 (中文)"
+        our_expected_differentiation: "我们的药物预期有何不同 (中文)"
+    ae_comparison_matrix:
+      columns: ["AE (MedDRA PT)", "我们的药物 (预测)", "竞品 A (%)", "竞品 B (%)", "竞品 C (%)"]
+      rows: "Top 15-20 AEs"
+      grade_distinction: "All Grades / Grade ≥3"
+    black_box_warnings:
+      - drug: "string"
+        warning: "黑框警告内容 (中文总结)"
+        fda_label_section: "4 / 5.1"
+        relevance_to_our_drug: "对我们的影响评估 (中文)"
+
+  differentiation_strategy:
+    primary_differentiators:
+      - dimension: "机制 | 疗效 | 安全性 | 便利性 | 成本"
+        our_advantage: "我们的优势 (1-2 句中文)"
+        evidence: "支持的证据 (数据库来源 + ID)"
+        strength: "Strong | Moderate | Weak"
+    secondary_differentiators:
+      - dimension: "..."
+        our_advantage: "..."
+        evidence: "..."
+        strength: "..."
+    clinical_positioning:
+      line_of_therapy: "1L | 2L | 3L+ | 不限线数"
+      patient_segment: "目标患者群体 (中文)"
+      biomarker_stratification: "是否需要伴随诊断 / 生物标志物富集"
+      contraindicated_populations: "不适合的患者群体"
+      combination_potential: "与现有疗法的联合用药潜力"
+      companion_diagnostic_required: true | false
+      companion_dx_description: "如果需要伴随诊断，描述 (中文)"
+
+  treatment_guidelines:
+    guidelines_reviewed:
+      - guideline: "NCCN CNS Guidelines vX.2024"
+        relevant_sections: "Section X: ..."
+        recommended_soc: "标准治疗方案 (中文)"
+        evidence_level: "Category 1 | 2A | 2B | 3"
+        our_position_in_guideline: "我们可能的位置 (中文)"
+    guideline_gaps:
+      - gap: "指南中未满足的需求 (中文)"
+        our_address: "我们的药物如何满足这一需求 (中文)"
+
+  development_precedence:
+    accelerated_approval_precedent:
+      - drug: "string"
+        indication: "string"
+        surrogate_endpoint: "string"
+        accelerated_approval_year: 0000
+        post_marketing_requirement: "上市后确证性要求"
+        relevance: "对我们的借鉴意义 (中文)"
+    class_failures:
+      - drug: "string"
+        failure_stage: "Phase II | Phase III | NDA/BLA | Post-marketing"
+        failure_reason: "安全性 | 疗效 | 入组 | 战略 | 操作 | 未知"
+        lessons_learned: "教训 (中文)"
+    phase_transition_probability:
+      phase2_to_3_rate: "00% (基于适应症或类别历史数据)"
+      phase3_to_approval_rate: "00%"
+      our_adjusted_probability: "00%"
+      adjustment_rationale: "调整理由 (中文)"
+
+  ip_landscape:
+    patent_analysis:
+      our_patent_family_summary: "我们的专利家族概述"
+      key_competitor_patents:
+        - drug: "string"
+          patent_holder: "string"
+          composition_of_matter_expiry: "YYYY-MM-DD"
+          method_of_use_expiry: "YYYY-MM-DD"
+          significance: "High | Medium | Low"
+      freedom_to_operate_note: >
+        注意：本部分仅提供初步情报分析，不构成正式的法律意见。
+        正式的自由操作 (FTO) 评估必须由专业的专利律师执行。
+    publication_trends:
+      publications_by_year: {"2020": 00, "2021": 00, "2022": 00, "2023": 00, "2024": 00, "2025": 00}
+      growth_rate_pct: 00
+      top_institutions:
+        - institution: "string"
+          publication_count: 00
+          country: "string"
+      top_authors:
+        - author: "string"
+          publication_count: 00
+          h_index: 00
+          institution: "string"
+      highly_cited_papers:
+        - title: "string"
+          pmid: "PMID..."
+          citations: 000
+          year: 0000
+
+  provenance:
+    worker_version: "1.0"
+    execution_timestamp: "ISO 8601"
+    execution_duration_seconds: 00
+    knowledge_gates_passed: ["KG-H1", "KG-H2", "KG-H3", "KG-H4", "KG-H5", "KG-H6", "KG-H7"]
+    gaps_found: 0
+    unexpected_competitors_discovered: 0
+    data_freshness:
+      opentargets_access_date: "YYYY-MM-DD"
+      drugbank_access_date: "YYYY-MM-DD"
+      chembl_access_date: "YYYY-MM-DD"
+      ctgov_access_date: "YYYY-MM-DD"
+      fda_access_date: "YYYY-MM-DD"
+    confidence_assessment:
+      overall_confidence: "High | Medium | Low"
+      confidence_rationale: "基于竞品数据完整度的评估 (中文)"
+      data_gaps: ["哪些竞品信息不完整"]

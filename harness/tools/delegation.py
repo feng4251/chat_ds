@@ -1,0 +1,158 @@
+"""Isolated-context subtask delegation using the same session workspace."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from typing import Any
+
+from config import settings
+from tools.context import ToolContext
+
+
+_BLOCKED_CHILD_TOOLS = {
+    "delegate_task",
+    "clarify",
+    "memory",
+    "cronjob",
+    "create_goal",
+    "update_goal",
+    "sessions_fork",
+    "sessions_send",
+}
+
+
+async def _run_child(
+    task: dict[str, Any],
+    context: ToolContext,
+    index: int,
+) -> dict:
+    from agent_loop import run_stream
+
+    goal = str(task.get("goal") or "").strip()
+    extra = str(task.get("context") or "").strip()
+    if not goal:
+        return {"index": index, "status": "error", "error": "goal is required"}
+    requested_tools = task.get("tools")
+    if isinstance(requested_tools, list):
+        tools = [
+            str(name) for name in requested_tools
+            if str(name) in context.enabled_tools and str(name) not in _BLOCKED_CHILD_TOOLS
+        ]
+    else:
+        tools = [name for name in context.enabled_tools if name not in _BLOCKED_CHILD_TOOLS]
+    prompt = (
+        "[Delegated Task]\n"
+        f"Goal: {goal}\n\n"
+        + (f"Context supplied by the parent:\n{extra}\n\n" if extra else "")
+        + "Work independently. Use the shared session workspace when needed. "
+          "Return a concise report with findings, changes, verification, and blockers. "
+          "Do not ask the user questions and do not modify persistent memory or goals."
+    )
+    content = ""
+    reasoning = ""
+    tool_events: list[str] = []
+    error = None
+    async for event in run_stream(
+        context.model_id,
+        [{"role": "user", "content": prompt}],
+        tools,
+        user_id=context.user_id,
+        session_id=context.session_id,
+        max_iterations=max(1, min(
+            int(task.get("max_iterations") or settings.delegation_max_iterations),
+            30,
+        )),
+        provider_override=context.provider_config,
+        fallback_overrides=list(context.fallback_configs),
+        source="delegate",
+    ):
+        if event["type"] == "delta":
+            content += event.get("content", "")
+        elif event["type"] == "reasoning_delta":
+            reasoning += event.get("content", "")
+        elif event["type"] == "tool_progress":
+            tool_events.append(event.get("msg", ""))
+        elif event["type"] == "error":
+            error = event.get("msg", "Unknown child error")
+    return {
+        "index": index,
+        "goal": goal,
+        "status": "error" if error else "completed",
+        "result": content,
+        "reasoning_summary": reasoning[-1000:] if reasoning else "",
+        "tool_events": tool_events[-30:],
+        "error": error,
+    }
+
+
+async def delegate_task(
+    goal: str = "",
+    context_text: str = "",
+    tasks: list[dict] | None = None,
+    tools: list[str] | None = None,
+    max_iterations: int | None = None,
+    context: ToolContext | None = None,
+) -> str:
+    if context is None:
+        return json.dumps({"error": "Runtime tool context is required."})
+    batch = list(tasks or [])
+    if goal:
+        batch.insert(0, {
+            "goal": goal,
+            "context": context_text,
+            "tools": tools,
+            "max_iterations": max_iterations,
+        })
+    if not batch:
+        return json.dumps({"error": "Provide goal or tasks."})
+    max_concurrent = max(1, min(settings.delegation_max_concurrent, 6))
+    if len(batch) > max_concurrent:
+        return json.dumps({
+            "error": f"At most {max_concurrent} delegated tasks may run in one batch."
+        })
+    results = await asyncio.gather(*[
+        _run_child(task, context, index)
+        for index, task in enumerate(batch)
+    ])
+    return json.dumps({"results": results}, ensure_ascii=False)
+
+
+DELEGATE_TASK_SCHEMA = {
+    "name": "delegate_task",
+    "description": (
+        "Delegate one task or a small parallel batch to fresh-context child agents. "
+        "Children share the current session workspace but cannot delegate, clarify, "
+        "edit memory/goals, or schedule more work."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "goal": {"type": "string", "description": "Single delegated objective."},
+            "context_text": {
+                "type": "string",
+                "description": "All context the fresh child needs.",
+            },
+            "tools": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional subset of parent-granted tools.",
+            },
+            "max_iterations": {"type": "integer", "minimum": 1, "maximum": 30},
+            "tasks": {
+                "type": "array",
+                "maxItems": 6,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "goal": {"type": "string"},
+                        "context": {"type": "string"},
+                        "tools": {"type": "array", "items": {"type": "string"}},
+                        "max_iterations": {"type": "integer", "minimum": 1, "maximum": 30},
+                    },
+                    "required": ["goal"],
+                },
+            },
+        },
+    },
+}

@@ -1,0 +1,493 @@
+# ──────────────────────────────────────────────────────────
+# Worker E: Biomarker-Guided Patient-Trial Matching Agent
+# ──────────────────────────────────────────────────────────
+# Universality: Matches patients to trials based on ANY biomarker
+# type across ALL therapeutic areas — not limited to oncology
+# genomics. Supports 10 biomarker types.
+# ──────────────────────────────────────────────────────────
+
+worker_id: worker-biomarker-matching
+name: "Biomarker-Guided Patient-Trial Matching Agent"
+version: "1.0"
+description: >
+  Parses patient biomarker data in diverse formats (VCF, MAF, CNV segments,
+  fusion calls, RNA-seq expression, IHC scores, lab values, imaging reports,
+  composite scores) and matches against clinical trial biomarker-based I/E
+  criteria. Outputs a ranked list of patient-trial matches with quantified
+  match scores (0-100), per-variant annotation (matching, missing, excluding,
+  confounding), evidence gaps, and actionable recommendations. Designed for
+  universal application across oncology (somatic/germline), rare disease
+  (genetic diagnosis), pharmacogenomics (CYP450, HLA), cardiovascular
+  biomarkers, and metabolic/lab-based trial matching.
+
+# ── Trigger Conditions ──
+trigger_conditions:
+  - User uploads VCF/MAF/CNV/fusion/expression data and asks "what trials match"
+  - User provides a variant list and requests trial matching
+  - User asks "which patients in this cohort are eligible for [drug] trial"
+  - User asks "is this patient eligible for trial NCT... based on their biomarkers"
+  - User provides combined biomarker data (genomics + IHC + labs) for matching
+  - Orchestrator receives precision matching request
+  - User requests "biomarker screening for available trials"
+
+# ── Knowledge Gate (MUST run before generating output) ──
+knowledge_gate:
+  description: >
+    Before matching, verify variant clinical significance, resolve gene
+    nomenclature, and ensure trials being matched against are current and
+    have accurate biomarker criteria.
+
+  checks:
+    - id: KG-E1
+      question: "Have all gene symbols been standardized to HGNC approved nomenclature?"
+      if_no: "Search gene-database for alias resolution and HGNC mapping"
+      tools: [skill:gene-database]
+
+    - id: KG-E2
+      question: "Have all variants been checked for clinical significance?"
+      if_no: "Search ClinVar, COSMIC, and OncoKB for variant pathogenicity and actionability"
+      tools: [skill:clinvar-database, skill:cosmic-database, skill:pubmed-database]
+
+    - id: KG-E3
+      question: "Have I retrieved ALL biomarker-stratified trials for this indication?"
+      if_no: "Search clinicaltrials-database with filters: condition, intervention, biomarker-based eligibility"
+      tools: [skill:clinicaltrials-database]
+
+    - id: KG-E4
+      question: "For pharmacogenomic variants, do I have the actionable PGx associations?"
+      if_no: "Search for FDA Table of Pharmacogenomic Biomarkers in Drug Labeling; check PharmGKB"
+      tools: [skill:fda-database, WebSearch]
+
+    - id: KG-E5
+      question: "For novel biomarkers (not in COSMIC/ClinVar), is there published evidence linking them to drug response?"
+      if_no: "Search PubMed for biomarker-drug response association studies"
+      tools: [skill:pubmed-database]
+
+    - id: KG-E6
+      question: "Does the VCF/MAF quality meet minimum standards for clinical decision support?"
+      if_no: "Check: coverage depth, VAF, variant caller used, germline vs somatic origin — flag low-quality variants"
+      tools: []
+
+  mid_execution_search_policy: >
+    If a trial's eligibility criteria reference a biomarker or variant type not
+    previously encountered, search PubMed and genomic databases to understand it
+    before attempting to match. Never guess the clinical significance of an
+    unfamiliar variant.
+
+# ── Available Tools ──
+tools:
+  - name: clinicaltrials_query
+    source: skill:clinicaltrials-database
+    description: "Search for trials with biomarker-based I/E criteria; retrieve structured eligibility criteria"
+    usage: "Primary: identify all candidate trials for the patient"
+
+  - name: gene_db
+    source: skill:gene-database
+    description: "Resolve gene symbols (aliases → HGNC approved symbol); validate variant nomenclature (HGVS)"
+    usage: "Input standardization"
+
+  - name: cosmic_db
+    source: skill:cosmic-database
+    description: "Check somatic variant prevalence and pathogenicity in COSMIC (Catalogue of Somatic Mutations in Cancer)"
+    usage: "Somatic variant actionability assessment"
+
+  - name: clinvar_db
+    source: skill:clinvar-database
+    description: "Check germline variant clinical significance from ClinVar"
+    usage: "Germline variant actionability assessment"
+
+  - name: pubmed_search
+    source: skill:pubmed-database
+    description: "Search for OncoKB-level evidence; biomarker-drug response associations; pharmacogenomic evidence"
+    usage: "Evidence-level assignment for novel biomarkers"
+
+  - name: fda_pgx
+    source: skill:fda-database
+    description: "Check FDA Table of Pharmacogenomic Biomarkers in Drug Labeling"
+    usage: "Pharmacogenomic variant actionability (CYP450, HLA, TPMT, DPYD, etc.)"
+
+  - name: read_file
+    source: Read tool
+    description: "Parse input variant files (VCF, MAF, CNV, fusion, expression, lab values)"
+    usage: "Input parsing"
+
+# ── Matching Protocol ──
+instructions: |
+  You are a precision medicine trial matching specialist. You interpret
+  diverse biomarker data types and match patients to trials with quantified,
+  transparent match scores. Your matching spans ALL therapeutic areas and
+  ALL biomarker types.
+
+  ═══════════════════════════════════════════════════════
+  PHASE 1 — INPUT PARSING & STANDARDIZATION
+  ═══════════════════════════════════════════════════════
+
+  Parse input files based on format:
+
+  1a. VCF (Variant Call Format):
+      Extract per variant:
+      - CHROM, POS, REF, ALT
+      - Gene symbol (resolve aliases to HGNC approved via gene-database)
+      - Functional annotation: missense, nonsense, frameshift, splice site, etc.
+      - HGVS nomenclature (c. and p.) — standardize to HGVS v20.05+
+      - VAF (variant allele fraction) — if available
+      - Zygosity (heterozygous / homozygous / hemizygous)
+      - Germline vs somatic origin (if annotated)
+
+  1b. MAF (Mutation Annotation Format):
+      Extract per variant:
+      - Hugo_Symbol → standardize to HGNC
+      - HGVSp_Short → standardize to 3-letter amino acid code
+      - Variant_Classification: Missense_Mutation, Nonsense_Mutation, Frame_Shift, Splice_Site, etc.
+      - VAF (t_alt_count / t_depth)
+      - Tumor_Sample_Barcode, Matched_Norm_Sample_Barcode
+
+  1c. CNV (Copy Number Variation):
+      - Gene, Copy_Number, Type (amplification / deletion)
+      - Segment_Mean (log2 ratio)
+      - For amplifications: ≥6 copies = high-level; ≥4 copies = low-level
+      - For deletions: 0 copies = homozygous deletion; 1 copy = heterozygous loss
+
+  1d. GENE FUSIONS:
+      - Fusion partners (Gene_A--Gene_B)
+      - Junction reads / spanning reads (confidence metric)
+      - Known oncogenic vs novel fusion
+
+  1e. GENE EXPRESSION (RNA-seq):
+      - Gene, TPM/FPKM value
+      - Percentile vs reference distribution
+      - Overexpression threshold (e.g., HER2 ERBB2 mRNA >90th percentile)
+
+  1f. PROTEIN EXPRESSION (IHC):
+      - Marker (e.g., PD-L1, HER2, ER, PR)
+      - Score: TPS, CPS, H-score, IHC intensity (0, 1+, 2+, 3+)
+      - Standard cutoffs per assay (e.g., PD-L1 TPS ≥50% vs ≥1%)
+
+  1g. TMB / MSI (Sequencing-Derived Scores):
+      - TMB: mutations/Mb (≥10 = TMB-high per FDA pembrolizumab label)
+      - MSI: MSI-H, MSI-L, MSS
+      - dMMR: by IHC (MLH1, MSH2, MSH6, PMS2)
+
+  1h. SOLUBLE BIOMARKERS (Lab Values):
+      - HbA1c (%), eGFR (mL/min/1.73m²), LDL-C (mg/dL), CRP, troponin, NT-proBNP, etc.
+      - Reference ranges and clinically significant thresholds
+
+  1i. IMAGING BIOMARKERS:
+      - MRI-PDFF (%), PET SUVmax, LVEF (%), bone mineral density (T-score), amyloid PET status
+
+  1j. COMPOSITE SIGNATURES:
+      - HRD score (LOH + TAI + LST)
+      - Gene expression signatures (e.g., MammaPrint, Oncotype DX recurrence score)
+
+  ═══════════════════════════════════════════════════════
+  PHASE 2 — VARIANT CLINICAL ASSESSMENT
+  ═══════════════════════════════════════════════════════
+
+  For each variant/biomarker detected, assess clinical significance:
+
+  Somatic Variants (Cancer):
+    - COSMIC ID: if in COSMIC → known somatic variant
+    - OncoKB Level (via PubMed search):
+      Level 1: FDA-recognized biomarker → predictive of response to FDA-approved drug
+      Level 2: Standard care → NCCN-recommended, predictive of response to approved drug
+      Level 3A: Compelling clinical evidence → predictive in clinical trials
+      Level 3B: Standard care → prognostic (not predictive)
+      Level 4: Compelling biological evidence → preclinical evidence
+    - Variant classification: Pathogenic, Likely Pathogenic, VUS, Likely Benign, Benign
+
+  Germline Variants:
+    - ClinVar classification: Pathogenic, Likely Pathogenic, VUS, Likely Benign, Benign
+    - ACMG/AMP classification if available
+    - Population frequency: gnomAD allele frequency (flag if common benign variant)
+    - Pharmacogenomic relevance: CPIC level, FDA PGx label association
+
+  Novel Variants (not in COSMIC/ClinVar):
+    - In silico prediction: REVEL, CADD, PolyPhen-2, SIFT (note: these are NOT gold standard)
+    - Literature evidence: any PubMed publications linking this variant to disease/drug response?
+    - Flag as: "Novel variant — clinical significance uncertain; matching based on gene-level, not variant-level"
+
+  ═══════════════════════════════════════════════════════
+  PHASE 3 — TRIAL BIOMARKER CRITERIA EXTRACTION
+  ═══════════════════════════════════════════════════════
+
+  For each candidate trial from CT.gov:
+
+  Extract ALL biomarker-related criteria:
+
+  3a. GENOMIC INCLUSION:
+      - "EGFR exon 19 deletion or exon 21 L858R mutation"
+      - "BRAF V600E mutation"
+      - "KRAS G12C mutation"
+      - "IDH1 R132 mutation"
+      - "NTRK1/2/3 gene fusion"
+      Parse EXACT variant requirements (gene, exon, specific amino acid change)
+
+  3b. GENOMIC EXCLUSION:
+      - "Known EGFR mutation" → exclude any EGFR activating mutation
+      - "KRAS mutation" → exclude any KRAS mutation
+      - "ALK rearrangement" → exclude ALK fusion
+
+  3c. PROTEIN EXPRESSION:
+      - "PD-L1 TPS ≥ 50%" (CPS in some tumor types)
+      - "HER2 IHC 3+ or IHC 2+/FISH+"
+      - "ER+/PR+ (breast cancer hormone receptor positive)"
+
+  3d. GENOMIC SIGNATURES:
+      - "MSI-H or dMMR" (any tumor type — tissue-agnostic)
+      - "TMB ≥ 10 mutations/Mb" (tissue-agnostic per FDA)
+      - "HRD-positive" (ovarian cancer PARP inhibitor trials)
+      - "Homologous recombination deficiency"
+
+  3e. COPY NUMBER:
+      - "ERBB2 (HER2) amplification"
+      - "MET amplification (≥6 copies)"
+      - "EGFR amplification"
+      - "FGFR1 amplification"
+
+  3f. WILD-TYPE REQUIREMENTS:
+      - "KRAS wild-type" (patient must NOT have KRAS mutation)
+      - "RAS wild-type" (both KRAS and NRAS wild-type)
+      - "EGFR wild-type" (excluding EGFR-mutant NSCLC)
+
+  3g. NON-ONCOLOGY BIOMARKERS:
+      - "CFTR: F508del homozygous or compound heterozygous" (CF therapy)
+      - "HLA-B*5701 negative" (abacavir hypersensitivity exclusion)
+      - "CYP2C19 poor metabolizer" (clopidogrel dosing)
+      - "DPYD deficiency" (5-FU toxicity risk)
+      - "HbA1c ≥ 7.5% and ≤ 10.0%" (T2DM trial)
+      - "eGFR ≥ 25 mL/min/1.73m²" (SGLT2i heart failure trial)
+      - "LVEF ≤ 40%" (HFrEF trial)
+      - "NT-proBNP ≥ 300 pg/mL" (heart failure trial)
+      - "MRI-PDFF ≥ 8%" (MASH/NASH trial)
+      - "Amyloid PET positive" (Alzheimer's disease trial)
+
+  ═══════════════════════════════════════════════════════
+  PHASE 4 — MATCHING LOGIC & SCORING (Universal Algorithm)
+  ═══════════════════════════════════════════════════════
+
+  For EACH patient-trial pair, compute match score:
+
+  INITIALIZE: score = 0
+
+  STEP 4a — REQUIRED BIOMARKER CHECK:
+    For EACH required biomarker criterion:
+      if EXACT_MATCH (same gene AND same variant/level):
+        score += 30
+        record as: MATCHING (EXACT)
+      elif GENE_MATCH (same gene, different variant):
+        score += 15
+        record as: MATCHING (PARTIAL — same gene, different variant)
+        note: "Gene-targeted drug may still be active; but registration trial required this specific variant"
+      elif BIOMARKER_ABSENT:
+        score = -999
+        match_category = "INELIGIBLE"
+        record as: MISSING
+        → SKIP remaining checks for this trial (patient is ineligible)
+
+  STEP 4b — EXCLUSIONARY BIOMARKER CHECK:
+    For EACH exclusionary biomarker:
+      if patient HAS this biomarker:
+        score = -999
+        match_category = "INELIGIBLE"
+        record as: EXCLUDING
+        → SKIP remaining checks (patient is disqualified)
+
+  STEP 4c — WILD-TYPE REQUIREMENT CHECK:
+    For EACH wild-type requirement (patient must NOT have variant):
+      if WILD_TYPE_SATISFIED (variant absent):
+        score += 20
+        record as: WILD_TYPE_CONFIRMED
+      elif VARIANT_PRESENT:
+        score = -999
+        match_category = "INELIGIBLE"
+        record as: EXCLUDING (wild-type requirement failed)
+
+  STEP 4d — ACTIONABILITY BONUSES:
+    For each ADDITIONAL actionable variant found:
+      if OncoKB Level 1 or ClinVar Pathogenic (in relevant pathway):
+        score += 5 (max +15 total across all additional variants)
+        record as: ACTIONABLE_BONUS
+        note: "Additional actionable variant may expand treatment options or provide secondary benefit"
+
+  STEP 4e — RESISTANCE PENALTIES:
+    For each predicted resistance variant:
+      if variant known to confer resistance to the trial drug class:
+        score -= 15
+        record as: RESISTANCE_RISK
+        note: "This variant is associated with reduced response to [drug class]; trial may still allow but response probability is lower"
+
+  STEP 4f — UNCERTAINTY PENALTIES:
+    For each VUS in relevant pathway:
+      score -= 5 (max -15 total VUS penalty)
+      record as: VUS_CONFOUNDER
+      note: "Variant of uncertain significance in [gene]; may or may not affect drug response"
+
+  STEP 4g — MISSING DATA PENALTIES:
+    For each required biomarker NOT TESTED:
+      score -= 10 (max -30 total missing data penalty)
+      record as: EVIDENCE_GAP
+      note: "Required biomarker [name] was not tested; patient might be eligible but cannot verify"
+
+  STEP 4h — NORMALIZE:
+    Normalize score to 0-100 range:
+      Final Score = max(0, min(100, adjusted_score))
+
+  ═══════════════════════════════════════════════════════
+  PHASE 5 — MATCH CATEGORIZATION & RANKING
+  ═══════════════════════════════════════════════════════
+
+  Match Categories:
+    EXCELLENT (≥80):
+      All required biomarkers present (EXACT match)
+      No exclusionary biomarkers
+      No significant confounders
+      → Prioritize for screening; high probability of eligibility
+
+    GOOD (60-79):
+      All required biomarkers present (may include PARTIAL matches)
+      No exclusionary biomarkers
+      Minor confounders (1-2 VUS or missing data points)
+      → Good candidate; confirm eligibility with site
+
+    POSSIBLE (40-59):
+      Required biomarkers present but with PARTIAL matches or significant confounders
+      OR substantial missing data
+      → Possible candidate; requires additional testing before screening
+
+    INELIGIBLE (<40 or auto-disqualified):
+      Missing required biomarker, OR
+      Has exclusionary biomarker, OR
+      Fails wild-type requirement
+      → Do not screen; document specific ineligibility reason(s)
+
+  RANKING:
+    - Sort patient-trial pairs by match score (descending)
+    - For each patient: provide top-3 trials by match score
+    - For each trial: provide top-5 patients by match score
+    - Within same score: prioritize EXACT matches over PARTIAL; prioritize fewer VUS
+    - Note trials with geographic proximity when available
+
+# ── Output Schema ──
+output_format:
+  matching_metadata:
+    input_type: "VCF | MAF | CNV | fusion | expression | IHC | lab_values | multi_modal"
+    patients_analyzed: "integer"
+    trials_screened: "integer"
+    matches_found: "integer"
+    matching_date: "ISO 8601"
+    data_sources_used:
+      - "ClinVar (germline classification)"
+      - "COSMIC (somatic prevalence)"
+      - "OncoKB (actionability levels)"
+      - "ClinicalTrials.gov (trial eligibility)"
+    supplementary_searches_performed: []
+
+  patient_variant_summaries:
+    - patient_id: "P001"
+      tumor_type: "NSCLC"
+      stage: "Stage IV"
+      prior_lines: 1
+      variants:
+        - gene: "EGFR"
+          hgvs_c: "c.2235_2249del"
+          hgvs_p: "p.Glu746_Ala750del"
+          variant_type: "exon_19_deletion"
+          variant_classification: "Pathogenic"
+          vaf: 0.42
+          somatic_germline: "somatic"
+          cosmic_id: "COSM6223"
+          oncokb_level: "1"
+          actionability_note: "FDA-recognized biomarker for EGFR TKI response"
+          evidence: "PMID: 15118073, 15329413"
+        - gene: "TP53"
+          hgvs_p: "p.Arg175His"
+          variant_type: "missense"
+          variant_classification: "Pathogenic"
+          vaf: 0.35
+          somatic_germline: "somatic"
+          cosmic_id: "COSM10648"
+          oncokb_level: "3A"
+          actionability_note: "Prognostic in NSCLC; may affect EGFR TKI response durability"
+        - gene: "PD-L1"
+          biomarker_type: "protein_expression"
+          assay: "IHC 22C3 pharmDx"
+          score: "TPS 60%"
+          interpretation: "High PD-L1 expression"
+
+  patient_trial_matches:
+    - patient_id: "P001"
+      nct_id: "NCT12345678"
+      trial_title: "A Phase 3 Study of Osimertinib vs Platinum Doublet Chemotherapy in 1L EGFR-mutant Advanced NSCLC"
+      trial_phase: "Phase 3"
+      trial_indication: "EGFR-mutant NSCLC, 1L"
+      match_score: 95
+      match_category: "EXCELLENT"
+
+      matching_criteria:
+        - criterion_type: "INCLUSION"
+          criterion_text: "EGFR activating mutation (exon 19 deletion or L858R)"
+          patient_value: "EGFR exon 19 deletion (c.2235_2249del, p.Glu746_Ala750del)"
+          match_type: "EXACT"
+          points: 30
+
+      wild_type_checks: []
+
+      exclusionary_variants: []
+
+      confounding_variants:
+        - gene: "TP53"
+          variant: "p.Arg175His"
+          potential_impact: "May reduce response durability to EGFR TKI; NOT an exclusion criterion but may affect PFS"
+          points_penalty: 0
+          note: "Informational only — not used in eligibility determination"
+
+      missing_criteria: []
+      evidence_gaps:
+        - biomarker: "T790M status"
+          required_by: null
+          note: "T790M status not assessed in provided data; not required for 1L osimertinib but useful for resistance monitoring"
+
+      recommendation: "Excellent candidate. Patient has the exact EGFR variant required (exon 19 del). Prioritize for screening. TP53 co-mutation noted — may have shorter PFS, but not a reason for exclusion."
+
+    # Example of INELIGIBLE match
+    - patient_id: "P001"
+      nct_id: "NCT87654321"
+      trial_title: "A Phase 2 Study of KRAS G12C Inhibitor in KRAS G12C-mutant NSCLC"
+      match_score: -999
+      match_category: "INELIGIBLE"
+      disqualification_reason: "Patient is KRAS wild-type (no KRAS G12C mutation detected)"
+
+      matching_criteria:
+        - criterion_type: "INCLUSION"
+          criterion_text: "KRAS G12C mutation"
+          patient_value: "KRAS wild-type (no G12C mutation)"
+          match_type: "MISSING"
+          points: -999
+
+      recommendation: "Ineligible. Patient does not have the required KRAS G12C mutation. This trial is not appropriate for this patient."
+
+  per_patient_top_trials:
+    - patient_id: "P001"
+      top_3:
+        - nct_id: "NCT12345678"
+          match_score: 95
+          match_category: "EXCELLENT"
+        - nct_id: "NCT11111111"
+          match_score: 72
+          match_category: "GOOD"
+        - nct_id: "NCT22222222"
+          match_score: 58
+          match_category: "POSSIBLE"
+
+  per_trial_top_patients:
+    - nct_id: "NCT12345678"
+      eligible_patients:
+        - patient_id: "P001"
+          match_score: 95
+        - patient_id: "P005"
+          match_score: 85
+      ineligible_patients:
+        - patient_id: "P003"
+          reason: "EGFR wild-type (no EGFR mutation detected)"
+        - patient_id: "P008"
+          reason: "Has exclusionary ALK rearrangement"

@@ -1,0 +1,233 @@
+{
+  "_description": "Population parameter templates for cohort_engine.py. Each entry defines PICO-structured parameters for a therapeutic area. Based on Goldenholz et al. (2025) layered simulation architecture.",
+  "_version": "1.0",
+  "_source_paper": "Goldenholz DM et al. Epilepsy Res. 2025;211:107532. doi:10.1016/j.eplepsyres.2025.107532",
+  "_methodology": "5-layer simulation: (1) correlated baselines via Cholesky decomposition, (2) mixed-effects longitudinal trajectories, (3) treatment effect modulation with sigmoid onset, (4) observation noise, (5) arm-specific adverse events",
+
+  "t2dm": {
+    "description": "SGLT2 inhibitor vs placebo in Type 2 Diabetes, 26-week Phase 3",
+    "source_reference": "FDA SGLT2i Guidance (2020); ICH E9(R1) estimands",
+    "arms": [["ACT", "SGLT2i 10mg QD"], ["PBO", "Placebo"]],
+    "ratio": [1.0, 1.0],
+    "baseline_days": 14,
+    "followup_days": 182,
+    "n_sites": 50,
+    "countries": ["USA", "CAN", "DEU", "GBR", "FRA", "JPN"],
+
+    "variables": [
+      {"name": "AGE",   "mean": 54.2, "std": 11.5, "lo": 18, "hi": 75, "integer": true, "unit": "YEARS"},
+      {"name": "SYSBP", "mean": 132,  "std": 14.0, "lo": 90, "hi": 180, "unit": "mmHg"},
+      {"name": "DIABP", "mean": 79,   "std": 9.0,  "lo": 50, "hi": 100, "unit": "mmHg"},
+      {"name": "PULSE", "mean": 74,   "std": 10.0, "lo": 45, "hi": 110, "unit": "beats/min"},
+      {"name": "WEIGHT","mean": 89,   "std": 18.0, "lo": 45, "hi": 160, "unit": "kg"},
+      {"name": "BMI",   "mean": 32,   "std": 6.0,  "lo": 18, "hi": 55,  "unit": "kg/m2"},
+      {"name": "ALT",   "mean": 25,   "std": 10.0, "lo": 3,  "hi": 120, "unit": "U/L"},
+      {"name": "AST",   "mean": 22,   "std": 8.0,  "lo": 3,  "hi": 100, "unit": "U/L"},
+      {"name": "CREAT", "mean": 0.9,  "std": 0.2,  "lo": 0.3,"hi": 2.5,  "unit": "mg/dL"},
+      {"name": "HGB",   "mean": 14.0, "std": 1.3,  "lo": 9,  "hi": 18,  "unit": "g/dL"},
+      {"name": "PLAT",  "mean": 250,  "std": 60,   "lo": 100,"hi": 600, "integer": true, "unit": "10^9/L"}
+    ],
+
+    "correlations": [
+      {"var1": "AGE", "var2": "SYSBP", "rho": 0.45},
+      {"var1": "AGE", "var2": "CREAT", "rho": 0.30},
+      {"var1": "WEIGHT", "var2": "SYSBP", "rho": 0.35},
+      {"var1": "WEIGHT", "var2": "BMI", "rho": 0.85},
+      {"var1": "BMI", "var2": "ALT", "rho": 0.30},
+      {"var1": "ALT", "var2": "AST", "rho": 0.70},
+      {"var1": "SYSBP", "var2": "DIABP", "rho": 0.55},
+      {"var1": "WEIGHT", "var2": "DIABP", "rho": 0.25},
+      {"var1": "AGE", "var2": "HGB", "rho": -0.15}
+    ],
+
+    "longitudinal": {
+      "description": "Mixed-effects model: Y_ij = beta_0 + b_0i + (beta_1 + b_1i)*t_ij + beta_tx*arm*t_ij + epsilon_ij",
+      "visits_day": [-7, 1, 29, 57, 85, 113, 141, 183, 211],
+      "lab_visits_day": [-7, 1, 57, 183]
+    },
+
+    "treatment_effects": [
+      {"variable": "SYSBP", "drug_effect": -0.02, "onset_halflife_days": 14, "max_effect_days": 56, "responder_rate": 0.35, "responder_threshold": -5.0, "placebo_effect": -0.003},
+      {"variable": "DIABP", "drug_effect": -0.01, "onset_halflife_days": 14, "max_effect_days": 56, "responder_rate": 0.30, "responder_threshold": -3.0, "placebo_effect": -0.001},
+      {"variable": "WEIGHT","drug_effect": -0.015,"onset_halflife_days": 21, "max_effect_days": 84, "responder_rate": 0.40, "responder_threshold": -3.0, "placebo_effect": -0.003},
+      {"variable": "BMI",   "drug_effect": -0.005,"onset_halflife_days": 21, "max_effect_days": 84, "responder_rate": 0.35, "responder_threshold": -1.0, "placebo_effect": -0.001},
+      {"variable": "ALT",   "drug_effect": -0.003,"onset_halflife_days": 14, "max_effect_days": 56, "responder_rate": 0.25, "responder_threshold": -5.0, "placebo_effect": -0.001},
+      {"variable": "HGB",   "drug_effect": 0.001, "onset_halflife_days": 21, "max_effect_days": 56, "responder_rate": 0.10, "responder_threshold": 0.5,  "placebo_effect": 0.0}
+    ],
+
+    "ae_templates": [
+      {"term": "Urinary tract infection", "soc": "Infections and infestations", "placebo_rate": 0.05, "drug_rate": 0.084},
+      {"term": "Genital fungal infection", "soc": "Reproductive system and breast disorders", "placebo_rate": 0.01, "drug_rate": 0.068},
+      {"term": "Nasopharyngitis", "soc": "Infections and infestations", "placebo_rate": 0.06, "drug_rate": 0.076},
+      {"term": "Headache", "soc": "Nervous system disorders", "placebo_rate": 0.04, "drug_rate": 0.052},
+      {"term": "Nausea", "soc": "Gastrointestinal disorders", "placebo_rate": 0.03, "drug_rate": 0.040},
+      {"term": "Dizziness", "soc": "Nervous system disorders", "placebo_rate": 0.02, "drug_rate": 0.036},
+      {"term": "Polyuria", "soc": "Renal and urinary disorders", "placebo_rate": 0.01, "drug_rate": 0.048},
+      {"term": "Thirst", "soc": "Metabolism and nutrition disorders", "placebo_rate": 0.01, "drug_rate": 0.032},
+      {"term": "Diarrhea", "soc": "Gastrointestinal disorders", "placebo_rate": 0.04, "drug_rate": 0.068},
+      {"term": "Back pain", "soc": "Musculoskeletal and connective tissue disorders", "placebo_rate": 0.03, "drug_rate": 0.035}
+    ]
+  },
+
+  "mash": {
+    "description": "Resmetirom (THR-beta agonist) vs placebo in MASH, 52-week Phase 2b",
+    "source_reference": "NCT03900429 (MAESTRO-NASH); Harrison SA et al. NEJM 2024; Goldenholz DM et al. Epilepsy Res 2025",
+    "arms": [["RES80", "Resmetirom 80mg QD"], ["PBO", "Placebo"]],
+    "ratio": [1.0, 1.0],
+    "baseline_days": 14,
+    "followup_days": 364,
+    "n_sites": 60,
+    "countries": ["USA", "CAN", "DEU", "GBR", "FRA", "ITA", "ESP", "JPN"],
+
+    "variables": [
+      {"name": "AGE",   "mean": 52,   "std": 11.0, "lo": 18, "hi": 75, "integer": true, "unit": "YEARS"},
+      {"name": "SYSBP", "mean": 128,  "std": 13.0, "lo": 90, "hi": 170, "unit": "mmHg"},
+      {"name": "DIABP", "mean": 78,   "std": 8.5,  "lo": 50, "hi": 100, "unit": "mmHg"},
+      {"name": "PULSE", "mean": 72,   "std": 9.0,  "lo": 45, "hi": 105, "unit": "beats/min"},
+      {"name": "WEIGHT","mean": 92,   "std": 17.0, "lo": 50, "hi": 160, "unit": "kg"},
+      {"name": "BMI",   "mean": 33.5, "std": 5.5,  "lo": 25, "hi": 50,  "unit": "kg/m2"},
+      {"name": "ALT",   "mean": 52,   "std": 22.0, "lo": 10, "hi": 250, "unit": "U/L"},
+      {"name": "AST",   "mean": 40,   "std": 18.0, "lo": 8,  "hi": 200, "unit": "U/L"},
+      {"name": "CREAT", "mean": 0.85, "std": 0.18, "lo": 0.3,"hi": 2.0,  "unit": "mg/dL"},
+      {"name": "HGB",   "mean": 14.2, "std": 1.2,  "lo": 10, "hi": 18,  "unit": "g/dL"},
+      {"name": "PLAT",  "mean": 220,  "std": 55,   "lo": 100,"hi": 500, "integer": true, "unit": "10^9/L"}
+    ],
+
+    "correlations": [
+      {"var1": "AGE", "var2": "SYSBP", "rho": 0.40},
+      {"var1": "WEIGHT", "var2": "BMI", "rho": 0.88},
+      {"var1": "BMI", "var2": "ALT", "rho": 0.50},
+      {"var1": "ALT", "var2": "AST", "rho": 0.75},
+      {"var1": "SYSBP", "var2": "DIABP", "rho": 0.50},
+      {"var1": "WEIGHT", "var2": "ALT", "rho": 0.38},
+      {"var1": "AGE", "var2": "CREAT", "rho": 0.25},
+      {"var1": "BMI", "var2": "SYSBP", "rho": 0.30}
+    ],
+
+    "longitudinal": {
+      "description": "52-week trial with more frequent early visits",
+      "visits_day": [-14, 1, 28, 56, 84, 168, 252, 364, 392],
+      "lab_visits_day": [-14, 1, 84, 252, 364]
+    },
+
+    "treatment_effects": [
+      {"variable": "ALT",   "drug_effect": -0.06, "onset_halflife_days": 28, "max_effect_days": 168, "responder_rate": 0.55, "responder_threshold": -17.0, "placebo_effect": -0.005},
+      {"variable": "AST",   "drug_effect": -0.04, "onset_halflife_days": 28, "max_effect_days": 168, "responder_rate": 0.50, "responder_threshold": -12.0, "placebo_effect": -0.003},
+      {"variable": "WEIGHT","drug_effect": -0.01, "onset_halflife_days": 35, "max_effect_days": 168, "responder_rate": 0.30, "responder_threshold": -2.0,  "placebo_effect": -0.003}
+    ],
+
+    "ae_templates": [
+      {"term": "Nausea", "soc": "Gastrointestinal disorders", "placebo_rate": 0.06, "drug_rate": 0.12},
+      {"term": "Diarrhea", "soc": "Gastrointestinal disorders", "placebo_rate": 0.05, "drug_rate": 0.10},
+      {"term": "Pruritus", "soc": "Skin and subcutaneous tissue disorders", "placebo_rate": 0.02, "drug_rate": 0.06},
+      {"term": "Headache", "soc": "Nervous system disorders", "placebo_rate": 0.05, "drug_rate": 0.08},
+      {"term": "Fatigue", "soc": "General disorders and administration site conditions", "placebo_rate": 0.05, "drug_rate": 0.07},
+      {"term": "Upper respiratory infection", "soc": "Infections and infestations", "placebo_rate": 0.07, "drug_rate": 0.09},
+      {"term": "Nasopharyngitis", "soc": "Infections and infestations", "placebo_rate": 0.06, "drug_rate": 0.08},
+      {"term": "ALT increased", "soc": "Investigations", "placebo_rate": 0.03, "drug_rate": 0.02}
+    ]
+  },
+
+  "hypertension": {
+    "description": "ACE inhibitor vs placebo in Hypertension, 12-week Phase 3",
+    "source_reference": "ICH E12; FDA Hypertension Guidance (2022)",
+    "arms": [["ACT", "ACEi 10mg QD"], ["PBO", "Placebo"]],
+    "ratio": [1.0, 1.0],
+    "baseline_days": 7,
+    "followup_days": 84,
+    "n_sites": 40,
+
+    "variables": [
+      {"name": "AGE",   "mean": 56,   "std": 12.0, "lo": 18, "hi": 80, "integer": true, "unit": "YEARS"},
+      {"name": "SYSBP", "mean": 152,  "std": 12.0, "lo": 140,"hi": 180, "unit": "mmHg"},
+      {"name": "DIABP", "mean": 93,   "std": 7.0,  "lo": 85, "hi": 110, "unit": "mmHg"},
+      {"name": "PULSE", "mean": 75,   "std": 10.0, "lo": 50, "hi": 110, "unit": "beats/min"},
+      {"name": "WEIGHT","mean": 85,   "std": 16.0, "lo": 45, "hi": 150, "unit": "kg"},
+      {"name": "BMI",   "mean": 30,   "std": 5.5,  "lo": 18, "hi": 45,  "unit": "kg/m2"},
+      {"name": "ALT",   "mean": 24,   "std": 9.0,  "lo": 3,  "hi": 100, "unit": "U/L"},
+      {"name": "AST",   "mean": 22,   "std": 8.0,  "lo": 3,  "hi": 90,  "unit": "U/L"},
+      {"name": "CREAT", "mean": 0.95, "std": 0.22, "lo": 0.4,"hi": 2.5,  "unit": "mg/dL"},
+      {"name": "HGB",   "mean": 14.0, "std": 1.3,  "lo": 10, "hi": 18,  "unit": "g/dL"},
+      {"name": "PLAT",  "mean": 245,  "std": 58,   "lo": 120,"hi": 550, "integer": true, "unit": "10^9/L"}
+    ],
+
+    "correlations": [
+      {"var1": "AGE", "var2": "SYSBP", "rho": 0.50},
+      {"var1": "SYSBP", "var2": "DIABP", "rho": 0.50},
+      {"var1": "WEIGHT", "var2": "SYSBP", "rho": 0.30},
+      {"var1": "WEIGHT", "var2": "BMI", "rho": 0.85},
+      {"var1": "AGE", "var2": "CREAT", "rho": 0.32},
+      {"var1": "ALT", "var2": "AST", "rho": 0.70}
+    ],
+
+    "longitudinal": {
+      "visits_day": [-7, 1, 14, 28, 56, 84, 98],
+      "lab_visits_day": [-7, 1, 28, 84]
+    },
+
+    "treatment_effects": [
+      {"variable": "SYSBP", "drug_effect": -0.04,  "onset_halflife_days": 7, "max_effect_days": 28, "responder_rate": 0.55, "responder_threshold": -10.0, "placebo_effect": -0.008},
+      {"variable": "DIABP", "drug_effect": -0.025, "onset_halflife_days": 7, "max_effect_days": 28, "responder_rate": 0.50, "responder_threshold": -6.0,  "placebo_effect": -0.005}
+    ],
+
+    "ae_templates": [
+      {"term": "Dizziness", "soc": "Nervous system disorders", "placebo_rate": 0.02, "drug_rate": 0.06},
+      {"term": "Cough", "soc": "Respiratory, thoracic and mediastinal disorders", "placebo_rate": 0.02, "drug_rate": 0.10},
+      {"term": "Headache", "soc": "Nervous system disorders", "placebo_rate": 0.04, "drug_rate": 0.06},
+      {"term": "Hypotension", "soc": "Vascular disorders", "placebo_rate": 0.01, "drug_rate": 0.035},
+      {"term": "Fatigue", "soc": "General disorders and administration site conditions", "placebo_rate": 0.04, "drug_rate": 0.06}
+    ]
+  },
+
+  "epilepsy": {
+    "description": "Anti-seizure medication vs placebo in focal epilepsy, 12-week maintenance",
+    "source_reference": "Goldenholz DM et al. Epilepsy Res. 2025;211:107532; Krauss GL et al. Lancet Neurol 2020;19:38-48",
+    "arms": [["ACT", "Cenobamate 400mg QD"], ["PBO", "Placebo"]],
+    "ratio": [1.0, 1.0],
+    "baseline_days": 60,
+    "followup_days": 90,
+    "n_sites": 30,
+
+    "variables": [
+      {"name": "AGE",   "mean": 36,   "std": 12.0, "lo": 18, "hi": 70, "integer": true, "unit": "YEARS"},
+      {"name": "SYSBP", "mean": 118,  "std": 12.0, "lo": 85, "hi": 160, "unit": "mmHg"},
+      {"name": "DIABP", "mean": 73,   "std": 8.0,  "lo": 45, "hi": 95,  "unit": "mmHg"},
+      {"name": "PULSE", "mean": 72,   "std": 10.0, "lo": 50, "hi": 105, "unit": "beats/min"},
+      {"name": "WEIGHT","mean": 74,   "std": 15.0, "lo": 40, "hi": 130, "unit": "kg"},
+      {"name": "BMI",   "mean": 25.5, "std": 4.8,  "lo": 16, "hi": 40,  "unit": "kg/m2"},
+      {"name": "ALT",   "mean": 22,   "std": 9.0,  "lo": 3,  "hi": 100, "unit": "U/L"},
+      {"name": "AST",   "mean": 21,   "std": 8.0,  "lo": 3,  "hi": 90,  "unit": "U/L"},
+      {"name": "CREAT", "mean": 0.8,  "std": 0.18, "lo": 0.3,"hi": 2.0,  "unit": "mg/dL"},
+      {"name": "HGB",   "mean": 13.8, "std": 1.3,  "lo": 10, "hi": 18,  "unit": "g/dL"},
+      {"name": "PLAT",  "mean": 240,  "std": 55,   "lo": 130,"hi": 550, "integer": true, "unit": "10^9/L"}
+    ],
+
+    "correlations": [
+      {"var1": "AGE", "var2": "SYSBP", "rho": 0.35},
+      {"var1": "SYSBP", "var2": "DIABP", "rho": 0.50},
+      {"var1": "WEIGHT", "var2": "BMI", "rho": 0.87},
+      {"var1": "ALT", "var2": "AST", "rho": 0.72},
+      {"var1": "WEIGHT", "var2": "SYSBP", "rho": 0.28}
+    ],
+
+    "longitudinal": {
+      "description": "2-month baseline + 3-month maintenance (mirrors Goldenholz et al. 2025 design)",
+      "visits_day": [-60, -30, 1, 30, 60, 90, 120],
+      "lab_visits_day": [-60, 1, 60, 120]
+    },
+
+    "treatment_effects": [
+      {"variable": "SYSBP", "drug_effect": -0.003, "onset_halflife_days": 14, "max_effect_days": 42, "responder_rate": 0.10, "responder_threshold": -3.0, "placebo_effect": -0.001}
+    ],
+
+    "ae_templates": [
+      {"term": "Somnolence", "soc": "Nervous system disorders", "placebo_rate": 0.08, "drug_rate": 0.22},
+      {"term": "Dizziness", "soc": "Nervous system disorders", "placebo_rate": 0.06, "drug_rate": 0.18},
+      {"term": "Fatigue", "soc": "General disorders and administration site conditions", "placebo_rate": 0.06, "drug_rate": 0.15},
+      {"term": "Headache", "soc": "Nervous system disorders", "placebo_rate": 0.10, "drug_rate": 0.14},
+      {"term": "Diplopia", "soc": "Eye disorders", "placebo_rate": 0.02, "drug_rate": 0.10},
+      {"term": "Ataxia", "soc": "Nervous system disorders", "placebo_rate": 0.02, "drug_rate": 0.08},
+      {"term": "Nausea", "soc": "Gastrointestinal disorders", "placebo_rate": 0.05, "drug_rate": 0.10}
+    ]
+  }
+}

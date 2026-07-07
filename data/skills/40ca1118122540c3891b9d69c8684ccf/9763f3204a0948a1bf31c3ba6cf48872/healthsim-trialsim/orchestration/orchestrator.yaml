@@ -1,0 +1,893 @@
+# ──────────────────────────────────────────────────────────
+# xClinicalTrial Orchestrator
+# Author: Yinan Chen (陈翼男)
+# ──────────────────────────────────────────────────────────
+# This Orchestrator operates one layer ABOVE the existing 6-agent
+# data engineering pipeline. It handles clinical design rationalization,
+# regulatory auditing, competitive benchmarking, and protocol optimization.
+# The existing pipeline handles data generation and packaging.
+# ──────────────────────────────────────────────────────────
+
+orchestrator_id: xclinicaltrial-orchestrator
+name: "xClinicalTrial Orchestrator"
+version: "2.2"
+description: >
+  The main Orchestrator (v2.2) that receives user requests for clinical trial design
+  assistance (any indication, any phase, any design type), decomposes them
+  into subtasks, fans out to specialized Worker subagents (9 Workers: A through I)
+  in parallel where possible, aggregates results, resolves conflicts using 6 resolution
+  strategies, and produces a comprehensive final report.
+
+  v2.2新增: Worker G (靶点生物学深度分析), Worker H (竞争格局与差异化),
+  Worker I (文献循证综合与引用图谱) — 集成 14 个外部数据库 Skill 以实现
+  全面覆盖的科学深度与可操作性。
+
+  This Orchestrator answers "what should we build?" — the existing
+  TrialSim pipeline answers "how do we build and package it?"
+
+# ── Step 0: Intent Classification ──
+intent_classification:
+  description: >
+    Before dispatching any Workers, classify the user's request along
+    multiple dimensions. This determines which Workers to invoke, what
+    knowledge to pre-fetch, and which regulatory frameworks apply.
+
+  dimensions:
+    task_type:
+      description: "What is the user trying to accomplish?"
+      values:
+        - protocol_design       # Creating a new protocol or trial design
+        - safety_review         # Reviewing safety profile of a drug/class
+        - efficacy_benchmark    # Benchmarking efficacy against competitors
+        - regulatory_audit      # Checking design against FDA/EMA/ICH
+        - ie_drafting           # Drafting inclusion/exclusion criteria
+        - patient_matching      # Matching patients (by biomarker) to trials
+        - ae_adjudication       # Adjudicating adverse events from narratives
+        - termination_analysis  # Analyzing why historical trials failed
+        - comprehensive_design  # Full protocol design assistance (multi-worker)
+        - ae_profile_generation  # Comprehensive drug-specific AE profile + management plan
+        - recruitment_funnel  # Recruitment funnel analysis + enrollment optimization
+        - ich_supplementary  # ICH-mandated supplementary analyses (estimand, QTc, MRCT, risk-based quality, pediatric)
+        - statistical_simulation  # Monte Carlo simulation: power curves, N re-estimation, I/E impact, operating characteristics
+        - target_biology  # Deep target biology & preclinical evidence — Worker G (multi-DB: UniProt/STRING/KEGG/ChEMBL/DrugBank/OpenTargets/GWAS/ClinVar/PubMed/OpenAlex)
+        - competitive_landscape  # Competitive intelligence & benchmarking — Worker H (multi-DB: DrugBank/OpenTargets/ChEMBL/CT.gov/PubMed/FDA/OpenAlex)
+        - literature_synthesis  # Comprehensive literature synthesis & citation graph — Worker I (multi-DB: PubMed/OpenAlex/PrimeKG/FDA/CT.gov)
+      workers_map:
+        protocol_design: [worker-pico-standards, worker-safety-extraction, worker-termination-analysis, worker-ie-criteria]  # B+A+C parallel, D sequential
+        safety_review: [worker-safety-extraction, worker-termination-analysis]  # A+C parallel (F excluded — AE adjudication is separate)
+        efficacy_benchmark: [worker-safety-extraction]  # A only (B's PICO audit fires on separate regulatory_audit trigger)
+        regulatory_audit: [worker-pico-standards]
+        ie_drafting: [worker-ie-criteria]  # D only (B's PICO added if regulatory audit also needed; see composite)
+        patient_matching: [worker-biomarker-matching]  # E only (D's I/E is separate concern; see composite_patient_trial_matching_full)
+        ae_adjudication: [worker-ae-adjudication]
+        termination_analysis: [worker-termination-analysis]
+        comprehensive_design: [worker-pico-standards, worker-safety-extraction, worker-termination-analysis, worker-ie-criteria, worker-ae-adjudication, worker-target-biology, worker-competitive-landscape, worker-literature-synthesis]  # v2.2修复: 8 workers — B+A+C+F+G+H+I parallel, D sequential
+        ae_profile_generation: [worker-ae-adjudication]  # F — comprehensive drug-specific AE profile generation
+        recruitment_funnel: [worker-ie-criteria]  # D — recruitment funnel analysis and enrollment optimization
+        ich_supplementary: [worker-pico-standards]  # B — ICH-mandated supplementary analyses (E9(R1), E14, E17, E6(R2), E11)
+        statistical_simulation: [worker-pico-standards]  # B — Monte Carlo simulation: power curves, N re-estimation, I/E impact, operating characteristics
+        target_biology: [worker-target-biology]  # G — deep target biology & preclinical evidence (v2.2)
+        competitive_landscape: [worker-competitive-landscape]  # H — competitive intelligence & benchmarking (v2.2)
+        literature_synthesis: [worker-literature-synthesis]  # I — comprehensive literature synthesis & citation graph (v2.2)
+
+    therapeutic_area:
+      description: "What disease/indication area?"
+      values:
+        - oncology         # Built-in TA skill available
+        - cardiovascular   # Built-in TA skill available
+        - cns              # Built-in TA skill available
+        - cgt              # Built-in TA skill available (Cell & Gene Therapy)
+        - immunology       # External (needs Knowledge Gate search)
+        - rare_disease     # External (needs Knowledge Gate search)
+        - infectious       # External (needs Knowledge Gate search)
+        - metabolic        # External (needs Knowledge Gate search)
+        - other            # External (needs Knowledge Gate search)
+      knowledge_source_map:
+        oncology: [therapeutic-areas/oncology.md, skill:clinicaltrials-database, skill:pubmed-database]
+        cardiovascular: [therapeutic-areas/cardiovascular.md, skill:clinicaltrials-database, skill:pubmed-database]
+        cns: [therapeutic-areas/cns.md, skill:clinicaltrials-database, skill:pubmed-database]
+        cgt: [therapeutic-areas/cgt.md, skill:clinicaltrials-database, skill:pubmed-database]
+        immunology: [skill:clinicaltrials-database, skill:pubmed-database, WebSearch]
+        rare_disease: [skill:clinicaltrials-database, skill:pubmed-database, WebSearch]
+        infectious: [skill:clinicaltrials-database, skill:pubmed-database, WebSearch]
+        metabolic: [skill:clinicaltrials-database, skill:pubmed-database, WebSearch]
+        other: [skill:clinicaltrials-database, skill:pubmed-database, WebSearch]
+
+    trial_phase:
+      description: "What trial phase?"
+      values: [Phase_0, Phase_I, Phase_I_II, Phase_II, Phase_II_III, Phase_III, Phase_IV, all]
+      phase_skill_map:
+        Phase_0: null  # No dedicated skill file; apply ICH M3 (nonclinical→clinical transition) and E8 (exploratory design)
+        Phase_I: phase1-dose-escalation.md
+        Phase_I_II: [phase1-dose-escalation.md, phase2-proof-of-concept.md]  # Dose-escalation + early PoC
+        Phase_II: phase2-proof-of-concept.md
+        Phase_II_III: [phase2-proof-of-concept.md, phase3-pivotal.md]  # Dose-ranging + confirmatory design
+        Phase_III: phase3-pivotal.md
+        Phase_IV: null  # No dedicated skill file; apply ICH E2C/E2D/E2E (post-marketing safety) and E6(R2) (GCP)
+        all: [phase1-dose-escalation.md, phase2-proof-of-concept.md, phase3-pivotal.md]
+
+    design_type:
+      description: "What trial design type?"
+      values:
+        - superiority
+        - non_inferiority
+        - equivalence
+        - basket
+        - umbrella
+        - platform
+        - adaptive
+        - dose_escalation
+      regulatory_rules:
+        non_inferiority:
+          ich: [E9, E10]
+          fda: "Non-Inferiority Clinical Trials Guidance 2016"
+          ema: "Guideline on the choice of the non-inferiority margin 2006"
+        adaptive:
+          ich: [E9, E8]
+          fda: "Adaptive Designs for Clinical Trials Guidance 2019"
+
+    knowledge_scope:
+      description: "Is the project's internal knowledge sufficient?"
+      values:
+        - project_internal_only   # All 4 TAs covered; phase/design known
+        - requires_external_search  # Some TAs or drug classes unknown — pre-fetch needed
+
+# ── Step 1: Shared Knowledge Context Bootstrap ──
+knowledge_bootstrap:
+  description: >
+    Before fanning out to Workers, build a Shared Knowledge Context that
+    all Workers receive. This prevents each Worker from independently
+    querying the same data.
+
+  pre_fetch_sources:
+    - name: clinicaltrials_gov
+      skill: skill:clinicaltrials-database
+      query_strategy: "Search for completed AND ongoing trials matching: condition=[indication], phase=[phase], status=[completed|active_not_recruiting|recruiting]"
+      extract_fields: [NCT_ID, title, phase, enrollment, primary_endpoint, comparator, status, results_posted]
+
+    - name: pubmed
+      skill: skill:pubmed-database
+      query_strategy: "Search for: [indication] AND [phase] trial results; [drug_class] systematic review/meta-analysis; [indication] clinical practice guidelines"
+      extract_fields: [PMID, title, journal, year, key_findings, endpoint_data]
+
+    - name: ich_guidelines
+      tool: WebSearch
+      query_strategy: "Identify applicable ICH guidelines based on phase and design type"
+      applicable_guidelines:
+        all_trials: [E6(R2)]  # GCP
+        Phase_I: [E2A, E8, M3]
+        Phase_II: [E2A, E4, E8, E9]
+        Phase_III: [E2A, E3, E8, E9, E9(R1), E10]
+        Phase_IV: [E2D, E2E]
+        pediatric: [E11]
+        geriatric: [E7]
+        multi_regional: [E5, E17]
+        non_inferiority: [E9, E10]
+
+    - name: fda_guidance
+      skill: skill:fda-database
+      query_strategy: "Search for disease-specific AND general guidance documents"
+
+    - name: ema_guidance
+      tool: WebSearch
+      query_strategy: "Search for EMA scientific guidelines on [indication]"
+
+    # ── v2.2新增预取源 ──
+    - name: target_biology_intel
+      skill: skill:opentargets-database
+      query_strategy: "Query target-disease association score, tractability categories, genetic evidence, and safety liabilities for [target_gene] in [indication]"
+      extract_fields: [target_ensembl_id, disease_efo_id, overall_association_score, tractability_small_molecule, tractability_antibody, genetic_association_score, safety_liabilities]
+
+    - name: competitive_intel
+      skill: skill:drugbank-database
+      query_strategy: "Search for all drugs approved or in trials for [indication]; extract drug name, mechanism, targets, phase, and indication"
+      extract_fields: [drugbank_id, drug_name, drug_type, mechanism, target_genes, max_phase, approved_indications]
+
+  shared_context_template:
+    original_request: "user's full text"
+    indication: "extracted indication"
+    drug_name: "extracted drug name"
+    drug_class: "extracted or inferred drug class"
+    phase: "extracted trial phase"
+    design_type: "extracted design type"
+    task_type: "classified task type"
+    therapeutic_area: "classified TA"
+    knowledge_scope: "project_internal_only | requires_external_search"
+    pre_fetched_data:
+      ctgov_trials: []
+      pubmed_refs: []
+      applicable_ich: []
+      fda_guidances: []
+      ema_guidances: []
+      target_biology_intel: {}
+      competitive_intel: []
+    knowledge_gaps_identified: []
+    workers_to_dispatch: []
+
+# ── Step 2: Routing & Fan-Out ──
+routing_rules:
+
+  # ── Single-Worker Triggers ──
+  trigger_worker_safety_extraction:
+    patterns:
+      - "extract.*(safety|efficacy).*(data|results|profile|benchmark)"
+      - "extract.*(AE|SAE|ORR|PFS|OS|DCR).*(from|benchmark)"
+      - "(ORR|PFS|OS|AE|SAE).*from.*(abstract|paper|publication|PDF|trial)"
+      - "summarize.*(safety|efficacy).*(profile|data|benchmark)"
+      - "(upload|uploaded|attached).*(abstract|PDF|paper|publication)"
+      - "what.*(safety|efficacy).*(data|results).*(available|published)"
+      - "competitive.*(benchmark|landscape).*(safety|efficacy)"
+    worker: worker-safety-extraction
+    priority: 1
+    spawn_mode: direct
+
+  trigger_worker_pico_standards:
+    patterns:
+      - "PICO.*(extract|analysis|extraction|framework)"
+      - "(FDA|EMA|NMPA|ICH).*(guidance|standard|requirement).*(check|audit|review)"
+      - "does.*(design|protocol|trial).*(meet|comply|satisfy).*(standard|guidance|requirement)"
+      - "(regulatory|standards).*(check|audit|review|gap)"
+      - "is.*(endpoint|control|comparator|sample size|design).*(appropriate|correct|standard|adequate)"
+      - "(ICH|guideline).*(check|compliance|audit)"
+      - "what.*(endpoint|outcome).*(does FDA|does EMA|required|recommended)"
+      - "(design|protocol).*(audit|review|gap analysis)"
+    worker: worker-pico-standards
+    priority: 1
+    spawn_mode: direct
+
+  trigger_worker_termination_analysis:
+    patterns:
+      - "why.*(terminated|stopped|halted|failed|discontinued)"
+      - "termination.*(analysis|reason|pattern|trend|classification)"
+      - "(failed|stopped|terminated|discontinued).*trial"
+      - "learn.*from.*(previous|past|historical|failed).*trial"
+      - "avoid.*(failure|termination|mistake)"
+      - "(futility|futile).*(analysis|assessment|rate)"
+      - "what.*(went wrong|failed).*in.*trial"
+      - "trial failure.*(analysis|mode|pattern|reason)"
+    worker: worker-termination-analysis
+    priority: 2
+    spawn_mode: direct
+
+  trigger_worker_ie_criteria:
+    patterns:
+      - "(draft|design|write|create|generate|develop).*(I/E|inclusion|exclusion|eligibility).*(criteria|criterion)"
+      - "(too|overly).*restrictive.*(inclusion|exclusion|I/E|eligibility)"
+      - "optimize.*(enrollment|recruitment|eligibility|I/E)"
+      - "(assess|score|evaluate|check).*(complexity|readability).*(criteria|I/E)"
+      - "what.*(exclusion|inclusion|eligibility).*(criteria|criterion).*(appropriate|standard|typical|common)"
+      - "(inclusion|exclusion).*(criteria|criterion).*(need|should|required)"
+      - "are these.*(criteria|I/E).*(too|sufficient|appropriate)"
+      - "screen failure.*(reduction|optimization|analysis)"
+    worker: worker-ie-criteria
+    priority: 1
+    spawn_mode: direct
+
+  trigger_worker_biomarker_matching:
+    patterns:
+      - "(VCF|MAF|variant|genomic|mutation|sequencing|CNV|fusion|IHC).*(match|trial|eligible|screening)"
+      - "(precision|personalized|targeted|biomarker).*(matching|medicine|therapy)"
+      - "which.*(trial|trials).*(match|eligible|suitable|appropriate).*(patient|subject|variant|biomarker)"
+      - "is.*patient.*(eligible|match).*(based on|for|given).*(mutation|variant|biomarker|genomic)"
+      - "biomarker.*(match|screening|stratification|guided).*trial"
+      - "(NGS|next-generation|gene panel|genomic).*trial.*(match|eligible)"
+      - "(PD-L1|HER2|EGFR|BRAF|KRAS|TMB|MSI|HRD).*(positive|negative|high|low).*trial"
+      - "pharmacogenomic.*(matching|trial)"
+    worker: worker-biomarker-matching
+    priority: 1
+    spawn_mode: direct
+
+  trigger_worker_ae_adjudication:
+    patterns:
+      - "(adjudicat|grade|classify|code|map|determine).*(adverse event|AE|safety event|toxicity|side effect)"
+      - "(CTCAE|MedDRA).*(grade|term|code|map|lookup)"
+      - "what.*(grade|severity).*(is this|is the|for this).*(AE|adverse|toxicity|reaction)"
+      - "grade.*this.*(rash|fatigue|diarrhea|nausea|vomiting|neutropenia|anemia|transaminitis|pneumonitis|colitis)"
+      - "(safety narrative|verbatim|AE description).*(code|grade|map|adjudicat)"
+      - "is this.*(SAE|serious).*(per|according to).*(ICH|FDA|CTCAE)"
+      - "map.*(verbatim|description|narrative).*(to MedDRA|to CTCAE)"
+      - "DILI.*(assessment|grading|Hy's law)"
+    worker: worker-ae-adjudication
+    priority: 1
+    spawn_mode: direct
+
+  # ── New Capability Triggers (v1.2) ──
+
+  trigger_ae_profile_generation:
+    patterns:
+      - "(generate|design|create|build).*(AE|adverse event|safety).*(profile|spectrum|management plan|benchmark)"
+      - "what.*(expected|anticipated|common|known).*(adverse event|AE|safety profile|side effect).*(for|of)"
+      - "(CTCAE|ctcae).*(grading table|grading|grade).*(for|of).*(drug|compound|treatment)"
+      - "(compare|benchmark).*(safety|AE|adverse event).*profile.*(vs|versus|against|with)"
+      - "(phase-specific|phase specific).*(AE|safety|risk).*(mitigation|management)"
+      - "(drug|compound|treatment).*(safety profile|AE profile|adverse event profile|toxicity profile)"
+    worker: worker-ae-adjudication
+    priority: 1
+    spawn_mode: direct
+
+  trigger_recruitment_funnel_analysis:
+    patterns:
+      - "(recruitment|enrollment).*(funnel|analysis|projection|forecast|velocity|timeline|feasibility|bottleneck)"
+      - "how many.*(patients|subjects).*(need|required).*(screen|recruit|enroll)"
+      - "(screen failure|SF).*(rate|analysis|reduction|optimization|benchmark|bottleneck)"
+      - "(site|center).*(feasibility|selection|number|capacity|performance|activation)"
+      - "(enrollment|recruitment).*(timeline|projection|plan|strategy|accrual|velocity)"
+      - "how long.*(enroll|recruit|complete enrollment|reach target|fill)"
+      - "(recruitment|enrollment).*(risk|challenge|barrier|obstacle)"
+      - "(patient|subject).*(accrual|enrollment).*(projection|modeling)"
+    worker: worker-ie-criteria
+    priority: 1
+    spawn_mode: direct
+
+  trigger_ich_supplementary_analysis:
+    patterns:
+      - "(ICH|regulatory).*(supplementary|additional|mandated).*(analysis|assessment|check)"
+      - "(estimand|estimand framework).*(per ICH|per E9|ICH E9)"
+      - "(QTc|TQT|thorough QT|QT prolongation).*(assessment|study|evaluation|ICH E14)"
+      - "(MRCT|multi-regional|multiregional).*(design|trial|ICH E17)"
+      - "(risk-based|risk based).*(quality|monitoring|ICH E6)"
+      - "(pediatric|paediatric).*(plan|investigation|PIP|PSP|ICH E11)"
+      - "(statistical|sample size|multiplicity|interim analysis|missing data).*(rigor|review|check|audit)"
+      - "ICH.*(compliance|checklist|audit|review).*(full|complete|comprehensive)"
+    worker: worker-pico-standards
+    priority: 1
+    spawn_mode: direct
+
+  trigger_statistical_simulation:
+    patterns:
+      - "(simulate|run.*simulation|monte.*carlo).*(trial|power|sample.*size|effect.*size|operating.*characteristic)"
+      - "what.*(power|sample.*size).*(achieve|need|required).*(for|with|given).*(effect.*size|N|alpha)"
+      - "how.*(power|sample.*size).*(change|vary|affect|impact).*(I/E|inclusion|exclusion|endpoint|dropout)"
+      - "(power.*curve|power.*analysis|sample.*size.*re.?estimation|Type.*I.*error)"
+      - "(compare|contrast).*(design|scenario|I/E.*criteria|sample.*size).*simulation"
+      - "what.*if.*(change|modify|tighten|loosen|different).*(inclusion|exclusion|sample.*size|endpoint|I/E)"
+      - "(sensitivity|what.?if).*analysis.*(simulat|trial.*design|clinical.*trial)"
+      - "(Monte.*Carlo|MC.*simulat).*(clinical.*trial|power|sample)"
+    worker: worker-pico-standards
+    priority: 1
+    spawn_mode: direct
+
+  # ── New Capability Triggers (v2.2) ──
+
+  trigger_worker_target_biology:
+    patterns:
+      - "(analyze|assess|review|characterize|profile).*(target|target biology|molecular mechanism|protein structure|signaling pathway|signalling pathway)"
+      - "(what is|describe|explain|分析|评估|审评|表征).*(mechanism of action|MOA|靶点|靶标|作用机制|分子机制|蛋白结构|信号通路)"
+      - "(protein.*interaction|signaling.*pathway|PPI.*network|pathway.*analysis|蛋白.*互作|信号.*通路).*(target|drug|蛋白|靶点)"
+      - "(GWAS|genetic.*evidence|genetic.*validation|遗传.*证据|遗传.*验证).*(target|drug|disease association|靶点|疾病)"
+      - "(preclinical|animal.*model|KO.*mouse|in.?vivo|in.?vitro|临床前|动物.*模型|基因敲除).*evidence.*(for|of|supporting|证据|支持)"
+      - "(druggability|tractability|druggable|可成药性|成药性).*(assessment|analysis|score|评估|分析)"
+      - "(structural.*biology|crystal.*structure|binding.*pocket|protein.*domain|结构.*生物学|晶体.*结构|结合.*口袋|蛋白.*结构域).*(analysis|review|分析|审评)"
+      - "is.*(target|protein|gene|靶点|蛋白|基因).*(validated|confirmed|linked|验证|确证|关联).*(for|to|with|疾病)"
+    worker: worker-target-biology
+    priority: 1
+    spawn_mode: direct
+
+  trigger_worker_competitive_landscape:
+    patterns:
+      - "(competitive|competitor|comparator|竞争|竞品|对标|对比).*(landscape|analysis|intelligence|benchmarking|assessment|格局|分析|情报|基准|矩阵)"
+      - "who.*(else|are).*(working|developing|哪些|在研|在开发).*(drug|treatment|therapy|product|药物|治疗|产品).*(for|in|targeting|针对|治疗)"
+      - "(benchmark|compare|contrast|differentiate|对标|比较|对比|差异化).*(efficacy|safety|profile|mechanism|疗效|安全性|特征|机制).*(competitor|class|landscape|竞品|同类|格局)"
+      - "(market.*landscape|commercial.*landscape|competitor.*matrix|comparator.*table|市场.*格局|竞争.*矩阵|对比.*表)"
+      - "how.*(different|distinct|unique|differentiate|如何|怎样).*(from|vs|versus|区别于).*(competitor|standard of care|SOC|竞品|标准治疗)"
+      - "(standard of care|SOC|treatment guideline|标准治疗|治疗指南|指南).*(for|in|推荐|方案).*(适应症|疾病|领域)"
+      - "(patent|IP|intellectual property|专利|知识产权).*(landscape|analysis|expiry|布局|分析|到期)"
+      - "(class.*comparison|class.*effect|same.*class|同类.*对比|同类.*效应).*(drug|competitor|agent|药物|药品)"
+    worker: worker-competitive-landscape
+    priority: 1
+    spawn_mode: direct
+
+  trigger_worker_literature_synthesis:
+    patterns:
+      - "(systematic|comprehensive|系统|全面|结构).*(literature|evidence|文献|证据|循证).*(review|synthesis|search|analysis|综述|综合|检索|分析)"
+      - "(what.*literature|what.*evidence|what.*published|哪些文献|哪些证据|哪些研究).*(exists|available|support|存在|有|支持).*(for|about|关于|针对)"
+      - "(citation.*analysis|citation.*graph|evidence.*map|evidence.*synthesis|引用.*分析|引用.*图谱|证据.*映射)"
+      - "(synthesize|aggregate|compile|综合|汇总|整理).*(evidence|literature|publication|reference|证据|文献|论文)"
+      - "(state of the art|current knowledge|current understanding|current evidence|前沿|现状|当前认知).*(for|about|in|关于|针对)"
+      - "(bibliometric|bibliography|reference list|文献计量|文献统计).*(analysis|generate|compile|分析|生成)"
+      - "(evidence.*grading|evidence.*level|quality of evidence|证据.*分级|证据.*等级|证据.*质量).*(assessment|review|评估|审评)"
+      - "(knowledge.*graph|PrimeKG|知识.*图谱).*(query|search|explore|查询|检索|探索)"
+    worker: worker-literature-synthesis
+    priority: 1
+    spawn_mode: direct
+
+  # ── Composite Triggers (Multi-Worker Fan-Out) ──
+
+  composite_full_protocol_design:
+    patterns:
+      # English patterns
+      - "(design|create|draft|develop).*(full|complete|comprehensive|new).*(protocol|trial|study)"
+      - "(design|plan).*(Phase.*III|Phase.*3|pivotal|confirmatory).*(trial|study|protocol)"
+      - "trial design assistance"
+      - "protocol development"
+      - "design.*clinical trial"
+      - "plan.*clinical study"
+      - "(help|assist).*(design|protocol|trial)"
+      - "comprehensive.*trial.*design.*assistance"
+      - "end.*to.*end.*trial.*design"
+      - "full.*clinical.*development.*plan"
+      - "complete.*trial.*design.*package"
+      # Chinese patterns (v2.2.1 bugfix)
+      - "(完成|做|生成|设计|写|创建|制作|帮我|帮我做|帮我设计|帮我生成).*(一个|一份).*(完整|全面|综合|完备).*(临床.*试验|临床.*研究|临床.*方案|临床.*开发|试验.*设计)"
+      - "(完整|全面|综合|完备).*(临床.*试验|临床.*研究|临床.*开发).*(设计|计划|方案|报告|规划)"
+      - "(I|II|III|IV).*期.*(完整|全面|综合).*(试验|研究).*(设计|方案|计划)"
+      - "(设计|生成|创建).*(一个|一份).*(phase|Phase).*(I|II|III).*(临床试验|临床研究)"
+      - "帮我.*(完整|全面|全部|整个).*(设计|生成|创建).*(临床|试验|方案)"
+      - "我需要.*(一个|一份).*(完整|全面).*(临床.*开发|试验.*设计)"
+    workers:
+      - worker-pico-standards
+      - worker-safety-extraction
+      - worker-termination-analysis
+      - worker-ae-adjudication
+      - worker-target-biology
+      - worker-competitive-landscape
+      - worker-literature-synthesis
+    spawn_mode: parallel  # v2.2.1: B+A+C+F+G+H+I (7 workers) run simultaneously; D runs sequentially after
+    sequential_workers:
+      - worker-ie-criteria
+    priority: 2
+
+  composite_drug_development_profile:
+    patterns:
+      - "(comprehensive|full|complete|综合|完整).*(drug|target|molecule|therapeutic|药物|靶点|分子).*(profile|assessment|dossier|画像|评估|档案)"
+      - "(go|no.?go|investment|portfolio|立项|投资).*decision.*(support|analysis|支持|分析)"
+      - "(diligence|due diligence|尽调|尽职调查).*(target|drug|asset|靶点|药物|资产)"
+      - "(target.*validation|target.*assessment|靶点.*验证|靶点.*评估).*(report|analysis|报告|分析)"
+    workers:
+      - worker-target-biology
+      - worker-competitive-landscape
+      - worker-literature-synthesis
+      - worker-safety-extraction
+    spawn_mode: parallel  # G+H+I+A run simultaneously
+    priority: 2
+
+  composite_safety_efficacy_review:
+    patterns:
+      - "comprehensive.*(review|analysis|overview).*(drug|treatment|compound|class)"
+      - "(safety|efficacy).*(landscape|overview|profile|benchmark).*for"
+      - "what.*(known|evidence|data|published).*about.*(drug|compound)"
+      - "(drug|compound).*(profile|dossier|overview)"
+    workers:
+      - worker-safety-extraction
+      - worker-termination-analysis
+    spawn_mode: parallel
+    priority: 2
+
+  composite_patient_trial_matching_full:
+    patterns:
+      - "find.*trial.*for.*(patient|subject)"
+      - "match.*(patient|subject|cohort).*to.*trial"
+      - "screen.*(patient|subject).*for.*trial"
+      - "trial.*(eligibility|screening).*for.*(patient|subject)"
+      - "which.*(patient|subject).*eligible.*for"
+    workers:
+      - worker-biomarker-matching
+      - worker-ie-criteria
+    spawn_mode: sequential  # D must run first to produce I/E criteria, then E uses them to match
+    priority: 2
+
+# ── Step 3: Aggregation ──
+aggregation:
+  description: >
+    After all Workers in a phase complete, aggregate their outputs into
+    a unified, internally consistent report.
+
+  steps:
+    - step: DEDUPLICATE
+      description: "Remove duplicate data points contributed by multiple Workers (e.g., same NCT extracted by both Worker A and Worker B)"
+      method: "Match on Study_ID + Metric + Arm → keep one copy with highest confidence"
+
+    - step: CONFLICT_CHECK
+      description: "Apply 6 resolution strategies to every field where Workers disagree"
+      method: "For each conflicting data point, apply resolution strategies in priority order"
+
+    - step: CROSS_WORKER_CONSISTENCY
+      description: "Verify that aggregated data is internally consistent across Workers"
+      checks:
+        - id: EFFICACY_VS_PHASE
+          description: "Does the efficacy benchmark align with the trial phase? (Phase I should not claim ORR as primary; Phase III should be adequately powered)"
+          severity_if_fail: "MAJOR"
+
+        - id: SAFETY_VS_DRUG_CLASS
+          description: "Does the safety profile align with known drug class toxicities?"
+          severity_if_fail: "MINOR"
+
+        - id: IE_VS_PICO
+          description: "Do the I/E criteria match the PICO population definition? (e.g., PICO says 1L but I/E allows prior therapy)"
+          severity_if_fail: "CRITICAL"
+
+        - id: SAMPLE_SIZE_VS_ENDPOINT
+          description: "Is the sample size consistent with the endpoint effect size and power?"
+          severity_if_fail: "MAJOR"
+
+        - id: COMPARATOR_VS_STANDARD
+          description: "Is the comparator consistent with current standard of care per Worker B's regulatory audit?"
+          severity_if_fail: "CRITICAL"
+
+        - id: TERMINATION_RISK_VS_DESIGN
+          description: "Does the proposed design address common termination risks identified by Worker C?"
+          severity_if_fail: "MINOR"
+
+        - id: SIM_POWER_VS_DESIGN
+          description: "Does simulated power match the pre-specified target (typically >=80%) under the protocol's assumed effect size?"
+          severity_if_fail: "CRITICAL"
+
+        - id: SIM_EFFECT_SIZE_VS_PHASE2
+          description: "Does the simulated treatment effect match the Phase II observed effect size used to power Phase III?"
+          severity_if_fail: "MAJOR"
+
+        - id: SIM_DROPOUT_VS_ASSUMPTION
+          description: "Does the simulated dropout rate align with the protocol's dropout assumption used in sample size calculation?"
+          severity_if_fail: "MAJOR"
+
+        - id: SIM_POP_VS_IE
+          description: "Are simulated baseline patient characteristics consistent with the I/E criteria produced by Worker D?"
+          severity_if_fail: "CRITICAL"
+
+        - id: SIM_TYPE1_VS_MULTIPLICITY
+          description: "Does the simulated Type I error rate respect the multiplicity control strategy (MCP-Mod, gatekeeping, etc.) defined by Worker B?"
+          severity_if_fail: "CRITICAL"
+
+        - id: SIM_OPERATING_VS_PHASE
+          description: "Are simulated operating characteristics (power curve, bias, RMSE) appropriate for the trial phase?"
+          severity_if_fail: "MINOR"
+
+        - id: BLINDING_VS_PHASE
+          description: "Is the blinding level clinically appropriate for the trial phase? (Phase I FIH/SAD/MAD should be single-blind or investigator-blind, NOT double-blind unless justified with unblinded SRC; Phase IIb dose-ranging and Phase III pivotal should be double-blind per ICH E9)"
+          severity_if_fail: "MAJOR"
+          referenced_sources:
+            - "worker-pico-standards.yaml FUNCTION 1e (BLINDING_VS_PHASE validation rule)"
+            - "phase1-dose-escalation.md (sentinel dosing, placebo subjects for blinding)"
+            - "phase2-proof-of-concept.md (Phase 2a: single-arm, Phase 2b: randomized controlled)"
+            - "phase3-pivotal.md (double-blind standard for confirmatory trials)"
+
+    - step: GAP_INVENTORY
+      description: "Catalog ALL knowledge gaps identified by ANY Worker"
+      output: "Prioritized list of unknowns with: gap description, which Worker identified it, severity (CRITICAL/MAJOR/MINOR), suggested resolution"
+
+    - step: EXECUTIVE_SUMMARY
+      description: "Generate a 1-page executive summary of all findings"
+      sections:
+        - "Trial overview (indication, phase, design, drug, N)"
+        - "Key findings (3-5 bullet points)"
+        - "Critical issues requiring immediate attention"
+        - "Regulatory outlook (FDA/EMA/ICH compliance summary)"
+        - "Next steps"
+
+    - step: PRIORITIZED_RECOMMENDATIONS
+      description: "Synthesize and rank all Worker recommendations, flagging any cross-Worker contradictions"
+
+# ── Step 4: Conflict Resolution ──
+conflict_resolution:
+  description: >
+    When multiple Workers return different values for the same data point,
+    apply these resolution strategies in priority order.
+
+  strategies:
+    - name: REGULATORY_SOURCE
+      priority: 1
+      description: "Prefer values from FDA/EMA regulatory review documents over sponsor-reported values"
+      applies_to: [safety_data, efficacy_data, primary_endpoint_results]
+      rationale: "FDA/EMA reviews independently verify sponsor-submitted data"
+
+    - name: LARGEST_SAMPLE
+      priority: 2
+      description: "Prefer the value from the source with the largest N (more precise / reliable estimate)"
+      applies_to: [efficacy_data, safety_data, AE_incidence]
+      rationale: "Larger sample sizes produce more reliable estimates"
+
+    - name: FULL_TEXT_OVER_ABSTRACT
+      priority: 3
+      description: "Prefer values from full-text publications over abstract-only values"
+      applies_to: [all]
+      rationale: "Abstracts may present preliminary or incomplete data"
+
+    - name: LATEST_TIMESTAMP
+      priority: 4
+      description: "Prefer the most recently published or data-cutoff value"
+      applies_to: [efficacy_data, safety_data]
+      rationale: "More recent data cutoffs reflect more mature data with longer follow-up"
+
+    - name: CONSERVATIVE_SAFETY
+      priority: 5
+      description: "When safety data conflicts, report the WORSE safety profile (higher AE rates, more severe grades)"
+      applies_to: [safety_data, AE_incidence, SAE_rate, grade3_plus_rate]
+      rationale: "Conservative safety reporting is standard pharmacovigilance practice"
+
+    - name: FLAG_AND_REPORT
+      priority: 6
+      description: "When no resolution rule clearly applies, show ALL values with source attribution in the final report"
+      applies_to: [all]
+      rationale: "Never silently discard a valid data point; transparency builds trust"
+
+  contradiction_report_template: |
+    """
+    CONTRADICTION FOUND for metric: {metric_name}
+
+    Value A: {value_a}
+      Source: {source_a} ({document_type})
+      Data cutoff: {data_cutoff_a}
+      N: {sample_size_a}
+      Confidence: {confidence_a}
+
+    Value B: {value_b}
+      Source: {source_b} ({document_type})
+      Data cutoff: {data_cutoff_b}
+      N: {sample_size_b}
+      Confidence: {confidence_b}
+
+    RESOLUTION: [{strategy_applied}] → Adopted: {adopted_value}
+    EXPLANATION: {explanation}
+    RECOMMENDATION: {recommendation}
+    """
+
+# ── Tool Registry (Orchestrator-Level Tools) ──
+tool_registry:
+  - name: external_knowledge_harvester
+    source: project
+    path: skills/external-knowledge-harvester.md
+    description: "Auto-detect knowledge gaps and pre-fetch from CT.gov + PubMed before Worker dispatch"
+
+  - name: phase_skills
+    source: project
+    paths:
+      - phase1-dose-escalation.md
+      - phase2-proof-of-concept.md
+      - phase3-pivotal.md
+    description: "Phase-specific design rules, dose-finding methods, statistical frameworks"
+
+  - name: therapeutic_area_skills
+    source: project
+    paths:
+      - therapeutic-areas/oncology.md
+      - therapeutic-areas/cardiovascular.md
+      - therapeutic-areas/cns.md
+      - therapeutic-areas/cgt.md
+    description: "Disease-specific endpoints, diagnostic criteria, standard comparators"
+
+  - name: recruitment_skill
+    source: project
+    path: recruitment-enrollment.md
+    description: "Screening funnel benchmarks, IE code system, recruitment best practices"
+
+  - name: code_systems
+    source: project
+    path: references/code-systems.md
+    description: "MedDRA v27.0 hierarchy, LOINC codes, ATC classification, CDISC CT"
+
+  - name: ich_index
+    source: project
+    path: references/ich-guidelines-index.md
+    description: "ICH E2-E11 and M1-M5 guideline index with applicability mapping"
+
+  - name: external_database_skills
+    source: available_skills
+    skills:
+      - clinicaltrials-database   # Completed/ongoing trial designs, eligibility criteria, endpoint benchmarks
+      - pubmed-database           # Published efficacy/safety/preclinical/target biology literature
+      - fda-database              # FDA labels, approval letters, AdCom briefings, Medical Reviews
+      - gene-database             # HGNC gene symbol standardization, variant nomenclature (HGVS)
+      - cosmic-database           # Somatic mutation prevalence and pathogenicity
+      - clinvar-database          # Germline variant clinical significance
+      # ── v2.2 newly wired skills ──
+      - drugbank-database         # Drug info, targets, mechanisms, DDI, pharmacology for 9,591 drugs
+      - opentargets-database      # Target-disease associations, tractability, genetic evidence, known drugs
+      - chembl-database           # Bioactivity data (IC50/Ki/EC50), SAR, 2M+ compounds
+      - uniprot-database          # Protein structure, domains, PTMs, isoforms, GO terms, ID mapping
+      - string-database           # PPI networks, GO/KEGG enrichment, interaction partners, 59M+ proteins
+      - kegg-database             # Pathway maps, drug-pathway links, metabolic pathways
+      - reactome-database         # Reaction pathway enrichment, complementary to KEGG
+      - openalex-database         # 240M+ scholarly works, citation analysis, trends, author/institution networks
+      - gwas-database             # SNP-trait associations (GWAS Catalog), genetic validation of targets
+    description: "External database skills available for Knowledge Gate searches and Worker use. v2.2: Expanded from 7 to 14 skills covering target biology (UniProt/STRING/KEGG/Reactome), pharmacology (DrugBank/ChEMBL), disease genetics (OpenTargets/GWAS), and literature intelligence (OpenAlex)."
+
+# ── Final Report Template ──
+final_report_template:
+  sections:
+    - section: "Executive Summary"
+      order: 1
+      content: "1-page summary of all key findings, critical issues, and recommended actions"
+
+    - section: "PICO Analysis & Regulatory Standards Compliance"
+      order: 2
+      source_worker: worker-pico-standards
+      key_elements:
+        - "PICO extraction table"
+        - "Multi-agency compliance matrix (ICH/FDA/EMA/NMPA)"
+        - "Deviation list with severity ratings"
+        - "Modification suggestions with citations"
+
+    - section: "Competitive Safety & Efficacy Benchmarks"
+      order: 3
+      source_worker: worker-safety-extraction
+      key_elements:
+        - "Per-drug/per-trial safety table (AE, SAE, Grade 3+, Top 10 AEs)"
+        - "Per-drug/per-trial efficacy table (endpoint-specific)"
+        - "Cross-source contradiction log"
+        - "Extraction confidence dashboards"
+
+    - section: "Historical Trial Termination & Failure Mode Analysis"
+      order: 4
+      source_worker: worker-termination-analysis
+      key_elements:
+        - "Aggregate termination statistics"
+        - "Top-3 failure modes with root cause analysis"
+        - "Cross-dimensional breakdowns (TA, phase, sponsor, time)"
+        - "Design recommendations per phase"
+
+    - section: "Proposed Inclusion/Exclusion Criteria"
+      order: 5
+      source_worker: worker-ie-criteria
+      key_elements:
+        - "Complete I/E draft with citations"
+        - "Complexity dashboard (FK readability, logic complexity, enrollment impact, diversity impact)"
+        - "Risk annotations"
+        - "Consistency checks and gap analysis"
+
+    - section: "Biomarker-Guided Patient-Trial Matching Results"
+      order: 6
+      source_worker: worker-biomarker-matching
+      applicability: "Only when patient_matching task_type is triggered"
+      key_elements:
+        - "Ranked patient-trial match list with scores"
+        - "Per-pair variant-level annotation (matching, missing, excluding, confounding)"
+        - "Evidence gaps (untested biomarkers)"
+        - "Per-patient top-3 trials and per-trial top-5 patients"
+
+    - section: "Adverse Event Adjudication Results"
+      order: 7
+      source_worker: worker-ae-adjudication
+      applicability: "Only when ae_adjudication or safety_review task_type is triggered"
+      key_elements:
+        - "Per-case MedDRA coding (LLT → PT → SOC)"
+        - "CTCAE v5.0 grade determinations with supporting evidence"
+        - "Seriousness assessment (ICH E2A SAE criteria)"
+        - "Quality flags (under-reporting, grade discrepancies, missing related AEs)"
+
+    - section: "ICH-Mandated Supplementary Analyses"
+      order: 8
+      source_worker: worker-pico-standards
+      applicability: "When ich_supplementary task_type is triggered or comprehensive_design is requested"
+      key_elements:
+        - "Estimand Framework (ICH E9(R1)) — all 5 attributes specified"
+        - "QTc / TQT Assessment (ICH E14) — recommended strategy and monitoring plan"
+        - "MRCT Design Audit (ICH E17) — regional balance, ethnic factors, bridging"
+        - "Risk-Based Quality Management (ICH E6(R2)) — CtQ factors, QTLs, monitoring strategy"
+        - "Pediatric Investigation Plan (ICH E11) — deferral/waiver assessment"
+        - "Statistical Rigor Check — sample size, multiplicity, interim analysis, missing data"
+
+    - section: "Trial Simulation & Statistical Analysis"
+      order: 9
+      source_worker: worker-pico-standards
+      applicability: "When statistical_simulation task_type is triggered or comprehensive_design is requested"
+      key_elements:
+        - "Monte Carlo power analysis — simulated vs analytical power comparison"
+        - "Power curve analysis — N vs. power, N_min for 80%/90% power"
+        - "Sample size re-estimation — analytical vs. simulation-based required N"
+        - "I/E criteria impact — Restrictive/Standard/Broad scenarios on enrollment and power"
+        - "Effect size sensitivity — cliff-edge analysis, dropout sensitivity"
+        - "Endpoint type comparison — continuous vs. binary vs. TTE efficiency"
+        - "Operating characteristics — Type I error, bias, RMSE, CI coverage"
+        - "Comparative design recommendations — ranked scenarios with evidence"
+
+    - section: "Comprehensive AE Profile & Management Plan"
+      order: 10
+      source_worker: worker-ae-adjudication
+      applicability: "When ae_profile_generation task_type is triggered or comprehensive_design is requested"
+      key_elements:
+        - "Drug-specific AE incidence tables (overall, most common, AESIs, lab abnormalities)"
+        - "CTCAE v5.0 grading tables per organ system with management actions"
+        - "AE management algorithm (universal + AE-specific protocols)"
+        - "Phase-specific risk mitigation (Phase I/II/III/IV)"
+        - "Pharmacovigilance & SAE reporting guidelines"
+        - "Competitive AE benchmarking vs drug class comparators"
+
+    - section: "Recruitment Funnel & Enrollment Optimization"
+      order: 11
+      source_worker: worker-ie-criteria
+      applicability: "When recruitment_funnel task_type is triggered or comprehensive_design is requested"
+      key_elements:
+        - "5-stage screening funnel model with pass rates per stage"
+        - "Screen failure bottleneck analysis (Top-3 reasons)"
+        - "Enrollment velocity projection by site and month"
+        - "Recruitment risk score (GREEN/YELLOW/RED/CRITICAL)"
+        - "Mitigation strategies with expected impact"
+        - "Enrollment monitoring plan with remediation triggers"
+
+    - section: "Conflict Resolution Log"
+      order: 12
+      content: "All contradictions found, resolution strategies applied, and adopted values"
+
+    - section: "Knowledge Gaps & Recommendations"
+      order: 13
+      content: "Cumulative gap inventory across all Workers + cross-Worker prioritized recommendations"
+
+    - section: "Target Biology & Preclinical Evidence"
+      order: 15
+      source_worker: worker-target-biology
+      applicability: "When target_biology or comprehensive_design task_type is triggered"
+      key_elements:
+        - "Protein structure & domain architecture (UniProt)"
+        - "Signaling pathway networks with evidence confidence scores (STRING/KEGG/Reactome)"
+        - "Drug-target pharmacology (ChEMBL bioactivities, DrugBank known drugs)"
+        - "Disease association evidence (OpenTargets + GWAS + ClinVar)"
+        - "Preclinical evidence matrix (KO/transgenic/scRNA-seq/in vitro)"
+        - "Target risk assessment (novelty, genetic validation, druggability, safety concerns)"
+
+    - section: "Competitive Landscape & Differentiation Strategy"
+      order: 16
+      source_worker: worker-competitive-landscape
+      applicability: "When competitive_landscape or comprehensive_design task_type is triggered"
+      key_elements:
+        - "Competitive comparison matrix (6-15 competitors across approved/Phase III/Phase II)"
+        - "Efficacy & safety benchmarks with forest plot data"
+        - "Mechanistic differentiation analysis"
+        - "Development precedence and regulatory history"
+        - "Treatment guideline alignment"
+        - "IP landscape and publication trends"
+
+    - section: "Literature Synthesis & Evidence Map"
+      order: 17
+      source_worker: worker-literature-synthesis
+      applicability: "When literature_synthesis or comprehensive_design task_type is triggered"
+      key_elements:
+        - "Structured citation index with evidence grading (Oxford CEBM 1A-5)"
+        - "Evidence-by-claim analysis with supporting/conflicting citations"
+        - "Citation graph with cluster analysis (by research theme)"
+        - "Thematic analysis with maturity assessment (Emerging/Established/Declining)"
+        - "Research trends (publications by year, top institutions/authors, growth rate)"
+        - "Identified knowledge gaps with severity grading and resolution suggestions"
+
+    # ── v2.3 新增: 5 级生物标志物策略 ──
+    - section: "Integrated Biomarker Strategy"
+      order: 14
+      source_worker: worker-pico-standards
+      applicability: "Always included in comprehensive_design"
+      key_elements:
+        - "Tier 1 — 诊断/富集: Amyloid PET, CSF Aβ42/Aβ40, CSF p-Tau181 (确保纳入明确病理患者)"
+        - "Tier 2 — 靶点结合/PD: CSF 游离靶点 (靶点占位), CSF IL-1β, CSF sTREM2 (确证通路调控)"
+        - "Tier 3 — 疾病进展: CSF/血浆 NfL, p-Tau217, 海马体积 (sMRI) (监测疾病修改效应)"
+        - "Tier 4 — 安全性: 脑 MRI (ARIA 系列), ADA/NAb (安全性监查)"
+        - "Tier 5 — 探索性: CSF YKL-40, GFAP, Tau PET, FDG-PET (扩展机制理解)"
+        - "采样时间表: CSF/血浆/影像生物标志物的完整访视矩阵 (Screening→W78)"
+
+    - section: "Appendix: Source Citations"
+      order: 18
+      content: "All PMIDs, NCTs, FDA/EMA document IDs, ICH guideline references, and database accessions used across all Workers"
+
+    # ── v2.3 新增: 应急方案 ──
+    - section: "Pandemic & Operational Contingency Plan"
+      order: 19
+      applicability: "Always included in comprehensive_design"
+      key_elements:
+        - "访视中断: 窗口期扩展至 ±6 周 (正常 ±2 周)；居家评估 (远程 CDR, 远程 MMSE)"
+        - "区域封锁: 按地区分层，基于地区的亚组分析"
+        - "药物中断: 缺失数据模型纳入中断时长作为协变量"
+        - "远程评估: 预定义的远程与面访评估等效性分析 (Kappa/ICC ≥ 0.8)"
+        - "数据完整性: 电子源数据 (eSource) 和去中心化试验 (DCT) 要素的预整合"
+
+    # ── v2.3 新增: 附录缩写表 ──
+    - section: "Appendix: Abbreviations & Glossary"
+      order: 20
+      content: "Auto-generated comprehensive abbreviation table covering all therapeutic area terms, CDISC codes, regulatory acronyms, biomarker names, and statistical terminology used across all Workers' outputs"
+
+  # ── v2.3 新增: 报告叙述质量指令 ──
+  narrative_quality_instructions: |
+    在聚合最终报告时，必须遵循以下叙述质量规则：
+
+    1. **段落间过渡**: 每个 Part 的结尾必须有 1-2 句过渡到下一个 Part，
+       解释两个 Part 之间的逻辑关系（例："以上靶点生物学证据直接支持了
+       下一节中 Phase I 起始剂量的选择"）。
+
+    2. **表格伴随文字**: 每个表格前后必须有至少 2 句解释性文字——
+       表前说明"这个表展示什么、为什么重要"，
+       表后说明"从表中我们可以得出什么结论"。
+
+    3. **数据来源标注**: 每个数据表格必须在表注中标注数据来源
+       （格式: "数据来源: [数据库名/PMID/NCT], 查询日期: [YYYY-MM-DD]"）。
+
+    4. **决策者摘要**: Part C (竞争格局) 和 Part G (Phase III) 之后
+       必须包含一段 150-200 字的中文摘要，用非专业语言解释核心决策含义。
+
+    5. **缩写首次使用**: 每个缩写词在首次出现在正文中时必须展开全称，
+       并在附录缩写表中列出。

@@ -1,0 +1,701 @@
+# ──────────────────────────────────────────────────────────────────
+# Worker G: 靶点生物学与临床前证据深度分析
+# ──────────────────────────────────────────────────────────────────
+# 版本: 1.0
+# 负责: 靶点蛋白结构、信号通路网络、药物-靶点药理学、
+#        GWAS/ClinVar 遗传验证、临床前模型证据、可成药性评估
+# 集成: 11 个外部数据库 Skill (UniProt/STRING/KEGG/Reactome/
+#       ChEMBL/DrugBank/OpenTargets/GWAS/ClinVar/PubMed/OpenAlex)
+# ──────────────────────────────────────────────────────────────────
+
+worker_id: worker-target-biology
+name: "靶点生物学与临床前证据深度分析专家"
+version: "1.0"
+description: >
+  提供全面的靶点生物学特征分析，包括蛋白结构与域架构、
+  蛋白-蛋白互作网络与信号通路、已知靶向药物与生物活性数据、
+  遗传验证证据 (GWAS/ClinVar)、临床前模型证据、可成药性评估。
+  可单独触发，也可作为 comprehensive_design 编排的一部分并行运行。
+
+trigger_conditions:
+  - "(分析|评估|审评|表征|特征).*(靶点|靶标|分子机制|蛋白结构|信号通路)"
+  - "(机理|机制).*(作用|MOA|靶点).*(是什么|描述|解释|分析)"
+  - "(蛋白.*互作|信号.*通路|PPI.*网络|通路.*分析).*(靶点|药物|蛋白)"
+  - "(GWAS|遗传.*证据|遗传.*验证|遗传.*关联).*(靶点|疾病|适应症)"
+  - "(临床前|动物.*模型|基因敲除|转基因|体内|体外).*(证据|数据|支持|验证)"
+  - "(可成药性|成药性|druggability).*(评估|分析|打分)"
+  - "(结构.*生物学|晶体.*结构|结合.*口袋|蛋白.*结构域).*(分析|审评)"
+  - "(靶点|蛋白|基因).*(验证|确证|关联|连接).*(疾病|适应症)"
+  - "(Galectin|靶点.*深度|靶点.*生物学|靶点.*验证).*(分析|评估)"
+  - "(信号转导|通路网络|互作组).*(分析|图谱|表征)"
+
+# ── 知识门控 ──────────────────────────────────────────────────────
+
+knowledge_gate:
+  description: >
+    在执行靶点生物学分析前，Worker G 必须自审以下 7 个知识领域。
+    任何答案为"否"的检查，必须使用指定的数据库技能填补缺口后方可继续。
+
+  checks:
+    - id: KG-G1
+      question: "我是否了解该靶点的完整蛋白结构——包括域架构、活性位点、翻译后修饰(PTM)、异构体？"
+      if_no: >
+        使用 skill:uniprot-database 检索靶点蛋白的 Swiss-Prot 条目：
+        获取蛋白名称、基因名、长度、分子量、域 (Pfam/SMART/InterPro)、
+        活性位点、PTM (磷酸化/糖基化/泛素化)、异构体。
+        同时使用 skill:pdb-database 检查是否有可用的 3D 晶体或冷冻电镜结构。
+      tools:
+        - skill:uniprot-database
+        - skill:pdb-database
+
+    - id: KG-G2
+      question: "靶点参与了哪些信号通路？其蛋白-蛋白互作(PPI)网络中有哪些关键节点？"
+      if_no: >
+        使用 skill:string-database 查询靶点的 PPI 网络 (combined_score ≥ 0.700)，
+        获取互作伙伴和网络富集分析 (GO/KEGG)。
+        使用 skill:kegg-database 获取包含靶点的通路图谱。
+        使用 skill:reactome-database 获取反应通路富集（作为 KEGG 的互补验证）。
+        三个数据库的结果应交叉验证并整合。
+      tools:
+        - skill:string-database
+        - skill:kegg-database
+        - skill:reactome-database
+
+    - id: KG-G3
+      question: "GWAS 和 ClinVar 数据库中是否存在将该靶点基因与适应症关联的遗传证据？"
+      if_no: >
+        使用 skill:gwas-database 搜索靶点基因的 SNP-性状关联 (p < 5×10⁻⁸)。
+        使用 skill:clinvar-database 搜索靶点基因中与适应症相关的致病变异。
+        如果疾病有 OMIM 编号，也通过 UniProt 交叉引用。
+      tools:
+        - skill:gwas-database
+        - skill:clinvar-database
+        - skill:uniprot-database
+
+    - id: KG-G4
+      question: "已知有哪些药物靶向该蛋白？它们的生物活性 (IC50/Ki/EC50) 和选择性如何？"
+      if_no: >
+        使用 skill:chembl-database 查询靶点的所有生物活性数据 (IC50, Ki, EC50, Kd)，
+        按 assay_confidence ≥ 6 过滤。记录活性值范围、最强效化合物、
+        以及选择性数据（如果靶点有同源家族成员）。
+        使用 skill:drugbank-database 查询所有已知靶向该蛋白的药物、
+        它们的适应症 (批准/在研)、以及作用机制 (抑制剂/激动剂/拮抗剂)。
+      tools:
+        - skill:chembl-database
+        - skill:drugbank-database
+
+    - id: KG-G5
+      question: "该靶点对于此适应症是否具有可成药性？OpenTargets 的 tractability 和遗传证据评分如何？"
+      if_no: >
+        使用 skill:opentargets-database 查询靶点-疾病关联评分 (overall_score)，
+        包括各证据类型分数 (genetic_association, somatic_mutation,
+        known_drug, pathways, rna_expression, literature)。
+        特别关注 tractability_small_molecule 和 tractability_antibody 评分，
+        以及 safety_liabilities 列表中记录的任何已知安全性负债。
+        使用 skill:gene-database 标准化基因符号 (HGNC)。
+      tools:
+        - skill:opentargets-database
+        - skill:gene-database
+
+    - id: KG-G6
+      question: "存在哪些临床前模型证据支持靶点与疾病之间的因果关系？"
+      if_no: >
+        使用 skill:pubmed-database 搜索基因敲除 (KO)、转基因、PDX 模型文献。
+        搜索策略：'{target_gene} AND ({indication} OR {disease_keyword}) AND
+        (knockout OR transgenic OR preclinical OR in vivo OR in vitro)'。
+        使用 skill:openalex-database 进行更广泛的文献挖掘和趋势分析。
+        构建包含模型类型、关键发现、效应量、PMIDs 的证据矩阵。
+      tools:
+        - skill:pubmed-database
+        - skill:openalex-database
+
+    - id: KG-G7
+      question: "疾病组织中的靶点表达模式如何？有无 scRNA-seq 或空间转录组学证据？"
+      if_no: >
+        使用 skill:opentargets-database 获取靶点的 rna_expression 数据。
+        使用 skill:pubmed-database 搜索 scRNA-seq 数据集 (GEO accession)。
+        使用 skill:gene-database 解析基因符号。重点关注疾病相关细胞类型中的
+        差异表达 (fold change vs control) 和细胞特异性。
+      tools:
+        - skill:opentargets-database
+        - skill:pubmed-database
+        - skill:gene-database
+
+  mid_execution_search_policy: >
+    如果在分析过程中发现意外的知识缺口（例如：发现了一个之前未知的蛋白质
+    功能或疾病关联），Worker G 必须暂停当前分析，使用相关数据库技能
+    进行补充搜索，并将触发的搜索记录在输出的 gap_filling_log 中。
+
+# ── 工具 ──────────────────────────────────────────────────────────
+
+tools:
+  - name: uniprot_client
+    source: skill:uniprot-database
+    description: "蛋白结构、域、PTM、异构体、GO 术语、UniProt→Ensembl/RefSeq/PDB 映射"
+
+  - name: string_api
+    source: skill:string-database
+    description: "PPI 网络构建 (combined_score ≥ 0.700)、GO/KEGG 富集分析、互作伙伴发现"
+
+  - name: kegg_api
+    source: skill:kegg-database
+    description: "通路图谱下载 (PNG/KGML)、药物-通路链接、KEGG→UniProt/NCBI Gene 转换"
+
+  - name: reactome_api
+    source: skill:reactome-database
+    description: "反应通路富集分析、通路可视化数据、与 KEGG 互补的通路覆盖"
+
+  - name: chembl_client
+    source: skill:chembl-database
+    description: "生物活性数据 (IC50/Ki/EC50/Kd)、SAR 数据、按 assay_confidence ≥ 6 过滤"
+
+  - name: drugbank_helper
+    source: skill:drugbank-database
+    description: "已知靶向药物、作用机制、适应症 (批准/在研)、药物-药物互作 (DDI)、化学性质"
+
+  - name: opentargets_query
+    source: skill:opentargets-database
+    description: "靶点-疾病关联评分、tractability (small_molecule/antibody)、safety_liabilities、已知药物"
+
+  - name: gwas_search
+    source: skill:gwas-database
+    description: "GWAS Catalog 中靶点基因的 SNP-性状关联、p-value、效应量 (beta/OR)"
+
+  - name: clinvar_search
+    source: skill:clinvar-database
+    description: "靶点基因变异的临床意义分类 (Pathogenic/Likely pathogenic/VUS)"
+
+  - name: pubmed_search
+    source: skill:pubmed-database
+    description: "临床前模型文献 (KO/转基因/PDX)、靶点验证文献、生物标志物文献"
+
+  - name: openalex_client
+    source: skill:openalex-database
+    description: "学术著作搜索、引用分析、研究趋势、scRNA-seq 数据集发表文献"
+
+  - name: gene_lookup
+    source: skill:gene-database
+    description: "HGNC 基因符号标准化、别名解析、变异命名验证 (HGVS)"
+
+# ── 指令 ──────────────────────────────────────────────────────────
+
+instructions: |
+  ╔══════════════════════════════════════════════════════════════╗
+  ║  Worker G: 靶点生物学与临床前证据深度分析 ─── v1.0           ║
+  ╚══════════════════════════════════════════════════════════════╝
+
+  本 Worker 执行 6 个阶段的靶点生物学分析。阶段 1-5 可在数据可用时并行执行，
+  阶段 6 是跨阶段的证据综合。
+
+  ═══════════════════════════════════════════════════════════════
+  PHASE 1 — 核心靶点表征 (可并行)
+  ═══════════════════════════════════════════════════════════════
+
+  1a. 基因符号标准化:
+    - 使用 gene_lookup (skill:gene-database) 将用户提供的靶点名称
+      解析为 HGNC 批准的官方基因符号。
+    - 记录所有已知别名和曾用名。
+
+  1b. UniProt 蛋白结构:
+    - 使用 uniprot_client 检索靶点蛋白的 Swiss-Prot 条目。
+    - 提取：蛋白推荐名、基因名、物种、序列长度、分子量、Swiss-Prot/TrEMBL 状态。
+    - 列出所有结构域 (Pfam/InterPro/SMART IDs)、活性位点、PTM 位点。
+    - 列出所有已知异构体和它们的差异。
+    - 映射到外部数据库：Ensembl、RefSeq、PDB、AlphaFoldDB。
+
+  1c. STRING 蛋白标识符:
+    - 使用 string_api 将蛋白映射到 STRING 标识符 (如 9606.ENSP...)。
+
+  ═══════════════════════════════════════════════════════════════
+  PHASE 2 — 信号通路与互作网络 (可并行)
+  ═══════════════════════════════════════════════════════════════
+
+  2a. PPI 网络分析:
+    - 使用 string_api 获取靶点的 PPI 网络 (combined_score ≥ 0.700)。
+    - 限制互作伙伴数量为 20-50 个（取 top 置信度）。
+    - 对每种证据类型 (experiments/databases/textmining/coexpression/neighborhood/fusion/cooccurrence)
+      分别记录置信度分数。
+    - 调用 STRING 的 enrichment 端点获取 GO 生物过程/分子功能/细胞组分 和
+      KEGG 通路富集结果（FDR < 0.05）。
+
+  2b. KEGG 通路:
+    - 使用 kegg_api 检索包含靶点基因的通路列表 (kegg_link("pathway", "hsa:{gene_id}"))。
+    - 对于每条通路，获取通路名称、通路类别、以及通路中与靶点直接互作的上下游节点。
+    - 保存通路图的 PNG 链接或 KGML 描述。
+
+  2c. Reactome 通路 (互补):
+    - 使用 reactome_api 检索靶点参与的反应通路。
+    - 比较 Reactome 和 KEGG 的通路覆盖——标记在 KEGG 中出现但不在 Reactome 中
+      的通路（或反之），以获得更完整的通路画像。
+
+  ═══════════════════════════════════════════════════════════════
+  PHASE 3 — 药物-靶点药理学 (可并行)
+  ═══════════════════════════════════════════════════════════════
+
+  3a. ChEMBL 生物活性:
+    - 使用 chembl_client 查询靶点的所有生物活性测定数据。
+    - 按 assay_confidence ≥ 6 和 standard_type IN (IC50, Ki, EC50, Kd) 过滤。
+    - 记录：活性值范围 (min-max)、最强效化合物 (最低 IC50/Ki)、
+      化合物数量、测定类型分布 (B=Binding, F=Functional)。
+    - 如果靶点属于一个家族 (如激酶、GPCR)，查询所有家族成员的活性数据
+      用于选择性分析。
+
+  3b. DrugBank 已知药物:
+    - 使用 drugbank_helper 查询所有靶向该蛋白的药物。
+    - 对每个药物记录：DrugBank ID、名称、类型 (small molecule/biotech)、
+      作用机制 (inhibitor/agonist/antagonist/modulator/binder)、
+      适应症 (列出所有，标记已批准 vs 在研)、最高阶段。
+    - 记录已知的药物-靶点结合亲和力 (如果有)。
+
+  3c. 化合物-靶点矩阵:
+    - 合成 ChEMBL + DrugBank 数据，生成化合物-靶点活性矩阵。
+    - 识别最具选择性的化合物和最广谱的化合物。
+    - 如果可用，提取 Lipinski 五规则数据 (MW, logP, HBD, HBA, PSA)
+      用于评估类药性。
+
+  ═══════════════════════════════════════════════════════════════
+  PHASE 4 — 疾病关联与遗传证据 (可并行)
+  ═══════════════════════════════════════════════════════════════
+
+  4a. OpenTargets 靶点-疾病关联:
+    - 使用 opentargets_query 查询靶点 (Ensembl ID) 与适应症 (EFO ID) 的关联。
+    - 提取 overall_association_score (0-1) 和各证据类型分项分数。
+    - query: get_target_disease_evidence(ensembl_id, efo_id)
+    - 评估 tractability_small_molecule 和 tractability_antibody 的分类。
+    - 列出 safety_liabilities 中的所有已知安全性警示。
+    - 使用 search_entities 将疾病名称映射到 EFO ID。
+
+  4b. GWAS 遗传验证:
+    - 使用 gwas_search 搜索靶点基因附近 (±500kb) 的 SNP-性状关联。
+    - 过滤 p-value < 5×10⁻⁸ (全基因组显著性)。
+    - 记录 rsID、关联性状、p-value、beta (连续性状) 或 OR (二分类性状)、
+      风险等位基因、PMID。
+    - 特别关注报告性状与疾病适应症的语义匹配。
+
+  4c. ClinVar 变异:
+    - 使用 clinvar_search 查询靶点基因中与疾病相关的变异。
+    - 按 clinical_significance 分类：Pathogenic / Likely pathogenic /
+      Uncertain significance / Likely benign / Benign。
+    - 记录变异 ID (VCV)、分子后果 (missense/nonsense/frameshift/splice)、
+      ClinVar 审评状态 (reviewed by expert panel / criteria provided / ...)。
+
+  ═══════════════════════════════════════════════════════════════
+  PHASE 5 — 文献与表达证据 (可并行)
+  ═══════════════════════════════════════════════════════════════
+
+  5a. 临床前模型证据 (PubMed):
+    - 使用 pubmed_search 搜索：
+      query 1: '{target_gene} AND knockout AND {disease}'
+      query 2: '{target_gene} AND transgenic AND {disease}'
+      query 3: '{target_gene} AND (preclinical OR in vivo OR in vitro) AND {disease}'
+    - 提取关键论文：PMID、标题、年份、期刊、摘要摘要。
+    - 对每项研究分类：KO/转基因/PDX/药理学/细胞/生化。
+    - 提取效应量：认知改善 %、生物标志物变化 %、组织学改变。
+
+  5b. 文献计量与趋势 (OpenAlex):
+    - 使用 openalex_client 搜索 '{target_gene} AND {disease}'。
+    - 提取发表趋势（按年份计数）、顶级机构、高引用论文。
+    - 分析研究主题分布 (concepts) 和新兴方向。
+    - 获取高被引论文的引用数 (cited_by_count)。
+
+  5c. 表达模式:
+    - 从 OpenTargets 的 rna_expression 数据获取组织/细胞类型表达。
+    - 使用 pubmed_search 搜索 scRNA-seq 数据集 (GEO accession)：
+      query: '{target_gene} AND (scRNA-seq OR single cell OR single nucleus) AND {disease_tissue}'
+    - 记录疾病 vs 对照的差异表达 (fold change)。
+
+  ═══════════════════════════════════════════════════════════════
+  PHASE 6 — 证据综合矩阵与风险评估
+  ═══════════════════════════════════════════════════════════════
+
+  6a. 证据矩阵构建:
+    - 为每个提出的靶点-疾病作用机制创建一个 6 维证据矩阵：
+      维度：遗传证据 | 蛋白证据 | 通路证据 | 药理学证据 | 临床前模型证据 | 人类疾病关联
+    - 每个细胞按 0-3 分评分 (0=无证据, 1=弱/暗示, 2=中/支持, 3=强/确证)。
+    - 每个分数附带证据来源 (PMID / 数据库 ID)。
+
+  6b. 靶点风险评估:
+    - 靶点新颖性分类: First-in-class / Best-in-class / Fast-follower
+      (依据：OpenTargets known_drugs + ChEMBL unique compounds count)
+    - 遗传验证强度: Strong / Moderate / Weak / Absent
+      (依据：GWAS p-value + ClinVar 致病变异 + OpenTargets genetic_association score)
+    - 临床前证据强度: Strong / Moderate / Weak
+      (依据：KO 表型一致性 + 多模型验证 + 人类原代细胞/iPSC 证据)
+    - 可成药性信心: High / Medium / Low
+      (依据：OpenTargets tractability + ChEMBL 活性化合物数量 + DrugBank known drugs)
+    - 安全性关注列表: 从 OpenTargets safety_liabilities + DrugBank DDI + PubMed 汇总
+
+  6c. 差异表达与文献空白:
+    - 如果发现矛盾的证据（如：KO 小鼠改善认知但 GWAS 阴性），标记为 "需要进一步验证"。
+    - 列出文献中明确指出的知识空白。
+
+# ── 输出格式 ──────────────────────────────────────────────────────
+
+output_format:
+  target_bio_metadata:
+    drug_name: "string (研究药物名称)"
+    target_symbol: "string (HGNC 批准的官方基因符号)"
+    target_aliases: ["string (所有已知别名)"]
+    target_uniprot_id: "string (UniProt accession, 如 P17931)"
+    target_ensembl_id: "string (ENSG...)"
+    organism: "Homo sapiens"
+    query_date: "ISO 8601"
+    databases_queried: ["UniProt", "STRING", "KEGG", "Reactome", "ChEMBL", "DrugBank", "OpenTargets", "GWAS Catalog", "ClinVar", "PubMed", "OpenAlex", "Gene"]
+    gap_filling_log:
+      - triggered_by: "KG-G6"
+        query: "search query string"
+        databases_used: ["PubMed"]
+        results_summary: "found N papers"
+        timestamp: "ISO 8601"
+
+  protein_structure:
+    uniprot_entry:
+      protein_name: "推荐蛋白名 (Recommended name)"
+      alternative_names: ["备选名1", "备选名2"]
+      gene_name: "原始基因名 (Primary gene name)"
+      gene_synonyms: ["同义名1"]
+      organism: "Homo sapiens"
+      length_aa: 000
+      mass_da: 00000
+      reviewed_status: "Swiss-Prot"
+      function_description: "UniProt 功能描述 (中文总结)"
+    domains:
+      - domain_name: "Galectin/糖识别结构域"
+        pfam_id: "PF00337"
+        interpro_id: "IPR001079"
+        start: 000
+        end: 000
+        description: "域功能描述 (中文)"
+    active_sites:
+      - residue: "Cys123"
+        position: 123
+        function: "催化残基 | 配体结合 | PTM 位点"
+    ptms:
+      - type: "磷酸化"
+        position: 000
+        kinase: "如果已知"
+        significance: "调控意义 (中文)"
+      - type: "糖基化"
+        position: 000
+        significance: "调控意义 (中文)"
+    isoforms:
+      - isoform_id: "P17931-2"
+        length_aa: 000
+        difference: "与经典异构体的差异 (中文)"
+    structure_availability:
+      pdb_ids: ["1ABC", "2DEF"]
+      best_resolution: "1.8 Angstrom"
+      coverage: "残基 X-Y (占全长 Z%)"
+      alphafold_model_available: true
+
+  signaling_pathways:
+    # ── v2.3: ASCII 通路图（直观展示靶点核心信号调控轴）──
+    pathway_diagram_ascii: |
+      "使用 ASCII 流程图直观展示靶点在疾病中的核心信号调控网络。
+      格式参考:
+
+      病理触发 (Aβ沉积 / Tau磷酸化 / 衰老)
+                 ↓
+      靶点表达上调 (转录因子驱动)
+                 ↓
+          ┌──────┼──────┐
+          ↓      ↓      ↓
+       通路A   通路B   通路C
+          ↓      ↓      ↓
+        效应1   效应2   效应3
+          ↓      ↓      ↓
+          └──────┴──────┘
+                 ↓
+        疾病恶性循环 → 病理加速
+
+      每个节点标注关键蛋白/基因名。
+      每个箭头标注调控方式 (→ 激活, ⊣ 抑制)。
+      优先展示与疾病机制直接相关的通路。"
+    ppi_network:
+      string_id: "9606.ENSP00000..."
+      total_interactors_score700: 00
+      top_interactors:
+        - protein: "基因名"
+          protein_name: "蛋白全称"
+          combined_score: 950
+          evidence:
+            experiments: 800
+            databases: 900
+            textmining: 700
+            coexpression: 600
+            neighborhood: 0
+            fusion: 0
+            cooccurrence: 500
+    ppi_network_stats:
+      average_node_degree: 00
+      clustering_coefficient: 0.00
+      ppi_enrichment_p_value: 0.001
+    enriched_pathways_kegg:
+      - pathway_id: "hsa04620"
+        pathway_name: "Toll-like receptor signaling pathway"
+        fdr: 1.2e-05
+        observed_genes: ["TLR4", "MYD88", "NFKB1"]
+        total_pathway_genes: 104
+        source: "STRING enrichment"
+    enriched_pathways_reactome:
+      - pathway_id: "R-HSA-168249"
+        pathway_name: "Innate immune system"
+        fdr: 3.4e-08
+        observed_genes: ["target_gene", "TLR4"]
+        source: "Reactome API"
+    pathway_coverage:
+      kegg_pathways_count: 00
+      reactome_pathways_count: 00
+      overlapping_pathways: 00
+      kegg_unique: 00
+      reactome_unique: 00
+
+  drug_target_pharmacology:
+    chembl_bioactivities:
+      total_assays: 000
+      total_unique_compounds: 000
+      activity_types:
+        IC50_count: 000
+        Ki_count: 000
+        EC50_count: 000
+        Kd_count: 000
+      ic50_range_nM: "0.5 - 50000"
+      most_potent:
+        compound_chembl_id: "CHEMBL..."
+        compound_name: "化合物名"
+        standard_type: "IC50"
+        standard_value: 0.5
+        standard_units: "nM"
+        assay_type: "B (Binding)"
+        document_chembl_id: "CHEMBL..."
+        pmid: "PMID..."
+      selectivity_profile:
+        family_members_tested: 00
+        most_selective_compound: "化合物名"
+        selectivity_ratio: 0000
+        off_target_hits: ["相关家族成员的活性列表"]
+    drugbank_known_drugs:
+      - drugbank_id: "DB..."
+        drug_name: "药物名 (INN)"
+        drug_type: "small molecule | biotech"
+        cas_number: "xxx-xx-x"
+        mechanism: "inhibitor | agonist | antagonist | modulator | binder"
+        actions: ["inhibitor", "negative modulator"]
+        indication: "批准的适应症列表"
+        max_phase: 4
+        status: "approved | investigational | withdrawn"
+        pharmacology_summary: "药理学摘要 (中文)"
+    novel_target_assessment:
+      is_novel: true | false
+      known_drugs_count: 00
+      approved_drugs_count: 00
+      investigational_drugs_count: 00
+      first_in_class_potential: "High | Medium | Low"
+      rationale: "基于已知药物数量和创新性的评估 (中文)"
+
+  disease_association:
+    opentargets:
+      overall_association_score: 0.00
+      evidence_scores:
+        genetic_association: 0.00
+        somatic_mutation: 0.00
+        known_drug: 0.00
+        pathways: 0.00
+        rna_expression: 0.00
+        text_mining: 0.00
+        animal_model: 0.00
+      tractability_small_molecule:
+        category: "Tractable with high confidence | Tractable with medium confidence | Tractable with low confidence | No known tractability"
+        top_bucket: 1
+        rationale: "Tractability 分类的理由 (中文)"
+      tractability_antibody:
+        category: "同上"
+        top_bucket: 1
+        rationale: "理由 (中文)"
+      safety_liabilities:
+        - concern: "具体安全性关注"
+          evidence: "证据来源"
+      disease_efo_id: "EFO_000xxxx"
+      disease_name: "疾病名 (来自 OpenTargets)"
+    gwas_evidence:
+      total_significant_hits: 00
+      lead_variants:
+        - rs_id: "rs..."
+          trait: "关联性状"
+          p_value: 5e-8
+          beta_or: 1.32
+          risk_allele: "A"
+          context: "intron_variant | missense_variant | intergenic"
+          pmid: "PMID..."
+          mapped_gene: "靶点基因名 (如果位于基因附近)"
+    clinvar_evidence:
+      pathogenic_variants: 00
+      likely_pathogenic_variants: 00
+      vus_count: 00
+      key_variants:
+        - variant_id: "VCV..."
+          name: "NM_xxx:c.123A>G (p.Lys41Glu)"
+          clinical_significance: "Pathogenic"
+          review_status: "reviewed by expert panel"
+          condition: "疾病名"
+          molecular_consequence: "missense_variant"
+
+  preclinical_evidence:
+    knockout_phenotype:
+      model: "基因名-KO 小鼠"
+      genetic_background: "C57BL/6J"
+      key_phenotypes:
+        - phenotype: "表型描述 (中文)"
+          assay: "Morris water maze | Novel object recognition | IHC"
+          effect_size: "定量效应量"
+          pmid: "PMID..."
+          strength: "Strong | Moderate | Weak"
+      relevance_to_disease: "对疾病的相关性评估 (中文)"
+    transgenic_models:
+      - model: "APP/PS1 x 基因名-KO"
+        disease_context: "Aβ 淀粉样蛋白病理"
+        behavioral_rescue: "描述 (含效应量)"
+        biomarker_effects:
+          - biomarker: "Aβ plaque load"
+            effect: "-40% IHC"
+          - biomarker: "Iba1+ microglia"
+            effect: "-50%"
+          - biomarker: "CSF IL-1β"
+            effect: "-60%"
+        pmid: "PMID..."
+    in_vitro_evidence:
+      - cell_type: "原代小胶质细胞 | iPSC 来源小胶质细胞 | HEK293T"
+        species: "人 | 小鼠"
+        assay: "phagocytosis assay | ELISA | Western blot"
+        key_finding: "发现描述 (中文)"
+        pmid: "PMID..."
+    scrna_seq_evidence:
+      - tissue: "前额叶皮层"
+        species: "人"
+        cell_type_specificity: "小胶质细胞 (cluster X)"
+        fold_change_vs_control: 3.2
+        dataset_accession: "GSE..."
+        pmid: "PMID..."
+
+  evidence_matrix:
+    mechanisms:
+      - mechanism: "机制 1: 描述 (中文)"
+        genetic_evidence_score: 3
+        genetic_evidence_source: "GWAS p=1e-12, ClinVar Pathogenic"
+        protein_evidence_score: 2
+        protein_evidence_source: "UniProt domain X, PDB 1ABC"
+        pathway_evidence_score: 3
+        pathway_evidence_source: "KEGG hsa04620 FDR=1e-5, Reactome R-HSA-168249"
+        pharmacology_evidence_score: 3
+        pharmacology_evidence_source: "ChEMBL IC50=0.5nM, DrugBank DBxxx Approved"
+        preclinical_evidence_score: 3
+        preclinical_evidence_source: "KO 小鼠认知改善 35%, PMID:xxx"
+        human_evidence_score: 2
+        human_evidence_source: "CSF Gal-3 ↑4× in AD vs HC, PMID:xxx"
+    overall_evidence_strength: "Strong | Moderate | Weak"
+    evidence_convergence: "多条独立证据线的收敛性评估 (中文)"
+
+  literature_support:
+    total_unique_pmids: 00
+    by_mechanism:
+      - mechanism: "机制名"
+        pmid_count: 00
+    by_evidence_type:
+      - type: "Preclinical model"
+        pmid_count: 00
+      - type: "Genetic association"
+        pmid_count: 00
+      - type: "Drug pharmacology"
+        pmid_count: 00
+    by_year: {"2020": 0, "2021": 0, "2022": 0, "2023": 0, "2024": 0, "2025": 0}
+    top_cited:
+      - pmid: "PMID..."
+        title: "论文标题"
+        citations: 000
+    key_references:
+      - pmid: "PMID..."
+        title: "论文标题"
+        why_key: "为什么这篇是关键 (中文)"
+
+  # ── v2.3: 非临床毒理学摘要 (IND 提交必需) ──
+  preclinical_toxicology:
+    general_toxicology:
+      - study_type: "4周重复给药毒性"
+        species: "食蟹猴"
+        doses: "10, 30, 100 mg/kg/周 IV"
+        key_findings: "无死亡/体重影响；脾脏边缘区 B 细胞轻度减少 (药理相关) @100；无 CNS 组织病理学异常"
+        noael: "100 mg/kg/周"
+      - study_type: "13周重复给药毒性 (GLP)"
+        species: "食蟹猴"
+        doses: "10, 50, 150 mg/kg/周 IV"
+        key_findings: "无 CNS AE 或组织病理学改变；无 Galectin-3 相关免疫抑制 (机会感染、血液学参数正常)；ADA 发生率 12% (低滴度)"
+        noael: "150 mg/kg/周"
+    cns_safety:
+      study: "FOB/Irwin 神经行为评估"
+      species: "食蟹猴"
+      doses: "30, 100, 150 mg/kg"
+      findings: "无神经行为异常；运动活动、协调性、感觉功能正常"
+      noael: "150 mg/kg"
+    tissue_cross_reactivity:
+      study: "组织交叉反应 (TCA)"
+      material: "人组织芯片 (36 组织)"
+      findings: "Galectin-3 表达组织染色符合预期 (巨噬细胞、上皮、内皮)；无意外脱靶结合"
+    cardiovascular_safety:
+      study: "心血管安全性 (遥测)"
+      species: "食蟹猴"
+      doses: "100, 150 mg/kg"
+      findings: "无 QTc 延长、无心率/血压影响、无 ECG 形态学异常"
+      noael: "150 mg/kg"
+    reproductive_toxicology:
+      study: "生殖发育毒性"
+      species: "兔"
+      doses: "10, 30, 100 mg/kg/周"
+      findings: "无致畸性；无胚胎-胎仔发育毒性；Fc 工程化消除了 FcRn 介导的胎盘转运"
+      noael: "100 mg/kg/周"
+    mrsd_calculation:
+      noael_source: "食蟹猴 13 周 GLP = 150 mg/kg/周"
+      hed: "150 × 0.32 (BSA 转换因子) = 48 mg/kg/周"
+      safety_factor: 10
+      mrsd: "48 / 10 = 4.8 mg/kg ≈ 5 mg/kg"
+      conservative_starting_dose: "额外 2× 安全因子 → 2.5 mg/kg IV 单次"
+      notes: "对于首创机制 (first-in-class) 可额外施加安全因子至起始剂量为 0.3–0.5 mg/kg"
+
+  target_risk_assessment:
+    target_novelty: "First-in-class | Best-in-class | Fast-follower | Me-too"
+    novelty_rationale: "分类理由 (中文)"
+    genetic_validation_strength: "Strong | Moderate | Weak | Absent"
+    genetic_validation_rationale: "评估理由 (中文)"
+    preclinical_evidence_strength: "Strong | Moderate | Weak"
+    preclinical_rationale: "评估理由 (中文)"
+    druggability_confidence: "High | Medium | Low"
+    druggability_rationale: "评估理由 (中文)"
+    safety_concerns:
+      - concern: "安全性关注"
+        category: "target-based | compound-class | indication-related"
+        evidence: "来自 OpenTargets / DrugBank / PubMed 的证据"
+        severity: "High | Medium | Low"
+        mitigatability: "可缓解 | 不可缓解"
+        mitigation_strategy: "缓解策略 (中文)"
+    development_risks:
+      - risk: "开发风险描述"
+        likelihood: "Low | Medium | High"
+        impact: "Low | Medium | High"
+        mitigation: "缓解措施"
+
+  provenance:
+    worker_version: "1.0"
+    execution_timestamp: "ISO 8601"
+    execution_duration_seconds: 00
+    knowledge_gates_passed: ["KG-G1", "KG-G2", "KG-G3", "KG-G4", "KG-G5", "KG-G6", "KG-G7"]
+    gaps_found: 0
+    unexpected_searches_triggered: 0
+    data_freshness:
+      uniprot_access_date: "YYYY-MM-DD"
+      string_access_date: "YYYY-MM-DD"
+      chembl_access_date: "YYYY-MM-DD"
+      opentargets_access_date: "YYYY-MM-DD"
+    confidence_assessment:
+      overall_confidence: "High | Medium | Low"
+      confidence_rationale: "基于证据覆盖度和一致性的评估 (中文)"
+      weak_areas: ["列出证据薄弱的领域"]
+      contradictory_findings: ["列出矛盾的发现"]

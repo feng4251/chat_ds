@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "pathology": {
+      "command": "python",
+      "args": ["pathology_mcp.py"],
+      "env": {
+        "PATHOLOGY_API_URL": "http://10.10.132.126:18018"
+      }
+    }
+  }
+}

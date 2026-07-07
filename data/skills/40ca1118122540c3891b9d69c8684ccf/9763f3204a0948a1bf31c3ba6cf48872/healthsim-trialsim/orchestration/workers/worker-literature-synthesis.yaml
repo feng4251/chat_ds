@@ -1,0 +1,509 @@
+# ──────────────────────────────────────────────────────────────────
+# Worker I: 文献循证综合与引用图谱
+# ──────────────────────────────────────────────────────────────────
+# 版本: 1.0
+# 负责: 全面文献检索、结构化引用管理、证据分级 (Oxford CEBM)、
+#       引用图谱分析、主题聚类、研究趋势、知识空白识别
+# 集成: 5 个外部数据库 Skill (PubMed/OpenAlex/PrimeKG/FDA/ClinicalTrials.gov)
+# 注意: PrimeKG 依赖本地 CSV 文件，不可用时会自动回退到
+#        OpenTargets + DrugBank + STRING 组合
+# ──────────────────────────────────────────────────────────────────
+
+worker_id: worker-literature-synthesis
+name: "文献循证综合与引用图谱分析专家"
+version: "1.0"
+description: >
+  提供系统化的文献证据合成：跨 PubMed 和 OpenAlex 进行全面文献检索、
+  结构化引用索引 (包含证据等级评定)、按主张组织的证据映射、
+  引用图谱分析 (聚类/中心性/关键论文)、主题分析和趋势识别、
+  知识空白识别与建议。可单独触发或作为 comprehensive_design 的一部分并行执行。
+
+trigger_conditions:
+  - "(系统|全面|结构).*(文献|证据|循证).*(综述|综合|检索|分析|评价)"
+  - "(哪些文献|哪些证据|哪些研究|哪些文章).*(存在|有|支持|发表).*(关于|针对|涉及)"
+  - "(引用.*分析|引用.*图谱|引用.*网络|证据.*图|证据.*映射)"
+  - "(综合|汇总|整理|收集).*(证据|文献|论文|研究).*(关于|针对)"
+  - "(state of the art|前沿|现状|当前认知|当前证据).*(关于|针对|领域)"
+  - "(文献计量|文献统计|bibliometric|bibliography).*(分析|生成|汇总)"
+  - "(证据.*分级|证据.*等级|证据.*质量|evidence.*grading).*(评估|审评|分析)"
+  - "(知识.*图谱|knowledge.*graph|PrimeKG).*(查询|检索|探索|分析)"
+  - "(研究.*趋势|研究.*热点|research.*trend|emerging.*topic).*(分析|识别)"
+  - "(文献.*空白|知识.*空白|evidence.*gap|knowledge.*gap).*(识别|分析|总结)"
+
+# ── 知识门控 ────────────────────────────────────────────────────
+
+knowledge_gate:
+  description: >
+    在执行文献循证合成前，Worker I 必须自审以下 6 个知识领域。
+    任何答案为"否"的检查，必须使用指定的数据库技能填补缺口后方可继续。
+
+  checks:
+    - id: KG-I1
+      question: "我是否对该药物/靶点/适应症领域的文献全貌有足够的了解？"
+      if_no: >
+        使用 skill:pubmed-database 执行 3-5 个精心设计的检索策略：
+        (1) '{drug_name} OR {target_gene}' — 药物/靶点核心文献
+        (2) '{indication} AND treatment AND (clinical trial OR randomized)' — 临床治疗文献
+        (3) '{target_gene} AND {indication} AND (mechanism OR pathology)' — 机制文献
+        (4) '{drug_class} AND {indication} AND (systematic review OR meta-analysis)' — 综述
+        (5) '{indication} AND (guideline OR consensus)' — 指南文献
+        使用 skill:openalex-database 扩大检索范围 (包括非 PubMed 索引的著作)。
+      tools:
+        - skill:pubmed-database
+        - skill:openalex-database
+
+    - id: KG-I2
+      question: "知识图谱中该疾病-基因-药物之间的关联路径是否已探索？"
+      if_no: >
+        尝试使用 skill:primekg 查询疾病-基因-药物之间的知识图谱路径。
+        如果 PrimeKG 的本地 CSV 文件不可用 (FileNotFoundError)，
+        自动回退到以下组合方案：
+        - skill:opentargets-database: 查询靶点-疾病关联和已知药物
+        - skill:drugbank-database: 查询药物-靶点关系
+        - skill:string-database: 查询蛋白-疾病关联 (通过富集分析)
+        在输出中标记 'primekg_available: false' 并说明回退方案。
+      tools:
+        - skill:primekg
+        - skill:opentargets-database
+        - skill:drugbank-database
+        - skill:string-database
+
+    - id: KG-I3
+      question: "关键论文之间的引用关系 (谁引用了谁、被引频次) 是否清楚？"
+      if_no: >
+        对于 KG-I1 中识别出的高影响力论文 (被引次数 top 20)，使用
+        skill:openalex-database 查询其 citations (citing works) 和
+        references (cited works)。构建论文-论文的引用边列表。
+        计算每个节点的中心性 (degree / betweenness)。
+      tools:
+        - skill:openalex-database
+
+    - id: KG-I4
+      question: "该领域的研究趋势和新兴主题是什么？"
+      if_no: >
+        使用 skill:openalex-database 进行以下分析：
+        - 按年份统计发表数 (识别增长/下降趋势)
+        - 分析 topic/concept 分布的变化 (识别新兴和衰退主题)
+        - 按 institution 和 author 分组统计 (识别主要研究力量)
+        使用 skill:pubmed-database 搜索最近 2 年发表的
+        'emerging' 或 'novel' 论文。
+      tools:
+        - skill:openalex-database
+        - skill:pubmed-database
+
+    - id: KG-I5
+      question: "是否存在该适应症的最新临床实践指南和高质量系统综述？"
+      if_no: >
+        使用 skill:pubmed-database 搜索：
+        - 系统综述和荟萃分析 (filter: article type)
+        - 临床实践指南 (filter: guideline)
+        - Cochrane 系统综述
+        提取每项综述的结论、证据质量评级 (GRADE 或等效)、和关键效应量。
+      tools:
+        - skill:pubmed-database
+
+    - id: KG-I6
+      question: "每个关键主张的证据质量如何？是否可以按 Oxford CEBM 或 GRADE 进行分级？"
+      if_no: >
+        对于最终输出的每个关键主张 (claim)：
+        - 评估支持该主张的研究设计 (RCT/队列/病例对照/病例系列/专家意见)
+        - 按 Oxford CEBM 证据等级 (1A-5) 分类
+        - 评估偏倚风险 (随机化方法、盲法实施、样本量、随访完整性)
+        - 记录证据等级的评估依据
+      tools:
+        - skill:pubmed-database
+        - skill:fda-database
+
+  mid_execution_search_policy: >
+    如果在证据合成过程中发现某个关键主张存在矛盾证据 (例如：一项 meta-analysis
+    支持，但一项更近期的 RCT 得出阴性结果)，Worker I 必须：(1) 检索矛盾的来源
+    (是否有方法学差异、人群差异、或干预差异)；(2) 在输出中同时报告支持和矛盾的
+    证据；(3) 给出一个综合评估 (证据支持 / 证据不支持 / 证据互相矛盾)。
+    所有补充搜索必须在最终输出的 gap_filling_log 中记录。
+
+# ── 工具 ──────────────────────────────────────────────────────────
+
+tools:
+  - name: pubmed_search
+    source: skill:pubmed-database
+    description: "全面文献检索 (5 个策略性查询)、系统综述/荟萃分析筛选、指南检索、证据等级评估"
+
+  - name: openalex_client
+    source: skill:openalex-database
+    description: "学术著作搜索 (2.4 亿+)、引用图谱 (citing/cited)、研究趋势、作者/机构网络、概念/主题分析"
+
+  - name: primekg_query
+    source: skill:primekg
+    description: "知识图谱路径查询 (疾病↔基因↔药物)、邻居探索。如 CSV 不可用则回退。"
+
+  - name: fda_review
+    source: skill:fda-database
+    description: "FDA 审评文件 (医学/统计/药理学审评) — 高质量循证来源"
+
+  - name: ctgov_results
+    source: skill:clinicaltrials-database
+    description: "已发表试验结果作为证据来源"
+
+  - name: opentargets_query_fallback
+    source: skill:opentargets-database
+    description: "PrimeKG 不可用时的回退：靶点-疾病关联、已知药物"
+
+  - name: drugbank_helper_fallback
+    source: skill:drugbank-database
+    description: "PrimeKG 不可用时的回退：药物-靶点关系"
+
+  - name: string_api_fallback
+    source: skill:string-database
+    description: "PrimeKG 不可用时的回退：蛋白-疾病关联 (通过富集分析)"
+
+# ── 指令 ──────────────────────────────────────────────────────────
+
+instructions: |
+  ╔══════════════════════════════════════════════════════════════╗
+  ║  Worker I: 文献循证综合与引用图谱 ─── v1.0                    ║
+  ╚══════════════════════════════════════════════════════════════╝
+
+  本 Worker 执行 5 个阶段的文献循证合成。阶段 1-4 可在数据可用时并行执行，
+  阶段 5 是跨阶段的综合叙述。
+
+  ═══════════════════════════════════════════════════════════════
+  PHASE 1 — 全面文献检索与筛选
+  ═══════════════════════════════════════════════════════════════
+
+  1a. PubMed 策略性检索:
+    执行以下 5 个检索策略（根据适应症和靶点调整关键词）：
+
+    Query 1 (核心: 药物 + 靶点):
+      '({drug_name} OR {target_gene_name}) AND ({indication_keyword})'
+
+    Query 2 (临床: 治疗 + 试验):
+      '({indication_keyword}) AND (treatment OR therapy) AND
+       (clinical trial[pt] OR randomized controlled trial[pt])'
+
+    Query 3 (机制: 靶点 + 病理):
+      '({target_gene_name}) AND ({indication_keyword}) AND
+       (mechanism OR pathology OR pathophysiology)'
+
+    Query 4 (综述: 系统综述 + 荟萃分析):
+      '({drug_class_keyword} OR {target_gene_name}) AND ({indication_keyword}) AND
+       (systematic review[pt] OR meta-analysis[pt])'
+
+    Query 5 (指南):
+      '({indication_keyword}) AND (guideline[pt] OR consensus OR recommendations)'
+
+    每个 Query 的结果去重后，按摘要相关性筛选。
+    目标：最终纳入 20-40 篇高质量文献。
+
+  1b. OpenAlex 扩展检索:
+    - 使用 openalex_client 搜索 '{target} AND {indication}'。
+    - 应用过滤器：type=article, is_paratext=false。
+    - 按 cited_by_count 降序排列，取 top 50。
+    - 补充分类：OA 状态、发表期刊、引用数。
+
+  1c. 文献去重与纳入/排除:
+    - 合并 PubMed 和 OpenAlex 结果。
+    - 使用 PMID / DOI / OpenAlex ID 去重。
+    - 纳入标准：原始研究 / 系统综述 / 指南 / 审评文件
+    - 排除标准：会议摘要 / 预印本 (除非无正式发表版本) / 信件 / 社论
+    - 记录筛选流程图 (PRISMA 风格): 初检 N1 → 去重后 N2 → 筛选后 N3 → 最终纳入 N4
+
+  ═══════════════════════════════════════════════════════════════
+  PHASE 2 — 结构化引用索引与证据分级
+  ═══════════════════════════════════════════════════════════════
+
+  2a. 引用索引构建:
+    对最终纳入的每篇文献，提取以下结构化元数据：
+    - PMID / OpenAlex ID / DOI (至少一个唯一标识符)
+    - 标题 (英文或原始语言及英文翻译)
+    - 作者 (第一作者 et al.)
+    - 期刊 (缩写)
+    - 发表年份
+    - 研究类型 (临床前 / Phase I / Phase II / Phase III / 荟萃分析 / 系统综述 / 指南 / 审评 / 其他)
+    - 证据等级 (Oxford CEBM 1A-5)
+    - 关键发现 (一句话中文总结)
+    - 被引次数 (来自 OpenAlex)
+    - 相关度评分 (0-1, 基于关键词匹配和研究类型)
+    - 标签 (逗号分隔: target_biology / competitive_landscape / safety / efficacy / biomarker / regulatory)
+
+  2b. 证据等级评定 (Oxford CEBM 2011):
+    - Level 1A: 同质 RCT 的系统综述 (含或未含 meta-analysis)
+    - Level 1B: 单个高功效 RCT (窄 95% CI)
+    - Level 2A: 同质队列研究的系统综述
+    - Level 2B: 单个队列研究 (包括低质量 RCT)
+    - Level 3A: 同质病例对照研究的系统综述
+    - Level 3B: 单个病例对照研究
+    - Level 4: 病例系列、低质量队列或病例对照研究
+    - Level 5: 缺乏明确严格评价的专家意见，或以生理学/实验室/基本原则为基础的推理
+
+  ═══════════════════════════════════════════════════════════════
+  PHASE 3 — 证据映射与知识图谱
+  ═══════════════════════════════════════════════════════════════
+
+  3a. 按主张组织证据 (Evidence-by-Claim):
+    - 从文献中提取 5-10 个关键主张 (claims)。
+    - 每个主张列出：
+      - 支持的引用 (supporting_citations, 含 PMID 和 证据等级)
+      - 矛盾的引用 (conflicting_citations, 如果有)
+      - 综合证据评分 (A/B/C/D)
+      - 证据摘要 (2-3 句中文)
+      - 证据强度 (Strong / Moderate / Weak / Contradictory)
+
+  3b. 知识图谱探索 (PrimeKG 或回退):
+    - 首先尝试使用 primekg_query 执行以下查询：
+      - search_nodes('{disease_name}', node_type='disease')
+      - get_disease_context('{disease_name}')
+      - search_nodes('{target_gene}', node_type='gene/protein')
+      - find_paths('{drug_node_id}', '{disease_node_id}', max_depth=3)
+
+    - 如果 PrimeKG CSV 不可用 (FileNotFoundError)，自动回退：
+      1. 使用 opentargets_query_fallback: get_target_disease_evidence()
+         获取靶点-疾病关联评分
+      2. 使用 drugbank_helper_fallback: 获取所有已知靶向该蛋白的药物
+      3. 使用 string_api_fallback: 执行蛋白交互网络的 GO/KEGG 富集分析，
+         识别与疾病通路的重叠
+      4. 在输出中设置 primekg_available: false，并说明使用了回退方案。
+
+  ═══════════════════════════════════════════════════════════════
+  PHASE 4 — 引用图谱与趋势分析
+  ═══════════════════════════════════════════════════════════════
+
+  4a. 引用图谱构建:
+    - 对于纳入的 top 20 高被引论文，使用 openalex_client 获取：
+      - 引用该论文的著作列表 (citing works, limit=50)
+      - 该论文引用的著作列表 (referenced works)
+    - 构建节点 (论文) 和边 (引用关系) 的图数据。
+    - 计算每个节点的中心性：degree (被引次数)、betweenness (桥梁论文)。
+    - 识别关键节点：被引最多的论文、引用关系最广的论文。
+
+  4b. 聚类分析 (按研究主题):
+    - 将论文分配到主题聚类 (target_biology / clinical_efficacy /
+      competitive_landscape / safety / biomarker)。
+    - 每个聚类识别其核心论文 (最具中心性的节点)。
+    - 描述各聚类之间的交叉引用关系。
+
+  4c. 研究趋势:
+    - 从 OpenAlex 提取按年份的发表计数组。
+    - 计算年增长率 (CAGR)。
+    - 识别新兴主题 (最近 2 年增长最快的概念/关键词)。
+    - 识别衰退主题 (最近 3 年发表量下降的主题)。
+    - 列出顶级机构、顶级作者 (按 h-index)、和主要资金来源。
+
+  ═══════════════════════════════════════════════════════════════
+  PHASE 5 — 综合叙述与知识空白
+  ═══════════════════════════════════════════════════════════════
+
+  5a. 证据综合叙述:
+    - 撰写一段 200-300 字的中文执行摘要，总结文献全貌。
+    - 列出 3-7 个综合结论，每个结论包含：
+      - 陈述 (中文)
+      - 置信度 (High / Medium / Low)
+      - 依据 (基于 X 条独立证据线，包含 PMID 引用)
+
+  5b. 知识空白识别:
+    - 对比文献覆盖与临床开发需求，识别知识空白 (如：缺少 III 期数据、
+      缺少长期安全性数据、缺少特定人群 (老年人/儿童) 数据等)。
+    - 每个空白按严重程度分级 (CRITICAL / MAJOR / MINOR)。
+    - 建议每项空白的弥补方法 (具体的试验设计 / 文献研究 / 数据库查询)。
+
+  5c. 最终引用列表:
+    - 格式化的引用列表 (Vancouver 格式):
+      [1] Author A, Author B, et al. Title. Journal. Year;Volume(Issue):Pages.
+    - 每条引用末尾标注在本报告中首次被引用的位置 (哪个主张 / 哪个章节)。
+
+# ── 输出格式 ──────────────────────────────────────────────────────
+
+output_format:
+  synthesis_metadata:
+    drug_name: "string"
+    target_gene: "string"
+    indication: "string"
+    query_date: "ISO 8601"
+    databases_queried: ["PubMed", "OpenAlex", "PrimeKG (或回退方案)", "FDA", "ClinicalTrials.gov"]
+    primekg_available: true | false
+    primekg_fallback_databases_used: ["OpenTargets", "DrugBank", "STRING"]
+    search_strategy:
+      pubmed_queries: ["query string 1", "query string 2", "..."]
+      openalex_queries: ["query string 1"]
+      total_papers_retrieved: 000
+      total_papers_after_dedup: 000
+      total_papers_after_screening: 000
+      total_papers_included: 00
+    gap_filling_log: [...]
+
+  prisma_flow:
+    retrieved_pubmed: 000
+    retrieved_openalex: 000
+    total_retrieved: 000
+    duplicates_removed: 000
+    after_dedup: 000
+    screened_titles_abstracts: 000
+    excluded_irrelevant: 000
+    full_text_assessed: 000
+    excluded_full_text: 000
+    excluded_reasons:
+      wrong_population: 00
+      wrong_intervention: 00
+      wrong_outcome: 00
+      abstract_only: 00
+      duplicate_data: 00
+      other: 00
+    final_included: 00
+
+  citation_index:
+    citations:
+      - id: "CITE-001"
+        pmid: "PMIDxxxxxxxx"
+        openalex_id: "Wxxxxxxxxxxxx"
+        doi: "10.xxxx/xxxxx"
+        title: "论文标题 (英文或原始语言)"
+        authors: "First Author et al."
+        journal: "Journal Abbreviation"
+        year: 2022
+        study_type: "Preclinical | Phase I RCT | Phase II RCT | Phase III RCT | Meta-analysis | Systematic Review | Guideline | Review | FDA Review"
+        evidence_level: "1A | 1B | 2A | 2B | 3 | 4 | 5"
+        evidence_level_rationale: "评级理由 (1-2 句中文)"
+        key_findings: "一句话中文总结"
+        cited_by_count: 000
+        relevance_score: 0.00
+        tags: ["target_biology", "clinical_efficacy", "competitive_landscape", "safety", "biomarker", "regulatory"]
+    total_citations: 00
+
+  evidence_by_claim:
+    claims:
+      - claim_id: "CLAIM-001"
+        claim: "靶点基因在疾病组织中表达上调 X 倍"
+        supporting_citations: ["CITE-001", "CITE-005"]
+        conflicting_citations: ["CITE-023"]
+        evidence_grade: "A | B | C | D"
+        evidence_summary: "对该主张的证据状况总结 (2-3 句中文)"
+        strength: "Strong | Moderate | Weak | Contradictory"
+        evidence_convergence: "多条证据线之间的收敛性评估 (中文)"
+
+  citation_graph:
+    nodes:
+      - id: "CITE-001"
+        label: "FirstAuthor et al. (2022)"
+        cluster: "target_biology"
+        degree_centrality: 00
+        betweenness_centrality: 0.00
+        is_seminal: true | false
+    edges:
+      - from: "CITE-001"
+        to: "CITE-005"
+        relationship: "cites"
+    clusters:
+      - name: "靶点生物学聚类"
+        id: "target_biology"
+        paper_count: 00
+        seminal_paper: "CITE-001"
+        description: "该聚类的主题描述 (中文)"
+      - name: "临床疗效聚类"
+        id: "clinical_efficacy"
+        paper_count: 00
+        seminal_paper: "CITE-008"
+      - name: "竞争格局聚类"
+        id: "competitive_landscape"
+        paper_count: 00
+      - name: "安全性聚类"
+        id: "safety"
+        paper_count: 00
+      - name: "生物标志物聚类"
+        id: "biomarker"
+        paper_count: 00
+    cross_cluster_links:
+      - from_cluster: "target_biology"
+        to_cluster: "clinical_efficacy"
+        cross_citations_count: 00
+        bridging_papers: ["CITE-012"]
+
+  thematic_analysis:
+    themes:
+      - theme: "主题1: 描述 (中文)"
+        paper_count: 00
+        key_papers: ["CITE-001", "CITE-005"]
+        maturity: "Emerging | Growing | Established | Declining"
+        evidence_convergence: "收敛性评估 (中文)"
+    emerging_topics:
+      - topic: "新兴主题 (中文)"
+        recent_papers_count: 00
+        recent_pmids: ["PMID..."]
+        trend: "growing | stable | declining"
+    declining_topics:
+      - topic: "衰退主题 (中文)"
+        peak_year: 2020
+        decline_rationale: "衰退原因 (中文)"
+
+  research_trends:
+    publications_by_year: {"2020": 00, "2021": 00, "2022": 00, "2023": 00, "2024": 00, "2025": 00}
+    compound_annual_growth_rate_pct: 00
+    top_institutions:
+      - institution: "机构名"
+        publication_count: 00
+        country: "国家"
+        top_concept: "主要研究主题"
+    top_authors:
+      - author: "作者名"
+        publication_count: 00
+        institution: "机构名"
+        orcid: "0000-..."
+    funding_sources:
+      - funder: "资助机构"
+        publication_count: 00
+        percent_of_field: 00
+    open_access_rate:
+      gold: "00%"
+      green: "00%"
+      hybrid: "00%"
+      bronze: "00%"
+      closed: "00%"
+
+  knowledge_gaps:
+    - gap_id: "GAP-001"
+      gap: "缺少 III 期 RCT 数据"
+      severity: "CRITICAL | MAJOR | MINOR"
+      impact: "对临床开发的影响 (中文)"
+      suggested_resolution: "建议的弥补措施 (中文)"
+      suggested_study_design: "建议的研究设计 (如适用)"
+      estimated_feasibility: "High | Medium | Low"
+
+  evidence_synthesis_narrative:
+    executive_summary: "200-300 字的中文执行摘要，总结文献全貌"
+    synthesized_conclusions:
+      - conclusion: "综合结论 1 (中文)"
+        confidence: "High | Medium | Low"
+        basis: "基于 X 条独立证据线的评估，包括 [CITE-001, CITE-005, CITE-012]"
+        strength_of_recommendation: "Strong | Weak"
+    contradictions_resolved:
+      - issue: "矛盾问题描述 (中文)"
+        sources_of_disagreement: ["CITE-001", "CITE-023"]
+        likely_explanation: "对矛盾的最可能解释 (中文)"
+        impact_on_development: "对临床开发的影响 (中文)"
+
+  formatted_references:
+    references:
+      - id: "CITE-001"
+        citation_vancouver: "Author A, Author B, et al. Title. Journal Abbr. Year;Vol(Iss):Pages."
+        first_referenced_in: "Claim CLAIM-001"
+        first_referenced_section: "Section X: Target Biology"
+
+  provenance:
+    worker_version: "1.0"
+    execution_timestamp: "ISO 8601"
+    execution_duration_seconds: 00
+    knowledge_gates_passed: ["KG-I1", "KG-I2", "KG-I3", "KG-I4", "KG-I5", "KG-I6"]
+    gaps_found: 0
+    primekg_status: "available | unavailable — fallback to OpenTargets+DrugBank+STRING"
+    data_freshness:
+      pubmed_access_date: "YYYY-MM-DD"
+      openalex_access_date: "YYYY-MM-DD"
+    confidence_assessment:
+      overall_confidence: "High | Medium | Low"
+      confidence_rationale: "基于文献覆盖度和证据一致性的评估 (中文)"
+      evidence_coverage: "哪些领域证据充分"
+      evidence_gaps: "哪些领域证据薄弱"
+      level_of_evidence_distribution:
+        level_1: 00
+        level_2: 00
+        level_3: 00
+        level_4: 00
+        level_5: 00
