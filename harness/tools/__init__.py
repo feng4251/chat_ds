@@ -57,6 +57,8 @@ register(
         },
     },
     web_search,
+    is_read_only=True,
+    parallel_safe=True,
 )
 
 register(
@@ -80,6 +82,8 @@ register(
         },
     },
     web_extract,
+    is_read_only=True,
+    parallel_safe=True,
 )
 
 # ── Phase 2: New tools ───────────────────────────────────────────────────────
@@ -88,6 +92,8 @@ register(
     "execute_code",
     EXECUTE_CODE_SCHEMA,
     execute_code,
+    is_read_only=True,
+    parallel_safe=False,
     emoji="🐍",
 )
 
@@ -95,6 +101,9 @@ register(
     "read_file",
     READ_FILE_SCHEMA,
     read_file,
+    is_read_only=True,
+    parallel_safe=True,
+    path_scoped=True,
     emoji="📖",
 )
 
@@ -102,6 +111,10 @@ register(
     "write_file",
     WRITE_FILE_SCHEMA,
     write_file,
+    is_read_only=False,
+    is_destructive=True,
+    parallel_safe=False,
+    path_scoped=True,
     emoji="📝",
 )
 
@@ -109,6 +122,10 @@ register(
     "patch_file",
     PATCH_FILE_SCHEMA,
     patch_file,
+    is_read_only=False,
+    is_destructive=True,
+    parallel_safe=False,
+    path_scoped=True,
     emoji="🩹",
 )
 
@@ -116,6 +133,9 @@ register(
     "search_files",
     SEARCH_FILES_SCHEMA,
     search_files,
+    is_read_only=True,
+    parallel_safe=True,
+    path_scoped=True,
     emoji="🔍",
 )
 
@@ -146,6 +166,8 @@ register(
     "skills_list",
     SKILLS_LIST_SCHEMA,
     skills_list,
+    is_read_only=True,
+    parallel_safe=True,
     emoji="📚",
 )
 
@@ -153,6 +175,9 @@ register(
     "skill_view",
     SKILL_VIEW_SCHEMA,
     skill_view,
+    is_read_only=True,
+    parallel_safe=True,
+    path_scoped=True,
     emoji="📖",
 )
 
@@ -160,6 +185,10 @@ register(
     "skill_manage",
     SKILL_MANAGE_SCHEMA,
     skill_manage,
+    is_read_only=False,
+    is_destructive=True,
+    parallel_safe=False,
+    path_scoped=True,
     emoji="🛠️",
 )
 
@@ -229,6 +258,8 @@ register(
     "mcp_server_list",
     MCP_SERVER_LIST_SCHEMA,
     mcp_server_list,
+    is_read_only=True,
+    parallel_safe=True,
     emoji="📋",
 )
 
@@ -236,6 +267,8 @@ register(
     "mcp_server_status",
     MCP_SERVER_STATUS_SCHEMA,
     mcp_server_status,
+    is_read_only=True,
+    parallel_safe=True,
     emoji="📡",
 )
 
@@ -245,6 +278,8 @@ register(
     "session_search",
     SESSION_SEARCH_SCHEMA,
     session_search,
+    is_read_only=True,
+    parallel_safe=True,
     emoji="🔎",
 )
 

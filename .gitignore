@@ -18,6 +18,7 @@ frontend/dist/
 *.db-wal
 data/memories/
 data/mcp/
+data/skills/harnessprobe/
 
 *.key
 *.pem

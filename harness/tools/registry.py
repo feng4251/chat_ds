@@ -24,7 +24,8 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "is_async", "description", "emoji",
         "accepts_context", "accepts_user_id", "accepts_session_id",
-        "accepts_enabled_user_skills",
+        "accepts_enabled_user_skills", "is_read_only", "is_destructive",
+        "parallel_safe", "path_scoped",
     )
 
     def __init__(
@@ -37,6 +38,10 @@ class ToolEntry:
         is_async: bool = True,
         description: str = "",
         emoji: str = "",
+        is_read_only: bool = False,
+        is_destructive: bool = False,
+        parallel_safe: bool = False,
+        path_scoped: bool = False,
     ):
         self.name = name
         self.toolset = toolset
@@ -54,6 +59,10 @@ class ToolEntry:
         self.accepts_user_id = "user_id" in params
         self.accepts_session_id = "session_id" in params
         self.accepts_enabled_user_skills = "enabled_user_skills" in params
+        self.is_read_only = is_read_only
+        self.is_destructive = is_destructive
+        self.parallel_safe = parallel_safe
+        self.path_scoped = path_scoped
 
 
 # ── ToolRegistry ───────────────────────────────────────────────────────────
@@ -76,6 +85,10 @@ class ToolRegistry:
         is_async: bool = True,
         description: str = "",
         emoji: str = "",
+        is_read_only: bool = False,
+        is_destructive: bool = False,
+        parallel_safe: bool = False,
+        path_scoped: bool = False,
     ):
         """Register a tool. Called at module-import time by each tool file."""
         existing = self._tools.get(name)
@@ -93,6 +106,10 @@ class ToolRegistry:
             is_async=is_async,
             description=description,
             emoji=emoji,
+            is_read_only=is_read_only,
+            is_destructive=is_destructive,
+            parallel_safe=parallel_safe,
+            path_scoped=path_scoped,
         )
 
     def deregister(self, name: str) -> None:
@@ -134,6 +151,19 @@ class ToolRegistry:
         """Return a tool's raw schema dict (no check_fn filtering)."""
         entry = self._tools.get(name)
         return entry.schema if entry else None
+
+    def get_metadata(self, name: str) -> Optional[dict]:
+        """Return harness-only execution metadata for a tool."""
+        entry = self._tools.get(name)
+        if not entry:
+            return None
+        return {
+            "read_only": entry.is_read_only,
+            "destructive": entry.is_destructive,
+            "parallel_safe": entry.parallel_safe,
+            "path_scoped": entry.path_scoped,
+            "toolset": entry.toolset,
+        }
 
     def get_emoji(self, name: str, default: str = "⚡") -> str:
         """Return the emoji for a tool, or *default* if unset."""
@@ -222,6 +252,19 @@ class ToolRegistry:
             return value is None
         return True
 
+    @staticmethod
+    def _strip_context_owned_args(entry: ToolEntry, args: Any) -> Any:
+        if not isinstance(args, dict):
+            return args
+        stripped = dict(args)
+        if entry.accepts_user_id:
+            stripped.pop("user_id", None)
+        if entry.accepts_session_id:
+            stripped.pop("session_id", None)
+        if entry.accepts_enabled_user_skills:
+            stripped.pop("enabled_user_skills", None)
+        return stripped
+
     # ── Dispatch ──────────────────────────────────────────────────────
 
     async def dispatch(
@@ -235,6 +278,8 @@ class ToolRegistry:
         if not entry:
             return tool_error(f"Unknown tool: {name}")
         try:
+            if context is not None:
+                args = self._strip_context_owned_args(entry, args)
             schema_error = self._validate_args(entry, args)
             if schema_error:
                 logger.info("Tool %s schema validation failed: %s", name, schema_error)
@@ -242,14 +287,14 @@ class ToolRegistry:
 
             call_args = dict(args)
             if context is not None:
-                if entry.accepts_context:
-                    call_args["context"] = context
                 if entry.accepts_user_id:
                     call_args["user_id"] = context.user_id
                 if entry.accepts_session_id:
                     call_args["session_id"] = context.session_id
                 if entry.accepts_enabled_user_skills:
                     call_args["enabled_user_skills"] = list(context.enabled_user_skills)
+                if entry.accepts_context:
+                    call_args["context"] = context
             if entry.is_async:
                 result = await entry.handler(**call_args)
             else:
@@ -281,6 +326,10 @@ def register(
     is_async: bool = True,
     description: str = "",
     emoji: str = "",
+    is_read_only: bool = False,
+    is_destructive: bool = False,
+    parallel_safe: bool = False,
+    path_scoped: bool = False,
 ):
     """Register a tool with the default registry."""
     registry.register(
@@ -292,12 +341,21 @@ def register(
         is_async=is_async,
         description=description,
         emoji=emoji,
+        is_read_only=is_read_only,
+        is_destructive=is_destructive,
+        parallel_safe=parallel_safe,
+        path_scoped=path_scoped,
     )
 
 
 def get_schemas(names: list[str]) -> list[dict]:
     """Return OpenAI-formatted tool definitions for the requested tool names."""
     return registry.get_definitions(names)
+
+
+def get_metadata(name: str) -> Optional[dict]:
+    """Return harness-only execution metadata for a registered tool."""
+    return registry.get_metadata(name)
 
 
 async def dispatch(

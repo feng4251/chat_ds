@@ -254,6 +254,8 @@ class SkillsManager:
 
         # If a linked file is requested, serve that instead
         if file_path:
+            if file_path == "__manifest__":
+                return self._load_resource_manifest(skill_md, skill_dir, name, session_id)
             return self._load_linked_file(skill_dir, file_path, name)
 
         result = load_skill_content(
@@ -280,11 +282,46 @@ class SkillsManager:
         result["skill_dir"] = str(skill_dir)
         if result.get("linked_files"):
             result["usage_hint"] = (
-                "To view linked files, call skill_view(name, file_path) "
-                "where file_path is e.g. 'references/api.md' or 'templates/config.yaml'"
+                "To inspect workflow resources, call skill_view(name, file_path='__manifest__') "
+                "for a compact resource graph, then call skill_view(name, file_path=...) "
+                "for relevant files such as orchestrators, workers, references, templates, or scripts."
             )
 
         return result
+
+    def _load_resource_manifest(
+        self,
+        skill_md: Path,
+        skill_dir: Path,
+        skill_name: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        result = load_skill_content(
+            skill_md,
+            skill_dir=str(skill_dir),
+            session_id=session_id,
+        )
+        if "error" in result:
+            return {"success": False, **result}
+        return {
+            "success": True,
+            "name": skill_name,
+            "file": "__manifest__",
+            "skill_dir": str(skill_dir),
+            "linked_files": result.get("linked_files") or {},
+            "resource_graph": result.get("resource_graph") or {},
+            "next_steps": [
+                "For complex deliverables, first open one or more orchestration/workflow/worker paths from resource_graph.suggested_files.",
+                "Then open task-relevant reference, format, script, example, or domain files from resource_graph.suggested_files.",
+                "Use skill_view(name, file_path=...) for all skill resources; workspace file tools cannot read skill files.",
+            ],
+            "hint": (
+                "For complex deliverables, inspect resource_graph.suggested_files with "
+                "skill_view(name, file_path=...) before drafting. When present, start with "
+                "orchestration/workflow files, then inspect task-relevant references, templates, "
+                "formats, scripts, examples, or domain resources from this manifest."
+            ),
+        }
 
     def _load_linked_file(
         self,
@@ -314,22 +351,11 @@ class SkillsManager:
             }
 
         if not target.exists():
-            # List available files
-            available = {}
-            for sub in ["references", "templates", "assets", "scripts"]:
-                subdir = skill_dir / sub
-                if subdir.is_dir():
-                    files = [
-                        str(f.relative_to(skill_dir))
-                        for f in subdir.rglob("*") if f.is_file()
-                    ]
-                    if files:
-                        available[sub] = sorted(files)
             return {
                 "success": False,
                 "error": f"File '{file_path}' not found in skill '{skill_name}'.",
-                "available_files": available,
-                "hint": "Use one of the available file paths listed above",
+                "available_files": self._available_resource_files(skill_dir),
+                "hint": "Use one of the available file paths listed above or call skill_view(name, file_path='__manifest__')",
             }
 
         try:
@@ -350,6 +376,27 @@ class SkillsManager:
             "content": content,
             "file_type": target.suffix,
         }
+
+    def _available_resource_files(self, skill_dir: Path) -> dict[str, list[str]]:
+        available: dict[str, list[str]] = {}
+        for subdir in sorted(p for p in skill_dir.iterdir() if p.is_dir()):
+            if subdir.name.startswith(".") or subdir.name in {"__pycache__", "node_modules"}:
+                continue
+            files = [
+                str(f.relative_to(skill_dir))
+                for f in subdir.rglob("*")
+                if f.is_file()
+            ]
+            if files:
+                available[subdir.name] = sorted(files)[:100]
+        root_files = [
+            str(f.relative_to(skill_dir))
+            for f in skill_dir.iterdir()
+            if f.is_file() and f.name != "SKILL.md"
+        ]
+        if root_files:
+            available["root_files"] = sorted(root_files)
+        return available
 
 
 # Module-level singleton

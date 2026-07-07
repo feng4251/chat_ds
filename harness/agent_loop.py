@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Optional
 
 import httpx
@@ -32,6 +33,107 @@ MAX_RETRIES = 3
 DEFAULT_MAX_TOKENS = 8192
 
 
+@dataclass
+class HarnessRunState:
+    tool_call_count: int = 0
+    tool_error_count: int = 0
+    parse_failure_count: int = 0
+    schema_failure_count: int = 0
+    successful_write_sizes: list[int] = field(default_factory=list)
+    viewed_skill_names: set[str] = field(default_factory=set)
+    viewed_skill_files: dict[str, set[str]] = field(default_factory=dict)
+    viewed_skill_categories: dict[str, set[str]] = field(default_factory=dict)
+    skill_available_categories: dict[str, set[str]] = field(default_factory=dict)
+    skill_suggested_files: dict[str, list[str]] = field(default_factory=dict)
+    session_skill_names: set[str] = field(default_factory=set)
+    continuation_reasons: list[str] = field(default_factory=list)
+
+    def record_skill_view(
+        self,
+        args: dict[str, Any],
+        result_data: dict[str, Any] | None = None,
+    ) -> None:
+        name = args.get("name")
+        if not name:
+            return
+        skill_name = str(name)
+        self.viewed_skill_names.add(skill_name)
+        file_path = args.get("file_path")
+        if isinstance(file_path, str) and file_path:
+            self.viewed_skill_files.setdefault(skill_name, set()).add(file_path)
+            category = file_path.split("/", 1)[0]
+            self.viewed_skill_categories.setdefault(skill_name, set()).add(category)
+        if isinstance(result_data, dict):
+            linked = result_data.get("linked_files")
+            if isinstance(linked, dict):
+                self.skill_available_categories.setdefault(skill_name, set()).update(
+                    str(category) for category in linked.keys()
+                )
+            graph = result_data.get("resource_graph")
+            if isinstance(graph, dict):
+                categories = graph.get("categories")
+                if isinstance(categories, dict):
+                    self.skill_available_categories.setdefault(skill_name, set()).update(
+                        str(category) for category in categories.keys()
+                    )
+                suggested = graph.get("suggested_files")
+                if isinstance(suggested, list):
+                    clean_suggested = [str(path) for path in suggested if isinstance(path, str)]
+                    if clean_suggested:
+                        self.skill_suggested_files[skill_name] = clean_suggested
+
+    def unviewed_session_skills(self) -> set[str]:
+        return self.session_skill_names - self.viewed_skill_names
+
+    def needs_more_skill_workflow(self) -> tuple[bool, str]:
+        for skill_name in sorted(self.viewed_skill_names & self.session_skill_names):
+            available_categories = self.skill_available_categories.get(skill_name, set())
+            if not available_categories:
+                continue
+            files = self.viewed_skill_files.get(skill_name, set())
+            categories = self.viewed_skill_categories.get(skill_name, set())
+            if "__manifest__" not in files:
+                return True, f"load the resource manifest for session skill '{skill_name}'"
+
+            primary_workflow_categories = {"orchestration", "workers", "workflows"}
+            if available_categories & primary_workflow_categories:
+                viewed_primary = categories & primary_workflow_categories
+                viewed_worker_file = any("/workers/" in path for path in files)
+                if not viewed_primary and not viewed_worker_file:
+                    return True, f"inspect orchestrator or worker resources for session skill '{skill_name}'"
+
+            supporting_categories = {
+                "references", "scripts", "templates", "formats", "protocols", "evaluation", "examples",
+            }
+            available_supporting = available_categories & supporting_categories
+            if available_supporting and not (categories & available_supporting):
+                return True, f"inspect supporting resources for session skill '{skill_name}'"
+        return False, ""
+
+
+def _suggested_workflow_paths_for_reason(
+    run_state: HarnessRunState,
+    reason: str,
+) -> list[str]:
+    requested_primary = "orchestrator" in reason or "worker" in reason
+    requested_supporting = "supporting" in reason
+    paths: list[str] = []
+    for skill_name in sorted(run_state.viewed_skill_names & run_state.session_skill_names):
+        for path in run_state.skill_suggested_files.get(skill_name, []):
+            if requested_primary:
+                if path.startswith(("orchestration/", "workers/", "workflows/")) or "/workers/" in path:
+                    paths.append(path)
+            elif requested_supporting:
+                if path.startswith((
+                    "references/", "scripts/", "templates/", "formats/", "protocols/",
+                    "evaluation/", "examples/",
+                )):
+                    paths.append(path)
+            else:
+                paths.append(path)
+    return paths
+
+
 async def run_stream(
     model_id: str,
     messages: list[dict],
@@ -40,6 +142,7 @@ async def run_stream(
     session_id: str = "default",
     timeout: float = 600.0,
     max_iterations: int = 20,
+    max_tokens: int | None = None,
     provider_override: dict[str, Any] | None = None,
     fallback_overrides: list[dict[str, Any]] | None = None,
     source: str = "chat",
@@ -105,17 +208,43 @@ async def run_stream(
     run_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     goal_continuations = 0
     goal_parse_failures = 0
-    tool_call_count = 0
-    tool_error_count = 0
-    successful_write_sizes: list[int] = []
+    run_state = HarnessRunState()
     artifact_enforcement_continuations = 0
-    viewed_skill_names: set[str] = set()
     skill_enforcement_continuations = 0
-    session_skill_names: set[str] = set()
+    skill_workflow_continuations = 0
+    max_skill_workflow_continuations = 4
+
+    def queue_skill_workflow_continuation(reason: str) -> None:
+        run_state.continuation_reasons.append(reason)
+        requires_manifest = "manifest" in reason
+        suggested_paths = [] if requires_manifest else _suggested_workflow_paths_for_reason(run_state, reason)
+        suggested_line = (
+            "\nSuggested skill resource paths to inspect now: " + ", ".join(suggested_paths[:12])
+            if suggested_paths else ""
+        )
+        next_action = (
+            "Your next tool call MUST be skill_view(name, file_path='__manifest__') for the relevant session skill. "
+            if requires_manifest else
+            "Your next tool call MUST choose at least one path from the suggested skill resource paths below "
+            "and call skill_view(name, file_path=that_path). "
+        )
+        conversation.append({
+            "role": "user",
+            "content": (
+                "The task uses a session-level skill for a complex deliverable, but the skill workflow "
+                f"is not sufficiently inspected yet: {reason}. "
+                "Before doing web search, code execution, workspace file reads, or final writing, call "
+                "skill_view for the missing skill resources. "
+                f"{next_action}"
+                "Use skill_view for skill resources; read_file/search_files are only for workspace files."
+                f"{suggested_line}\n"
+                "After reading those skill resources, continue the task."
+            ),
+        })
     if "skill_view" in tools:
         try:
             from skills.scanner import find_all_skills
-            session_skill_names = {
+            run_state.session_skill_names = {
                 str(skill.get("name"))
                 for skill in find_all_skills(
                     user_id,
@@ -274,7 +403,7 @@ async def run_stream(
         body: dict = {
             "model": api_model,
             "messages": sanitized,
-            "max_tokens": DEFAULT_MAX_TOKENS,
+            "max_tokens": int(max_tokens or DEFAULT_MAX_TOKENS),
             "temperature": 0.7,
             "stream": True,
         }
@@ -533,11 +662,15 @@ async def run_stream(
             run_usage["total_tokens"] += estimated_input + estimated_output
 
         if finish_reason == "stop":
-            unviewed_session_skills = session_skill_names - viewed_skill_names
+            unviewed_session_skills = run_state.unviewed_session_skills()
             if (
                 unviewed_session_skills
                 and skill_enforcement_continuations < 1
-                and (tool_call_count > 0 or len(full_content.strip()) < 200)
+                and (
+                    _looks_like_complex_artifact_request(original_user_text)
+                    or run_state.tool_call_count > 0
+                    or len(full_content.strip()) < 200
+                )
             ):
                 skill_enforcement_continuations += 1
                 skill_list = ", ".join(sorted(unviewed_session_skills))
@@ -562,12 +695,30 @@ async def run_stream(
                 continue
 
             needs_artifact_gate = bool(
-                viewed_skill_names
+                run_state.viewed_skill_names
                 and _looks_like_complex_artifact_request(original_user_text)
             )
+            needs_workflow_gate, workflow_reason = run_state.needs_more_skill_workflow()
+            if (
+                needs_artifact_gate
+                and needs_workflow_gate
+                and skill_workflow_continuations < max_skill_workflow_continuations
+            ):
+                skill_workflow_continuations += 1
+                conversation.append({
+                    "role": "assistant",
+                    "content": full_content or "(No visible response.)",
+                })
+                queue_skill_workflow_continuation(workflow_reason)
+                yield {
+                    "type": "tool_progress",
+                    "msg": f"↻ Inspecting session skill workflow before finishing — {workflow_reason}",
+                }
+                yield {"type": "delta", "content": "\n\n"}
+                continue
             if needs_artifact_gate and artifact_enforcement_continuations < 1:
-                largest_write = max(successful_write_sizes or [0])
-                if tool_error_count >= 2 or (largest_write and largest_write < 20_000) or (
+                largest_write = max(run_state.successful_write_sizes or [0])
+                if run_state.tool_error_count >= 2 or (largest_write and largest_write < 20_000) or (
                     not largest_write and len(full_content.strip()) < 8_000
                 ):
                     artifact_enforcement_continuations += 1
@@ -731,7 +882,7 @@ async def run_stream(
 
             # Execute each tool and append results
             for tc in assembled_calls:
-                tool_call_count += 1
+                run_state.tool_call_count += 1
                 args_summary = tc.arguments[:80] if tc.arguments else "{}"
                 display_tool_name = tc.name
                 yield {
@@ -739,10 +890,9 @@ async def run_stream(
                     "msg": f"🔧 {tc.name}({args_summary})",
                 }
 
-                try:
-                    args = json.loads(tc.arguments) if tc.arguments else {}
-                except json.JSONDecodeError:
-                    args = {}
+                args = _safe_parse_args(tc.arguments or "")
+                if isinstance(args, dict) and "__tool_arg_parse_error" in args:
+                    run_state.parse_failure_count += 1
                 executed_args = args
 
                 if tc.name == "tool_search" and deferred_catalog is not None:
@@ -815,15 +965,17 @@ async def run_stream(
                     result = str(result) + "\n\n" + hint
                 outcome, outcome_detail = _tool_outcome_summary(str(result))
                 if outcome != "success":
-                    tool_error_count += 1
+                    run_state.tool_error_count += 1
+                    if isinstance(executed_args, dict) and "__tool_arg_parse_error" in executed_args:
+                        run_state.parse_failure_count += 1
+                    if "schema" in outcome_detail.lower() or "required field" in outcome_detail.lower():
+                        run_state.schema_failure_count += 1
                 elif display_tool_name == "write_file":
                     written_size = _tool_result_size(str(result))
                     if written_size is not None:
-                        successful_write_sizes.append(written_size)
-                if display_tool_name == "skill_view" and outcome == "success":
-                    viewed_name = executed_args.get("name") if isinstance(executed_args, dict) else None
-                    if viewed_name:
-                        viewed_skill_names.add(str(viewed_name))
+                        run_state.successful_write_sizes.append(written_size)
+                if display_tool_name == "skill_view" and outcome == "success" and isinstance(executed_args, dict):
+                    run_state.record_skill_view(executed_args, _json_object(str(result)))
                 logger.info(
                     "Tool completed user=%s session=%s tool=%s outcome=%s detail=%s",
                     user_id, session_id, display_tool_name, outcome, outcome_detail[:300],
@@ -839,6 +991,23 @@ async def run_stream(
                     "tool_call_id": tc.id or f"call_unknown",
                     "content": wrapped,
                 })
+
+            needs_artifact_gate_after_tools = bool(
+                run_state.viewed_skill_names
+                and _looks_like_complex_artifact_request(original_user_text)
+            )
+            needs_workflow_gate_after_tools, workflow_reason_after_tools = run_state.needs_more_skill_workflow()
+            if (
+                needs_artifact_gate_after_tools
+                and needs_workflow_gate_after_tools
+                and skill_workflow_continuations < max_skill_workflow_continuations
+            ):
+                skill_workflow_continuations += 1
+                queue_skill_workflow_continuation(workflow_reason_after_tools)
+                yield {
+                    "type": "tool_progress",
+                    "msg": f"↻ Inspecting session skill workflow before continuing — {workflow_reason_after_tools}",
+                }
 
             # ── Context compression check ────────────────────────────
             if compressor.should_compress():
@@ -1210,11 +1379,8 @@ async def _iter_provider_stream(
 
 def _tool_outcome_summary(raw: str) -> tuple[str, str]:
     """Return an auditable status line without exposing a large tool payload."""
-    try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return "success", ""
-    if not isinstance(data, dict):
+    data = _json_object(raw)
+    if data is None:
         return "success", ""
     if data.get("error"):
         return "error", str(data["error"])
@@ -1227,14 +1393,19 @@ def _tool_outcome_summary(raw: str) -> tuple[str, str]:
 
 
 def _tool_result_size(raw: str) -> int | None:
+    data = _json_object(raw)
+    if data is None:
+        return None
+    size = data.get("size")
+    return size if isinstance(size, int) and size >= 0 else None
+
+
+def _json_object(raw: str) -> dict[str, Any] | None:
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return None
-    if not isinstance(data, dict):
-        return None
-    size = data.get("size")
-    return size if isinstance(size, int) and size >= 0 else None
+    return data if isinstance(data, dict) else None
 
 
 def _latest_user_text(messages: list[dict]) -> str:
