@@ -178,6 +178,7 @@ async def chat_completions(req: Request):
     provider_config: Optional[dict] = body.get("provider_config")
     fallback_configs: list[dict] = body.get("fallback_configs") or []
     source: str = body.get("source", "chat")
+    max_tokens: int | None = body.get("max_tokens")
 
     # Per-user / per-session isolation
     user_id: str = body.get("user", "default")
@@ -189,6 +190,7 @@ async def chat_completions(req: Request):
             model_id, messages, tools, user_id, session_id,
             provider_config, fallback_configs, source,
             enabled_user_skills,
+            max_tokens,
         )
 
     # ── Non-streaming: collect all events, assemble full response ──────
@@ -206,6 +208,7 @@ async def chat_completions(req: Request):
         fallback_overrides=fallback_configs,
         source=source,
         enabled_user_skills=enabled_user_skills,
+        max_tokens=max_tokens,
     ):
         tp = evt["type"]
         if tp == "delta":
@@ -266,6 +269,7 @@ def _streaming_response(
     fallback_configs: list[dict],
     source: str,
     enabled_user_skills: list[str] | None = None,
+    max_tokens: int | None = None,
 ) -> StreamingResponse:
     """Build an SSE streaming response from the agent loop."""
 
@@ -280,6 +284,7 @@ def _streaming_response(
             fallback_overrides=fallback_configs,
             source=source,
             enabled_user_skills=enabled_user_skills,
+            max_tokens=max_tokens,
         ):
             tp = evt["type"]
             if tp == "tool_progress":

@@ -63,7 +63,8 @@ async def read_file(
         return json.dumps({"error": str(e)})
 
     if not path.exists():
-        return json.dumps({"error": f"File not found: {filepath}"})
+        hint = "Use skill_view(name, file_path=...) for files inside an installed skill. read_file only reads workspace files."
+        return json.dumps({"error": f"File not found: {filepath}", "hint": hint})
     if not path.is_file():
         return json.dumps({"error": f"Not a regular file: {filepath}"})
     if path.is_symlink():
@@ -463,8 +464,9 @@ def _search_content_python(
 READ_FILE_SCHEMA = {
     "name": "read_file",
     "description": (
-        "Read a file from the session sandbox. Lines are 1-indexed. "
-        "Use offset/limit to read large files in sections.\n\n"
+        "Read a file from the session workspace sandbox only. This does not read files "
+        "inside installed skills; use skill_view(name, file_path=...) for skill resources. "
+        "Lines are 1-indexed. Use offset/limit to read large workspace files in sections.\n\n"
         "Files up to 10MB are supported. Returns the content with metadata "
         "including total line count."
     ),
@@ -473,7 +475,7 @@ READ_FILE_SCHEMA = {
         "properties": {
             "filepath": {
                 "type": "string",
-                "description": "Relative path within the sandbox to read.",
+                "description": "Relative path within the session workspace, not an installed skill directory.",
             },
             "offset": {
                 "type": "integer",
@@ -497,7 +499,8 @@ WRITE_FILE_SCHEMA = {
         "automatically and existing files are overwritten. Never call write_file with empty "
         "args, _raw_args, or malformed JSON; required fields are filepath and content. For a "
         "long requested deliverable, write the complete artifact content, not a placeholder "
-        "or stub."
+        "or stub. For one requested deliverable, prefer one complete file unless the user "
+        "explicitly asks for multiple files; do not split chapters into many scratch files."
     ),
     "parameters": {
         "type": "object",
@@ -543,10 +546,12 @@ SEARCH_FILES_SCHEMA = {
     "name": "search_files",
     "description": (
         "Search file contents (ripgrep/regex) or find files by name (glob) "
-        "within the session sandbox.\n\n"
+        "within the session workspace sandbox only. This does not search installed "
+        "skill directories; use skill_view(name, file_path='__manifest__') and "
+        "skill_view(name, file_path=...) for skill resources.\n\n"
         "Content search (target='content'): regex pattern matching across "
-        "text files with optional file_glob filter.\n"
-        "File search (target='files'): glob pattern to find files by name.\n\n"
+        "workspace text files with optional file_glob filter.\n"
+        "File search (target='files'): glob pattern to find workspace files by name.\n\n"
         "Use file_glob to restrict search to specific file types "
         "(e.g., '*.py', '*.md')."
     ),
@@ -565,7 +570,7 @@ SEARCH_FILES_SCHEMA = {
             },
             "path": {
                 "type": "string",
-                "description": "Relative directory within sandbox to search (default '.').",
+                "description": "Relative workspace directory to search (default '.').",
                 "default": ".",
             },
             "file_glob": {

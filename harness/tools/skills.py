@@ -118,7 +118,11 @@ async def skills_list(
                 "skills": output_skills,
                 "categories": categories,
                 "count": len(output_skills),
-                "hint": "Use skill_view(name) to see full content, tags, and linked files",
+                "hint": (
+                    "Use skill_view(name) to see full content. For complex skills, then use "
+                    "skill_view(name, file_path='__manifest__') to inspect workflow resources "
+                    "before reading specific linked files."
+                ),
             },
             ensure_ascii=False,
         )
@@ -138,7 +142,9 @@ async def skill_view(
     """View the content of a skill or a specific file within a skill directory.
 
     Progressive disclosure tier 2-3: loads full SKILL.md content plus
-    linked_files index.  Use file_path to access specific linked files.
+    linked_files and resource_graph indexes. Use file_path='__manifest__'
+    for a compact workflow-resource manifest, or use file_path to access
+    specific linked files.
 
     MCP dependencies are registered by the harness control plane when a skill
     is installed. The response reports their declared configuration for
@@ -257,14 +263,6 @@ SKILLS_LIST_SCHEMA = {
                 "type": "string",
                 "description": "Optional category filter to narrow results.",
             },
-            "user_id": {
-                "type": "string",
-                "description": "User identifier for per-user skill isolation.",
-            },
-            "session_id": {
-                "type": "string",
-                "description": "Session identifier.",
-            },
         },
         "required": [],
     },
@@ -273,10 +271,11 @@ SKILLS_LIST_SCHEMA = {
 SKILL_VIEW_SCHEMA = {
     "name": "skill_view",
     "description": (
-        "Load a skill's full content including instructions, tags, and linked files. "
-        "First call returns SKILL.md content plus a 'linked_files' dict showing "
-        "available references/templates/scripts. To access those, call again with "
-        "the file_path parameter (e.g., 'references/api.md')."
+        "Load a skill's full content including instructions, tags, linked files, and a "
+        "generic resource graph. First call returns SKILL.md content plus indexes. "
+        "For complex tasks, call again with file_path='__manifest__' to inspect "
+        "workflow resources, then call with specific file paths to load orchestrators, "
+        "workers, references, scripts, templates, or other linked resources."
     ),
     "parameters": {
         "type": "object",
@@ -288,18 +287,11 @@ SKILL_VIEW_SCHEMA = {
             "file_path": {
                 "type": "string",
                 "description": (
-                    "Optional path to a linked file within the skill "
-                    "(e.g., 'references/api.md', 'templates/config.yaml'). "
-                    "Omit to get the main SKILL.md content."
+                    "Optional path to a linked file within the skill. Use '__manifest__' "
+                    "to inspect the skill's compact resource graph, then request files such as "
+                    "'orchestration/orchestrator.yaml', 'references/api.md', or "
+                    "'templates/config.yaml'. Omit to get the main SKILL.md content."
                 ),
-            },
-            "user_id": {
-                "type": "string",
-                "description": "User identifier for per-user skill isolation.",
-            },
-            "session_id": {
-                "type": "string",
-                "description": "Session identifier.",
             },
         },
         "required": ["name"],

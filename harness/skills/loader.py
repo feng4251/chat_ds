@@ -153,8 +153,9 @@ def load_skill_content(
         hermes_meta.get("related_skills") or frontmatter.get("related_skills", "")
     )
 
-    # Discover linked files
+    # Discover linked files and workflow resources
     linked_files = _discover_linked_files(skill_dir_path)
+    resource_graph = _discover_resource_graph(skill_dir_path, linked_files)
 
     result: Dict[str, Any] = {
         "name": name,
@@ -163,6 +164,7 @@ def load_skill_content(
         "tags": tags,
         "related_skills": related_skills,
         "linked_files": linked_files if linked_files else None,
+        "resource_graph": resource_graph if resource_graph else None,
         "frontmatter": frontmatter,
     }
 
@@ -223,74 +225,118 @@ def _parse_tags(tags_value) -> list[str]:
     return [t.strip().strip("'\"") for t in tags_str.split(",") if t.strip()]
 
 
+_WORKFLOW_DIRS = (
+    "orchestration",
+    "workers",
+    "workflows",
+    "references",
+    "templates",
+    "formats",
+    "protocols",
+    "scripts",
+    "examples",
+    "evaluation",
+    "assets",
+)
+
+_TEXT_RESOURCE_SUFFIXES = {
+    ".md", ".txt", ".rst",
+    ".yaml", ".yml", ".json", ".toml", ".ini", ".cfg",
+    ".py", ".sh", ".bash", ".js", ".ts", ".tsx", ".jsx",
+    ".sql", ".csv", ".r", ".jl",
+}
+
+
 def _discover_linked_files(skill_dir: Path) -> dict[str, list[str]]:
-    """Discover reference, template, asset, and script files in a skill directory."""
+    """Discover linked reference, workflow, template, asset, and script files."""
     linked: dict[str, list[str]] = {}
 
-    # References
-    refs_dir = skill_dir / "references"
-    if refs_dir.is_dir():
-        refs = [
-            str(f.relative_to(skill_dir))
-            for f in refs_dir.glob("*.md")
-        ]
-        if refs:
-            linked["references"] = sorted(refs)
+    for directory in _WORKFLOW_DIRS:
+        subdir = skill_dir / directory
+        if not subdir.is_dir():
+            continue
+        files = _list_resource_files(skill_dir, subdir)
+        if files:
+            linked[directory] = files
 
-    # Templates
-    tmpl_dir = skill_dir / "templates"
-    if tmpl_dir.is_dir():
-        tmpls = []
-        for ext in ["*.md", "*.py", "*.yaml", "*.yml", "*.json", "*.tex", "*.sh"]:
-            tmpls.extend(
-                str(f.relative_to(skill_dir)) for f in tmpl_dir.rglob(ext)
-            )
-        if tmpls:
-            linked["templates"] = sorted(tmpls)
+    # Common domain-specific resource directories should be surfaced without
+    # knowing their semantics in advance.
+    for subdir in sorted(p for p in skill_dir.iterdir() if p.is_dir()):
+        if subdir.name.startswith(".") or subdir.name in linked:
+            continue
+        if subdir.name in {"__pycache__", "node_modules", ".git"}:
+            continue
+        files = _list_resource_files(skill_dir, subdir, limit=50)
+        if files:
+            linked[subdir.name] = files
 
-    # Assets
-    assets_dir = skill_dir / "assets"
-    if assets_dir.is_dir():
-        assets = [
-            str(f.relative_to(skill_dir))
-            for f in assets_dir.rglob("*") if f.is_file()
-        ]
-        if assets:
-            linked["assets"] = sorted(assets)
-
-    # Scripts (subdirectory)
-    scripts_dir = skill_dir / "scripts"
-    if scripts_dir.is_dir():
-        scripts = []
-        for ext in ["*.py", "*.sh", "*.bash", "*.js", "*.ts", "*.rb"]:
-            scripts.extend(
-                str(f.relative_to(skill_dir)) for f in scripts_dir.glob(ext)
-            )
-        if scripts:
-            linked["scripts"] = sorted(scripts)
-
-    # ── Root-level files ──────────────────────────────────────────────
     # openclaw-compatible .mcp.json (MCP server configuration)
     mcp_json = skill_dir / ".mcp.json"
     if mcp_json.is_file():
         linked["mcp_config"] = [".mcp.json"]
 
-    # Root-level Python scripts (e.g., pathology_mcp.py)
-    root_py = sorted(
-        str(f.relative_to(skill_dir))
-        for f in skill_dir.glob("*.py")
-    )
-    if root_py:
-        existing = linked.get("scripts", [])
-        linked["scripts"] = sorted(existing + root_py)
-
-    # Root-level requirements / config files
-    root_other = sorted(
-        str(f.relative_to(skill_dir))
-        for f in skill_dir.glob("requirements*.txt")
-    )
-    if root_other:
-        existing = linked.get("assets", [])
-        linked["assets"] = sorted(existing + root_other)
+    root_files = []
+    for child in sorted(skill_dir.iterdir()):
+        if not child.is_file() or child.name == "SKILL.md":
+            continue
+        if child.name.startswith(".") and child.name != ".mcp.json":
+            continue
+        if child.suffix.lower() in _TEXT_RESOURCE_SUFFIXES or child.name.startswith("requirements"):
+            root_files.append(str(child.relative_to(skill_dir)))
+    if root_files:
+        linked["root_files"] = root_files
 
     return linked
+
+
+def _list_resource_files(skill_dir: Path, directory: Path, limit: int = 200) -> list[str]:
+    files: list[str] = []
+    for path in sorted(directory.rglob("*")):
+        if not path.is_file():
+            continue
+        if any(part in {"__pycache__", "node_modules", ".git"} for part in path.parts):
+            continue
+        if path.suffix.lower() not in _TEXT_RESOURCE_SUFFIXES:
+            continue
+        files.append(str(path.relative_to(skill_dir)))
+        if len(files) >= limit:
+            break
+    return files
+
+
+def _discover_resource_graph(
+    skill_dir: Path,
+    linked_files: dict[str, list[str]],
+) -> dict[str, Any]:
+    """Return a compact, generic resource graph for progressive disclosure."""
+    if not linked_files:
+        return {}
+
+    important_categories = [
+        name for name in (
+            "orchestration", "workers", "workflows", "protocols", "formats",
+            "references", "scripts", "evaluation", "examples", "templates",
+            "therapeutic-areas", "domains", "rwe",
+        )
+        if name in linked_files
+    ]
+    categories = {
+        name: {
+            "count": len(files),
+            "sample": files[:12],
+        }
+        for name, files in linked_files.items()
+    }
+    suggested_files: list[str] = []
+    for category in important_categories:
+        suggested_files.extend(linked_files.get(category, [])[:8])
+    return {
+        "skill_root": str(skill_dir),
+        "categories": categories,
+        "important_categories": important_categories,
+        "suggested_files": suggested_files[:40],
+        "hint": (
+            "For complex tasks, inspect relevant suggested_files with "
+            "skill_view(name, file_path=...) before drafting the final artifact."
+        ),
+    }
