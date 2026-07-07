@@ -1,0 +1,33 @@
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # JWT
+    secret_key: str = "chat-ds-secret-key-change-in-production-2026"
+    algorithm: str = "HS256"
+    access_token_expire_minutes: int = 1440  # 24h
+
+    # Database
+    database_url: str = "sqlite+aiosqlite:///./chat_ds.db"
+
+    # Default model endpoints (intranet)
+    # 10.10.132.126 serves AgentModel (DeepSeek-V4-Flash, 1M ctx) — 主模型
+    # 10.10.132.128 serves qwen3_5 (397B, multimodal) — 多模态识别
+    deepseek_pro_base_url: str = "http://10.10.132.126:1025/v1"
+    deepseek_pro_api_key: str = "EMPTY"
+    qwen3_5_base_url: str = "http://10.10.132.128:1025/v1"
+    qwen3_5_api_key: str = "EMPTY"
+
+    # Application
+    app_title: str = "Chat ACITS"
+    cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:5174"]
+
+    # Harness agent service
+    harness_url: str = "http://harness:8020"
+    internal_api_token: str = "chat-ds-internal-token"
+    scheduler_poll_seconds: int = 15
+    hook_timeout_seconds: int = 8
+    allow_private_hook_urls: bool = False
+
+settings = Settings()

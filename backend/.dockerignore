@@ -1,0 +1,15 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+.coverage
+.env
+.env.*
+chat_ds.db
+chat_ds.db-journal
+data/
+gen_files.py
+Dockerfile
+.dockerignore

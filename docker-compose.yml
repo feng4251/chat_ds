@@ -1,0 +1,91 @@
+services:
+  executor:
+    build:
+      context: ./executor
+    container_name: chat_acits_executor
+    restart: unless-stopped
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; raise SystemExit(0 if os.path.exists('/run/chat-ds-executor/executor.sock') else 1)"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    volumes:
+      - executor_socket:/run/chat-ds-executor
+
+  harness:
+    build:
+      context: ./harness
+    container_name: chat_acits_harness
+    restart: unless-stopped
+    depends_on:
+      executor:
+        condition: service_healthy
+    environment:
+      DEEPSEEK_PRO_URL: http://10.10.132.126:1025/v1
+      QWEN3_5_URL: http://10.10.132.128:1025/v1
+      BACKEND_INTERNAL_URL: http://backend:8010
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-chat-ds-internal-token}
+    volumes:
+      - ./data:/app/data
+      - ./harness/data/memories:/app/data/memories
+      - /nfs/temp/chat_ds:/nfs/temp/chat_ds
+      - executor_socket:/run/chat-ds-executor
+    networks:
+      - chat_net
+
+  backend:
+    build:
+      context: ./backend
+    container_name: chat_acits_backend
+    restart: unless-stopped
+    depends_on:
+      - harness
+    environment:
+      # SQLite on local Docker volume — NFS locks break aiosqlite
+      DATABASE_URL: sqlite+aiosqlite:////app/db/chat_ds.db
+      # Override JWT secret in production. Generate with: python -c 'import secrets; print(secrets.token_urlsafe(48))'
+      SECRET_KEY: ${SECRET_KEY:-chat-acits-CHANGE-ME-IN-PRODUCTION}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-chat-ds-internal-token}
+      # Internal LLM endpoints (override here if they change)
+      DEEPSEEK_PRO_BASE_URL: http://10.10.132.126:1025/v1
+      QWEN3_5_BASE_URL: http://10.10.132.128:1025/v1
+    volumes:
+      - ./data:/app/data
+      - chat_ds_db:/app/db
+      - /nfs/temp/chat_ds:/nfs/temp/chat_ds
+    networks:
+      - chat_net
+    # Backend is not exposed externally — nginx in frontend container proxies
+    # to it via the chat_net Docker network. Uncomment for direct debugging:
+    # ports:
+    #   - "8010:8010"
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: chat_acits_frontend
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    networks:
+      - chat_net
+
+networks:
+  chat_net:
+    driver: bridge
+
+volumes:
+  chat_ds_db:
+    driver: local
+  executor_socket:
+    driver: local
