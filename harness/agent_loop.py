@@ -9,7 +9,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
 import httpx
@@ -38,6 +40,129 @@ DEFAULT_MAX_TOKENS = 8192
 _WORKER_BREADTH_TARGET = 4
 
 
+_LARGE_TOOL_ARGUMENT_STRING_CAP = 2_000
+_CONTEXT_OVERFLOW_RE = re.compile(
+    r"maximum context length is\s+(\d+)\s+tokens.*?"
+    r"requested\s+(\d+)\s+output tokens.*?"
+    r"prompt contains at least\s+(\d+)\s+input tokens",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _estimate_serialized_tokens(value: Any) -> int:
+    try:
+        serialized = json.dumps(value, ensure_ascii=False, default=str)
+    except TypeError:
+        serialized = str(value)
+    return max(len(serialized) // 4, len(serialized.encode("utf-8")) // 4)
+
+
+def _estimate_payload_tokens(messages: list[dict], tool_schemas: list[dict]) -> int:
+    token_estimate = 0
+    for message in messages:
+        token_estimate += _estimate_serialized_tokens(message)
+    for schema in tool_schemas:
+        token_estimate += _estimate_serialized_tokens(schema)
+    return max(1, token_estimate + len(messages) * 4 + len(tool_schemas) * 16)
+
+
+def _context_safety_margin(context_limit: int) -> int:
+    return max(8192, int(context_limit * 0.10))
+
+
+def _clamp_max_tokens_for_context(
+    requested_max_tokens: int,
+    context_length: Any,
+    estimated_input_tokens: int,
+) -> tuple[int, dict[str, int]]:
+    try:
+        context_limit = int(context_length)
+    except (TypeError, ValueError):
+        return requested_max_tokens, {}
+    if context_limit <= 0:
+        return requested_max_tokens, {}
+    safety_margin = _context_safety_margin(context_limit)
+    available_output = context_limit - estimated_input_tokens - safety_margin
+    effective_max_tokens = min(requested_max_tokens, max(512, available_output))
+    return effective_max_tokens, {
+        "context_length": context_limit,
+        "estimated_input_tokens": estimated_input_tokens,
+        "requested_max_tokens": requested_max_tokens,
+        "effective_max_tokens": effective_max_tokens,
+        "safety_margin": safety_margin,
+        "available_output_tokens": available_output,
+    }
+
+
+def _retry_max_tokens_from_context_overflow(error_body: str, current_max_tokens: int) -> tuple[int | None, dict[str, int]]:
+    match = _CONTEXT_OVERFLOW_RE.search(error_body or "")
+    if not match:
+        return None, {}
+    context_limit = int(match.group(1))
+    requested_output = int(match.group(2))
+    prompt_tokens = int(match.group(3))
+    safety_margin = _context_safety_margin(context_limit)
+    available_output = context_limit - prompt_tokens - safety_margin
+    if available_output < 512:
+        return None, {
+            "context_length": context_limit,
+            "prompt_tokens": prompt_tokens,
+            "requested_max_tokens": requested_output,
+            "safety_margin": safety_margin,
+            "available_output_tokens": available_output,
+        }
+    adjusted = min(current_max_tokens, requested_output, available_output)
+    if adjusted >= current_max_tokens:
+        return None, {}
+    return adjusted, {
+        "context_length": context_limit,
+        "prompt_tokens": prompt_tokens,
+        "requested_max_tokens": requested_output,
+        "effective_max_tokens": adjusted,
+        "safety_margin": safety_margin,
+        "available_output_tokens": available_output,
+    }
+
+
+def _compact_tool_argument_value(value: Any, *, tool_name: str, key: str = "", filepath: str = "") -> Any:
+    if isinstance(value, str):
+        omit_written_content = (
+            tool_name in {"write_file", "patch_file", "skill_manage"}
+            and key in {"content", "old_text", "new_text", "file_content"}
+            and len(value) > 500
+        )
+        if omit_written_content or len(value) > _LARGE_TOOL_ARGUMENT_STRING_CAP:
+            target = f" for {filepath}" if filepath else ""
+            return f"[omitted {len(value)} chars from conversation history{target}; use the workspace file or tool result if needed]"
+        return value
+    if isinstance(value, list):
+        return [
+            _compact_tool_argument_value(item, tool_name=tool_name, key=key, filepath=filepath)
+            for item in value
+        ]
+    if isinstance(value, dict):
+        nested_filepath = str(value.get("filepath") or value.get("file_path") or filepath or "")
+        return {
+            str(k): _compact_tool_argument_value(
+                v, tool_name=tool_name, key=str(k), filepath=nested_filepath,
+            )
+            for k, v in value.items()
+        }
+    return value
+
+
+def _compact_tool_call_arguments(tool_name: str, arguments: str) -> str:
+    args = _safe_parse_args(arguments or "")
+    if not isinstance(args, dict) or "__tool_arg_parse_error" in args:
+        if len(arguments or "") <= _LARGE_TOOL_ARGUMENT_STRING_CAP:
+            return arguments or "{}"
+        return json.dumps({
+            "_arguments_omitted": f"{len(arguments or '')} chars omitted from conversation history",
+        })
+    compacted = _compact_tool_argument_value(args, tool_name=tool_name)
+    return json.dumps(compacted, ensure_ascii=False)
+
+
 @dataclass
 class HarnessRunState:
     tool_call_count: int = 0
@@ -45,6 +170,8 @@ class HarnessRunState:
     parse_failure_count: int = 0
     schema_failure_count: int = 0
     successful_write_sizes: list[int] = field(default_factory=list)
+    artifacts: list[dict[str, Any]] = field(default_factory=list)
+    invalid_placeholder_write_count: int = 0
     viewed_skill_names: set[str] = field(default_factory=set)
     viewed_skill_files: dict[str, set[str]] = field(default_factory=dict)
     viewed_skill_categories: dict[str, set[str]] = field(default_factory=dict)
@@ -194,6 +321,15 @@ async def run_stream(
     fallback_overrides: list[dict[str, Any]] | None = None,
     source: str = "chat",
     enabled_user_skills: list[str] | None = None,
+    run_id: str | None = None,
+    root_run_id: str | None = None,
+    parent_run_id: str | None = None,
+    agent_kind: str = "primary",
+    agent_name: str | None = None,
+    depth: int = 0,
+    workspace_scope: str = "shared_session",
+    event_schema: str = "flat",
+    event_sink: Any | None = None,
 ) -> AsyncIterator[dict]:
     """Async generator yielding SSE-style dicts for a full agent conversation turn.
 
@@ -206,7 +342,26 @@ async def run_stream(
     """
     provider = dict(provider_override or PROVIDERS.get(model_id) or {})
     if not provider:
-        yield {"type": "error", "msg": f"Unknown model: {model_id}"}
+        msg = f"Unknown model: {model_id}"
+        event = {
+            "type": "agent_event",
+            "event_type": "run.failed",
+            "run_id": run_id,
+            "root_run_id": root_run_id or run_id,
+            "parent_run_id": parent_run_id,
+            "agent_kind": agent_kind,
+            "agent_name": agent_name or agent_kind,
+            "depth": depth,
+            "workspace_scope": workspace_scope,
+            "seq": 1,
+            "payload": {"error": msg},
+        }
+        if event_sink is not None:
+            maybe = event_sink(event)
+            if hasattr(maybe, "__await__"):
+                await maybe
+        yield event
+        yield {"type": "error", "msg": msg}
         return
     provider.setdefault("id", model_id)
     provider.setdefault("protocol", "openai")
@@ -250,16 +405,55 @@ async def run_stream(
         enabled_tools=tuple(tools),
         source=source,
         enabled_user_skills=tuple(enabled_user_skills or []),
+        run_id=run_id,
+        root_run_id=root_run_id or run_id,
+        parent_run_id=parent_run_id,
+        agent_kind=agent_kind,
+        agent_name=agent_name,
+        depth=depth,
+        workspace_scope=workspace_scope,
+        event_sink=event_sink,
     )
     hint_tracker = SubdirectoryHintTracker(user_id, session_id)
     run_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    event_seq = 0
+
+    async def emit_agent_event(event_type: str, payload: dict[str, Any] | None = None, **extra: Any) -> dict:
+        nonlocal event_seq
+        event_seq += 1
+        event = {
+            "type": "agent_event",
+            "event_type": event_type,
+            "run_id": run_id,
+            "root_run_id": root_run_id or run_id,
+            "parent_run_id": parent_run_id,
+            "agent_kind": agent_kind,
+            "agent_name": agent_name or agent_kind,
+            "depth": depth,
+            "workspace_scope": workspace_scope,
+            "seq": event_seq,
+            "payload": payload or {},
+        }
+        event.update(extra)
+        if event_sink is not None:
+            maybe = event_sink(event)
+            if hasattr(maybe, "__await__"):
+                await maybe
+        return event
+
     goal_continuations = 0
     goal_parse_failures = 0
     run_state = HarnessRunState()
     artifact_enforcement_continuations = 0
+    verifier_continuations = 0
     skill_enforcement_continuations = 0
     skill_workflow_continuations = 0
     max_skill_workflow_continuations = 8
+    yield await emit_agent_event("run.started", {
+        "model_id": model_id,
+        "source": source,
+        "enabled_tools": tools,
+    })
 
     def queue_skill_workflow_continuation(reason: str) -> None:
         run_state.continuation_reasons.append(reason)
@@ -415,7 +609,9 @@ async def run_stream(
 
     while budget.remaining > 0:
         if not budget.consume():
-            yield {"type": "error", "msg": "Agent iteration budget exhausted."}
+            msg = "Agent iteration budget exhausted."
+            yield await emit_agent_event("run.failed", {"error": msg})
+            yield {"type": "error", "msg": msg}
             return
 
         # ── Sanitize messages before sending ──────────────────────────
@@ -447,10 +643,29 @@ async def run_stream(
                 user_id, session_id,
             )
 
+        requested_max_tokens = int(max_tokens or DEFAULT_MAX_TOKENS)
+        estimated_input_tokens = _estimate_payload_tokens(sanitized, tool_schemas)
+        effective_max_tokens, max_token_budget = _clamp_max_tokens_for_context(
+            requested_max_tokens,
+            provider.get("context_length"),
+            estimated_input_tokens,
+        )
+        if effective_max_tokens < requested_max_tokens:
+            log_fn = logger.warning if max_token_budget.get("available_output_tokens", 0) < 512 else logger.info
+            log_fn(
+                "Clamped max_tokens for model=%s context_length=%s estimated_input=%s requested=%s effective=%s safety_margin=%s",
+                provider.get("id") or api_model,
+                max_token_budget.get("context_length"),
+                max_token_budget.get("estimated_input_tokens"),
+                max_token_budget.get("requested_max_tokens"),
+                max_token_budget.get("effective_max_tokens"),
+                max_token_budget.get("safety_margin"),
+            )
+
         body: dict = {
             "model": api_model,
             "messages": sanitized,
-            "max_tokens": int(max_tokens or DEFAULT_MAX_TOKENS),
+            "max_tokens": effective_max_tokens,
             "temperature": 0.7,
             "stream": True,
         }
@@ -500,6 +715,7 @@ async def run_stream(
                                 scrubbed_reasoning = scrubber.feed(reasoning)
                                 if scrubbed_reasoning:
                                     full_reasoning += scrubbed_reasoning
+                                    yield await emit_agent_event("agent.reasoning_delta", {"content": scrubbed_reasoning})
                                     yield {
                                         "type": "reasoning_delta",
                                         "content": scrubbed_reasoning,
@@ -511,6 +727,7 @@ async def run_stream(
                                 scrubbed_content = scrubber.feed(content)
                                 if scrubbed_content:
                                     full_content += scrubbed_content
+                                    yield await emit_agent_event("agent.delta", {"content": scrubbed_content})
                                     yield {
                                         "type": "delta",
                                         "content": scrubbed_content,
@@ -599,6 +816,23 @@ async def run_stream(
                         )
                         continue
 
+                adjusted_max_tokens, overflow_budget = _retry_max_tokens_from_context_overflow(
+                    e.body,
+                    int(body.get("max_tokens") or 0),
+                )
+                if adjusted_max_tokens is not None:
+                    body["max_tokens"] = adjusted_max_tokens
+                    logger.warning(
+                        "Provider reported context overflow; retrying model=%s context_length=%s prompt_tokens=%s requested=%s effective=%s safety_margin=%s",
+                        provider.get("id") or api_model,
+                        overflow_budget.get("context_length"),
+                        overflow_budget.get("prompt_tokens"),
+                        overflow_budget.get("requested_max_tokens"),
+                        overflow_budget.get("effective_max_tokens"),
+                        overflow_budget.get("safety_margin"),
+                    )
+                    continue
+
                 classified = classify_api_error(e, provider=model_id, model=api_model)
                 logger.warning(
                     "LLM call failed (attempt %d/%d): %s — %s",
@@ -622,7 +856,20 @@ async def run_stream(
                         enabled_tools=tuple(tools),
                         source=source,
                         enabled_user_skills=tuple(enabled_user_skills or []),
+                        run_id=run_id,
+                        root_run_id=root_run_id or run_id,
+                        parent_run_id=parent_run_id,
+                        agent_kind=agent_kind,
+                        agent_name=agent_name,
+                        depth=depth,
+                        workspace_scope=workspace_scope,
+                        event_sink=event_sink,
                     )
+                    yield await emit_agent_event("model.switch", {
+                        "from_model": previous.get("id") or model_id,
+                        "to_model": provider.get("id") or api_model,
+                        "reason": classified.reason.value,
+                    })
                     yield {
                         "type": "model_switch",
                         "from_model": previous.get("id") or model_id,
@@ -632,9 +879,11 @@ async def run_stream(
                     fallback_requested = True
                     break
                 if not classified.retryable or attempt >= MAX_RETRIES:
+                    msg = f"LLM error: {classified.reason.value} — {classified.message[:300]}"
+                    yield await emit_agent_event("run.failed", {"error": msg})
                     yield {
                         "type": "error",
-                        "msg": f"LLM error: {classified.reason.value} — {classified.message[:300]}",
+                        "msg": msg,
                     }
                     return
                 delay = jittered_backoff(attempt)
@@ -662,7 +911,20 @@ async def run_stream(
                         enabled_tools=tuple(tools),
                         source=source,
                         enabled_user_skills=tuple(enabled_user_skills or []),
+                        run_id=run_id,
+                        root_run_id=root_run_id or run_id,
+                        parent_run_id=parent_run_id,
+                        agent_kind=agent_kind,
+                        agent_name=agent_name,
+                        depth=depth,
+                        workspace_scope=workspace_scope,
+                        event_sink=event_sink,
                     )
+                    yield await emit_agent_event("model.switch", {
+                        "from_model": previous.get("id") or model_id,
+                        "to_model": provider.get("id") or api_model,
+                        "reason": "transport_error",
+                    })
                     yield {
                         "type": "model_switch",
                         "from_model": previous.get("id") or model_id,
@@ -672,9 +934,11 @@ async def run_stream(
                     fallback_requested = True
                     break
                 if attempt >= MAX_RETRIES:
+                    msg = f"LLM transport error after {MAX_RETRIES} attempts: {type(e).__name__}: {e}"
+                    yield await emit_agent_event("run.failed", {"error": msg})
                     yield {
                         "type": "error",
-                        "msg": f"LLM transport error after {MAX_RETRIES} attempts: {type(e).__name__}: {e}",
+                        "msg": msg,
                     }
                     return
                 delay = jittered_backoff(attempt)
@@ -683,7 +947,9 @@ async def run_stream(
             except Exception as e:
                 logger.exception("Unexpected error streaming LLM (attempt %d): %s", attempt, e)
                 if attempt >= MAX_RETRIES:
-                    yield {"type": "error", "msg": f"LLM error: {type(e).__name__}: {e}"}
+                    msg = f"LLM error: {type(e).__name__}: {e}"
+                    yield await emit_agent_event("run.failed", {"error": msg})
+                    yield {"type": "error", "msg": msg}
                     return
                 delay = jittered_backoff(attempt)
                 await asyncio.sleep(delay)
@@ -765,7 +1031,8 @@ async def run_stream(
                 continue
             if needs_artifact_gate and artifact_enforcement_continuations < 1:
                 largest_write = max(run_state.successful_write_sizes or [0])
-                if run_state.tool_error_count >= 2 or (largest_write and largest_write < 20_000) or (
+                invalid_placeholder_write = run_state.invalid_placeholder_write_count > 0
+                if invalid_placeholder_write or run_state.tool_error_count >= 2 or (largest_write and largest_write < 20_000) or (
                     not largest_write and len(full_content.strip()) < 8_000
                 ):
                     artifact_enforcement_continuations += 1
@@ -773,14 +1040,19 @@ async def run_stream(
                         "role": "assistant",
                         "content": full_content or "(No visible response.)",
                     })
+                    continuation_reason = (
+                        "A file write was rejected because it contained a compacted conversation-history placeholder. "
+                        if invalid_placeholder_write else ""
+                    )
                     conversation.append({
                         "role": "user",
                         "content": (
+                            continuation_reason +
                             "The task uses a session-level skill and asks for a complex deliverable. "
                             "Continue once to complete the artifact using the loaded skill workflow and any "
                             "relevant linked files. If tool calls failed validation, retry with valid schema "
-                            "arguments. Produce one coherent final artifact with the required major sections; "
-                            "do not stop at a short summary, placeholder, or incomplete file."
+                            "arguments and real generated content. Produce one coherent final artifact with the "
+                            "required major sections; do not stop at a short summary, placeholder, or incomplete file."
                         ),
                     })
                     yield {
@@ -805,11 +1077,19 @@ async def run_stream(
                         "type": "tool_progress",
                         "msg": "⏸ Goal paused — token budget reached.",
                     }
+                    yield await emit_agent_event("usage.updated", {
+                        **run_usage,
+                        "model": provider.get("id") or api_model,
+                    })
                     yield {
                         "type": "usage",
                         **run_usage,
                         "model": provider.get("id") or api_model,
                     }
+                    yield await emit_agent_event("run.completed", {
+                        "finish_reason": "stop",
+                        "usage": run_usage,
+                    })
                     yield {"type": "done", "finish_reason": "stop"}
                     return
                 verdict, reason, parse_failed = await _judge_goal(
@@ -888,11 +1168,55 @@ async def run_stream(
                             "⏸ Goal paused — automatic continuation budget reached."
                         ),
                     }
+            verifier_payload = _deterministic_verifier_payload(
+                run_state,
+                requested_artifact=_looks_like_file_artifact_request(original_user_text),
+            )
+            if verifier_payload is not None:
+                yield await emit_agent_event("verifier.requested", {
+                    "verifier_kind": verifier_payload["verifier_kind"],
+                    "target_run_id": run_id,
+                    "target_artifacts": verifier_payload.get("target_artifacts", []),
+                })
+                yield await emit_agent_event("verifier.completed", {
+                    **verifier_payload,
+                    "target_run_id": run_id,
+                })
+                if verifier_payload["needs_more_work"] and verifier_continuations < 1:
+                    verifier_continuations += 1
+                    conversation.append({
+                        "role": "assistant",
+                        "content": full_content or "(No visible response.)",
+                    })
+                    conversation.append({
+                        "role": "user",
+                        "content": (
+                            "[Verifier requested one follow-up]\n"
+                            f"Verifier kind: {verifier_payload['verifier_kind']}\n"
+                            f"Verdict: {verifier_payload['verdict']}\n"
+                            f"Reason: {verifier_payload['reason']}\n\n"
+                            "Continue once to resolve the concrete verifier finding. If a file write failed, retry with valid schema and real content. If an artifact is empty, rewrite it with substantive content. If the finding is already resolved, explain the evidence briefly."
+                        ),
+                    })
+                    yield {
+                        "type": "tool_progress",
+                        "msg": f"↻ Verifier requested follow-up — {verifier_payload['reason']}",
+                    }
+                    yield {"type": "delta", "content": "\n\n"}
+                    continue
+            yield await emit_agent_event("usage.updated", {
+                **run_usage,
+                "model": provider.get("id") or api_model,
+            })
             yield {
                 "type": "usage",
                 **run_usage,
                 "model": provider.get("id") or api_model,
             }
+            yield await emit_agent_event("run.completed", {
+                "finish_reason": "stop",
+                "usage": run_usage,
+            })
             yield {"type": "done", "finish_reason": "stop"}
             return
 
@@ -919,7 +1243,7 @@ async def run_stream(
                         "type": "function",
                         "function": {
                             "name": tc.name,
-                            "arguments": tc.arguments,
+                            "arguments": _compact_tool_call_arguments(tc.name, tc.arguments),
                         },
                     }
                     for i, tc in enumerate(assembled_calls)
@@ -932,6 +1256,11 @@ async def run_stream(
                 run_state.tool_call_count += 1
                 args_summary = tc.arguments[:80] if tc.arguments else "{}"
                 display_tool_name = tc.name
+                yield await emit_agent_event("tool.started", {
+                    "tool_name": tc.name,
+                    "tool_call_id": tc.id or "",
+                    "args_compacted": _compact_tool_call_arguments(tc.name, tc.arguments),
+                }, tool_name=tc.name, tool_call_id=tc.id or "")
                 yield {
                     "type": "tool_progress",
                     "msg": f"🔧 {tc.name}({args_summary})",
@@ -1013,6 +1342,9 @@ async def run_stream(
                 outcome, outcome_detail = _tool_outcome_summary(str(result))
                 if outcome != "success":
                     run_state.tool_error_count += 1
+                    result_data = _json_object(str(result))
+                    if isinstance(result_data, dict) and result_data.get("reason") == "invalid_placeholder_content":
+                        run_state.invalid_placeholder_write_count += 1
                     if isinstance(executed_args, dict) and "__tool_arg_parse_error" in executed_args:
                         run_state.parse_failure_count += 1
                     if "schema" in outcome_detail.lower() or "required field" in outcome_detail.lower():
@@ -1021,12 +1353,37 @@ async def run_stream(
                     written_size = _tool_result_size(str(result))
                     if written_size is not None:
                         run_state.successful_write_sizes.append(written_size)
+                artifact_payload = _artifact_payload_from_tool_result(display_tool_name, str(result)) if outcome == "success" else None
+                if artifact_payload is not None:
+                    run_state.artifacts.append(artifact_payload)
                 if display_tool_name == "skill_view" and outcome == "success" and isinstance(executed_args, dict):
                     run_state.record_skill_view(executed_args, _json_object(str(result)))
                 logger.info(
                     "Tool completed user=%s session=%s tool=%s outcome=%s detail=%s",
                     user_id, session_id, display_tool_name, outcome, outcome_detail[:300],
                 )
+                yield await emit_agent_event(
+                    "tool.completed" if outcome == "success" else "tool.failed",
+                    {
+                        "tool_name": display_tool_name,
+                        "tool_call_id": tc.id or "",
+                        "outcome": outcome,
+                        "detail": outcome_detail[:1000],
+                    },
+                    tool_name=display_tool_name,
+                    tool_call_id=tc.id or "",
+                )
+                if artifact_payload is not None:
+                    yield await emit_agent_event(
+                        "artifact.created",
+                        {
+                            **artifact_payload,
+                            "source_tool_name": display_tool_name,
+                            "source_tool_call_id": tc.id or "",
+                        },
+                        tool_name=display_tool_name,
+                        tool_call_id=tc.id or "",
+                    )
                 marker = "✅" if outcome == "success" else "⚠️"
                 progress = f"{marker} {display_tool_name}: {outcome}"
                 if outcome_detail:
@@ -1081,11 +1438,19 @@ async def run_stream(
             continue
 
         # content_filter or other — treat as stop
+        yield await emit_agent_event("usage.updated", {
+            **run_usage,
+            "model": provider.get("id") or api_model,
+        })
         yield {
             "type": "usage",
             **run_usage,
             "model": provider.get("id") or api_model,
         }
+        yield await emit_agent_event("run.completed", {
+            "finish_reason": finish_reason,
+            "usage": run_usage,
+        })
         yield {"type": "done", "finish_reason": finish_reason}
         return
 
@@ -1447,6 +1812,71 @@ def _tool_result_size(raw: str) -> int | None:
     return size if isinstance(size, int) and size >= 0 else None
 
 
+def _artifact_payload_from_tool_result(tool_name: str, raw: str) -> dict[str, Any] | None:
+    if tool_name not in {"write_file", "patch_file"}:
+        return None
+    data = _json_object(raw)
+    if data is None:
+        return None
+    if data.get("status") not in {"written", "patched"}:
+        return None
+    path = str(data.get("path") or "").strip()
+    if not path:
+        return None
+    size = data.get("size")
+    payload = {
+        "kind": "file",
+        "title": Path(path).name,
+        "path": path,
+    }
+    if isinstance(size, int) and size >= 0:
+        payload["size_bytes"] = size
+    return payload
+
+
+def _deterministic_verifier_payload(
+    run_state: HarnessRunState,
+    *,
+    requested_artifact: bool = False,
+) -> dict[str, Any] | None:
+    target_artifacts = [artifact.get("path") for artifact in run_state.artifacts if artifact.get("path")]
+    if not target_artifacts and run_state.tool_error_count == 0 and run_state.invalid_placeholder_write_count == 0 and run_state.schema_failure_count == 0 and not requested_artifact:
+        return None
+    findings: list[str] = []
+    needs_more_work = False
+    verdict = "pass"
+    if requested_artifact and not target_artifacts:
+        findings.append("The user requested a file or durable deliverable, but no artifact was produced.")
+        needs_more_work = True
+        verdict = "fail"
+    if run_state.invalid_placeholder_write_count > 0:
+        findings.append("A write was rejected because it contained compacted conversation-history placeholder content.")
+        needs_more_work = True
+        verdict = "fail"
+    empty_artifacts = [artifact.get("path") for artifact in run_state.artifacts if int(artifact.get("size_bytes") or 0) <= 0]
+    if empty_artifacts:
+        findings.append(f"Artifact is empty: {', '.join(str(path) for path in empty_artifacts)}.")
+        needs_more_work = True
+        verdict = "fail"
+    if run_state.schema_failure_count > 0 or run_state.parse_failure_count > 0:
+        findings.append("One or more tool calls failed schema or argument parsing validation.")
+        needs_more_work = True
+        verdict = "fail"
+    if run_state.tool_error_count > 0 and not findings:
+        findings.append("One or more tool calls failed; review whether the failure blocks the requested deliverable.")
+        verdict = "inconclusive"
+    if not findings:
+        findings.append("Artifacts referenced by successful write/patch tool results are non-empty.")
+    return {
+        "verifier_kind": "artifact_integrity",
+        "target_artifacts": target_artifacts,
+        "verdict": verdict,
+        "reason": findings[0],
+        "findings": findings,
+        "needs_more_work": needs_more_work,
+    }
+
+
 def _json_object(raw: str) -> dict[str, Any] | None:
     try:
         data = json.loads(raw)
@@ -1481,6 +1911,16 @@ def _looks_like_complex_artifact_request(text: str) -> bool:
         "regulatory", "simulation", "分析", "策略", "白皮书", "proposal",
     )
     return sum(1 for marker in markers if marker in lowered) >= 2
+
+
+def _looks_like_file_artifact_request(text: str) -> bool:
+    lowered = text.lower()
+    markers = (
+        "write", "save", "create a file", "生成文件", "写入文件", "保存", "导出",
+        "artifact", "deliverable", "report", "报告", "文档", "markdown", ".md",
+        ".txt", ".csv", ".json", ".pdf", "workspace", "工作区",
+    )
+    return any(marker in lowered for marker in markers)
 
 
 # ── Internal helpers ────────────────────────────────────────────────────

@@ -141,6 +141,17 @@ class AgentRun(Base):
     conversation_id: Mapped[str] = mapped_column(
         String(32), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    parent_run_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
+    root_run_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
+    delegation_tool_call_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    agent_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="primary")
+    agent_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    depth: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    workspace_scope: Mapped[str] = mapped_column(String(32), nullable=False, default="shared_session")
+    workspace_ref: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    requested_tools: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    effective_tools: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    policy: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     source: Mapped[str] = mapped_column(String(24), nullable=False, default="chat")
     requested_model_id: Mapped[str] = mapped_column(String(128), nullable=False)
     resolved_model_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
@@ -153,6 +164,86 @@ class AgentRun(Base):
     total_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     started_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
+class AgentRunEvent(Base):
+    """Append-only normalized event stream for agent run trees."""
+
+    __tablename__ = "agent_run_events"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=generate_uuid)
+    run_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    conversation_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    parent_run_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
+    seq: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    payload: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    tool_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    tool_call_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    event_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class Artifact(Base):
+    """Query projection for durable session artifacts produced by agent runs."""
+
+    __tablename__ = "artifacts"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=generate_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    conversation_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    run_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    root_run_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
+    parent_run_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, default="file")
+    title: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    mime_type: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    preview_kind: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    source_tool_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    source_tool_call_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    source_event_key: Mapped[Optional[str]] = mapped_column(String(192), nullable=True, index=True)
+    summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    metadata_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class TaskItem(Base):
+    """Query projection for run/agent/verifier task status."""
+
+    __tablename__ = "task_items"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=generate_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    conversation_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    run_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    root_run_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
+    parent_run_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
+    task_key: Mapped[str] = mapped_column(String(192), nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, default="run")
+    title: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="running")
+    agent_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    metadata_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
 class ScheduledJob(Base):

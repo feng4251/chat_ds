@@ -3,7 +3,7 @@ import {
   FiPackage, FiX, FiInfo, FiTrash2, FiPlus, FiArrowUpCircle, FiCheck, FiLink,
 } from 'react-icons/fi'
 import {
-  getSkills, deleteSkill, promoteSkill,
+  getSkills, promoteSkill,
   getConversationSettings, updateConversationSettings,
 } from '../api'
 
@@ -44,6 +44,82 @@ function SkillChip({ skill, onClick }) {
       </span>
       <FiInfo size={11} className="shrink-0 opacity-50 group-hover:opacity-100" />
     </button>
+  )
+}
+
+function SkillGroupChip({ group, expanded, onToggle, onOpen }) {
+  const main = group.main
+  const children = group.children
+  const childCount = children.length
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        onClick={childCount ? onToggle : () => onOpen(main)}
+        title={main.description || main.name}
+        aria-label={`Skill bundle: ${main.name}`}
+        className="group flex items-center gap-1.5 pl-2.5 pr-2 py-1.5 rounded-lg text-xs border shadow-sm transition hover:shadow bg-purple-50 border-purple-200 text-purple-700 hover:bg-purple-100"
+      >
+        <FiPackage size={12} className="shrink-0" />
+        <span className="font-medium truncate max-w-[170px]">{main.name}</span>
+        {childCount > 0 && (
+          <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-purple-200/70 text-purple-800 font-semibold">
+            +{childCount}
+          </span>
+        )}
+        <span className="text-[9px] uppercase tracking-wide px-1 py-0.5 rounded font-medium bg-purple-200/60 text-purple-800">
+          session
+        </span>
+        <FiInfo
+          size={11}
+          className={
+            'shrink-0 transition ' +
+            (expanded ? 'opacity-100 rotate-180' : 'opacity-50 group-hover:opacity-100')
+          }
+        />
+      </button>
+      {expanded && childCount > 0 && (
+        <div className="absolute left-0 top-full mt-1.5 z-40 w-80 max-h-80 overflow-y-auto rounded-xl border border-purple-100 bg-white shadow-xl p-2">
+          <button
+            type="button"
+            onClick={() => onOpen(main)}
+            className="w-full flex items-start gap-2 rounded-lg px-2.5 py-2 text-left hover:bg-purple-50 transition"
+          >
+            <FiPackage size={13} className="mt-0.5 shrink-0 text-purple-600" />
+            <div className="min-w-0 flex-1">
+              <div className="text-xs font-semibold text-slate-900 truncate">{main.name}</div>
+              <div className="text-[11px] text-slate-500 line-clamp-2">主 skill</div>
+            </div>
+          </button>
+          <div className="my-1 border-t border-stone-100" />
+          <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wide text-slate-400">
+            子 skills
+          </div>
+          {children.map((child) => (
+            <button
+              type="button"
+              key={`${child.session_id || 'session'}-${child.name}`}
+              onClick={() => onOpen(child)}
+              title={child.description || child.name}
+              className="w-full flex items-start gap-2 rounded-lg px-2.5 py-2 text-left hover:bg-stone-50 transition"
+            >
+              <FiPackage size={13} className="mt-0.5 shrink-0 text-slate-400" />
+              <div className="min-w-0 flex-1">
+                <div className="text-xs font-medium text-slate-800 truncate">{child.name}</div>
+                {child.description && (
+                  <div className="text-[11px] text-slate-500 line-clamp-2">{child.description}</div>
+                )}
+              </div>
+              {child.category && (
+                <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded bg-stone-100 text-stone-500">
+                  {child.category}
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -168,25 +244,26 @@ function SkillSelectorModal({ convId, onClose, onChanged }) {
   const [savingId, setSavingId] = useState(null)
   const [error, setError] = useState('')
 
-  async function load() {
-    setLoading(true)
-    setError('')
-    try {
-      const [userList, settings] = await Promise.all([
-        getSkills(null),
-        getConversationSettings(convId),
-      ])
-      setUserSkills(Array.isArray(userList) ? userList.filter((s) => !s.session_id) : [])
-      setEnabled(Array.isArray(settings.enabled_user_skills) ? settings.enabled_user_skills : [])
-    } catch (err) {
-      setError(err.message || '加载失败')
-    } finally {
-      setLoading(false)
-    }
-  }
-
   useEffect(() => {
-    load()
+    let cancelled = false
+    Promise.resolve().then(async () => {
+      setLoading(true)
+      setError('')
+      try {
+        const [userList, settings] = await Promise.all([
+          getSkills(null),
+          getConversationSettings(convId),
+        ])
+        if (cancelled) return
+        setUserSkills(Array.isArray(userList) ? userList.filter((s) => !s.session_id) : [])
+        setEnabled(Array.isArray(settings.enabled_user_skills) ? settings.enabled_user_skills : [])
+      } catch (err) {
+        if (!cancelled) setError(err.message || '加载失败')
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    })
+    return () => { cancelled = true }
   }, [convId])
 
   async function toggle(skill) {
@@ -315,6 +392,7 @@ function SkillSelectorModal({ convId, onClose, onChanged }) {
 export default function SkillBar({ skills = [], convId, onRefresh, onDelete, onUnlink }) {
   const [active, setActive] = useState(null)
   const [selectorOpen, setSelectorOpen] = useState(false)
+  const [expandedGroup, setExpandedGroup] = useState('')
   const [promoting, setPromoting] = useState(false)
 
   // session skills first, then user-level
@@ -323,6 +401,28 @@ export default function SkillBar({ skills = [], convId, onRefresh, onDelete, onU
     const bS = b.scope === 'session' || b.session_id ? 0 : 1
     return aS - bS
   })
+
+  const sessionSkills = sorted.filter((s) => s.scope === 'session' || s.session_id)
+  const userSkills = sorted.filter((s) => !(s.scope === 'session' || s.session_id))
+  const bundleChildren = sessionSkills.filter((s) =>
+    s.is_bundle_child || s.bundle_parent || s.bundle_root || s.source_root || s.category === 'skills-bundle'
+  )
+  const childNames = new Set(bundleChildren.map((s) => s.name))
+  const explicitMainName = bundleChildren.find((s) => s.bundle_root)?.bundle_root
+    || bundleChildren.find((s) => s.source_root)?.source_root
+    || bundleChildren.find((s) => s.bundle_parent)?.bundle_parent
+  const explicitMain = explicitMainName
+    ? sessionSkills.find((s) => s.name === explicitMainName)
+    : null
+  const candidateMains = sessionSkills.filter((s) => !childNames.has(s.name) && s.category !== 'skills-bundle')
+  const bundleMain = explicitMain || (bundleChildren.length > 0 && candidateMains.length === 1 ? candidateMains[0] : null)
+  const groupedItems = bundleMain
+    ? [
+        { type: 'group', key: `bundle-${bundleMain.session_id || 'session'}-${bundleMain.name}`, main: bundleMain, children: bundleChildren.filter((s) => s.name !== bundleMain.name) },
+        ...sessionSkills.filter((s) => s.name !== bundleMain.name && !childNames.has(s.name)).map((skill) => ({ type: 'skill', key: `${skill.session_id || 'session'}-${skill.name}`, skill })),
+        ...userSkills.map((skill) => ({ type: 'skill', key: `${skill.session_id || 'user'}-${skill.name}`, skill })),
+      ]
+    : sorted.map((skill) => ({ type: 'skill', key: `${skill.session_id || 'user'}-${skill.name}`, skill }))
 
   async function handlePromote(skill) {
     if (!confirm(`确认将 Skill "${skill.name}" 升级为 user-level?`)) return
@@ -348,12 +448,25 @@ export default function SkillBar({ skills = [], convId, onRefresh, onDelete, onU
             {skills.length}
           </span>
         </div>
-        {sorted.map((s) => (
-          <SkillChip
-            key={`${s.session_id || 'user'}-${s.name}`}
-            skill={s}
-            onClick={() => setActive(s)}
-          />
+        {groupedItems.map((item) => (
+          item.type === 'group' ? (
+            <SkillGroupChip
+              key={item.key}
+              group={{ main: item.main, children: item.children }}
+              expanded={expandedGroup === item.key}
+              onToggle={() => setExpandedGroup((current) => current === item.key ? '' : item.key)}
+              onOpen={(skill) => {
+                setActive(skill)
+                setExpandedGroup('')
+              }}
+            />
+          ) : (
+            <SkillChip
+              key={item.key}
+              skill={item.skill}
+              onClick={() => setActive(item.skill)}
+            />
+          )
         ))}
         {convId && (
           <button

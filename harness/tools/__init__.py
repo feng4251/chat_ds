@@ -116,6 +116,7 @@ register(
     parallel_safe=False,
     path_scoped=True,
     emoji="📝",
+    allow_in_parallel_child=False,
 )
 
 register(
@@ -127,6 +128,7 @@ register(
     parallel_safe=False,
     path_scoped=True,
     emoji="🩹",
+    allow_in_parallel_child=False,
 )
 
 register(
@@ -151,6 +153,8 @@ register(
     CLARIFY_SCHEMA,
     clarify,
     emoji="❓",
+    allow_in_child=False,
+    requires_user_visibility=True,
 )
 
 register(
@@ -158,6 +162,8 @@ register(
     MEMORY_SCHEMA,
     memory,
     emoji="🧠",
+    allow_in_child=False,
+    mutates_global_state=True,
 )
 
 # ── Phase 4: Skills tools ─────────────────────────────────────────────────────
@@ -190,6 +196,7 @@ register(
     parallel_safe=False,
     path_scoped=True,
     emoji="🛠️",
+    allow_in_parallel_child=False,
 )
 
 # ── Phase 7: Browser tools ────────────────────────────────────────────────────
@@ -302,6 +309,8 @@ register(
     SESSIONS_FORK_SCHEMA,
     sessions_fork,
     emoji="🌿",
+    allow_in_child=False,
+    mutates_global_state=True,
 )
 
 register(
@@ -309,6 +318,8 @@ register(
     SESSIONS_SEND_SCHEMA,
     sessions_send,
     emoji="📨",
+    allow_in_child=False,
+    mutates_global_state=True,
 )
 
 register(
@@ -323,6 +334,7 @@ register(
     DELEGATE_TASK_SCHEMA,
     delegate_task,
     emoji="🧩",
+    allow_in_child=False,
 )
 
 register(
@@ -330,6 +342,8 @@ register(
     CRONJOB_SCHEMA,
     cronjob,
     emoji="⏰",
+    allow_in_child=False,
+    mutates_global_state=True,
 )
 
 register(
@@ -344,6 +358,8 @@ register(
     CREATE_GOAL_SCHEMA,
     create_goal,
     emoji="🎯",
+    allow_in_child=False,
+    mutates_global_state=True,
 )
 
 register(
@@ -351,4 +367,6 @@ register(
     UPDATE_GOAL_SCHEMA,
     update_goal,
     emoji="🎯",
+    allow_in_child=False,
+    mutates_global_state=True,
 )

@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import {
   FiSend, FiPaperclip, FiX, FiMessageSquare, FiFile,
-  FiSliders, FiChevronDown, FiCode, FiBookOpen, FiImage, FiSearch,
-  FiArrowDown, FiRefreshCw, FiAlertCircle, FiCheckCircle,
+  FiSliders, FiCode, FiBookOpen, FiImage, FiSearch,
+  FiArrowDown, FiCpu,
 } from 'react-icons/fi'
 import { MessageBubble } from './MessageBubble'
 import ModelSelector from './ModelSelector'
@@ -23,6 +23,129 @@ const SAMPLE_PROMPTS = [
 
 const CAPABILITIES = ['GLM-5.2 主模型', 'Qwen3-5 多模态', '可接入自定义模型']
 
+function updateAgentRuns(runs, event) {
+  if (!event?.run_id) return runs || []
+  const payload = event.payload || {}
+  const id = event.run_id
+  const next = [...(runs || [])]
+  let idx = next.findIndex((run) => run.id === id)
+  if (idx < 0) {
+    next.push({
+      id,
+      parent_run_id: event.parent_run_id || null,
+      root_run_id: event.root_run_id || id,
+      agent_kind: event.agent_kind || 'agent',
+      agent_name: event.agent_name || event.agent_kind || 'agent',
+      depth: event.depth || 0,
+      workspace_scope: event.workspace_scope || 'shared_session',
+      status: 'running',
+      preview: '',
+      tools: [],
+      artifacts: [],
+      verifier: null,
+      usage: null,
+      events: [],
+    })
+    idx = next.length - 1
+  }
+  const run = { ...next[idx], events: [...(next[idx].events || []), event] }
+  run.parent_run_id = event.parent_run_id || run.parent_run_id
+  run.root_run_id = event.root_run_id || run.root_run_id
+  run.agent_kind = event.agent_kind || run.agent_kind
+  run.agent_name = event.agent_name || run.agent_name
+  run.depth = event.depth ?? run.depth
+  run.workspace_scope = event.workspace_scope || run.workspace_scope
+  if (event.event_type === 'agent.spawned' || event.event_type === 'run.started') run.status = 'running'
+  if (event.event_type === 'agent.delta') run.preview = (run.preview || '') + (payload.content || '')
+  if (event.event_type === 'tool.started') run.tools = [...run.tools, { name: payload.tool_name, status: 'running' }]
+  if (event.event_type === 'tool.completed' || event.event_type === 'tool.failed') {
+    const tools = [...run.tools]
+    const toolIdx = [...tools].reverse().findIndex((tool) => tool.name === payload.tool_name && tool.status === 'running')
+    if (toolIdx >= 0) {
+      const realIdx = tools.length - 1 - toolIdx
+      tools[realIdx] = { ...tools[realIdx], status: event.event_type === 'tool.completed' ? 'success' : 'failed', detail: payload.detail }
+    } else {
+      tools.push({ name: payload.tool_name, status: event.event_type === 'tool.completed' ? 'success' : 'failed', detail: payload.detail })
+    }
+    run.tools = tools
+  }
+  if (event.event_type === 'usage.updated') run.usage = payload
+  if (event.event_type === 'artifact.created') {
+    const artifact = {
+      title: payload.title || payload.path || 'artifact',
+      path: payload.path || '',
+      kind: payload.kind || 'file',
+      size_bytes: payload.size_bytes || payload.size || 0,
+    }
+    run.artifacts = [...(run.artifacts || []), artifact]
+  }
+  if (event.event_type === 'verifier.completed' || event.event_type === 'verifier.failed') {
+    run.verifier = {
+      status: event.event_type === 'verifier.failed' ? 'failed' : (payload.verdict || 'inconclusive'),
+      reason: payload.reason || payload.error || '',
+    }
+  }
+  if (event.event_type === 'run.completed') {
+    run.status = 'succeeded'
+    run.usage = payload.usage || run.usage
+  }
+  if (event.event_type === 'run.failed') {
+    run.status = 'failed'
+    run.error = payload.error || 'Unknown error'
+  }
+  next[idx] = run
+  return next
+}
+
+function AgentRunCards({ runs }) {
+  const visibleRuns = (runs || []).filter((run) => (
+    (run.agent_kind !== 'primary' && run.depth > 0)
+    || run.artifacts?.length > 0
+    || run.verifier
+  ))
+  if (visibleRuns.length === 0) return null
+  return (
+    <div className="ml-10 -mt-3 mb-5 space-y-2">
+      {visibleRuns.map((run) => (
+        <details key={run.id} className="rounded-xl border border-indigo-100 bg-indigo-50/40 px-3 py-2 text-xs" open={run.status === 'running'}>
+          <summary className="cursor-pointer flex items-center gap-2 text-slate-700">
+            <FiCpu className="text-indigo-500" size={13} />
+            <span className="font-medium">{run.agent_name || run.agent_kind}</span>
+            <span className={run.status === 'failed' ? 'text-red-600' : run.status === 'succeeded' ? 'text-green-600' : 'text-amber-600'}>{run.status}</span>
+            <span className="text-slate-400">{run.workspace_scope}</span>
+          </summary>
+          {run.tools?.length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {run.tools.slice(-8).map((tool, idx) => (
+                <span key={`${tool.name}-${idx}`} className="px-2 py-0.5 rounded-full bg-white border border-indigo-100 text-slate-600">
+                  {tool.name}: {tool.status}
+                </span>
+              ))}
+            </div>
+          )}
+          {run.artifacts?.length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {run.artifacts.slice(-4).map((artifact, idx) => (
+                <span key={`${artifact.path || artifact.title}-${idx}`} className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-100 text-emerald-700">
+                  {artifact.title || artifact.path} · {(artifact.size_bytes || 0).toLocaleString()}b
+                </span>
+              ))}
+            </div>
+          )}
+          {run.verifier && (
+            <div className={run.verifier.status === 'pass' ? 'mt-2 text-emerald-600' : run.verifier.status === 'failed' || run.verifier.status === 'fail' ? 'mt-2 text-red-600' : 'mt-2 text-amber-600'}>
+              verifier: {run.verifier.status}{run.verifier.reason ? ` — ${run.verifier.reason}` : ''}
+            </div>
+          )}
+          {run.preview && <div className="mt-2 max-h-28 overflow-y-auto whitespace-pre-wrap text-slate-600 bg-white/70 rounded-lg p-2">{run.preview.slice(-800)}</div>}
+          {run.error && <div className="mt-2 text-red-600">{run.error}</div>}
+          {run.usage?.total_tokens ? <div className="mt-2 text-slate-400">{run.usage.total_tokens.toLocaleString()} tokens</div> : null}
+        </details>
+      ))}
+    </div>
+  )
+}
+
 export default function ChatArea({
   activeConv,
   models = [],
@@ -40,7 +163,6 @@ export default function ChatArea({
   const [workspaceOpen, setWorkspaceOpen] = useState(false)
   const [showScrollBtn, setShowScrollBtn] = useState(false)
   const [isDragging, setIsDragging] = useState(false)
-  const [retryingId, setRetryingId] = useState(null)
   const endRef = useRef(null)
   const scrollContainerRef = useRef(null)
   const inpRef = useRef(null)
@@ -81,6 +203,8 @@ export default function ChatArea({
     }
   }, [activeConv, models])
 
+  const hasNoMessages = msgs.length === 0
+
   // Track scroll position to show/hide "scroll to bottom" button
   useEffect(() => {
     const el = scrollContainerRef.current
@@ -93,7 +217,7 @@ export default function ChatArea({
 
     el.addEventListener('scroll', onScroll, { passive: true })
     return () => el.removeEventListener('scroll', onScroll)
-  }, [msgs.length === 0]) // re-attach when switching between welcome/chat
+  }, [hasNoMessages]) // re-attach when switching between welcome/chat
 
   // Auto-scroll to bottom when new content arrives — but only if user is already
   // near the bottom (don't fight manual scroll-up)
@@ -269,7 +393,7 @@ export default function ChatArea({
       el.removeEventListener('dragover', onDragOver)
       el.removeEventListener('drop', onDrop)
     }
-  }, [handleFiles, msgs.length === 0])
+  }, [handleFiles, hasNoMessages])
 
   async function doSend(textOverride) {
     const text = (textOverride ?? inp).trim()
@@ -291,6 +415,7 @@ export default function ChatArea({
       reasoning: '',
       id: 'a' + Date.now(),
       streaming: true,
+      agentRuns: [],
     }
     setMsgs((p) => [...p, uMsg, aMsg])
 
@@ -315,6 +440,9 @@ export default function ChatArea({
             if (evt.tool_progress) {
               updated.tool_progress =
                 (updated.tool_progress ? updated.tool_progress + '\n' : '') + evt.tool_progress
+            }
+            if (evt.agent_event) {
+              updated.agentRuns = updateAgentRuns(updated.agentRuns || [], evt.agent_event)
             }
             if (evt.reasoning_delta) {
               updated.reasoning = (updated.reasoning || '') + evt.reasoning_delta
@@ -378,6 +506,7 @@ export default function ChatArea({
         reasoning: '',
         id: 'a' + Date.now(),
         streaming: true,
+        agentRuns: [],
       }
       return next
     })
@@ -404,6 +533,9 @@ export default function ChatArea({
             if (evt.tool_progress) {
               updated.tool_progress =
                 (updated.tool_progress ? updated.tool_progress + '\n' : '') + evt.tool_progress
+            }
+            if (evt.agent_event) {
+              updated.agentRuns = updateAgentRuns(updated.agentRuns || [], evt.agent_event)
             }
             if (evt.reasoning_delta) {
               updated.reasoning = (updated.reasoning || '') + evt.reasoning_delta
@@ -537,11 +669,13 @@ export default function ChatArea({
               const isLastAssistant =
                 m.role === 'assistant' && i === msgs.length - 1 && !m.streaming
               return (
-                <MessageBubble
-                  key={m.id}
-                  msg={m}
-                  onRegenerate={isLastAssistant ? regenerateLast : undefined}
-                />
+                <div key={m.id}>
+                  <MessageBubble
+                    msg={m}
+                    onRegenerate={isLastAssistant ? regenerateLast : undefined}
+                  />
+                  {m.role === 'assistant' && <AgentRunCards runs={m.agentRuns} />}
+                </div>
               )
             })}
             <div ref={endRef} />

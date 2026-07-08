@@ -23,3 +23,11 @@ class ToolContext:
     enabled_tools: tuple[str, ...] = ()
     source: str = "chat"
     enabled_user_skills: tuple[str, ...] = ()
+    run_id: str | None = None
+    root_run_id: str | None = None
+    parent_run_id: str | None = None
+    agent_kind: str = "primary"
+    agent_name: str | None = None
+    depth: int = 0
+    workspace_scope: str = "shared_session"
+    event_sink: Any | None = None

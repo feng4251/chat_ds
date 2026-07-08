@@ -19,6 +19,10 @@ from pathlib import Path
 
 from tools.path_security import sandbox_dir, validate_path
 from tools.approval import check_file_write_safety
+from tools.omission_guard import (
+    compacted_history_omission_error,
+    contains_compacted_history_omission,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +145,8 @@ async def write_file(
     """
     if not isinstance(content, str):
         return json.dumps({"error": "content must be a string"})
+    if contains_compacted_history_omission(content):
+        return json.dumps(compacted_history_omission_error("content"), ensure_ascii=False)
 
     try:
         path = _resolve(filepath, user_id, session_id)
@@ -177,6 +183,10 @@ async def patch_file(
     """Apply an exact, atomic text replacement within a workspace file."""
     if not old_text:
         return json.dumps({"error": "old_text cannot be empty"})
+    if contains_compacted_history_omission(old_text):
+        return json.dumps(compacted_history_omission_error("old_text"), ensure_ascii=False)
+    if contains_compacted_history_omission(new_text):
+        return json.dumps(compacted_history_omission_error("new_text"), ensure_ascii=False)
     try:
         path = _resolve(filepath, user_id, session_id)
     except ValueError as exc:

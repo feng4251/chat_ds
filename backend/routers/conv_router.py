@@ -194,7 +194,6 @@ async def upload_session_file(
             with zipfile.ZipFile(io.BytesIO(contents)) as zf:
                 has_skill = any(
                     entry.replace("\\", "/").rstrip("/").split("/")[-1] == "SKILL.md"
-                    and len(entry.replace("\\", "/").rstrip("/").split("/")) <= 2
                     for entry in zf.namelist()
                 )
             if has_skill:
@@ -205,10 +204,17 @@ async def upload_session_file(
                     contents, filename, None, cid, cur_user, db
                 )
                 result["skill"] = install_result["skill"]
+                result["skills"] = install_result.get("skills", [install_result["skill"]])
+                result["installed_count"] = install_result.get("installed_count", len(result["skills"]))
                 result["mcp"] = install_result["mcp"]
-                result["message"] = (
-                    f"Skill '{install_result['skill']['name']}' installed for this session"
-                )
+                if result["installed_count"] == 1:
+                    result["message"] = (
+                        f"Skill '{install_result['skill']['name']}' installed for this session"
+                    )
+                else:
+                    result["message"] = (
+                        f"Installed {result['installed_count']} skills for this session"
+                    )
         except zipfile.BadZipFile:
             pass
 

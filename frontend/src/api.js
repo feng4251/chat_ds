@@ -131,6 +131,15 @@ export async function readWorkspaceFile(convId, path) {
   return await res.json()
 }
 
+export async function getWorkspaceFileBlobUrl(convId, path) {
+  const token = localStorage.getItem('token')
+  const res = await fetch(`${API}/conversations/${convId}/workspace/file/raw?path=${encodeURIComponent(path)}`, {
+    headers: token ? { Authorization: 'Bearer ' + token } : {},
+  })
+  if (!res.ok) throw new Error(`File preview failed (${res.status})`)
+  return URL.createObjectURL(await res.blob())
+}
+
 export async function writeWorkspaceFile(convId, path, content) {
   const res = await request(`/conversations/${convId}/workspace/file?path=${encodeURIComponent(path)}`, {
     method: 'PUT',
@@ -166,6 +175,34 @@ export async function clearGoal(convId) {
 
 export async function getRuns(convId) {
   const res = await request(`/conversations/${convId}/runs`)
+  return await res.json()
+}
+
+export async function getArtifacts(convId, params = {}) {
+  const search = new URLSearchParams()
+  if (params.run_id) search.set('run_id', params.run_id)
+  if (params.limit) search.set('limit', String(params.limit))
+  const suffix = search.toString() ? `?${search}` : ''
+  const res = await request(`/conversations/${convId}/artifacts${suffix}`)
+  return await res.json()
+}
+
+export async function getArtifact(convId, artifactId) {
+  const res = await request(`/conversations/${convId}/artifacts/${artifactId}`)
+  return await res.json()
+}
+
+export async function getTasks(convId) {
+  const res = await request(`/conversations/${convId}/tasks`)
+  return await res.json()
+}
+
+export async function getRunEvents(convId, runId, params = {}) {
+  const search = new URLSearchParams()
+  if (params.limit) search.set('limit', String(params.limit))
+  if (params.offset) search.set('offset', String(params.offset))
+  const suffix = search.toString() ? `?${search}` : ''
+  const res = await request(`/conversations/${convId}/runs/${runId}/events${suffix}`)
   return await res.json()
 }
 

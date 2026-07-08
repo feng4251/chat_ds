@@ -4,7 +4,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
     # vLLM provider endpoints (from env)
-    deepseek_pro_url: str = "http://10.10.132.126:1025/v1"
+    deepseek_pro_url: str = "http://10.10.132.2:1025/v1"
     qwen3_5_url: str = "http://10.10.132.128:1025/v1"
 
     # Internal model for context compression (auxiliary summarization)
@@ -26,13 +26,13 @@ PROVIDERS: dict[str, dict] = {
         "base_url": settings.deepseek_pro_url,
         "api_model": "AgentModel",
         "api_key": "EMPTY",
-        "provider": "DeepSeek",
-        "display_name": "DeepSeek-V4-Flash (主模型)",
+        "provider": "ZhipuAI",
+        "display_name": "GLM-5.2 (主模型)",
         "is_multimodal": False,
         "is_default": True,
         "capabilities": ["text", "tools", "reasoning"],
         "protocol": "openai",
-        "context_length": 1048572,
+        "context_length": 303872,
     },
     "qwen3_5": {
         "base_url": settings.qwen3_5_url,
