@@ -12,9 +12,9 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:///./chat_ds.db"
 
     # Default model endpoints (intranet)
-    # 10.10.132.126 serves AgentModel (DeepSeek-V4-Flash, 1M ctx) — 主模型
+    # 10.10.132.2 serves AgentModel (GLM-5.2, 303872 ctx) — 主模型
     # 10.10.132.128 serves qwen3_5 (397B, multimodal) — 多模态识别
-    deepseek_pro_base_url: str = "http://10.10.132.126:1025/v1"
+    deepseek_pro_base_url: str = "http://10.10.132.2:1025/v1"
     deepseek_pro_api_key: str = "EMPTY"
     qwen3_5_base_url: str = "http://10.10.132.128:1025/v1"
     qwen3_5_api_key: str = "EMPTY"

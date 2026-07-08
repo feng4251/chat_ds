@@ -7,7 +7,7 @@ import shutil
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,12 +15,15 @@ from auth import get_current_user
 from database import get_db
 from models import (
     AgentRun,
+    AgentRunEvent,
+    Artifact,
     Conversation,
     CustomModelConfig,
     Message,
     ScheduledJob,
     ScheduledJobRun,
     SkillPackage,
+    TaskItem,
 )
 from schemas import (
     ConversationSettingsUpdate,
@@ -37,6 +40,7 @@ from workspace import (
     redact_trajectory_value,
     safe_workspace_path,
     serialize_json_list,
+    workspace_file_metadata,
 )
 from hooks import emit_event
 
@@ -111,12 +115,49 @@ async def read_workspace_file(
         raise HTTPException(400, str(exc))
     if not file_path.is_file():
         raise HTTPException(400, "Not a regular file")
+    meta = workspace_file_metadata(file_path)
+    if not meta["is_text"]:
+        return {
+            "path": path,
+            "content": "",
+            "editable": False,
+            **meta,
+        }
     if file_path.stat().st_size > MAX_WORKSPACE_FILE_CHARS * 4:
-        raise HTTPException(400, "File is too large to edit in the browser")
+        return {
+            "path": path,
+            "content": "",
+            "editable": False,
+            "too_large": True,
+            **meta,
+        }
     return {
         "path": path,
         "content": file_path.read_text(encoding="utf-8", errors="replace"),
+        "editable": True,
+        **meta,
     }
+
+
+@router.get("/{cid}/workspace/file/raw")
+async def raw_workspace_file(
+    cid: str,
+    path: str = Query(...),
+    user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    await _conversation(cid, user.id, db)
+    try:
+        file_path = safe_workspace_path(user.id, cid, path, must_exist=True)
+    except FileNotFoundError:
+        raise HTTPException(404, "File not found")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    if not file_path.is_file():
+        raise HTTPException(400, "Not a regular file")
+    meta = workspace_file_metadata(file_path)
+    headers = {"Content-Disposition": f'inline; filename="{file_path.name}"'}
+    return FileResponse(file_path, media_type=meta["mime_type"], filename=file_path.name, headers=headers)
 
 
 @router.put("/{cid}/workspace/file")
@@ -364,28 +405,125 @@ async def fork_conversation(
     return {"id": fork.id, "title": fork.title, "source_conversation_id": cid}
 
 
-@router.get("/{cid}/runs")
-async def list_runs(
+def _artifact_to_dict(artifact: Artifact) -> dict:
+    return {
+        "id": artifact.id,
+        "run_id": artifact.run_id,
+        "root_run_id": artifact.root_run_id,
+        "parent_run_id": artifact.parent_run_id,
+        "kind": artifact.kind,
+        "title": artifact.title,
+        "path": artifact.path,
+        "mime_type": artifact.mime_type,
+        "preview_kind": artifact.preview_kind,
+        "size_bytes": artifact.size_bytes,
+        "sha256": artifact.sha256,
+        "source_tool_name": artifact.source_tool_name,
+        "source_tool_call_id": artifact.source_tool_call_id,
+        "source_event_key": artifact.source_event_key,
+        "summary": artifact.summary,
+        "metadata": json.loads(artifact.metadata_json) if artifact.metadata_json else {},
+        "created_at": str(artifact.created_at),
+    }
+
+
+def _task_to_dict(task: TaskItem) -> dict:
+    return {
+        "id": task.id,
+        "run_id": task.run_id,
+        "root_run_id": task.root_run_id,
+        "parent_run_id": task.parent_run_id,
+        "task_key": task.task_key,
+        "kind": task.kind,
+        "title": task.title,
+        "status": task.status,
+        "agent_name": task.agent_name,
+        "summary": task.summary,
+        "error": task.error,
+        "metadata": json.loads(task.metadata_json) if task.metadata_json else {},
+        "started_at": str(task.started_at),
+        "ended_at": str(task.ended_at) if task.ended_at else None,
+        "updated_at": str(task.updated_at),
+    }
+
+
+@router.get("/{cid}/artifacts")
+async def list_artifacts(
     cid: str,
-    limit: int = Query(50, ge=1, le=200),
+    run_id: str | None = None,
+    limit: int = Query(200, ge=1, le=500),
     user=Depends(get_current_user),
     db=Depends(get_db),
 ):
     await _conversation(cid, user.id, db)
-    runs = (await db.execute(
-        select(AgentRun)
-        .where(AgentRun.conversation_id == cid, AgentRun.user_id == user.id)
-        .order_by(desc(AgentRun.started_at))
+    query = select(Artifact).where(
+        Artifact.conversation_id == cid,
+        Artifact.user_id == user.id,
+    )
+    if run_id:
+        query = query.where(Artifact.run_id == run_id)
+    artifacts = (await db.execute(
+        query.order_by(desc(Artifact.created_at)).limit(limit)
+    )).scalars().all()
+    return {"artifacts": [_artifact_to_dict(artifact) for artifact in artifacts]}
+
+
+@router.get("/{cid}/artifacts/{artifact_id}")
+async def get_artifact(
+    cid: str,
+    artifact_id: str,
+    user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    await _conversation(cid, user.id, db)
+    artifact = (await db.execute(
+        select(Artifact).where(
+            Artifact.id == artifact_id,
+            Artifact.conversation_id == cid,
+            Artifact.user_id == user.id,
+        )
+    )).scalar_one_or_none()
+    if artifact is None:
+        raise HTTPException(404, "Artifact not found")
+    return _artifact_to_dict(artifact)
+
+
+@router.get("/{cid}/tasks")
+async def list_tasks(
+    cid: str,
+    limit: int = Query(500, ge=1, le=1000),
+    user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    await _conversation(cid, user.id, db)
+    tasks = (await db.execute(
+        select(TaskItem)
+        .where(TaskItem.conversation_id == cid, TaskItem.user_id == user.id)
+        .order_by(desc(TaskItem.updated_at))
         .limit(limit)
     )).scalars().all()
-    return [{
+    return {"tasks": [_task_to_dict(task) for task in tasks]}
+
+
+def _run_to_dict(run: AgentRun) -> dict:
+    return {
         "id": run.id,
+        "parent_run_id": run.parent_run_id,
+        "root_run_id": run.root_run_id or run.id,
+        "agent_kind": run.agent_kind or "primary",
+        "agent_name": run.agent_name,
+        "depth": run.depth or 0,
+        "workspace_scope": run.workspace_scope or "shared_session",
+        "workspace_ref": run.workspace_ref,
         "source": run.source,
         "requested_model_id": run.requested_model_id,
         "resolved_model_id": run.resolved_model_id,
         "status": run.status,
         "finish_reason": run.finish_reason,
         "error": run.error,
+        "requested_tools": json.loads(run.requested_tools) if run.requested_tools else [],
+        "effective_tools": json.loads(run.effective_tools) if run.effective_tools else [],
+        "policy": json.loads(run.policy) if run.policy else None,
         "tool_events": json.loads(run.tool_events) if run.tool_events else [],
         "usage": {
             "input_tokens": run.input_tokens,
@@ -394,7 +532,101 @@ async def list_runs(
         },
         "started_at": str(run.started_at),
         "ended_at": str(run.ended_at) if run.ended_at else None,
-    } for run in runs]
+        "children": [],
+    }
+
+
+@router.get("/{cid}/runs")
+async def list_runs(
+    cid: str,
+    limit: int = Query(200, ge=1, le=500),
+    user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    await _conversation(cid, user.id, db)
+    runs = (await db.execute(
+        select(AgentRun)
+        .where(AgentRun.conversation_id == cid, AgentRun.user_id == user.id)
+        .order_by(AgentRun.started_at)
+        .limit(limit)
+    )).scalars().all()
+    nodes = {run.id: _run_to_dict(run) for run in runs}
+    roots: list[dict] = []
+    for run in runs:
+        node = nodes[run.id]
+        parent_id = run.parent_run_id
+        if parent_id and parent_id in nodes:
+            nodes[parent_id]["children"].append(node)
+        else:
+            roots.append(node)
+    flat = sorted(nodes.values(), key=lambda item: item.get("started_at") or "", reverse=True)
+    return {"runs": flat, "tree": roots}
+
+
+@router.get("/{cid}/runs/{run_id}")
+async def get_run(
+    cid: str,
+    run_id: str,
+    user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    await _conversation(cid, user.id, db)
+    run = (await db.execute(
+        select(AgentRun).where(
+            AgentRun.id == run_id,
+            AgentRun.conversation_id == cid,
+            AgentRun.user_id == user.id,
+        )
+    )).scalar_one_or_none()
+    if run is None:
+        raise HTTPException(404, "Run not found")
+    return _run_to_dict(run)
+
+
+@router.get("/{cid}/runs/{run_id}/events")
+async def get_run_events(
+    cid: str,
+    run_id: str,
+    limit: int = Query(500, ge=1, le=2000),
+    offset: int = Query(0, ge=0),
+    user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    await _conversation(cid, user.id, db)
+    run = (await db.execute(
+        select(AgentRun.id).where(
+            AgentRun.id == run_id,
+            AgentRun.conversation_id == cid,
+            AgentRun.user_id == user.id,
+        )
+    )).scalar_one_or_none()
+    if run is None:
+        raise HTTPException(404, "Run not found")
+    events = (await db.execute(
+        select(AgentRunEvent)
+        .where(AgentRunEvent.run_id == run_id, AgentRunEvent.conversation_id == cid)
+        .order_by(AgentRunEvent.seq, AgentRunEvent.event_time)
+        .offset(offset)
+        .limit(limit)
+    )).scalars().all()
+    return {
+        "events": [
+            {
+                "id": event.id,
+                "run_id": event.run_id,
+                "parent_run_id": event.parent_run_id,
+                "seq": event.seq,
+                "event_type": event.event_type,
+                "payload": json.loads(event.payload) if event.payload else {},
+                "tool_name": event.tool_name,
+                "tool_call_id": event.tool_call_id,
+                "event_time": str(event.event_time),
+            }
+            for event in events
+        ],
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @router.get("/{cid}/trajectory")
@@ -407,7 +639,9 @@ async def export_trajectory(
     messages = (await db.execute(
         select(Message).where(Message.conversation_id == cid).order_by(Message.created_at)
     )).scalars().all()
-    runs = await list_runs(cid, 200, user, db)
+    runs_payload = await list_runs(cid, 200, user, db)
+    artifacts_payload = await list_artifacts(cid, None, 500, user, db)
+    tasks_payload = await list_tasks(cid, 1000, user, db)
     jobs = (await db.execute(
         select(ScheduledJob)
         .where(ScheduledJob.conversation_id == cid, ScheduledJob.user_id == user.id)
@@ -420,7 +654,7 @@ async def export_trajectory(
         .limit(500)
     )).scalars().all()
     payload = {
-        "schema": "chat-ds-session-trajectory-v1",
+        "schema": "chat-ds-session-trajectory-v2",
         "conversation": {
             "id": conv.id,
             "title": conv.title,
@@ -446,7 +680,10 @@ async def export_trajectory(
             },
             "created_at": str(m.created_at),
         } for m in messages],
-        "runs": redact_trajectory_value(runs),
+        "runs": redact_trajectory_value(runs_payload.get("runs", [])),
+        "run_tree": redact_trajectory_value(runs_payload.get("tree", [])),
+        "artifacts": redact_trajectory_value(artifacts_payload.get("artifacts", [])),
+        "tasks": redact_trajectory_value(tasks_payload.get("tasks", [])),
         "scheduled_jobs": [{
             "id": job.id,
             "name": job.name,

@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import {
   FiX, FiSave, FiTrash2, FiPlus, FiPlay, FiDownload,
   FiFolder, FiTarget, FiClock, FiSliders, FiActivity, FiServer, FiZap,
-  FiEye, FiEdit3, FiColumns,
+  FiEye, FiEdit3, FiColumns, FiArchive, FiCheckSquare,
 } from 'react-icons/fi'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -10,8 +10,8 @@ import rehypeHighlight from 'rehype-highlight'
 import 'highlight.js/styles/github-dark.css'
 import {
   getConversationSettings, updateConversationSettings,
-  getWorkspace, readWorkspaceFile, writeWorkspaceFile, deleteWorkspaceFile,
-  getGoal, updateGoal, clearGoal, getRuns, downloadTrajectory,
+  getWorkspace, readWorkspaceFile, getWorkspaceFileBlobUrl, writeWorkspaceFile, deleteWorkspaceFile,
+  getGoal, updateGoal, clearGoal, getRuns, getRunEvents, getArtifacts, getTasks, downloadTrajectory,
   getSchedules, createSchedule, updateSchedule, deleteSchedule, runSchedule,
   getHooks, createHook, updateHook, deleteHook,
   getMcpServers, addMcpServer, deleteMcpServer,
@@ -23,6 +23,26 @@ const TOOL_GROUPS = {
   '知识与会话': ['memory', 'session_search', 'sessions_list', 'sessions_history', 'sessions_send', 'sessions_fork', 'session_status', 'skills_list', 'skill_view', 'skill_manage'],
   '协作与自动化': ['todo', 'clarify', 'delegate_task', 'cronjob', 'get_goal', 'create_goal', 'update_goal'],
   '多模态与扩展': ['image_generate', 'vision_analyze', 'mcp_server_list', 'mcp_server_status'],
+}
+
+const TOOL_POLICY_BADGES = {
+  read_file: ['read-only'],
+  search_files: ['read-only'],
+  web_search: ['read-only'],
+  web_extract: ['read-only'],
+  browser_snapshot: ['read-only'],
+  write_file: ['workspace', 'parallel-child-off'],
+  patch_file: ['workspace', 'parallel-child-off'],
+  execute_code: ['sandbox'],
+  skill_manage: ['workspace', 'parallel-child-off'],
+  clarify: ['child-off', 'user-visible'],
+  memory: ['child-off', 'global-state'],
+  sessions_fork: ['child-off', 'global-state'],
+  sessions_send: ['child-off', 'global-state'],
+  delegate_task: ['child-off'],
+  cronjob: ['child-off', 'global-state'],
+  create_goal: ['child-off', 'global-state'],
+  update_goal: ['child-off', 'global-state'],
 }
 
 function isMarkdownFile(path) {
@@ -84,9 +104,15 @@ export default function SessionWorkspace({ open, onClose, convId, models, onSett
   const [workspace, setWorkspace] = useState({ files: [] })
   const [selectedFile, setSelectedFile] = useState('')
   const [fileContent, setFileContent] = useState('')
+  const [fileMeta, setFileMeta] = useState(null)
+  const [fileBlobUrl, setFileBlobUrl] = useState('')
   const [previewMode, setPreviewMode] = useState('split')
   const [goal, setGoal] = useState({})
   const [runs, setRuns] = useState([])
+  const [runTree, setRunTree] = useState([])
+  const [runEvents, setRunEvents] = useState({ runId: '', events: [] })
+  const [artifacts, setArtifacts] = useState([])
+  const [tasks, setTasks] = useState([])
   const [jobs, setJobs] = useState([])
   const [hooks, setHooks] = useState([])
   const [mcpServers, setMcpServers] = useState([])
@@ -108,15 +134,20 @@ export default function SessionWorkspace({ open, onClose, convId, models, onSett
       getWorkspace(convId),
       getGoal(convId),
       getRuns(convId),
+      getArtifacts(convId),
+      getTasks(convId),
       getSchedules(convId),
       getHooks(),
       getMcpServers(convId),
-    ]).then(([s, w, g, r, j, h, m]) => {
+    ]).then(([s, w, g, r, a, t, j, h, m]) => {
       if (cancelled) return
       setSettings(s)
       setWorkspace(w)
       setGoal(g)
-      setRuns(r)
+      setRuns(Array.isArray(r) ? r : (r.runs || []))
+      setRunTree(Array.isArray(r) ? [] : (r.tree || []))
+      setArtifacts(a.artifacts || [])
+      setTasks(t.tasks || [])
       setJobs(j)
       setHooks(h)
       setMcpServers(m.servers || [])
@@ -125,6 +156,12 @@ export default function SessionWorkspace({ open, onClose, convId, models, onSett
     })
     return () => { cancelled = true }
   }, [open, convId])
+
+  useEffect(() => {
+    return () => {
+      if (fileBlobUrl) URL.revokeObjectURL(fileBlobUrl)
+    }
+  }, [fileBlobUrl])
 
   async function saveSettings() {
     setSaving(true)
@@ -141,9 +178,20 @@ export default function SessionWorkspace({ open, onClose, convId, models, onSett
 
   async function openFile(path) {
     setSelectedFile(path)
+    if (fileBlobUrl) URL.revokeObjectURL(fileBlobUrl)
+    setFileBlobUrl('')
+    setFileContent('')
+    setFileMeta(null)
     try {
       const data = await readWorkspaceFile(convId, path)
-      setFileContent(data.content)
+      setFileMeta(data)
+      if (data.editable) {
+        setFileContent(data.content || '')
+      }
+      if (!data.editable || ['pdf', 'image', 'office', 'binary'].includes(data.preview_kind)) {
+        const url = await getWorkspaceFileBlobUrl(convId, path)
+        setFileBlobUrl(url)
+      }
     } catch (e) { setError(e.message) }
   }
 
@@ -170,7 +218,17 @@ export default function SessionWorkspace({ open, onClose, convId, models, onSett
       await deleteWorkspaceFile(convId, selectedFile)
       setSelectedFile('')
       setFileContent('')
+      setFileMeta(null)
+      if (fileBlobUrl) URL.revokeObjectURL(fileBlobUrl)
+      setFileBlobUrl('')
       setWorkspace(await getWorkspace(convId))
+    } catch (e) { setError(e.message) }
+  }
+
+  async function openRunEvents(runId) {
+    try {
+      const data = await getRunEvents(convId, runId)
+      setRunEvents({ runId, events: data.events || [] })
     } catch (e) { setError(e.message) }
   }
 
@@ -238,6 +296,8 @@ export default function SessionWorkspace({ open, onClose, convId, models, onSett
   const tabs = [
     ['settings', FiSliders, '运行配置'],
     ['workspace', FiFolder, '工作区'],
+    ['artifacts', FiArchive, '产物'],
+    ['tasks', FiCheckSquare, '任务'],
     ['goal', FiTarget, '目标'],
     ['automation', FiClock, '自动化'],
     ['mcp', FiServer, 'MCP'],
@@ -245,9 +305,12 @@ export default function SessionWorkspace({ open, onClose, convId, models, onSett
     ['runs', FiActivity, '轨迹'],
   ]
 
-  const isMd = isMarkdownFile(selectedFile)
-  const showPreview = isMd && previewMode !== 'edit'
-  const showEditor = !isMd || previewMode !== 'preview'
+  const previewKind = fileMeta?.preview_kind || (isMarkdownFile(selectedFile) ? 'markdown' : 'text')
+  const isMd = previewKind === 'markdown'
+  const isEditable = fileMeta?.editable !== false
+  const canPreviewContent = selectedFile && previewMode !== 'edit'
+  const showPreview = Boolean(canPreviewContent)
+  const showEditor = isEditable && selectedFile && previewMode !== 'preview'
   const gridTemplate = showPreview && showEditor
     ? 'grid-cols-[200px_1fr_1fr] min-h-[600px]'
     : 'grid-cols-[200px_1fr] min-h-[600px]'
@@ -316,9 +379,12 @@ export default function SessionWorkspace({ open, onClose, convId, models, onSett
                     <button
                       key={f.path}
                       onClick={() => openFile(f.path)}
-                      className={`block w-full text-left px-3 py-1.5 text-xs truncate border-l-2 ${selectedFile === f.path ? 'bg-indigo-50 text-indigo-700 border-indigo-500 font-medium' : 'hover:bg-stone-50 border-transparent text-slate-700'}`}
+                      className={`flex w-full items-center gap-2 text-left px-3 py-1.5 text-xs border-l-2 ${selectedFile === f.path ? 'bg-indigo-50 text-indigo-700 border-indigo-500 font-medium' : 'hover:bg-stone-50 border-transparent text-slate-700'}`}
                     >
-                      {f.path}
+                      <span className="min-w-0 flex-1 truncate">{f.path}</span>
+                      {f.preview_kind && (
+                        <span className="shrink-0 text-[10px] text-slate-400">{f.preview_kind}</span>
+                      )}
                     </button>
                   ))}
                   {workspace.files.length === 0 && (
@@ -382,21 +448,92 @@ export default function SessionWorkspace({ open, onClose, convId, models, onSett
                     </span>
                     <span className="text-[10px] text-slate-400 font-mono truncate max-w-[200px]">{selectedFile}</span>
                   </div>
-                  <div className="flex-1 overflow-y-auto p-4 prose prose-sm max-w-none">
-                    {fileContent ? (
-                      <ReactMarkdown
-                        remarkPlugins={[[remarkGfm, { singleTilde: false }]]}
-                        rehypePlugins={[rehypeHighlight]}
-                        components={mdComponents}
-                      >
-                        {fileContent}
-                      </ReactMarkdown>
+                  <div className={`flex-1 ${['pdf', 'image'].includes(previewKind) ? 'overflow-hidden p-0' : 'overflow-y-auto p-4'} ${isMd ? 'prose prose-sm max-w-none' : ''}`}>
+                    {previewKind === 'markdown' ? (
+                      fileContent ? (
+                        <ReactMarkdown
+                          remarkPlugins={[[remarkGfm, { singleTilde: false }]]}
+                          rehypePlugins={[rehypeHighlight]}
+                          components={mdComponents}
+                        >
+                          {fileContent}
+                        </ReactMarkdown>
+                      ) : (
+                        <div className="text-xs text-slate-400 italic">无内容</div>
+                      )
+                    ) : previewKind === 'text' ? (
+                      <pre className="whitespace-pre-wrap break-words font-mono text-xs leading-relaxed text-slate-700">{fileContent || '无内容'}</pre>
+                    ) : previewKind === 'pdf' && fileBlobUrl ? (
+                      <iframe src={fileBlobUrl} title={selectedFile} className="w-full h-full min-h-[560px] bg-stone-50" />
+                    ) : previewKind === 'image' && fileBlobUrl ? (
+                      <div className="h-full min-h-[560px] flex items-center justify-center bg-stone-50 p-4">
+                        <img src={fileBlobUrl} alt={selectedFile} className="max-w-full max-h-full rounded-lg shadow-sm" />
+                      </div>
+                    ) : previewKind === 'office' ? (
+                      <FileFallback fileBlobUrl={fileBlobUrl} selectedFile={selectedFile} label="Office 文件暂不做在线转码预览" />
                     ) : (
-                      <div className="text-xs text-slate-400 italic">无内容</div>
+                      <FileFallback fileBlobUrl={fileBlobUrl} selectedFile={selectedFile} label="该文件类型不可直接预览" />
                     )}
                   </div>
                 </div>
               )}
+            </div>
+          )}
+
+          {tab === 'artifacts' && (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="text-sm font-medium text-slate-800">Session artifacts</div>
+                <button onClick={async () => setArtifacts((await getArtifacts(convId)).artifacts || [])} className="secondary">刷新</button>
+              </div>
+              {artifacts.map((artifact) => (
+                <button
+                  key={artifact.id}
+                  onClick={() => {
+                    if (artifact.path) {
+                      setTab('workspace')
+                      openFile(artifact.path)
+                    }
+                  }}
+                  className="w-full text-left p-3 border border-stone-200 rounded-xl bg-white hover:bg-stone-50"
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="text-sm font-medium text-slate-800 truncate">{artifact.title || artifact.path || artifact.id}</div>
+                      <div className="text-xs text-slate-500 mt-1 truncate">{artifact.path || artifact.kind} · {artifact.preview_kind || artifact.mime_type || 'artifact'}</div>
+                    </div>
+                    <div className="text-right text-[11px] text-slate-400 shrink-0">
+                      <div>{(artifact.size_bytes || 0).toLocaleString()} bytes</div>
+                      <div className="font-mono">{(artifact.run_id || '').slice(0, 8)}</div>
+                    </div>
+                  </div>
+                  {artifact.summary && <div className="mt-2 text-xs text-slate-500 line-clamp-2">{artifact.summary}</div>}
+                </button>
+              ))}
+              {artifacts.length === 0 && <div className="text-xs text-slate-400 italic">暂无 artifact</div>}
+            </div>
+          )}
+
+          {tab === 'tasks' && (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="text-sm font-medium text-slate-800">Durable tasks</div>
+                <button onClick={async () => setTasks((await getTasks(convId)).tasks || [])} className="secondary">刷新</button>
+              </div>
+              {tasks.map((task) => (
+                <button key={task.id} onClick={() => openRunEvents(task.run_id)} className="w-full text-left p-3 border border-stone-200 rounded-xl bg-white hover:bg-stone-50">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="text-sm font-medium text-slate-800 truncate">{task.title || task.task_key}</div>
+                      <div className="text-xs text-slate-500 mt-1">{task.kind} · {task.agent_name || 'agent'} · <span className="font-mono">{(task.run_id || '').slice(0, 8)}</span></div>
+                    </div>
+                    <span className={task.status === 'succeeded' ? 'text-green-600 text-xs' : task.status === 'failed' ? 'text-red-600 text-xs' : task.status === 'blocked' ? 'text-amber-600 text-xs' : 'text-indigo-600 text-xs'}>{task.status}</span>
+                  </div>
+                  {task.summary && <div className="mt-2 text-xs text-slate-500 line-clamp-2">{task.summary}</div>}
+                  {task.error && <div className="mt-2 text-xs text-red-600 line-clamp-2">{task.error}</div>}
+                </button>
+              ))}
+              {tasks.length === 0 && <div className="text-xs text-slate-400 italic">暂无 durable task</div>}
             </div>
           )}
 
@@ -477,17 +614,52 @@ export default function SessionWorkspace({ open, onClose, convId, models, onSett
           )}
 
           {tab === 'runs' && (
-            <div className="space-y-3">
-              <button onClick={() => downloadTrajectory(convId)} className="primary"><FiDownload />导出脱敏轨迹 JSON</button>
-              {runs.map((run) => <div key={run.id} className="border border-stone-200 rounded-xl p-3">
-                <div className="flex justify-between text-sm"><span className="font-medium">{run.resolved_model_id || run.requested_model_id}</span><span className={run.status === 'succeeded' ? 'text-green-600' : run.status === 'failed' ? 'text-red-600' : 'text-amber-600'}>{run.status}</span></div>
-                <div className="text-xs text-slate-500 mt-1">{run.started_at} · {run.usage.total_tokens.toLocaleString()} tokens · {run.finish_reason || '—'}</div>
-                {run.tool_events?.length > 0 && <div className="mt-2 text-[11px] text-slate-500 bg-stone-50 p-2 rounded">{run.tool_events.slice(-5).join(' · ')}</div>}
-                {run.error && <div className="mt-2 text-xs text-red-600">{run.error}</div>}
-              </div>)}
+            <div className="grid grid-cols-[1fr_1.1fr] gap-4">
+              <div className="space-y-3">
+                <button onClick={() => downloadTrajectory(convId)} className="primary"><FiDownload />导出脱敏轨迹 JSON</button>
+                {(runTree.length ? runTree : runs).map((run) => (
+                  <RunNode key={run.id} run={run} onOpenEvents={openRunEvents} />
+                ))}
+                {runs.length === 0 && <div className="text-xs text-slate-400 italic">暂无运行轨迹</div>}
+              </div>
+              <div className="border border-stone-200 rounded-xl overflow-hidden min-h-[420px]">
+                <div className="px-3 py-2 border-b bg-stone-50 text-xs font-medium">事件日志 {runEvents.runId ? <span className="font-mono text-slate-400">{runEvents.runId.slice(0, 8)}</span> : null}</div>
+                <div className="p-3 space-y-2 max-h-[640px] overflow-y-auto">
+                  {runEvents.events.map((event) => (
+                    <div key={event.id} className="text-[11px] border border-stone-100 rounded-lg p-2 bg-white">
+                      <div className="flex justify-between gap-2"><span className="font-medium text-slate-700">{event.seq}. {event.event_type}</span><span className="text-slate-400">{event.tool_name || ''}</span></div>
+                      <pre className="mt-1 whitespace-pre-wrap break-words text-slate-500 font-mono">{JSON.stringify(event.payload || {}, null, 2)}</pre>
+                    </div>
+                  ))}
+                  {!runEvents.runId && <div className="text-xs text-slate-400 italic">点击左侧 run 查看 normalized events</div>}
+                  {runEvents.runId && runEvents.events.length === 0 && <div className="text-xs text-slate-400 italic">该 run 暂无事件</div>}
+                </div>
+              </div>
             </div>
           )}
         </div>
+      </div>
+    </div>
+  )
+}
+
+function FileFallback({ fileBlobUrl, selectedFile, label }) {
+  return (
+    <div className="h-full min-h-[560px] flex items-center justify-center bg-stone-50 p-6 text-center">
+      <div className="max-w-sm">
+        <div className="text-sm font-medium text-slate-700">{label}</div>
+        <div className="mt-2 text-xs text-slate-500 break-all">{selectedFile}</div>
+        {fileBlobUrl && (
+          <a
+            href={fileBlobUrl}
+            target="_blank"
+            rel="noreferrer"
+            download={selectedFile?.split('/').pop() || undefined}
+            className="inline-flex items-center gap-1.5 mt-4 px-3 py-1.5 rounded-lg bg-indigo-600 text-white text-xs font-medium hover:bg-indigo-700"
+          >
+            <FiDownload size={12} /> 打开 / 下载
+          </a>
+        )}
       </div>
     </div>
   )
@@ -498,9 +670,42 @@ function Section({ title, children }) {
 }
 
 function Check({ label, checked, onChange }) {
-  return <label className="flex items-center gap-2 text-xs text-slate-700"><input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} />{label}</label>
+  const badges = TOOL_POLICY_BADGES[label] || []
+  return (
+    <label className="flex items-center gap-2 text-xs text-slate-700">
+      <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} />
+      <span>{label}</span>
+      {badges.map((badge) => (
+        <span key={badge} className="px-1.5 py-0.5 rounded bg-stone-100 text-[10px] text-slate-500">{badge}</span>
+      ))}
+    </label>
+  )
 }
 
 function Field({ label, children }) {
   return <label className="block"><span className="block text-xs text-slate-500 mb-1">{label}</span>{children}</label>
+}
+
+function RunNode({ run, onOpenEvents }) {
+  return (
+    <div className="border border-stone-200 rounded-xl p-3 bg-white">
+      <button onClick={() => onOpenEvents(run.id)} className="w-full text-left">
+        <div className="flex justify-between text-sm gap-2">
+          <span className="font-medium truncate">{run.agent_name || run.agent_kind || run.resolved_model_id || run.requested_model_id}</span>
+          <span className={run.status === 'succeeded' ? 'text-green-600' : run.status === 'failed' ? 'text-red-600' : 'text-amber-600'}>{run.status}</span>
+        </div>
+        <div className="text-xs text-slate-500 mt-1">
+          depth {run.depth || 0} · {run.workspace_scope || 'shared_session'} · {(run.usage?.total_tokens || 0).toLocaleString()} tokens · {run.finish_reason || '—'}
+        </div>
+        <div className="text-[10px] text-slate-400 mt-1 font-mono truncate">{run.id}</div>
+      </button>
+      {run.tool_events?.length > 0 && <div className="mt-2 text-[11px] text-slate-500 bg-stone-50 p-2 rounded">{run.tool_events.slice(-5).join(' · ')}</div>}
+      {run.error && <div className="mt-2 text-xs text-red-600">{run.error}</div>}
+      {run.children?.length > 0 && (
+        <div className="mt-3 ml-4 pl-3 border-l border-indigo-100 space-y-2">
+          {run.children.map((child) => <RunNode key={child.id} run={child} onOpenEvents={onOpenEvents} />)}
+        </div>
+      )}
+    </div>
+  )
 }

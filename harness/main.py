@@ -4,6 +4,7 @@ GET  /v1/models              → list configured providers
 POST /v1/chat/completions    → SSE stream (multi-turn agent with tool calling)
 """
 
+import asyncio
 import json
 import logging
 import time
@@ -179,6 +180,8 @@ async def chat_completions(req: Request):
     fallback_configs: list[dict] = body.get("fallback_configs") or []
     source: str = body.get("source", "chat")
     max_tokens: int | None = body.get("max_tokens")
+    run_metadata: dict = body.get("run_metadata") or {}
+    event_schema: str = body.get("event_schema") or "flat"
 
     # Per-user / per-session isolation
     user_id: str = body.get("user", "default")
@@ -191,6 +194,8 @@ async def chat_completions(req: Request):
             provider_config, fallback_configs, source,
             enabled_user_skills,
             max_tokens,
+            run_metadata,
+            event_schema,
         )
 
     # ── Non-streaming: collect all events, assemble full response ──────
@@ -270,85 +275,97 @@ def _streaming_response(
     source: str,
     enabled_user_skills: list[str] | None = None,
     max_tokens: int | None = None,
+    run_metadata: dict | None = None,
+    event_schema: str = "flat",
 ) -> StreamingResponse:
     """Build an SSE streaming response from the agent loop."""
+    run_metadata = run_metadata or {}
 
     async def _stream():
-        async for evt in run_stream(
-            model_id,
-            messages,
-            tools,
-            user_id=user_id,
-            session_id=session_id,
-            provider_override=provider_config,
-            fallback_overrides=fallback_configs,
-            source=source,
-            enabled_user_skills=enabled_user_skills,
-            max_tokens=max_tokens,
-        ):
-            tp = evt["type"]
-            if tp == "tool_progress":
-                payload = {
-                    "choices": [{"delta": {"tool_progress": evt["msg"]}, "index": 0}]
-                }
-                yield f"data: {json.dumps(payload)}\n\n"
-            elif tp == "delta":
-                payload = {
-                    "choices": [
-                        {"delta": {"content": evt["content"]}, "index": 0}
-                    ],
-                    "object": "chat.completion.chunk",
-                }
-                yield f"data: {json.dumps(payload)}\n\n"
-            elif tp == "reasoning_delta":
-                payload = {
-                    "choices": [
-                        {"delta": {"reasoning": evt["content"]}, "index": 0}
-                    ],
-                    "object": "chat.completion.chunk",
-                }
-                yield f"data: {json.dumps(payload)}\n\n"
-            elif tp == "usage":
-                payload = {
-                    "choices": [{"delta": {"usage": {
-                        "input_tokens": evt.get("input_tokens", 0),
-                        "output_tokens": evt.get("output_tokens", 0),
-                        "total_tokens": evt.get("total_tokens", 0),
-                    }}, "index": 0}],
-                    "model": evt.get("model"),
-                    "object": "chat.completion.chunk",
-                }
-                yield f"data: {json.dumps(payload)}\n\n"
-            elif tp == "model_switch":
-                payload = {
-                    "choices": [{"delta": {"model_switch": {
-                        "from_model": evt.get("from_model"),
-                        "to_model": evt.get("to_model"),
-                        "reason": evt.get("reason"),
-                    }}, "index": 0}],
-                    "object": "chat.completion.chunk",
-                }
-                yield f"data: {json.dumps(payload)}\n\n"
-            elif tp == "done":
-                payload = {
-                    "choices": [
-                        {
-                            "delta": {},
-                            "finish_reason": evt.get("finish_reason", "stop"),
-                            "index": 0,
-                        }
-                    ],
-                    "object": "chat.completion.chunk",
-                }
-                yield f"data: {json.dumps(payload)}\n\n"
-                yield "data: [DONE]\n\n"
-            elif tp == "error":
-                payload = {
-                    "choices": [{"delta": {"error": evt["msg"]}, "index": 0}],
-                    "object": "chat.completion.chunk",
-                }
-                yield f"data: {json.dumps(payload)}\n\n"
-                yield "data: [DONE]\n\n"
+        if event_schema != "chatds.agent.v2":
+            async for evt in run_stream(
+                model_id,
+                messages,
+                tools,
+                user_id=user_id,
+                session_id=session_id,
+                provider_override=provider_config,
+                fallback_overrides=fallback_configs,
+                source=source,
+                enabled_user_skills=enabled_user_skills,
+                max_tokens=max_tokens,
+                run_id=run_metadata.get("run_id"),
+                root_run_id=run_metadata.get("root_run_id"),
+                parent_run_id=run_metadata.get("parent_run_id"),
+                agent_kind=run_metadata.get("agent_kind") or "primary",
+                agent_name=run_metadata.get("agent_name"),
+                depth=int(run_metadata.get("depth") or 0),
+                workspace_scope=run_metadata.get("workspace_scope") or "shared_session",
+                event_schema=event_schema,
+            ):
+                if evt.get("type") == "agent_event":
+                    continue
+                async for encoded in _encode_stream_event(evt):
+                    yield encoded
+            return
+
+        queue: asyncio.Queue[dict | None] = asyncio.Queue()
+        seen_agent_events: set[tuple[str, str, int]] = set()
+
+        async def forward_agent_event(event: dict) -> None:
+            await queue.put(event)
+
+        async def produce() -> None:
+            try:
+                async for evt in run_stream(
+                    model_id,
+                    messages,
+                    tools,
+                    user_id=user_id,
+                    session_id=session_id,
+                    provider_override=provider_config,
+                    fallback_overrides=fallback_configs,
+                    source=source,
+                    enabled_user_skills=enabled_user_skills,
+                    max_tokens=max_tokens,
+                    run_id=run_metadata.get("run_id"),
+                    root_run_id=run_metadata.get("root_run_id"),
+                    parent_run_id=run_metadata.get("parent_run_id"),
+                    agent_kind=run_metadata.get("agent_kind") or "primary",
+                    agent_name=run_metadata.get("agent_name"),
+                    depth=int(run_metadata.get("depth") or 0),
+                    workspace_scope=run_metadata.get("workspace_scope") or "shared_session",
+                    event_schema=event_schema,
+                    event_sink=forward_agent_event,
+                ):
+                    await queue.put(evt)
+            finally:
+                await queue.put(None)
+
+        producer = asyncio.create_task(produce())
+        try:
+            while True:
+                evt = await queue.get()
+                if evt is None:
+                    break
+                if evt.get("type") == "agent_event":
+                    key = (
+                        str(evt.get("run_id") or ""),
+                        str(evt.get("event_type") or ""),
+                        int(evt.get("seq") or 0),
+                    )
+                    if key in seen_agent_events:
+                        continue
+                    seen_agent_events.add(key)
+                async for encoded in _encode_stream_event(evt):
+                    yield encoded
+        finally:
+            if not producer.done():
+                producer.cancel()
+                try:
+                    await producer
+                except asyncio.CancelledError:
+                    pass
 
     return StreamingResponse(
         _stream(),
@@ -359,3 +376,75 @@ def _streaming_response(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+async def _encode_stream_event(evt: dict):
+    tp = evt["type"]
+    if tp == "agent_event":
+        payload = {
+            "choices": [{"delta": {"agent_event": evt}, "index": 0}],
+            "object": "chat.completion.chunk",
+        }
+        yield f"data: {json.dumps(payload)}\n\n"
+    elif tp == "tool_progress":
+        payload = {
+            "choices": [{"delta": {"tool_progress": evt["msg"]}, "index": 0}]
+        }
+        yield f"data: {json.dumps(payload)}\n\n"
+    elif tp == "delta":
+        payload = {
+            "choices": [
+                {"delta": {"content": evt["content"]}, "index": 0}
+            ],
+            "object": "chat.completion.chunk",
+        }
+        yield f"data: {json.dumps(payload)}\n\n"
+    elif tp == "reasoning_delta":
+        payload = {
+            "choices": [
+                {"delta": {"reasoning": evt["content"]}, "index": 0}
+            ],
+            "object": "chat.completion.chunk",
+        }
+        yield f"data: {json.dumps(payload)}\n\n"
+    elif tp == "usage":
+        payload = {
+            "choices": [{"delta": {"usage": {
+                "input_tokens": evt.get("input_tokens", 0),
+                "output_tokens": evt.get("output_tokens", 0),
+                "total_tokens": evt.get("total_tokens", 0),
+            }}, "index": 0}],
+            "model": evt.get("model"),
+            "object": "chat.completion.chunk",
+        }
+        yield f"data: {json.dumps(payload)}\n\n"
+    elif tp == "model_switch":
+        payload = {
+            "choices": [{"delta": {"model_switch": {
+                "from_model": evt.get("from_model"),
+                "to_model": evt.get("to_model"),
+                "reason": evt.get("reason"),
+            }}, "index": 0}],
+            "object": "chat.completion.chunk",
+        }
+        yield f"data: {json.dumps(payload)}\n\n"
+    elif tp == "done":
+        payload = {
+            "choices": [
+                {
+                    "delta": {},
+                    "finish_reason": evt.get("finish_reason", "stop"),
+                    "index": 0,
+                }
+            ],
+            "object": "chat.completion.chunk",
+        }
+        yield f"data: {json.dumps(payload)}\n\n"
+        yield "data: [DONE]\n\n"
+    elif tp == "error":
+        payload = {
+            "choices": [{"delta": {"error": evt["msg"]}, "index": 0}],
+            "object": "chat.completion.chunk",
+        }
+        yield f"data: {json.dumps(payload)}\n\n"
+        yield "data: [DONE]\n\n"

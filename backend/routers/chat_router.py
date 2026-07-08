@@ -1,7 +1,10 @@
 import asyncio
+import hashlib
 import json
 import logging
+import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -12,9 +15,18 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 from database import get_db, async_session
-from models import User, Conversation, Message, CustomModelConfig, AgentRun
+from models import (
+    Artifact,
+    User,
+    Conversation,
+    Message,
+    CustomModelConfig,
+    AgentRun,
+    AgentRunEvent,
+    TaskItem,
+)
 from schemas import ChatRequest
-from workspace import ensure_workspace, serialize_json_list
+from workspace import ensure_workspace, safe_workspace_path, serialize_json_list, workspace_file_metadata
 from hooks import emit_event
 # All tools available to the agent harness for native tool-calling.
 AGENT_TOOLS = [
@@ -40,6 +52,287 @@ router = APIRouter(prefix="/api/chat", tags=["chat"])
 _background_tasks: set[asyncio.Task] = set()
 
 
+def _event_payload(event: dict) -> dict:
+    return event.get("payload") if isinstance(event.get("payload"), dict) else {}
+
+
+def _event_key(event: dict, run_id: str) -> str:
+    return f"{run_id}:{event.get('event_type') or 'unknown'}:{int(event.get('seq') or 0)}"
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+async def _project_artifact_event(
+    s: AsyncSession,
+    *,
+    conv_id: str,
+    user_id: str,
+    root_run_id: str,
+    run_id: str,
+    event: dict,
+    payload: dict,
+) -> None:
+    if event.get("event_type") != "artifact.created":
+        return
+    source_event_key = str(payload.get("source_event_key") or _event_key(event, run_id))
+    exists = (await s.execute(
+        select(Artifact.id).where(
+            Artifact.conversation_id == conv_id,
+            Artifact.user_id == user_id,
+            Artifact.source_event_key == source_event_key,
+        )
+    )).scalar_one_or_none()
+    if exists:
+        return
+    path = str(payload.get("path") or "").strip() or None
+    title = str(payload.get("title") or (Path(path).name if path else "artifact"))[:256]
+    mime_type = payload.get("mime_type")
+    preview_kind = payload.get("preview_kind")
+    size_bytes = int(payload.get("size_bytes") or payload.get("size") or 0)
+    sha256 = payload.get("sha256")
+    if path:
+        try:
+            file_path = safe_workspace_path(user_id, conv_id, path, must_exist=True)
+            if file_path.is_file():
+                stat = file_path.stat()
+                meta = workspace_file_metadata(file_path)
+                mime_type = meta.get("mime_type") or mime_type
+                preview_kind = meta.get("preview_kind") or preview_kind
+                size_bytes = stat.st_size
+                sha256 = _file_sha256(file_path)
+        except (FileNotFoundError, ValueError, OSError):
+            pass
+    s.add(Artifact(
+        id=uuid.uuid4().hex,
+        user_id=user_id,
+        conversation_id=conv_id,
+        run_id=run_id,
+        root_run_id=str(event.get("root_run_id") or root_run_id or run_id),
+        parent_run_id=event.get("parent_run_id"),
+        kind=str(payload.get("kind") or "file")[:32],
+        title=title,
+        path=path,
+        mime_type=str(mime_type)[:128] if mime_type else None,
+        preview_kind=str(preview_kind)[:32] if preview_kind else None,
+        size_bytes=max(0, size_bytes),
+        sha256=str(sha256)[:64] if sha256 else None,
+        source_tool_name=event.get("tool_name") or payload.get("source_tool_name") or payload.get("tool_name"),
+        source_tool_call_id=event.get("tool_call_id") or payload.get("source_tool_call_id") or payload.get("tool_call_id"),
+        source_event_key=source_event_key,
+        summary=str(payload.get("summary")) if payload.get("summary") else None,
+        metadata_json=json.dumps(payload, ensure_ascii=False),
+    ))
+
+
+def _task_key_for_event(event: dict, payload: dict, run_id: str) -> str | None:
+    event_type = str(event.get("event_type") or "")
+    if event_type.startswith("verifier."):
+        verifier_kind = str(payload.get("verifier_kind") or "generic")
+        target_run_id = str(payload.get("target_run_id") or run_id)
+        return str(payload.get("task_key") or payload.get("verifier_key") or f"verifier:{target_run_id}:{verifier_kind}")
+    if event_type in {"agent.spawned", "run.started", "run.completed", "run.failed"}:
+        return f"run:{run_id}"
+    return None
+
+
+def _project_task_event(
+    s: AsyncSession,
+    *,
+    task_items: dict[str, TaskItem],
+    conv_id: str,
+    user_id: str,
+    root_run_id: str,
+    run_id: str,
+    event: dict,
+    payload: dict,
+) -> None:
+    task_key = _task_key_for_event(event, payload, run_id)
+    if not task_key:
+        return
+    event_type = str(event.get("event_type") or "")
+    now = datetime.utcnow()
+    agent_kind = str(event.get("agent_kind") or "primary")
+    if event_type.startswith("verifier."):
+        kind = "verification"
+        title = str(payload.get("verifier_kind") or "Verifier")[:256]
+    else:
+        kind = "delegate" if agent_kind == "delegate" else "primary"
+        title = str(event.get("agent_name") or payload.get("goal") or agent_kind or "Run")[:256]
+    task = task_items.get(task_key)
+    if task is None:
+        task = TaskItem(
+            id=uuid.uuid4().hex,
+            user_id=user_id,
+            conversation_id=conv_id,
+            run_id=run_id,
+            root_run_id=str(event.get("root_run_id") or root_run_id or run_id),
+            parent_run_id=event.get("parent_run_id"),
+            task_key=task_key,
+            kind=kind,
+            title=title,
+            status="running",
+            agent_name=event.get("agent_name"),
+            metadata_json=json.dumps(payload, ensure_ascii=False),
+        )
+        s.add(task)
+        task_items[task_key] = task
+    task.run_id = run_id
+    task.root_run_id = str(event.get("root_run_id") or task.root_run_id or root_run_id or run_id)
+    task.parent_run_id = event.get("parent_run_id") or task.parent_run_id
+    task.kind = kind
+    task.title = title or task.title
+    task.agent_name = event.get("agent_name") or task.agent_name
+    task.metadata_json = json.dumps(payload, ensure_ascii=False)
+    task.updated_at = now
+    if event_type in {"agent.spawned", "run.started", "verifier.requested"}:
+        task.status = "running"
+        task.ended_at = None
+        if payload.get("goal"):
+            task.summary = str(payload.get("goal"))[:4000]
+    elif event_type == "run.completed":
+        task.status = "succeeded"
+        task.summary = str(payload.get("finish_reason") or "completed")[:4000]
+        task.ended_at = now
+    elif event_type == "run.failed":
+        task.status = "failed"
+        task.error = str(payload.get("error") or "Unknown error")
+        task.ended_at = now
+    elif event_type == "verifier.completed":
+        verdict = str(payload.get("verdict") or "inconclusive")
+        task.status = "succeeded" if verdict == "pass" else "failed" if verdict == "fail" else "blocked"
+        task.summary = str(payload.get("reason") or verdict)[:4000]
+        task.error = task.summary if task.status == "failed" else None
+        task.ended_at = now
+    elif event_type == "verifier.failed":
+        task.status = "failed"
+        task.error = str(payload.get("error") or payload.get("reason") or "Verifier failed")
+        task.ended_at = now
+
+
+async def _persist_agent_events(
+    s: AsyncSession,
+    *,
+    conv_id: str,
+    user_id: str | None,
+    root_run_id: str,
+    requested_model_id: str,
+    resolved_model_id: str,
+    events: list[dict],
+) -> None:
+    if not user_id or not events:
+        return
+    existing_runs = {
+        run.id: run
+        for run in (await s.execute(
+            select(AgentRun).where(AgentRun.conversation_id == conv_id)
+        )).scalars().all()
+    }
+    task_items = {
+        task.task_key: task
+        for task in (await s.execute(
+            select(TaskItem).where(
+                TaskItem.conversation_id == conv_id,
+                TaskItem.user_id == user_id,
+            )
+        )).scalars().all()
+    }
+    for event in events:
+        run_id = str(event.get("run_id") or "")
+        if not run_id:
+            continue
+        payload = _event_payload(event)
+        if run_id not in existing_runs:
+            child_run = AgentRun(
+                id=run_id,
+                user_id=user_id,
+                conversation_id=conv_id,
+                parent_run_id=event.get("parent_run_id"),
+                root_run_id=event.get("root_run_id") or root_run_id,
+                agent_kind=str(event.get("agent_kind") or "delegate"),
+                agent_name=event.get("agent_name"),
+                depth=int(event.get("depth") or 0),
+                workspace_scope=str(event.get("workspace_scope") or "shared_session"),
+                source="delegate" if event.get("agent_kind") == "delegate" else "chat",
+                requested_model_id=str(payload.get("model_id") or requested_model_id),
+                resolved_model_id=resolved_model_id,
+                status="running",
+            )
+            s.add(child_run)
+            existing_runs[run_id] = child_run
+        run = existing_runs[run_id]
+        run.parent_run_id = event.get("parent_run_id") or run.parent_run_id
+        run.root_run_id = event.get("root_run_id") or run.root_run_id or root_run_id
+        run.agent_kind = str(event.get("agent_kind") or run.agent_kind or "delegate")
+        run.agent_name = event.get("agent_name") or run.agent_name
+        run.depth = int(event.get("depth") if event.get("depth") is not None else run.depth or 0)
+        run.workspace_scope = str(event.get("workspace_scope") or run.workspace_scope or "shared_session")
+        if event.get("event_type") == "agent.spawned":
+            run.effective_tools = json.dumps(payload.get("effective_tools") or [], ensure_ascii=False)
+            run.requested_tools = json.dumps(payload.get("requested_tools") or [], ensure_ascii=False)
+        elif event.get("event_type") == "run.started":
+            run.status = "running"
+            if payload.get("model_id"):
+                run.requested_model_id = str(payload.get("model_id"))
+            if payload.get("enabled_tools") is not None:
+                run.effective_tools = json.dumps(payload.get("enabled_tools"), ensure_ascii=False)
+        elif event.get("event_type") == "usage.updated":
+            run.input_tokens = int(payload.get("input_tokens", run.input_tokens) or 0)
+            run.output_tokens = int(payload.get("output_tokens", run.output_tokens) or 0)
+            run.total_tokens = int(payload.get("total_tokens", run.total_tokens) or 0)
+            run.resolved_model_id = str(payload.get("model") or run.resolved_model_id or resolved_model_id)
+        elif event.get("event_type") == "model.switch":
+            run.resolved_model_id = str(payload.get("to_model") or run.resolved_model_id or resolved_model_id)
+        elif event.get("event_type") == "run.completed":
+            run.status = "succeeded"
+            run.finish_reason = str(payload.get("finish_reason") or "stop")
+            usage_payload = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+            run.input_tokens = int(usage_payload.get("input_tokens", run.input_tokens) or 0)
+            run.output_tokens = int(usage_payload.get("output_tokens", run.output_tokens) or 0)
+            run.total_tokens = int(usage_payload.get("total_tokens", run.total_tokens) or 0)
+            run.ended_at = datetime.utcnow()
+        elif event.get("event_type") == "run.failed":
+            run.status = "failed"
+            run.error = str(payload.get("error") or "Unknown error")
+            run.ended_at = datetime.utcnow()
+        await _project_artifact_event(
+            s,
+            conv_id=conv_id,
+            user_id=user_id,
+            root_run_id=root_run_id,
+            run_id=run_id,
+            event=event,
+            payload=payload,
+        )
+        _project_task_event(
+            s,
+            task_items=task_items,
+            conv_id=conv_id,
+            user_id=user_id,
+            root_run_id=root_run_id,
+            run_id=run_id,
+            event=event,
+            payload=payload,
+        )
+        s.add(AgentRunEvent(
+            id=uuid.uuid4().hex,
+            run_id=run_id,
+            conversation_id=conv_id,
+            user_id=user_id,
+            parent_run_id=event.get("parent_run_id"),
+            seq=int(event.get("seq") or 0),
+            event_type=str(event.get("event_type") or "unknown"),
+            payload=json.dumps(payload, ensure_ascii=False),
+            tool_name=event.get("tool_name") or payload.get("tool_name"),
+            tool_call_id=event.get("tool_call_id") or payload.get("tool_call_id"),
+        ))
+
+
 async def _persist_after_stream(
     conv_id: str,
     model_id: str,
@@ -52,6 +345,7 @@ async def _persist_after_stream(
     usage: dict,
     finish_reason: str,
     error_message: str | None,
+    agent_events: list[dict] | None = None,
 ):
     """Save the assistant message (with reasoning + tool_progress) + maybe
     generate title. Runs in its own db session so it survives the original
@@ -60,6 +354,7 @@ async def _persist_after_stream(
         assistant_message = None
         event_user_id = None
         try:
+            agent_events = agent_events or []
             input_tokens = int(usage.get("input_tokens", 0) or 0)
             output_tokens = int(usage.get("output_tokens", 0) or 0)
             total_tokens = int(usage.get("total_tokens", 0) or 0)
@@ -94,10 +389,24 @@ async def _persist_after_stream(
                 ):
                     conv.goal_status = "budget_limited"
                     conv.goal_note = "Goal token budget reached."
+            await _persist_agent_events(
+                s,
+                conv_id=conv_id,
+                user_id=event_user_id,
+                root_run_id=run_id,
+                requested_model_id=model_id,
+                resolved_model_id=resolved_model_id or model_id,
+                events=agent_events,
+            )
             run = (await s.execute(
                 select(AgentRun).where(AgentRun.id == run_id)
             )).scalar_one_or_none()
             if run:
+                run.root_run_id = run.root_run_id or run.id
+                run.agent_kind = run.agent_kind or "primary"
+                run.agent_name = run.agent_name or "primary"
+                run.depth = run.depth or 0
+                run.workspace_scope = run.workspace_scope or "shared_session"
                 run.resolved_model_id = resolved_model_id or model_id
                 run.status = "failed" if error_message else "succeeded"
                 run.finish_reason = finish_reason
@@ -149,29 +458,69 @@ def _spawn_persist(
     usage: dict,
     finish_reason: str,
     error_message: str | None,
+    agent_events: list[dict] | None = None,
 ):
     t = asyncio.create_task(_persist_after_stream(
         conv_id, model_id, content, reasoning, tool_progress, first_user_content,
-        run_id, resolved_model_id, usage, finish_reason, error_message,
+        run_id, resolved_model_id, usage, finish_reason, error_message, agent_events,
     ))
     _background_tasks.add(t)
     t.add_done_callback(_background_tasks.discard)
 
 
+def _spawn_persist_then_emit(
+    *,
+    user_id: str,
+    conv_id: str,
+    model_id: str,
+    content: str,
+    reasoning: str,
+    tool_progress: str,
+    first_user_content: str,
+    run_id: str,
+    resolved_model_id: str,
+    usage: dict,
+    finish_reason: str,
+    error_message: str | None,
+    agent_events: list[dict] | None = None,
+) -> None:
+    async def persist_then_emit() -> None:
+        await _persist_after_stream(
+            conv_id, model_id, content, reasoning, tool_progress, first_user_content,
+            run_id, resolved_model_id, usage, finish_reason, error_message, agent_events,
+        )
+        await emit_event(
+            user_id,
+            "run.failed" if error_message else "run.completed",
+            {
+                "conversation_id": conv_id,
+                "run_id": run_id,
+                "model_id": resolved_model_id,
+                "usage": usage,
+                "error": error_message,
+            },
+            conv_id,
+        )
+
+    t = asyncio.create_task(persist_then_emit())
+    _background_tasks.add(t)
+    t.add_done_callback(_background_tasks.discard)
+
+
 BUILTIN = {
-    # 10.10.132.126 DeepSeek-V4-Flash (1M ctx) — 主模型
+    # 10.10.132.2 GLM-5.2 (303872 ctx) — 主模型
     "deepseek_v4_pro": {
         "api_model": "AgentModel",
         "base_url": settings.deepseek_pro_base_url,
         "api_key": settings.deepseek_pro_api_key,
         "is_multimodal": False,
         "max_tokens": 262144,
-        "display_name": "DeepSeek-V4-Flash (主模型)",
+        "display_name": "GLM-5.2 (主模型)",
         "is_default": True,
         "capabilities": ["text", "tools", "reasoning"],
         "provider": "builtin",
         "protocol": "openai",
-        "context_length": 1048572,
+        "context_length": 303872,
     },
     # 10.10.132.128 Qwen3-5 (397B, multimodal) — 多模态识别
     "qwen3_5": {
@@ -459,11 +808,20 @@ async def _chat_stream(req: ChatRequest, cur_user: User, db: AsyncSession):
         conversation_id=conv_id,
         source="chat",
         requested_model_id=model_id,
+        resolved_model_id=model_id,
         status="running",
+        agent_kind="primary",
+        agent_name="primary",
+        depth=0,
+        workspace_scope="shared_session",
+        requested_tools=json.dumps(enabled_tools, ensure_ascii=False),
+        effective_tools=json.dumps(enabled_tools, ensure_ascii=False),
     )
     db.add(run)
     await db.commit()
     await db.refresh(run)
+    run.root_run_id = run.id
+    await db.commit()
     await emit_event(
         cur_user.id,
         "message.created",
@@ -490,6 +848,8 @@ async def _chat_stream(req: ChatRequest, cur_user: User, db: AsyncSession):
         finish_reason = "stop"
         resolved_model_id = model_id
         usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        agent_events: list[dict] = []
+        seen_agent_events: set[tuple[str, str, int]] = set()
 
         # Emit routed_model event so the frontend knows which model was chosen
         yield f"data: {json.dumps({'routed_model': model_id, 'conversation_id': conv_id})}\n\n"
@@ -547,6 +907,15 @@ async def _chat_stream(req: ChatRequest, cur_user: User, db: AsyncSession):
                             "fallback_configs": fallback_configs,
                             "source": "chat",
                             "enabled_user_skills": enabled_user_skills,
+                            "event_schema": "chatds.agent.v2",
+                            "run_metadata": {
+                                "run_id": run.id,
+                                "root_run_id": run.id,
+                                "agent_kind": "primary",
+                                "agent_name": "primary",
+                                "depth": 0,
+                                "workspace_scope": "shared_session",
+                            },
                         },
                     ) as response:
                         if response.status_code >= 400:
@@ -562,6 +931,17 @@ async def _chat_stream(req: ChatRequest, cur_user: User, db: AsyncSession):
                                 try:
                                     data = json.loads(chunk)
                                     delta = data["choices"][0].get("delta", {})
+                                    agent_event = delta.get("agent_event")
+                                    if isinstance(agent_event, dict):
+                                        key = (
+                                            str(agent_event.get("run_id") or ""),
+                                            str(agent_event.get("event_type") or ""),
+                                            int(agent_event.get("seq") or 0),
+                                        )
+                                        if key not in seen_agent_events:
+                                            seen_agent_events.add(key)
+                                            agent_events.append(agent_event)
+                                            yield f"data: {json.dumps({'agent_event': agent_event, 'conversation_id': conv_id})}\n\n"
                                     # Harness tool_progress
                                     tp = delta.get("tool_progress")
                                     if tp:
@@ -625,25 +1005,21 @@ async def _chat_stream(req: ChatRequest, cur_user: User, db: AsyncSession):
         finally:
             if not full_content and not full_reasoning and not error_message:
                 error_message = "Stream ended before producing a response."
-            _spawn_persist(
-                conv_id, model_id, full_content, full_reasoning,
-                full_tool_progress, req.content, run.id,
-                resolved_model_id, usage, finish_reason, error_message,
+            _spawn_persist_then_emit(
+                user_id=cur_user.id,
+                conv_id=conv_id,
+                model_id=model_id,
+                content=full_content,
+                reasoning=full_reasoning,
+                tool_progress=full_tool_progress,
+                first_user_content=req.content,
+                run_id=run.id,
+                resolved_model_id=resolved_model_id,
+                usage=usage,
+                finish_reason=finish_reason,
+                error_message=error_message,
+                agent_events=list(agent_events),
             )
-            event_task = asyncio.create_task(emit_event(
-                cur_user.id,
-                "run.failed" if error_message else "run.completed",
-                {
-                    "conversation_id": conv_id,
-                    "run_id": run.id,
-                    "model_id": resolved_model_id,
-                    "usage": usage,
-                    "error": error_message,
-                },
-                conv_id,
-            ))
-            _background_tasks.add(event_task)
-            event_task.add_done_callback(_background_tasks.discard)
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 

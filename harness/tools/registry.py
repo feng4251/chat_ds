@@ -25,7 +25,9 @@ class ToolEntry:
         "is_async", "description", "emoji",
         "accepts_context", "accepts_user_id", "accepts_session_id",
         "accepts_enabled_user_skills", "is_read_only", "is_destructive",
-        "parallel_safe", "path_scoped",
+        "parallel_safe", "path_scoped", "allow_in_child",
+        "allow_in_parallel_child", "mutates_workspace", "mutates_global_state",
+        "requires_user_visibility",
     )
 
     def __init__(
@@ -42,6 +44,11 @@ class ToolEntry:
         is_destructive: bool = False,
         parallel_safe: bool = False,
         path_scoped: bool = False,
+        allow_in_child: bool = True,
+        allow_in_parallel_child: bool | None = None,
+        mutates_workspace: bool | None = None,
+        mutates_global_state: bool = False,
+        requires_user_visibility: bool = False,
     ):
         self.name = name
         self.toolset = toolset
@@ -63,6 +70,11 @@ class ToolEntry:
         self.is_destructive = is_destructive
         self.parallel_safe = parallel_safe
         self.path_scoped = path_scoped
+        self.allow_in_child = allow_in_child
+        self.allow_in_parallel_child = parallel_safe if allow_in_parallel_child is None else allow_in_parallel_child
+        self.mutates_workspace = (not is_read_only and path_scoped) if mutates_workspace is None else mutates_workspace
+        self.mutates_global_state = mutates_global_state
+        self.requires_user_visibility = requires_user_visibility
 
 
 # ── ToolRegistry ───────────────────────────────────────────────────────────
@@ -89,6 +101,11 @@ class ToolRegistry:
         is_destructive: bool = False,
         parallel_safe: bool = False,
         path_scoped: bool = False,
+        allow_in_child: bool = True,
+        allow_in_parallel_child: bool | None = None,
+        mutates_workspace: bool | None = None,
+        mutates_global_state: bool = False,
+        requires_user_visibility: bool = False,
     ):
         """Register a tool. Called at module-import time by each tool file."""
         existing = self._tools.get(name)
@@ -110,6 +127,11 @@ class ToolRegistry:
             is_destructive=is_destructive,
             parallel_safe=parallel_safe,
             path_scoped=path_scoped,
+            allow_in_child=allow_in_child,
+            allow_in_parallel_child=allow_in_parallel_child,
+            mutates_workspace=mutates_workspace,
+            mutates_global_state=mutates_global_state,
+            requires_user_visibility=requires_user_visibility,
         )
 
     def deregister(self, name: str) -> None:
@@ -162,6 +184,11 @@ class ToolRegistry:
             "destructive": entry.is_destructive,
             "parallel_safe": entry.parallel_safe,
             "path_scoped": entry.path_scoped,
+            "allow_in_child": entry.allow_in_child,
+            "allow_in_parallel_child": entry.allow_in_parallel_child,
+            "mutates_workspace": entry.mutates_workspace,
+            "mutates_global_state": entry.mutates_global_state,
+            "requires_user_visibility": entry.requires_user_visibility,
             "toolset": entry.toolset,
         }
 
@@ -330,6 +357,11 @@ def register(
     is_destructive: bool = False,
     parallel_safe: bool = False,
     path_scoped: bool = False,
+    allow_in_child: bool = True,
+    allow_in_parallel_child: bool | None = None,
+    mutates_workspace: bool | None = None,
+    mutates_global_state: bool = False,
+    requires_user_visibility: bool = False,
 ):
     """Register a tool with the default registry."""
     registry.register(
@@ -345,6 +377,11 @@ def register(
         is_destructive=is_destructive,
         parallel_safe=parallel_safe,
         path_scoped=path_scoped,
+        allow_in_child=allow_in_child,
+        allow_in_parallel_child=allow_in_parallel_child,
+        mutates_workspace=mutates_workspace,
+        mutates_global_state=mutates_global_state,
+        requires_user_visibility=requires_user_visibility,
     )
 
 

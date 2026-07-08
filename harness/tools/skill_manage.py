@@ -34,6 +34,10 @@ from typing import Any, Optional
 
 from skills.scanner import USER_SKILLS_BASE, EXCLUDED_SKILL_DIRS
 from skills.manager import get_manager
+from tools.omission_guard import (
+    compacted_history_omission_error,
+    contains_compacted_history_omission,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -231,6 +235,8 @@ async def _create_skill(
     err = _validate_name(name)
     if err:
         return {"success": False, "error": err}
+    if contains_compacted_history_omission(content):
+        return {"success": False, **compacted_history_omission_error("content")}
 
     err = _validate_category(category)
     if err:
@@ -301,6 +307,9 @@ def _edit_skill(
     name: str, content: str, user_id: str, skills_base: Path,
 ) -> dict[str, Any]:
     """Replace the SKILL.md of an existing skill (full rewrite)."""
+    if contains_compacted_history_omission(content):
+        return {"success": False, **compacted_history_omission_error("content")}
+
     err = _validate_frontmatter(content)
     if err:
         return {"success": False, "error": err}
@@ -339,6 +348,10 @@ def _patch_skill(
     """Targeted find-and-replace within a skill file."""
     if not old_text:
         return {"success": False, "error": "old_text is required for patch."}
+    if contains_compacted_history_omission(old_text):
+        return {"success": False, **compacted_history_omission_error("old_text")}
+    if contains_compacted_history_omission(new_text):
+        return {"success": False, **compacted_history_omission_error("new_text")}
 
     existing = _find_skill(name, skills_base)
     if not existing:
@@ -477,6 +490,8 @@ def _write_file(
 
     if not file_content and file_content != "":
         return {"success": False, "error": "file_content is required."}
+    if contains_compacted_history_omission(file_content):
+        return {"success": False, **compacted_history_omission_error("file_content")}
 
     # Check file size for binary content
     content_bytes = file_content.encode("utf-8")

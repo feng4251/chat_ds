@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import os
 import re
 import shutil
@@ -164,6 +165,35 @@ def atomic_write_bytes(path: Path, content: bytes) -> None:
         raise
 
 
+def workspace_file_metadata(path: Path) -> dict:
+    ext = path.suffix.lower().lstrip('.')
+    mime_type = mimetypes.guess_type(str(path))[0] or 'application/octet-stream'
+    text_exts = {
+        'txt', 'md', 'markdown', 'mdx', 'py', 'js', 'jsx', 'ts', 'tsx', 'json',
+        'yaml', 'yml', 'toml', 'csv', 'tsv', 'log', 'xml', 'html', 'css', 'sql',
+        'sh', 'bash', 'r', 'R', 'ini', 'cfg', 'conf', 'tex', 'bib', 'rst',
+    }
+    is_text = mime_type.startswith('text/') or ext in text_exts
+    if ext in {'md', 'markdown', 'mdx'}:
+        preview_kind = 'markdown'
+    elif is_text:
+        preview_kind = 'text'
+    elif mime_type == 'application/pdf' or ext == 'pdf':
+        preview_kind = 'pdf'
+    elif mime_type.startswith('image/'):
+        preview_kind = 'image'
+    elif ext in {'doc', 'docx', 'ppt', 'pptx', 'xls', 'xlsx'}:
+        preview_kind = 'office'
+    else:
+        preview_kind = 'binary'
+    return {
+        'ext': ext,
+        'mime_type': mime_type,
+        'is_text': is_text,
+        'preview_kind': preview_kind,
+    }
+
+
 def list_workspace_files(user_id: str, session_id: str) -> list[dict]:
     root = ensure_workspace(user_id, session_id).resolve()
     files: list[dict] = []
@@ -172,7 +202,12 @@ def list_workspace_files(user_id: str, session_id: str) -> list[dict]:
             continue
         rel = str(path.relative_to(root))
         stat = path.stat()
-        files.append({"path": rel, "size": stat.st_size, "updated_at": stat.st_mtime})
+        files.append({
+            "path": rel,
+            "size": stat.st_size,
+            "updated_at": stat.st_mtime,
+            **workspace_file_metadata(path),
+        })
     return files
 
 

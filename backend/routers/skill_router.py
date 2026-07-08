@@ -140,6 +140,91 @@ class SkillUploadJson(BaseModel):
     session_id: Optional[str] = None
 
 
+def _zip_file_entries(zf: zipfile.ZipFile) -> list[tuple[zipfile.ZipInfo, str]]:
+    entries: list[tuple[zipfile.ZipInfo, str]] = []
+    for info in zf.infolist():
+        if info.is_dir():
+            continue
+        norm = info.filename.replace("\\", "/").lstrip("/")
+        parts: list[str] = []
+        for part in norm.split("/"):
+            if part in {"", "."}:
+                continue
+            if part == "..":
+                raise HTTPException(status_code=400, detail=f"Path traversal detected: {info.filename}")
+            parts.append(part)
+        if parts:
+            entries.append((info, "/".join(parts)))
+    return entries
+
+
+def _is_allowed_skill_file(rel_path: str) -> tuple[bool, bool]:
+    lower = rel_path.lower()
+    is_binary = any(lower.endswith(ext) for ext in ALLOWED_BINARY_EXTENSIONS)
+    is_text = any(lower.endswith(ext) for ext in ALLOWED_EXTENSIONS)
+    return is_text or is_binary, is_binary
+
+
+def _discover_skill_manifests(
+    zf: zipfile.ZipFile,
+    entries: list[tuple[zipfile.ZipInfo, str]],
+) -> list[dict]:
+    manifests: list[dict] = []
+    seen_names: dict[str, str] = {}
+    for info, norm in entries:
+        parts = norm.split("/")
+        if parts[-1] != "SKILL.md":
+            continue
+        if info.file_size > MAX_FILE_SIZE:
+            raise HTTPException(status_code=400, detail=f"SKILL.md too large: {norm}")
+
+        skill_md_content = zf.read(info.filename).decode("utf-8", errors="replace")
+        fm = _parse_frontmatter(skill_md_content)
+        skill_name = fm.get("name", "").strip()
+        if not skill_name:
+            raise HTTPException(status_code=400, detail=f"{norm} frontmatter must have a 'name' field")
+        _validate_skill_name(skill_name)
+        if skill_name in seen_names:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Duplicate skill name '{skill_name}' in {seen_names[skill_name]} and {norm}",
+            )
+        seen_names[skill_name] = norm
+
+        root = "/".join(parts[:-1])
+        path_category = "/".join(parts[:-2]) or None
+        manifests.append({
+            "name": skill_name,
+            "description": fm.get("description", "").strip(),
+            "version": fm.get("version", ""),
+            "root": root,
+            "skill_md": norm,
+            "skill_md_content": skill_md_content,
+            "category": path_category,
+        })
+
+    if not manifests:
+        raise HTTPException(status_code=400, detail="SKILL.md not found in zip")
+
+    manifests.sort(key=lambda item: (item["root"].count("/"), item["root"], item["name"]))
+    return manifests
+
+
+def _entry_is_under_skill_root(entry_path: str, root: str) -> bool:
+    return (entry_path == root or entry_path.startswith(f"{root}/")) if root else True
+
+
+def _entry_is_under_nested_skill_root(entry_path: str, root: str, all_roots: list[str]) -> bool:
+    for other_root in all_roots:
+        if other_root == root:
+            continue
+        if root and not other_root.startswith(f"{root}/"):
+            continue
+        if _entry_is_under_skill_root(entry_path, other_root):
+            return True
+    return False
+
+
 async def _process_skill_zip(
     contents: bytes,
     filename: str,
@@ -167,156 +252,154 @@ async def _process_skill_zip(
     except zipfile.BadZipFile:
         raise HTTPException(status_code=400, detail="Invalid zip file")
 
-    # Validate: must have SKILL.md at root or one level deep
-    skill_md_path = None
-    name_list = zf.namelist()
-    for name in name_list:
-        norm = name.replace("\\", "/")
-        parts = norm.rstrip("/").split("/")
-        if parts[-1] == "SKILL.md" and len(parts) <= 2:
-            skill_md_path = name
-            break
-
-    if skill_md_path is None:
-        raise HTTPException(status_code=400, detail="SKILL.md not found in zip root")
-
-    # Read SKILL.md
-    skill_md_content = zf.read(skill_md_path).decode("utf-8", errors="replace")
-    fm = _parse_frontmatter(skill_md_content)
-
-    skill_name = fm.get("name", "").strip()
-    if not skill_name:
-        raise HTTPException(status_code=400, detail="SKILL.md frontmatter must have a 'name' field")
-    _validate_skill_name(skill_name)
-    description = fm.get("description", "").strip()
-
-    # Determine the root dir inside the zip
-    root_parts = skill_md_path.replace("\\", "/").rstrip("/").split("/")
-    zip_root = "" if len(root_parts) == 1 else "/".join(root_parts[:-1]) + "/"
-
-    # Extract target directory
-    if session_id:
-        user_skills_dir = SKILLS_DATA_DIR / user.id / session_id
-    else:
-        user_skills_dir = SKILLS_DATA_DIR / user.id
-    target_dir = user_skills_dir / skill_name
-
-    scope_filter = (
-        SkillPackage.session_id == session_id
-        if session_id else SkillPackage.session_id.is_(None)
-    )
-    existing_pkg = (await db.execute(
-        select(SkillPackage).where(
-            SkillPackage.user_id == user.id,
-            SkillPackage.name == skill_name,
-            scope_filter,
-        ).limit(1)
-    )).scalar_one_or_none()
-
-    if target_dir.exists() or existing_pkg is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Skill '{skill_name}' already exists. Delete it first to update.",
-        )
-
-    target_dir.mkdir(parents=True, exist_ok=True)
-
+    created_dirs: list[Path] = []
+    installed_skills: list[dict] = []
+    target_dirs: dict[str, Path] = {}
     try:
-        for entry_name in name_list:
-            if entry_name.endswith("/"):
-                continue
-            if zip_root and not entry_name.startswith(zip_root):
-                continue
+        entries = _zip_file_entries(zf)
+        manifests = _discover_skill_manifests(zf, entries)
 
-            rel = entry_name[len(zip_root):] if zip_root else entry_name
-            rel = rel.replace("\\", "/")
+        if session_id:
+            user_skills_dir = SKILLS_DATA_DIR / user.id / session_id
+        else:
+            user_skills_dir = SKILLS_DATA_DIR / user.id
 
-            if not rel or rel == "SKILL.md":
-                continue
+        scope_filter = (
+            SkillPackage.session_id == session_id
+            if session_id else SkillPackage.session_id.is_(None)
+        )
+        skill_names = [str(manifest["name"]) for manifest in manifests]
+        skill_roots = [str(manifest["root"]) for manifest in manifests]
+        existing_rows = (await db.execute(
+            select(SkillPackage.name).where(
+                SkillPackage.user_id == user.id,
+                SkillPackage.name.in_(skill_names),
+                scope_filter,
+            )
+        )).all()
+        existing_names = {row[0] for row in existing_rows}
+        existing_dirs = {
+            name for name in skill_names
+            if (user_skills_dir / name).exists()
+        }
+        conflicts = sorted(existing_names | existing_dirs)
+        if conflicts:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Skills already exist: {', '.join(conflicts)}. Delete them first to update.",
+            )
 
-            safe_path = _validate_bundle_rel_path(rel, target_dir)
+        for manifest in manifests:
+            skill_name = str(manifest["name"])
+            root = str(manifest["root"])
+            target_dir = user_skills_dir / skill_name
+            target_dir.mkdir(parents=True, exist_ok=True)
+            created_dirs.append(target_dir)
+            target_dirs[skill_name] = target_dir
 
-            ext = Path(rel).suffix.lower()
-            is_binary = ext in ALLOWED_BINARY_EXTENSIONS
-            if not is_binary and ext not in ALLOWED_EXTENSIONS:
-                logger.warning("Skipping file with disallowed extension: %s", rel)
-                continue
-
-            file_bytes = zf.read(entry_name)
-            if len(file_bytes) > MAX_FILE_SIZE:
-                logger.warning("Skipping oversized file (%d bytes): %s", len(file_bytes), rel)
-                continue
-
-            if not is_binary:
-                try:
-                    file_bytes.decode("utf-8")
-                except UnicodeDecodeError:
-                    logger.warning("Skipping non-UTF-8 file: %s", rel)
+            for info, norm in entries:
+                if not _entry_is_under_skill_root(norm, root):
+                    continue
+                if _entry_is_under_nested_skill_root(norm, root, skill_roots):
+                    continue
+                rel = norm[len(root):].lstrip("/") if root else norm
+                if not rel:
                     continue
 
-            safe_path.parent.mkdir(parents=True, exist_ok=True)
-            safe_path.write_bytes(file_bytes)
+                allowed, is_binary = _is_allowed_skill_file(rel)
+                if not allowed:
+                    logger.warning("Skipping file with disallowed extension: %s", rel)
+                    continue
+                if info.file_size > MAX_FILE_SIZE:
+                    logger.warning("Skipping oversized file (%d bytes): %s", info.file_size, rel)
+                    continue
 
-    except HTTPException:
+                safe_path = _validate_bundle_rel_path(rel, target_dir)
+                file_bytes = zf.read(info.filename)
+                if not is_binary:
+                    try:
+                        file_bytes.decode("utf-8")
+                    except UnicodeDecodeError:
+                        logger.warning("Skipping non-UTF-8 file: %s", rel)
+                        continue
+
+                safe_path.parent.mkdir(parents=True, exist_ok=True)
+                safe_path.write_bytes(file_bytes)
+
+            skill_category = category
+            if skill_category is None and manifest.get("category"):
+                skill_category = str(manifest["category"])[:64]
+
+            description = str(manifest.get("description") or "")
+            installed_skill = {
+                "name": skill_name,
+                "description": description,
+                "category": skill_category,
+                "version": str(manifest.get("version") or ""),
+                "session_id": session_id,
+            }
+            installed_skills.append(installed_skill)
+            db.add(SkillPackage(
+                user_id=user.id,
+                name=skill_name,
+                session_id=session_id,
+                description=description[:1024] if description else None,
+                category=skill_category,
+                version=str(manifest.get("version") or ""),
+            ))
+
+        await db.commit()
+    except Exception:
+        await db.rollback()
         import shutil
-        if target_dir.exists():
-            shutil.rmtree(target_dir)
+        for target_dir in created_dirs:
+            if target_dir.exists():
+                shutil.rmtree(target_dir, ignore_errors=True)
         raise
     finally:
         zf.close()
 
-    # Write SKILL.md
-    (target_dir / "SKILL.md").write_text(skill_md_content, encoding="utf-8")
-
-    # Persist to DB
-    skill_pkg = SkillPackage(
-        user_id=user.id,
-        name=skill_name,
-        session_id=session_id,
-        description=description[:1024] if description else None,
-        category=category,
-        version=fm.get("version", ""),
-    )
-    db.add(skill_pkg)
-    await db.commit()
-
-    # Invalidate skills cache
     try:
         _invalidate_skills_cache(user.id)
     except Exception:
         pass
 
-    # Auto-register MCP servers from the skill
     mcp_result = {"registered": [], "skipped": [], "errors": []}
-    try:
-        mcp_result = await _auto_register_mcp(
-            str(target_dir), user.id, session_id or "default"
-        )
-        if mcp_result.get("registered"):
-            logger.info(
-                "Auto MCP for skill '%s' (user=%s): registered=%s",
-                skill_name, user.id, mcp_result["registered"],
+    mcp_by_skill: dict[str, dict] = {}
+    for skill in installed_skills:
+        skill_name = str(skill["name"])
+        try:
+            skill_mcp = await _auto_register_mcp(
+                str(target_dirs[skill_name]), user.id, session_id or "default"
             )
-        if mcp_result.get("errors"):
-            logger.warning(
-                "Auto MCP for skill '%s' had errors: %s",
-                skill_name, mcp_result["errors"],
-            )
-    except Exception:
-        logger.exception(
-            "Auto MCP registration failed for skill '%s'", skill_name,
-        )
+            mcp_by_skill[skill_name] = skill_mcp
+            for key in ("registered", "skipped", "errors"):
+                values = skill_mcp.get(key) or []
+                if isinstance(values, list):
+                    mcp_result[key].extend(values)
+            if skill_mcp.get("registered"):
+                logger.info(
+                    "Auto MCP for skill '%s' (user=%s): registered=%s",
+                    skill_name, user.id, skill_mcp["registered"],
+                )
+            if skill_mcp.get("errors"):
+                logger.warning(
+                    "Auto MCP for skill '%s' had errors: %s",
+                    skill_name, skill_mcp["errors"],
+                )
+        except Exception:
+            logger.exception("Auto MCP registration failed for skill '%s'", skill_name)
+            error = f"Auto MCP registration failed for skill '{skill_name}'"
+            mcp_result["errors"].append(error)
+            mcp_by_skill[skill_name] = {"registered": [], "skipped": [], "errors": [error]}
 
     return {
         "success": True,
-        "skill": {
-            "name": skill_name,
-            "description": description,
-            "category": category,
-            "version": fm.get("version", ""),
-            "session_id": session_id,
-        },
+        "skill": installed_skills[0],
+        "skills": installed_skills,
+        "installed_count": len(installed_skills),
         "mcp": mcp_result,
+        "mcp_by_skill": mcp_by_skill,
     }
 
 
