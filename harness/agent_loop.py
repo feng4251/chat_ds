@@ -32,6 +32,11 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 3
 DEFAULT_MAX_TOKENS = 8192
 
+# For a complex deliverable driven by a session skill that declares multiple
+# worker/pipeline resources, encourage reading a breadth of them (not just one)
+# before drafting. The target scales down for skills that declare fewer workers.
+_WORKER_BREADTH_TARGET = 4
+
 
 @dataclass
 class HarnessRunState:
@@ -45,6 +50,7 @@ class HarnessRunState:
     viewed_skill_categories: dict[str, set[str]] = field(default_factory=dict)
     skill_available_categories: dict[str, set[str]] = field(default_factory=dict)
     skill_suggested_files: dict[str, list[str]] = field(default_factory=dict)
+    skill_category_files: dict[str, dict[str, list[str]]] = field(default_factory=dict)
     session_skill_names: set[str] = field(default_factory=set)
     continuation_reasons: list[str] = field(default_factory=list)
 
@@ -69,6 +75,10 @@ class HarnessRunState:
                 self.skill_available_categories.setdefault(skill_name, set()).update(
                     str(category) for category in linked.keys()
                 )
+                declared = self.skill_category_files.setdefault(skill_name, {})
+                for category, files in linked.items():
+                    if isinstance(files, list) and files:
+                        declared[str(category)] = [str(f) for f in files if isinstance(f, str)]
             graph = result_data.get("resource_graph")
             if isinstance(graph, dict):
                 categories = graph.get("categories")
@@ -76,6 +86,14 @@ class HarnessRunState:
                     self.skill_available_categories.setdefault(skill_name, set()).update(
                         str(category) for category in categories.keys()
                     )
+                    declared = self.skill_category_files.setdefault(skill_name, {})
+                    for category, meta in categories.items():
+                        # Prefer the fuller linked_files list; fall back to the sample.
+                        if str(category) in declared:
+                            continue
+                        sample = meta.get("sample") if isinstance(meta, dict) else None
+                        if isinstance(sample, list) and sample:
+                            declared[str(category)] = [str(f) for f in sample if isinstance(f, str)]
                 suggested = graph.get("suggested_files")
                 if isinstance(suggested, list):
                     clean_suggested = [str(path) for path in suggested if isinstance(path, str)]
@@ -95,15 +113,37 @@ class HarnessRunState:
             if "__manifest__" not in files:
                 return True, f"load the resource manifest for session skill '{skill_name}'"
 
+            declared = self.skill_category_files.get(skill_name, {})
+            declared_workers = [
+                path for path in declared.get("workers", [])
+                if "/workers/" in path or path.startswith("workers/")
+            ]
             primary_workflow_categories = {"orchestration", "workers", "workflows"}
-            if available_categories & primary_workflow_categories:
+            if declared_workers:
+                # Breadth: read several distinct workers, scaled by what exists.
+                viewed_workers = {
+                    path for path in files
+                    if "/workers/" in path or path.startswith("workers/")
+                }
+                target = min(len(declared_workers), _WORKER_BREADTH_TARGET)
+                if len(viewed_workers) < target:
+                    return True, (
+                        f"inspect additional worker resources for session skill '{skill_name}' "
+                        f"(viewed {len(viewed_workers)} of {target} recommended workers)"
+                    )
+            elif available_categories & primary_workflow_categories:
                 viewed_primary = categories & primary_workflow_categories
                 viewed_worker_file = any("/workers/" in path for path in files)
                 if not viewed_primary and not viewed_worker_file:
                     return True, f"inspect orchestrator or worker resources for session skill '{skill_name}'"
 
+            # Output/format specifications are frequently required for a faithful
+            # deliverable; require them explicitly when the skill declares them.
+            if "formats" in available_categories and "formats" not in categories:
+                return True, f"inspect output format specifications for session skill '{skill_name}'"
+
             supporting_categories = {
-                "references", "scripts", "templates", "formats", "protocols", "evaluation", "examples",
+                "references", "scripts", "templates", "protocols", "evaluation", "examples",
             }
             available_supporting = available_categories & supporting_categories
             if available_supporting and not (categories & available_supporting):
@@ -116,16 +156,23 @@ def _suggested_workflow_paths_for_reason(
     reason: str,
 ) -> list[str]:
     requested_primary = "orchestrator" in reason or "worker" in reason
+    requested_formats = "format" in reason
     requested_supporting = "supporting" in reason
     paths: list[str] = []
     for skill_name in sorted(run_state.viewed_skill_names & run_state.session_skill_names):
+        already_viewed = run_state.viewed_skill_files.get(skill_name, set())
         for path in run_state.skill_suggested_files.get(skill_name, []):
+            if path in already_viewed:
+                continue  # prefer resources the model has not read yet
             if requested_primary:
                 if path.startswith(("orchestration/", "workers/", "workflows/")) or "/workers/" in path:
                     paths.append(path)
+            elif requested_formats:
+                if path.startswith("formats/") or "/formats/" in path:
+                    paths.append(path)
             elif requested_supporting:
                 if path.startswith((
-                    "references/", "scripts/", "templates/", "formats/", "protocols/",
+                    "references/", "scripts/", "templates/", "protocols/",
                     "evaluation/", "examples/",
                 )):
                     paths.append(path)
@@ -212,7 +259,7 @@ async def run_stream(
     artifact_enforcement_continuations = 0
     skill_enforcement_continuations = 0
     skill_workflow_continuations = 0
-    max_skill_workflow_continuations = 4
+    max_skill_workflow_continuations = 8
 
     def queue_skill_workflow_continuation(reason: str) -> None:
         run_state.continuation_reasons.append(reason)
