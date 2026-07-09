@@ -40,7 +40,10 @@ def _sandbox_dir(user_id: str, session_id: str) -> Path:
 
 def _resolve(filepath: str, user_id: str, session_id: str) -> Path:
     """Resolve a relative path within the user+session sandbox."""
-    return validate_path(filepath, user_id, session_id, sub="workspace")
+    clean = str(filepath or "")
+    if clean.startswith("workspace/"):
+        clean = clean[len("workspace/"):]
+    return validate_path(clean, user_id, session_id, sub="workspace")
 
 
 # ── Tool handlers ──────────────────────────────────────────────────────────
