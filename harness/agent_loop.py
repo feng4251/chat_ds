@@ -348,7 +348,7 @@ async def run_stream(
     user_id: str = "default",
     session_id: str = "default",
     timeout: float = 600.0,
-    max_iterations: int = 20,
+    max_iterations: int = 60,
     max_tokens: int | None = None,
     provider_override: dict[str, Any] | None = None,
     fallback_overrides: list[dict[str, Any]] | None = None,
@@ -1045,6 +1045,7 @@ async def run_stream(
             needs_artifact_gate = bool(
                 run_state.viewed_skill_names
                 and _looks_like_complex_artifact_request(original_user_text)
+                and max(run_state.successful_write_sizes or [0]) < 20_000
             )
             needs_workflow_gate, workflow_reason = run_state.needs_more_skill_workflow()
             if (
@@ -1464,6 +1465,7 @@ async def run_stream(
             needs_artifact_gate_after_tools = bool(
                 run_state.viewed_skill_names
                 and _looks_like_complex_artifact_request(original_user_text)
+                and max(run_state.successful_write_sizes or [0]) < 20_000
             )
             needs_workflow_gate_after_tools, workflow_reason_after_tools = run_state.needs_more_skill_workflow()
             if (
@@ -1518,6 +1520,10 @@ async def run_stream(
         })
         yield {"type": "done", "finish_reason": finish_reason}
         return
+
+    msg = f"Agent iteration budget exhausted after {budget.used} iterations."
+    yield await emit_agent_event("run.failed", {"error": msg, "usage": run_usage})
+    yield {"type": "error", "msg": msg}
 
 
 async def _fetch_goal(user_id: str, session_id: str) -> dict | None:
@@ -2001,6 +2007,7 @@ def _looks_like_unfulfilled_action_promise(text: str) -> bool:
     action_markers = (
         "run", "execute", "write", "save", "create", "call", "use the tool",
         "workspace", "simulation", "analysis", "script", "生成", "写入", "运行", "执行", "调用", "保存",
+        "撰写", "编写", "创建", "输出", "整理", "文档", "报告",
     )
     completion_markers = (
         "completed", "done", "已完成", "完成如下", "最终", "final", "结果如下",

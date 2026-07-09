@@ -200,6 +200,8 @@ def _resolve_cwd(cwd: str, user_id: str, session_id: str, script: Path) -> Path:
         if not root.is_dir():
             raise FileNotFoundError(f"Skill cwd not found: {cwd}")
         return root
+    if cwd.startswith("workspace/"):
+        cwd = cwd[len("workspace/"):]
     return validate_path(cwd, user_id, session_id, sub="workspace", must_exist=True)
 
 
