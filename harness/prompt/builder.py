@@ -162,6 +162,10 @@ MCP_GUIDANCE = (
     "- Skills that bundle MCP servers (.mcp.json or *_mcp.py scripts) are "
     "registered by the runtime on upload. The mcp_* tools should already be "
     "available — try calling them directly.\n"
+    "- If `mcp_server_list` says no MCP servers are configured, the installed "
+    "skills may be REST/API or script-based rather than MCP-backed. In that case, "
+    "use the skill's documented scripts with `run_skill_python`, or use web_search/"
+    "web_extract for general web research; do not invent mcp_* tool names.\n"
     "- If the expected mcp_* tools are missing, use mcp_server_status to "
     "check connection state and report the concrete error. MCP configuration "
     "changes belong to the control plane, not the model-driven agent loop.\n"
@@ -188,6 +192,21 @@ MCP_GUIDANCE = (
     "not actually read by a tool call in this conversation.\n"
     "- Do not speculate about network topology, dual-NIC setups, load "
     "balancers, or NAT mappings unless the tool result explicitly documents them."
+)
+
+PYTHON_RUNTIME_GUIDANCE = (
+    "# Python execution boundary\n"
+    "- `execute_code` is for pure calculation and offline data processing only. It is "
+    "network-disabled and cannot install packages or call PubMed, ClinicalTrials.gov, "
+    "OpenAlex, internal APIs, or MCP servers.\n"
+    "- If a session skill provides a Python script or the task needs HTTP/API access "
+    "from skill code, use `run_skill_python` with a real path from `skill_view` or "
+    "the tool error's `available_skill_scripts`, e.g. `skills/<skill>/scripts/<file>.py`.\n"
+    "- Do not create ad-hoc workspace Python scripts that import requests/httpx and run "
+    "them with execute_code. Prefer existing skill scripts; if writing a workspace helper "
+    "is necessary, run it with `run_skill_python`, not `execute_code`.\n"
+    "- For general literature/current web search not tied to a skill script, use "
+    "web_search/web_extract."
 )
 
 # ---------------------------------------------------------------------------
@@ -434,6 +453,8 @@ def build_system_prompt(
     # 4b. Output formatting guidance — markdown preview mode
     if tools:
         stable.append(OUTPUT_FORMATTING_GUIDANCE)
+        if "execute_code" in tools or "run_skill_python" in tools:
+            stable.append(PYTHON_RUNTIME_GUIDANCE)
 
     # 5. MCP guidance (when MCP management tools are available)
     if any(t.startswith("mcp_server_") for t in tools):

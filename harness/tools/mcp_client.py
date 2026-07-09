@@ -466,6 +466,36 @@ def _offline_status(name: str, cfg: dict) -> dict:
     }
 
 
+def _no_mcp_diagnostic(user_id: str, session_id: str) -> dict:
+    skill_root = Path("data/skills") / user_id / session_id
+    skill_count = 0
+    mcp_candidates: list[str] = []
+    script_candidates: list[str] = []
+    if skill_root.is_dir():
+        skill_count = sum(1 for path in skill_root.iterdir() if path.is_dir() and (path / "SKILL.md").is_file())
+        for path in sorted(skill_root.rglob("*")):
+            if not path.is_file():
+                continue
+            rel = str(path.relative_to(skill_root))
+            if path.name == ".mcp.json" or "mcp" in path.name.lower():
+                mcp_candidates.append(rel)
+            elif path.suffix == ".py" and len(script_candidates) < 20:
+                script_candidates.append("skills/" + rel)
+    reason = (
+        "No .mcp.json or *mcp*.py server files were found in the installed session skills; "
+        "these skills appear to be REST/API or script-based rather than MCP-backed."
+        if skill_count and not mcp_candidates
+        else "No MCP server configuration is present for this session."
+    )
+    return {
+        "reason": reason,
+        "session_skill_count": skill_count,
+        "mcp_candidate_files": mcp_candidates[:20],
+        "available_skill_scripts_sample": script_candidates,
+        "recommended_next_tool": "run_skill_python" if script_candidates else "skill_view",
+    }
+
+
 # ── Tool registration / deregistration helpers ───────────────────────────────
 
 
@@ -1667,7 +1697,13 @@ async def mcp_server_list(
                 "dependency_status": cfg.get("_runtime_status"),
                 "network_egress": cfg.get("transport", _detect_transport(cfg)) in {"http", "sse"} or bool(cfg.get("_requires_network")),
             })
-        return json.dumps({"success": True, "servers": result, "count": len(result), "message": "No MCP servers are configured for this session." if not result else ""}, ensure_ascii=False)
+        return json.dumps({
+            "success": True,
+            "servers": result,
+            "count": len(result),
+            "message": "" if result else "No MCP servers are configured for this session.",
+            "diagnostic": None if result else _no_mcp_diagnostic(user_id, session_id),
+        }, ensure_ascii=False)
 
     except Exception as e:
         logger.exception("mcp_server_list error")
@@ -1726,7 +1762,13 @@ async def mcp_server_status(
             else:
                 results.append(_offline_status(sname, servers[sname]))
 
-        return json.dumps({"success": True, "servers": results, "count": len(results), "message": "No MCP servers are configured for this session." if not results else ""}, ensure_ascii=False)
+        return json.dumps({
+            "success": True,
+            "servers": results,
+            "count": len(results),
+            "message": "" if results else "No MCP servers are configured for this session.",
+            "diagnostic": None if results else _no_mcp_diagnostic(user_id, session_id),
+        }, ensure_ascii=False)
 
     except Exception as e:
         logger.exception("mcp_server_status error")
