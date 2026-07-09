@@ -48,6 +48,10 @@ ALLOWED_EXTENSIONS = frozenset({
 # Files inside a skill zip that shouldn't count against the text-only check
 ALLOWED_BINARY_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico"})
 
+DEPENDENCY_MANIFEST_NAMES = frozenset({
+    "pyproject.toml", "setup.cfg", "Pipfile", "environment.yml", "environment.yaml",
+})
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -63,6 +67,50 @@ def _validate_bundle_rel_path(zip_path: str, target_dir: Path) -> Path:
     except ValueError:
         raise HTTPException(status_code=400, detail=f"Path traversal detected: {zip_path}")
     return resolved
+
+
+def _dependency_manifest_entries(
+    zf: zipfile.ZipFile,
+    entries: list[tuple[zipfile.ZipInfo, str]],
+    skill_roots: list[str],
+) -> list[tuple[zipfile.ZipInfo, str]]:
+    result: list[tuple[zipfile.ZipInfo, str]] = []
+    for info, norm in entries:
+        name = Path(norm).name
+        if not (name.startswith("requirements") and name.endswith(".txt") or name in DEPENDENCY_MANIFEST_NAMES):
+            continue
+        if any(_entry_is_under_skill_root(norm, root) for root in skill_roots):
+            continue
+        result.append((info, norm))
+    return result
+
+
+def _copy_bundle_dependency_manifests(
+    zf: zipfile.ZipFile,
+    manifest_entries: list[tuple[zipfile.ZipInfo, str]],
+    user_skills_dir: Path,
+) -> list[str]:
+    copied: list[str] = []
+    if not manifest_entries:
+        return copied
+    target_root = user_skills_dir / "_bundle_runtime"
+    target_root.mkdir(parents=True, exist_ok=True)
+    for info, norm in manifest_entries:
+        if info.file_size > MAX_FILE_SIZE:
+            logger.warning("Skipping oversized bundle dependency manifest (%d bytes): %s", info.file_size, norm)
+            continue
+        rel = norm.replace("/", "__")
+        safe_path = _validate_bundle_rel_path(rel, target_root)
+        data = zf.read(info.filename)
+        try:
+            data.decode("utf-8")
+        except UnicodeDecodeError:
+            logger.warning("Skipping non-UTF-8 bundle dependency manifest: %s", norm)
+            continue
+        safe_path.parent.mkdir(parents=True, exist_ok=True)
+        safe_path.write_bytes(data)
+        copied.append(str(safe_path.relative_to(user_skills_dir)))
+    return copied
 
 
 def _parse_frontmatter(text: str) -> dict:
@@ -270,6 +318,7 @@ async def _process_skill_zip(
         )
         skill_names = [str(manifest["name"]) for manifest in manifests]
         skill_roots = [str(manifest["root"]) for manifest in manifests]
+        bundle_dependency_entries = _dependency_manifest_entries(zf, entries, skill_roots)
         existing_rows = (await db.execute(
             select(SkillPackage.name).where(
                 SkillPackage.user_id == user.id,
@@ -287,6 +336,15 @@ async def _process_skill_zip(
             raise HTTPException(
                 status_code=409,
                 detail=f"Skills already exist: {', '.join(conflicts)}. Delete them first to update.",
+            )
+
+        bundle_runtime_files = _copy_bundle_dependency_manifests(
+            zf, bundle_dependency_entries, user_skills_dir
+        )
+        if bundle_runtime_files:
+            logger.info(
+                "Copied %d bundle dependency manifest(s) for user=%s session=%s",
+                len(bundle_runtime_files), user.id, session_id or "user",
             )
 
         for manifest in manifests:

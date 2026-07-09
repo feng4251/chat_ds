@@ -98,17 +98,65 @@ def _resolve_script(script_path: str, user_id: str, session_id: str) -> Path:
 
 def _resolve_skill_path(rel_text: str, user_id: str, session_id: str) -> Path:
     rel = PurePosixPath(rel_text)
-    if rel.is_absolute() or ".." in rel.parts or len(rel.parts) < 2:
-        raise ValueError("Skill paths must be skills/<skill>/<relative.py>.")
+    if rel.is_absolute() or ".." in rel.parts:
+        raise ValueError("Skill path escapes the current session skill directory.")
     root = (USER_SKILLS_BASE / user_id / session_id).resolve()
+    if len(rel.parts) < 2:
+        return _resolve_unique_skill_script(rel_text, root)
     candidate = (root / Path(*rel.parts)).resolve()
     try:
         candidate.relative_to(root)
     except ValueError:
         raise ValueError("Skill path escapes the current session skill directory.")
     if not candidate.exists():
+        matches = _skill_script_matches(rel_text, root)
+        if matches:
+            choices = ", ".join(_display_skill_candidate(path, root) for path in matches[:10])
+            raise FileNotFoundError(
+                f"Skill script not found: skills/{rel_text}. Did you mean one of: {choices}"
+            )
         raise FileNotFoundError(f"Skill script not found: skills/{rel_text}")
     return candidate
+
+
+def _resolve_unique_skill_script(rel_text: str, root: Path) -> Path:
+    matches = _skill_script_matches(rel_text, root)
+    if not matches:
+        raise ValueError(
+            "Skill paths must be skills/<skill>/<relative.py>, or skills/<script.py> "
+            "when that script name is unique in the current session skills."
+        )
+    if len(matches) > 1:
+        choices = ", ".join(_display_skill_candidate(path, root) for path in matches[:10])
+        raise ValueError(
+            f"Ambiguous skill script path skills/{rel_text}. Use a full path such as: {choices}"
+        )
+    return matches[0]
+
+
+def _skill_script_matches(rel_text: str, root: Path) -> list[Path]:
+    if not root.is_dir():
+        return []
+    name = PurePosixPath(rel_text).name
+    if not name.endswith(".py"):
+        return []
+    matches: list[Path] = []
+    for path in sorted(root.rglob(name)):
+        try:
+            resolved = path.resolve()
+            resolved.relative_to(root)
+        except ValueError:
+            continue
+        if not resolved.is_symlink() and resolved.is_file():
+            matches.append(resolved)
+    return matches
+
+
+def _display_skill_candidate(path: Path, root: Path) -> str:
+    try:
+        return "skills/" + str(path.resolve().relative_to(root))
+    except ValueError:
+        return str(path)
 
 
 def _resolve_cwd(cwd: str, user_id: str, session_id: str, script: Path) -> Path:
@@ -168,7 +216,7 @@ RUN_SKILL_PYTHON_SCHEMA = {
         "properties": {
             "script_path": {
                 "type": "string",
-                "description": "Path to a .py script: workspace-relative path, workspace/<path>, or skills/<skill>/<path>.",
+                "description": "Path to a .py script: workspace-relative path, workspace/<path>, skills/<skill>/<path>, or skills/<script.py> when unique.",
             },
             "args": {
                 "type": "array",

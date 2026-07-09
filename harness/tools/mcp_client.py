@@ -1667,7 +1667,7 @@ async def mcp_server_list(
                 "dependency_status": cfg.get("_runtime_status"),
                 "network_egress": cfg.get("transport", _detect_transport(cfg)) in {"http", "sse"} or bool(cfg.get("_requires_network")),
             })
-        return json.dumps({"success": True, "servers": result, "count": len(result)}, ensure_ascii=False)
+        return json.dumps({"success": True, "servers": result, "count": len(result), "message": "No MCP servers are configured for this session." if not result else ""}, ensure_ascii=False)
 
     except Exception as e:
         logger.exception("mcp_server_list error")
@@ -1726,7 +1726,7 @@ async def mcp_server_status(
             else:
                 results.append(_offline_status(sname, servers[sname]))
 
-        return json.dumps({"success": True, "servers": results, "count": len(results)}, ensure_ascii=False)
+        return json.dumps({"success": True, "servers": results, "count": len(results), "message": "No MCP servers are configured for this session." if not results else ""}, ensure_ascii=False)
 
     except Exception as e:
         logger.exception("mcp_server_status error")
