@@ -217,6 +217,9 @@ class MCPServerState:
             "tools": tool_names,
             "last_error": self.last_error,
             "last_connect_time": self.last_connect_time,
+            "runtime": self.config.get("_runtime", "default"),
+            "dependency_status": self.config.get("_runtime_status"),
+            "network_egress": self.transport in {"http", "sse"} or bool(self.config.get("_requires_network")),
         }
 
 
@@ -246,8 +249,8 @@ def _build_safe_env(user_env: dict | None) -> dict:
     for key, value in os.environ.items():
         if key in _SAFE_ENV_KEYS or key.startswith("XDG_"):
             env[key] = value
-    # Curated compatibility modules for common bundled MCP scripts. We do not
-    # install arbitrary skill dependencies at runtime.
+    # Curated compatibility modules for common bundled MCP scripts. Skill-owned
+    # Python MCP servers can add their session venv via runtime_env_for_subprocess().
     env["PYTHONPATH"] = "/app/mcp_vendor"
     if user_env:
         env.update(user_env)
@@ -445,6 +448,22 @@ def _filter_user_mcp_servers(
                 continue
         filtered[sname] = cfg
     return filtered
+
+
+def _offline_status(name: str, cfg: dict) -> dict:
+    transport = cfg.get("transport", _detect_transport(cfg))
+    return {
+        "name": name,
+        "connected": False,
+        "transport": transport,
+        "tool_count": 0,
+        "tools": [],
+        "last_error": "Not connected yet",
+        "last_connect_time": 0,
+        "runtime": cfg.get("_runtime", "default"),
+        "dependency_status": cfg.get("_runtime_status"),
+        "network_egress": transport in {"http", "sse"} or bool(cfg.get("_requires_network")),
+    }
 
 
 # ── Tool registration / deregistration helpers ───────────────────────────────
@@ -736,6 +755,7 @@ async def _get_or_connect(
         if not config:
             return None
         state = MCPServerState(server_name, config)
+        state._session_id = session_id
         key = (user_id, session_id)
         _mcp_states.setdefault(key, {})[server_name] = state
 
@@ -898,10 +918,40 @@ async def _connect_stdio(state: MCPServerState) -> bool:
         state.last_error = "stdio transport requires 'command' in config"
         return False
 
+    if config.get("_runtime") == "session_python_env":
+        try:
+            from runtime.python_env import (
+                ensure_session_runtime,
+                resolve_session_python,
+                runtime_env_for_subprocess,
+            )
+            user_id = str(config.get("_user_id") or "default")
+            session_id = str(state._session_id or config.get("_session_id") or "default")
+            runtime_status = await ensure_session_runtime(
+                user_id,
+                session_id,
+                extra_skill_dirs=[config.get("_source_path")] if config.get("_source_path") else None,
+            )
+            config["_runtime_status"] = runtime_status.get("status")
+            config["_runtime_env_hash"] = runtime_status.get("env_hash")
+            if runtime_status.get("status") not in {"ready"}:
+                state.last_error = (
+                    "Python runtime is not ready: "
+                    f"{runtime_status.get('status')} {runtime_status.get('error') or ''}"
+                ).strip()
+                return False
+            runtime_python = resolve_session_python(runtime_status)
+            if runtime_python and str(command) in {"python", "python3"}:
+                command = runtime_python
+            user_env = runtime_env_for_subprocess(runtime_status, _build_safe_env(user_env))
+        except Exception as exc:
+            state.last_error = f"Python runtime setup failed: {_sanitize_error(_exc_str(exc))}"
+            return False
+
     # Reset ready event for (re)connection
     state._ready_event.clear()
 
-    safe_env = _build_safe_env(user_env)
+    safe_env = user_env if isinstance(user_env, dict) and config.get("_runtime") == "session_python_env" else _build_safe_env(user_env)
 
     server_params = StdioServerParameters(
         command=command,
@@ -1450,7 +1500,11 @@ async def mcp_server_add(
         config = _load_scope_config(user_id, session_id)
         servers = config.get("servers", {})
 
-        server_config: dict = {"timeout": timeout}
+        server_config: dict = {
+            "timeout": timeout,
+            "_user_id": user_id,
+            "_session_id": session_id,
+        }
 
         if command:
             # Reject obviously wrong stdio args that won't work
@@ -1476,6 +1530,9 @@ async def mcp_server_add(
                         ),
                     }, ensure_ascii=False)
             server_config["command"] = command
+            if command in {"python", "python3"} or str(command).endswith(("/python", "/python3")):
+                server_config.setdefault("_runtime", "session_python_env")
+                server_config.setdefault("_requires_network", True)
             if args:
                 server_config["args"] = args
             if env:
@@ -1606,6 +1663,9 @@ async def mcp_server_list(
                 "command": cfg.get("command", ""),
                 "connected": state.connected if state else False,
                 "tool_count": len(state.tools) if state else 0,
+                "runtime": cfg.get("_runtime", "default"),
+                "dependency_status": cfg.get("_runtime_status"),
+                "network_egress": cfg.get("transport", _detect_transport(cfg)) in {"http", "sse"} or bool(cfg.get("_requires_network")),
             })
         return json.dumps({"success": True, "servers": result, "count": len(result)}, ensure_ascii=False)
 
@@ -1654,15 +1714,7 @@ async def mcp_server_status(
             else:
                 return json.dumps({
                     "success": True,
-                    "server": {
-                        "name": name,
-                        "connected": False,
-                        "transport": _detect_transport(servers[name]),
-                        "tool_count": 0,
-                        "tools": [],
-                        "last_error": "Not connected yet",
-                        "last_connect_time": 0,
-                    },
+                    "server": _offline_status(name, servers[name]),
                 }, ensure_ascii=False)
 
         # All servers
@@ -1672,15 +1724,7 @@ async def mcp_server_status(
             if state:
                 results.append(state.to_status())
             else:
-                results.append({
-                    "name": sname,
-                    "connected": False,
-                    "transport": _detect_transport(servers[sname]),
-                    "tool_count": 0,
-                    "tools": [],
-                    "last_error": "Not connected yet",
-                    "last_connect_time": 0,
-                })
+                results.append(_offline_status(sname, servers[sname]))
 
         return json.dumps({"success": True, "servers": results, "count": len(results)}, ensure_ascii=False)
 

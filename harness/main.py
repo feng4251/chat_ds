@@ -146,6 +146,24 @@ async def internal_session_cleanup(
     return await cleanup_session_runtime(user_id, session_id)
 
 
+@app.post("/internal/runtime/python/ensure")
+async def internal_runtime_python_ensure(
+    user_id: str,
+    session_id: str,
+):
+    from runtime.python_env import ensure_session_runtime
+    return await ensure_session_runtime(user_id, session_id)
+
+
+@app.get("/internal/runtime/python/status")
+async def internal_runtime_python_status(
+    user_id: str,
+    session_id: str,
+):
+    from runtime.python_env import get_session_runtime_status
+    return get_session_runtime_status(user_id, session_id)
+
+
 # ── Public endpoints ───────────────────────────────────────────────────────
 
 
