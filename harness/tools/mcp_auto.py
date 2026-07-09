@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from skills.loader import parse_frontmatter, substitute_template_vars
+from runtime.python_env import scan_skill_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -139,10 +140,20 @@ async def auto_register_skill_mcp(
     if not mcp_servers:
         return {"registered": [], "skipped": [], "errors": []}
 
+    runtime_result = scan_skill_runtime(skill_path)
+
     for server_name, server_config in mcp_servers.items():
         server_config["_source_skill"] = skill_path.name
         server_config["_source_path"] = str(skill_path)
         server_config["_scope"] = "session" if session_id != "default" else "user"
+        server_config["_user_id"] = user_id
+        server_config["_session_id"] = session_id
+        if _detect_runtime_for_server(server_config) == "session_python_env":
+            server_config["_runtime"] = "session_python_env"
+            server_config["_runtime_status"] = runtime_result.get("status")
+            server_config["_requires_network"] = bool(
+                (runtime_result.get("dependencies") or {}).get("python_packages")
+            )
 
     # ── Step 2: Load existing config, merge new servers ──────────────────
     from tools.mcp_client import _load_scope_config, _save_config
@@ -203,7 +214,19 @@ async def auto_register_skill_mcp(
         "registered": registered,
         "skipped": skipped,
         "errors": errors,
+        "runtime": runtime_result,
     }
+
+
+
+def _detect_runtime_for_server(server_config: dict) -> str:
+    command = str(server_config.get("command") or "")
+    args = [str(arg) for arg in server_config.get("args") or []]
+    if command in {"python", "python3"} or command.endswith("/python") or command.endswith("/python3"):
+        return "session_python_env"
+    if any(arg.endswith(".py") for arg in args):
+        return "session_python_env"
+    return "default"
 
 
 

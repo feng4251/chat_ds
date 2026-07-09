@@ -30,7 +30,7 @@ from workspace import ensure_workspace, safe_workspace_path, serialize_json_list
 from hooks import emit_event
 # All tools available to the agent harness for native tool-calling.
 AGENT_TOOLS = [
-    "web_search", "web_extract", "execute_code",
+    "web_search", "web_extract", "execute_code", "run_skill_python",
     "read_file", "write_file", "patch_file", "search_files",
     "todo", "clarify", "memory",
     "skills_list", "skill_view", "skill_manage",

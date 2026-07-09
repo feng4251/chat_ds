@@ -364,7 +364,7 @@ async def _process_skill_zip(
     except Exception:
         pass
 
-    mcp_result = {"registered": [], "skipped": [], "errors": []}
+    mcp_result = {"registered": [], "skipped": [], "errors": [], "runtime": []}
     mcp_by_skill: dict[str, dict] = {}
     for skill in installed_skills:
         skill_name = str(skill["name"])
@@ -377,6 +377,10 @@ async def _process_skill_zip(
                 values = skill_mcp.get(key) or []
                 if isinstance(values, list):
                     mcp_result[key].extend(values)
+            runtime = skill_mcp.get("runtime")
+            if isinstance(runtime, dict):
+                runtime_summary = {"skill": skill_name, **runtime}
+                mcp_result["runtime"].append(runtime_summary)
             if skill_mcp.get("registered"):
                 logger.info(
                     "Auto MCP for skill '%s' (user=%s): registered=%s",
@@ -400,6 +404,7 @@ async def _process_skill_zip(
         "installed_count": len(installed_skills),
         "mcp": mcp_result,
         "mcp_by_skill": mcp_by_skill,
+        "runtime": mcp_result.get("runtime", []),
     }
 
 

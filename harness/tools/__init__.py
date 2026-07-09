@@ -2,6 +2,7 @@ from tools.registry import register
 from tools.web_search import web_search
 from tools.web_extract import web_extract
 from tools.code_execution import execute_code, EXECUTE_CODE_SCHEMA
+from tools.skill_python import run_skill_python, RUN_SKILL_PYTHON_SCHEMA
 from tools.file_tools import read_file, write_file, patch_file, search_files
 from tools.file_tools import (
     READ_FILE_SCHEMA, WRITE_FILE_SCHEMA, PATCH_FILE_SCHEMA, SEARCH_FILES_SCHEMA,
@@ -95,6 +96,17 @@ register(
     is_read_only=True,
     parallel_safe=False,
     emoji="🐍",
+)
+
+register(
+    "run_skill_python",
+    RUN_SKILL_PYTHON_SCHEMA,
+    run_skill_python,
+    is_read_only=False,
+    parallel_safe=False,
+    path_scoped=True,
+    emoji="🐍",
+    allow_in_parallel_child=False,
 )
 
 register(
