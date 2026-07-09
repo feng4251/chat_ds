@@ -47,11 +47,28 @@ BUILTIN_PACKAGES = {
     "xlsxwriter",
 }
 IMPORT_PACKAGE_HINTS = {
+    "Bio": "biopython",
     "bs4": "beautifulsoup4",
     "cv2": "opencv-python",
     "PIL": "Pillow",
     "sklearn": "scikit-learn",
     "yaml": "pyyaml",
+}
+HIGH_CONFIDENCE_IMPORT_PACKAGES = {
+    "aiohttp",
+    "biopython",
+    "beautifulsoup4",
+    "httpx",
+    "lxml",
+    "openai",
+    "opencv-python",
+    "plotly",
+    "pydantic",
+    "pyyaml",
+    "requests",
+    "rich",
+    "tenacity",
+    "tqdm",
 }
 REQ_OPTION_RE = re.compile(r"^\s*(?:-|#)")
 REQ_NAME_RE = re.compile(r"^\s*([A-Za-z0-9_.-]+)")
@@ -79,6 +96,9 @@ def scan_skill_dependencies(skill_dir: str | Path) -> dict[str, Any]:
     _scan_manifests(root, packages, unsupported, warnings, sources)
     _scan_mcp_entrypoints(root, entrypoints, warnings, sources)
     heuristic_imports = _scan_python_imports(root, packages, warnings)
+    for package in heuristic_imports:
+        if package in HIGH_CONFIDENCE_IMPORT_PACKAGES:
+            packages.append(package)
 
     return {
         "python_packages": _dedupe(packages),

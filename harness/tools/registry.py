@@ -292,6 +292,35 @@ class ToolRegistry:
             stripped.pop("enabled_user_skills", None)
         return stripped
 
+    @staticmethod
+    def _strip_unexpected_args(entry: ToolEntry, args: Any) -> tuple[Any, list[str]]:
+        if not isinstance(args, dict):
+            return args, []
+        params = entry.schema.get("parameters") or {}
+        properties = params.get("properties") or {}
+        allow_extra = params.get("additionalProperties") is True or not properties
+        if allow_extra:
+            return args, []
+        unexpected = sorted(k for k in args if k not in properties)
+        if not unexpected:
+            return args, []
+        return {k: v for k, v in args.items() if k in properties}, unexpected
+
+    @staticmethod
+    def _append_ignored_args_notice(result: str, ignored_args: list[str]) -> str:
+        notice = {
+            "ignored_unexpected_fields": ignored_args,
+            "hint": "Unexpected fields were ignored; use the tool schema fields only on future calls.",
+        }
+        try:
+            data = json.loads(result)
+        except json.JSONDecodeError:
+            return result + "\n\n" + json.dumps(notice, ensure_ascii=False)
+        if isinstance(data, dict):
+            data.update(notice)
+            return json.dumps(data, ensure_ascii=False)
+        return result + "\n\n" + json.dumps(notice, ensure_ascii=False)
+
     # ── Dispatch ──────────────────────────────────────────────────────
 
     async def dispatch(
@@ -307,6 +336,7 @@ class ToolRegistry:
         try:
             if context is not None:
                 args = self._strip_context_owned_args(entry, args)
+            args, ignored_args = self._strip_unexpected_args(entry, args)
             schema_error = self._validate_args(entry, args)
             if schema_error:
                 logger.info("Tool %s schema validation failed: %s", name, schema_error)
@@ -326,6 +356,8 @@ class ToolRegistry:
                 result = await entry.handler(**call_args)
             else:
                 result = entry.handler(**call_args)
+            if ignored_args:
+                result = self._append_ignored_args_notice(str(result), ignored_args)
             return str(result)
         except Exception as e:
             logger.exception("Tool %s dispatch error: %s", name, e)

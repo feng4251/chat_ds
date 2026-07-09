@@ -30,7 +30,11 @@ async def run_skill_python(
         script = _resolve_script(script_path, user_id, session_id)
         workdir = _resolve_cwd(cwd, user_id, session_id, script)
     except (ValueError, FileNotFoundError) as exc:
-        return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False)
+        return json.dumps({
+            "status": "error",
+            "error": str(exc),
+            "available_skill_scripts": _available_skill_scripts(user_id, session_id),
+        }, ensure_ascii=False)
     runtime = await ensure_session_runtime(user_id, session_id)
     if runtime.get("status") != "ready":
         return json.dumps({
@@ -157,6 +161,25 @@ def _display_skill_candidate(path: Path, root: Path) -> str:
         return "skills/" + str(path.resolve().relative_to(root))
     except ValueError:
         return str(path)
+
+
+def _available_skill_scripts(user_id: str, session_id: str) -> list[str]:
+    root = (USER_SKILLS_BASE / user_id / session_id).resolve()
+    if not root.is_dir():
+        return []
+    result: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        try:
+            resolved = path.resolve()
+            resolved.relative_to(root)
+        except ValueError:
+            continue
+        if resolved.is_symlink() or not resolved.is_file():
+            continue
+        result.append(_display_skill_candidate(resolved, root))
+        if len(result) >= 40:
+            break
+    return result
 
 
 def _resolve_cwd(cwd: str, user_id: str, session_id: str, script: Path) -> Path:
