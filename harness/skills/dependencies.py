@@ -90,6 +90,32 @@ def scan_skill_dependencies(skill_dir: str | Path) -> dict[str, Any]:
     }
 
 
+def scan_dependency_manifests(root_dir: str | Path) -> dict[str, Any]:
+    root = Path(root_dir).resolve()
+    if not root.is_dir():
+        return {
+            "python_packages": [],
+            "entrypoints": [],
+            "unsupported": [],
+            "warnings": [f"Dependency manifest directory not found: {root_dir}"],
+            "sources": [],
+            "heuristic_imports": [],
+        }
+    packages: list[str] = []
+    unsupported: list[str] = []
+    warnings: list[str] = []
+    sources: list[dict[str, str]] = []
+    _scan_manifests(root, packages, unsupported, warnings, sources)
+    return {
+        "python_packages": _dedupe(packages),
+        "entrypoints": [],
+        "unsupported": _dedupe(unsupported),
+        "warnings": _dedupe(warnings),
+        "sources": sources,
+        "heuristic_imports": [],
+    }
+
+
 def aggregate_dependency_reports(reports: list[dict[str, Any]]) -> dict[str, Any]:
     packages: list[str] = []
     entrypoints: list[str] = []

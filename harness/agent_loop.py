@@ -34,10 +34,13 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 3
 DEFAULT_MAX_TOKENS = 8192
 
-# For a complex deliverable driven by a session skill that declares multiple
-# worker/pipeline resources, encourage reading a breadth of them (not just one)
-# before drafting. The target scales down for skills that declare fewer workers.
-_WORKER_BREADTH_TARGET = 4
+# Complex session-skill deliverables should cover the explicit workflow files
+# declared by the skill, not just sample a few worker resources.
+_MAX_REQUIRED_WORKFLOW_FILES = 32
+_WORKFLOW_FILE_CATEGORIES = (
+    "orchestration", "workflows", "workers", "formats", "evaluation", "scripts", "protocols",
+)
+_SUPPORTING_WORKFLOW_CATEGORIES = {"references", "templates", "examples"}
 
 
 _LARGE_TOOL_ARGUMENT_STRING_CAP = 2_000
@@ -240,42 +243,65 @@ class HarnessRunState:
             if "__manifest__" not in files:
                 return True, f"load the resource manifest for session skill '{skill_name}'"
 
-            declared = self.skill_category_files.get(skill_name, {})
-            declared_workers = [
-                path for path in declared.get("workers", [])
-                if "/workers/" in path or path.startswith("workers/")
-            ]
+            required_files = _required_workflow_files(self.skill_category_files.get(skill_name, {}))
+            missing_required = [path for path in required_files if path not in files]
+            if missing_required:
+                return True, (
+                    f"inspect explicit workflow resources for session skill '{skill_name}' "
+                    f"(missing {len(missing_required)} of {len(required_files)} declared files)"
+                )
+
             primary_workflow_categories = {"orchestration", "workers", "workflows"}
-            if declared_workers:
-                # Breadth: read several distinct workers, scaled by what exists.
-                viewed_workers = {
-                    path for path in files
-                    if "/workers/" in path or path.startswith("workers/")
-                }
-                target = min(len(declared_workers), _WORKER_BREADTH_TARGET)
-                if len(viewed_workers) < target:
-                    return True, (
-                        f"inspect additional worker resources for session skill '{skill_name}' "
-                        f"(viewed {len(viewed_workers)} of {target} recommended workers)"
-                    )
-            elif available_categories & primary_workflow_categories:
+            if available_categories & primary_workflow_categories:
                 viewed_primary = categories & primary_workflow_categories
                 viewed_worker_file = any("/workers/" in path for path in files)
                 if not viewed_primary and not viewed_worker_file:
                     return True, f"inspect orchestrator or worker resources for session skill '{skill_name}'"
 
-            # Output/format specifications are frequently required for a faithful
-            # deliverable; require them explicitly when the skill declares them.
             if "formats" in available_categories and "formats" not in categories:
                 return True, f"inspect output format specifications for session skill '{skill_name}'"
 
-            supporting_categories = {
-                "references", "scripts", "templates", "protocols", "evaluation", "examples",
-            }
-            available_supporting = available_categories & supporting_categories
+            available_supporting = available_categories & _SUPPORTING_WORKFLOW_CATEGORIES
             if available_supporting and not (categories & available_supporting):
                 return True, f"inspect supporting resources for session skill '{skill_name}'"
         return False, ""
+
+
+def _required_workflow_files(declared: dict[str, list[str]]) -> list[str]:
+    required: list[str] = []
+    for category in _WORKFLOW_FILE_CATEGORIES:
+        for path in declared.get(category, []):
+            if _is_required_workflow_file(path):
+                required.append(path)
+    return _dedupe_paths(required)[:_MAX_REQUIRED_WORKFLOW_FILES]
+
+
+def _is_required_workflow_file(path: str) -> bool:
+    normalized = str(path or "").strip()
+    if not normalized or normalized.endswith("/"):
+        return False
+    name = normalized.rsplit("/", 1)[-1].lower()
+    if name in {"readme.md", "license", "license.md"}:
+        return False
+    return normalized.startswith((
+        "orchestration/", "workflows/", "workers/", "formats/",
+        "evaluation/", "scripts/", "protocols/",
+    )) or any(part in normalized for part in (
+        "/orchestration/", "/workflows/", "/workers/", "/formats/",
+        "/evaluation/", "/scripts/", "/protocols/",
+    ))
+
+
+def _dedupe_paths(paths: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for path in paths:
+        normalized = str(path)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
 
 
 def _suggested_workflow_paths_for_reason(
@@ -288,9 +314,16 @@ def _suggested_workflow_paths_for_reason(
     paths: list[str] = []
     for skill_name in sorted(run_state.viewed_skill_names & run_state.session_skill_names):
         already_viewed = run_state.viewed_skill_files.get(skill_name, set())
+        missing_required = [
+            path for path in _required_workflow_files(run_state.skill_category_files.get(skill_name, {}))
+            if path not in already_viewed
+        ]
+        if missing_required:
+            paths.extend(missing_required)
+            continue
         for path in run_state.skill_suggested_files.get(skill_name, []):
             if path in already_viewed:
-                continue  # prefer resources the model has not read yet
+                continue
             if requested_primary:
                 if path.startswith(("orchestration/", "workers/", "workflows/")) or "/workers/" in path:
                     paths.append(path)
@@ -305,7 +338,7 @@ def _suggested_workflow_paths_for_reason(
                     paths.append(path)
             else:
                 paths.append(path)
-    return paths
+    return _dedupe_paths(paths)
 
 
 async def run_stream(
@@ -448,7 +481,8 @@ async def run_stream(
     verifier_continuations = 0
     skill_enforcement_continuations = 0
     skill_workflow_continuations = 0
-    max_skill_workflow_continuations = 8
+    action_promise_continuations = 0
+    max_skill_workflow_continuations = 36
     yield await emit_agent_event("run.started", {
         "model_id": model_id,
         "source": source,
@@ -460,14 +494,15 @@ async def run_stream(
         requires_manifest = "manifest" in reason
         suggested_paths = [] if requires_manifest else _suggested_workflow_paths_for_reason(run_state, reason)
         suggested_line = (
-            "\nSuggested skill resource paths to inspect now: " + ", ".join(suggested_paths[:12])
+            "\nSuggested skill resource paths to inspect now: " + ", ".join(suggested_paths[:20])
             if suggested_paths else ""
         )
         next_action = (
             "Your next tool call MUST be skill_view(name, file_path='__manifest__') for the relevant session skill. "
             if requires_manifest else
-            "Your next tool call MUST choose at least one path from the suggested skill resource paths below "
-            "and call skill_view(name, file_path=that_path). "
+            "Your next tool calls MUST inspect the suggested skill resource paths below with "
+            "skill_view(name, file_path=that_path). You may issue multiple independent skill_view "
+            "calls in the same assistant turn to cover the missing workflow files. "
         )
         conversation.append({
             "role": "user",
@@ -1061,6 +1096,36 @@ async def run_stream(
                     }
                     yield {"type": "delta", "content": "\n\n"}
                     continue
+
+            if (
+                action_promise_continuations < 1
+                and _looks_like_unfulfilled_action_promise(full_content)
+                and (
+                    _looks_like_complex_artifact_request(original_user_text)
+                    or run_state.tool_error_count > 0
+                    or run_state.viewed_skill_names
+                    or run_state.tool_call_count > 0
+                )
+            ):
+                action_promise_continuations += 1
+                conversation.append({
+                    "role": "assistant",
+                    "content": full_content or "(No visible response.)",
+                })
+                conversation.append({
+                    "role": "user",
+                    "content": (
+                        "Your last response ended by promising a concrete next action, but no tool call or final deliverable followed. "
+                        "Do not stop after describing the next step. Continue now: use the needed tool call, write the requested artifact, "
+                        "or provide the completed final answer with concrete evidence."
+                    ),
+                })
+                yield {
+                    "type": "tool_progress",
+                    "msg": "↻ Continuing after an unfinished action promise",
+                }
+                yield {"type": "delta", "content": "\n\n"}
+                continue
 
             current_goal = await _fetch_goal(user_id, session_id)
             if current_goal and current_goal.get("status") == "active":
@@ -1921,6 +1986,28 @@ def _looks_like_file_artifact_request(text: str) -> bool:
         ".txt", ".csv", ".json", ".pdf", "workspace", "工作区",
     )
     return any(marker in lowered for marker in markers)
+
+
+def _looks_like_unfulfilled_action_promise(text: str) -> bool:
+    stripped = text.strip()
+    if len(stripped) < 40:
+        return False
+    tail = stripped[-700:].lower()
+    promise_markers = (
+        "let me ", "i will ", "i'll ", "i am going to ", "i’m going to ",
+        "next, i", "now i will", "i have the full content", "continue by",
+        "让我", "接下来", "下一步", "现在我", "我将", "我会",
+    )
+    action_markers = (
+        "run", "execute", "write", "save", "create", "call", "use the tool",
+        "workspace", "simulation", "analysis", "script", "生成", "写入", "运行", "执行", "调用", "保存",
+    )
+    completion_markers = (
+        "completed", "done", "已完成", "完成如下", "最终", "final", "结果如下",
+    )
+    if any(marker in tail for marker in completion_markers):
+        return False
+    return any(marker in tail for marker in promise_markers) and any(marker in tail for marker in action_markers)
 
 
 # ── Internal helpers ────────────────────────────────────────────────────

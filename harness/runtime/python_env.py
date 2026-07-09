@@ -12,7 +12,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from skills.dependencies import aggregate_dependency_reports, scan_skill_dependencies
+from skills.dependencies import (
+    aggregate_dependency_reports,
+    scan_dependency_manifests,
+    scan_skill_dependencies,
+)
 from skills.scanner import USER_SKILLS_BASE
 
 RUNTIME_ROOT = Path(os.environ.get("SKILL_RUNTIME_ROOT", "/app/data/runtime_envs"))
@@ -238,6 +242,15 @@ def _scan_session_reports(
             roots.append(path)
     seen: set[str] = set()
     reports: list[dict[str, Any]] = []
+    if session_root.is_dir():
+        for root in _manifest_roots(session_root, roots):
+            key = str(root.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            report = scan_dependency_manifests(root)
+            report["manifest_dir"] = key
+            reports.append(report)
     for root in roots:
         key = str(root.resolve())
         if key in seen:
@@ -247,6 +260,31 @@ def _scan_session_reports(
         report["skill_dir"] = key
         reports.append(report)
     return reports
+
+
+def _manifest_roots(session_root: Path, skill_roots: list[Path]) -> list[Path]:
+    skill_root_set = {str(path.resolve()) for path in skill_roots}
+    roots: list[Path] = []
+    for path in [session_root, *[p for p in session_root.iterdir() if p.is_dir()]]:
+        resolved = str(path.resolve())
+        if resolved in skill_root_set:
+            continue
+        if _has_dependency_manifest(path):
+            roots.append(path)
+    return roots
+
+
+def _has_dependency_manifest(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    for child in path.iterdir():
+        name = child.name
+        if child.is_file() and (
+            (name.startswith("requirements") and name.endswith(".txt"))
+            or name in {"pyproject.toml", "setup.cfg", "Pipfile", "environment.yml", "environment.yaml"}
+        ):
+            return True
+    return False
 
 
 def _dependency_status(manifest: dict[str, Any]) -> str:

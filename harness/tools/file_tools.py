@@ -62,12 +62,18 @@ async def read_file(
         session_id: Session identifier for sandbox isolation.
     """
     try:
-        path = _resolve(filepath, user_id, session_id)
+        if filepath.startswith("results/"):
+            path = validate_path(filepath[len("results/"):], user_id, session_id, sub="results")
+        else:
+            path = _resolve(filepath, user_id, session_id)
     except ValueError as e:
         return json.dumps({"error": str(e)})
 
     if not path.exists():
-        hint = "Use skill_view(name, file_path=...) for files inside an installed skill. read_file only reads workspace files."
+        hint = (
+            "Use skill_view(name, file_path=...) for files inside an installed skill. "
+            "read_file reads workspace files and persisted tool results under results/."
+        )
         return json.dumps({"error": f"File not found: {filepath}", "hint": hint})
     if not path.is_file():
         return json.dumps({"error": f"Not a regular file: {filepath}"})
@@ -474,8 +480,8 @@ def _search_content_python(
 READ_FILE_SCHEMA = {
     "name": "read_file",
     "description": (
-        "Read a file from the session workspace sandbox only. This does not read files "
-        "inside installed skills; use skill_view(name, file_path=...) for skill resources. "
+        "Read a file from the session workspace sandbox, or a persisted tool result under results/. "
+        "This does not read files inside installed skills; use skill_view(name, file_path=...) for skill resources. "
         "Lines are 1-indexed. Use offset/limit to read large workspace files in sections.\n\n"
         "Files up to 10MB are supported. Returns the content with metadata "
         "including total line count."
@@ -485,7 +491,7 @@ READ_FILE_SCHEMA = {
         "properties": {
             "filepath": {
                 "type": "string",
-                "description": "Relative path within the session workspace, not an installed skill directory.",
+                "description": "Relative path within the session workspace, or results/<file> for persisted tool output; not an installed skill directory.",
             },
             "offset": {
                 "type": "integer",

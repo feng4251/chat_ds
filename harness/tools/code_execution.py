@@ -28,6 +28,29 @@ EXECUTOR_SOCKET = os.environ.get(
     "EXECUTOR_SOCKET", "/run/chat-ds-executor/executor.sock"
 )
 
+_NETWORK_IMPORT_RE = re.compile(
+    r"(^|\n)\s*(?:import\s+(requests|httpx|urllib|aiohttp|socket)\b|from\s+(requests|httpx|urllib|aiohttp|socket)\b)",
+    re.IGNORECASE,
+)
+_NETWORK_CALL_RE = re.compile(r"\bpip\s+install\b|(?:requests|httpx)\.(?:get|post|put|delete|request|stream)\s*\(|urllib\.request\.urlopen\s*\(|aiohttp\.ClientSession\s*\(|socket\.(?:create_connection|socket)\s*\(|subprocess\.(?:run|Popen|call)\([^\n]*(?:curl|wget|pip)", re.IGNORECASE)
+_EXTERNAL_PATH_RE = re.compile(r"/(?:app/data/skills|nfs/temp/chat_ds|tmp/exec_[A-Za-z0-9_]+)")
+
+
+def _execution_boundary_error(code: str) -> str | None:
+    if _EXTERNAL_PATH_RE.search(code):
+        return (
+            "execute_code runs in a fresh ephemeral executor. Use stable relative paths "
+            "under skills/... and workspace/...; do not use /app/data/skills, /nfs/temp/chat_ds, "
+            "or /tmp/exec_* paths from previous tool calls."
+        )
+    if _NETWORK_IMPORT_RE.search(code) or _NETWORK_CALL_RE.search(code):
+        return (
+            "execute_code is network-disabled and cannot install packages or call web/internal APIs. "
+            "Use web_search/web_extract for web data, or run_skill_python for declared skill scripts "
+            "that need the managed session Python runtime."
+        )
+    return None
+
 
 def _safe_snapshot_relpath(path: Path, root: Path, prefix: str) -> str | None:
     if path.is_symlink() or not path.is_file():
@@ -161,6 +184,9 @@ async def execute_code(
     danger = check_code_danger(code)
     if danger:
         return json.dumps({"status": "blocked", "error": danger})
+    boundary_error = _execution_boundary_error(code)
+    if boundary_error:
+        return json.dumps({"status": "blocked", "error": boundary_error}, ensure_ascii=False)
 
     timeout = max(1, min(int(timeout), MAX_TIMEOUT))
     code = _code_with_session_snapshot(code, user_id, session_id)
@@ -205,7 +231,8 @@ EXECUTE_CODE_SCHEMA = {
         "a read-only snapshot of the current session workspace under ./workspace "
         "and installed session skill resources under ./skills; do not use absolute "
         "host/container paths. It cannot reach web, internal APIs, MCP servers, or "
-        "install packages at runtime. "
+        "install packages at runtime. Do not reuse /tmp/exec_* paths from prior calls; "
+        "persist cross-call outputs under workspace/... instead. "
         f"Default timeout is {DEFAULT_TIMEOUT}s; maximum is {MAX_TIMEOUT}s."
     ),
     "parameters": {
