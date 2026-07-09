@@ -109,7 +109,7 @@ def _copy_bundle_dependency_manifests(
             continue
         safe_path.parent.mkdir(parents=True, exist_ok=True)
         safe_path.write_bytes(data)
-        copied.append(str(safe_path.relative_to(user_skills_dir)))
+        copied.append(str(safe_path.relative_to(user_skills_dir.resolve())))
     return copied
 
 
