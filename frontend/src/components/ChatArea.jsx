@@ -99,9 +99,12 @@ function updateAgentRuns(runs, event) {
 
 function AgentRunCards({ runs }) {
   const visibleRuns = (runs || []).filter((run) => (
-    (run.agent_kind !== 'primary' && run.depth > 0)
-    || run.artifacts?.length > 0
-    || run.verifier
+    run.agent_kind !== 'primary' && (
+      run.depth > 0
+      || run.artifacts?.length > 0
+      || run.verifier
+      || run.status === 'running'
+    )
   ))
   if (visibleRuns.length === 0) return null
   return (
