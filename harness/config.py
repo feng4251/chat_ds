@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     agent_debug_trace: bool = False
     agent_debug_trace_result_chars: int = 4000
     agent_debug_trace_workspace: bool = True
+    web_search_providers: str = "searxng,ddg"
+    searxng_base_url: str = "http://searxng:8080"
+    searxng_timeout_seconds: float = 10.0
 
 settings = Settings()
 

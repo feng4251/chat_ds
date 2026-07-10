@@ -1,4 +1,25 @@
 services:
+
+  searxng:
+    profiles:
+      - local-search
+    build:
+      context: ./searxng-master
+      dockerfile: Dockerfile.chatds
+    container_name: chat_acits_searxng
+    restart: unless-stopped
+    environment:
+      SEARXNG_PORT: ${SEARXNG_PORT:-8080}
+      SEARXNG_BIND_ADDRESS: 0.0.0.0
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-chat-ds-local-searxng-change-me}
+    ports:
+      - "${SEARXNG_HOST_BIND:-127.0.0.1}:${SEARXNG_HOST_PORT:-8088}:8080"
+    volumes:
+      - ./searxng:/etc/searxng:rw
+      - searxng_data:/var/cache/searxng
+    networks:
+      - chat_net
+
   executor:
     build:
       context: ./executor
@@ -36,6 +57,9 @@ services:
       AGENT_DEBUG_TRACE: ${AGENT_DEBUG_TRACE:-true}
       AGENT_DEBUG_TRACE_RESULT_CHARS: ${AGENT_DEBUG_TRACE_RESULT_CHARS:-4000}
       AGENT_DEBUG_TRACE_WORKSPACE: ${AGENT_DEBUG_TRACE_WORKSPACE:-true}
+      WEB_SEARCH_PROVIDERS: ${WEB_SEARCH_PROVIDERS:-searxng,ddg}
+      SEARXNG_BASE_URL: ${SEARXNG_BASE_URL:-http://searxng:8080}
+      SEARXNG_TIMEOUT_SECONDS: ${SEARXNG_TIMEOUT_SECONDS:-10}
     volumes:
       - ./data:/app/data
       - ./harness/data/memories:/app/data/memories
@@ -93,4 +117,6 @@ volumes:
   chat_ds_db:
     driver: local
   executor_socket:
+    driver: local
+  searxng_data:
     driver: local

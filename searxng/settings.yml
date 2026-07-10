@@ -1,0 +1,42 @@
+use_default_settings:
+  engines:
+    keep_only:
+      - bing
+      - bing news
+
+engines:
+  - name: bing
+    engine: bing
+    shortcut: bi
+    base_url: https://www.bing.com
+    disabled: false
+
+  - name: bing news
+    engine: bing_news
+    shortcut: bin
+    base_url: https://www.bing.com
+    disabled: false
+
+server:
+  bind_address: "0.0.0.0"
+  port: 8080
+  secret_key: "${SEARXNG_SECRET:-chat-ds-local-searxng-change-me}"
+  limiter: false
+  public_instance: false
+  image_proxy: false
+  method: "GET"
+
+search:
+  safe_search: 1
+  autocomplete: ""
+  default_lang: "auto"
+  formats:
+    - html
+    - json
+
+outgoing:
+  request_timeout: 8.0
+  max_request_timeout: 12.0
+
+valkey:
+  url: false
