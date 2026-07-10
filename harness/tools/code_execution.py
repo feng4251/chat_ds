@@ -10,6 +10,7 @@ import re
 from pathlib import Path, PurePosixPath
 
 from tools.approval import check_code_danger, check_code_warnings
+from tools.omission_guard import compacted_history_omission_error, contains_compacted_history_omission
 from tools.path_security import SANDBOX_ROOT, sandbox_dir
 
 logger = logging.getLogger(__name__)
@@ -34,11 +35,20 @@ _NETWORK_IMPORT_RE = re.compile(
     re.IGNORECASE,
 )
 _NETWORK_CALL_RE = re.compile(r"(?:requests|httpx)\.(?:get|post|put|delete|request|stream)\s*\(|urllib\.request\.urlopen\s*\(|aiohttp\.ClientSession\s*\(|socket\.(?:create_connection|socket)\s*\(|subprocess\.(?:run|Popen|call)\([^\n]*(?:curl|wget)", re.IGNORECASE)
-_EXTERNAL_PATH_RE = re.compile(r"/(?:app/data/skills|nfs/temp/chat_ds|tmp/exec_[A-Za-z0-9_]+)[^'\"\s)]*")
+_FILE_WRITE_RE = re.compile(r"\.write_text\s*\(|\.write_bytes\s*\(|\.mkdir\s*\(|\bopen\s*\([^\n)]*(?:['\"]w['\"]|['\"]a['\"]|['\"]x['\"]|mode\s*=\s*['\"][wax+])|\bos\.makedirs\s*\(|\bshutil\.(?:copy|copyfile|copytree|move)\s*\(", re.IGNORECASE)
+_EXTERNAL_PATH_RE = re.compile(r"/(?:app/data/skills|app/workspace|nfs/temp/chat_ds|tmp/exec_[A-Za-z0-9_]+)[^'\"\s)]*")
+
+
+def _managed_runtime_reason(code: str) -> str | None:
+    if _NETWORK_IMPORT_RE.search(code) or _NETWORK_CALL_RE.search(code):
+        return "network/API code"
+    if _FILE_WRITE_RE.search(code):
+        return "workspace file-write code"
+    return None
 
 
 def _requires_managed_runtime(code: str) -> bool:
-    return bool(_NETWORK_IMPORT_RE.search(code) or _NETWORK_CALL_RE.search(code))
+    return _managed_runtime_reason(code) is not None
 
 
 def _execution_boundary_error(code: str, user_id: str, session_id: str) -> str | None:
@@ -55,7 +65,7 @@ def _execution_boundary_error(code: str, user_id: str, session_id: str) -> str |
                 "execute_code runs in a fresh ephemeral executor. Use stable relative paths "
                 "under skills/... and workspace/...; do not reuse /tmp/exec_* paths from previous calls."
             )
-        if _is_current_session_absolute_path(path, user_id, session_id):
+        if path.startswith("/app/workspace") or _is_current_session_absolute_path(path, user_id, session_id):
             continue
         return (
             "Absolute paths are limited to the current session workspace/skills. Use stable relative paths "
@@ -190,11 +200,12 @@ def _code_with_session_snapshot(code: str, user_id: str, session_id: str) -> str
 
 
 def _rewrite_session_absolute_paths(code: str, user_id: str, session_id: str) -> str:
+    rewritten = code.replace("/app/workspace/", "workspace/").replace("/app/workspace", "workspace")
     if not user_id or user_id == "default" or not session_id or session_id == "default":
-        return code
+        return rewritten
     skill_abs_prefix = f"{SKILL_DATA_ROOT}/{user_id}/{session_id}/"
     workspace_abs_prefix = f"{SANDBOX_ROOT}/{user_id}/{session_id}/workspace/"
-    return code.replace(skill_abs_prefix, "skills/").replace(workspace_abs_prefix, "workspace/")
+    return rewritten.replace(skill_abs_prefix, "skills/").replace(workspace_abs_prefix, "workspace/")
 
 
 async def execute_code(
@@ -206,6 +217,8 @@ async def execute_code(
     """Run Python in a separate container with no network namespace, or managed runtime for network code."""
     if not code or not code.strip():
         return json.dumps({"status": "error", "error": "No code provided."})
+    if contains_compacted_history_omission(code):
+        return json.dumps(compacted_history_omission_error("code"), ensure_ascii=False)
     if len(code.encode("utf-8")) > MAX_CODE_BYTES:
         return json.dumps({"status": "error", "error": "Code payload is too large."})
 
@@ -217,7 +230,8 @@ async def execute_code(
         return json.dumps({"status": "blocked", "error": boundary_error}, ensure_ascii=False)
 
     timeout = max(1, min(int(timeout), MAX_TIMEOUT))
-    if _requires_managed_runtime(code):
+    managed_reason = _managed_runtime_reason(code)
+    if managed_reason:
         from tools.skill_python import run_managed_python_code
         managed_code = _rewrite_session_absolute_paths(code, user_id, session_id)
         result = json.loads(await run_managed_python_code(
@@ -228,8 +242,8 @@ async def execute_code(
         ))
         result["execution_runtime"] = "managed_session_python"
         result["execution_note"] = (
-            "execute_code detected network/API code and ran it in the managed session Python runtime. "
-            "The default executor remains network-disabled."
+            f"execute_code detected {managed_reason} and ran it in the managed session Python runtime. "
+            "Pure read-only calculations still use the network-disabled executor."
         )
         warnings = check_code_warnings(code)
         if warnings:
@@ -276,9 +290,9 @@ EXECUTE_CODE_SCHEMA = {
         "Run Python code for calculations and data processing. By default this uses a dedicated, "
         "ephemeral container with networking disabled and a read-only snapshot of the current session "
         "workspace under ./workspace and installed session skill resources under ./skills. If the code "
-        "imports/calls network libraries such as requests/httpx/urllib/aiohttp/socket, execute_code "
-        "automatically runs that single call in the managed session Python runtime instead; the default "
-        "executor remains offline. Inline pip install is never allowed; declared skill dependencies are "
+        "imports/calls network libraries such as requests/httpx/urllib/aiohttp/socket, or writes files, "
+        "execute_code automatically runs that single call in the managed session Python runtime instead; "
+        "pure read-only calculations still use the offline executor. Inline pip install is never allowed; declared skill dependencies are "
         "installed by the managed runtime. Use stable relative paths under skills/... and workspace/...; "
         "do not access other sessions or reuse /tmp/exec_* paths from prior calls. "
         f"Default timeout is {DEFAULT_TIMEOUT}s; maximum is {MAX_TIMEOUT}s."

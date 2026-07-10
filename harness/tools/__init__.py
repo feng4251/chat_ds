@@ -59,7 +59,7 @@ register(
     },
     web_search,
     is_read_only=True,
-    parallel_safe=True,
+    parallel_safe=False,
 )
 
 register(
