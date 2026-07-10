@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import date
 
 
@@ -20,9 +21,12 @@ async def web_search(query: str, max_results: int = 5, timeout: float = 15.0) ->
             timeout=timeout,
         )
     except asyncio.TimeoutError:
-        return "(Web search timed out.)"
+        return '{"status":"timeout","error":"Web search timed out."}'
     except Exception as e:
-        return f"(Web search failed: {type(e).__name__}: {e})"
+        return json.dumps({
+            "status": "error",
+            "error": f"Web search failed: {type(e).__name__}: {e}",
+        }, ensure_ascii=False)
 
     if not results:
         return "(No search results found.)"

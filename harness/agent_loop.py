@@ -137,7 +137,7 @@ def _compact_tool_argument_value(value: Any, *, tool_name: str, key: str = "", f
             and len(value) > 500
         )
         if omit_written_content:
-            return ""
+            return "__CHATDS_OMITTED_TOOL_CONTENT_REGENERATE_OR_READ_SOURCE__"
         if len(value) > _LARGE_TOOL_ARGUMENT_STRING_CAP:
             target = f" for {filepath}" if filepath else ""
             return f"[large argument omitted: {len(value)} chars{target}]"
@@ -265,6 +265,8 @@ class HarnessRunState:
     continuation_reasons: list[str] = field(default_factory=list)
     last_tool_error_at: int = 0
     last_successful_artifact_at: int = 0
+    last_parse_failure_at: int = 0
+    last_schema_failure_at: int = 0
 
     def record_skill_view(
         self,
@@ -581,12 +583,15 @@ async def run_stream(
     skill_workflow_continuations = 0
     action_promise_continuations = 0
     tool_failure_continuations = 0
-    max_skill_workflow_continuations = 36
+    max_skill_workflow_continuations = 12
     yield await emit_agent_event("run.started", {
         "model_id": model_id,
         "source": source,
         "enabled_tools": tools,
     })
+
+    def workflow_reason_retryable(reason: str) -> bool:
+        return run_state.continuation_reasons.count(reason) < 2
 
     def queue_skill_workflow_continuation(reason: str) -> None:
         run_state.continuation_reasons.append(reason)
@@ -1193,6 +1198,7 @@ async def run_stream(
             if (
                 needs_artifact_gate
                 and needs_workflow_gate
+                and workflow_reason_retryable(workflow_reason)
                 and skill_workflow_continuations < max_skill_workflow_continuations
             ):
                 skill_workflow_continuations += 1
@@ -1548,6 +1554,7 @@ async def run_stream(
                 args = _safe_parse_args(tc.arguments or "")
                 if isinstance(args, dict) and "__tool_arg_parse_error" in args:
                     run_state.parse_failure_count += 1
+                    run_state.last_parse_failure_at = run_state.tool_call_count
                 executed_args = args
                 for debug_evt in await debug_stream_event("tool.call", {
                     "tool_name": tc.name,
@@ -1634,8 +1641,10 @@ async def run_stream(
                         run_state.invalid_placeholder_write_count += 1
                     if isinstance(executed_args, dict) and "__tool_arg_parse_error" in executed_args:
                         run_state.parse_failure_count += 1
+                        run_state.last_parse_failure_at = run_state.tool_call_count
                     if "schema" in outcome_detail.lower() or "required field" in outcome_detail.lower():
                         run_state.schema_failure_count += 1
+                        run_state.last_schema_failure_at = run_state.tool_call_count
                 elif display_tool_name == "write_file":
                     written_size = _tool_result_size(str(result))
                     if written_size is not None:
@@ -1707,6 +1716,7 @@ async def run_stream(
             if (
                 needs_artifact_gate_after_tools
                 and needs_workflow_gate_after_tools
+                and workflow_reason_retryable(workflow_reason_after_tools)
                 and skill_workflow_continuations < max_skill_workflow_continuations
             ):
                 skill_workflow_continuations += 1
@@ -2128,11 +2138,13 @@ async def _iter_provider_stream(
 
 def _tool_outcome_summary(raw: str) -> tuple[str, str]:
     """Return an auditable status line without exposing a large tool payload."""
+    raw_text = str(raw or "").strip()
+    raw_lower = raw_text.lower()
+    if raw_lower.startswith("(web search timed out") or raw_lower.startswith("(web search failed"):
+        return "error", raw_text.strip("()")
     data = _json_object(raw)
     if data is None:
         return "success", ""
-    if data.get("error"):
-        return "error", str(data["error"])
     status = str(data.get("status", "")).lower()
     if status in {"error", "blocked", "timeout", "failed"}:
         detail = str(data.get("error") or data.get("message") or data.get("detail") or "")
@@ -2146,6 +2158,8 @@ def _tool_outcome_summary(raw: str) -> tuple[str, str]:
             elif data.get("runtime_status"):
                 detail = f"runtime_status={data.get('runtime_status')}"
         return status, detail
+    if data.get("error"):
+        return "error", str(data["error"])
     if data.get("success") is False:
         return "error", str(data.get("message") or data.get("detail") or "")
     return "success", ""
@@ -2205,10 +2219,13 @@ def _deterministic_verifier_payload(
         findings.append(f"Artifact is empty: {', '.join(str(path) for path in empty_artifacts)}.")
         needs_more_work = True
         verdict = "fail"
-    if run_state.schema_failure_count > 0 or run_state.parse_failure_count > 0:
-        findings.append("One or more tool calls failed schema or argument parsing validation.")
+    last_validation_failure_at = max(run_state.last_schema_failure_at, run_state.last_parse_failure_at)
+    if (run_state.schema_failure_count > 0 or run_state.parse_failure_count > 0) and last_validation_failure_at > run_state.last_successful_artifact_at:
+        findings.append("One or more tool calls failed schema or argument parsing validation after the last successful artifact.")
         needs_more_work = True
         verdict = "fail"
+    elif run_state.schema_failure_count > 0 or run_state.parse_failure_count > 0:
+        findings.append("Earlier schema or argument parsing failures were followed by a successful artifact write/patch.")
     if run_state.tool_error_count > 0 and not findings:
         if run_state.last_tool_error_at > run_state.last_successful_artifact_at:
             findings.append("One or more tool calls failed during a requested artifact workflow and must be resolved before completion.")
