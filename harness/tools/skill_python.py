@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -35,6 +36,52 @@ async def run_skill_python(
             "error": str(exc),
             "available_skill_scripts": _available_skill_scripts(user_id, session_id),
         }, ensure_ascii=False)
+    return await _run_python_script(
+        script,
+        args=args,
+        timeout=timeout,
+        cwd=workdir,
+        user_id=user_id,
+        session_id=session_id,
+    )
+
+
+async def run_managed_python_code(
+    code: str,
+    *,
+    timeout: int = DEFAULT_TIMEOUT,
+    user_id: str = "default",
+    session_id: str = "default",
+) -> str:
+    if not code or not code.strip():
+        return json.dumps({"status": "error", "error": "No code provided."}, ensure_ascii=False)
+    workspace = sandbox_dir(user_id, session_id, sub="workspace")
+    managed_dir = workspace / ".chatds" / "managed_execute_code"
+    managed_dir.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(code.encode("utf-8", errors="replace")).hexdigest()[:16]
+    script = managed_dir / f"execute_code_{digest}.py"
+    script.write_text(code, encoding="utf-8")
+    return await _run_python_script(
+        script,
+        args=[],
+        timeout=timeout,
+        cwd=workspace,
+        user_id=user_id,
+        session_id=session_id,
+        managed_fallback=True,
+    )
+
+
+async def _run_python_script(
+    script: Path,
+    *,
+    args: list[str] | None,
+    timeout: int,
+    cwd: Path,
+    user_id: str,
+    session_id: str,
+    managed_fallback: bool = False,
+) -> str:
     runtime = await ensure_session_runtime(user_id, session_id)
     if runtime.get("status") != "ready":
         return json.dumps({
@@ -47,12 +94,12 @@ async def run_skill_python(
     python = resolve_session_python(runtime) or os.sys.executable
     safe_args = [str(item) for item in (args or [])]
     timeout = max(1, min(int(timeout), MAX_TIMEOUT))
-    env = runtime_env_for_subprocess(runtime, _safe_env(), user_id=user_id, session_id=session_id)
+    env = _runtime_env(runtime, user_id=user_id, session_id=session_id, script=script)
     proc = await asyncio.create_subprocess_exec(
         python,
         str(script),
         *safe_args,
-        cwd=str(workdir),
+        cwd=str(cwd),
         env=env,
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
@@ -67,6 +114,8 @@ async def run_skill_python(
             "status": "error",
             "error": f"Process timed out after {timeout}s.",
             "runtime_status": runtime.get("status"),
+            "script_path": _display_path(script, user_id, session_id),
+            "cwd": _display_path(cwd, user_id, session_id),
         }, ensure_ascii=False)
     stdout = stdout_b.decode("utf-8", errors="replace")
     stderr = stderr_b.decode("utf-8", errors="replace")
@@ -76,9 +125,11 @@ async def run_skill_python(
         "stdout": _truncate(stdout, MAX_STDOUT),
         "stderr": _truncate(stderr, MAX_STDERR),
         "script_path": _display_path(script, user_id, session_id),
-        "cwd": _display_path(workdir, user_id, session_id),
+        "cwd": _display_path(cwd, user_id, session_id),
         "runtime_status": runtime.get("status"),
         "env_hash": runtime.get("env_hash"),
+        "managed_fallback": managed_fallback,
+        "workspace_output_dir": "workspace/output_result",
     }, ensure_ascii=False)
 
 
@@ -208,6 +259,84 @@ def _resolve_cwd(cwd: str, user_id: str, session_id: str, script: Path) -> Path:
 def _safe_env() -> dict[str, str]:
     keep = {"PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "TMPDIR"}
     return {key: value for key, value in os.environ.items() if key in keep or key.startswith("XDG_")}
+
+
+def _runtime_env(runtime: dict[str, Any], *, user_id: str, session_id: str, script: Path) -> dict[str, str]:
+    env = runtime_env_for_subprocess(runtime, _safe_env(), user_id=user_id, session_id=session_id)
+    workspace = sandbox_dir(user_id, session_id, sub="workspace")
+    output_dir = workspace / "output_result"
+    tmp_dir = workspace / ".chatds" / "tmp"
+    compat_dir = workspace / ".chatds" / "runtime_compat"
+    for path in (output_dir, tmp_dir, compat_dir):
+        path.mkdir(parents=True, exist_ok=True)
+    _write_sitecustomize(compat_dir)
+    python_paths = [str(compat_dir)]
+    if env.get("PYTHONPATH"):
+        python_paths.append(env["PYTHONPATH"])
+    env.update({
+        "CHATDS_WORKSPACE": str(workspace),
+        "CHATDS_SKILL_ROOT": str((USER_SKILLS_BASE / user_id / session_id).resolve()),
+        "CHATDS_OUTPUT_DIR": str(output_dir),
+        "OUTPUT_DIR": str(output_dir),
+        "RESULTS_DIR": str(output_dir),
+        "TMPDIR": str(tmp_dir),
+        "MPLCONFIGDIR": str(tmp_dir / "matplotlib"),
+        "PYTHONPATH": os.pathsep.join(python_paths),
+    })
+    return env
+
+
+def _write_sitecustomize(compat_dir: Path) -> None:
+    module = compat_dir / "sitecustomize.py"
+    module.write_text(_SITECUSTOMIZE, encoding="utf-8")
+
+
+_SITECUSTOMIZE = r'''
+import builtins as _builtins
+import io as _io
+import os as _os
+
+_ORIGINAL_OPEN = _builtins.open
+_ORIGINAL_IO_OPEN = _io.open
+_OUTPUT_DIR = _os.environ.get("CHATDS_OUTPUT_DIR")
+_WORKSPACE = _os.environ.get("CHATDS_WORKSPACE")
+_SKILL_ROOT = _os.environ.get("CHATDS_SKILL_ROOT")
+_MARKERS = ("output", "outputs", "output_result", "results", "artifacts")
+_WRITE_MODES = ("w", "a", "x", "+")
+
+
+def _map_path(file, mode):
+    try:
+        path = _os.fspath(file)
+    except TypeError:
+        return file
+    if not _os.path.isabs(path):
+        if _WORKSPACE and (path == "workspace" or path.startswith("workspace/")):
+            return _os.path.join(_WORKSPACE, path.split("/", 1)[1] if "/" in path else "")
+        if _SKILL_ROOT and (path == "skills" or path.startswith("skills/")):
+            return _os.path.join(_SKILL_ROOT, path.split("/", 1)[1] if "/" in path else "")
+        return file
+    if not _OUTPUT_DIR or not any(flag in str(mode) for flag in _WRITE_MODES):
+        return file
+    lowered = path.lower()
+    if not any(marker in lowered for marker in _MARKERS):
+        return file
+    target = _os.path.join(_OUTPUT_DIR, _os.path.basename(path) or "result")
+    _os.makedirs(_os.path.dirname(target), exist_ok=True)
+    return target
+
+
+def open(file, mode="r", *args, **kwargs):
+    return _ORIGINAL_OPEN(_map_path(file, mode), mode, *args, **kwargs)
+
+
+def io_open(file, mode="r", *args, **kwargs):
+    return _ORIGINAL_IO_OPEN(_map_path(file, mode), mode, *args, **kwargs)
+
+
+_builtins.open = open
+_io.open = io_open
+'''
 
 
 def _truncate(text: str, limit: int) -> str:

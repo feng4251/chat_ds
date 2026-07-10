@@ -93,9 +93,11 @@ register(
     "execute_code",
     EXECUTE_CODE_SCHEMA,
     execute_code,
-    is_read_only=True,
+    is_read_only=False,
     parallel_safe=False,
+    path_scoped=True,
     emoji="🐍",
+    allow_in_parallel_child=False,
 )
 
 register(

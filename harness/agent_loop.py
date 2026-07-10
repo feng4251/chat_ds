@@ -136,9 +136,11 @@ def _compact_tool_argument_value(value: Any, *, tool_name: str, key: str = "", f
             and key in {"content", "old_text", "new_text", "file_content"}
             and len(value) > 500
         )
-        if omit_written_content or len(value) > _LARGE_TOOL_ARGUMENT_STRING_CAP:
+        if omit_written_content:
+            return ""
+        if len(value) > _LARGE_TOOL_ARGUMENT_STRING_CAP:
             target = f" for {filepath}" if filepath else ""
-            return f"[omitted {len(value)} chars from conversation history{target}; use the workspace file or tool result if needed]"
+            return f"[large argument omitted: {len(value)} chars{target}]"
         return value
     if isinstance(value, list):
         return [
@@ -261,6 +263,8 @@ class HarnessRunState:
     skill_category_files: dict[str, dict[str, list[str]]] = field(default_factory=dict)
     session_skill_names: set[str] = field(default_factory=set)
     continuation_reasons: list[str] = field(default_factory=list)
+    last_tool_error_at: int = 0
+    last_successful_artifact_at: int = 0
 
     def record_skill_view(
         self,
@@ -576,6 +580,7 @@ async def run_stream(
     skill_enforcement_continuations = 0
     skill_workflow_continuations = 0
     action_promise_continuations = 0
+    tool_failure_continuations = 0
     max_skill_workflow_continuations = 36
     yield await emit_agent_event("run.started", {
         "model_id": model_id,
@@ -1398,6 +1403,50 @@ async def run_stream(
                             "⏸ Goal paused — automatic continuation budget reached."
                         ),
                     }
+            if (
+                run_state.tool_error_count > 0
+                and run_state.last_tool_error_at > run_state.last_successful_artifact_at
+                and tool_failure_continuations < 2
+                and (
+                    _looks_like_complex_artifact_request(original_user_text)
+                    or _looks_like_file_artifact_request(original_user_text)
+                    or run_state.viewed_skill_names
+                )
+            ):
+                tool_failure_continuations += 1
+                for debug_evt in await debug_stream_event("gate.continuation", {
+                    "gate": "tool_failure_recovery",
+                    "reason": "tool failures remain before completing a complex or artifact workflow",
+                    "continuation_count": tool_failure_continuations,
+                    "tool_error_count": run_state.tool_error_count,
+                    "parse_failure_count": run_state.parse_failure_count,
+                    "schema_failure_count": run_state.schema_failure_count,
+                    "invalid_placeholder_write_count": run_state.invalid_placeholder_write_count,
+                }):
+                    yield debug_evt
+                conversation.append({
+                    "role": "assistant",
+                    "content": full_content or "(No visible response.)",
+                })
+                conversation.append({
+                    "role": "user",
+                    "content": (
+                        "One or more required tool calls failed before this complex/artifact workflow was complete. "
+                        "Do not finish yet. Read the JSON tool results already in context, fix the concrete cause, "
+                        "and retry with the appropriate tool. If execute_code was rerouted to managed runtime, inspect "
+                        "stdout/stderr and continue from that result. If run_skill_python failed, fix the script path, "
+                        "cwd, imports, args, or output location. If write_file failed, regenerate real content rather "
+                        "than copying any omitted-history marker. Only stop when the failed step is resolved or you can "
+                        "state a concrete external blocker."
+                    ),
+                })
+                yield {
+                    "type": "tool_progress",
+                    "msg": "↻ Recovering failed tool step before finishing",
+                }
+                yield {"type": "delta", "content": "\n\n"}
+                continue
+
             verifier_payload = _deterministic_verifier_payload(
                 run_state,
                 requested_artifact=_looks_like_file_artifact_request(original_user_text),
@@ -1579,6 +1628,7 @@ async def run_stream(
                 outcome, outcome_detail = _tool_outcome_summary(str(result))
                 if outcome != "success":
                     run_state.tool_error_count += 1
+                    run_state.last_tool_error_at = run_state.tool_call_count
                     result_data = _json_object(str(result))
                     if isinstance(result_data, dict) and result_data.get("reason") == "invalid_placeholder_content":
                         run_state.invalid_placeholder_write_count += 1
@@ -1593,6 +1643,7 @@ async def run_stream(
                 artifact_payload = _artifact_payload_from_tool_result(display_tool_name, str(result)) if outcome == "success" else None
                 if artifact_payload is not None:
                     run_state.artifacts.append(artifact_payload)
+                    run_state.last_successful_artifact_at = run_state.tool_call_count
                 if display_tool_name == "skill_view" and outcome == "success" and isinstance(executed_args, dict):
                     run_state.record_skill_view(executed_args, _json_object(str(result)))
                 logger.info(
@@ -2159,8 +2210,12 @@ def _deterministic_verifier_payload(
         needs_more_work = True
         verdict = "fail"
     if run_state.tool_error_count > 0 and not findings:
-        findings.append("One or more tool calls failed; review whether the failure blocks the requested deliverable.")
-        verdict = "inconclusive"
+        if run_state.last_tool_error_at > run_state.last_successful_artifact_at:
+            findings.append("One or more tool calls failed during a requested artifact workflow and must be resolved before completion.")
+            needs_more_work = True
+            verdict = "fail" if requested_artifact else "inconclusive"
+        else:
+            findings.append("Earlier tool failures were followed by a successful artifact write/patch.")
     if not findings:
         findings.append("Artifacts referenced by successful write/patch tool results are non-empty.")
     return {

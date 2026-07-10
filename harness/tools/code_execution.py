@@ -28,28 +28,50 @@ EXECUTOR_SOCKET = os.environ.get(
     "EXECUTOR_SOCKET", "/run/chat-ds-executor/executor.sock"
 )
 
+_PIP_INSTALL_RE = re.compile(r"\bpip\s+install\b|subprocess\.(?:run|Popen|call)\([^\n]*(?:pip|python\s+-m\s+pip)", re.IGNORECASE)
 _NETWORK_IMPORT_RE = re.compile(
     r"(^|\n)\s*(?:import\s+(requests|httpx|urllib|aiohttp|socket)\b|from\s+(requests|httpx|urllib|aiohttp|socket)\b)",
     re.IGNORECASE,
 )
-_NETWORK_CALL_RE = re.compile(r"\bpip\s+install\b|(?:requests|httpx)\.(?:get|post|put|delete|request|stream)\s*\(|urllib\.request\.urlopen\s*\(|aiohttp\.ClientSession\s*\(|socket\.(?:create_connection|socket)\s*\(|subprocess\.(?:run|Popen|call)\([^\n]*(?:curl|wget|pip)", re.IGNORECASE)
-_EXTERNAL_PATH_RE = re.compile(r"/(?:app/data/skills|nfs/temp/chat_ds|tmp/exec_[A-Za-z0-9_]+)")
+_NETWORK_CALL_RE = re.compile(r"(?:requests|httpx)\.(?:get|post|put|delete|request|stream)\s*\(|urllib\.request\.urlopen\s*\(|aiohttp\.ClientSession\s*\(|socket\.(?:create_connection|socket)\s*\(|subprocess\.(?:run|Popen|call)\([^\n]*(?:curl|wget)", re.IGNORECASE)
+_EXTERNAL_PATH_RE = re.compile(r"/(?:app/data/skills|nfs/temp/chat_ds|tmp/exec_[A-Za-z0-9_]+)[^'\"\s)]*")
 
 
-def _execution_boundary_error(code: str) -> str | None:
-    if _EXTERNAL_PATH_RE.search(code):
+def _requires_managed_runtime(code: str) -> bool:
+    return bool(_NETWORK_IMPORT_RE.search(code) or _NETWORK_CALL_RE.search(code))
+
+
+def _execution_boundary_error(code: str, user_id: str, session_id: str) -> str | None:
+    if _PIP_INSTALL_RE.search(code):
         return (
-            "execute_code runs in a fresh ephemeral executor. Use stable relative paths "
-            "under skills/... and workspace/...; do not use /app/data/skills, /nfs/temp/chat_ds, "
-            "or /tmp/exec_* paths from previous tool calls."
+            "Inline pip install is not allowed in execute_code. The managed session runtime "
+            "installs declared skill dependencies automatically; remove pip install lines and retry, "
+            "or run a declared skill script with run_skill_python."
         )
-    if _NETWORK_IMPORT_RE.search(code) or _NETWORK_CALL_RE.search(code):
+    for match in _EXTERNAL_PATH_RE.finditer(code):
+        path = match.group(0)
+        if path.startswith("/tmp/exec_"):
+            return (
+                "execute_code runs in a fresh ephemeral executor. Use stable relative paths "
+                "under skills/... and workspace/...; do not reuse /tmp/exec_* paths from previous calls."
+            )
+        if _is_current_session_absolute_path(path, user_id, session_id):
+            continue
         return (
-            "execute_code is network-disabled and cannot install packages or call web/internal APIs. "
-            "Use web_search/web_extract for web data, or run_skill_python for declared skill scripts "
-            "that need the managed session Python runtime."
+            "Absolute paths are limited to the current session workspace/skills. Use stable relative paths "
+            "under skills/... and workspace/...; do not access another session or host path."
         )
     return None
+
+
+def _is_current_session_absolute_path(path: str, user_id: str, session_id: str) -> bool:
+    if not user_id or user_id == "default" or not session_id or session_id == "default":
+        return False
+    allowed_prefixes = (
+        f"{SKILL_DATA_ROOT}/{user_id}/{session_id}/",
+        f"{SANDBOX_ROOT}/{user_id}/{session_id}/workspace/",
+    )
+    return path.startswith(allowed_prefixes)
 
 
 def _safe_snapshot_relpath(path: Path, root: Path, prefix: str) -> str | None:
@@ -146,9 +168,7 @@ def _code_with_session_snapshot(code: str, user_id: str, session_id: str) -> str
     files = _session_snapshot(user_id, session_id, code)
     if not files:
         return code
-    skill_abs_prefix = f"{SKILL_DATA_ROOT}/{user_id}/{session_id}/"
-    workspace_abs_prefix = f"{SANDBOX_ROOT}/{user_id}/{session_id}/workspace/"
-    rewritten = code.replace(skill_abs_prefix, "skills/").replace(workspace_abs_prefix, "workspace/")
+    rewritten = _rewrite_session_absolute_paths(code, user_id, session_id)
     prelude = (
         "import json as __chatds_json, pathlib as __chatds_pathlib\n"
         f"__chatds_files = __chatds_json.loads({json.dumps(json.dumps(files, ensure_ascii=False))})\n"
@@ -169,13 +189,21 @@ def _code_with_session_snapshot(code: str, user_id: str, session_id: str) -> str
     return prelude + rewritten
 
 
+def _rewrite_session_absolute_paths(code: str, user_id: str, session_id: str) -> str:
+    if not user_id or user_id == "default" or not session_id or session_id == "default":
+        return code
+    skill_abs_prefix = f"{SKILL_DATA_ROOT}/{user_id}/{session_id}/"
+    workspace_abs_prefix = f"{SANDBOX_ROOT}/{user_id}/{session_id}/workspace/"
+    return code.replace(skill_abs_prefix, "skills/").replace(workspace_abs_prefix, "workspace/")
+
+
 async def execute_code(
     code: str,
     timeout: int = DEFAULT_TIMEOUT,
     user_id: str = "default",
     session_id: str = "default",
 ) -> str:
-    """Run Python in a separate container with no network namespace."""
+    """Run Python in a separate container with no network namespace, or managed runtime for network code."""
     if not code or not code.strip():
         return json.dumps({"status": "error", "error": "No code provided."})
     if len(code.encode("utf-8")) > MAX_CODE_BYTES:
@@ -184,11 +212,30 @@ async def execute_code(
     danger = check_code_danger(code)
     if danger:
         return json.dumps({"status": "blocked", "error": danger})
-    boundary_error = _execution_boundary_error(code)
+    boundary_error = _execution_boundary_error(code, user_id, session_id)
     if boundary_error:
         return json.dumps({"status": "blocked", "error": boundary_error}, ensure_ascii=False)
 
     timeout = max(1, min(int(timeout), MAX_TIMEOUT))
+    if _requires_managed_runtime(code):
+        from tools.skill_python import run_managed_python_code
+        managed_code = _rewrite_session_absolute_paths(code, user_id, session_id)
+        result = json.loads(await run_managed_python_code(
+            managed_code,
+            timeout=timeout,
+            user_id=user_id,
+            session_id=session_id,
+        ))
+        result["execution_runtime"] = "managed_session_python"
+        result["execution_note"] = (
+            "execute_code detected network/API code and ran it in the managed session Python runtime. "
+            "The default executor remains network-disabled."
+        )
+        warnings = check_code_warnings(code)
+        if warnings:
+            result["warnings"] = warnings
+        return json.dumps(result, ensure_ascii=False)
+
     code = _code_with_session_snapshot(code, user_id, session_id)
     if len(code.encode("utf-8")) > MAX_CODE_BYTES:
         return json.dumps({"status": "error", "error": "Code plus session snapshot is too large."})
@@ -226,13 +273,14 @@ async def execute_code(
 EXECUTE_CODE_SCHEMA = {
     "name": "execute_code",
     "description": (
-        "Run Python code in a dedicated, ephemeral container with networking "
-        "disabled. Use it for calculations and pure data processing. It receives "
-        "a read-only snapshot of the current session workspace under ./workspace "
-        "and installed session skill resources under ./skills; do not use absolute "
-        "host/container paths. It cannot reach web, internal APIs, MCP servers, or "
-        "install packages at runtime. Do not reuse /tmp/exec_* paths from prior calls; "
-        "persist cross-call outputs under workspace/... instead. "
+        "Run Python code for calculations and data processing. By default this uses a dedicated, "
+        "ephemeral container with networking disabled and a read-only snapshot of the current session "
+        "workspace under ./workspace and installed session skill resources under ./skills. If the code "
+        "imports/calls network libraries such as requests/httpx/urllib/aiohttp/socket, execute_code "
+        "automatically runs that single call in the managed session Python runtime instead; the default "
+        "executor remains offline. Inline pip install is never allowed; declared skill dependencies are "
+        "installed by the managed runtime. Use stable relative paths under skills/... and workspace/...; "
+        "do not access other sessions or reuse /tmp/exec_* paths from prior calls. "
         f"Default timeout is {DEFAULT_TIMEOUT}s; maximum is {MAX_TIMEOUT}s."
     ),
     "parameters": {

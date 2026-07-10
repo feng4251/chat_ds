@@ -239,13 +239,13 @@ def _session_python_paths(user_id: str | None, session_id: str | None) -> list[s
         safe_session = _safe_component(session_id, "session_id")
     except ValueError:
         return []
-    root = USER_SKILLS_BASE / safe_user / safe_session
+    root = (USER_SKILLS_BASE / safe_user / safe_session).resolve()
     if not root.is_dir():
         return []
     paths: list[str] = []
-    for skill_dir in sorted(path.parent for path in root.rglob("SKILL.md") if path.is_file()):
+    for skill_dir in sorted(path.parent.resolve() for path in root.rglob("SKILL.md") if path.is_file()):
         paths.append(str(skill_dir))
-        scripts = skill_dir / "scripts"
+        scripts = (skill_dir / "scripts").resolve()
         if scripts.is_dir():
             paths.append(str(scripts))
     return paths
