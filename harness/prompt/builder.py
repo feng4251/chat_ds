@@ -205,6 +205,12 @@ PYTHON_RUNTIME_GUIDANCE = (
     "- Do not create ad-hoc workspace Python scripts that import requests/httpx and run "
     "them with execute_code. Prefer existing skill scripts; if writing a workspace helper "
     "is necessary, run it with `run_skill_python`, not `execute_code`.\n"
+    "- Never paste descriptive skill documentation, pseudo-code, or copied snippets from "
+    "skill_view into `execute_code`. `execute_code` only accepts self-contained offline "
+    "calculation code; skill/API workflows must use a real `skills/<skill>/...` or "
+    "`workspace/...` script via `run_skill_python`.\n"
+    "- If `run_skill_python` fails, read its JSON stdout/stderr/error fields and fix the "
+    "script path, cwd, imports, or arguments; do not switch the same network/API work to `execute_code`.\n"
     "- For general literature/current web search not tied to a skill script, use "
     "web_search/web_extract."
 )

@@ -973,7 +973,12 @@ async def _connect_stdio(state: MCPServerState) -> bool:
             runtime_python = resolve_session_python(runtime_status)
             if runtime_python and str(command) in {"python", "python3"}:
                 command = runtime_python
-            user_env = runtime_env_for_subprocess(runtime_status, _build_safe_env(user_env))
+            user_env = runtime_env_for_subprocess(
+                runtime_status,
+                _build_safe_env(user_env),
+                user_id=user_id,
+                session_id=session_id,
+            )
         except Exception as exc:
             state.last_error = f"Python runtime setup failed: {_sanitize_error(_exc_str(exc))}"
             return False
