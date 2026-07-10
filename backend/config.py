@@ -29,5 +29,7 @@ class Settings(BaseSettings):
     scheduler_poll_seconds: int = 15
     hook_timeout_seconds: int = 8
     allow_private_hook_urls: bool = False
+    agent_debug_trace: bool = False
+    agent_event_immediate_persist: bool = True
 
 settings = Settings()

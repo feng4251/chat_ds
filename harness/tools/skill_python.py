@@ -47,7 +47,7 @@ async def run_skill_python(
     python = resolve_session_python(runtime) or os.sys.executable
     safe_args = [str(item) for item in (args or [])]
     timeout = max(1, min(int(timeout), MAX_TIMEOUT))
-    env = runtime_env_for_subprocess(runtime, _safe_env())
+    env = runtime_env_for_subprocess(runtime, _safe_env(), user_id=user_id, session_id=session_id)
     proc = await asyncio.create_subprocess_exec(
         python,
         str(script),

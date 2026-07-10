@@ -11,6 +11,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
@@ -27,7 +28,7 @@ from tools.context import ToolContext
 from tools.registry import dispatch, get_schemas
 from tools.tool_result_storage import wrap_result
 from transports.base import build_tool_call
-from workspace_context import load_workspace_context, SubdirectoryHintTracker
+from workspace_context import get_workspace, load_workspace_context, SubdirectoryHintTracker
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,7 @@ _SUPPORTING_WORKFLOW_CATEGORIES = {"references", "templates", "examples"}
 
 
 _LARGE_TOOL_ARGUMENT_STRING_CAP = 2_000
+_DEBUG_RESULT_DEFAULT_CAP = 4_000
 _CONTEXT_OVERFLOW_RE = re.compile(
     r"maximum context length is\s+(\d+)\s+tokens.*?"
     r"requested\s+(\d+)\s+output tokens.*?"
@@ -164,6 +166,82 @@ def _compact_tool_call_arguments(tool_name: str, arguments: str) -> str:
         })
     compacted = _compact_tool_argument_value(args, tool_name=tool_name)
     return json.dumps(compacted, ensure_ascii=False)
+
+
+def _debug_payload(value: Any, *, cap: int | None = None) -> Any:
+    cap = max(200, int(cap or getattr(settings, "agent_debug_trace_result_chars", _DEBUG_RESULT_DEFAULT_CAP)))
+    if isinstance(value, str):
+        if len(value) <= cap:
+            return value
+        return value[:cap] + f"\n... [truncated {len(value) - cap} chars]"
+    if isinstance(value, list):
+        return [_debug_payload(item, cap=cap) for item in value[:50]]
+    if isinstance(value, dict):
+        cleaned: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            lowered = key_text.lower()
+            if any(marker in lowered for marker in ("token", "secret", "password", "api_key", "authorization")):
+                cleaned[key_text] = "[redacted]"
+            else:
+                cleaned[key_text] = _debug_payload(item, cap=cap)
+        return cleaned
+    return value
+
+
+def _workspace_debug_trace_enabled() -> bool:
+    return bool(getattr(settings, "agent_debug_trace_workspace", True))
+
+
+def _append_workspace_debug_event(user_id: str, session_id: str, event: dict[str, Any]) -> None:
+    if not _workspace_debug_trace_enabled():
+        return
+    run_id = str(event.get("run_id") or "unknown")
+    safe_run_id = re.sub(r"[^A-Za-z0-9_.-]", "_", run_id)[:128] or "unknown"
+    record = {
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "event_type": event.get("event_type"),
+        "run_id": event.get("run_id"),
+        "root_run_id": event.get("root_run_id"),
+        "parent_run_id": event.get("parent_run_id"),
+        "agent_kind": event.get("agent_kind"),
+        "agent_name": event.get("agent_name"),
+        "depth": event.get("depth"),
+        "workspace_scope": event.get("workspace_scope"),
+        "seq": event.get("seq"),
+        "tool_name": event.get("tool_name"),
+        "tool_call_id": event.get("tool_call_id"),
+        "payload": event.get("payload") or {},
+    }
+    try:
+        debug_dir = get_workspace(user_id, session_id) / "debug" / "agent_runs"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
+        with (debug_dir / f"{safe_run_id}.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(line)
+        with (debug_dir / "latest.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception:
+        logger.debug(
+            "Failed to append workspace debug trace user=%s session=%s run=%s",
+            user_id, session_id, run_id, exc_info=True,
+        )
+
+
+def _tool_debug_result(raw: str) -> dict[str, Any]:
+    parsed = _json_object(raw)
+    payload: dict[str, Any] = {"raw_excerpt": _debug_payload(raw)}
+    if isinstance(parsed, dict):
+        payload["status"] = parsed.get("status")
+        payload["error"] = parsed.get("error")
+        payload["returncode"] = parsed.get("returncode")
+        payload["script_path"] = parsed.get("script_path")
+        payload["cwd"] = parsed.get("cwd")
+        payload["runtime_status"] = parsed.get("runtime_status")
+        payload["stdout_excerpt"] = _debug_payload(str(parsed.get("stdout") or "")) if parsed.get("stdout") is not None else None
+        payload["stderr_excerpt"] = _debug_payload(str(parsed.get("stderr") or "")) if parsed.get("stderr") is not None else None
+        payload = {k: v for k, v in payload.items() if v not in (None, "")}
+    return payload
 
 
 @dataclass
@@ -450,6 +528,7 @@ async def run_stream(
     hint_tracker = SubdirectoryHintTracker(user_id, session_id)
     run_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     event_seq = 0
+    debug_trace_enabled = bool(getattr(settings, "agent_debug_trace", False))
 
     async def emit_agent_event(event_type: str, payload: dict[str, Any] | None = None, **extra: Any) -> dict:
         nonlocal event_seq
@@ -473,6 +552,21 @@ async def run_stream(
             if hasattr(maybe, "__await__"):
                 await maybe
         return event
+
+    async def emit_debug_event(event_type: str, payload: dict[str, Any] | None = None, **extra: Any) -> dict | None:
+        if not debug_trace_enabled:
+            return None
+        event = await emit_agent_event(
+            f"debug.{event_type}",
+            _debug_payload(payload or {}),
+            **extra,
+        )
+        _append_workspace_debug_event(user_id, session_id, event)
+        return event
+
+    async def debug_stream_event(event_type: str, payload: dict[str, Any] | None = None, **extra: Any) -> list[dict]:
+        event = await emit_debug_event(event_type, payload, **extra)
+        return [event] if event is not None else []
 
     goal_continuations = 0
     goal_parse_failures = 0
@@ -648,6 +742,19 @@ async def run_stream(
             yield await emit_agent_event("run.failed", {"error": msg})
             yield {"type": "error", "msg": msg}
             return
+        for debug_evt in await debug_stream_event("iteration.started", {
+            "iteration": budget.used,
+            "remaining_after_consume": budget.remaining,
+            "max_iterations": budget.max_total,
+            "conversation_messages": len(conversation),
+            "tool_calls_so_far": run_state.tool_call_count,
+            "tool_errors_so_far": run_state.tool_error_count,
+            "skill_workflow_continuations": skill_workflow_continuations,
+            "artifact_enforcement_continuations": artifact_enforcement_continuations,
+            "action_promise_continuations": action_promise_continuations,
+            "goal_continuations": goal_continuations,
+        }):
+            yield debug_evt
 
         # ── Sanitize messages before sending ──────────────────────────
         sanitized = _sanitize_messages(
@@ -708,6 +815,19 @@ async def run_stream(
             body["tools"] = tool_schemas
         if protocol != "anthropic":
             body["stream_options"] = {"include_usage": True}
+        for debug_evt in await debug_stream_event("llm.request", {
+            "iteration": budget.used,
+            "provider_model": provider.get("id") or model_id,
+            "api_model": api_model,
+            "protocol": protocol,
+            "message_count": len(sanitized),
+            "tool_schema_count": len(tool_schemas),
+            "requested_max_tokens": requested_max_tokens,
+            "effective_max_tokens": effective_max_tokens,
+            "estimated_input_tokens": estimated_input_tokens,
+            "context_budget": max_token_budget,
+        }):
+            yield debug_evt
 
         # Qwen-specific: disable thinking by default (it's mainly a tool model)
         if (provider.get("id") or model_id) == "qwen3_5":
@@ -995,6 +1115,16 @@ async def run_stream(
         # ── Determine next action based on finish_reason ──────────────
         if finish_reason is None:
             finish_reason = "stop"
+        for debug_evt in await debug_stream_event("llm.finish", {
+            "iteration": budget.used,
+            "finish_reason": finish_reason,
+            "content_chars": len(full_content),
+            "reasoning_chars": len(full_reasoning),
+            "tool_call_fragment_count": len(tool_call_fragments),
+            "api_usage": api_usage,
+            "provider_model": provider.get("id") or model_id,
+        }):
+            yield debug_evt
 
         # Feed token usage to context compressor
         if api_usage:
@@ -1022,6 +1152,13 @@ async def run_stream(
             ):
                 skill_enforcement_continuations += 1
                 skill_list = ", ".join(sorted(unviewed_session_skills))
+                for debug_evt in await debug_stream_event("gate.continuation", {
+                    "gate": "skill_enforcement",
+                    "reason": "session skill available but not loaded",
+                    "skills": sorted(unviewed_session_skills),
+                    "continuation_count": skill_enforcement_continuations,
+                }):
+                    yield debug_evt
                 conversation.append({
                     "role": "assistant",
                     "content": full_content or "(No visible response.)",
@@ -1054,6 +1191,14 @@ async def run_stream(
                 and skill_workflow_continuations < max_skill_workflow_continuations
             ):
                 skill_workflow_continuations += 1
+                for debug_evt in await debug_stream_event("gate.continuation", {
+                    "gate": "skill_workflow_before_finish",
+                    "reason": workflow_reason,
+                    "continuation_count": skill_workflow_continuations,
+                    "max_continuations": max_skill_workflow_continuations,
+                    "largest_write_size": max(run_state.successful_write_sizes or [0]),
+                }):
+                    yield debug_evt
                 conversation.append({
                     "role": "assistant",
                     "content": full_content or "(No visible response.)",
@@ -1072,6 +1217,16 @@ async def run_stream(
                     not largest_write and len(full_content.strip()) < 8_000
                 ):
                     artifact_enforcement_continuations += 1
+                    for debug_evt in await debug_stream_event("gate.continuation", {
+                        "gate": "artifact_enforcement",
+                        "reason": "complex artifact incomplete or tool failures require one follow-up",
+                        "continuation_count": artifact_enforcement_continuations,
+                        "largest_write_size": largest_write,
+                        "tool_error_count": run_state.tool_error_count,
+                        "invalid_placeholder_write": invalid_placeholder_write,
+                        "visible_content_chars": len(full_content.strip()),
+                    }):
+                        yield debug_evt
                     conversation.append({
                         "role": "assistant",
                         "content": full_content or "(No visible response.)",
@@ -1109,6 +1264,15 @@ async def run_stream(
                 )
             ):
                 action_promise_continuations += 1
+                for debug_evt in await debug_stream_event("gate.continuation", {
+                    "gate": "action_promise",
+                    "reason": "assistant promised a concrete next action without completing it",
+                    "continuation_count": action_promise_continuations,
+                    "visible_content_tail": full_content[-700:],
+                    "tool_error_count": run_state.tool_error_count,
+                    "tool_call_count": run_state.tool_call_count,
+                }):
+                    yield debug_evt
                 conversation.append({
                     "role": "assistant",
                     "content": full_content or "(No visible response.)",
@@ -1336,6 +1500,13 @@ async def run_stream(
                 if isinstance(args, dict) and "__tool_arg_parse_error" in args:
                     run_state.parse_failure_count += 1
                 executed_args = args
+                for debug_evt in await debug_stream_event("tool.call", {
+                    "tool_name": tc.name,
+                    "tool_call_id": tc.id or "",
+                    "arguments": _compact_tool_call_arguments(tc.name, tc.arguments),
+                    "parse_error": args.get("__tool_arg_parse_error") if isinstance(args, dict) else None,
+                }, tool_name=tc.name, tool_call_id=tc.id or ""):
+                    yield debug_evt
 
                 if tc.name == "tool_search" and deferred_catalog is not None:
                     result = json.dumps(
@@ -1439,6 +1610,20 @@ async def run_stream(
                     tool_name=display_tool_name,
                     tool_call_id=tc.id or "",
                 )
+                for debug_evt in await debug_stream_event(
+                    "tool.result",
+                    {
+                        "tool_name": display_tool_name,
+                        "original_tool_name": tc.name,
+                        "tool_call_id": tc.id or "",
+                        "outcome": outcome,
+                        "detail": outcome_detail[:1000],
+                        "result": _tool_debug_result(str(result)),
+                    },
+                    tool_name=display_tool_name,
+                    tool_call_id=tc.id or "",
+                ):
+                    yield debug_evt
                 if artifact_payload is not None:
                     yield await emit_agent_event(
                         "artifact.created",
@@ -1475,6 +1660,14 @@ async def run_stream(
             ):
                 skill_workflow_continuations += 1
                 queue_skill_workflow_continuation(workflow_reason_after_tools)
+                for debug_evt in await debug_stream_event("gate.continuation", {
+                    "gate": "skill_workflow_after_tools",
+                    "reason": workflow_reason_after_tools,
+                    "continuation_count": skill_workflow_continuations,
+                    "max_continuations": max_skill_workflow_continuations,
+                    "largest_write_size": max(run_state.successful_write_sizes or [0]),
+                }):
+                    yield debug_evt
                 yield {
                     "type": "tool_progress",
                     "msg": f"↻ Inspecting session skill workflow before continuing — {workflow_reason_after_tools}",
@@ -1490,6 +1683,15 @@ async def run_stream(
             continue
 
         if finish_reason == "length":
+            for debug_evt in await debug_stream_event("gate.continuation", {
+                "gate": "length_continuation",
+                "reason": "model hit max output tokens",
+                "iteration": budget.used,
+                "effective_max_tokens": effective_max_tokens,
+                "content_chars": len(full_content),
+                "reasoning_chars": len(full_reasoning),
+            }):
+                yield debug_evt
             # Inject continuation prompt and loop
             conversation.append({
                 "role": "user",
@@ -1522,6 +1724,19 @@ async def run_stream(
         return
 
     msg = f"Agent iteration budget exhausted after {budget.used} iterations."
+    for debug_evt in await debug_stream_event("budget.exhausted", {
+        "used": budget.used,
+        "max_iterations": budget.max_total,
+        "remaining": budget.remaining,
+        "tool_call_count": run_state.tool_call_count,
+        "tool_error_count": run_state.tool_error_count,
+        "parse_failure_count": run_state.parse_failure_count,
+        "schema_failure_count": run_state.schema_failure_count,
+        "successful_write_sizes": run_state.successful_write_sizes[-10:],
+        "viewed_skill_names": sorted(run_state.viewed_skill_names),
+        "continuation_reasons_tail": run_state.continuation_reasons[-10:],
+    }):
+        yield debug_evt
     yield await emit_agent_event("run.failed", {"error": msg, "usage": run_usage})
     yield {"type": "error", "msg": msg}
 
@@ -1869,7 +2084,17 @@ def _tool_outcome_summary(raw: str) -> tuple[str, str]:
         return "error", str(data["error"])
     status = str(data.get("status", "")).lower()
     if status in {"error", "blocked", "timeout", "failed"}:
-        return status, str(data.get("error") or "")
+        detail = str(data.get("error") or data.get("message") or data.get("detail") or "")
+        if not detail:
+            stderr = str(data.get("stderr") or "").strip()
+            stdout = str(data.get("stdout") or "").strip()
+            if stderr:
+                detail = stderr[-1000:]
+            elif stdout:
+                detail = stdout[-1000:]
+            elif data.get("runtime_status"):
+                detail = f"runtime_status={data.get('runtime_status')}"
+        return status, detail
     if data.get("success") is False:
         return "error", str(data.get("message") or data.get("detail") or "")
     return "success", ""

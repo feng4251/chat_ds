@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     delegation_max_iterations: int = 12
     goal_max_continuations: int = 8
     goal_max_parse_failures: int = 3
+    agent_debug_trace: bool = False
+    agent_debug_trace_result_chars: int = 4000
+    agent_debug_trace_workspace: bool = True
 
 settings = Settings()
 

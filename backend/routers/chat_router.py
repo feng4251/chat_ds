@@ -233,6 +233,23 @@ async def _persist_agent_events(
             select(AgentRun).where(AgentRun.conversation_id == conv_id)
         )).scalars().all()
     }
+    event_run_ids = {
+        str(event.get("run_id") or "")
+        for event in events
+        if event.get("run_id")
+    }
+    persisted_event_keys: set[tuple[str, str, int]] = set()
+    if event_run_ids:
+        rows = (await s.execute(
+            select(AgentRunEvent.run_id, AgentRunEvent.event_type, AgentRunEvent.seq).where(
+                AgentRunEvent.conversation_id == conv_id,
+                AgentRunEvent.run_id.in_(event_run_ids),
+            )
+        )).all()
+        persisted_event_keys = {
+            (str(row[0]), str(row[1]), int(row[2] or 0))
+            for row in rows
+        }
     task_items = {
         task.task_key: task
         for task in (await s.execute(
@@ -247,6 +264,14 @@ async def _persist_agent_events(
         if not run_id:
             continue
         payload = _event_payload(event)
+        event_type = str(event.get("event_type") or "unknown")
+        if event_type in {"agent.delta", "agent.reasoning_delta"}:
+            continue
+        seq = int(event.get("seq") or 0)
+        event_key = (run_id, event_type, seq)
+        event_already_persisted = event_key in persisted_event_keys
+        if event_already_persisted and event_type.startswith("debug."):
+            continue
         if run_id not in existing_runs:
             child_run = AgentRun(
                 id=run_id,
@@ -319,18 +344,86 @@ async def _persist_agent_events(
             event=event,
             payload=payload,
         )
-        s.add(AgentRunEvent(
-            id=uuid.uuid4().hex,
-            run_id=run_id,
-            conversation_id=conv_id,
-            user_id=user_id,
-            parent_run_id=event.get("parent_run_id"),
-            seq=int(event.get("seq") or 0),
-            event_type=str(event.get("event_type") or "unknown"),
-            payload=json.dumps(payload, ensure_ascii=False),
-            tool_name=event.get("tool_name") or payload.get("tool_name"),
-            tool_call_id=event.get("tool_call_id") or payload.get("tool_call_id"),
-        ))
+        if not event_already_persisted:
+            s.add(AgentRunEvent(
+                id=uuid.uuid4().hex,
+                run_id=run_id,
+                conversation_id=conv_id,
+                user_id=user_id,
+                parent_run_id=event.get("parent_run_id"),
+                seq=seq,
+                event_type=event_type,
+                payload=json.dumps(payload, ensure_ascii=False),
+                tool_name=event.get("tool_name") or payload.get("tool_name"),
+                tool_call_id=event.get("tool_call_id") or payload.get("tool_call_id"),
+            ))
+            persisted_event_keys.add(event_key)
+
+
+def _should_persist_agent_event_immediately(event_type: str) -> bool:
+    if not settings.agent_event_immediate_persist:
+        return False
+    if event_type.startswith("debug."):
+        return True
+    if not settings.agent_debug_trace:
+        return False
+    if event_type in {"agent.delta", "agent.reasoning_delta"}:
+        return False
+    return event_type.startswith((
+        "run.",
+        "usage.",
+        "model.",
+        "tool.",
+        "artifact.",
+        "verifier.",
+        "agent.spawned",
+    ))
+
+
+async def _persist_agent_event_immediate(
+    *,
+    conv_id: str,
+    user_id: str,
+    root_run_id: str,
+    requested_model_id: str,
+    resolved_model_id: str,
+    event: dict,
+) -> None:
+    run_id = str(event.get("run_id") or "")
+    event_type = str(event.get("event_type") or "")
+    seq = int(event.get("seq") or 0)
+    if not user_id or not run_id or not event_type or seq <= 0:
+        return
+    if not _should_persist_agent_event_immediately(event_type):
+        return
+    async with async_session() as s:
+        exists = (await s.execute(
+            select(AgentRunEvent.id).where(
+                AgentRunEvent.conversation_id == conv_id,
+                AgentRunEvent.run_id == run_id,
+                AgentRunEvent.event_type == event_type,
+                AgentRunEvent.seq == seq,
+            )
+        )).scalar_one_or_none()
+        if exists:
+            return
+        try:
+            await _persist_agent_events(
+                s,
+                conv_id=conv_id,
+                user_id=user_id,
+                root_run_id=root_run_id,
+                requested_model_id=requested_model_id,
+                resolved_model_id=resolved_model_id,
+                events=[event],
+            )
+            await s.commit()
+        except Exception:
+            await s.rollback()
+            logger.debug(
+                "Immediate agent event persist failed conv=%s run=%s type=%s seq=%s",
+                conv_id, run_id, event_type, seq, exc_info=True,
+            )
 
 
 async def _persist_after_stream(
@@ -941,6 +1034,18 @@ async def _chat_stream(req: ChatRequest, cur_user: User, db: AsyncSession):
                                         if key not in seen_agent_events:
                                             seen_agent_events.add(key)
                                             agent_events.append(agent_event)
+                                            event_type = str(agent_event.get("event_type") or "")
+                                            if _should_persist_agent_event_immediately(event_type):
+                                                t = asyncio.create_task(_persist_agent_event_immediate(
+                                                    conv_id=conv_id,
+                                                    user_id=cur_user.id,
+                                                    root_run_id=run.id,
+                                                    requested_model_id=model_id,
+                                                    resolved_model_id=resolved_model_id,
+                                                    event=agent_event,
+                                                ))
+                                                _background_tasks.add(t)
+                                                t.add_done_callback(_background_tasks.discard)
                                             yield f"data: {json.dumps({'agent_event': agent_event, 'conversation_id': conv_id})}\n\n"
                                     # Harness tool_progress
                                     tp = delta.get("tool_progress")

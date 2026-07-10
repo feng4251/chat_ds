@@ -209,14 +209,46 @@ def get_session_runtime_status(user_id: str, session_id: str) -> dict[str, Any]:
     }
 
 
-def runtime_env_for_subprocess(status: dict[str, Any], base_env: dict[str, str]) -> dict[str, str]:
+def runtime_env_for_subprocess(
+    status: dict[str, Any],
+    base_env: dict[str, str],
+    *,
+    user_id: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, str]:
     env = dict(base_env)
     venv_path = status.get("venv_path")
     if isinstance(venv_path, str) and venv_path:
         bin_dir = str(Path(venv_path) / "bin")
         env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
         env["VIRTUAL_ENV"] = venv_path
+    python_paths = _session_python_paths(user_id, session_id)
+    if python_paths:
+        existing = env.get("PYTHONPATH")
+        if existing:
+            python_paths.append(existing)
+        env["PYTHONPATH"] = os.pathsep.join(python_paths)
     return env
+
+
+def _session_python_paths(user_id: str | None, session_id: str | None) -> list[str]:
+    if not user_id or not session_id:
+        return []
+    try:
+        safe_user = _safe_component(user_id, "user_id")
+        safe_session = _safe_component(session_id, "session_id")
+    except ValueError:
+        return []
+    root = USER_SKILLS_BASE / safe_user / safe_session
+    if not root.is_dir():
+        return []
+    paths: list[str] = []
+    for skill_dir in sorted(path.parent for path in root.rglob("SKILL.md") if path.is_file()):
+        paths.append(str(skill_dir))
+        scripts = skill_dir / "scripts"
+        if scripts.is_dir():
+            paths.append(str(scripts))
+    return paths
 
 
 def resolve_session_python(status: dict[str, Any]) -> str | None:
