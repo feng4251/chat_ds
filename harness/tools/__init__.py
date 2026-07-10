@@ -41,7 +41,7 @@ register(
     "web_search",
     {
         "name": "web_search",
-        "description": "Search the web using DuckDuckGo. Returns top results with title, snippet, and URL.",
+        "description": "Search the web using SearXNG first, with DuckDuckGo fallback. Returns top results with title, snippet, and URL.",
         "parameters": {
             "type": "object",
             "properties": {
