@@ -139,8 +139,7 @@ def _compact_tool_argument_value(value: Any, *, tool_name: str, key: str = "", f
         if omit_written_content:
             return "__CHATDS_OMITTED_TOOL_CONTENT_REGENERATE_OR_READ_SOURCE__"
         if len(value) > _LARGE_TOOL_ARGUMENT_STRING_CAP:
-            target = f" for {filepath}" if filepath else ""
-            return f"[large argument omitted: {len(value)} chars{target}]"
+            return f"__CHATDS_OMITTED_TOOL_ARGUMENT_{len(value)}_CHARS__"
         return value
     if isinstance(value, list):
         return [
@@ -164,7 +163,7 @@ def _compact_tool_call_arguments(tool_name: str, arguments: str) -> str:
         if len(arguments or "") <= _LARGE_TOOL_ARGUMENT_STRING_CAP:
             return arguments or "{}"
         return json.dumps({
-            "_arguments_omitted": f"{len(arguments or '')} chars omitted from conversation history",
+            "_arguments_omitted": f"__CHATDS_OMITTED_TOOL_ARGUMENT_{len(arguments or '')}_CHARS__",
         })
     compacted = _compact_tool_argument_value(args, tool_name=tool_name)
     return json.dumps(compacted, ensure_ascii=False)
@@ -2141,6 +2140,8 @@ def _tool_outcome_summary(raw: str) -> tuple[str, str]:
     raw_text = str(raw or "").strip()
     raw_lower = raw_text.lower()
     if raw_lower.startswith("(web search timed out") or raw_lower.startswith("(web search failed"):
+        return "error", raw_text.strip("()")
+    if raw_lower.startswith("(failed to fetch "):
         return "error", raw_text.strip("()")
     data = _json_object(raw)
     if data is None:

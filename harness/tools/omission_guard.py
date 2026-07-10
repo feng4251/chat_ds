@@ -10,6 +10,8 @@ _OMITTED_HISTORY_RE = re.compile(
     r"\[omitted\s+\d+\s+chars\s+from conversation history"
     r"(?:\s+for [^\]]+)?;\s+use the workspace file or tool result if needed\]"
     r"|__CHATDS_OMITTED_TOOL_CONTENT_[A-Z_]+__"
+    r"|__CHATDS_OMITTED_TOOL_ARGUMENT_\d+_CHARS__"
+    r"|\[large argument omitted:\s*\d+\s*chars(?:[^\]]*)\]"
     r")",
     re.IGNORECASE,
 )

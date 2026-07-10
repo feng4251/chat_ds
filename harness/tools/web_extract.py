@@ -1,3 +1,4 @@
+import json
 import re
 
 import httpx
@@ -16,6 +17,10 @@ def _strip_html(html: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _fetch_error(url: str, error: str) -> str:
+    return json.dumps({"status": "error", "error": f"Failed to fetch {url}: {error}"}, ensure_ascii=False)
+
+
 async def web_extract(url: str, max_chars: int = 2500, timeout: float = 10.0) -> str:
     """Fetch and extract readable text from a web page."""
     try:
@@ -26,10 +31,10 @@ async def web_extract(url: str, max_chars: int = 2500, timeout: float = 10.0) ->
         ) as c:
             r = await c.get(url)
         if r.status_code != 200 or not r.text:
-            return f"(Failed to fetch {url}: HTTP {r.status_code})"
+            return _fetch_error(url, f"HTTP {r.status_code}")
         html = r.text
     except Exception as e:
-        return f"(Failed to fetch {url}: {e})"
+        return _fetch_error(url, f"{type(e).__name__}: {e}")
 
     text = ""
     try:
