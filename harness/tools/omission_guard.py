@@ -6,8 +6,11 @@ import re
 from typing import Any
 
 _OMITTED_HISTORY_RE = re.compile(
+    r"(?:"
     r"\[omitted\s+\d+\s+chars\s+from conversation history"
-    r"(?:\s+for [^\]]+)?;\s+use the workspace file or tool result if needed\]",
+    r"(?:\s+for [^\]]+)?;\s+use the workspace file or tool result if needed\]"
+    r"|__CHATDS_OMITTED_TOOL_CONTENT_[A-Z_]+__"
+    r")",
     re.IGNORECASE,
 )
 

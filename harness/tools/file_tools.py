@@ -166,6 +166,17 @@ async def write_file(
     safety_err = check_file_write_safety(str(path))
     if safety_err:
         return json.dumps({"error": safety_err})
+    if content == "" and path.exists():
+        try:
+            existing_size = path.stat().st_size
+        except OSError:
+            existing_size = 0
+        if existing_size > 0:
+            return json.dumps({
+                "error": "Refusing to overwrite a non-empty existing file with empty content. Use patch_file or provide the full replacement content.",
+                "reason": "empty_overwrite_blocked",
+                "existing_size": existing_size,
+            }, ensure_ascii=False)
 
     # Create parent directories
     path.parent.mkdir(parents=True, exist_ok=True)

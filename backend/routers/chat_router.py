@@ -60,6 +60,25 @@ def _event_key(event: dict, run_id: str) -> str:
     return f"{run_id}:{event.get('event_type') or 'unknown'}:{int(event.get('seq') or 0)}"
 
 
+def _agent_event_terminal_status(agent_events: list[dict]) -> tuple[str | None, str | None]:
+    terminal_type = None
+    terminal_error = None
+    for event in sorted(agent_events or [], key=lambda item: int(item.get("seq") or 0)):
+        event_type = str(event.get("event_type") or "")
+        if event_type == "run.completed":
+            terminal_type = event_type
+            terminal_error = None
+        elif event_type == "run.failed":
+            terminal_type = event_type
+            payload = _event_payload(event)
+            terminal_error = str(payload.get("error") or "Agent run failed.")[:4000]
+    if terminal_type == "run.failed":
+        return "failed", terminal_error or "Agent run failed."
+    if terminal_type == "run.completed":
+        return "succeeded", None
+    return None, None
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -448,6 +467,11 @@ async def _persist_after_stream(
         event_user_id = None
         try:
             agent_events = agent_events or []
+            terminal_status, terminal_error = _agent_event_terminal_status(agent_events)
+            if terminal_status == "failed" and not error_message:
+                error_message = terminal_error
+            elif terminal_status is None and not error_message:
+                error_message = "Harness stream ended without a terminal run event."
             input_tokens = int(usage.get("input_tokens", 0) or 0)
             output_tokens = int(usage.get("output_tokens", 0) or 0)
             total_tokens = int(usage.get("total_tokens", 0) or 0)
@@ -1035,6 +1059,9 @@ async def _chat_stream(req: ChatRequest, cur_user: User, db: AsyncSession):
                                             seen_agent_events.add(key)
                                             agent_events.append(agent_event)
                                             event_type = str(agent_event.get("event_type") or "")
+                                            if event_type == "run.failed":
+                                                payload = _event_payload(agent_event)
+                                                error_message = str(payload.get("error") or "Agent run failed.")[:4000]
                                             if _should_persist_agent_event_immediately(event_type):
                                                 t = asyncio.create_task(_persist_agent_event_immediate(
                                                     conv_id=conv_id,
@@ -1093,6 +1120,12 @@ async def _chat_stream(req: ChatRequest, cur_user: User, db: AsyncSession):
                 error_message = "Harness 服务响应超时。"
             except Exception as e:
                 error_message = f"调用 Harness 时出错:{type(e).__name__}: {e}"
+
+            terminal_status, terminal_error = _agent_event_terminal_status(agent_events)
+            if terminal_status == "failed" and not error_message:
+                error_message = terminal_error
+            elif terminal_status is None and not error_message:
+                error_message = "Harness stream ended without a terminal run event."
 
             if error_message:
                 if full_content:
