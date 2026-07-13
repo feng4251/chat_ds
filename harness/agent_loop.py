@@ -35,9 +35,13 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 3
 DEFAULT_MAX_TOKENS = 8192
 MIN_COMPLEX_REPORT_BYTES = 30_000
-MIN_COMPLEX_REPORT_H2 = 8
-MIN_COMPLEX_REPORT_TABLE_ROWS = 12
-MIN_COMPLEX_REPORT_CODE_FENCES_WITH_CODE = 4
+MIN_COMPLEX_REPORT_TARGET_BYTES = 120_000
+MIN_COMPLEX_REPORT_H2 = 18
+MIN_COMPLEX_REPORT_H3 = 24
+MIN_COMPLEX_REPORT_TABLE_ROWS = 40
+MIN_COMPLEX_REPORT_CODE_FENCES_WITH_CODE = 8
+MAX_VERIFIER_CONTINUATIONS = 4
+MAX_ARTIFACT_ENFORCEMENT_CONTINUATIONS = 3
 
 # Complex session-skill deliverables should cover the explicit workflow files
 # declared by the skill, not just sample a few worker resources.
@@ -397,6 +401,50 @@ def _dedupe_paths(paths: list[str]) -> list[str]:
     return result
 
 
+def _successful_evidence_tool_count(run_state: HarnessRunState) -> int:
+    return (
+        run_state.successful_search_count
+        + run_state.successful_extract_count
+        + run_state.successful_code_execution_count
+        + run_state.successful_skill_python_count
+    )
+
+
+def _written_markdown_artifact_paths(run_state: HarnessRunState) -> list[str]:
+    paths: list[str] = []
+    for artifact in run_state.artifacts:
+        path = artifact.get("path") if isinstance(artifact, dict) else None
+        if isinstance(path, str) and path.endswith(".md"):
+            paths.append(path)
+    return _dedupe_paths(paths)
+
+
+def _complex_report_context(run_state: HarnessRunState, original_user_text: str) -> bool:
+    return bool(
+        _looks_like_complex_artifact_request(original_user_text)
+        or run_state.session_skill_names
+        or run_state.viewed_skill_names
+        or _successful_evidence_tool_count(run_state) >= 2
+    )
+
+
+def _needs_complex_artifact_gate(run_state: HarnessRunState, original_user_text: str, visible_content: str = "") -> bool:
+    if not _complex_report_context(run_state, original_user_text):
+        return False
+    largest_write = max(run_state.successful_write_sizes or [0])
+    if run_state.invalid_placeholder_write_count > 0:
+        return True
+    if run_state.tool_error_count >= 2:
+        return True
+    if not largest_write and len(visible_content.strip()) < 8_000:
+        return True
+    if _successful_evidence_tool_count(run_state) > 0 and largest_write < MIN_COMPLEX_REPORT_TARGET_BYTES:
+        return True
+    if _written_markdown_artifact_paths(run_state) and largest_write < MIN_COMPLEX_REPORT_TARGET_BYTES:
+        return True
+    return False
+
+
 def _suggested_workflow_paths_for_reason(
     run_state: HarnessRunState,
     reason: str,
@@ -593,6 +641,8 @@ async def run_stream(
     action_promise_continuations = 0
     tool_failure_continuations = 0
     max_skill_workflow_continuations = 12
+    max_artifact_enforcement_continuations = MAX_ARTIFACT_ENFORCEMENT_CONTINUATIONS
+    max_verifier_continuations = MAX_VERIFIER_CONTINUATIONS
     yield await emit_agent_event("run.started", {
         "model_id": model_id,
         "source": source,
@@ -871,81 +921,96 @@ async def run_stream(
                     protocol=protocol,
                     body=body,
                 )
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    async with client.stream(
-                        "POST",
-                        request_url,
-                        headers=headers,
-                        json=request_body,
-                    ) as resp:
-                        if resp.status_code != 200:
-                            text = await resp.aread()
-                            err_text = text.decode(errors="replace")[:1000]
-                            raise _http_error(resp.status_code, err_text)
+                stream_timeout = httpx.Timeout(
+                    connect=max(1.0, float(settings.llm_stream_connect_timeout_seconds)),
+                    read=max(5.0, float(settings.llm_stream_read_timeout_seconds)),
+                    write=30.0,
+                    pool=30.0,
+                )
+                total_stream_timeout = max(
+                    30.0,
+                    float(settings.llm_stream_total_timeout_seconds),
+                )
 
-                        async for normalized in _iter_provider_stream(resp, protocol):
-                            reasoning = normalized.get("reasoning", "")
-                            if reasoning:
-                                scrubbed_reasoning = scrubber.feed(reasoning)
-                                if scrubbed_reasoning:
-                                    full_reasoning += scrubbed_reasoning
-                                    yield await emit_agent_event("agent.reasoning_delta", {"content": scrubbed_reasoning})
-                                    yield {
-                                        "type": "reasoning_delta",
-                                        "content": scrubbed_reasoning,
-                                    }
+                async def consume_provider_stream() -> None:
+                    nonlocal full_content, full_reasoning, finish_reason
+                    async with httpx.AsyncClient(timeout=stream_timeout) as client:
+                        async with client.stream(
+                            "POST",
+                            request_url,
+                            headers=headers,
+                            json=request_body,
+                        ) as resp:
+                            if resp.status_code != 200:
+                                body_bytes = await resp.aread()
+                                err_text = body_bytes.decode(errors="replace")[:1000]
+                                raise _http_error(resp.status_code, err_text)
 
-                            # Regular content — scrub and emit
-                            content = normalized.get("content", "")
-                            if content:
-                                scrubbed_content = scrubber.feed(content)
-                                if scrubbed_content:
-                                    full_content += scrubbed_content
-                                    yield await emit_agent_event("agent.delta", {"content": scrubbed_content})
-                                    yield {
-                                        "type": "delta",
-                                        "content": scrubbed_content,
-                                    }
+                            async for normalized in _iter_provider_stream(resp, protocol):
+                                reasoning = normalized.get("reasoning", "")
+                                if reasoning:
+                                    scrubbed_reasoning = scrubber.feed(reasoning)
+                                    if scrubbed_reasoning:
+                                        full_reasoning += scrubbed_reasoning
+                                        yield await emit_agent_event("agent.reasoning_delta", {"content": scrubbed_reasoning})
+                                        yield {
+                                            "type": "reasoning_delta",
+                                            "content": scrubbed_reasoning,
+                                        }
 
-                            # Accumulate tool call fragments
-                            for tc_delta in normalized.get("tool_calls", []):
-                                idx = tc_delta.get("index", 0)
-                                if idx not in tool_call_fragments:
-                                    tool_call_fragments[idx] = {
-                                        "id": None,
-                                        "name": "",
-                                        "arguments": "",
-                                    }
-                                frag = tool_call_fragments[idx]
-                                if tc_delta.get("id"):
-                                    frag["id"] = tc_delta["id"]
-                                fn = tc_delta.get("function", {})
-                                if fn.get("name"):
-                                    frag["name"] = fn["name"]
-                                if fn.get("arguments"):
-                                    frag["arguments"] += fn["arguments"]
+                                content = normalized.get("content", "")
+                                if content:
+                                    scrubbed_content = scrubber.feed(content)
+                                    if scrubbed_content:
+                                        full_content += scrubbed_content
+                                        yield await emit_agent_event("agent.delta", {"content": scrubbed_content})
+                                        yield {
+                                            "type": "delta",
+                                            "content": scrubbed_content,
+                                        }
 
-                            # Check finish reason
-                            fr = normalized.get("finish_reason")
-                            if fr:
-                                finish_reason = fr
+                                for tc_delta in normalized.get("tool_calls", []):
+                                    idx = tc_delta.get("index", 0)
+                                    if idx not in tool_call_fragments:
+                                        tool_call_fragments[idx] = {
+                                            "id": None,
+                                            "name": "",
+                                            "arguments": "",
+                                        }
+                                    frag = tool_call_fragments[idx]
+                                    if tc_delta.get("id"):
+                                        frag["id"] = tc_delta["id"]
+                                    fn = tc_delta.get("function", {})
+                                    if fn.get("name"):
+                                        frag["name"] = fn["name"]
+                                    if fn.get("arguments"):
+                                        frag["arguments"] += fn["arguments"]
 
-                            # Capture token usage from streaming chunks
-                            usage = normalized.get("usage")
-                            if usage:
-                                api_usage["prompt_tokens"] = max(
-                                    api_usage.get("prompt_tokens", 0),
-                                    int(usage.get("prompt_tokens", 0) or 0),
-                                )
-                                api_usage["completion_tokens"] = max(
-                                    api_usage.get("completion_tokens", 0),
-                                    int(usage.get("completion_tokens", 0) or 0),
-                                )
-                                api_usage["total_tokens"] = max(
-                                    api_usage.get("total_tokens", 0),
-                                    int(usage.get("total_tokens", 0) or 0),
-                                    api_usage["prompt_tokens"] + api_usage["completion_tokens"],
-                                )
+                                fr = normalized.get("finish_reason")
+                                if fr:
+                                    finish_reason = fr
+
+                                usage = normalized.get("usage")
+                                if usage:
+                                    api_usage["prompt_tokens"] = max(
+                                        api_usage.get("prompt_tokens", 0),
+                                        int(usage.get("prompt_tokens", 0) or 0),
+                                    )
+                                    api_usage["completion_tokens"] = max(
+                                        api_usage.get("completion_tokens", 0),
+                                        int(usage.get("completion_tokens", 0) or 0),
+                                    )
+                                    api_usage["total_tokens"] = max(
+                                        api_usage.get("total_tokens", 0),
+                                        int(usage.get("total_tokens", 0) or 0),
+                                        api_usage["prompt_tokens"] + api_usage["completion_tokens"],
+                                    )
+
+                async for stream_event in _aiter_with_timeout(
+                    consume_provider_stream(),
+                    timeout_seconds=total_stream_timeout,
+                ):
+                    yield stream_event
 
                 # Flush scrubber tail
                 tail = scrubber.flush()
@@ -1063,7 +1128,7 @@ async def run_stream(
                 delay = jittered_backoff(attempt)
                 await asyncio.sleep(delay)
 
-            except (httpx.ReadTimeout, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+            except (asyncio.TimeoutError, httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
                 logger.warning(
                     "LLM transport error (attempt %d/%d): %s", attempt, MAX_RETRIES, e,
                 )
@@ -1198,11 +1263,7 @@ async def run_stream(
                 yield {"type": "delta", "content": "\n\n"}
                 continue
 
-            needs_artifact_gate = bool(
-                run_state.viewed_skill_names
-                and _looks_like_complex_artifact_request(original_user_text)
-                and max(run_state.successful_write_sizes or [0]) < 20_000
-            )
+            needs_artifact_gate = _needs_complex_artifact_gate(run_state, original_user_text, full_content)
             needs_workflow_gate, workflow_reason = run_state.needs_more_skill_workflow()
             if (
                 needs_artifact_gate
@@ -1230,16 +1291,14 @@ async def run_stream(
                 }
                 yield {"type": "delta", "content": "\n\n"}
                 continue
-            if needs_artifact_gate and artifact_enforcement_continuations < 1:
+            if needs_artifact_gate and artifact_enforcement_continuations < max_artifact_enforcement_continuations:
                 largest_write = max(run_state.successful_write_sizes or [0])
                 invalid_placeholder_write = run_state.invalid_placeholder_write_count > 0
-                if invalid_placeholder_write or run_state.tool_error_count >= 2 or (largest_write and largest_write < 20_000) or (
-                    not largest_write and len(full_content.strip()) < 8_000
-                ):
+                if True:
                     artifact_enforcement_continuations += 1
                     for debug_evt in await debug_stream_event("gate.continuation", {
                         "gate": "artifact_enforcement",
-                        "reason": "complex artifact incomplete or tool failures require one follow-up",
+                        "reason": "complex artifact incomplete or tool failures require follow-up",
                         "continuation_count": artifact_enforcement_continuations,
                         "largest_write_size": largest_write,
                         "tool_error_count": run_state.tool_error_count,
@@ -1260,7 +1319,7 @@ async def run_stream(
                         "content": (
                             continuation_reason +
                             "The task uses a session-level skill and asks for a complex deliverable. "
-                            "Continue once to complete the artifact using the loaded skill workflow and any "
+                            "Continue to complete the artifact using the loaded skill workflow and any "
                             "relevant linked files. If tool calls failed validation, retry with valid schema "
                             "arguments and real generated content. Produce one coherent final artifact with the "
                             "required major sections; do not stop at a short summary, placeholder, or incomplete file."
@@ -1465,6 +1524,7 @@ async def run_stream(
             verifier_payload = _deterministic_verifier_payload(
                 run_state,
                 requested_artifact=_looks_like_file_artifact_request(original_user_text),
+                complex_report=_complex_report_context(run_state, original_user_text),
             )
             if verifier_payload is not None:
                 yield await emit_agent_event("verifier.requested", {
@@ -1476,7 +1536,7 @@ async def run_stream(
                     **verifier_payload,
                     "target_run_id": run_id,
                 })
-                if verifier_payload["needs_more_work"] and verifier_continuations < 1:
+                if verifier_payload["needs_more_work"] and verifier_continuations < max_verifier_continuations:
                     verifier_continuations += 1
                     conversation.append({
                         "role": "assistant",
@@ -1485,11 +1545,11 @@ async def run_stream(
                     conversation.append({
                         "role": "user",
                         "content": (
-                            "[Verifier requested one follow-up]\n"
+                            f"[Verifier requested follow-up {verifier_continuations}/{max_verifier_continuations}]\n"
                             f"Verifier kind: {verifier_payload['verifier_kind']}\n"
                             f"Verdict: {verifier_payload['verdict']}\n"
                             f"Reason: {verifier_payload['reason']}\n\n"
-                            "Continue once to resolve the concrete verifier finding. If a file write failed, retry with valid schema and real content. If an artifact is empty, rewrite it with substantive content. If a README/checklist link or pending marker is wrong, patch the affected Markdown artifact. If a Markdown report is structurally thin, expand it by preserving worker outputs, adding appendices, mapping executed tool/script/search evidence to report sections, and citing sources; do not pad with generic prose. If the finding is already resolved, explain the evidence briefly."
+                            "Continue to resolve every concrete verifier finding. If a file write failed, retry with valid schema and real content. If an artifact is empty, rewrite it with substantive content. If a README/checklist link or pending marker is wrong, patch the affected Markdown artifact. If a Markdown report is structurally thin, expand it by preserving worker outputs, adding appendices, mapping executed tool/script/search evidence to report sections, and citing sources; do not pad with generic prose. For long Markdown files, prefer appending well-labeled sections or replacing exact short anchors over fragile large exact patches. If the finding is already resolved, explain the evidence briefly."
                         ),
                     })
                     yield {
@@ -1729,11 +1789,7 @@ async def run_stream(
                     "content": wrapped,
                 })
 
-            needs_artifact_gate_after_tools = bool(
-                run_state.viewed_skill_names
-                and _looks_like_complex_artifact_request(original_user_text)
-                and max(run_state.successful_write_sizes or [0]) < 20_000
-            )
+            needs_artifact_gate_after_tools = _needs_complex_artifact_gate(run_state, original_user_text)
             needs_workflow_gate_after_tools, workflow_reason_after_tools = run_state.needs_more_skill_workflow()
             if (
                 needs_artifact_gate_after_tools
@@ -1807,6 +1863,11 @@ async def run_stream(
         return
 
     msg = f"Agent iteration budget exhausted after {budget.used} iterations."
+    exhausted_verifier_payload = _deterministic_verifier_payload(
+        run_state,
+        requested_artifact=_looks_like_file_artifact_request(original_user_text),
+        complex_report=_complex_report_context(run_state, original_user_text),
+    )
     for debug_evt in await debug_stream_event("budget.exhausted", {
         "used": budget.used,
         "max_iterations": budget.max_total,
@@ -1818,9 +1879,16 @@ async def run_stream(
         "successful_write_sizes": run_state.successful_write_sizes[-10:],
         "viewed_skill_names": sorted(run_state.viewed_skill_names),
         "continuation_reasons_tail": run_state.continuation_reasons[-10:],
+        "verifier": exhausted_verifier_payload,
     }):
         yield debug_evt
-    yield await emit_agent_event("run.failed", {"error": msg, "usage": run_usage})
+    if exhausted_verifier_payload is not None:
+        yield await emit_agent_event("verifier.completed", {
+            **exhausted_verifier_payload,
+            "target_run_id": run_id,
+            "terminal_reason": "iteration_budget_exhausted",
+        })
+    yield await emit_agent_event("run.failed", {"error": msg, "usage": run_usage, "verifier": exhausted_verifier_payload})
     yield {"type": "error", "msg": msg}
 
 
@@ -2158,6 +2226,41 @@ async def _iter_provider_stream(
             }
 
 
+async def _aiter_with_timeout(iterator: AsyncIterator[dict], *, timeout_seconds: float) -> AsyncIterator[dict]:
+    queue: asyncio.Queue[tuple[bool, Any]] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(1.0, float(timeout_seconds))
+
+    async def pump() -> None:
+        try:
+            async for item in iterator:
+                await queue.put((True, item))
+        except BaseException as exc:
+            await queue.put((False, exc))
+        else:
+            await queue.put((False, None))
+
+    task = asyncio.create_task(pump())
+    try:
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError()
+            ok, value = await asyncio.wait_for(queue.get(), timeout=remaining)
+            if ok:
+                yield value
+                continue
+            if value is None:
+                break
+            raise value
+    except asyncio.TimeoutError:
+        task.cancel()
+        raise
+    finally:
+        if not task.done():
+            task.cancel()
+
+
 def _tool_outcome_summary(raw: str) -> tuple[str, str]:
     """Return an auditable status line without exposing a large tool payload."""
     raw_text = str(raw or "").strip()
@@ -2300,51 +2403,67 @@ def _markdown_artifact_findings(run_state: HarnessRunState, target_artifacts: li
     return findings
 
 
-def _markdown_quality_findings(run_state: HarnessRunState, target_artifacts: list[Any]) -> list[str]:
+def _markdown_quality_findings(
+    run_state: HarnessRunState,
+    target_artifacts: list[Any],
+    *,
+    complex_report: bool = False,
+) -> list[str]:
     workspace = get_workspace(run_state.user_id, run_state.session_id)
     findings: list[str] = []
-    evidence_tool_count = (
-        run_state.successful_search_count
-        + run_state.successful_extract_count
-        + run_state.successful_code_execution_count
-        + run_state.successful_skill_python_count
+    evidence_tool_count = _successful_evidence_tool_count(run_state)
+    markdown_paths = [
+        str(path) for path in target_artifacts
+        if isinstance(path, str) and str(path).endswith(".md")
+    ]
+    complex_workflow = bool(
+        complex_report
+        or run_state.session_skill_names
+        or run_state.viewed_skill_names
+        or evidence_tool_count > 0
     )
-    complex_skill_workflow = bool(run_state.viewed_skill_names and evidence_tool_count > 0)
-    markdown_paths = [str(path) for path in target_artifacts if isinstance(path, str) and str(path).endswith(".md")]
     for rel_path, path, stat in _likely_report_artifacts(workspace, markdown_paths):
         try:
             content = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
         metrics = _markdown_metrics(content)
-        is_large_report = stat.st_size >= MIN_COMPLEX_REPORT_BYTES or metrics["h1"] + metrics["h2"] >= 10
-        if not is_large_report and not complex_skill_workflow:
-            continue
-        if complex_skill_workflow and stat.st_size < MIN_COMPLEX_REPORT_BYTES:
-            findings.append(
-                f"Markdown report appears under-detailed for a skill workflow with tool evidence: {rel_path} is {stat.st_size} bytes; preserve evidence, script outputs, and appendices instead of summarizing them away."
-            )
+        is_large_report = (
+            stat.st_size >= MIN_COMPLEX_REPORT_BYTES
+            or metrics["h1"] + metrics["h2"] >= 10
+            or evidence_tool_count > 0
+        )
+        if not is_large_report and not complex_workflow:
             continue
         missing: list[str] = []
+        if complex_workflow and stat.st_size < MIN_COMPLEX_REPORT_TARGET_BYTES:
+            missing.append(f"{stat.st_size} bytes, below {MIN_COMPLEX_REPORT_TARGET_BYTES} target bytes")
         if metrics["h2"] < MIN_COMPLEX_REPORT_H2:
             missing.append(f"only {metrics['h2']} H2 sections")
+        if metrics["h3"] < MIN_COMPLEX_REPORT_H3:
+            missing.append(f"only {metrics['h3']} H3 subsections")
         if metrics["tables"] < MIN_COMPLEX_REPORT_TABLE_ROWS:
             missing.append(f"only {metrics['tables']} table rows")
         if evidence_tool_count and metrics["code_fences"] < MIN_COMPLEX_REPORT_CODE_FENCES_WITH_CODE:
             missing.append(f"only {metrics['code_fences']} code/result blocks")
-        if evidence_tool_count and metrics["evidence_terms"] < 3:
-            missing.append("few explicit evidence/source/appendix/trace sections")
+        if evidence_tool_count and metrics["evidence_terms"] < 5:
+            missing.append("few explicit evidence/source/appendix/trace/result sections")
+        if metrics["links"] < 5 and evidence_tool_count:
+            missing.append(f"only {metrics['links']} Markdown citations/links")
         if missing:
-            findings.append(f"Markdown report lacks expected structural/evidence density for a complex skill deliverable: {rel_path} has {', '.join(missing)}.")
+            findings.append(
+                "Markdown report lacks expected structural/evidence density for a complex skill deliverable: "
+                f"{rel_path} has {', '.join(missing)}. Preserve worker/script outputs, source evidence, "
+                "trace-step mapping, appendices, and tables instead of condensing them into prose."
+            )
     return findings
-
 
 
 
 def _likely_report_artifacts(workspace: Path, markdown_paths: list[str]) -> list[tuple[str, Path, Any]]:
     candidates: list[tuple[str, Path, Any, bool]] = []
     report_terms = ("report", "final", "full", "comprehensive", "dossier", "development_plan", "plan")
-    for rel_path in markdown_paths:
+    for rel_path in _dedupe_paths(markdown_paths):
         try:
             path = (workspace / rel_path).resolve()
             path.relative_to(workspace)
@@ -2355,19 +2474,13 @@ def _likely_report_artifacts(workspace: Path, markdown_paths: list[str]) -> list
             continue
         lower_name = path.name.lower()
         candidates.append((rel_path, path, stat, any(term in lower_name for term in report_terms)))
-    likely = [(rel, path, stat) for rel, path, stat, is_report in candidates if is_report]
-    if likely:
-        return likely
-    if len(candidates) == 1:
-        rel, path, stat, _ = candidates[0]
-        return [(rel, path, stat)]
-    large = [(rel, path, stat) for rel, path, stat, _ in candidates if stat.st_size >= MIN_COMPLEX_REPORT_BYTES]
-    if large:
-        return large
-    if candidates:
-        rel, path, stat, _ = max(candidates, key=lambda item: item[2].st_size)
-        return [(rel, path, stat)]
-    return []
+    if not candidates:
+        return []
+    candidates = sorted(
+        candidates,
+        key=lambda item: (not item[3], -int(item[2].st_size or 0), item[0]),
+    )
+    return [(rel, path, stat) for rel, path, stat, _ in candidates]
 
 
 def _markdown_metrics(content: str) -> dict[str, int]:
@@ -2387,15 +2500,20 @@ def _deterministic_verifier_payload(
     run_state: HarnessRunState,
     *,
     requested_artifact: bool = False,
+    complex_report: bool = False,
 ) -> dict[str, Any] | None:
     target_artifacts = [artifact.get("path") for artifact in run_state.artifacts if artifact.get("path")]
-    if not target_artifacts and run_state.tool_error_count == 0 and run_state.invalid_placeholder_write_count == 0 and run_state.schema_failure_count == 0 and not requested_artifact:
+    if not target_artifacts and run_state.tool_error_count == 0 and run_state.invalid_placeholder_write_count == 0 and run_state.schema_failure_count == 0 and not requested_artifact and not complex_report:
         return None
     findings: list[str] = []
     needs_more_work = False
     verdict = "pass"
     if requested_artifact and not target_artifacts:
         findings.append("The user requested a file or durable deliverable, but no artifact was produced.")
+        needs_more_work = True
+        verdict = "fail"
+    if complex_report and not any(isinstance(path, str) and path.endswith(".md") for path in target_artifacts):
+        findings.append("The complex report workflow did not produce a Markdown report artifact.")
         needs_more_work = True
         verdict = "fail"
     if run_state.invalid_placeholder_write_count > 0:
@@ -2412,11 +2530,15 @@ def _deterministic_verifier_payload(
         findings.extend(markdown_findings)
         needs_more_work = True
         verdict = "fail"
-    markdown_quality_findings = _markdown_quality_findings(run_state, target_artifacts)
+    markdown_quality_findings = _markdown_quality_findings(
+        run_state,
+        target_artifacts,
+        complex_report=complex_report,
+    )
     if markdown_quality_findings:
         findings.extend(markdown_quality_findings)
         needs_more_work = True
-        verdict = "fail" if requested_artifact else "inconclusive"
+        verdict = "fail" if requested_artifact or complex_report else "inconclusive"
     last_validation_failure_at = max(run_state.last_schema_failure_at, run_state.last_parse_failure_at)
     if (run_state.schema_failure_count > 0 or run_state.parse_failure_count > 0) and last_validation_failure_at > run_state.last_successful_artifact_at:
         findings.append("One or more tool calls failed schema or argument parsing validation after the last successful artifact.")
@@ -2428,7 +2550,7 @@ def _deterministic_verifier_payload(
         if run_state.last_tool_error_at > run_state.last_successful_artifact_at:
             findings.append("One or more tool calls failed during a requested artifact workflow and must be resolved before completion.")
             needs_more_work = True
-            verdict = "fail" if requested_artifact else "inconclusive"
+            verdict = "fail" if requested_artifact or complex_report else "inconclusive"
         else:
             findings.append("Earlier tool failures were followed by a successful artifact write/patch.")
     if not findings:
