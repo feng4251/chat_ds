@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     agent_debug_trace: bool = False
     agent_debug_trace_result_chars: int = 4000
     agent_debug_trace_workspace: bool = True
+    llm_stream_total_timeout_seconds: float = 600.0
+    llm_stream_read_timeout_seconds: float = 120.0
+    llm_stream_connect_timeout_seconds: float = 30.0
     web_search_providers: str = "searxng,ddg"
     searxng_base_url: str = "http://searxng:8080"
     searxng_timeout_seconds: float = 10.0
