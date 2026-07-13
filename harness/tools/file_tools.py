@@ -38,6 +38,17 @@ def _sandbox_dir(user_id: str, session_id: str) -> Path:
     return sandbox_dir(user_id, session_id, sub="workspace")
 
 
+def _make_workspace_path_readable(path: Path) -> None:
+    try:
+        if path.is_dir():
+            path.chmod(0o755)
+        else:
+            path.parent.chmod(0o755)
+            path.chmod(0o644)
+    except OSError:
+        pass
+
+
 def _resolve(filepath: str, user_id: str, session_id: str) -> Path:
     """Resolve a relative path within the user+session sandbox."""
     clean = str(filepath or "")
@@ -183,6 +194,7 @@ async def write_file(
 
     try:
         path.write_text(content, encoding="utf-8")
+        _make_workspace_path_readable(path)
         return json.dumps({
             "status": "written",
             "path": filepath,
@@ -236,6 +248,7 @@ async def patch_file(
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_path, path)
+        _make_workspace_path_readable(path)
     except Exception as exc:
         try:
             os.unlink(temp_path)

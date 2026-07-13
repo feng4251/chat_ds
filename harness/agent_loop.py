@@ -643,11 +643,6 @@ async def run_stream(
     max_skill_workflow_continuations = 12
     max_artifact_enforcement_continuations = MAX_ARTIFACT_ENFORCEMENT_CONTINUATIONS
     max_verifier_continuations = MAX_VERIFIER_CONTINUATIONS
-    yield await emit_agent_event("run.started", {
-        "model_id": model_id,
-        "source": source,
-        "enabled_tools": tools,
-    })
 
     def workflow_reason_retryable(reason: str) -> bool:
         return run_state.continuation_reasons.count(reason) < 2
@@ -697,6 +692,21 @@ async def run_stream(
                 "Failed to inspect session skills for user=%s session=%s",
                 user_id, session_id, exc_info=True,
             )
+
+    original_user_text_for_budget = _latest_user_text(messages)
+    if _looks_like_complex_artifact_request(original_user_text_for_budget) or run_state.session_skill_names:
+        complex_max_iterations = max(
+            max_iterations,
+            int(getattr(settings, "complex_report_max_iterations", max_iterations) or max_iterations),
+        )
+        max_iterations = min(complex_max_iterations, 240)
+
+    yield await emit_agent_event("run.started", {
+        "model_id": model_id,
+        "source": source,
+        "enabled_tools": tools,
+        "max_iterations": max_iterations,
+    })
 
     # ── Auto-connect MCP servers for exactly this user+session ──────────
     mcp_tool_names: list[str] = []
@@ -2362,6 +2372,17 @@ def _safe_workspace_artifact_path(value: Any) -> str | None:
 
 
 
+def _make_workspace_artifact_readable(path: Path) -> None:
+    try:
+        if path.is_dir():
+            path.chmod(0o755)
+        else:
+            path.parent.chmod(0o755)
+            path.chmod(0o644)
+    except OSError:
+        pass
+
+
 def _markdown_artifact_findings(run_state: HarnessRunState, target_artifacts: list[Any]) -> list[str]:
     workspace = get_workspace(run_state.user_id, run_state.session_id)
     artifact_paths = [str(path) for path in target_artifacts if isinstance(path, str) and path]
@@ -2379,7 +2400,11 @@ def _markdown_artifact_findings(run_state: HarnessRunState, target_artifacts: li
             findings.append(f"Artifact path was reported but is not readable in the workspace: {rel_path}.")
             continue
         try:
+            _make_workspace_artifact_readable(path)
             content = path.read_text(encoding="utf-8", errors="replace")
+        except PermissionError:
+            findings.append(f"Artifact path was reported but is not readable by the harness/backend: {rel_path}.")
+            continue
         except OSError:
             findings.append(f"Artifact path was reported but could not be read: {rel_path}.")
             continue
@@ -2424,7 +2449,11 @@ def _markdown_quality_findings(
     )
     for rel_path, path, stat in _likely_report_artifacts(workspace, markdown_paths):
         try:
+            _make_workspace_artifact_readable(path)
             content = path.read_text(encoding="utf-8", errors="replace")
+        except PermissionError:
+            findings.append(f"Markdown report is not readable by the harness/backend: {rel_path}.")
+            continue
         except OSError:
             continue
         metrics = _markdown_metrics(content)
