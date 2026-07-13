@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from skills.manager import get_manager
@@ -27,6 +28,8 @@ logger = logging.getLogger(__name__)
 
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
+MAX_CANDIDATE_FILES = 12
+CANDIDATE_FILE_KEYWORDS = ("reference", "ground", "truth", "template", "format", "example", "evaluation", "script")
 
 # Pattern to extract default env var values from SKILL.md or script content.
 # Matches blocks like:
@@ -120,8 +123,9 @@ async def skills_list(
                 "count": len(output_skills),
                 "hint": (
                     "Use skill_view(name) to see full content. For complex skills, then use "
-                    "skill_view(name, file_path='__manifest__') to inspect workflow resources "
-                    "before reading specific linked files."
+                    "skill_view(name, file_path='__manifest__') to inspect workflow resources, "
+                    "especially report templates, reference/ground-truth examples, evaluation files, "
+                    "and scripts before drafting final Markdown."
                 ),
             },
             ensure_ascii=False,
@@ -172,6 +176,21 @@ async def skill_view(
             include_optional=include_optional,
             enabled_user_skills=enabled_user_skills,
         )
+
+        if result.get("success") is False and file_path:
+            candidates = _current_session_file_candidates(
+                file_path,
+                user_id=user_id,
+                session_id=session_id,
+                include_optional=include_optional,
+                enabled_user_skills=enabled_user_skills,
+            )
+            if candidates:
+                result["candidate_files"] = candidates
+                result["hint"] = (
+                    "The requested file was not found in that skill. Use one of candidate_files if it matches the intended current-session skill resource, "
+                    "or call skill_view(name, file_path='__manifest__') to inspect the available resource graph."
+                )
 
         # ── Auto-detect bundled MCP server scripts ───────────────────────
         # If the skill has an .mcp.json (mcp_config in linked_files) or
@@ -246,6 +265,65 @@ async def skill_view(
     except Exception as e:
         logger.exception("skill_view error")
         return json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)
+
+
+
+
+def _current_session_file_candidates(
+    requested_path: str,
+    *,
+    user_id: str,
+    session_id: str,
+    include_optional: bool,
+    enabled_user_skills: list[str] | None,
+) -> list[dict[str, str]]:
+    requested = PurePosixPath(requested_path)
+    if requested.is_absolute() or ".." in requested.parts:
+        return []
+    basename = requested.name.lower()
+    requested_text = str(requested).lower()
+    skills = find_all_skills(
+        user_id,
+        session_id,
+        include_optional=include_optional,
+        enabled_user_skills=enabled_user_skills,
+    )
+    candidates: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for skill in skills:
+        skill_name = str(skill.get("name") or "")
+        skill_path = skill.get("path")
+        if not skill_name or not isinstance(skill_path, str):
+            continue
+        root = Path(skill_path).parent.resolve()
+        for path in sorted(root.rglob("*")):
+            if len(candidates) >= MAX_CANDIDATE_FILES:
+                return candidates
+            if path.is_symlink() or not path.is_file() or path.name == "SKILL.md":
+                continue
+            try:
+                resolved = path.resolve()
+                rel = str(PurePosixPath(resolved.relative_to(root)))
+            except (OSError, ValueError):
+                continue
+            rel_lower = rel.lower()
+            if not _candidate_file_matches(requested_text, basename, rel_lower):
+                continue
+            key = (skill_name, rel)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append({"skill": skill_name, "file_path": rel})
+    return candidates
+
+
+def _candidate_file_matches(requested_text: str, basename: str, rel_lower: str) -> bool:
+    rel_name = PurePosixPath(rel_lower).name
+    if basename and rel_name == basename:
+        return True
+    if requested_text and requested_text in rel_lower:
+        return True
+    return any(keyword in rel_lower for keyword in CANDIDATE_FILE_KEYWORDS) and any(part in rel_lower for part in ("report", "md", "py", "yaml", "json", "csv"))
 
 
 # ── JSON Schemas for registry ──────────────────────────────────────────────

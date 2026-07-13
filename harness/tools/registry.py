@@ -5,6 +5,7 @@ Enhanced from the hermes-agent pattern. Thread-safe for async FastAPI usage.
 
 from __future__ import annotations
 
+import difflib
 import inspect
 import json
 import logging
@@ -323,6 +324,20 @@ class ToolRegistry:
 
     # ── Dispatch ──────────────────────────────────────────────────────
 
+    def _unknown_tool_suggestions(self, name: str) -> list[str]:
+        registered = sorted(self._tools)
+        suggestions = difflib.get_close_matches(name, registered, n=5, cutoff=0.45)
+        aliases = {
+            "target_skill": ["skill_view", "run_skill_python", "skills_list"],
+            "read_skill": ["skill_view", "skills_list"],
+            "search_web": ["web_search"],
+            "python": ["execute_code", "run_skill_python"],
+        }
+        for candidate in aliases.get(name, []):
+            if candidate in self._tools and candidate not in suggestions:
+                suggestions.append(candidate)
+        return suggestions[:8]
+
     async def dispatch(
         self,
         name: str,
@@ -332,7 +347,11 @@ class ToolRegistry:
         """Execute a tool handler by name with runtime-owned context."""
         entry = self._tools.get(name)
         if not entry:
-            return tool_error(f"Unknown tool: {name}")
+            return tool_error(
+                f"Unknown tool: {name}",
+                unknown_tool=name,
+                suggestions=self._unknown_tool_suggestions(name),
+            )
         try:
             if context is not None:
                 args = self._strip_context_owned_args(entry, args)

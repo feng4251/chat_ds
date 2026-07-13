@@ -12,7 +12,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, AsyncIterator, Optional
 
 import httpx
@@ -34,6 +34,10 @@ logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 3
 DEFAULT_MAX_TOKENS = 8192
+MIN_COMPLEX_REPORT_BYTES = 30_000
+MIN_COMPLEX_REPORT_H2 = 8
+MIN_COMPLEX_REPORT_TABLE_ROWS = 12
+MIN_COMPLEX_REPORT_CODE_FENCES_WITH_CODE = 4
 
 # Complex session-skill deliverables should cover the explicit workflow files
 # declared by the skill, not just sample a few worker resources.
@@ -247,6 +251,8 @@ def _tool_debug_result(raw: str) -> dict[str, Any]:
 
 @dataclass
 class HarnessRunState:
+    user_id: str = "default"
+    session_id: str = "default"
     tool_call_count: int = 0
     tool_error_count: int = 0
     parse_failure_count: int = 0
@@ -261,6 +267,10 @@ class HarnessRunState:
     skill_suggested_files: dict[str, list[str]] = field(default_factory=dict)
     skill_category_files: dict[str, dict[str, list[str]]] = field(default_factory=dict)
     session_skill_names: set[str] = field(default_factory=set)
+    successful_search_count: int = 0
+    successful_extract_count: int = 0
+    successful_code_execution_count: int = 0
+    successful_skill_python_count: int = 0
     continuation_reasons: list[str] = field(default_factory=list)
     last_tool_error_at: int = 0
     last_successful_artifact_at: int = 0
@@ -575,7 +585,7 @@ async def run_stream(
 
     goal_continuations = 0
     goal_parse_failures = 0
-    run_state = HarnessRunState()
+    run_state = HarnessRunState(user_id=user_id, session_id=session_id)
     artifact_enforcement_continuations = 0
     verifier_continuations = 0
     skill_enforcement_continuations = 0
@@ -1479,7 +1489,7 @@ async def run_stream(
                             f"Verifier kind: {verifier_payload['verifier_kind']}\n"
                             f"Verdict: {verifier_payload['verdict']}\n"
                             f"Reason: {verifier_payload['reason']}\n\n"
-                            "Continue once to resolve the concrete verifier finding. If a file write failed, retry with valid schema and real content. If an artifact is empty, rewrite it with substantive content. If the finding is already resolved, explain the evidence briefly."
+                            "Continue once to resolve the concrete verifier finding. If a file write failed, retry with valid schema and real content. If an artifact is empty, rewrite it with substantive content. If a README/checklist link or pending marker is wrong, patch the affected Markdown artifact. If a Markdown report is structurally thin, expand it by preserving worker outputs, adding appendices, mapping executed tool/script/search evidence to report sections, and citing sources; do not pad with generic prose. If the finding is already resolved, explain the evidence briefly."
                         ),
                     })
                     yield {
@@ -1648,10 +1658,23 @@ async def run_stream(
                     written_size = _tool_result_size(str(result))
                     if written_size is not None:
                         run_state.successful_write_sizes.append(written_size)
-                artifact_payload = _artifact_payload_from_tool_result(display_tool_name, str(result)) if outcome == "success" else None
-                if artifact_payload is not None:
-                    run_state.artifacts.append(artifact_payload)
+                if outcome == "success":
+                    if display_tool_name == "web_search":
+                        run_state.successful_search_count += 1
+                    elif display_tool_name == "web_extract":
+                        run_state.successful_extract_count += 1
+                    elif display_tool_name == "execute_code":
+                        run_state.successful_code_execution_count += 1
+                    elif display_tool_name == "run_skill_python":
+                        run_state.successful_skill_python_count += 1
+                artifact_payloads = _artifact_payloads_from_tool_result(display_tool_name, str(result)) if outcome == "success" else []
+                if artifact_payloads:
+                    run_state.artifacts.extend(artifact_payloads)
                     run_state.last_successful_artifact_at = run_state.tool_call_count
+                    for artifact_payload in artifact_payloads:
+                        size = artifact_payload.get("size_bytes")
+                        if isinstance(size, int) and size >= 0:
+                            run_state.successful_write_sizes.append(size)
                 if display_tool_name == "skill_view" and outcome == "success" and isinstance(executed_args, dict):
                     run_state.record_skill_view(executed_args, _json_object(str(result)))
                 logger.info(
@@ -2174,27 +2197,191 @@ def _tool_result_size(raw: str) -> int | None:
     return size if isinstance(size, int) and size >= 0 else None
 
 
-def _artifact_payload_from_tool_result(tool_name: str, raw: str) -> dict[str, Any] | None:
-    if tool_name not in {"write_file", "patch_file"}:
-        return None
+def _artifact_payloads_from_tool_result(tool_name: str, raw: str) -> list[dict[str, Any]]:
     data = _json_object(raw)
     if data is None:
-        return None
-    if data.get("status") not in {"written", "patched"}:
-        return None
-    path = str(data.get("path") or "").strip()
-    if not path:
-        return None
-    size = data.get("size")
-    payload = {
-        "kind": "file",
-        "title": Path(path).name,
-        "path": path,
-    }
-    if isinstance(size, int) and size >= 0:
-        payload["size_bytes"] = size
-    return payload
+        return []
+    if tool_name in {"write_file", "patch_file"}:
+        if data.get("status") not in {"written", "patched"}:
+            return []
+        path = _safe_workspace_artifact_path(data.get("path"))
+        if not path:
+            return []
+        payload = {
+            "kind": "file",
+            "title": Path(path).name,
+            "path": path,
+            "source_tool": tool_name,
+        }
+        size = data.get("size")
+        if isinstance(size, int) and size >= 0:
+            payload["size_bytes"] = size
+        return [payload]
+    if tool_name not in {"execute_code", "run_skill_python"}:
+        return []
+    if data.get("status") != "success":
+        return []
+    artifacts = data.get("artifacts")
+    if not isinstance(artifacts, list):
+        return []
+    payloads: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in artifacts:
+        if not isinstance(item, dict):
+            continue
+        path = _safe_workspace_artifact_path(item.get("path"))
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        payload = {
+            "kind": "file",
+            "title": str(item.get("title") or Path(path).name),
+            "path": path,
+            "source_tool": tool_name,
+        }
+        size = item.get("size_bytes")
+        if isinstance(size, int) and size >= 0:
+            payload["size_bytes"] = size
+        payloads.append(payload)
+    return payloads
 
+
+def _safe_workspace_artifact_path(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if text.startswith("workspace/"):
+        text = text[len("workspace/"):]
+    rel = PurePosixPath(text)
+    if not text or rel.is_absolute() or ".." in rel.parts or any(part in {"", "."} for part in rel.parts):
+        return None
+    return str(rel)
+
+
+
+def _markdown_artifact_findings(run_state: HarnessRunState, target_artifacts: list[Any]) -> list[str]:
+    workspace = get_workspace(run_state.user_id, run_state.session_id)
+    artifact_paths = [str(path) for path in target_artifacts if isinstance(path, str) and path]
+    artifact_set = set(artifact_paths)
+    findings: list[str] = []
+    for rel_path in artifact_paths:
+        if not rel_path.endswith(".md"):
+            continue
+        try:
+            path = (workspace / rel_path).resolve()
+            path.relative_to(workspace)
+        except (OSError, ValueError):
+            continue
+        if not path.is_file() or path.is_symlink():
+            findings.append(f"Artifact path was reported but is not readable in the workspace: {rel_path}.")
+            continue
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            findings.append(f"Artifact path was reported but could not be read: {rel_path}.")
+            continue
+        if "__CHATDS_OMITTED" in content or "REGENERATE_OR_READ_SOURCE" in content:
+            findings.append(f"Artifact contains an omitted-history placeholder: {rel_path}.")
+        pending_markers = ("⏳", "待执行", "TODO", "TBD")
+        if path.name.lower() in {"readme.md", "_checklist.md", "checklist.md"} and any(marker in content for marker in pending_markers):
+            findings.append(f"Artifact still contains pending checklist/index markers: {rel_path}.")
+        for match in re.finditer(r"\[[^\]]+\]\(([^)]+\.md)\)", content):
+            linked = match.group(1).split("#", 1)[0].strip()
+            if not linked or re.match(r"^[a-z][a-z0-9+.-]*:", linked, re.I):
+                continue
+            linked_rel = PurePosixPath(linked)
+            if linked_rel.is_absolute() or ".." in linked_rel.parts:
+                findings.append(f"Artifact has an unsafe Markdown file link: {rel_path} -> {linked}.")
+                break
+            linked_path = str(PurePosixPath(rel_path).parent.joinpath(linked_rel)) if "/" in rel_path else str(linked_rel)
+            if linked_path not in artifact_set and not (workspace / linked_path).is_file():
+                findings.append(f"Artifact links to a missing Markdown file: {rel_path} -> {linked}.")
+                break
+    return findings
+
+
+def _markdown_quality_findings(run_state: HarnessRunState, target_artifacts: list[Any]) -> list[str]:
+    workspace = get_workspace(run_state.user_id, run_state.session_id)
+    findings: list[str] = []
+    evidence_tool_count = (
+        run_state.successful_search_count
+        + run_state.successful_extract_count
+        + run_state.successful_code_execution_count
+        + run_state.successful_skill_python_count
+    )
+    complex_skill_workflow = bool(run_state.viewed_skill_names and evidence_tool_count > 0)
+    markdown_paths = [str(path) for path in target_artifacts if isinstance(path, str) and str(path).endswith(".md")]
+    for rel_path, path, stat in _likely_report_artifacts(workspace, markdown_paths):
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        metrics = _markdown_metrics(content)
+        is_large_report = stat.st_size >= MIN_COMPLEX_REPORT_BYTES or metrics["h1"] + metrics["h2"] >= 10
+        if not is_large_report and not complex_skill_workflow:
+            continue
+        if complex_skill_workflow and stat.st_size < MIN_COMPLEX_REPORT_BYTES:
+            findings.append(
+                f"Markdown report appears under-detailed for a skill workflow with tool evidence: {rel_path} is {stat.st_size} bytes; preserve evidence, script outputs, and appendices instead of summarizing them away."
+            )
+            continue
+        missing: list[str] = []
+        if metrics["h2"] < MIN_COMPLEX_REPORT_H2:
+            missing.append(f"only {metrics['h2']} H2 sections")
+        if metrics["tables"] < MIN_COMPLEX_REPORT_TABLE_ROWS:
+            missing.append(f"only {metrics['tables']} table rows")
+        if evidence_tool_count and metrics["code_fences"] < MIN_COMPLEX_REPORT_CODE_FENCES_WITH_CODE:
+            missing.append(f"only {metrics['code_fences']} code/result blocks")
+        if evidence_tool_count and metrics["evidence_terms"] < 3:
+            missing.append("few explicit evidence/source/appendix/trace sections")
+        if missing:
+            findings.append(f"Markdown report lacks expected structural/evidence density for a complex skill deliverable: {rel_path} has {', '.join(missing)}.")
+    return findings
+
+
+
+
+def _likely_report_artifacts(workspace: Path, markdown_paths: list[str]) -> list[tuple[str, Path, Any]]:
+    candidates: list[tuple[str, Path, Any, bool]] = []
+    report_terms = ("report", "final", "full", "comprehensive", "dossier", "development_plan", "plan")
+    for rel_path in markdown_paths:
+        try:
+            path = (workspace / rel_path).resolve()
+            path.relative_to(workspace)
+            stat = path.stat()
+        except (OSError, ValueError):
+            continue
+        if not path.is_file() or path.is_symlink() or path.name.lower() in {"readme.md", "_checklist.md", "checklist.md"}:
+            continue
+        lower_name = path.name.lower()
+        candidates.append((rel_path, path, stat, any(term in lower_name for term in report_terms)))
+    likely = [(rel, path, stat) for rel, path, stat, is_report in candidates if is_report]
+    if likely:
+        return likely
+    if len(candidates) == 1:
+        rel, path, stat, _ = candidates[0]
+        return [(rel, path, stat)]
+    large = [(rel, path, stat) for rel, path, stat, _ in candidates if stat.st_size >= MIN_COMPLEX_REPORT_BYTES]
+    if large:
+        return large
+    if candidates:
+        rel, path, stat, _ = max(candidates, key=lambda item: item[2].st_size)
+        return [(rel, path, stat)]
+    return []
+
+
+def _markdown_metrics(content: str) -> dict[str, int]:
+    lines = content.splitlines()
+    lower = content.lower()
+    return {
+        "h1": sum(1 for line in lines if line.startswith("# ")),
+        "h2": sum(1 for line in lines if line.startswith("## ")),
+        "h3": sum(1 for line in lines if line.startswith("### ")),
+        "tables": sum(1 for line in lines if line.strip().startswith("|") and line.strip().endswith("|")),
+        "code_fences": sum(1 for line in lines if line.strip().startswith("```")) // 2,
+        "links": len(re.findall(r"\[[^\]]+\]\([^)]+\)", content)),
+        "evidence_terms": sum(1 for term in ("evidence", "source", "appendix", "trace", "artifact", "reference", "citation", "output", "result") if term in lower),
+    }
 
 def _deterministic_verifier_payload(
     run_state: HarnessRunState,
@@ -2220,6 +2407,16 @@ def _deterministic_verifier_payload(
         findings.append(f"Artifact is empty: {', '.join(str(path) for path in empty_artifacts)}.")
         needs_more_work = True
         verdict = "fail"
+    markdown_findings = _markdown_artifact_findings(run_state, target_artifacts)
+    if markdown_findings:
+        findings.extend(markdown_findings)
+        needs_more_work = True
+        verdict = "fail"
+    markdown_quality_findings = _markdown_quality_findings(run_state, target_artifacts)
+    if markdown_quality_findings:
+        findings.extend(markdown_quality_findings)
+        needs_more_work = True
+        verdict = "fail" if requested_artifact else "inconclusive"
     last_validation_failure_at = max(run_state.last_schema_failure_at, run_state.last_parse_failure_at)
     if (run_state.schema_failure_count > 0 or run_state.parse_failure_count > 0) and last_validation_failure_at > run_state.last_successful_artifact_at:
         findings.append("One or more tool calls failed schema or argument parsing validation after the last successful artifact.")

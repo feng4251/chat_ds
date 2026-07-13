@@ -11,6 +11,27 @@ from config import settings
 _BACKENDS = ("api", "lite", "html")
 
 
+
+def _simplified_query(query: str) -> str | None:
+    words = [word.strip(' ,;:()[]{}') for word in query.split() if word.strip(' ,;:()[]{}')]
+    if len(words) < 8:
+        return None
+    simplified = " ".join(words[:8])
+    return simplified if simplified and simplified != query else None
+
+
+def _failure_hints(query: str) -> list[str]:
+    simplified = _simplified_query(query)
+    hints = [
+        "Retry with a shorter query focused on 3-8 core terms.",
+        "Try an English query if the original query is Chinese or mixed-language.",
+        "For evidence-heavy tasks, search official source names plus the entity, then extract the result pages.",
+    ]
+    if simplified:
+        hints.insert(0, f"Suggested shorter query: {simplified}")
+    return hints
+
+
 def _dated_query(query: str) -> str:
     return f"{date.today().strftime('%Y年%m月%d日')} {query}"
 
@@ -88,31 +109,39 @@ async def web_search(query: str, max_results: int = 5, timeout: float = 15.0) ->
     per_attempt_timeout = max(5.0, min(timeout, 10.0))
     providers = [p.strip().lower() for p in settings.web_search_providers.split(",") if p.strip()]
 
-    for provider in providers:
-        if provider == "searxng":
-            try:
-                results = await _search_searxng(
-                    query,
-                    max_results,
-                    max(3.0, min(float(settings.searxng_timeout_seconds or 10.0), timeout)),
-                )
+    queries = [query]
+    simplified = _simplified_query(query)
+    if simplified:
+        queries.append(simplified)
+
+    for query_variant in queries:
+        if query_variant != query:
+            attempts.append(f"retry: simplified query '{query_variant}'")
+        for provider in providers:
+            if provider == "searxng":
+                try:
+                    results = await _search_searxng(
+                        query_variant,
+                        max_results,
+                        max(3.0, min(float(settings.searxng_timeout_seconds or 10.0), timeout)),
+                    )
+                    if results:
+                        return _format_results(results)
+                    attempts.append("searxng: no results")
+                except asyncio.TimeoutError:
+                    attempts.append("searxng: timeout")
+                except httpx.TimeoutException:
+                    attempts.append("searxng: timeout")
+                except httpx.HTTPStatusError as e:
+                    attempts.append(f"searxng: HTTP {e.response.status_code}")
+                except Exception as e:
+                    attempts.append(f"searxng: {type(e).__name__}: {str(e)[:160]}")
+            elif provider in {"ddg", "duckduckgo", "ddgs"}:
+                results = await _search_ddg(query_variant, max_results, per_attempt_timeout, attempts)
                 if results:
                     return _format_results(results)
-                attempts.append("searxng: no results")
-            except asyncio.TimeoutError:
-                attempts.append("searxng: timeout")
-            except httpx.TimeoutException:
-                attempts.append("searxng: timeout")
-            except httpx.HTTPStatusError as e:
-                attempts.append(f"searxng: HTTP {e.response.status_code}")
-            except Exception as e:
-                attempts.append(f"searxng: {type(e).__name__}: {str(e)[:160]}")
-        elif provider in {"ddg", "duckduckgo", "ddgs"}:
-            results = await _search_ddg(query, max_results, per_attempt_timeout, attempts)
-            if results:
-                return _format_results(results)
-        else:
-            attempts.append(f"{provider}: unsupported provider")
+            else:
+                attempts.append(f"{provider}: unsupported provider")
 
     if not providers:
         attempts.append("providers: none configured")
@@ -121,4 +150,5 @@ async def web_search(query: str, max_results: int = 5, timeout: float = 15.0) ->
         "status": status,
         "error": "Web search failed after trying configured providers.",
         "attempts": attempts,
+        "hints": _failure_hints(query),
     }, ensure_ascii=False)
