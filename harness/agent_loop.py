@@ -1706,7 +1706,7 @@ async def run_stream(
                     tool_call_id=tc.id or "",
                 ):
                     yield debug_evt
-                if artifact_payload is not None:
+                for artifact_payload in artifact_payloads:
                     yield await emit_agent_event(
                         "artifact.created",
                         {
