@@ -17,6 +17,9 @@ DEFAULT_TIMEOUT = 120
 MAX_TIMEOUT = 300
 MAX_STDOUT = 80_000
 MAX_STDERR = 20_000
+MAX_ARTIFACTS = 40
+ARTIFACT_EXTENSIONS = {".md", ".json", ".csv", ".tsv", ".txt", ".yaml", ".yml"}
+ARTIFACT_SKIP_DIRS = {".chatds", "debug", "__pycache__", ".pytest_cache"}
 
 
 async def run_skill_python(
@@ -94,6 +97,7 @@ async def _run_python_script(
     python = resolve_session_python(runtime) or os.sys.executable
     safe_args = [str(item) for item in (args or [])]
     timeout = max(1, min(int(timeout), MAX_TIMEOUT))
+    before_artifacts = _workspace_artifact_snapshot(user_id, session_id)
     env = _runtime_env(runtime, user_id=user_id, session_id=session_id, script=script)
     proc = await asyncio.create_subprocess_exec(
         python,
@@ -119,6 +123,7 @@ async def _run_python_script(
         }, ensure_ascii=False)
     stdout = stdout_b.decode("utf-8", errors="replace")
     stderr = stderr_b.decode("utf-8", errors="replace")
+    artifacts = _workspace_artifact_changes(user_id, session_id, before_artifacts)
     return json.dumps({
         "status": "success" if proc.returncode == 0 else "error",
         "returncode": proc.returncode,
@@ -130,6 +135,7 @@ async def _run_python_script(
         "env_hash": runtime.get("env_hash"),
         "managed_fallback": managed_fallback,
         "workspace_output_dir": "workspace/output_result",
+        "artifacts": artifacts,
     }, ensure_ascii=False)
 
 
@@ -143,7 +149,10 @@ def _resolve_script(script_path: str, user_id: str, session_id: str) -> Path:
     elif path_text.startswith("skills/"):
         path = _resolve_skill_path(path_text[len("skills/"):], user_id, session_id)
     else:
-        path = validate_path(path_text, user_id, session_id, sub="workspace", must_exist=True)
+        try:
+            path = validate_path(path_text, user_id, session_id, sub="workspace", must_exist=True)
+        except FileNotFoundError:
+            path = _resolve_unique_skill_script(path_text, (USER_SKILLS_BASE / user_id / session_id).resolve())
     if path.suffix != ".py":
         raise ValueError("script_path must point to a .py file.")
     if path.is_symlink() or not path.is_file():
@@ -254,6 +263,65 @@ def _resolve_cwd(cwd: str, user_id: str, session_id: str, script: Path) -> Path:
     if cwd.startswith("workspace/"):
         cwd = cwd[len("workspace/"):]
     return validate_path(cwd, user_id, session_id, sub="workspace", must_exist=True)
+
+
+def _workspace_artifact_snapshot(user_id: str, session_id: str) -> dict[str, tuple[int, int]]:
+    workspace = sandbox_dir(user_id, session_id, sub="workspace").resolve()
+    snapshot: dict[str, tuple[int, int]] = {}
+    for path in _iter_workspace_artifact_files(workspace):
+        try:
+            stat = path.stat()
+            rel = str(PurePosixPath(path.resolve().relative_to(workspace)))
+        except (OSError, ValueError):
+            continue
+        snapshot[rel] = (stat.st_size, stat.st_mtime_ns)
+    return snapshot
+
+
+def _workspace_artifact_changes(
+    user_id: str,
+    session_id: str,
+    before: dict[str, tuple[int, int]],
+) -> list[dict[str, Any]]:
+    workspace = sandbox_dir(user_id, session_id, sub="workspace").resolve()
+    changes: list[dict[str, Any]] = []
+    for path in _iter_workspace_artifact_files(workspace):
+        try:
+            resolved = path.resolve()
+            rel = str(PurePosixPath(resolved.relative_to(workspace)))
+            stat = resolved.stat()
+        except (OSError, ValueError):
+            continue
+        current = (stat.st_size, stat.st_mtime_ns)
+        if before.get(rel) == current:
+            continue
+        changes.append({
+            "kind": "file",
+            "path": rel,
+            "title": resolved.name,
+            "size_bytes": stat.st_size,
+            "source": "workspace_diff",
+        })
+    changes.sort(key=lambda item: (0 if str(item.get("path", "")).startswith("output_result/") else 1, str(item.get("path", ""))))
+    return changes[:MAX_ARTIFACTS]
+
+
+def _iter_workspace_artifact_files(workspace: Path):
+    if not workspace.is_dir():
+        return
+    for path in sorted(workspace.rglob("*")):
+        rel_parts = path.relative_to(workspace).parts
+        if any(part in ARTIFACT_SKIP_DIRS for part in rel_parts):
+            continue
+        if path.is_symlink() or not path.is_file():
+            continue
+        if path.suffix.lower() not in ARTIFACT_EXTENSIONS:
+            continue
+        try:
+            path.resolve().relative_to(workspace)
+        except ValueError:
+            continue
+        yield path
 
 
 def _safe_env() -> dict[str, str]:
@@ -370,7 +438,7 @@ RUN_SKILL_PYTHON_SCHEMA = {
         "properties": {
             "script_path": {
                 "type": "string",
-                "description": "Path to a .py script: workspace-relative path, workspace/<path>, skills/<skill>/<path>, or skills/<script.py> when unique.",
+                "description": "Path to a .py script: workspace-relative path, workspace/<path>, skills/<skill>/<path>, or a unique installed skill script path such as scripts/foo.py.",
             },
             "args": {
                 "type": "array",
