@@ -64,6 +64,7 @@ async def run_managed_python_code(
     digest = hashlib.sha256(code.encode("utf-8", errors="replace")).hexdigest()[:16]
     script = managed_dir / f"execute_code_{digest}.py"
     script.write_text(code, encoding="utf-8")
+    _make_workspace_path_readable(script)
     return await _run_python_script(
         script,
         args=[],
@@ -295,6 +296,7 @@ def _workspace_artifact_changes(
         current = (stat.st_size, stat.st_mtime_ns)
         if before.get(rel) == current:
             continue
+        _make_workspace_path_readable(resolved)
         changes.append({
             "kind": "file",
             "path": rel,
@@ -337,6 +339,7 @@ def _runtime_env(runtime: dict[str, Any], *, user_id: str, session_id: str, scri
     compat_dir = workspace / ".chatds" / "runtime_compat"
     for path in (output_dir, tmp_dir, compat_dir):
         path.mkdir(parents=True, exist_ok=True)
+        _make_workspace_path_readable(path)
     _write_sitecustomize(compat_dir)
     python_paths = [str(compat_dir)]
     if env.get("PYTHONPATH"):
@@ -350,6 +353,8 @@ def _runtime_env(runtime: dict[str, Any], *, user_id: str, session_id: str, scri
         "TMPDIR": str(tmp_dir),
         "MPLCONFIGDIR": str(tmp_dir / "matplotlib"),
         "PYTHONPATH": os.pathsep.join(python_paths),
+        "PYTHONUNBUFFERED": "1",
+        "CHATDS_FILE_UMASK": "022",
     })
     return env
 
@@ -357,6 +362,18 @@ def _runtime_env(runtime: dict[str, Any], *, user_id: str, session_id: str, scri
 def _write_sitecustomize(compat_dir: Path) -> None:
     module = compat_dir / "sitecustomize.py"
     module.write_text(_SITECUSTOMIZE, encoding="utf-8")
+    _make_workspace_path_readable(module)
+
+
+def _make_workspace_path_readable(path: Path) -> None:
+    try:
+        if path.is_dir():
+            path.chmod(0o755)
+        else:
+            path.parent.chmod(0o755)
+            path.chmod(0o644)
+    except OSError:
+        pass
 
 
 _SITECUSTOMIZE = r'''
@@ -371,6 +388,11 @@ _WORKSPACE = _os.environ.get("CHATDS_WORKSPACE")
 _SKILL_ROOT = _os.environ.get("CHATDS_SKILL_ROOT")
 _MARKERS = ("output", "outputs", "output_result", "results", "artifacts")
 _WRITE_MODES = ("w", "a", "x", "+")
+
+try:
+    _os.umask(int(_os.environ.get("CHATDS_FILE_UMASK", "022"), 8))
+except Exception:
+    pass
 
 
 def _map_path(file, mode):

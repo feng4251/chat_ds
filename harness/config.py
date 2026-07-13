@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     llm_stream_total_timeout_seconds: float = 600.0
     llm_stream_read_timeout_seconds: float = 120.0
     llm_stream_connect_timeout_seconds: float = 30.0
+    complex_report_max_iterations: int = 160
     web_search_providers: str = "searxng,ddg"
     searxng_base_url: str = "http://searxng:8080"
     searxng_timeout_seconds: float = 10.0
