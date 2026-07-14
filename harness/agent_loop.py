@@ -275,6 +275,7 @@ class HarnessRunState:
     artifacts: list[dict[str, Any]] = field(default_factory=list)
     invalid_placeholder_write_count: int = 0
     invalid_placeholder_paths: dict[str, int] = field(default_factory=dict)
+    invalid_placeholder_last_at: int = 0
     viewed_skill_names: set[str] = field(default_factory=set)
     viewed_skill_files: dict[str, set[str]] = field(default_factory=dict)
     viewed_skill_categories: dict[str, set[str]] = field(default_factory=dict)
@@ -622,6 +623,10 @@ def _written_markdown_artifact_paths(run_state: HarnessRunState) -> list[str]:
     return _dedupe_paths(paths)
 
 
+def _has_unresolved_placeholder_write(run_state: HarnessRunState) -> bool:
+    return run_state.invalid_placeholder_last_at > run_state.last_successful_artifact_at
+
+
 def _complex_report_context(run_state: HarnessRunState, original_user_text: str) -> bool:
     return bool(
         _looks_like_complex_artifact_request(original_user_text)
@@ -635,9 +640,9 @@ def _needs_complex_artifact_gate(run_state: HarnessRunState, original_user_text:
     if not _complex_report_context(run_state, original_user_text):
         return False
     largest_write = max(run_state.successful_write_sizes or [0])
-    if run_state.invalid_placeholder_write_count > 0:
+    if _has_unresolved_placeholder_write(run_state):
         return True
-    if run_state.tool_error_count >= 2:
+    if run_state.tool_error_count >= 2 and run_state.last_tool_error_at > run_state.last_successful_artifact_at:
         return True
     if not largest_write and len(visible_content.strip()) < 8_000:
         return True
@@ -1955,6 +1960,7 @@ async def run_stream(
                     result_data = _json_object(str(result))
                     if isinstance(result_data, dict) and result_data.get("reason") == "invalid_placeholder_content":
                         run_state.invalid_placeholder_write_count += 1
+                        run_state.invalid_placeholder_last_at = run_state.tool_call_count
                         placeholder_path = str(result_data.get("field") or "").strip()
                         if placeholder_path:
                             seen = run_state.invalid_placeholder_paths.get(placeholder_path, 0) + 1
@@ -2092,6 +2098,47 @@ async def run_stream(
             continue
 
         if finish_reason == "length":
+            for reconciled in _reconcile_workspace_artifacts(
+                run_state, list(run_state.skill_workflow_contracts.values())
+            ):
+                yield await emit_agent_event(
+                    "artifact.created",
+                    {**reconciled, "source_tool_name": "workspace_reconcile"},
+                )
+            length_verifier_payload = _deterministic_verifier_payload(
+                run_state,
+                requested_artifact=_looks_like_file_artifact_request(original_user_text),
+                complex_report=_complex_report_context(run_state, original_user_text),
+            )
+            if length_verifier_payload is not None and not length_verifier_payload.get("needs_more_work"):
+                yield await emit_agent_event("verifier.requested", {
+                    "verifier_kind": length_verifier_payload["verifier_kind"],
+                    "target_run_id": run_id,
+                    "target_artifacts": length_verifier_payload.get("target_artifacts", []),
+                    "terminal_reason": "model_hit_max_output_tokens",
+                })
+                yield await emit_agent_event("verifier.completed", {
+                    **length_verifier_payload,
+                    "target_run_id": run_id,
+                    "terminal_reason": "model_hit_max_output_tokens",
+                })
+                yield await emit_agent_event("usage.updated", {
+                    **run_usage,
+                    "model": provider.get("id") or api_model,
+                })
+                yield {
+                    "type": "usage",
+                    **run_usage,
+                    "model": provider.get("id") or api_model,
+                }
+                yield await emit_agent_event("run.completed", {
+                    "finish_reason": "stop",
+                    "terminal_reason": "model_hit_max_output_tokens_after_contract_complete",
+                    "usage": run_usage,
+                    "verifier": length_verifier_payload,
+                })
+                yield {"type": "done", "finish_reason": "stop"}
+                return
             for debug_evt in await debug_stream_event("gate.continuation", {
                 "gate": "length_continuation",
                 "reason": "model hit max output tokens",
@@ -2161,6 +2208,15 @@ async def run_stream(
             "target_run_id": run_id,
             "terminal_reason": "iteration_budget_exhausted",
         })
+        if not exhausted_verifier_payload.get("needs_more_work"):
+            yield await emit_agent_event("run.completed", {
+                "finish_reason": "stop",
+                "terminal_reason": "iteration_budget_exhausted_after_contract_complete",
+                "usage": run_usage,
+                "verifier": exhausted_verifier_payload,
+            })
+            yield {"type": "done", "finish_reason": "stop"}
+            return
     yield await emit_agent_event("run.failed", {"error": msg, "usage": run_usage, "verifier": exhausted_verifier_payload})
     yield {"type": "error", "msg": msg}
 
@@ -3078,10 +3134,12 @@ def _deterministic_verifier_payload(
         findings.append("The complex report workflow did not produce a Markdown report artifact.")
         needs_more_work = True
         verdict = "fail"
-    if run_state.invalid_placeholder_write_count > 0:
-        findings.append("A write was rejected because it contained compacted conversation-history placeholder content.")
+    if _has_unresolved_placeholder_write(run_state):
+        findings.append("A write was rejected because it contained compacted conversation-history placeholder content after the last successful artifact update.")
         needs_more_work = True
         verdict = "fail"
+    elif run_state.invalid_placeholder_write_count > 0:
+        findings.append("Earlier compacted-history placeholder writes were rejected before a later successful artifact update.")
     empty_artifacts = [artifact.get("path") for artifact in run_state.artifacts if int(artifact.get("size_bytes") or 0) <= 0]
     if empty_artifacts:
         findings.append(f"Artifact is empty: {', '.join(str(path) for path in empty_artifacts)}.")
