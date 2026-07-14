@@ -397,7 +397,11 @@ class HarnessRunState:
                         f"inspect all declared worker resources for session skill '{skill_name}' "
                         f"(missing {len(missing_workers)} worker files)"
                     )
-                if _successful_evidence_tool_count(self) < max(1, min(3, len(worker_files))):
+                outputs_ready = (
+                    _has_modular_artifacts_for_contract(self, contract)
+                    and (not contract.get("requires_merge") or _has_merged_artifact_for_contract(self, contract))
+                )
+                if not outputs_ready and _successful_evidence_tool_count(self) < max(1, min(3, len(worker_files))):
                     return True, (
                         f"collect worker evidence for session skill '{skill_name}' before final synthesis"
                     )
@@ -575,7 +579,11 @@ def _workflow_contract_findings(run_state: HarnessRunState) -> list[dict[str, An
                 "missing_files": missing[:20],
             })
         worker_files = [str(path) for path in contract.get("worker_files") or []]
-        if worker_files and _successful_evidence_tool_count(run_state) < max(1, min(3, len(worker_files))):
+        outputs_ready = (
+            _has_modular_artifacts_for_contract(run_state, contract)
+            and (not contract.get("requires_merge") or _has_merged_artifact_for_contract(run_state, contract))
+        )
+        if worker_files and not outputs_ready and _successful_evidence_tool_count(run_state) < max(1, min(3, len(worker_files))):
             findings.append({
                 "severity": "blocker",
                 "category": "skill_worker_evidence",
