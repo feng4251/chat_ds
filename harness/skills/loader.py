@@ -344,6 +344,150 @@ def _discover_resource_graph(
     }
 
 
+def _parse_bytes_literal(value: Any) -> int | None:
+    """Parse a size literal such as '150KB', '100 KB', '2MB', or '102400' into bytes."""
+    if isinstance(value, (int, float)):
+        return int(value) if value >= 0 else None
+    if not isinstance(value, str):
+        return None
+    match = re.search(r"(\d+(?:\.\d+)?)\s*(kb|mb|gb|k|m|g|b)?", value.strip(), re.IGNORECASE)
+    if not match:
+        return None
+    number = float(match.group(1))
+    unit = (match.group(2) or "b").lower()
+    factor = {"b": 1, "k": 1024, "kb": 1024, "m": 1024 ** 2, "mb": 1024 ** 2, "g": 1024 ** 3, "gb": 1024 ** 3}
+    return int(number * factor.get(unit, 1))
+
+
+def _parse_int_literal(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        match = re.search(r"\d[\d,]*", value)
+        if match:
+            return int(match.group(0).replace(",", ""))
+    return None
+
+
+def _parse_orchestrator_contract(skill_dir: Path) -> dict[str, Any]:
+    """Parse structured YAML orchestrator contracts under orchestration/ and workflows/.
+
+    Reads the skill's OWN declared final_report_template (sections + auto_merge) so the
+    harness executes the skill's intent instead of inferring it from prose. Returns an
+    empty dict when no orchestrator YAML declares a final report template.
+    """
+    loader = _get_yaml_loader()
+    if not loader:
+        return {}
+    candidates: list[Path] = []
+    for sub in ("orchestration", "workflows", "orchestrator"):
+        base = skill_dir / sub
+        if base.is_dir():
+            candidates.extend(sorted(p for p in base.glob("*.y*ml") if p.is_file()))
+    candidates.extend(sorted(p for p in skill_dir.glob("orchestrat*.y*ml") if p.is_file()))
+
+    contract: dict[str, Any] = {}
+    for path in _dedupe_paths_local(candidates):
+        text = _read_text_resource(path)
+        if not text:
+            continue
+        try:
+            data = loader(text)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        template = data.get("final_report_template")
+        if not isinstance(template, dict):
+            continue
+
+        sections = template.get("sections")
+        if isinstance(sections, list):
+            declared_sections = [s for s in sections if isinstance(s, dict) and s.get("section")]
+            if declared_sections:
+                contract["declared_section_count"] = len(declared_sections)
+                contract["section_titles"] = [str(s.get("section")) for s in declared_sections][:60]
+
+        auto_merge = template.get("auto_merge")
+        if isinstance(auto_merge, dict):
+            output_artifact = auto_merge.get("output_artifact")
+            command = auto_merge.get("command_template") or auto_merge.get("command")
+            if output_artifact or command:
+                contract["merge_mandatory"] = bool(auto_merge.get("mandatory"))
+                if output_artifact:
+                    contract["declared_final_artifact"] = str(output_artifact).strip()
+                if command:
+                    contract["merge_command"] = str(command).strip()
+                size_range = auto_merge.get("expected_size_range")
+                if isinstance(size_range, str) and "-" in size_range:
+                    low, _, high = size_range.partition("-")
+                    low_bytes = _parse_bytes_literal(low)
+                    high_bytes = _parse_bytes_literal(high)
+                    if low_bytes:
+                        contract["expected_min_bytes"] = low_bytes
+                    if high_bytes:
+                        contract["expected_max_bytes"] = high_bytes
+                checks = auto_merge.get("post_merge_verification")
+                if isinstance(checks, list):
+                    parsed_checks = [str(c).strip() for c in checks if str(c).strip()]
+                    if parsed_checks:
+                        contract["post_merge_checks"] = parsed_checks[:20]
+                        for check in parsed_checks:
+                            min_lines = re.search(r"line count\s*>\s*([\d,]+)|>\s*([\d,]+)\s*lines", check, re.IGNORECASE)
+                            if min_lines:
+                                value = _parse_int_literal(min_lines.group(1) or min_lines.group(2))
+                                if value:
+                                    contract["expected_min_lines"] = value
+                            min_bytes = re.search(r"size\s*>\s*([\d.]+\s*[kmg]?b)|>\s*([\d.]+\s*[kmg]b)", check, re.IGNORECASE)
+                            if min_bytes and "expected_min_bytes" not in contract:
+                                value = _parse_bytes_literal(min_bytes.group(1) or min_bytes.group(2))
+                                if value:
+                                    contract["expected_min_bytes"] = value
+    return contract
+
+
+def _parse_output_format_contract(skill_dir: Path) -> dict[str, Any]:
+    """Parse formats/*.md output-packaging specs (declared file count, modular files).
+
+    The output format spec is the skill's declaration of HOW the report is packaged
+    (e.g. '11 content files + README + _checklist + FULL_REPORT = 14 total'). Returns
+    an empty dict when no format spec is present.
+    """
+    formats_dir = skill_dir / "formats"
+    if not formats_dir.is_dir():
+        return {}
+    contract: dict[str, Any] = {}
+    modular_files: list[str] = []
+    for path in sorted(p for p in formats_dir.glob("*.md") if p.is_file()):
+        text = _read_text_resource(path)
+        if not text:
+            continue
+        # Declared total file count, e.g. "= 14 total" or "File count | 11 content files ... = 14 total"
+        total_match = re.search(r"=\s*(\d+)\s*total", text, re.IGNORECASE)
+        if total_match and "declared_file_count" not in contract:
+            contract["declared_file_count"] = int(total_match.group(1))
+        # Modular numbered output files, e.g. `01_executive_summary.md`
+        for match in re.finditer(r"`?(\d{2}_[A-Za-z0-9_.-]+\.md)`?", text):
+            modular_files.append(match.group(1))
+    if modular_files:
+        contract["declared_modular_files"] = _dedupe(modular_files)[:40]
+    return contract
+
+
+def _dedupe_paths_local(paths: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    result: list[Path] = []
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+    return result
+
+
 def _discover_workflow_contract(
     skill_dir: Path,
     linked_files: dict[str, list[str]],
@@ -385,6 +529,21 @@ def _discover_workflow_contract(
         }
         for path in worker_files
     ]
+
+    # Structured contract from the skill's OWN declarations (authoritative).
+    output_contract: dict[str, Any] = {}
+    output_contract.update(_parse_orchestrator_contract(skill_dir))
+    for key, value in _parse_output_format_contract(skill_dir).items():
+        output_contract.setdefault(key, value)
+
+    # requires_merge is authoritative: true ONLY when the skill declares a final
+    # merged artifact / merge command (not merely because prose mentions "full report").
+    declares_merge = bool(
+        output_contract.get("declared_final_artifact")
+        or output_contract.get("merge_command")
+    )
+    declares_modular = bool(output_contract.get("declared_modular_files"))
+
     contract: dict[str, Any] = {
         "workflow_files": _dedupe(workflow_files)[:80],
         "orchestrator_files": [path for path in workflow_files if "orchestrator" in _basename(path).lower()][:20],
@@ -396,9 +555,10 @@ def _discover_workflow_contract(
         "merge_requirements": _dedupe(merge_requirements)[:40],
         "sanity_checks": _dedupe(sanity_checks)[:60],
         "declared_external_sources": _dedupe(declared_external_sources)[:40],
+        "output_contract": output_contract,
         "requires_worker_outputs": bool(worker_files),
-        "requires_modular_artifacts": bool(artifact_patterns),
-        "requires_merge": bool(merge_requirements),
+        "requires_modular_artifacts": declares_modular or bool(artifact_patterns),
+        "requires_merge": declares_merge,
         "recommended_execution": [
             "Load __manifest__, then inspect orchestrator/workflow files first.",
             "Inspect each declared worker file and collect evidence for every worker before final synthesis.",

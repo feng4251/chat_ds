@@ -303,28 +303,37 @@ class SkillsManager:
         )
         if "error" in result:
             return {"success": False, **result}
-        return {
+        workflow_contract = result.get("workflow_contract") or {}
+        output_contract = workflow_contract.get("output_contract") or {}
+        next_steps = [
+            "Load orchestrator/workflow files from workflow_contract.orchestrator_files or resource_graph.suggested_files.",
+            "Load every declared worker file from workflow_contract.worker_files before final synthesis.",
+            "Collect evidence for each declared worker using the available tools/MCP/database/search resources named by the skill.",
+            "Generate declared modular artifacts/checklists in the current session workspace when workflow_contract.artifact_patterns is present.",
+            "Run or reproduce declared merge/sanity steps, preferring run_skill_python for skill-provided scripts.",
+            "Use skill_view(name, file_path=...) for all skill resources; workspace file tools cannot read skill files.",
+        ]
+        execution_plan_hint = _build_execution_plan_hint(output_contract)
+        payload = {
             "success": True,
             "name": skill_name,
             "file": "__manifest__",
             "skill_dir": str(skill_dir),
             "linked_files": result.get("linked_files") or {},
             "resource_graph": result.get("resource_graph") or {},
-            "workflow_contract": result.get("workflow_contract") or {},
-            "next_steps": [
-                "Load orchestrator/workflow files from workflow_contract.orchestrator_files or resource_graph.suggested_files.",
-                "Load every declared worker file from workflow_contract.worker_files before final synthesis.",
-                "Collect evidence for each declared worker using the available tools/MCP/database/search resources named by the skill.",
-                "Generate declared modular artifacts/checklists in the current session workspace when workflow_contract.artifact_patterns is present.",
-                "Run or reproduce declared merge/sanity steps, preferring run_skill_python for skill-provided scripts.",
-                "Use skill_view(name, file_path=...) for all skill resources; workspace file tools cannot read skill files.",
-            ],
+            "workflow_contract": workflow_contract,
+            "next_steps": next_steps,
             "hint": (
                 "For complex deliverables, treat workflow_contract as the execution contract, not just reference material. "
                 "Inspect orchestrators, workers, formats, scripts, and supporting resources before drafting; then produce the "
                 "declared workspace artifacts and merged final deliverable before stopping."
             ),
         }
+        if output_contract:
+            payload["output_contract"] = output_contract
+        if execution_plan_hint:
+            payload["execution_plan_hint"] = execution_plan_hint
+        return payload
 
     def _load_linked_file(
         self,
@@ -400,6 +409,42 @@ class SkillsManager:
         if root_files:
             available["root_files"] = sorted(root_files)
         return available
+
+def _build_execution_plan_hint(output_contract: dict[str, Any]) -> str:
+    """Turn the skill's declared output contract into a concrete execution instruction.
+
+    The instruction mirrors the skill's OWN declarations (file count, merge command,
+    final artifact, post-merge checks). The harness does not invent a path here — it
+    only restates what the skill declared so the model executes it faithfully.
+    """
+    if not output_contract:
+        return ""
+    parts: list[str] = []
+    file_count = output_contract.get("declared_file_count")
+    modular = output_contract.get("declared_modular_files") or []
+    if modular:
+        parts.append(
+            f"Write the {len(modular)} declared modular files "
+            f"({', '.join(modular[:4])}{', …' if len(modular) > 4 else ''}) into the session workspace."
+        )
+    elif file_count:
+        parts.append(f"Write the declared modular content files ({file_count} total artifacts expected).")
+    merge_command = output_contract.get("merge_command")
+    final_artifact = output_contract.get("declared_final_artifact")
+    if merge_command:
+        mandatory = " (mandatory)" if output_contract.get("merge_mandatory") else ""
+        parts.append(
+            f"Then run the skill's declared merge step{mandatory} with the Bash tool exactly as the skill specifies "
+            f"(do NOT rewrite the large report with the write_file tool): `{merge_command}`."
+        )
+    elif final_artifact:
+        parts.append(f"Then produce the declared final artifact `{final_artifact}`.")
+    checks = output_contract.get("post_merge_checks") or []
+    if checks:
+        parts.append("Verify the merged report against the skill's post-merge checks: " + "; ".join(checks[:5]) + ".")
+    if final_artifact:
+        parts.append(f"Completion requires `{final_artifact}` to exist in the workspace and pass those checks.")
+    return " ".join(parts)
 
 
 # Module-level singleton

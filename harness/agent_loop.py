@@ -7,6 +7,7 @@ Ported from hermes-agent/conversation_loop.py.
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 import logging
 import re
@@ -42,6 +43,15 @@ MIN_COMPLEX_REPORT_TABLE_ROWS = 40
 MIN_COMPLEX_REPORT_CODE_FENCES_WITH_CODE = 8
 MAX_VERIFIER_CONTINUATIONS = 4
 MAX_ARTIFACT_ENFORCEMENT_CONTINUATIONS = 3
+
+# Upper bound on files scanned when reconciling skill-declared output artifacts
+# that were produced out-of-band (Bash `cat` merge, delegate_task worker writes).
+_MAX_RECONCILE_FILES = 4000
+_RECONCILE_SKIP_DIRS = {"debug", ".venvs", "__pycache__", ".git", "node_modules"}
+
+# After this many rejected placeholder writes to the SAME path, stop nudging the
+# model to retry that file and instead steer it to regenerate from the source.
+_MAX_PLACEHOLDER_RETRIES_PER_PATH = 2
 
 # Complex session-skill deliverables should cover the explicit workflow files
 # declared by the skill, not just sample a few worker resources.
@@ -264,6 +274,7 @@ class HarnessRunState:
     successful_write_sizes: list[int] = field(default_factory=list)
     artifacts: list[dict[str, Any]] = field(default_factory=list)
     invalid_placeholder_write_count: int = 0
+    invalid_placeholder_paths: dict[str, int] = field(default_factory=dict)
     viewed_skill_names: set[str] = field(default_factory=set)
     viewed_skill_files: dict[str, set[str]] = field(default_factory=dict)
     viewed_skill_categories: dict[str, set[str]] = field(default_factory=dict)
@@ -295,8 +306,9 @@ class HarnessRunState:
         self.viewed_skill_names.add(skill_name)
         file_path = args.get("file_path")
         if isinstance(file_path, str) and file_path:
-            self.viewed_skill_files.setdefault(skill_name, set()).add(file_path)
-            category = file_path.split("/", 1)[0]
+            normalized = _normalize_skill_file_path(file_path)
+            self.viewed_skill_files.setdefault(skill_name, set()).add(normalized)
+            category = normalized.split("/", 1)[0]
             self.viewed_skill_categories.setdefault(skill_name, set()).add(category)
         if isinstance(result_data, dict):
             linked = result_data.get("linked_files")
@@ -346,7 +358,7 @@ class HarnessRunState:
                 return True, f"load the resource manifest for session skill '{skill_name}'"
 
             required_files = _required_workflow_files(self.skill_category_files.get(skill_name, {}))
-            missing_required = [path for path in required_files if path not in files]
+            missing_required = _unviewed_required(required_files, files)
             if missing_required:
                 return True, (
                     f"inspect explicit workflow resources for session skill '{skill_name}' "
@@ -369,7 +381,7 @@ class HarnessRunState:
 
             contract = self.skill_workflow_contracts.get(skill_name) or {}
             contract_required = _contract_required_files(contract)
-            missing_contract = [path for path in contract_required if path not in files]
+            missing_contract = _unviewed_required(contract_required, files)
             if missing_contract:
                 return True, (
                     f"inspect workflow contract resources for session skill '{skill_name}' "
@@ -378,7 +390,7 @@ class HarnessRunState:
 
             if contract.get("requires_worker_outputs"):
                 worker_files = [str(path) for path in contract.get("worker_files") or []]
-                missing_workers = [path for path in worker_files if path not in files]
+                missing_workers = _unviewed_required(worker_files, files)
                 if missing_workers:
                     return True, (
                         f"inspect all declared worker resources for session skill '{skill_name}' "
@@ -434,6 +446,31 @@ def _dedupe_paths(paths: list[str]) -> list[str]:
     return result
 
 
+def _normalize_skill_file_path(path: str) -> str:
+    """Normalize a skill-relative file path for consistent viewed/required matching.
+
+    Strips leading './', collapses duplicate slashes, trims whitespace, and
+    lowercases — so a required 'orchestration/orchestrator.yaml' matches a viewed
+    './Orchestration/orchestrator.yaml' regardless of casing or prefix noise.
+    Preserves the special '__manifest__' sentinel.
+    """
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    if text == "__manifest__":
+        return text
+    while text.startswith("./"):
+        text = text[2:]
+    text = re.sub(r"/{2,}", "/", text).strip("/")
+    return text.lower()
+
+
+def _unviewed_required(required: list[str], viewed: set[str]) -> list[str]:
+    """Return required paths whose normalized form is absent from the (already
+    normalized) viewed set, preserving the original path text for the caller."""
+    return [path for path in required if _normalize_skill_file_path(path) not in viewed]
+
+
 def _contract_required_files(contract: dict[str, Any]) -> list[str]:
     paths: list[str] = []
     for key in ("orchestrator_files", "worker_files", "format_files"):
@@ -465,7 +502,7 @@ def _has_modular_artifacts_for_contract(run_state: HarnessRunState, contract: di
     if not markdown_paths:
         return False
     patterns = [str(item).lower() for item in (contract.get("artifact_patterns") or [])]
-    declared_count = _declared_file_count(patterns)
+    declared_count = _declared_file_count_for_contract(contract)
     numbered_count = sum(1 for path in markdown_paths if re.search(r"(?:^|/)\d{2}_[^/]+\.md$", path))
     has_checklist = any("checklist" in path.lower() for path in markdown_paths)
     if declared_count and len(markdown_paths) >= min(declared_count, 8):
@@ -480,6 +517,15 @@ def _has_modular_artifacts_for_contract(run_state: HarnessRunState, contract: di
 def _has_merged_artifact_for_contract(run_state: HarnessRunState, contract: dict[str, Any]) -> bool:
     paths = [path.lower() for path in _artifact_path_strings(run_state) if path.lower().endswith(".md")]
     if not paths:
+        return False
+    # Prefer the skill's OWN declared final-artifact name (basename glob) so the
+    # merged file the skill produced is what we check for — not a harness guess.
+    final_pats, _ = _contract_artifact_matchers(contract)
+    if final_pats:
+        for path in paths:
+            base = path.rsplit("/", 1)[-1]
+            if any(fnmatch.fnmatch(base, pat) for pat in final_pats):
+                return True
         return False
     if any("full_report" in path or "full-report" in path or "merged" in path for path in paths):
         return True
@@ -496,12 +542,23 @@ def _declared_file_count(patterns: list[str]) -> int | None:
     return None
 
 
+def _declared_file_count_for_contract(contract: dict[str, Any]) -> int | None:
+    """Prefer the skill's structured output_contract count; fall back to the
+    heuristic 'declared_file_count:N' token embedded in artifact_patterns."""
+    output_contract = contract.get("output_contract")
+    if isinstance(output_contract, dict):
+        count = output_contract.get("declared_file_count")
+        if isinstance(count, int) and count > 0:
+            return count
+    return _declared_file_count([str(item).lower() for item in (contract.get("artifact_patterns") or [])])
+
+
 def _workflow_contract_findings(run_state: HarnessRunState) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     for skill_name, contract in sorted(run_state.skill_workflow_contracts.items()):
         files = run_state.viewed_skill_files.get(skill_name, set())
         required_files = _contract_required_files(contract)
-        missing = [path for path in required_files if path not in files]
+        missing = _unviewed_required(required_files, files)
         if missing:
             findings.append({
                 "severity": "blocker",
@@ -526,10 +583,21 @@ def _workflow_contract_findings(run_state: HarnessRunState) -> list[dict[str, An
                 "artifact_patterns": (contract.get("artifact_patterns") or [])[:20],
             })
         if contract.get("requires_merge") and not _has_merged_artifact_for_contract(run_state, contract):
+            output_contract = contract.get("output_contract") if isinstance(contract.get("output_contract"), dict) else {}
+            declared_final = output_contract.get("declared_final_artifact")
+            merge_command = output_contract.get("merge_command")
+            message = f"Skill {skill_name} declares a merged final report"
+            if declared_final:
+                message += f" ({declared_final})"
+            message += " but no matching final report artifact is present in the workspace."
+            if merge_command:
+                message += f" Run the skill's declared merge with the Bash tool: {merge_command}"
             findings.append({
                 "severity": "blocker",
                 "category": "skill_merge",
-                "message": f"Skill {skill_name} declares a merged final report but no merged/full report artifact is present.",
+                "message": message,
+                "declared_final_artifact": declared_final,
+                "merge_command": merge_command,
                 "merge_requirements": (contract.get("merge_requirements") or [])[:10],
             })
     return findings
@@ -590,10 +658,10 @@ def _suggested_workflow_paths_for_reason(
     paths: list[str] = []
     for skill_name in sorted(run_state.viewed_skill_names & run_state.session_skill_names):
         already_viewed = run_state.viewed_skill_files.get(skill_name, set())
-        missing_required = [
-            path for path in _required_workflow_files(run_state.skill_category_files.get(skill_name, {}))
-            if path not in already_viewed
-        ]
+        missing_required = _unviewed_required(
+            _required_workflow_files(run_state.skill_category_files.get(skill_name, {})),
+            already_viewed,
+        )
         if missing_required:
             paths.extend(missing_required)
             continue
@@ -1383,6 +1451,15 @@ async def run_stream(
             run_usage["total_tokens"] += estimated_input + estimated_output
 
         if finish_reason == "stop":
+            # The skill's declared merge / worker files may have been produced by
+            # Bash or delegate_task on the final turn; register them before any gate.
+            for reconciled in _reconcile_workspace_artifacts(
+                run_state, list(run_state.skill_workflow_contracts.values())
+            ):
+                yield await emit_agent_event(
+                    "artifact.created",
+                    {**reconciled, "source_tool_name": "workspace_reconcile"},
+                )
             unviewed_session_skills = run_state.unviewed_session_skills()
             if (
                 unviewed_session_skills
@@ -1866,6 +1943,19 @@ async def run_stream(
                     result_data = _json_object(str(result))
                     if isinstance(result_data, dict) and result_data.get("reason") == "invalid_placeholder_content":
                         run_state.invalid_placeholder_write_count += 1
+                        placeholder_path = str(result_data.get("field") or "").strip()
+                        if placeholder_path:
+                            seen = run_state.invalid_placeholder_paths.get(placeholder_path, 0) + 1
+                            run_state.invalid_placeholder_paths[placeholder_path] = seen
+                            if seen >= _MAX_PLACEHOLDER_RETRIES_PER_PATH:
+                                result = str(result) + (
+                                    "\n\nStop retrying this same write. The content at "
+                                    f"'{placeholder_path}' keeps arriving as a compacted-history "
+                                    "placeholder. Regenerate it from the underlying worker output "
+                                    "or source file (re-read the worker result or re-run the worker), "
+                                    "and write the full literal text — do NOT copy the elided "
+                                    "'[...omitted...]' placeholder."
+                                )
                     if isinstance(executed_args, dict) and "__tool_arg_parse_error" in executed_args:
                         run_state.parse_failure_count += 1
                         run_state.last_parse_failure_at = run_state.tool_call_count
@@ -1949,6 +2039,16 @@ async def run_stream(
                     "content": wrapped,
                 })
 
+            reconciled_payloads = _reconcile_workspace_artifacts(
+                run_state,
+                list(run_state.skill_workflow_contracts.values()),
+            )
+            for reconciled in reconciled_payloads:
+                yield await emit_agent_event(
+                    "artifact.created",
+                    {**reconciled, "source_tool_name": "workspace_reconcile"},
+                )
+
             needs_workflow_gate_after_tools, workflow_reason_after_tools = run_state.needs_more_skill_workflow()
             if (
                 needs_workflow_gate_after_tools
@@ -2021,6 +2121,9 @@ async def run_stream(
         return
 
     msg = f"Agent iteration budget exhausted after {budget.used} iterations."
+    # Register any skill-declared merge/worker outputs produced out-of-band before
+    # the final verdict, so a completed report is not reported as a failure.
+    _reconcile_workspace_artifacts(run_state, list(run_state.skill_workflow_contracts.values()))
     exhausted_verifier_payload = _deterministic_verifier_payload(
         run_state,
         requested_artifact=_looks_like_file_artifact_request(original_user_text),
@@ -2519,6 +2622,155 @@ def _safe_workspace_artifact_path(value: Any) -> str | None:
     return str(rel)
 
 
+def _basename_glob(name: str) -> str:
+    """Reduce a declared artifact name to a lowercase basename glob.
+
+    Template placeholders (e.g. '{TRIAL_NAME}_FULL_REPORT.md') become '*' so the
+    real produced file ('GAL3_AD_FULL_REPORT.md') matches. Skill declarations own
+    the shape; the harness only mirrors them.
+    """
+    base = str(name or "").strip().rsplit("/", 1)[-1]
+    base = re.sub(r"\{[^}]*\}", "*", base)
+    return base.lower().strip()
+
+
+def _contract_artifact_matchers(contract: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """Return (final_patterns, modular_patterns) basename globs from the skill's
+    own declared output contract. Empty lists when the skill declares nothing."""
+    output_contract = contract.get("output_contract")
+    if not isinstance(output_contract, dict):
+        output_contract = {}
+    final_patterns: list[str] = []
+    modular_patterns: list[str] = []
+
+    final_artifact = output_contract.get("declared_final_artifact")
+    if isinstance(final_artifact, str) and final_artifact.strip():
+        pat = _basename_glob(final_artifact)
+        if pat:
+            final_patterns.append(pat)
+
+    for name in output_contract.get("declared_modular_files") or []:
+        pat = _basename_glob(str(name))
+        if pat:
+            modular_patterns.append(pat)
+
+    for token in contract.get("artifact_patterns") or []:
+        if not isinstance(token, str) or token.startswith("declared_file_count:"):
+            continue
+        pat = _basename_glob(token)
+        if not pat or not pat.endswith((".md", ".json", ".csv", ".tsv", ".txt", ".yaml", ".yml")):
+            continue
+        if any(marker in pat for marker in ("full_report", "full-report", "merged", "report")):
+            final_patterns.append(pat)
+        else:
+            modular_patterns.append(pat)
+
+    return _dedupe_paths(final_patterns), _dedupe_paths(modular_patterns)
+
+
+def _iter_workspace_files(workspace_resolved: Path):
+    """Yield real (non-symlink) files under the session workspace, skipping
+    debug/venv/cache trees. Bounded by _MAX_RECONCILE_FILES at the call site."""
+    stack = [workspace_resolved]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = list(current.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir():
+                    if entry.name in _RECONCILE_SKIP_DIRS:
+                        continue
+                    stack.append(entry)
+                elif entry.is_file():
+                    yield entry
+            except OSError:
+                continue
+
+
+def _reconcile_workspace_artifacts(
+    run_state: HarnessRunState,
+    contracts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Register skill-declared output files produced out-of-band into run_state.artifacts.
+
+    The skill's declared merge runs via Bash `cat` and its workers via delegate_task;
+    neither path flows through _artifact_payloads_from_tool_result, so the produced
+    files (e.g. the merged FULL_REPORT.md) were never visible to completion checks.
+    This scans ONLY this session's workspace and registers real files matching the
+    skill's declared final/modular artifact names. Strictly workspace-scoped; it does
+    not run the merge itself. Returns the newly-registered payloads (may be empty).
+    """
+    final_pats: list[str] = []
+    modular_pats: list[str] = []
+    for contract in contracts:
+        if not isinstance(contract, dict):
+            continue
+        fp, mp = _contract_artifact_matchers(contract)
+        final_pats.extend(fp)
+        modular_pats.extend(mp)
+    final_pats = _dedupe_paths(final_pats)
+    all_pats = _dedupe_paths(final_pats + modular_pats)
+    if not all_pats:
+        return []
+
+    try:
+        workspace_resolved = get_workspace(run_state.user_id, run_state.session_id).resolve()
+    except OSError:
+        return []
+    if not workspace_resolved.is_dir():
+        return []
+
+    existing: set[str] = set()
+    for artifact in run_state.artifacts:
+        if isinstance(artifact, dict):
+            registered = _safe_workspace_artifact_path(artifact.get("path"))
+            if registered:
+                existing.add(registered)
+
+    new_payloads: list[dict[str, Any]] = []
+    scanned = 0
+    for path in _iter_workspace_files(workspace_resolved):
+        scanned += 1
+        if scanned > _MAX_RECONCILE_FILES:
+            break
+        base = path.name.lower()
+        if not any(fnmatch.fnmatch(base, pat) for pat in all_pats):
+            continue
+        try:
+            rel = str(path.resolve().relative_to(workspace_resolved))
+        except (OSError, ValueError):
+            continue
+        rel_norm = _safe_workspace_artifact_path(rel)
+        if not rel_norm or rel_norm in existing:
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        payload: dict[str, Any] = {
+            "kind": "file",
+            "title": path.name,
+            "path": rel_norm,
+            "source_tool": "workspace_reconcile",
+            "size_bytes": int(size),
+        }
+        if any(fnmatch.fnmatch(base, pat) for pat in final_pats):
+            payload["is_final_report"] = True
+        run_state.artifacts.append(payload)
+        existing.add(rel_norm)
+        new_payloads.append(payload)
+        if size > 0:
+            run_state.successful_write_sizes.append(int(size))
+    if new_payloads:
+        run_state.last_successful_artifact_at = run_state.tool_call_count
+    return new_payloads
+
+
 
 def _make_workspace_artifact_readable(path: Path) -> None:
     try:
@@ -2576,6 +2828,36 @@ def _markdown_artifact_findings(run_state: HarnessRunState, target_artifacts: li
     return findings
 
 
+def _active_output_contract(run_state: HarnessRunState) -> dict[str, Any]:
+    """Return the richest skill-declared output_contract captured this run.
+
+    The skill is authoritative for completion thresholds; this surfaces its OWN
+    parsed declarations (from orchestrator.yaml / formats). Empty when no skill
+    declared a structured output contract."""
+    best: dict[str, Any] = {}
+    best_score = -1
+    for contract in run_state.skill_workflow_contracts.values():
+        if not isinstance(contract, dict):
+            continue
+        output_contract = contract.get("output_contract")
+        if not isinstance(output_contract, dict) or not output_contract:
+            continue
+        score = len(output_contract)
+        if score > best_score:
+            best_score = score
+            best = output_contract
+    return best
+
+
+def _all_contract_final_pats(run_state: HarnessRunState) -> list[str]:
+    pats: list[str] = []
+    for contract in run_state.skill_workflow_contracts.values():
+        if isinstance(contract, dict):
+            final_pats, _ = _contract_artifact_matchers(contract)
+            pats.extend(final_pats)
+    return _dedupe_paths(pats)
+
+
 def _markdown_quality_findings(
     run_state: HarnessRunState,
     target_artifacts: list[Any],
@@ -2583,18 +2865,116 @@ def _markdown_quality_findings(
     complex_report: bool = False,
 ) -> list[str]:
     workspace = get_workspace(run_state.user_id, run_state.session_id)
-    findings: list[str] = []
-    evidence_tool_count = _successful_evidence_tool_count(run_state)
     markdown_paths = [
         str(path) for path in target_artifacts
         if isinstance(path, str) and str(path).endswith(".md")
     ]
-    complex_workflow = bool(
-        complex_report
+    output_contract = _active_output_contract(run_state)
+    if output_contract:
+        # The skill declared its own completion thresholds — verify against those.
+        return _contract_report_findings(run_state, workspace, markdown_paths, output_contract)
+    has_any_skill = bool(
+        run_state.skill_workflow_contracts
         or run_state.session_skill_names
         or run_state.viewed_skill_names
-        or evidence_tool_count > 0
     )
+    if has_any_skill:
+        # A skill is driving the workflow but declared no structured output
+        # contract. The skill is authoritative: do NOT impose harness-invented
+        # density thresholds. Integrity checks are handled by
+        # _markdown_artifact_findings; nothing to add here.
+        return []
+    # No skill contract at all — last-resort density heuristic, and only for a
+    # bare "write me a complex report" request.
+    if not complex_report:
+        return []
+    return _legacy_density_findings(run_state, workspace, markdown_paths)
+
+
+def _contract_report_findings(
+    run_state: HarnessRunState,
+    workspace: Path,
+    markdown_paths: list[str],
+    output_contract: dict[str, Any],
+) -> list[str]:
+    findings: list[str] = []
+    final_pats = _all_contract_final_pats(run_state)
+
+    # Identify the declared final report file (prefer the skill's declared name).
+    candidates = _likely_report_artifacts(workspace, markdown_paths)
+    final_entry = None
+    if final_pats:
+        for rel_path, path, stat in candidates:
+            base = path.name.lower()
+            if any(fnmatch.fnmatch(base, pat) for pat in final_pats):
+                final_entry = (rel_path, path, stat)
+                break
+    if final_entry is None and candidates:
+        final_entry = candidates[0]
+
+    declared_final = output_contract.get("declared_final_artifact")
+    if final_entry is None:
+        if declared_final:
+            findings.append(
+                f"Skill declares a final report artifact ({declared_final}) but no matching "
+                "Markdown report was found in the workspace."
+            )
+        return findings
+
+    rel_path, path, stat = final_entry
+    try:
+        _make_workspace_artifact_readable(path)
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except PermissionError:
+        return [f"Markdown report is not readable by the harness/backend: {rel_path}."]
+    except OSError:
+        return findings
+
+    metrics = _markdown_metrics(content)
+    line_count = content.count("\n") + 1
+    shortfalls: list[str] = []
+
+    min_bytes = output_contract.get("expected_min_bytes")
+    if isinstance(min_bytes, int) and min_bytes > 0 and stat.st_size < min_bytes:
+        shortfalls.append(f"{stat.st_size} bytes, below the skill-declared minimum of {min_bytes} bytes")
+
+    min_lines = output_contract.get("expected_min_lines")
+    if isinstance(min_lines, int) and min_lines > 0 and line_count < min_lines:
+        shortfalls.append(f"{line_count} lines, below the skill-declared minimum of {min_lines} lines")
+
+    section_count = output_contract.get("declared_section_count")
+    if isinstance(section_count, int) and section_count > 0:
+        headings = metrics["h1"] + metrics["h2"]
+        if headings < section_count:
+            shortfalls.append(
+                f"{headings} top-level sections, below the {section_count} sections declared by the skill"
+            )
+
+    if shortfalls:
+        findings.append(
+            "Final report does not meet the skill's own declared completion contract: "
+            f"{rel_path} has {', '.join(shortfalls)}. Regenerate the missing sections from the skill's "
+            "worker outputs and re-run the skill's declared merge instead of condensing content."
+        )
+
+    file_count = output_contract.get("declared_file_count")
+    if isinstance(file_count, int) and file_count > 0:
+        present_md = len({p.lower() for p in _artifact_path_strings(run_state) if p.lower().endswith(".md")})
+        if present_md < file_count:
+            findings.append(
+                f"Skill declares {file_count} output files, but only {present_md} Markdown artifacts are present. "
+                "Produce every declared modular file, the README/checklist, and the merged final report."
+            )
+    return findings
+
+
+def _legacy_density_findings(
+    run_state: HarnessRunState,
+    workspace: Path,
+    markdown_paths: list[str],
+) -> list[str]:
+    findings: list[str] = []
+    evidence_tool_count = _successful_evidence_tool_count(run_state)
     for rel_path, path, stat in _likely_report_artifacts(workspace, markdown_paths):
         try:
             _make_workspace_artifact_readable(path)
@@ -2605,15 +2985,8 @@ def _markdown_quality_findings(
         except OSError:
             continue
         metrics = _markdown_metrics(content)
-        is_large_report = (
-            stat.st_size >= MIN_COMPLEX_REPORT_BYTES
-            or metrics["h1"] + metrics["h2"] >= 10
-            or evidence_tool_count > 0
-        )
-        if not is_large_report and not complex_workflow:
-            continue
         missing: list[str] = []
-        if complex_workflow and stat.st_size < MIN_COMPLEX_REPORT_TARGET_BYTES:
+        if stat.st_size < MIN_COMPLEX_REPORT_TARGET_BYTES:
             missing.append(f"{stat.st_size} bytes, below {MIN_COMPLEX_REPORT_TARGET_BYTES} target bytes")
         if metrics["h2"] < MIN_COMPLEX_REPORT_H2:
             missing.append(f"only {metrics['h2']} H2 sections")
@@ -2629,7 +3002,7 @@ def _markdown_quality_findings(
             missing.append(f"only {metrics['links']} Markdown citations/links")
         if missing:
             findings.append(
-                "Markdown report lacks expected structural/evidence density for a complex skill deliverable: "
+                "Markdown report lacks expected structural/evidence density for a complex deliverable: "
                 f"{rel_path} has {', '.join(missing)}. Preserve worker/script outputs, source evidence, "
                 "trace-step mapping, appendices, and tables instead of condensing them into prose."
             )
