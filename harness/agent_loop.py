@@ -1771,28 +1771,40 @@ async def run_stream(
                     **verifier_payload,
                     "target_run_id": run_id,
                 })
-                if verifier_payload["needs_more_work"] and verifier_continuations < max_verifier_continuations:
-                    verifier_continuations += 1
-                    conversation.append({
-                        "role": "assistant",
-                        "content": full_content or "(No visible response.)",
+                if verifier_payload["needs_more_work"]:
+                    if verifier_continuations < max_verifier_continuations:
+                        verifier_continuations += 1
+                        conversation.append({
+                            "role": "assistant",
+                            "content": full_content or "(No visible response.)",
+                        })
+                        conversation.append({
+                            "role": "user",
+                            "content": (
+                                f"[Verifier requested follow-up {verifier_continuations}/{max_verifier_continuations}]\n"
+                                f"Verifier kind: {verifier_payload['verifier_kind']}\n"
+                                f"Verdict: {verifier_payload['verdict']}\n"
+                                f"Reason: {verifier_payload['reason']}\n\n"
+                                "Continue to resolve every concrete verifier finding. If a file write failed, retry with valid schema and real content. If an artifact is empty, rewrite it with substantive content. If a README/checklist link or pending marker is wrong, patch the affected Markdown artifact. If a Markdown report is structurally thin, expand it by preserving worker outputs, adding appendices, mapping executed tool/script/search evidence to report sections, and citing sources; do not pad with generic prose. For long Markdown files, prefer appending well-labeled sections or replacing exact short anchors over fragile large exact patches. If the finding is already resolved, explain the evidence briefly."
+                            ),
+                        })
+                        yield {
+                            "type": "tool_progress",
+                            "msg": f"↻ Verifier requested follow-up — {verifier_payload['reason']}",
+                        }
+                        yield {"type": "delta", "content": "\n\n"}
+                        continue
+                    msg = (
+                        "Verifier failed after exhausting automatic follow-up budget: "
+                        f"{verifier_payload['reason']}"
+                    )
+                    yield await emit_agent_event("run.failed", {
+                        "error": msg,
+                        "finish_reason": "verifier_failed",
+                        "verifier": verifier_payload,
                     })
-                    conversation.append({
-                        "role": "user",
-                        "content": (
-                            f"[Verifier requested follow-up {verifier_continuations}/{max_verifier_continuations}]\n"
-                            f"Verifier kind: {verifier_payload['verifier_kind']}\n"
-                            f"Verdict: {verifier_payload['verdict']}\n"
-                            f"Reason: {verifier_payload['reason']}\n\n"
-                            "Continue to resolve every concrete verifier finding. If a file write failed, retry with valid schema and real content. If an artifact is empty, rewrite it with substantive content. If a README/checklist link or pending marker is wrong, patch the affected Markdown artifact. If a Markdown report is structurally thin, expand it by preserving worker outputs, adding appendices, mapping executed tool/script/search evidence to report sections, and citing sources; do not pad with generic prose. For long Markdown files, prefer appending well-labeled sections or replacing exact short anchors over fragile large exact patches. If the finding is already resolved, explain the evidence briefly."
-                        ),
-                    })
-                    yield {
-                        "type": "tool_progress",
-                        "msg": f"↻ Verifier requested follow-up — {verifier_payload['reason']}",
-                    }
-                    yield {"type": "delta", "content": "\n\n"}
-                    continue
+                    yield {"type": "error", "msg": msg}
+                    return
             yield await emit_agent_event("usage.updated", {
                 **run_usage,
                 "model": provider.get("id") or api_model,
