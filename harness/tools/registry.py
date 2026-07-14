@@ -9,11 +9,42 @@ import difflib
 import inspect
 import json
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, get_args, get_origin, get_type_hints
 
 from tools.context import ToolContext
+from tools.omission_guard import (
+    compacted_history_omission_error,
+    contains_compacted_history_omission,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _is_tool_context_annotation(annotation: Any) -> bool:
+    if annotation is inspect.Signature.empty:
+        return False
+    if annotation is ToolContext:
+        return True
+    origin = get_origin(annotation)
+    if origin is None:
+        return False
+    return any(arg is ToolContext for arg in get_args(annotation))
+
+
+def _find_omission_path(value: Any, path: str = "args") -> str | None:
+    if contains_compacted_history_omission(value):
+        return path
+    if isinstance(value, dict):
+        for key, item in value.items():
+            found = _find_omission_path(item, f"{path}.{key}")
+            if found:
+                return found
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            found = _find_omission_path(item, f"{path}[{index}]")
+            if found:
+                return found
+    return None
 
 
 # ── ToolEntry ──────────────────────────────────────────────────────────────
@@ -60,10 +91,16 @@ class ToolEntry:
         self.description = description or schema.get("description", "")
         self.emoji = emoji
         try:
-            params = inspect.signature(handler).parameters
+            signature = inspect.signature(handler)
+            params = signature.parameters
+            type_hints = get_type_hints(handler)
         except (TypeError, ValueError):
             params = {}
-        self.accepts_context = "context" in params
+            type_hints = {}
+        self.accepts_context = any(
+            name == "context" and _is_tool_context_annotation(type_hints.get(name, param.annotation))
+            for name, param in params.items()
+        )
         self.accepts_user_id = "user_id" in params
         self.accepts_session_id = "session_id" in params
         self.accepts_enabled_user_skills = "enabled_user_skills" in params
@@ -291,7 +328,19 @@ class ToolRegistry:
             stripped.pop("session_id", None)
         if entry.accepts_enabled_user_skills:
             stripped.pop("enabled_user_skills", None)
+        if entry.accepts_context:
+            stripped.pop("context", None)
         return stripped
+
+    @staticmethod
+    def _normalize_alias_args(entry: ToolEntry, args: Any) -> Any:
+        if not isinstance(args, dict):
+            return args
+        if entry.name == "search_files" and "context" in args and "context_lines" not in args:
+            normalized = dict(args)
+            normalized["context_lines"] = normalized.pop("context")
+            return normalized
+        return args
 
     @staticmethod
     def _strip_unexpected_args(entry: ToolEntry, args: Any) -> tuple[Any, list[str]]:
@@ -355,6 +404,15 @@ class ToolRegistry:
         try:
             if context is not None:
                 args = self._strip_context_owned_args(entry, args)
+            args = self._normalize_alias_args(entry, args)
+            omission_path = _find_omission_path(args)
+            if omission_path:
+                logger.info("Tool %s rejected compacted-history placeholder at %s", name, omission_path)
+                return tool_error(
+                    compacted_history_omission_error(omission_path)["error"],
+                    reason="invalid_placeholder_content",
+                    field=omission_path,
+                )
             args, ignored_args = self._strip_unexpected_args(entry, args)
             schema_error = self._validate_args(entry, args)
             if schema_error:

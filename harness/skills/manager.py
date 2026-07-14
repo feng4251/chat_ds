@@ -310,16 +310,19 @@ class SkillsManager:
             "skill_dir": str(skill_dir),
             "linked_files": result.get("linked_files") or {},
             "resource_graph": result.get("resource_graph") or {},
+            "workflow_contract": result.get("workflow_contract") or {},
             "next_steps": [
-                "For complex deliverables, first open one or more orchestration/workflow/worker paths from resource_graph.suggested_files.",
-                "Then open task-relevant reference, format, script, example, or domain files from resource_graph.suggested_files.",
+                "Load orchestrator/workflow files from workflow_contract.orchestrator_files or resource_graph.suggested_files.",
+                "Load every declared worker file from workflow_contract.worker_files before final synthesis.",
+                "Collect evidence for each declared worker using the available tools/MCP/database/search resources named by the skill.",
+                "Generate declared modular artifacts/checklists in the current session workspace when workflow_contract.artifact_patterns is present.",
+                "Run or reproduce declared merge/sanity steps, preferring run_skill_python for skill-provided scripts.",
                 "Use skill_view(name, file_path=...) for all skill resources; workspace file tools cannot read skill files.",
             ],
             "hint": (
-                "For complex deliverables, inspect resource_graph.suggested_files with "
-                "skill_view(name, file_path=...) before drafting. When present, start with "
-                "orchestration/workflow files, then inspect task-relevant references, templates, "
-                "formats, scripts, examples, or domain resources from this manifest."
+                "For complex deliverables, treat workflow_contract as the execution contract, not just reference material. "
+                "Inspect orchestrators, workers, formats, scripts, and supporting resources before drafting; then produce the "
+                "declared workspace artifacts and merged final deliverable before stopping."
             ),
         }
 

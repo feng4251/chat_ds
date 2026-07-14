@@ -11,6 +11,10 @@ from typing import Any
 
 from runtime.python_env import ensure_session_runtime, resolve_session_python, runtime_env_for_subprocess
 from skills.scanner import USER_SKILLS_BASE
+from tools.omission_guard import (
+    compacted_history_omission_error,
+    contains_compacted_history_omission,
+)
 from tools.path_security import sandbox_dir, validate_path
 
 DEFAULT_TIMEOUT = 120
@@ -30,6 +34,9 @@ async def run_skill_python(
     user_id: str = "default",
     session_id: str = "default",
 ) -> str:
+    for field, value in (("script_path", script_path), ("cwd", cwd), ("args", args or [])):
+        if contains_compacted_history_omission(value):
+            return json.dumps(compacted_history_omission_error(field), ensure_ascii=False)
     try:
         script = _resolve_script(script_path, user_id, session_id)
         workdir = _resolve_cwd(cwd, user_id, session_id, script)

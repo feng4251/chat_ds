@@ -271,7 +271,7 @@ async def search_files(
     limit: int = DEFAULT_SEARCH_LIMIT,
     offset: int = 0,
     output_mode: str = "content",
-    context: int = 0,
+    context_lines: int = 0,
     user_id: str = "default",
     session_id: str = "default",
 ) -> str:
@@ -285,7 +285,7 @@ async def search_files(
         limit: Maximum results (default 50).
         offset: Skip first N results (default 0).
         output_mode: "content" for matching lines, "files_with_matches" for file paths.
-        context: Lines of context around matches (content mode only).
+        context_lines: Lines of context around matches (content mode only).
         user_id: User identifier for sandbox isolation.
         session_id: Session identifier for sandbox isolation.
     """
@@ -306,7 +306,7 @@ async def search_files(
         return _search_filenames(pattern, search_dir, sandbox, limit, offset)
 
     return await _search_content(
-        pattern, search_dir, sandbox, file_glob, limit, offset, output_mode, context
+        pattern, search_dir, sandbox, file_glob, limit, offset, output_mode, context_lines
     )
 
 
@@ -630,6 +630,11 @@ SEARCH_FILES_SCHEMA = {
                 "enum": ["content", "files_with_matches"],
                 "description": "'content' for matching lines, 'files_with_matches' for file paths.",
                 "default": "content",
+            },
+            "context_lines": {
+                "type": "integer",
+                "description": "Lines of context around matches for content search.",
+                "default": 0,
             },
         },
         "required": ["pattern"],
