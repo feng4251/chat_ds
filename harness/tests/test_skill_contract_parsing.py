@@ -3,15 +3,13 @@ from pathlib import Path
 
 from skills.loader import load_skill_content
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-
-
 def _find_skill_md() -> Path | None:
-    base = REPO_ROOT / "data" / "skills"
-    if not base.is_dir():
-        return None
-    for md in base.rglob("healthsim-trialsim/SKILL.md"):
-        return md
+    for parent in Path(__file__).resolve().parents:
+        base = parent / "data" / "skills"
+        if not base.is_dir():
+            continue
+        for md in base.rglob("healthsim-trialsim/SKILL.md"):
+            return md
     return None
 
 
