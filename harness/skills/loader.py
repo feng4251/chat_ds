@@ -156,6 +156,7 @@ def load_skill_content(
     # Discover linked files and workflow resources
     linked_files = _discover_linked_files(skill_dir_path)
     resource_graph = _discover_resource_graph(skill_dir_path, linked_files)
+    workflow_contract = _discover_workflow_contract(skill_dir_path, linked_files, content)
 
     result: Dict[str, Any] = {
         "name": name,
@@ -165,6 +166,7 @@ def load_skill_content(
         "related_skills": related_skills,
         "linked_files": linked_files if linked_files else None,
         "resource_graph": resource_graph if resource_graph else None,
+        "workflow_contract": workflow_contract if workflow_contract else None,
         "frontmatter": frontmatter,
     }
 
@@ -340,3 +342,175 @@ def _discover_resource_graph(
             "skill_view(name, file_path=...) before drafting the final artifact."
         ),
     }
+
+
+def _discover_workflow_contract(
+    skill_dir: Path,
+    linked_files: dict[str, list[str]],
+    skill_body: str,
+) -> dict[str, Any]:
+    files = _flatten_linked_files(linked_files)
+    workflow_files = [
+        path for path in files
+        if path.startswith(("orchestration/", "workflows/", "workers/", "protocols/"))
+    ]
+    worker_files = [
+        path for path in files
+        if "/workers/" in path or path.startswith("workers/") or _basename(path).startswith("worker-")
+    ]
+    format_files = [path for path in files if path.startswith("formats/") or "/formats/" in path]
+    script_files = [path for path in files if path.startswith("scripts/") or path.endswith(".py") or path.endswith(".sh")]
+
+    artifact_patterns: list[str] = []
+    merge_requirements: list[str] = []
+    sanity_checks: list[str] = []
+    declared_external_sources: list[str] = []
+    scanned_files = _dedupe(files[:80])
+    scanned_files.insert(0, "SKILL.md")
+    scanned_files = _dedupe(scanned_files)
+    for rel_path in scanned_files:
+        text = skill_body if rel_path == "SKILL.md" else _read_text_resource(skill_dir / rel_path)
+        if not text:
+            continue
+        artifact_patterns.extend(_extract_artifact_patterns(text))
+        merge_requirements.extend(_extract_merge_requirements(text))
+        sanity_checks.extend(_extract_sanity_checks(text))
+        declared_external_sources.extend(_extract_external_sources(text))
+
+    workers = [
+        {
+            "id": _worker_id_from_path(path),
+            "file": path,
+            "role_hint": _worker_role_hint(skill_dir / path),
+        }
+        for path in worker_files
+    ]
+    contract: dict[str, Any] = {
+        "workflow_files": _dedupe(workflow_files)[:80],
+        "orchestrator_files": [path for path in workflow_files if "orchestrator" in _basename(path).lower()][:20],
+        "worker_files": _dedupe(worker_files)[:80],
+        "workers": workers[:80],
+        "format_files": _dedupe(format_files)[:40],
+        "script_candidates": _dedupe(script_files)[:40],
+        "artifact_patterns": _dedupe(artifact_patterns)[:80],
+        "merge_requirements": _dedupe(merge_requirements)[:40],
+        "sanity_checks": _dedupe(sanity_checks)[:60],
+        "declared_external_sources": _dedupe(declared_external_sources)[:40],
+        "requires_worker_outputs": bool(worker_files),
+        "requires_modular_artifacts": bool(artifact_patterns),
+        "requires_merge": bool(merge_requirements),
+        "recommended_execution": [
+            "Load __manifest__, then inspect orchestrator/workflow files first.",
+            "Inspect each declared worker file and collect evidence for every worker before final synthesis.",
+            "Generate the declared modular artifacts/checklist in the session workspace when artifact patterns are specified.",
+            "Use run_skill_python for skill-provided Python entrypoints; use execute_code only for small ad-hoc calculations.",
+            "Run the declared merge/sanity steps and verify the final artifact before stopping.",
+        ],
+    }
+    return {key: value for key, value in contract.items() if value not in ([], {}, None, False)}
+
+
+def _flatten_linked_files(linked_files: dict[str, list[str]]) -> list[str]:
+    result: list[str] = []
+    for files in linked_files.values():
+        result.extend(str(path) for path in files if isinstance(path, str))
+    return _dedupe(result)
+
+
+def _read_text_resource(path: Path, limit: int = 120_000) -> str:
+    try:
+        if path.is_symlink() or not path.is_file() or path.suffix.lower() not in _TEXT_RESOURCE_SUFFIXES:
+            return ""
+        return path.read_text(encoding="utf-8", errors="replace")[:limit]
+    except OSError:
+        return ""
+
+
+def _basename(path: str) -> str:
+    return str(path).rsplit("/", 1)[-1]
+
+
+def _worker_id_from_path(path: str) -> str:
+    name = _basename(path)
+    stem = name.rsplit(".", 1)[0]
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", stem).strip("-") or stem
+
+
+def _worker_role_hint(path: Path) -> str:
+    text = _read_text_resource(path, limit=8_000)
+    if not text:
+        return ""
+    for line in text.splitlines():
+        stripped = line.strip().strip("#")
+        if not stripped or len(stripped) > 180:
+            continue
+        lowered = stripped.lower()
+        if any(key in lowered for key in ("role", "worker", "agent", "objective", "mission", "task")):
+            return stripped[:180]
+    return ""
+
+
+def _extract_artifact_patterns(text: str) -> list[str]:
+    patterns: list[str] = []
+    for match in re.finditer(r"(?:`|\b)([A-Za-z0-9_{}*?.-]+\.(?:md|json|csv|tsv|txt|yaml|yml))(?:`|\b)", text):
+        token = match.group(1)
+        if any(marker in token.lower() for marker in ("readme.md", "checklist", "report", "full", "output", "result")) or "*" in token or "{" in token:
+            patterns.append(token)
+    for match in re.finditer(r"\b(\d{2}_[A-Za-z0-9_*?.-]+\.md)\b", text):
+        patterns.append(match.group(1))
+    file_count = re.search(r"(\d+)\s+(?:content\s+)?files?", text, re.IGNORECASE)
+    if file_count:
+        patterns.append(f"declared_file_count:{file_count.group(1)}")
+    return patterns
+
+
+def _extract_merge_requirements(text: str) -> list[str]:
+    requirements: list[str] = []
+    lowered = text.lower()
+    if "auto-merge" in lowered or "auto merge" in lowered or "full_report" in lowered or "full report" in lowered:
+        requirements.append("auto_merge_full_report")
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lowered_line = stripped.lower()
+        if ("cat " in lowered_line and ">" in lowered_line) or "merge" in lowered_line and "report" in lowered_line:
+            requirements.append(stripped[:240])
+    return requirements
+
+
+def _extract_sanity_checks(text: str) -> list[str]:
+    checks: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip().strip("-* ")
+        lowered = stripped.lower()
+        if not stripped or len(stripped) > 240:
+            continue
+        if any(key in lowered for key in ("sanity", "checklist", "file size", "line count", "must", "required", "> 100", ">100", "verify")):
+            checks.append(stripped)
+    return checks[:80]
+
+
+def _extract_external_sources(text: str) -> list[str]:
+    sources = []
+    known = (
+        "PubMed", "ClinicalTrials", "ClinicalTrials.gov", "FDA", "EMA", "WHO",
+        "UniProt", "NCBI", "Gene", "MeSH", "DrugBank", "ChEMBL", "OpenAlex",
+        "Crossref", "Semantic Scholar", "Europe PMC", "SEC", "USPTO",
+    )
+    for source in known:
+        if re.search(rf"\b{re.escape(source)}\b", text, re.IGNORECASE):
+            sources.append(source)
+    return sources
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        normalized = str(value).strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result

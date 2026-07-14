@@ -270,11 +270,13 @@ class HarnessRunState:
     skill_available_categories: dict[str, set[str]] = field(default_factory=dict)
     skill_suggested_files: dict[str, list[str]] = field(default_factory=dict)
     skill_category_files: dict[str, dict[str, list[str]]] = field(default_factory=dict)
+    skill_workflow_contracts: dict[str, dict[str, Any]] = field(default_factory=dict)
     session_skill_names: set[str] = field(default_factory=set)
     successful_search_count: int = 0
     successful_extract_count: int = 0
     successful_code_execution_count: int = 0
     successful_skill_python_count: int = 0
+    successful_mcp_tool_count: int = 0
     continuation_reasons: list[str] = field(default_factory=list)
     last_tool_error_at: int = 0
     last_successful_artifact_at: int = 0
@@ -326,6 +328,9 @@ class HarnessRunState:
                     clean_suggested = [str(path) for path in suggested if isinstance(path, str)]
                     if clean_suggested:
                         self.skill_suggested_files[skill_name] = clean_suggested
+            contract = result_data.get("workflow_contract")
+            if isinstance(contract, dict) and contract:
+                self.skill_workflow_contracts[skill_name] = contract
 
     def unviewed_session_skills(self) -> set[str]:
         return self.session_skill_names - self.viewed_skill_names
@@ -361,6 +366,34 @@ class HarnessRunState:
             available_supporting = available_categories & _SUPPORTING_WORKFLOW_CATEGORIES
             if available_supporting and not (categories & available_supporting):
                 return True, f"inspect supporting resources for session skill '{skill_name}'"
+
+            contract = self.skill_workflow_contracts.get(skill_name) or {}
+            contract_required = _contract_required_files(contract)
+            missing_contract = [path for path in contract_required if path not in files]
+            if missing_contract:
+                return True, (
+                    f"inspect workflow contract resources for session skill '{skill_name}' "
+                    f"(missing {len(missing_contract)} of {len(contract_required)} contract files)"
+                )
+
+            if contract.get("requires_worker_outputs"):
+                worker_files = [str(path) for path in contract.get("worker_files") or []]
+                missing_workers = [path for path in worker_files if path not in files]
+                if missing_workers:
+                    return True, (
+                        f"inspect all declared worker resources for session skill '{skill_name}' "
+                        f"(missing {len(missing_workers)} worker files)"
+                    )
+                if _successful_evidence_tool_count(self) < max(1, min(3, len(worker_files))):
+                    return True, (
+                        f"collect worker evidence for session skill '{skill_name}' before final synthesis"
+                    )
+
+            if contract.get("requires_modular_artifacts") and not _has_modular_artifacts_for_contract(self, contract):
+                return True, f"generate declared modular/checklist artifacts for session skill '{skill_name}'"
+
+            if contract.get("requires_merge") and not _has_merged_artifact_for_contract(self, contract):
+                return True, f"create the declared merged final report artifact for session skill '{skill_name}'"
         return False, ""
 
 
@@ -401,12 +434,114 @@ def _dedupe_paths(paths: list[str]) -> list[str]:
     return result
 
 
+def _contract_required_files(contract: dict[str, Any]) -> list[str]:
+    paths: list[str] = []
+    for key in ("orchestrator_files", "worker_files", "format_files"):
+        value = contract.get(key)
+        if isinstance(value, list):
+            paths.extend(str(path) for path in value if isinstance(path, str))
+    workflow_files = contract.get("workflow_files")
+    if isinstance(workflow_files, list):
+        paths.extend(str(path) for path in workflow_files if isinstance(path, str) and _is_required_workflow_file(path))
+    return _dedupe_paths(paths)[:_MAX_REQUIRED_WORKFLOW_FILES]
+
+
+def _artifact_path_strings(run_state: HarnessRunState) -> list[str]:
+    paths: list[str] = []
+    for artifact in run_state.artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        path = artifact.get("path")
+        if isinstance(path, str):
+            paths.append(path)
+    return _dedupe_paths(paths)
+
+
+def _has_modular_artifacts_for_contract(run_state: HarnessRunState, contract: dict[str, Any]) -> bool:
+    paths = _artifact_path_strings(run_state)
+    if not paths:
+        return False
+    markdown_paths = [path for path in paths if path.lower().endswith(".md")]
+    if not markdown_paths:
+        return False
+    patterns = [str(item).lower() for item in (contract.get("artifact_patterns") or [])]
+    declared_count = _declared_file_count(patterns)
+    numbered_count = sum(1 for path in markdown_paths if re.search(r"(?:^|/)\d{2}_[^/]+\.md$", path))
+    has_checklist = any("checklist" in path.lower() for path in markdown_paths)
+    if declared_count and len(markdown_paths) >= min(declared_count, 8):
+        return True
+    if numbered_count >= 3:
+        return True
+    if has_checklist and len(markdown_paths) >= 2:
+        return True
+    return not patterns and bool(markdown_paths)
+
+
+def _has_merged_artifact_for_contract(run_state: HarnessRunState, contract: dict[str, Any]) -> bool:
+    paths = [path.lower() for path in _artifact_path_strings(run_state) if path.lower().endswith(".md")]
+    if not paths:
+        return False
+    if any("full_report" in path or "full-report" in path or "merged" in path for path in paths):
+        return True
+    if contract.get("requires_merge"):
+        return False
+    return bool(paths)
+
+
+def _declared_file_count(patterns: list[str]) -> int | None:
+    for pattern in patterns:
+        match = re.match(r"declared_file_count:(\d+)", pattern)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _workflow_contract_findings(run_state: HarnessRunState) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for skill_name, contract in sorted(run_state.skill_workflow_contracts.items()):
+        files = run_state.viewed_skill_files.get(skill_name, set())
+        required_files = _contract_required_files(contract)
+        missing = [path for path in required_files if path not in files]
+        if missing:
+            findings.append({
+                "severity": "blocker",
+                "category": "skill_workflow_contract",
+                "message": f"Missing {len(missing)} declared workflow resource inspections for skill {skill_name}.",
+                "missing_files": missing[:20],
+            })
+        worker_files = [str(path) for path in contract.get("worker_files") or []]
+        if worker_files and _successful_evidence_tool_count(run_state) < max(1, min(3, len(worker_files))):
+            findings.append({
+                "severity": "blocker",
+                "category": "skill_worker_evidence",
+                "message": f"Worker workflow for skill {skill_name} needs evidence/tool execution before final synthesis.",
+                "worker_count": len(worker_files),
+                "evidence_tool_count": _successful_evidence_tool_count(run_state),
+            })
+        if contract.get("requires_modular_artifacts") and not _has_modular_artifacts_for_contract(run_state, contract):
+            findings.append({
+                "severity": "blocker",
+                "category": "skill_artifacts",
+                "message": f"Skill {skill_name} declares modular/checklist artifacts that are not present in workspace artifacts.",
+                "artifact_patterns": (contract.get("artifact_patterns") or [])[:20],
+            })
+        if contract.get("requires_merge") and not _has_merged_artifact_for_contract(run_state, contract):
+            findings.append({
+                "severity": "blocker",
+                "category": "skill_merge",
+                "message": f"Skill {skill_name} declares a merged final report but no merged/full report artifact is present.",
+                "merge_requirements": (contract.get("merge_requirements") or [])[:10],
+            })
+    return findings
+
+
 def _successful_evidence_tool_count(run_state: HarnessRunState) -> int:
     return (
         run_state.successful_search_count
         + run_state.successful_extract_count
         + run_state.successful_code_execution_count
         + run_state.successful_skill_python_count
+        + run_state.successful_mcp_tool_count
     )
 
 
@@ -662,6 +797,20 @@ async def run_stream(
             "skill_view(name, file_path=that_path). You may issue multiple independent skill_view "
             "calls in the same assistant turn to cover the missing workflow files. "
         )
+        if "collect worker evidence" in reason:
+            next_action = (
+                "Your next steps MUST execute the declared worker workflow: use the skill's declared MCP/database/search/script resources, "
+                "collect source evidence for each worker, and preserve worker outputs as workspace artifacts before final synthesis. "
+            )
+        elif "modular" in reason or "checklist" in reason:
+            next_action = (
+                "Your next steps MUST write the declared modular artifact/checklist files into the current session workspace. "
+                "Do not stop with a single condensed report when the skill contract declares multiple artifacts. "
+            )
+        elif "merged final report" in reason or "merged" in reason:
+            next_action = (
+                "Your next steps MUST create the declared merged/full report artifact from the modular files and verify its sanity checks. "
+            )
         conversation.append({
             "role": "user",
             "content": (
@@ -1276,8 +1425,7 @@ async def run_stream(
             needs_artifact_gate = _needs_complex_artifact_gate(run_state, original_user_text, full_content)
             needs_workflow_gate, workflow_reason = run_state.needs_more_skill_workflow()
             if (
-                needs_artifact_gate
-                and needs_workflow_gate
+                needs_workflow_gate
                 and workflow_reason_retryable(workflow_reason)
                 and skill_workflow_continuations < max_skill_workflow_continuations
             ):
@@ -1737,6 +1885,8 @@ async def run_stream(
                         run_state.successful_code_execution_count += 1
                     elif display_tool_name == "run_skill_python":
                         run_state.successful_skill_python_count += 1
+                    elif display_tool_name.startswith("mcp_"):
+                        run_state.successful_mcp_tool_count += 1
                 artifact_payloads = _artifact_payloads_from_tool_result(display_tool_name, str(result)) if outcome == "success" else []
                 if artifact_payloads:
                     run_state.artifacts.extend(artifact_payloads)
@@ -1799,11 +1949,9 @@ async def run_stream(
                     "content": wrapped,
                 })
 
-            needs_artifact_gate_after_tools = _needs_complex_artifact_gate(run_state, original_user_text)
             needs_workflow_gate_after_tools, workflow_reason_after_tools = run_state.needs_more_skill_workflow()
             if (
-                needs_artifact_gate_after_tools
-                and needs_workflow_gate_after_tools
+                needs_workflow_gate_after_tools
                 and workflow_reason_retryable(workflow_reason_after_tools)
                 and skill_workflow_continuations < max_skill_workflow_continuations
             ):
@@ -2568,6 +2716,11 @@ def _deterministic_verifier_payload(
         findings.extend(markdown_quality_findings)
         needs_more_work = True
         verdict = "fail" if requested_artifact or complex_report else "inconclusive"
+    workflow_findings = _workflow_contract_findings(run_state)
+    if workflow_findings:
+        findings.extend(str(item.get("message") or item) for item in workflow_findings)
+        needs_more_work = True
+        verdict = "fail"
     last_validation_failure_at = max(run_state.last_schema_failure_at, run_state.last_parse_failure_at)
     if (run_state.schema_failure_count > 0 or run_state.parse_failure_count > 0) and last_validation_failure_at > run_state.last_successful_artifact_at:
         findings.append("One or more tool calls failed schema or argument parsing validation after the last successful artifact.")
