@@ -460,19 +460,28 @@ def _parse_output_format_contract(skill_dir: Path) -> dict[str, Any]:
         return {}
     contract: dict[str, Any] = {}
     modular_files: list[str] = []
+    output_format_files: list[str] = []
     for path in sorted(p for p in formats_dir.glob("*.md") if p.is_file()):
         text = _read_text_resource(path)
         if not text:
             continue
+        declares_output_packaging = False
         # Declared total file count, e.g. "= 14 total" or "File count | 11 content files ... = 14 total"
         total_match = re.search(r"=\s*(\d+)\s*total", text, re.IGNORECASE)
-        if total_match and "declared_file_count" not in contract:
-            contract["declared_file_count"] = int(total_match.group(1))
+        if total_match:
+            declares_output_packaging = True
+            if "declared_file_count" not in contract:
+                contract["declared_file_count"] = int(total_match.group(1))
         # Modular numbered output files, e.g. `01_executive_summary.md`
         for match in re.finditer(r"`?(\d{2}_[A-Za-z0-9_.-]+\.md)`?", text):
+            declares_output_packaging = True
             modular_files.append(match.group(1))
+        if declares_output_packaging:
+            output_format_files.append(str(path.relative_to(skill_dir)))
     if modular_files:
         contract["declared_modular_files"] = _dedupe(modular_files)[:40]
+    if output_format_files:
+        contract["output_format_files"] = _dedupe(output_format_files)[:20]
     return contract
 
 
@@ -535,6 +544,10 @@ def _discover_workflow_contract(
     output_contract.update(_parse_orchestrator_contract(skill_dir))
     for key, value in _parse_output_format_contract(skill_dir).items():
         output_contract.setdefault(key, value)
+    output_format_files = [
+        str(path) for path in output_contract.get("output_format_files") or []
+        if isinstance(path, str)
+    ]
 
     # requires_merge is authoritative: true ONLY when the skill declares a final
     # merged artifact / merge command (not merely because prose mentions "full report").
@@ -549,7 +562,7 @@ def _discover_workflow_contract(
         "orchestrator_files": [path for path in workflow_files if "orchestrator" in _basename(path).lower()][:20],
         "worker_files": _dedupe(worker_files)[:80],
         "workers": workers[:80],
-        "format_files": _dedupe(format_files)[:40],
+        "format_files": output_format_files[:40],
         "script_candidates": _dedupe(script_files)[:40],
         "artifact_patterns": _dedupe(artifact_patterns)[:80],
         "merge_requirements": _dedupe(merge_requirements)[:40],
