@@ -340,6 +340,12 @@ class ToolRegistry:
             normalized = dict(args)
             normalized["context_lines"] = normalized.pop("context")
             return normalized
+        if entry.name in {"read_file", "write_file", "patch_file"} and "filepath" not in args:
+            for alias in ("file_path", "path", "filename"):
+                if alias in args:
+                    normalized = dict(args)
+                    normalized["filepath"] = normalized.pop(alias)
+                    return normalized
         return args
 
     @staticmethod

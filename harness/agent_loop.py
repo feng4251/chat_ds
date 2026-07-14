@@ -410,10 +410,17 @@ class HarnessRunState:
         return False, ""
 
 
+def _is_core_output_format_file(path: str) -> bool:
+    name = str(path or "").rsplit("/", 1)[-1].lower()
+    return any(marker in name for marker in ("output", "report", "template", "format"))
+
+
 def _required_workflow_files(declared: dict[str, list[str]]) -> list[str]:
     required: list[str] = []
     for category in _WORKFLOW_FILE_CATEGORIES:
         for path in declared.get(category, []):
+            if category == "formats" and not _is_core_output_format_file(path):
+                continue
             if _is_required_workflow_file(path):
                 required.append(path)
     return _dedupe_paths(required)[:_MAX_REQUIRED_WORKFLOW_FILES]
@@ -3114,6 +3121,26 @@ def _markdown_metrics(content: str) -> dict[str, int]:
         "evidence_terms": sum(1 for term in ("evidence", "source", "appendix", "trace", "artifact", "reference", "citation", "output", "result") if term in lower),
     }
 
+def _verifier_payload(
+    *,
+    target_artifacts: list[Any],
+    verdict: str,
+    findings: list[str],
+    needs_more_work: bool,
+    blocking_findings: list[str] | None = None,
+) -> dict[str, Any]:
+    reason_candidates = blocking_findings if needs_more_work and blocking_findings else findings
+    reason = reason_candidates[0] if reason_candidates else "Artifacts referenced by successful write/patch tool results are non-empty."
+    return {
+        "verifier_kind": "artifact_integrity",
+        "target_artifacts": target_artifacts,
+        "verdict": verdict,
+        "reason": reason,
+        "findings": findings or [reason],
+        "needs_more_work": needs_more_work,
+    }
+
+
 def _deterministic_verifier_payload(
     run_state: HarnessRunState,
     *,
@@ -3124,30 +3151,40 @@ def _deterministic_verifier_payload(
     if not target_artifacts and run_state.tool_error_count == 0 and run_state.invalid_placeholder_write_count == 0 and run_state.schema_failure_count == 0 and not requested_artifact and not complex_report:
         return None
     findings: list[str] = []
+    blocking_findings: list[str] = []
     needs_more_work = False
     verdict = "pass"
     if requested_artifact and not target_artifacts:
-        findings.append("The user requested a file or durable deliverable, but no artifact was produced.")
+        message = "The user requested a file or durable deliverable, but no artifact was produced."
+        findings.append(message)
+        blocking_findings.append(message)
         needs_more_work = True
         verdict = "fail"
     if complex_report and not any(isinstance(path, str) and path.endswith(".md") for path in target_artifacts):
-        findings.append("The complex report workflow did not produce a Markdown report artifact.")
+        message = "The complex report workflow did not produce a Markdown report artifact."
+        findings.append(message)
+        blocking_findings.append(message)
         needs_more_work = True
         verdict = "fail"
     if _has_unresolved_placeholder_write(run_state):
-        findings.append("A write was rejected because it contained compacted conversation-history placeholder content after the last successful artifact update.")
+        message = "A write was rejected because it contained compacted conversation-history placeholder content after the last successful artifact update."
+        findings.append(message)
+        blocking_findings.append(message)
         needs_more_work = True
         verdict = "fail"
     elif run_state.invalid_placeholder_write_count > 0:
         findings.append("Earlier compacted-history placeholder writes were rejected before a later successful artifact update.")
     empty_artifacts = [artifact.get("path") for artifact in run_state.artifacts if int(artifact.get("size_bytes") or 0) <= 0]
     if empty_artifacts:
-        findings.append(f"Artifact is empty: {', '.join(str(path) for path in empty_artifacts)}.")
+        message = f"Artifact is empty: {', '.join(str(path) for path in empty_artifacts)}."
+        findings.append(message)
+        blocking_findings.append(message)
         needs_more_work = True
         verdict = "fail"
     markdown_findings = _markdown_artifact_findings(run_state, target_artifacts)
     if markdown_findings:
         findings.extend(markdown_findings)
+        blocking_findings.extend(markdown_findings)
         needs_more_work = True
         verdict = "fail"
     markdown_quality_findings = _markdown_quality_findings(
@@ -3157,37 +3194,43 @@ def _deterministic_verifier_payload(
     )
     if markdown_quality_findings:
         findings.extend(markdown_quality_findings)
+        blocking_findings.extend(markdown_quality_findings)
         needs_more_work = True
         verdict = "fail" if requested_artifact or complex_report else "inconclusive"
     workflow_findings = _workflow_contract_findings(run_state)
     if workflow_findings:
-        findings.extend(str(item.get("message") or item) for item in workflow_findings)
+        workflow_messages = [str(item.get("message") or item) for item in workflow_findings]
+        findings.extend(workflow_messages)
+        blocking_findings.extend(workflow_messages)
         needs_more_work = True
         verdict = "fail"
     last_validation_failure_at = max(run_state.last_schema_failure_at, run_state.last_parse_failure_at)
     if (run_state.schema_failure_count > 0 or run_state.parse_failure_count > 0) and last_validation_failure_at > run_state.last_successful_artifact_at:
-        findings.append("One or more tool calls failed schema or argument parsing validation after the last successful artifact.")
+        message = "One or more tool calls failed schema or argument parsing validation after the last successful artifact."
+        findings.append(message)
+        blocking_findings.append(message)
         needs_more_work = True
         verdict = "fail"
     elif run_state.schema_failure_count > 0 or run_state.parse_failure_count > 0:
         findings.append("Earlier schema or argument parsing failures were followed by a successful artifact write/patch.")
     if run_state.tool_error_count > 0 and not findings:
         if run_state.last_tool_error_at > run_state.last_successful_artifact_at:
-            findings.append("One or more tool calls failed during a requested artifact workflow and must be resolved before completion.")
+            message = "One or more tool calls failed during a requested artifact workflow and must be resolved before completion."
+            findings.append(message)
+            blocking_findings.append(message)
             needs_more_work = True
             verdict = "fail" if requested_artifact or complex_report else "inconclusive"
         else:
             findings.append("Earlier tool failures were followed by a successful artifact write/patch.")
     if not findings:
         findings.append("Artifacts referenced by successful write/patch tool results are non-empty.")
-    return {
-        "verifier_kind": "artifact_integrity",
-        "target_artifacts": target_artifacts,
-        "verdict": verdict,
-        "reason": findings[0],
-        "findings": findings,
-        "needs_more_work": needs_more_work,
-    }
+    return _verifier_payload(
+        target_artifacts=target_artifacts,
+        verdict=verdict,
+        findings=findings,
+        needs_more_work=needs_more_work,
+        blocking_findings=blocking_findings,
+    )
 
 
 def _json_object(raw: str) -> dict[str, Any] | None:
