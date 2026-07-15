@@ -21,6 +21,7 @@ MAX_CODE_BYTES = 900_000
 MAX_SNAPSHOT_FILES = 120
 MAX_SNAPSHOT_FILE_BYTES = 200_000
 MAX_SNAPSHOT_TOTAL_BYTES = 650_000
+MAX_CODE_WITH_SNAPSHOT_BYTES = 500_000
 SNAPSHOT_EXTENSIONS = {
     ".py", ".json", ".csv", ".tsv", ".txt", ".md", ".yaml", ".yml",
 }
@@ -179,6 +180,14 @@ def _code_with_session_snapshot(code: str, user_id: str, session_id: str) -> str
     if not files:
         return code
     rewritten = _rewrite_session_absolute_paths(code, user_id, session_id)
+    total_file_bytes = sum(len(str(item.get("content", "")).encode("utf-8", errors="replace")) for item in files)
+    estimated_payload_bytes = len(rewritten.encode("utf-8", errors="replace")) + total_file_bytes
+    if estimated_payload_bytes > MAX_CODE_WITH_SNAPSHOT_BYTES:
+        return (
+            "# ChatDS skipped automatic session snapshot injection because the workspace/skill snapshot is too large.\n"
+            "# Read needed files explicitly from stable relative paths under workspace/ or skills/.\n"
+            + rewritten
+        )
     prelude = (
         "import json as __chatds_json, pathlib as __chatds_pathlib\n"
         f"__chatds_files = __chatds_json.loads({json.dumps(json.dumps(files, ensure_ascii=False))})\n"
@@ -293,7 +302,9 @@ EXECUTE_CODE_SCHEMA = {
         "imports/calls network libraries such as requests/httpx/urllib/aiohttp/socket, or writes files, "
         "execute_code automatically runs that single call in the managed session Python runtime instead; "
         "pure read-only calculations still use the offline executor. Inline pip install is never allowed; declared skill dependencies are "
-        "installed by the managed runtime. Use stable relative paths under skills/... and workspace/...; "
+        "installed by the managed runtime. Do not use execute_code to carry long Markdown/report bodies; "
+        "write large artifacts with write_file/patch_file or run a real workspace/skill script with run_skill_python. "
+        "Use stable relative paths under skills/... and workspace/...; "
         "do not access other sessions or reuse /tmp/exec_* paths from prior calls. "
         f"Default timeout is {DEFAULT_TIMEOUT}s; maximum is {MAX_TIMEOUT}s."
     ),
