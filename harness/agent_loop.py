@@ -506,6 +506,18 @@ def _artifact_path_strings(run_state: HarnessRunState) -> list[str]:
     return _dedupe_paths(paths)
 
 
+def _artifact_latest_payloads(run_state: HarnessRunState) -> list[dict[str, Any]]:
+    latest: dict[str, dict[str, Any]] = {}
+    for artifact in run_state.artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        path = _safe_workspace_artifact_path(artifact.get("path"))
+        if not path:
+            continue
+        latest[path] = artifact
+    return list(latest.values())
+
+
 def _has_modular_artifacts_for_contract(run_state: HarnessRunState, contract: dict[str, Any]) -> bool:
     paths = _artifact_path_strings(run_state)
     if not paths:
@@ -3182,7 +3194,22 @@ def _deterministic_verifier_payload(
         verdict = "fail"
     elif run_state.invalid_placeholder_write_count > 0:
         findings.append("Earlier compacted-history placeholder writes were rejected before a later successful artifact update.")
-    empty_artifacts = [artifact.get("path") for artifact in run_state.artifacts if int(artifact.get("size_bytes") or 0) <= 0]
+    workspace = get_workspace(run_state.user_id, run_state.session_id)
+    empty_artifacts: list[str] = []
+    for artifact in _artifact_latest_payloads(run_state):
+        rel_path = artifact.get("path")
+        if not isinstance(rel_path, str):
+            continue
+        try:
+            path = (workspace / rel_path).resolve()
+            path.relative_to(workspace)
+        except (OSError, ValueError):
+            continue
+        try:
+            if not path.is_file() or path.stat().st_size <= 0:
+                empty_artifacts.append(rel_path)
+        except OSError:
+            empty_artifacts.append(rel_path)
     if empty_artifacts:
         message = f"Artifact is empty: {', '.join(str(path) for path in empty_artifacts)}."
         findings.append(message)
