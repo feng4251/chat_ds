@@ -155,9 +155,19 @@ def _compact_tool_argument_value(value: Any, *, tool_name: str, key: str = "", f
             and len(value) > 500
         )
         if omit_written_content:
-            return "__CHATDS_OMITTED_TOOL_CONTENT_REGENERATE_OR_READ_SOURCE__"
+            return {
+                "_chatds_argument_omitted": True,
+                "kind": "large_file_content",
+                "chars": len(value),
+                "instruction": "Do not reuse this summary as tool input; regenerate literal content or read the source/workspace file.",
+            }
         if len(value) > _LARGE_TOOL_ARGUMENT_STRING_CAP:
-            return f"__CHATDS_OMITTED_TOOL_ARGUMENT_{len(value)}_CHARS__"
+            return {
+                "_chatds_argument_omitted": True,
+                "kind": "large_argument",
+                "chars": len(value),
+                "instruction": "Do not reuse this summary as tool input; regenerate or read the source/workspace file.",
+            }
         return value
     if isinstance(value, list):
         return [
@@ -181,7 +191,9 @@ def _compact_tool_call_arguments(tool_name: str, arguments: str) -> str:
         if len(arguments or "") <= _LARGE_TOOL_ARGUMENT_STRING_CAP:
             return arguments or "{}"
         return json.dumps({
-            "_arguments_omitted": f"__CHATDS_OMITTED_TOOL_ARGUMENT_{len(arguments or '')}_CHARS__",
+            "_chatds_arguments_omitted": True,
+            "chars": len(arguments or ""),
+            "instruction": "Do not reuse this summary as tool input; regenerate valid JSON arguments from source context.",
         })
     compacted = _compact_tool_argument_value(args, tool_name=tool_name)
     return json.dumps(compacted, ensure_ascii=False)
@@ -581,20 +593,27 @@ def _workflow_contract_findings(run_state: HarnessRunState) -> list[dict[str, An
     findings: list[dict[str, Any]] = []
     for skill_name, contract in sorted(run_state.skill_workflow_contracts.items()):
         files = run_state.viewed_skill_files.get(skill_name, set())
+        worker_files = [str(path) for path in contract.get("worker_files") or []]
+        outputs_ready = (
+            _has_modular_artifacts_for_contract(run_state, contract)
+            and (not contract.get("requires_merge") or _has_merged_artifact_for_contract(run_state, contract))
+        )
         required_files = _contract_required_files(contract)
         missing = _unviewed_required(required_files, files)
-        if missing:
+        if missing and not outputs_ready:
             findings.append({
                 "severity": "blocker",
                 "category": "skill_workflow_contract",
                 "message": f"Missing {len(missing)} declared workflow resource inspections for skill {skill_name}.",
                 "missing_files": missing[:20],
             })
-        worker_files = [str(path) for path in contract.get("worker_files") or []]
-        outputs_ready = (
-            _has_modular_artifacts_for_contract(run_state, contract)
-            and (not contract.get("requires_merge") or _has_merged_artifact_for_contract(run_state, contract))
-        )
+        elif missing:
+            findings.append({
+                "severity": "warning",
+                "category": "skill_workflow_contract",
+                "message": f"{len(missing)} declared workflow resource inspections were not directly observed before outputs satisfied the skill artifact contract.",
+                "missing_files": missing[:20],
+            })
         if worker_files and not outputs_ready and _successful_evidence_tool_count(run_state) < max(1, min(3, len(worker_files))):
             findings.append({
                 "severity": "blocker",
@@ -1578,7 +1597,9 @@ async def run_stream(
                         "content": full_content or "(No visible response.)",
                     })
                     continuation_reason = (
-                        "A file write was rejected because it contained a compacted conversation-history placeholder. "
+                        "A file write/code call was rejected because it contained compacted-history placeholder text. "
+                        "Do not retry by copying prior assistant/tool-call arguments. First read the current workspace file, "
+                        "skill resource, or worker output that should be the source of truth, then regenerate literal content. "
                         if invalid_placeholder_write else ""
                     )
                     conversation.append({
@@ -1589,7 +1610,8 @@ async def run_stream(
                             "Continue to complete the artifact using the loaded skill workflow and any "
                             "relevant linked files. If tool calls failed validation, retry with valid schema "
                             "arguments and real generated content. Produce one coherent final artifact with the "
-                            "required major sections; do not stop at a short summary, placeholder, or incomplete file."
+                            "required major sections; do not stop at a short summary, placeholder, or incomplete file. "
+                            "For large Markdown artifacts, do not embed the whole report body in execute_code."
                         ),
                     })
                     yield {
@@ -1776,9 +1798,11 @@ async def run_stream(
                         "Do not finish yet. Read the JSON tool results already in context, fix the concrete cause, "
                         "and retry with the appropriate tool. If execute_code was rerouted to managed runtime, inspect "
                         "stdout/stderr and continue from that result. If run_skill_python failed, fix the script path, "
-                        "cwd, imports, args, or output location. If write_file failed, regenerate real content rather "
-                        "than copying any omitted-history marker. Only stop when the failed step is resolved or you can "
-                        "state a concrete external blocker."
+                        "cwd, imports, args, or output location. If write_file or execute_code failed because of "
+                        "omitted-history/placeholder content, do not copy prior tool arguments; read the source "
+                        "workspace/skill file or regenerate from worker evidence first. Use execute_code only for "
+                        "small executable calculations, not long Markdown bodies. Only stop when the failed step is "
+                        "resolved or you can state a concrete external blocker."
                     ),
                 })
                 yield {
@@ -3052,6 +3076,14 @@ def _contract_report_findings(
             "worker outputs and re-run the skill's declared merge instead of condensing content."
         )
 
+    duplicated_numbers = _duplicate_markdown_heading_numbers(content)
+    if duplicated_numbers:
+        findings.append(
+            "Final report contains duplicate numbered section headings "
+            f"({', '.join(duplicated_numbers[:12])}). Rebuild the declared modular files from the "
+            "skill workflow and re-run the declared merge instead of appending overlapping expansions."
+        )
+
     file_count = output_contract.get("declared_file_count")
     if isinstance(file_count, int) and file_count > 0:
         present_md = len({p.lower() for p in _artifact_path_strings(run_state) if p.lower().endswith(".md")})
@@ -3061,6 +3093,20 @@ def _contract_report_findings(
                 "Produce every declared modular file, the README/checklist, and the merged final report."
             )
     return findings
+
+
+def _duplicate_markdown_heading_numbers(content: str) -> list[str]:
+    counts: dict[str, int] = {}
+    for line in content.splitlines():
+        if not line.startswith(("## ", "### ")):
+            continue
+        title = line.lstrip("#").strip()
+        match = re.match(r"((?:\d+\.)+\d+)", title)
+        if not match:
+            continue
+        number = match.group(1)
+        counts[number] = counts.get(number, 0) + 1
+    return [number for number, count in sorted(counts.items()) if count > 1]
 
 
 def _legacy_density_findings(
