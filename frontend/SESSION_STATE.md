@@ -1,5 +1,7 @@
 # Claude Code 会话状态快照
 
+> **历史文档（2026-07-03）**：当前项目状态请以仓库根目录 `SESSION_HANDOFF.md` 为准。本文中的旧部署步骤只供追溯。
+
 **保存时间**: 2026-07-03
 **会话主题**: chat_ds 系统三个 Issue 修复（A/B/C）
 **当前工作目录**: `/nfs/yangbb/codes/chat_ds/frontend`
@@ -10,8 +12,8 @@
 
 ### 远程服务器
 - **地址**: `root@10.10.130.178`
-- **密码**: `Lzy@665599T`
-- **登录方式**: `sshpass -p 'Lzy@665599T' ssh -o StrictHostKeyChecking=no root@10.10.130.178 "..."`
+- **凭据**: 只从仓库根目录 `.local_secrets/remote_10.10.130.178.env` 读取，不写入 Markdown
+- **登录方式**: source 上述受限权限文件后，使用 `sshpass -e ssh "$CHATDS_REMOTE_USER@$CHATDS_REMOTE_HOST" "..."`
 
 ### Docker 容器（chat_ds 三容器架构）
 - `chat_acits_frontend` — nginx:5173，部署在 `/usr/share/nginx/html/`
@@ -35,8 +37,8 @@ docker run --rm --network=host --dns 223.5.5.5 \
   sh -c "rm -rf /app/dist && npm run build"
 
 # 部署前端
-sshpass -p 'Lzy@665599T' scp -o StrictHostKeyChecking=no -r /tmp/fe_new/dist root@10.10.130.178:/tmp/fe_deploy2
-sshpass -p 'Lzy@665599T' ssh -o StrictHostKeyChecking=no root@10.10.130.178 \
+sshpass -e scp -o StrictHostKeyChecking=no -r /tmp/fe_new/dist "$CHATDS_REMOTE_USER@$CHATDS_REMOTE_HOST:/tmp/fe_deploy2"
+sshpass -e ssh -o StrictHostKeyChecking=no "$CHATDS_REMOTE_USER@$CHATDS_REMOTE_HOST" \
   "docker cp /tmp/fe_deploy2/. chat_acits_frontend:/usr/share/nginx/html/ && docker exec chat_acits_frontend nginx -s reload"
 ```
 
@@ -55,8 +57,8 @@ sshpass -p 'Lzy@665599T' ssh -o StrictHostKeyChecking=no root@10.10.130.178 \
 
 **部署命令**:
 ```bash
-sshpass -p 'Lzy@665599T' scp -o StrictHostKeyChecking=no /tmp/mgr_new.py root@10.10.130.178:/tmp/mgr_new.py
-sshpass -p 'Lzy@665599T' ssh -o StrictHostKeyChecking=no root@10.10.130.178 \
+sshpass -e scp -o StrictHostKeyChecking=no /tmp/mgr_new.py "$CHATDS_REMOTE_USER@$CHATDS_REMOTE_HOST:/tmp/mgr_new.py"
+sshpass -e ssh -o StrictHostKeyChecking=no "$CHATDS_REMOTE_USER@$CHATDS_REMOTE_HOST" \
   "docker cp /tmp/mgr_new.py chat_acits_harness:/app/skills/manager.py && docker restart chat_acits_harness"
 ```
 
@@ -189,19 +191,19 @@ sshpass -p 'Lzy@665599T' ssh -o StrictHostKeyChecking=no root@10.10.130.178 \
 ### 验证命令
 ```bash
 # 查看 harness 健康状态
-sshpass -p 'Lzy@665599T' ssh -o StrictHostKeyChecking=no root@10.10.130.178 \
+sshpass -e ssh -o StrictHostKeyChecking=no "$CHATDS_REMOTE_USER@$CHATDS_REMOTE_HOST" \
   "docker exec chat_acits_harness python -c \"import urllib.request; print(urllib.request.urlopen('http://localhost:8020/health').read().decode())\""
 
 # 查看 harness 日志（最近 10 分钟）
-sshpass -p 'Lzy@665599T' ssh -o StrictHostKeyChecking=no root@10.10.130.178 \
+sshpass -e ssh -o StrictHostKeyChecking=no "$CHATDS_REMOTE_USER@$CHATDS_REMOTE_HOST" \
   "docker logs chat_acits_harness --since 10m 2>&1 | tail -30"
 
 # 检查 manager.py 部署状态
-sshpass -p 'Lzy@665599T' ssh -o StrictHostKeyChecking=no root@10.10.130.178 \
+sshpass -e ssh -o StrictHostKeyChecking=no "$CHATDS_REMOTE_USER@$CHATDS_REMOTE_HOST" \
   "docker exec chat_acits_harness grep -c 'enabled_user_skills' /app/skills/manager.py"
 
 # 检查前端部署状态
-sshpass -p 'Lzy@665599T' ssh -o StrictHostKeyChecking=no root@10.10.130.178 \
+sshpass -e ssh -o StrictHostKeyChecking=no "$CHATDS_REMOTE_USER@$CHATDS_REMOTE_HOST" \
   "docker exec chat_acits_frontend cat /usr/share/nginx/html/index.html | grep -o 'index-[^\"]*\\.js'"
 ```
 
@@ -219,20 +221,20 @@ sshpass -p 'Lzy@665599T' ssh -o StrictHostKeyChecking=no root@10.10.130.178 \
 
 1. **检查 Docker 容器状态**:
    ```bash
-   sshpass -p 'Lzy@665599T' ssh -o StrictHostKeyChecking=no root@10.10.130.178 \
+   sshpass -e ssh -o StrictHostKeyChecking=no "$CHATDS_REMOTE_USER@$CHATDS_REMOTE_HOST" \
      "docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'"
    ```
 
 2. **验证 Issue C 修复已部署**:
    ```bash
-   sshpass -p 'Lzy@665599T' ssh -o StrictHostKeyChecking=no root@10.10.130.178 \
+   sshpass -e ssh -o StrictHostKeyChecking=no "$CHATDS_REMOTE_USER@$CHATDS_REMOTE_HOST" \
      "docker exec chat_acits_harness python -c \"from skills.manager import get_manager; import inspect; print(inspect.signature(get_manager().get_system_prompt_block))\""
    ```
    预期输出包含 `enabled_user_skills: 'list[str] | None' = None`
 
 3. **验证 Issue A/B 前端修复已部署**:
    ```bash
-   sshpass -p 'Lzy@665599T' ssh -o StrictHostKeyChecking=no root@10.10.130.178 \
+   sshpass -e ssh -o StrictHostKeyChecking=no "$CHATDS_REMOTE_USER@$CHATDS_REMOTE_HOST" \
      "docker exec chat_acits_frontend cat /usr/share/nginx/html/index.html | grep -o 'index-[^\"]*\\.js'"
    ```
    预期输出: `index-CO52qeA4.js`（或更新版本）
