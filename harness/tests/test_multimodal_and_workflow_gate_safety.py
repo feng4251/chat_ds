@@ -1801,6 +1801,43 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
             ),
         )
 
+    def test_single_explicit_ingress_skill_survives_generic_use_skill_wording(self):
+        packages = {
+            "visual-browser-operator": {
+                "description": (
+                    "Inspect rendered interfaces with ordinary browser actions."
+                ),
+                "workflow_contract": None,
+            },
+        }
+        request = (
+            "http://172.30.100.145:5173/chat/example "
+            "使用skill访问这个网站，说明这个网站的内容"
+        )
+        # Without an ingress receipt, unrelated generic wording remains
+        # fail-closed rather than guessing from a sole catalog entry.
+        self.assertEqual(
+            (),
+            _deterministic_complex_skill_selection(
+                request,
+                set(packages),
+                "visual-browser-operator",
+                packages,
+            ),
+        )
+        # The exact single selection already compiled from the user's action
+        # clause may advance to digest binding and typed capability planning.
+        self.assertEqual(
+            ("visual-browser-operator",),
+            _deterministic_complex_skill_selection(
+                request,
+                set(packages),
+                "visual-browser-operator",
+                packages,
+                explicit_selected_skill_names=("visual-browser-operator",),
+            ),
+        )
+
     def test_session_skill_description_selector_is_cross_domain_and_fail_closed(self):
         catalog = {
             "launch-readiness": {

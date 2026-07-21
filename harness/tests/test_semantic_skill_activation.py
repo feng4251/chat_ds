@@ -285,7 +285,7 @@ class SemanticSkillActivationTests(unittest.IsolatedAsyncioTestCase):
                 "response_choices_invalid",
             ),
             (
-                {"choices": [{**valid_choice, "finish_reason": "stop"}]},
+                {"choices": [{**valid_choice, "finish_reason": "length"}]},
                 "typed_finish_reason_invalid",
             ),
             (
@@ -299,6 +299,79 @@ class SemanticSkillActivationTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(expected=expected):
                 decision, error = _semantic_skill_selector_arguments(
                     payload,
+                    {"one"},
+                )
+                self.assertIsNone(decision)
+                self.assertEqual(expected, error)
+
+    def test_nonstream_selector_accepts_stop_with_one_schema_valid_forced_call(self):
+        payload = {
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "function": {
+                            "name": "select_session_skill",
+                            "arguments": json.dumps({
+                                "decision": "candidate",
+                                "candidate_names": ["one"],
+                                "reason": "one exact metadata match",
+                            }),
+                        },
+                    }],
+                },
+                "finish_reason": "stop",
+            }],
+        }
+
+        decision, error = _semantic_skill_selector_arguments(payload, {"one"})
+
+        self.assertEqual("", error)
+        self.assertEqual(("one",), decision["candidate_names"])
+
+    def test_nonstream_selector_stop_does_not_weaken_call_validation(self):
+        valid_arguments = json.dumps({
+            "decision": "candidate",
+            "candidate_names": ["one"],
+            "reason": "one exact metadata match",
+        })
+        call = {
+            "function": {
+                "name": "select_session_skill",
+                "arguments": valid_arguments,
+            },
+        }
+        cases = (
+            ({"message": {"tool_calls": []}, "finish_reason": "stop"},
+             "typed_call_missing_or_multiple"),
+            ({"message": {"tool_calls": [call, call]}, "finish_reason": "stop"},
+             "typed_call_missing_or_multiple"),
+            ({
+                "message": {"tool_calls": [{
+                    "function": {
+                        "name": "select_session_skill",
+                        "arguments": "{not-json",
+                    },
+                }]},
+                "finish_reason": "stop",
+            }, "typed_arguments_malformed_json"),
+            ({
+                "message": {"tool_calls": [{
+                    "function": {
+                        "name": "select_session_skill",
+                        "arguments": json.dumps({
+                            "decision": "candidate",
+                            "candidate_names": ["two"],
+                            "reason": "attempt outside the disclosed page",
+                        }),
+                    },
+                }]},
+                "finish_reason": "stop",
+            }, "typed_candidate_outside_page"),
+        )
+        for choice, expected in cases:
+            with self.subTest(expected=expected):
+                decision, error = _semantic_skill_selector_arguments(
+                    {"choices": [choice]},
                     {"one"},
                 )
                 self.assertIsNone(decision)

@@ -209,8 +209,23 @@ class MCPSessionRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     set(mcp_client._load_config("user", "session")["servers"]),
                     {"shared", "local"},
                 )
+                self.assertEqual(
+                    0o600,
+                    (
+                        Path(temp_dir)
+                        / "user"
+                        / "session"
+                        / mcp_client.MCP_CONFIG_FILE
+                    ).stat().st_mode & 0o777,
+                )
             finally:
                 mcp_client.MCP_CONFIG_BASE = old_base
+
+    def test_config_scope_rejects_path_traversal(self):
+        with self.assertRaisesRegex(ValueError, "user scope"):
+            mcp_client._session_config_path("../other-user", "session")
+        with self.assertRaisesRegex(ValueError, "session scope"):
+            mcp_client._session_config_path("user", "../../other-session")
 
     async def test_persistent_connect_failure_signals_ready(self):
         state = mcp_client.MCPServerState(

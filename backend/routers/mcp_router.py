@@ -13,10 +13,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, field_validator
 
 from auth import get_current_user
+from config import settings
 from models import User
 
 router = APIRouter(prefix="/api/mcp", tags=["mcp"])
-HARNESS_URL = "http://harness:8020"
 
 
 class MCPServerConfig(BaseModel):
@@ -47,9 +47,16 @@ class MCPServerConfig(BaseModel):
 
 
 async def _harness_request(method: str, path: str, **kwargs) -> dict:
+    headers = dict(kwargs.pop("headers", {}) or {})
+    headers["X-Internal-Token"] = settings.internal_api_token
     try:
         async with httpx.AsyncClient(timeout=45) as client:
-            response = await client.request(method, HARNESS_URL + path, **kwargs)
+            response = await client.request(
+                method,
+                settings.harness_url + path,
+                headers=headers,
+                **kwargs,
+            )
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=503, detail=f"Harness unavailable: {exc}")
     if response.status_code >= 400:

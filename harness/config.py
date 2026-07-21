@@ -53,7 +53,11 @@ class Settings(BaseSettings):
     # budget warrants it and material model output keeps arriving.  The total
     # timeout is the absolute deployment cap; neither progress nor a caller can
     # extend a request beyond it.
-    llm_stream_total_timeout_seconds: float = 1500.0
+    # GLM-class reasoning streams can remain productively active for roughly
+    # half an hour on large Skill workflows.  This absolute ceiling therefore
+    # leaves a measured buffer beyond 30 minutes; the shorter initial/read
+    # no-progress leases below still terminate genuinely stalled providers.
+    llm_stream_total_timeout_seconds: float = 2400.0
     llm_stream_initial_timeout_seconds: float = 600.0
     llm_stream_progress_grace_seconds: float = 180.0
     llm_stream_input_planning_tokens_per_second: float = 256.0
@@ -68,9 +72,23 @@ class Settings(BaseSettings):
     # control-plane repair into a 25-minute blocking request.
     llm_nonstream_repair_timeout_seconds: float = 600.0
     complex_report_max_iterations: int = 160
-    web_search_providers: str = "searxng,ddg"
+    # Keep ordinary production traffic on the SearXNG metasearch boundary.
+    # `ddg` is an explicit optional fallback for deployments with direct egress.
+    web_search_providers: str = "searxng"
     searxng_base_url: str = "http://searxng:8080"
     searxng_timeout_seconds: float = 10.0
+    # Private browser navigation remains disabled unless an origin is present
+    # both here and as an explicit URL in the current primary user turn.
+    browser_private_origin_allowlist: str = ""
+    # Some controlled egress stacks return synthetic addresses for public DNS
+    # (for example 198.18.0.0/15). This opt-in is accepted only for DNS names,
+    # never literal IP URLs, and only within the fixed synthetic carrier ranges
+    # recognized by tools.approval.
+    browser_dns_synthetic_public_ranges: str = ""
+    # Browser control is fail-closed over a private Unix-domain transport.
+    # There is intentionally no local Chromium fallback in tools.browser.
+    browser_cdp_socket: str = "/run/chat-ds-browser/cdp.sock"
+    browser_cdp_connect_timeout_seconds: float = 10.0
 
 settings = Settings()
 

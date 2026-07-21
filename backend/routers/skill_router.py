@@ -26,6 +26,7 @@ from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import get_current_user
+from config import settings
 from database import get_db
 from models import Conversation, SkillPackage, User
 from skill_frontmatter import SkillFrontmatterError, parse_skill_frontmatter
@@ -924,7 +925,10 @@ async def _auto_register_mcp(
     try:
         async with httpx.AsyncClient(timeout=120) as client:
             response = await client.post(
-                "http://harness:8020/internal/mcp/auto-register",
+                f"{settings.harness_url}/internal/mcp/auto-register",
+                headers={
+                    "X-Internal-Token": settings.internal_api_token,
+                },
                 params={
                     "skill_dir": skill_dir,
                     "user_id": user_id,
@@ -952,7 +956,10 @@ async def _remove_skill_mcp(
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(
-                "http://harness:8020/internal/mcp/remove-skill",
+                f"{settings.harness_url}/internal/mcp/remove-skill",
+                headers={
+                    "X-Internal-Token": settings.internal_api_token,
+                },
                 params={
                     "skill_dir": skill_dir,
                     "user_id": user_id,

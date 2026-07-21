@@ -339,6 +339,9 @@ async def execute_job(job_id: str, *, force: bool = False) -> None:
             async with httpx.AsyncClient(timeout=900) as client:
                 response = await client.post(
                     f"{settings.harness_url}/v1/chat/completions",
+                    headers={
+                        "X-Internal-Token": settings.internal_api_token,
+                    },
                     json={
                         "model": model_id,
                         "messages": messages,
