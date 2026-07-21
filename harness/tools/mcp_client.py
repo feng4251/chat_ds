@@ -23,10 +23,15 @@ Reference: hermes-agent/tools/mcp_tool.py
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
 import re
+import secrets
+import shutil
+import stat
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -104,6 +109,15 @@ _MCP_MESSAGE_HANDLER_SUPPORTED = _check_message_handler_support()
 MCP_CONFIG_BASE = Path("data/mcp")
 MCP_CONFIG_FILE = "servers.json"
 MCP_STDERR_LOG_DIR = Path("data/mcp/logs")
+MCP_STDIO_SANDBOX_LAUNCHER = (
+    Path(__file__).resolve().parents[1] / "runtime" / "mcp_stdio_sandbox.py"
+)
+MCP_STDIO_CHILD_SPEC_ENV = "CHATDS_MCP_CHILD_SPEC_B64"
+# Linux limits each individual argv/env string to roughly 128 KiB even when
+# ARG_MAX is larger. Base64 expands by 4/3, so keep the raw JSON comfortably
+# below that per-string boundary and fail with a deterministic error, not
+# subprocess E2BIG.
+MCP_STDIO_CHILD_SPEC_MAX_BYTES = 64 * 1024
 
 # Sentinel session_id used when no real session is available.
 # Configs stored under this key are user-level (shared across sessions).
@@ -257,6 +271,82 @@ def _build_safe_env(user_env: dict | None) -> dict:
     return env
 
 
+def _sandboxed_stdio_parameters(
+    command: str,
+    args: list[str],
+    child_env: dict[str, str],
+) -> tuple[str, list[str], dict[str, str], Path]:
+    """Return an isolated launcher command without pre-drop env execution.
+
+    Python and ELF loaders consume variables such as ``PYTHONPATH`` and
+    ``LD_PRELOAD`` before application code can drop privileges.  The trusted
+    launcher therefore starts under ``python -I`` with a tiny inert
+    environment, lowers itself to the unprivileged MCP identity, and only then
+    execs the configured server with its requested environment.
+    """
+
+    normalized_env = {
+        str(key): str(value)
+        for key, value in child_env.items()
+        if isinstance(key, str) and "\x00" not in key and "=" not in key
+        and "\x00" not in str(value)
+    }
+    sandbox_id = secrets.token_hex(12)
+    sandbox_home = f"/tmp/chatds-mcp-{sandbox_id}"
+    normalized_env.update({
+        "HOME": sandbox_home,
+        "USER": "nobody",
+        "LOGNAME": "nobody",
+        "TMPDIR": "/tmp",
+        "XDG_CACHE_HOME": f"{sandbox_home}/.cache",
+        "XDG_CONFIG_HOME": f"{sandbox_home}/.config",
+        "XDG_DATA_HOME": f"{sandbox_home}/.local/share",
+    })
+    encoded_spec = json.dumps(
+        {"env": normalized_env, "home": sandbox_home},
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(encoded_spec) > MCP_STDIO_CHILD_SPEC_MAX_BYTES:
+        raise ValueError("stdio MCP environment exceeds the sandbox boundary")
+
+    launcher_env = {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        MCP_STDIO_CHILD_SPEC_ENV: base64.urlsafe_b64encode(encoded_spec).decode(
+            "ascii"
+        ),
+    }
+    launcher_args = [
+        "-I",
+        str(MCP_STDIO_SANDBOX_LAUNCHER),
+        "--",
+        str(command),
+        *(str(arg) for arg in args),
+    ]
+    return sys.executable, launcher_args, launcher_env, Path(sandbox_home)
+
+
+def _remove_stdio_sandbox_home(path: Path) -> None:
+    """Remove one runtime-owned temporary home without following replacements."""
+
+    if path.parent != Path("/tmp") or not path.name.startswith("chatds-mcp-"):
+        return
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+    try:
+        if stat.S_ISDIR(mode):
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    except OSError:
+        logger.debug("Could not remove one stdio MCP temporary home", exc_info=True)
+
+
 def _sanitize_error(text: str) -> str:
     """Strip credential-like patterns from error text before returning to LLM."""
     return _CREDENTIAL_PATTERN.sub("[REDACTED]", text)
@@ -279,13 +369,15 @@ def _get_stderr_log(server_name: str) -> Any:
     """
     log_dir = MCP_STDERR_LOG_DIR
     try:
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / f"{server_name}.log"
+        log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        log_dir.chmod(0o700)
+        log_path = log_dir / f"{_sanitize_mcp_name_component(server_name)}.log"
         # Write startup marker
         with open(log_path, "a", encoding="utf-8", errors="replace") as f:
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             f.write(f"\n===== [{ts}] MCP server '{server_name}' started =====\n")
         fh = open(log_path, "a", encoding="utf-8", errors="replace", buffering=1)
+        log_path.chmod(0o600)
         fh.fileno()  # sanity-check: real fd
         return fh
     except Exception as exc:
@@ -341,16 +433,33 @@ def _record_success(state: MCPServerState) -> None:
 # _load_config merges both layers: session overrides user for same-name servers.
 
 
+def _mcp_scope_component(value: str, *, label: str) -> str:
+    component = str(value or "").strip()
+    if (
+        len(component) > 128
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", component) is None
+        or component in {".", ".."}
+    ):
+        raise ValueError(f"Invalid MCP {label} scope")
+    return component
+
+
 def _session_config_path(user_id: str, session_id: str) -> Path:
     """Path to the session-scoped MCP config file."""
-    if session_id and session_id != DEFAULT_SESSION_ID:
-        return MCP_CONFIG_BASE / user_id / session_id / MCP_CONFIG_FILE
-    return MCP_CONFIG_BASE / user_id / MCP_CONFIG_FILE
+    safe_user = _mcp_scope_component(user_id, label="user")
+    safe_session = _mcp_scope_component(
+        session_id or DEFAULT_SESSION_ID,
+        label="session",
+    )
+    if safe_session != DEFAULT_SESSION_ID:
+        return MCP_CONFIG_BASE / safe_user / safe_session / MCP_CONFIG_FILE
+    return MCP_CONFIG_BASE / safe_user / MCP_CONFIG_FILE
 
 
 def _user_config_path(user_id: str) -> Path:
     """Path to the user-level MCP config file (fallback, shared across sessions)."""
-    return MCP_CONFIG_BASE / user_id / MCP_CONFIG_FILE
+    safe_user = _mcp_scope_component(user_id, label="user")
+    return MCP_CONFIG_BASE / safe_user / MCP_CONFIG_FILE
 
 
 def _load_scope_config(user_id: str, session_id: str = "default") -> dict:
@@ -408,8 +517,32 @@ def _load_config(user_id: str, session_id: str = "default") -> dict:
 def _save_config(user_id: str, config: dict, session_id: str = "default") -> None:
     """Save MCP server configurations to the session-scoped path."""
     path = _session_config_path(user_id, session_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Configs can contain explicitly supplied MCP credentials.  Do not rely on
+    # the host/container umask: shared NFS deployments commonly override it.
+    for directory in (MCP_CONFIG_BASE, *reversed(path.parents[:-2])):
+        if directory == Path("."):
+            continue
+        try:
+            directory.chmod(0o700)
+        except OSError:
+            logger.debug("Could not harden one MCP config directory", exc_info=True)
+    temp_path = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    payload = json.dumps(config, indent=2, ensure_ascii=False)
+    fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        path.chmod(0o600)
+    except BaseException:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def _filter_user_mcp_servers(
@@ -988,10 +1121,20 @@ async def _connect_stdio(state: MCPServerState) -> bool:
 
     safe_env = user_env if isinstance(user_env, dict) and config.get("_runtime") == "session_python_env" else _build_safe_env(user_env)
 
+    (
+        sandbox_command,
+        sandbox_args,
+        sandbox_env,
+        sandbox_home,
+    ) = _sandboxed_stdio_parameters(
+        str(command),
+        [str(arg) for arg in args],
+        safe_env,
+    )
     server_params = StdioServerParameters(
-        command=command,
-        args=args,
-        env=safe_env if safe_env else None,
+        command=sandbox_command,
+        args=sandbox_args,
+        env=sandbox_env,
     )
 
     errlog = _get_stderr_log(state.name)
@@ -1037,6 +1180,7 @@ async def _connect_stdio(state: MCPServerState) -> bool:
         if state._keepalive_task:
             state._keepalive_task.cancel()
             state._keepalive_task = None
+        _remove_stdio_sandbox_home(sandbox_home)
 
     return True
 

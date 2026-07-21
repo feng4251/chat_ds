@@ -1715,7 +1715,10 @@ async def _chat_stream_with_turn(
                     async with client.stream(
                         "POST",
                         f"{settings.harness_url}/v1/chat/completions",
-                        headers={"Content-Type": "application/json"},
+                        headers={
+                            "Content-Type": "application/json",
+                            "X-Internal-Token": settings.internal_api_token,
+                        },
                         json={
                             "model": model_id,
                             "messages": final,

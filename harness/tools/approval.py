@@ -15,7 +15,7 @@ from __future__ import annotations
 import ipaddress
 import re
 import socket
-from urllib.parse import urlparse
+from urllib.parse import urlsplit
 
 # ---------------------------------------------------------------------------
 # Dangerous command patterns
@@ -142,10 +142,50 @@ _PRIVATE_NETWORKS: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = [
     ipaddress.ip_network("127.0.0.0/8"),
     ipaddress.ip_network("169.254.0.0/16"),
     ipaddress.ip_network("100.64.0.0/10"),   # CGNAT
+    ipaddress.ip_network("198.18.0.0/15"),  # benchmarking / synthetic DNS
     ipaddress.ip_network("::1/128"),
     ipaddress.ip_network("fc00::/7"),
     ipaddress.ip_network("fe80::/10"),
 ]
+
+# Deployment configuration may narrow, but never widen beyond, these address
+# families commonly reserved by transparent egress proxies for synthetic DNS.
+# A literal URL using one of these addresses remains blocked regardless.
+_SUPPORTED_SYNTHETIC_DNS_SUPERNETS: tuple[
+    ipaddress.IPv4Network | ipaddress.IPv6Network, ...
+] = (
+    ipaddress.ip_network("198.18.0.0/15"),
+    ipaddress.ip_network("fc00::/18"),
+)
+
+
+def _synthetic_dns_networks(
+    configured: str | tuple[str, ...] | list[str],
+) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    """Parse a deployment-owned, tightly bounded synthetic-DNS policy."""
+
+    values = (
+        re.split(r"[\s,;]+", configured)
+        if isinstance(configured, str)
+        else [str(value) for value in configured]
+    )
+    accepted: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    for value in values:
+        candidate = str(value or "").strip()
+        if not candidate:
+            continue
+        try:
+            network = ipaddress.ip_network(candidate, strict=True)
+        except ValueError:
+            continue
+        if not any(
+            network.version == parent.version and network.subnet_of(parent)
+            for parent in _SUPPORTED_SYNTHETIC_DNS_SUPERNETS
+        ):
+            continue
+        if network not in accepted:
+            accepted.append(network)
+    return tuple(accepted)
 
 
 def _is_always_blocked(hostname: str, ip_addr: str | None = None) -> bool:
@@ -165,23 +205,165 @@ def _is_always_blocked(hostname: str, ip_addr: str | None = None) -> bool:
     return False
 
 
-def _is_private_ip(hostname: str) -> bool:
-    """Check if the hostname resolves to a private/internal IP address."""
+def _resolved_ip_addresses(hostname: str) -> tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, ...]:
+    """Resolve every address for one host, failing closed on ambiguity."""
+
     try:
-        ip = ipaddress.ip_address(hostname)
+        return (ipaddress.ip_address(hostname),)
     except ValueError:
         try:
-            ip = ipaddress.ip_address(socket.getaddrinfo(hostname, None)[0][4][0])
-        except (socket.gaierror, IndexError, ValueError):
-            return True  # fail-closed: can't resolve → block
+            rows = socket.getaddrinfo(
+                hostname,
+                None,
+                type=socket.SOCK_STREAM,
+            )
+        except (socket.gaierror, OSError):
+            return ()
+    addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    for row in rows:
+        try:
+            value = str(row[4][0]).split("%", 1)[0]
+            address = ipaddress.ip_address(value)
+        except (IndexError, TypeError, ValueError):
+            continue
+        if address not in addresses:
+            addresses.append(address)
+    return tuple(addresses)
 
-    for net in _PRIVATE_NETWORKS:
-        if ip in net:
-            return True
-    return False
+
+def _is_private_address(
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> bool:
+    return any(address in network for network in _PRIVATE_NETWORKS)
 
 
-def check_url_safety(url: str) -> str | None:
+def canonical_http_origin(
+    url: str,
+    *,
+    require_origin_only: bool = False,
+) -> str | None:
+    """Return a stable HTTP(S) origin without accepting URL credentials."""
+
+    if not isinstance(url, str) or not url or url != url.strip():
+        return None
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    scheme = parsed.scheme.casefold()
+    if scheme not in {"http", "https"}:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    hostname = parsed.hostname
+    if not hostname or any(ord(char) < 32 for char in hostname):
+        return None
+    if require_origin_only and (
+        parsed.path not in {"", "/"} or parsed.query or parsed.fragment
+    ):
+        return None
+    try:
+        address = ipaddress.ip_address(hostname)
+        canonical_host = address.compressed
+        if isinstance(address, ipaddress.IPv6Address):
+            canonical_host = f"[{canonical_host}]"
+    except ValueError:
+        try:
+            canonical_host = hostname.rstrip(".").encode("idna").decode("ascii").casefold()
+        except (UnicodeError, ValueError):
+            return None
+        if not canonical_host:
+            return None
+    default_port = 80 if scheme == "http" else 443
+    port_suffix = "" if port in {None, default_port} else f":{port}"
+    return f"{scheme}://{canonical_host}{port_suffix}"
+
+
+def _never_allowlisted_address(
+    hostname: str,
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> bool:
+    return bool(
+        _is_always_blocked(hostname, str(address))
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_unspecified
+        or address.is_multicast
+        or address.is_reserved
+        # ``IPv6Address.is_global`` still reports the deprecated fec0::/10
+        # site-local range as global on supported Python versions.  Treat it
+        # as internal explicitly; no deployment allowlist may grant it.
+        or (
+            isinstance(address, ipaddress.IPv6Address)
+            and address.is_site_local
+        )
+    )
+
+
+def _private_origin_is_allowlist_eligible(origin: str) -> bool:
+    parsed = urlsplit(origin)
+    hostname = parsed.hostname or ""
+    addresses = _resolved_ip_addresses(hostname)
+    return bool(
+        addresses
+        and not any(
+            _never_allowlisted_address(hostname, address)
+            for address in addresses
+        )
+        # A deployment entry advertised as a private origin must not be a
+        # split-horizon/mixed public+private answer.  Mixed answers stay on the
+        # ordinary fail-closed path instead of receiving private reachability.
+        and all(_is_private_address(address) for address in addresses)
+    )
+
+
+_EXPLICIT_HTTP_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_URL_TRAILING_PUNCTUATION = ".,;:!?)]}\u3002\uff0c\uff1b\uff1a\uff01\uff1f\uff09\u3011\u300b"
+
+
+def compile_user_private_origin_grants(
+    user_text: str,
+    configured_origins: str | list[str] | tuple[str, ...],
+) -> tuple[str, ...]:
+    """Intersect explicit user URL origins with a deployment-owned allowlist.
+
+    A Skill body, model argument, redirect, or bare hostname cannot create a
+    grant.  Always-blocked metadata, loopback, link-local, malformed, and
+    credential-bearing origins are excluded even when configuration is wrong.
+    """
+
+    if isinstance(configured_origins, str):
+        configured_values = re.split(r"[\s,;]+", configured_origins)
+    else:
+        configured_values = [
+            str(value) for value in configured_origins
+            if isinstance(value, str)
+        ]
+    configured: set[str] = set()
+    for value in configured_values:
+        candidate = str(value or "").strip()
+        if not candidate:
+            continue
+        origin = canonical_http_origin(candidate, require_origin_only=True)
+        if origin and _private_origin_is_allowlist_eligible(origin):
+            configured.add(origin)
+
+    grants: list[str] = []
+    for match in _EXPLICIT_HTTP_URL_RE.finditer(str(user_text or "")):
+        value = match.group(0).rstrip(_URL_TRAILING_PUNCTUATION)
+        origin = canonical_http_origin(value)
+        if origin in configured and origin not in grants:
+            grants.append(origin)
+    return tuple(grants)
+
+
+def check_url_safety(
+    url: str,
+    *,
+    allowed_private_origins: tuple[str, ...] | list[str] = (),
+    synthetic_public_ranges: str | tuple[str, ...] | list[str] = (),
+) -> str | None:
     """Validate URL safety. Returns an error message if blocked, ``None`` if safe.
 
     Blocks:
@@ -192,20 +374,61 @@ def check_url_safety(url: str) -> str | None:
     if not url or not isinstance(url, str):
         return "Invalid URL"
 
+    origin = canonical_http_origin(url)
+    if origin is None:
+        return (
+            "Blocked: URL must use http(s), contain no credentials, and have "
+            "a valid hostname/port"
+        )
+    hostname = urlsplit(origin).hostname or ""
     try:
-        parsed = urlparse(url)
-    except Exception:
-        return f"Cannot parse URL: {url[:200]}"
+        ipaddress.ip_address(hostname)
+        hostname_is_literal_ip = True
+    except ValueError:
+        hostname_is_literal_ip = False
+    addresses = _resolved_ip_addresses(hostname)
+    if not addresses:
+        return f"Blocked: cannot safely resolve hostname {hostname[:200]}"
+    configured_synthetic = _synthetic_dns_networks(synthetic_public_ranges)
 
-    hostname = parsed.hostname or ""
-    if not hostname:
-        return f"No hostname in URL: {url[:200]}"
+    def is_synthetic_public(
+        address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    ) -> bool:
+        return bool(
+            not hostname_is_literal_ip
+            and any(address in network for network in configured_synthetic)
+        )
 
-    if _is_always_blocked(hostname):
-        return f"Blocked: {hostname} is a cloud metadata endpoint"
+    if any(
+        _never_allowlisted_address(hostname, address)
+        and not is_synthetic_public(address)
+        for address in addresses
+    ):
+        return f"Blocked: {hostname} is metadata, loopback, link-local, or otherwise non-routable"
 
-    if _is_private_ip(hostname):
-        return f"Blocked: {hostname} resolves to a private/internal IP"
+    allowed = {
+        normalized
+        for value in allowed_private_origins
+        if (
+            normalized := canonical_http_origin(
+                str(value), require_origin_only=True
+            )
+        ) is not None
+        and _private_origin_is_allowlist_eligible(normalized)
+    }
+    for address in addresses:
+        if is_synthetic_public(address):
+            continue
+        if _is_private_address(address):
+            if origin not in allowed:
+                return f"Blocked: {hostname} resolves to a private/internal IP"
+            continue
+        # Fail closed for IANA special-purpose/documentation/this-network
+        # space that is neither one of our explicitly modeled private ranges
+        # nor a truly globally routable address.  This also protects mixed DNS
+        # answers: every returned address must be safe independently.
+        if not address.is_global:
+            return f"Blocked: {hostname} resolves to a non-global IP"
 
     return None
 

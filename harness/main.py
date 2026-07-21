@@ -5,6 +5,7 @@ POST /v1/chat/completions    → SSE stream (multi-turn agent with tool calling)
 """
 
 import asyncio
+import hmac
 import json
 import logging
 import time
@@ -13,9 +14,14 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
-from config import DEFAULT_AGENT_MODEL_ID, PROVIDERS, canonical_provider_id
+from config import (
+    DEFAULT_AGENT_MODEL_ID,
+    PROVIDERS,
+    canonical_provider_id,
+    settings,
+)
 from agent_loop import run_stream
 import tools  # noqa: F401 — triggers tool registration
 
@@ -45,8 +51,37 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Shutdown MCP disconnect failed")
 
+    try:
+        from tools.browser import close_all_browser_sessions
+        await close_all_browser_sessions()
+    except Exception:
+        logger.exception("Shutdown browser cleanup failed")
+
 
 app = FastAPI(title="Chat ACITS Harness", version="2.0.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def require_internal_api_token(request: Request, call_next):
+    """Authenticate every stateful Harness API boundary.
+
+    The Harness shares a container network with extensible subprocess-backed
+    capabilities.  Network placement alone is therefore not authentication:
+    callers of the agent loop and its internal control plane must prove that
+    they are the trusted backend.  Health and the read-only model catalog stay
+    available to container health checks and service discovery.
+    """
+
+    path = request.url.path
+    if path == "/v1/chat/completions" or path.startswith("/internal/"):
+        supplied = request.headers.get("X-Internal-Token", "")
+        expected = str(settings.internal_api_token or "")
+        if not expected or not hmac.compare_digest(supplied, expected):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Unauthorized Harness request"},
+            )
+    return await call_next(request)
 
 
 @app.get("/health")
@@ -232,6 +267,14 @@ async def chat_completions(req: Request):
         source=source,
         enabled_user_skills=enabled_user_skills,
         max_tokens=max_tokens,
+        run_id=run_metadata.get("run_id"),
+        root_run_id=run_metadata.get("root_run_id"),
+        parent_run_id=run_metadata.get("parent_run_id"),
+        agent_kind=run_metadata.get("agent_kind") or "primary",
+        agent_name=run_metadata.get("agent_name"),
+        depth=int(run_metadata.get("depth") or 0),
+        workspace_scope=run_metadata.get("workspace_scope") or "shared_session",
+        event_schema=event_schema,
     ):
         tp = evt["type"]
         if tp == "delta":

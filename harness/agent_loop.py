@@ -120,6 +120,14 @@ logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 3
 DEFAULT_MAX_TOKENS = 8192
+# A primary mandatory control/tool frontier needs only enough room to
+# serialize a *known-small* native call, not the caller's report-sized
+# generation allowance (or the provider's entire context window).  The cap is
+# never applied merely because a call is mandatory: every exposed tool must be
+# in the conservative bounded-argument allowlist below.  This distinction is
+# important for write_file/patch_file/execute_code, whose tool arguments are
+# themselves the large artifact or program the model is producing.
+_PRIMARY_MANDATORY_FRONTIER_MAX_TOKENS = DEFAULT_MAX_TOKENS
 # One SSE event may legitimately contain a large structured-tool delta, but a
 # peer must not be able to retain an unbounded number of data fields or bytes
 # before the blank-line dispatch boundary.  The byte ceiling leaves headroom
@@ -235,6 +243,23 @@ _DELEGATE_BOUNDED_ARGUMENT_TOOLS = frozenset({
     "run_skill_python",
     "run_declared_command",
 })
+# Primary control phases use a separate, deliberately narrower allowlist.
+# Unknown/MCP tools and tools carrying content, code, patches, JSON request
+# bodies, command argv, or capability-plan prose retain the caller's normal
+# output allowance.  Keeping this list positive (rather than trying to
+# enumerate every large tool) means a newly registered capability cannot be
+# accidentally truncated by the 8K control-phase cap.
+_PRIMARY_BOUNDED_ARGUMENT_TOOLS = frozenset({
+    "read_file",
+    "search_files",
+    "skills_list",
+    "skill_view",
+    "skill_copy_resource",
+    "web_search",
+    "web_extract",
+    "skill_http_get",
+    "select_session_skill",
+})
 _VOLATILE_TOOL_RESULT_FIELDS = frozenset({
     "request_id", "duration", "duration_ms", "duration_seconds",
     "elapsed", "elapsed_ms", "elapsed_seconds", "recorded_at",
@@ -277,6 +302,11 @@ _MAX_INTENT_CLASSIFIER_CONTRACT_BYTES = 128 * 1024
 # no-op response shape.  This is deliberately run-scoped and does not add an
 # iteration: a second reasoning-only truncation remains terminal.
 _MAX_DELEGATE_REASONING_ONLY_LENGTH_RECOVERIES = 1
+# A primary turn that was abandoned after hidden reasoning, but before any
+# visible byte, structured tool fragment, or current-turn dispatch, may spend
+# one existing iteration on a fresh logical correction.  This is deliberately
+# not an HTTP replay.  A second reasoning-only interruption is terminal.
+_MAX_PRIMARY_REASONING_ONLY_STREAM_RECOVERIES = 1
 # Larger delegated tasks reserve two already-budgeted no-tool turns for
 # synthesis.  The second turn is a single continuation opportunity when the
 # first substantive synthesis is truncated.  Small two-turn children still
@@ -1259,6 +1289,8 @@ _NON_SENSITIVE_DEBUG_TOKEN_KEYS = {
     "estimated_input_tokens",
     "estimated_output_tokens",
     "requested_max_tokens",
+    "caller_requested_max_tokens",
+    "primary_phase_max_tokens",
     "effective_max_tokens",
     "available_output_tokens",
     "context_length",
@@ -8945,6 +8977,20 @@ def _emit_run_cancelled_on_cancellation(func):
         bound.apply_defaults()
         arguments = bound.arguments
         run_id = arguments.get("run_id")
+        browser_run_scope_id = str(
+            arguments.get("_browser_run_scope_id")
+            or run_id
+            or uuid.uuid4().hex
+        )
+        if (
+            "_browser_run_scope_id" in signature.parameters
+            and not arguments.get("_browser_run_scope_id")
+        ):
+            # The scope is runtime-owned and never comes from model arguments.
+            # It lets the outer lifecycle wrapper clean up compatibility calls
+            # that have no durable AgentRun identifier.
+            kwargs = dict(kwargs)
+            kwargs["_browser_run_scope_id"] = browser_run_scope_id
         root_run_id = arguments.get("root_run_id") or run_id
         parent_run_id = arguments.get("parent_run_id")
         agent_kind = str(arguments.get("agent_kind") or "primary")
@@ -9081,6 +9127,21 @@ def _emit_run_cancelled_on_cancellation(func):
             # server or direct async-generator client may close the iterator
             # explicitly instead of cancelling the awaiting task.
             raise
+        finally:
+            try:
+                from tools.browser import close_browser_run
+
+                cleanup = asyncio.create_task(close_browser_run(
+                    user_id,
+                    session_id,
+                    str(run_id or browser_run_scope_id),
+                ))
+                await asyncio.wait_for(asyncio.shield(cleanup), timeout=2.0)
+            except BaseException:
+                # Run teardown must not replace the model/tool terminal result.
+                # The exact-key helper is idempotent and the shielded task may
+                # still finish if a second cancellation arrives here.
+                logger.debug("Browser run cleanup did not finish synchronously", exc_info=True)
 
     return wrapped
 
@@ -9129,6 +9190,7 @@ async def run_stream(
     declared_artifact_patterns: list[str] | None = None,
     thinking_policy: str = "provider_default",
     temperature_override: float | None = None,
+    _browser_run_scope_id: str | None = None,
 ) -> AsyncIterator[dict]:
     """Async generator yielding SSE-style dicts for a full agent conversation turn.
 
@@ -9281,6 +9343,19 @@ async def run_stream(
         for pattern in (declared_artifact_patterns or [])
         if isinstance(pattern, str) and pattern.strip()
     ])
+    from tools.approval import compile_user_private_origin_grants
+
+    allowed_browser_private_origins = (
+        compile_user_private_origin_grants(
+            _latest_user_text(messages),
+            str(
+                getattr(settings, "browser_private_origin_allowlist", "")
+                or ""
+            ),
+        )
+        if agent_kind == "primary" and source != "delegate"
+        else ()
+    )
     tool_context = ToolContext(
         user_id=user_id,
         session_id=session_id,
@@ -9291,6 +9366,9 @@ async def run_stream(
         source=source,
         enabled_user_skills=tuple(enabled_user_skills or []),
         run_id=run_id,
+        browser_run_scope_id=str(
+            _browser_run_scope_id or run_id or uuid.uuid4().hex
+        ),
         root_run_id=root_run_id or run_id,
         parent_run_id=parent_run_id,
         agent_kind=agent_kind,
@@ -9306,6 +9384,7 @@ async def run_stream(
         allowed_skill_http_post_prefixes=tuple(
             allowed_skill_http_post_prefixes or ()
         ),
+        allowed_browser_private_origins=allowed_browser_private_origins,
         allowed_read_paths=tuple(allowed_read_paths or ()),
         artifact_write_boundary=bool(
             (agent_kind == "delegate" or source == "delegate")
@@ -9518,6 +9597,8 @@ async def run_stream(
     delegate_quarantined_tools: set[str] = set()
     delegate_reasoning_only_length_recoveries = 0
     pending_delegate_reasoning_only_recovery = False
+    primary_reasoning_only_stream_recoveries = 0
+    pending_primary_reasoning_only_recovery = False
     delegate_synthesis_length_continuations = 0
     pending_delegate_synthesis_length_continuation = False
     # A post-dispatch emergency synthesis may itself produce a clean visible
@@ -12391,6 +12472,7 @@ async def run_stream(
             relevance_selected_skill_names=(
                 session_skill_relevance_decision.selected_skill_names
             ),
+            explicit_selected_skill_names=explicit_selected_skill_names,
         )
         if not selected:
             return None
@@ -13611,6 +13693,11 @@ async def run_stream(
             yield await emit_agent_event("run.failed", {"error": msg})
             yield {"type": "error", "msg": msg}
             return
+        # This baseline makes the recovery gate's no-dispatch premise
+        # explicit and auditable.  Deterministic workflow auto-calls completed
+        # before this model turn belong to preserved prior state, not to the
+        # provider sample that may be abandoned below.
+        iteration_dispatch_count_start = run_state.tool_call_count
         delegate_synthesis_turn_reserve = min(
             _DELEGATE_SYNTHESIS_TURN_RESERVE,
             max(1, budget.max_total - 1),
@@ -13621,6 +13708,10 @@ async def run_stream(
             pending_delegate_reasoning_only_recovery
         )
         pending_delegate_reasoning_only_recovery = False
+        iteration_primary_reasoning_only_recovery = (
+            pending_primary_reasoning_only_recovery
+        )
+        pending_primary_reasoning_only_recovery = False
         iteration_required_capability_recovery = bool(
             iteration_reasoning_only_recovery
             and pending_delegate_required_capability_recovery
@@ -13750,17 +13841,20 @@ async def run_stream(
         standard_unsatisfied_required = (
             unsatisfied_standard_required_capabilities()
         )
-        optional_only_execution_window = bool(
+        standard_plan_first_execution_window = bool(
             standard_plan_execution_window_pending
-            and run_state.skill_capability_plans
-            and not direct_required_tool_groups
-            and not standard_unsatisfied_required
+        )
+        standard_selected_capability_count = sum(
+            len(plan.get("required") or [])
+            + len(plan.get("optional") or [])
+            for plan in run_state.skill_capability_plans.values()
+            if isinstance(plan, dict)
         )
         if standard_plan_execution_window_pending:
-            # Exactly one post-plan model turn may use optional selections.
-            # A subsequent turn closes tools unless an exact required receipt
-            # remains outstanding. Empty/unsupported-only plans therefore
-            # converge naturally without a required-call loop.
+            # This flag distinguishes the initial full selected surface from
+            # a later, deliberately narrow required-receipt correction.  It
+            # does not expire the plan's authorization: selected capabilities
+            # remain reusable after their minimum required receipt is present.
             standard_plan_execution_window_pending = False
         if (
             agent_kind == "primary"
@@ -13774,38 +13868,96 @@ async def run_stream(
             )
             and iteration_workflow_policy is None
             and iteration_tool_stream_repair is None
-            and not optional_only_execution_window
         ):
             direct_unsatisfied_groups = [
                 group for group in direct_required_tool_groups
                 if not (set(group) & direct_called_tools)
             ]
             if direct_unsatisfied_groups or standard_unsatisfied_required:
+                required_frontier_tools: list[str] = []
+                for group in direct_unsatisfied_groups:
+                    required_frontier_tools.extend(
+                        name for name in group if name in tools
+                    )
+                for candidate in standard_unsatisfied_required:
+                    tool_name = str(candidate.get("tool_name") or "")
+                    if tool_name in tools:
+                        required_frontier_tools.append(tool_name)
+                    required_frontier_tools.extend(
+                        str(name) for name in candidate.get("tool_names") or []
+                        if str(name) in tools
+                    )
+                    kind = str(candidate.get("kind") or "")
+                    deterministic_bridge = {
+                        "skill_resource": "skill_view",
+                        "declared_command": "run_declared_command",
+                    }.get(kind)
+                    if deterministic_bridge in tools:
+                        required_frontier_tools.append(deterministic_bridge)
+                required_frontier_tools = list(dict.fromkeys(
+                    required_frontier_tools
+                ))
+                # The first model turn after accepting a typed plan may use
+                # both its required and optional selections. If required
+                # receipts remain after that bounded window, subsequent
+                # correction turns expose only the unresolved capability
+                # frontier instead of the entire selected catalog.
+                bounded_direct_tools = (
+                    list(tools)
+                    if standard_plan_first_execution_window
+                    else required_frontier_tools or list(tools)
+                )
+                if main_model_skill_selection_pending:
+                    bounded_direct_tools.append(
+                        _SESSION_SKILL_SELECTOR_TOOL_NAME
+                    )
                 # Bound one explicit direct action to the small capability
                 # surface selected at ingress. This still permits workflows
                 # such as read+patch while preventing a single search request
                 # from dispatching an unbounded parallel query batch.
                 iteration_workflow_policy = {
                     "tools": [
-                        *tools,
-                        *(
-                            [_SESSION_SKILL_SELECTOR_TOOL_NAME]
-                            if main_model_skill_selection_pending else []
-                        ),
+                        *dict.fromkeys(bounded_direct_tools),
                     ],
                     "max_calls": max(
                         1,
-                        len(tools)
-                        + (1 if main_model_skill_selection_pending else 0),
-                        len(direct_unsatisfied_groups)
-                        + len(standard_unsatisfied_required),
+                        (
+                            standard_selected_capability_count
+                            if standard_plan_first_execution_window
+                            else len(direct_unsatisfied_groups)
+                            + len(standard_unsatisfied_required)
+                        ),
                     ),
-                    "reason": "bounded explicit direct action",
+                    "reason": (
+                        "bounded typed Skill first execution window"
+                        if standard_plan_first_execution_window
+                        else "bounded unresolved required capability frontier"
+                    ),
+                }
+            elif (
+                run_state.skill_capability_plans
+                and standard_selected_capability_count > 0
+            ):
+                # ``required`` is a minimum exact-receipt gate and
+                # ``optional`` is discretionary authorization; neither is a
+                # one-shot call allowance.  Keep only the already-selected
+                # finite capability surface available so a standard Skill can
+                # perform repeated writes/searches/reads across bounded model
+                # iterations, while allowing the model to stop and synthesize
+                # on any turn.  The per-turn batch cap is independent of the
+                # authorization lifetime and prevents a single response from
+                # expanding into an unbounded parallel call batch.
+                iteration_workflow_policy = {
+                    "tools": list(dict.fromkeys(tools)),
+                    "max_calls": max(1, standard_selected_capability_count),
+                    "reason": (
+                        "bounded reusable typed Skill capability surface"
+                    ),
                 }
             else:
-                # Once every requested action group crossed its dispatch
-                # boundary, close the tool surface. The following turn may
-                # only synthesize the observed result/failure.
+                # Direct one-shot actions and empty/unsupported-only standard
+                # plans have no reusable selected capability. Close their
+                # surface once every minimum receipt has been observed.
                 iteration_workflow_policy = {
                     "tools": [],
                     "max_calls": 0,
@@ -14112,6 +14264,12 @@ async def run_stream(
             "delegate_reasoning_only_recovery": (
                 iteration_reasoning_only_recovery
             ),
+            "primary_reasoning_only_stream_recovery": (
+                iteration_primary_reasoning_only_recovery
+            ),
+            "current_turn_dispatch_count": (
+                run_state.tool_call_count - iteration_dispatch_count_start
+            ),
             "delegate_required_capability_recovery": (
                 iteration_required_capability_recovery
             ),
@@ -14325,8 +14483,39 @@ async def run_stream(
         direct_unsatisfied_at_request.extend(
             unsatisfied_standard_required_capabilities()
         )
+        primary_mandatory_control_tool_frontier = bool(
+            agent_kind == "primary"
+            and direct_unsatisfied_at_request
+            and iteration_exposed_tools
+        )
+        primary_bounded_argument_tool_frontier = bool(
+            primary_mandatory_control_tool_frontier
+            and iteration_exposed_tools.issubset(
+                _PRIMARY_BOUNDED_ARGUMENT_TOOLS
+            )
+        )
 
-        requested_max_tokens = int(max_tokens or DEFAULT_MAX_TOKENS)
+        caller_requested_max_tokens = int(max_tokens or DEFAULT_MAX_TOKENS)
+        requested_max_tokens = caller_requested_max_tokens
+        primary_phase_output_token_cap: int | None = None
+        if primary_bounded_argument_tool_frontier:
+            # Context length is an admission ceiling, not a useful generation
+            # budget for an atomic, known-small control/tool phase.  The
+            # caller's larger allowance remains available to a later terminal
+            # synthesis turn.  Large/unknown argument schemas deliberately do
+            # not enter this branch.
+            primary_phase_output_token_cap = (
+                _PRIMARY_MANDATORY_FRONTIER_MAX_TOKENS
+            )
+            requested_max_tokens = min(
+                requested_max_tokens,
+                primary_phase_output_token_cap,
+            )
+        # Deliberately do not cap iteration_primary_reasoning_only_recovery
+        # here: it can occur during long report synthesis or while serializing
+        # a large structured argument.  Its one-turn allowance, thinking-off
+        # policy, and stream deadline are the control boundary; the ordinary
+        # context clamp below determines the actual wire budget.
         if iteration_result_footer_repair:
             requested_max_tokens = min(
                 requested_max_tokens,
@@ -14544,6 +14733,8 @@ async def run_stream(
             and (
                 not thinking_enabled_by_default
                 or iteration_reasoning_only_recovery
+                or iteration_primary_reasoning_only_recovery
+                or primary_mandatory_control_tool_frontier
                 or delegate_tools_closed_terminal_turn
                 or delegate_required_capability_at_request
                 or delegate_retrieval_call_at_request
@@ -14595,6 +14786,18 @@ async def run_stream(
                 iteration_tool_stream_repair is not None
             ),
             "direct_required_unsatisfied": direct_unsatisfied_at_request,
+            "primary_mandatory_control_tool_frontier": (
+                primary_mandatory_control_tool_frontier
+            ),
+            "primary_bounded_argument_tool_frontier": (
+                primary_bounded_argument_tool_frontier
+            ),
+            "primary_reasoning_only_stream_recovery": (
+                iteration_primary_reasoning_only_recovery
+            ),
+            "primary_phase_max_tokens": (
+                primary_phase_output_token_cap
+            ),
             "delegate_required_capability_recovery": (
                 iteration_required_capability_recovery
             ),
@@ -14698,6 +14901,7 @@ async def run_stream(
                 else {}
             ),
             "requested_max_tokens": requested_max_tokens,
+            "caller_requested_max_tokens": caller_requested_max_tokens,
             "effective_max_tokens": effective_max_tokens,
             "estimated_input_tokens": estimated_input_tokens,
             "context_budget": max_token_budget,
@@ -14741,31 +14945,55 @@ async def run_stream(
             earlier dispatched results gets the existing tools-closed
             post-dispatch synthesis; a child with no handler boundary spends
             its single reasoning-only recovery allowance under the same closed
-            policy.  Recovery samples themselves are terminal on interruption.
+            policy.  A primary run may likewise spend one new logical turn
+            only when this sample has no visible byte, tool fragment, or
+            current-turn dispatch. Recovery samples themselves are terminal on
+            a second reasoning-only interruption.
             """
             nonlocal delegate_reasoning_only_length_recoveries
             nonlocal pending_delegate_reasoning_only_recovery
             nonlocal pending_delegate_required_capability_recovery
+            nonlocal primary_reasoning_only_stream_recoveries
+            nonlocal pending_primary_reasoning_only_recovery
             nonlocal forced_workflow_policy
             nonlocal previous_length_content
 
-            if not (
-                delegated_subtask
-                and not full_content
+            current_turn_dispatch_count = (
+                run_state.tool_call_count - iteration_dispatch_count_start
+            )
+            common_reasoning_only_shape = bool(
+                not full_content
+                and attempt_raw_content_chars == 0
                 and full_reasoning.strip()
                 and not tool_call_accumulator.fragment_count
+                and current_turn_dispatch_count == 0
                 and budget.remaining > 0
                 and iteration_tool_stream_repair is None
-                and not iteration_reasoning_only_recovery
                 and not iteration_synthesis_length_continuation
                 and not iteration_visible_length_recovery
                 and not iteration_result_footer_repair
                 and not iteration_output_contract_repair
                 and not iteration_post_dispatch_stream_synthesis
-            ):
+            )
+            delegated_recovery_eligible = bool(
+                common_reasoning_only_shape
+                and delegated_subtask
+                and not iteration_reasoning_only_recovery
+            )
+            primary_recovery_eligible = bool(
+                common_reasoning_only_shape
+                and agent_kind == "primary"
+                and not delegated_subtask
+                and not iteration_primary_reasoning_only_recovery
+                and primary_reasoning_only_stream_recoveries
+                < _MAX_PRIMARY_REASONING_ONLY_STREAM_RECOVERIES
+            )
+            if not (delegated_recovery_eligible or primary_recovery_eligible):
                 return None
 
-            if delegate_dispatched_tool_result_count > 0:
+            if delegated_recovery_eligible and (
+                delegate_dispatched_tool_result_count > 0
+            ):
                 recovery = queue_delegate_post_dispatch_stream_synthesis(
                     "provider_stream_interrupted_after_reasoning",
                     terminal_contract_audit=True,
@@ -14776,6 +15004,10 @@ async def run_stream(
                     "exception_kind": exception_kind,
                     "reasoning_chars_discarded": len(full_reasoning),
                     "content_chars_discarded": 0,
+                    "raw_content_chars_received": attempt_raw_content_chars,
+                    "raw_reasoning_chars_received": (
+                        attempt_raw_reasoning_chars
+                    ),
                     "stream_fragment_count": 0,
                 })
                 return (
@@ -14785,11 +15017,91 @@ async def run_stream(
                     "tool results after a reasoning-only stream interruption",
                 )
 
-            if (
+            if delegated_recovery_eligible and (
                 delegate_reasoning_only_length_recoveries
                 >= _MAX_DELEGATE_REASONING_ONLY_LENGTH_RECOVERIES
             ):
                 return None
+            if primary_recovery_eligible:
+                primary_reasoning_only_stream_recoveries += 1
+                pending_primary_reasoning_only_recovery = True
+                # Preserve the same runtime-owned capability surface and
+                # workflow frontier for the new logical turn.  No assistant
+                # sample, hidden reasoning, or provider request body is added
+                # back to history.
+                forced_workflow_policy = copy.deepcopy(
+                    iteration_workflow_policy
+                )
+                previous_length_content = ""
+                mandatory_frontier = bool(
+                    primary_mandatory_control_tool_frontier
+                )
+                next_action = (
+                    "Immediately emit the required allowed structured tool "
+                    "call or calls for the current mandatory frontier. Do not "
+                    "return a prose answer before that dispatch boundary."
+                    if mandatory_frontier
+                    else (
+                        "Immediately emit the next necessary allowed tool call "
+                        "or provide the concise substantive answer now."
+                    )
+                )
+                conversation.append({
+                    "role": "user",
+                    "content": (
+                        "The previous primary provider stream was abandoned "
+                        "after emitting hidden reasoning but no visible content "
+                        "or structured tool fragment. No tool was dispatched. "
+                        "That incomplete sample was discarded; this is a new "
+                        "logical turn, not an HTTP replay. This is the single "
+                        "bounded recovery for that response shape. Do not "
+                        "repeat or narrate analysis. "
+                        + next_action
+                    ),
+                })
+                recovery = {
+                    "gate": "primary_reasoning_only_stream_recovery",
+                    "reason": (
+                        "primary provider stream was interrupted after hidden "
+                        "reasoning without visible content, a structured tool "
+                        "fragment, or a current-turn dispatch"
+                    ),
+                    "iteration": budget.used,
+                    "remaining_iterations": budget.remaining,
+                    "exception_kind": exception_kind,
+                    "reasoning_chars_discarded": len(full_reasoning),
+                    "content_chars_discarded": 0,
+                    "raw_content_chars_received": attempt_raw_content_chars,
+                    "raw_reasoning_chars_received": (
+                        attempt_raw_reasoning_chars
+                    ),
+                    "stream_fragment_count": 0,
+                    "current_turn_dispatch_count": current_turn_dispatch_count,
+                    "prior_dispatch_count_preserved": (
+                        iteration_dispatch_count_start
+                    ),
+                    "mandatory_control_tool_frontier": mandatory_frontier,
+                    "mandatory_requirement_count": len(
+                        direct_unsatisfied_at_request
+                    ),
+                    "tools_exposed_next_turn": len(iteration_exposed_tools),
+                    "http_request_replayed": False,
+                    "logical_recovery_turn": True,
+                    "prior_runtime_state_preserved": True,
+                    "recovery_count": (
+                        primary_reasoning_only_stream_recoveries
+                    ),
+                    "max_recoveries": (
+                        _MAX_PRIMARY_REASONING_ONLY_STREAM_RECOVERIES
+                    ),
+                }
+                return (
+                    "primary.reasoning_only_stream_recovery.requested",
+                    recovery,
+                    "↻ Recovering once from a reasoning-only interrupted "
+                    "primary stream",
+                )
+
             delegate_reasoning_only_length_recoveries += 1
             pending_delegate_reasoning_only_recovery = True
             missing_required_capabilities = [
@@ -16344,15 +16656,81 @@ async def run_stream(
                     stream_interruption_recovery_queued = True
                     break
                 if not _stream_retry_is_safe(full_content, full_reasoning):
-                    msg = (
-                        "The model stream was interrupted after partial output. "
-                        "The harness did not transparently replay the request because doing "
-                        "so could duplicate already emitted content."
+                    primary_reasoning_only_terminal = bool(
+                        agent_kind == "primary"
+                        and not delegated_subtask
+                        and not full_content
+                        and attempt_raw_content_chars == 0
+                        and full_reasoning.strip()
+                        and not tool_call_accumulator.fragment_count
+                        and run_state.tool_call_count
+                        == iteration_dispatch_count_start
                     )
+                    primary_recovery_exhausted = bool(
+                        primary_reasoning_only_terminal
+                        and primary_reasoning_only_stream_recoveries
+                        >= _MAX_PRIMARY_REASONING_ONLY_STREAM_RECOVERIES
+                    )
+                    terminal_finish_reason = (
+                        "primary_reasoning_only_stream_recovery_exhausted"
+                        if primary_recovery_exhausted
+                        else (
+                            "primary_reasoning_only_stream_unrecoverable"
+                            if primary_reasoning_only_terminal
+                            else "stream_interrupted_after_partial"
+                        )
+                    )
+                    msg = (
+                        (
+                            "The primary model stream was interrupted after "
+                            "hidden reasoning but before any visible content or "
+                            "tool fragment. Its single bounded new-turn recovery "
+                            "was already used, so the run stopped without replaying "
+                            "the provider request."
+                        )
+                        if primary_recovery_exhausted
+                        else (
+                            "The primary model stream was interrupted after hidden "
+                            "reasoning but before any visible content or tool "
+                            "fragment, and no bounded new-turn recovery remained. "
+                            "The provider request was not replayed."
+                            if primary_reasoning_only_terminal
+                            else (
+                                "The model stream was interrupted after partial "
+                                "output. The harness did not transparently replay "
+                                "the request because doing so could duplicate "
+                                "already emitted content."
+                            )
+                        )
+                    )
+                    if primary_reasoning_only_terminal:
+                        for debug_evt in await debug_stream_event(
+                            (
+                                "primary.reasoning_only_stream_recovery.exhausted"
+                                if primary_recovery_exhausted
+                                else "primary.reasoning_only_stream_recovery.unavailable"
+                            ),
+                            {
+                                "iteration": budget.used,
+                                "finish_reason": terminal_finish_reason,
+                                "recovery_count": (
+                                    primary_reasoning_only_stream_recoveries
+                                ),
+                                "max_recoveries": (
+                                    _MAX_PRIMARY_REASONING_ONLY_STREAM_RECOVERIES
+                                ),
+                                "content_chars": 0,
+                                "reasoning_chars_discarded": len(full_reasoning),
+                                "stream_fragment_count": 0,
+                                "current_turn_dispatch_count": 0,
+                                "http_request_replayed": False,
+                            },
+                        ):
+                            yield debug_evt
                     await notify_turn_boundary("finished", {
                         "iteration": budget.used,
                         "finish_reason": "abandoned",
-                        "abandon_reason": "stream_interrupted_after_partial",
+                        "abandon_reason": terminal_finish_reason,
                         "content_chars": len(full_content),
                         "reasoning_chars": len(full_reasoning),
                         "tool_call_fragment_count": (
@@ -16361,7 +16739,7 @@ async def run_stream(
                     })
                     yield await emit_agent_event("run.failed", {
                         "error": msg,
-                        "finish_reason": "stream_interrupted_after_partial",
+                        "finish_reason": terminal_finish_reason,
                         "partial_content_chars": len(full_content),
                         "partial_reasoning_chars": len(full_reasoning),
                         "stream_fragment_count": (
@@ -16382,6 +16760,14 @@ async def run_stream(
                                 "detected_count", 0
                             ) or 0
                         ),
+                        "primary_reasoning_only_recovery_count": (
+                            primary_reasoning_only_stream_recoveries
+                        ),
+                        "primary_reasoning_only_recovery_turn": (
+                            iteration_primary_reasoning_only_recovery
+                        ),
+                        "reasoning_only_new_turn_recovery_available": False,
+                        "http_request_replayed": False,
                         "exception_kind": type(e).__name__,
                     })
                     yield {"type": "error", "msg": msg}
@@ -16536,14 +16922,79 @@ async def run_stream(
                     stream_interruption_recovery_queued = True
                     break
                 if not _stream_retry_is_safe(full_content, full_reasoning):
-                    msg = (
-                        "The model stream failed after partial output. The request was not "
-                        "replayed because a restarted stream could duplicate visible content."
+                    primary_reasoning_only_terminal = bool(
+                        agent_kind == "primary"
+                        and not delegated_subtask
+                        and not full_content
+                        and attempt_raw_content_chars == 0
+                        and full_reasoning.strip()
+                        and not tool_call_accumulator.fragment_count
+                        and run_state.tool_call_count
+                        == iteration_dispatch_count_start
                     )
+                    primary_recovery_exhausted = bool(
+                        primary_reasoning_only_terminal
+                        and primary_reasoning_only_stream_recoveries
+                        >= _MAX_PRIMARY_REASONING_ONLY_STREAM_RECOVERIES
+                    )
+                    terminal_finish_reason = (
+                        "primary_reasoning_only_stream_recovery_exhausted"
+                        if primary_recovery_exhausted
+                        else (
+                            "primary_reasoning_only_stream_unrecoverable"
+                            if primary_reasoning_only_terminal
+                            else "stream_interrupted_after_partial"
+                        )
+                    )
+                    msg = (
+                        (
+                            "The primary model stream failed after hidden reasoning "
+                            "but before any visible content or tool fragment. Its "
+                            "single bounded new-turn recovery was already used, so "
+                            "the run stopped without replaying the provider request."
+                        )
+                        if primary_recovery_exhausted
+                        else (
+                            "The primary model stream failed after hidden reasoning "
+                            "but before any visible content or tool fragment, and no "
+                            "bounded new-turn recovery remained. The provider request "
+                            "was not replayed."
+                            if primary_reasoning_only_terminal
+                            else (
+                                "The model stream failed after partial output. The "
+                                "request was not replayed because a restarted stream "
+                                "could duplicate visible content."
+                            )
+                        )
+                    )
+                    if primary_reasoning_only_terminal:
+                        for debug_evt in await debug_stream_event(
+                            (
+                                "primary.reasoning_only_stream_recovery.exhausted"
+                                if primary_recovery_exhausted
+                                else "primary.reasoning_only_stream_recovery.unavailable"
+                            ),
+                            {
+                                "iteration": budget.used,
+                                "finish_reason": terminal_finish_reason,
+                                "recovery_count": (
+                                    primary_reasoning_only_stream_recoveries
+                                ),
+                                "max_recoveries": (
+                                    _MAX_PRIMARY_REASONING_ONLY_STREAM_RECOVERIES
+                                ),
+                                "content_chars": 0,
+                                "reasoning_chars_discarded": len(full_reasoning),
+                                "stream_fragment_count": 0,
+                                "current_turn_dispatch_count": 0,
+                                "http_request_replayed": False,
+                            },
+                        ):
+                            yield debug_evt
                     await notify_turn_boundary("finished", {
                         "iteration": budget.used,
                         "finish_reason": "abandoned",
-                        "abandon_reason": "stream_interrupted_after_partial",
+                        "abandon_reason": terminal_finish_reason,
                         "content_chars": len(full_content),
                         "reasoning_chars": len(full_reasoning),
                         "tool_call_fragment_count": (
@@ -16552,7 +17003,7 @@ async def run_stream(
                     })
                     yield await emit_agent_event("run.failed", {
                         "error": msg,
-                        "finish_reason": "stream_interrupted_after_partial",
+                        "finish_reason": terminal_finish_reason,
                         "partial_content_chars": len(full_content),
                         "partial_reasoning_chars": len(full_reasoning),
                         "stream_fragment_count": (
@@ -16573,6 +17024,14 @@ async def run_stream(
                                 "detected_count", 0
                             ) or 0
                         ),
+                        "primary_reasoning_only_recovery_count": (
+                            primary_reasoning_only_stream_recoveries
+                        ),
+                        "primary_reasoning_only_recovery_turn": (
+                            iteration_primary_reasoning_only_recovery
+                        ),
+                        "reasoning_only_new_turn_recovery_available": False,
+                        "http_request_replayed": False,
                         "exception_kind": type(e).__name__,
                     })
                     yield {"type": "error", "msg": msg}
@@ -25734,14 +26193,25 @@ def _legacy_density_findings(
     workspace: Path,
     markdown_paths: list[str],
 ) -> list[str]:
-    findings: list[str] = []
     evidence_tool_count = _successful_evidence_tool_count(run_state)
-    for rel_path, path, stat in _likely_report_artifacts(workspace, markdown_paths):
+    assessments: list[dict[str, Any]] = []
+    for index, (rel_path, path, stat) in enumerate(
+        _likely_report_artifacts(workspace, markdown_paths)
+    ):
         try:
             _make_workspace_artifact_readable(path)
             content = path.read_text(encoding="utf-8", errors="replace")
         except PermissionError:
-            findings.append(f"Markdown report is not readable by the harness/backend: {rel_path}.")
+            terminal_rank = _terminal_report_artifact_rank(rel_path)
+            assessments.append({
+                "index": index,
+                "rel_path": rel_path,
+                "stat": stat,
+                "missing": ["is not readable by the harness/backend"],
+                "channels": [],
+                "terminal": terminal_rank > 0,
+                "terminal_rank": terminal_rank,
+            })
             continue
         except OSError:
             continue
@@ -25753,27 +26223,208 @@ def _legacy_density_findings(
             missing.append(f"only {metrics['h2']} H2 sections")
         if metrics["h3"] < MIN_COMPLEX_REPORT_H3:
             missing.append(f"only {metrics['h3']} H3 subsections")
-        if metrics["tables"] < MIN_COMPLEX_REPORT_TABLE_ROWS:
-            missing.append(f"only {metrics['tables']} table rows")
-        if evidence_tool_count and metrics["code_fences"] < MIN_COMPLEX_REPORT_CODE_FENCES_WITH_CODE:
-            missing.append(f"only {metrics['code_fences']} code/result blocks")
-        if evidence_tool_count and metrics["evidence_terms"] < 5:
-            missing.append("few explicit evidence/source/appendix/trace/result sections")
-        if metrics["links"] < 5 and evidence_tool_count:
-            missing.append(f"only {metrics['links']} Markdown citations/links")
-        if missing:
-            findings.append(
-                "Markdown report lacks expected structural/evidence density for a complex deliverable: "
-                f"{rel_path} has {', '.join(missing)}. Preserve worker/script outputs, source evidence, "
-                "trace-step mapping, appendices, and tables instead of condensing them into prose."
-            )
-    return findings
 
+        # Evidence density is format-dependent.  A clinical or policy report
+        # can preserve substantial evidence in tables, linked citations, and
+        # traceability appendices without containing executable code.  Treat
+        # these as substitutable channels instead of imposing every medium as
+        # an independent hard threshold.
+        evidence_channels: list[str] = []
+        if metrics["tables"] >= MIN_COMPLEX_REPORT_TABLE_ROWS:
+            evidence_channels.append("tables")
+        if metrics["links"] >= 5 or metrics["citations"] >= 5:
+            evidence_channels.append("citations/links")
+        if metrics["evidence_terms"] >= 3:
+            evidence_channels.append("evidence/appendix/trace sections")
+        if metrics["code_fences"] >= MIN_COMPLEX_REPORT_CODE_FENCES_WITH_CODE:
+            evidence_channels.append("code/result blocks")
+
+        required_channels = 2 if evidence_tool_count else 1
+        if len(evidence_channels) < required_channels:
+            present = ", ".join(evidence_channels) if evidence_channels else "none"
+            missing.append(
+                f"only {len(evidence_channels)} evidence-density channels "
+                f"({present}); expected at least {required_channels} across tables, "
+                "citations/links, explicit evidence/source/appendix/trace sections, "
+                "or code/result blocks"
+            )
+        terminal_rank = _terminal_report_artifact_rank(rel_path)
+        assessments.append({
+            "index": index,
+            "rel_path": rel_path,
+            "stat": stat,
+            "missing": missing,
+            "channels": evidence_channels,
+            "terminal": terminal_rank > 0,
+            "terminal_rank": terminal_rank,
+        })
+
+    if not assessments:
+        return []
+
+    # Intermediate merge inputs and scratch expansions are not independent
+    # deliverables.  An explicit final cohort supersedes weaker complete/full
+    # checkpoints; absent a strong final, assess the weak terminal cohort.
+    # Require every member of the selected cohort to pass, otherwise retain
+    # the legacy best-candidate fallback.  A failure names only the closest
+    # candidate so follow-up work can converge instead of growing an
+    # impossible list of mutually incompatible blockers.
+    strong_terminal_assessments = [
+        assessment for assessment in assessments
+        if assessment.get("terminal_rank") == 2
+    ]
+    terminal_assessments = strong_terminal_assessments or [
+        assessment for assessment in assessments if assessment["terminal"]
+    ]
+    if terminal_assessments:
+        # Every explicitly terminal-looking deliverable must be healthy.  A
+        # dense ancillary ``*_report.md`` must not mask a thin ``*_final.md``
+        # merely because both happen to enter the terminal cohort.  Keep the
+        # response convergent by reporting only the closest failing candidate
+        # below rather than emitting one blocker per file.
+        candidates = [
+            assessment
+            for assessment in terminal_assessments
+            if assessment["missing"]
+        ]
+        if not candidates:
+            return []
+    else:
+        # With no filename that clearly claims terminal status, retain the
+        # legacy best-artifact fallback: one satisfactory candidate is enough
+        # because the harness has no reliable basis for declaring every
+        # Markdown artifact an independent final deliverable.
+        candidates = assessments
+        if any(not assessment["missing"] for assessment in candidates):
+            return []
+    best = min(
+        candidates,
+        key=lambda assessment: (
+            len(assessment["missing"]),
+            -len(assessment["channels"]),
+            -int(getattr(assessment["stat"], "st_size", 0) or 0),
+            int(assessment["index"]),
+        ),
+    )
+    return [
+        "Markdown report lacks expected structural/evidence density for a complex deliverable: "
+        f"{best['rel_path']} has {', '.join(best['missing'])}. Preserve worker/script outputs, "
+        "source evidence, trace-step mapping, appendices, and tables instead of condensing them "
+        "into prose."
+    ]
+
+
+_LEGACY_REPORT_STRONG_TERMINAL_ENGLISH_RE = re.compile(
+    r"(?:^|[._\-\s])final(?:$|[._\-\s])",
+    re.IGNORECASE,
+)
+_LEGACY_REPORT_WEAK_TERMINAL_ENGLISH_RE = re.compile(
+    r"(?:^|[._\-\s])(?:full|complete|completed)(?:$|[._\-\s])",
+    re.IGNORECASE,
+)
+_LEGACY_REPORT_STRONG_TERMINAL_TERMS = (
+    # Only markers that explicitly claim a finished/final artifact belong in
+    # the strongest must-all-pass terminal cohort.  A strong final supersedes
+    # earlier ``complete``/``full`` checkpoints left in the same workspace.
+    # Chinese (simplified/traditional), Japanese, and Korean report/final
+    # filename conventions.  These are intentionally domain-neutral and are
+    # used only by the no-Skill-contract legacy fallback.
+    "最终",
+    "最終",
+    "终稿",
+    "終稿",
+    "定稿",
+    "正式版",
+    "確定版",
+    "최종",
+    "확정본",
+)
+_LEGACY_REPORT_WEAK_TERMINAL_TERMS = (
+    "完整版",
+    "完整報告",
+    "完成版",
+    "完全版",
+    "완성본",
+    "완료본",
+)
+_LEGACY_REPORT_INTERMEDIATE_TERMS = (
+    "draft",
+    "partial",
+    "incomplete",
+    "continuation",
+    "expansion",
+    "scratch",
+    "checkpoint",
+    "working",
+    "wip",
+    # Chinese (simplified/traditional), Japanese, and Korean draft/work-in-
+    # progress conventions.  Intermediate terms take precedence over terminal
+    # terms so names such as ``最终报告_修订中.md`` remain non-terminal.
+    "草稿",
+    "初稿",
+    "中间稿",
+    "中間稿",
+    "工作稿",
+    "临时",
+    "臨時",
+    "未完成",
+    "续写",
+    "續寫",
+    "扩展",
+    "擴展",
+    "修订中",
+    "修訂中",
+    "待完善",
+    "下書き",
+    "作業中",
+    "途中",
+    "暫定",
+    "ドラフト",
+    "초안",
+    "작업중",
+    "중간본",
+    "임시본",
+    "미완성",
+    "진행중",
+    "드래프트",
+)
+
+
+def _terminal_report_artifact_rank(rel_path: str) -> int:
+    """Classify report-like filenames as non-terminal, weak, or strong.
+
+    ``complete``/``full`` commonly name a pre-final assembly checkpoint.  A
+    later explicit ``final`` artifact therefore supersedes weak checkpoints,
+    while multiple explicit final artifacts remain independently accountable.
+    """
+
+    name = PurePosixPath(str(rel_path or "")).name.casefold()
+    stem = PurePosixPath(name).stem
+    if stem.startswith("_") or any(
+        term in stem for term in _LEGACY_REPORT_INTERMEDIATE_TERMS
+    ):
+        return 0
+    # English markers require filename-token boundaries: substring matching
+    # would misclassify names such as ``incomplete_report``, ``finality_notes``
+    # or ``fulfillment``. CJK conventions do not use the same separators and
+    # intentionally retain substring matching.
+    if bool(_LEGACY_REPORT_STRONG_TERMINAL_ENGLISH_RE.search(stem)) or any(
+        term in stem for term in _LEGACY_REPORT_STRONG_TERMINAL_TERMS
+    ):
+        return 2
+    if bool(_LEGACY_REPORT_WEAK_TERMINAL_ENGLISH_RE.search(stem)) or any(
+        term in stem for term in _LEGACY_REPORT_WEAK_TERMINAL_TERMS
+    ):
+        return 1
+    return 0
+
+
+def _is_likely_terminal_report_artifact(rel_path: str) -> bool:
+    return _terminal_report_artifact_rank(rel_path) > 0
 
 
 def _likely_report_artifacts(workspace: Path, markdown_paths: list[str]) -> list[tuple[str, Path, Any]]:
-    candidates: list[tuple[str, Path, Any, bool]] = []
-    report_terms = ("report", "final", "full", "comprehensive", "dossier", "development_plan", "plan")
+    candidates: list[tuple[str, Path, Any, int]] = []
     for rel_path in _dedupe_paths(markdown_paths):
         try:
             path = (workspace / rel_path).resolve()
@@ -25783,20 +26434,32 @@ def _likely_report_artifacts(workspace: Path, markdown_paths: list[str]) -> list
             continue
         if not path.is_file() or path.is_symlink() or path.name.lower() in {"readme.md", "_checklist.md", "checklist.md"}:
             continue
-        lower_name = path.name.lower()
-        candidates.append((rel_path, path, stat, any(term in lower_name for term in report_terms)))
+        candidates.append((
+            rel_path,
+            path,
+            stat,
+            _terminal_report_artifact_rank(path.name),
+        ))
     if not candidates:
         return []
     candidates = sorted(
         candidates,
-        key=lambda item: (not item[3], -int(item[2].st_size or 0), item[0]),
+        key=lambda item: (-item[3], -int(item[2].st_size or 0), item[0]),
     )
     return [(rel, path, stat) for rel, path, stat, _ in candidates]
 
 
 def _markdown_metrics(content: str) -> dict[str, int]:
     lines = content.splitlines()
-    lower = content.lower()
+    evidence_marker_groups = (
+        r"\b(?:evidence|evidentiary)\b|证据|循证|依据",
+        r"\b(?:source|sources)\b|来源|数据源",
+        r"\b(?:appendix|appendices)\b|附录",
+        r"\b(?:trace|traceability|tracing)\b|溯源|追溯|追踪",
+        r"\b(?:artifact|artifacts|deliverable|deliverables)\b|产物|交付物",
+        r"\b(?:reference|references|citation|citations)\b|参考|引用|文献",
+        r"\b(?:output|outputs|result|results)\b|输出|结果",
+    )
     return {
         "h1": sum(1 for line in lines if line.startswith("# ")),
         "h2": sum(1 for line in lines if line.startswith("## ")),
@@ -25804,7 +26467,14 @@ def _markdown_metrics(content: str) -> dict[str, int]:
         "tables": sum(1 for line in lines if line.strip().startswith("|") and line.strip().endswith("|")),
         "code_fences": sum(1 for line in lines if line.strip().startswith("```")) // 2,
         "links": len(re.findall(r"\[[^\]]+\]\([^)]+\)", content)),
-        "evidence_terms": sum(1 for term in ("evidence", "source", "appendix", "trace", "artifact", "reference", "citation", "output", "result") if term in lower),
+        "citations": len(re.findall(
+            r"\[(?:\d{1,4}(?:\s*[-–,]\s*\d{1,4})*)\](?!\()",
+            content,
+        )),
+        "evidence_terms": sum(
+            1 for pattern in evidence_marker_groups
+            if re.search(pattern, content, re.IGNORECASE)
+        ),
     }
 
 def _verifier_payload(
@@ -27241,7 +27911,13 @@ def _semantic_skill_selector_arguments(
         choice = choices[0]
         if not isinstance(choice, dict):
             return None, "response_choice_invalid"
-        if choice.get("finish_reason") != "tool_calls":
+        # Some OpenAI-compatible servers return ``stop`` even when a forced,
+        # fully materialized function call is present.  The call itself remains
+        # the authority boundary: below we still require exactly one call to
+        # the disclosed selector and strictly validate its complete arguments.
+        # Other terminal reasons (notably ``length``/``content_filter``) cannot
+        # attest that the structured call is complete and remain fail-closed.
+        if choice.get("finish_reason") not in {"tool_calls", "stop"}:
             return None, "typed_finish_reason_invalid"
         message = choice.get("message")
         if not isinstance(message, dict):
@@ -27662,6 +28338,7 @@ def _deterministic_complex_skill_selection(
     loaded_packages: dict[str, dict[str, Any]],
     *,
     relevance_selected_skill_names: tuple[str, ...] = (),
+    explicit_selected_skill_names: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
     """Select a complex-request Skill without treating model choice as authority.
 
@@ -27691,7 +28368,20 @@ def _deterministic_complex_skill_selection(
     if explicit_matches == [viewed_skill_name]:
         return (viewed_skill_name,)
 
-    if relevance_selected_skill_names != (viewed_skill_name,):
+    # Exact activation was already resolved from a user action clause at the
+    # ingress boundary.  Re-running the description-relevance selector here
+    # would make generic, unambiguous requests such as "use this Skill" lose
+    # their selection merely because the request and description use different
+    # words.  Reuse only an exact *single* ingress selection; this advances to
+    # canonical digest binding and the typed finite capability planner, not to
+    # execution authority.
+    explicitly_selected = (
+        explicit_selected_skill_names == (viewed_skill_name,)
+    )
+    if (
+        not explicitly_selected
+        and relevance_selected_skill_names != (viewed_skill_name,)
+    ):
         decision = _bounded_session_skill_relevance_selection(
             text,
             {

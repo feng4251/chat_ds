@@ -1,24 +1,79 @@
 services:
 
+  searxng-valkey:
+    profiles:
+      - local-search
+    image: docker.io/valkey/valkey:9-alpine@sha256:c9b77919daeba2c02ad954d0c844cc4e7142069d177b89c5fd771f405daf9e02
+    container_name: chat_acits_searxng_valkey
+    restart: unless-stopped
+    command:
+      - valkey-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - ${SEARXNG_VALKEY_MAXMEMORY:-128mb}
+      - --maxmemory-policy
+      - noeviction
+      - --loglevel
+      - warning
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    volumes:
+      - searxng_valkey_data:/data
+    networks:
+      - search_net
+
   searxng:
     profiles:
       - local-search
-    build:
-      context: ./searxng-master
-      dockerfile: Dockerfile.chatds
+    # Pinned official image for upstream commit 8456831a (2026-07-09).
+    # Keeping the complete SearXNG source tree outside this application repo
+    # makes a clean checkout reproducible instead of relying on local files.
+    image: docker.io/searxng/searxng:2026.7.9-8456831a0@sha256:a7b2b16eb4d79c2f0f6cff84fab9c41137e4e6dd29a1f64e2d785d27acb5a2e0
     container_name: chat_acits_searxng
     restart: unless-stopped
+    depends_on:
+      searxng-valkey:
+        condition: service_healthy
     environment:
       SEARXNG_PORT: ${SEARXNG_PORT:-8080}
       SEARXNG_BIND_ADDRESS: 0.0.0.0
-      SEARXNG_SECRET: ${SEARXNG_SECRET:-chat-ds-local-searxng-change-me}
+      # Keep the optional profile parseable when local search is disabled,
+      # but fail closed at container startup if the profile is enabled
+      # without a deployment-owned secret.
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-}
+      SEARXNG_VALKEY_URL: ${SEARXNG_VALKEY_URL:-valkey://searxng-valkey:6379/0}
+      # limiter.toml pass-lists the production Harness. This protects the LAN
+      # endpoint without throttling the trusted JSON API caller.
+      SEARXNG_LIMITER: ${SEARXNG_LIMITER:-true}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        test -n "$$SEARXNG_SECRET" &&
+        exec /usr/local/searxng/entrypoint.sh
     ports:
       - "${SEARXNG_HOST_BIND:-127.0.0.1}:${SEARXNG_HOST_PORT:-8088}:8080"
     volumes:
       - ./searxng:/etc/searxng:rw
       - searxng_data:/var/cache/searxng
     networks:
-      - chat_net
+      - search_net
+    healthcheck:
+      test:
+        - CMD
+        - /usr/local/searxng/.venv/bin/python
+        - -c
+        - "import urllib.request; raise SystemExit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2).read() == b'OK' else 1)"
+      interval: 10s
+      timeout: 4s
+      retries: 12
+      start_period: 15s
 
   executor:
     build:
@@ -45,6 +100,73 @@ services:
     volumes:
       - executor_socket:/run/chat-ds-executor
 
+  # A one-shot, networkless permission initializer is retained even though a
+  # brand-new volume copies the sidecar image's ownership metadata.  It also
+  # makes upgrades safe when the named volume already exists with root:root
+  # ownership from an older deployment.  Reuse the locally-built browser
+  # image so production startup never depends on pulling a utility image from
+  # an external registry.
+  browser-socket-init:
+    image: chat_ds-browser
+    pull_policy: never
+    container_name: chat_acits_browser_socket_init
+    restart: "no"
+    network_mode: none
+    user: "0:0"
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+    security_opt:
+      - no-new-privileges:true
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["chown 65532:65532 /run/chat-ds-browser && chmod 0700 /run/chat-ds-browser"]
+    volumes:
+      - browser_cdp_socket:/run/chat-ds-browser
+
+  browser:
+    image: chat_ds-browser
+    build:
+      context: ./browser_sidecar
+    container_name: chat_acits_browser
+    restart: unless-stopped
+    init: true
+    depends_on:
+      browser-socket-init:
+        condition: service_completed_successfully
+    user: "65532:65532"
+    read_only: true
+    pids_limit: 256
+    mem_limit: 2g
+    cpus: 2.0
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      # Docker's stock seccomp policy blocks Chromium's user-namespace
+      # bootstrap on the production kernels. Chromium still installs its own
+      # renderer seccomp filters; the outer container remains non-root,
+      # capability-free, read-only, and isolated from the business network.
+      - seccomp:unconfined
+    environment:
+      BROWSER_CDP_SOCKET: /run/chat-ds-browser/cdp.sock
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+      - /dev/shm:size=512m,mode=1777
+    volumes:
+      - browser_cdp_socket:/run/chat-ds-browser
+    networks:
+      - browser_egress
+    healthcheck:
+      test: ["CMD", "python", "-I", "/app/server.py", "--healthcheck"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    stop_grace_period: 10s
+
   harness:
     build:
       context: ./harness
@@ -52,6 +174,8 @@ services:
     restart: unless-stopped
     depends_on:
       executor:
+        condition: service_healthy
+      browser:
         condition: service_healthy
     environment:
       # Backward-compatible env key; this endpoint serves AgentModel (GLM-5.2).
@@ -72,16 +196,38 @@ services:
       # Allows multiple admission cohorts in one complex delegated batch;
       # each child/model/tool path retains its own tighter bounded controls.
       DELEGATION_BATCH_TIMEOUT_SECONDS: ${DELEGATION_BATCH_TIMEOUT_SECONDS:-3600}
-      WEB_SEARCH_PROVIDERS: ${WEB_SEARCH_PROVIDERS:-searxng,ddg}
+      # Absolute ceiling for a stream that continues making real progress.
+      # Initial-response and read-stall leases remain independently shorter.
+      LLM_STREAM_TOTAL_TIMEOUT_SECONDS: ${LLM_STREAM_TOTAL_TIMEOUT_SECONDS:-2400}
+      WEB_SEARCH_PROVIDERS: ${WEB_SEARCH_PROVIDERS:-searxng}
       SEARXNG_BASE_URL: ${SEARXNG_BASE_URL:-http://searxng:8080}
       SEARXNG_TIMEOUT_SECONDS: ${SEARXNG_TIMEOUT_SECONDS:-10}
+      BROWSER_PRIVATE_ORIGIN_ALLOWLIST: ${BROWSER_PRIVATE_ORIGIN_ALLOWLIST:-}
+      BROWSER_DNS_SYNTHETIC_PUBLIC_RANGES: ${BROWSER_DNS_SYNTHETIC_PUBLIC_RANGES:-}
+      # Chromium is reachable only through a dedicated named-volume socket.
+      # No CDP port or browser service name exists on chat_net.
+      BROWSER_CDP_SOCKET: /run/chat-ds-browser/cdp.sock
+      BROWSER_CDP_CONNECT_TIMEOUT_SECONDS: ${BROWSER_CDP_CONNECT_TIMEOUT_SECONDS:-10}
     volumes:
       - ./data:/app/data
       - ./harness/data/memories:/app/data/memories
       - /nfs/temp/chat_ds:/nfs/temp/chat_ds
       - executor_socket:/run/chat-ds-executor
+      - browser_cdp_socket:/run/chat-ds-browser:ro
     networks:
       - chat_net
+      - search_net
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -I
+        - -c
+        - "import urllib.request; raise SystemExit(0 if urllib.request.urlopen('http://127.0.0.1:8020/health', timeout=2).status == 200 else 1)"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
 
   backend:
     build:
@@ -89,7 +235,8 @@ services:
     container_name: chat_acits_backend
     restart: unless-stopped
     depends_on:
-      - harness
+      harness:
+        condition: service_healthy
     environment:
       # SQLite on local Docker volume — NFS locks break aiosqlite
       DATABASE_URL: sqlite+aiosqlite:////app/db/chat_ds.db
@@ -127,11 +274,26 @@ services:
 networks:
   chat_net:
     driver: bridge
+  # Egress-only browser network.  Harness/backend/frontend are deliberately
+  # absent, so a compromised renderer cannot resolve or dial chat_net peers.
+  browser_egress:
+    driver: bridge
+  # Stable, application-owned source range for SearXNG limiter pass-listing.
+  # Only the search stack and trusted Harness join this network.
+  search_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.29.250.0/24
 
 volumes:
   chat_ds_db:
     driver: local
   executor_socket:
     driver: local
+  browser_cdp_socket:
+    driver: local
   searxng_data:
+    driver: local
+  searxng_valkey_data:
     driver: local

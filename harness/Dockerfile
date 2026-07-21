@@ -1,23 +1,25 @@
 FROM python:3.12-slim
 WORKDIR /app
 
-# TUNA mirrors (faster from China intranet)
+# TUNA mirrors (faster from China intranet).  The default Debian CDN is slow
+# enough on the production network to make immutable browser-image builds
+# unreliable, so route both the main and security suites explicitly.
+RUN sed -i \
+    -e 's|http://deb.debian.org/debian-security|https://mirrors.tuna.tsinghua.edu.cn/debian-security|g' \
+    -e 's|http://deb.debian.org/debian|https://mirrors.tuna.tsinghua.edu.cn/debian|g' \
+    /etc/apt/sources.list.d/debian.sources
+
 RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
 
-# trafilatura needs libxml2 / libxslt at runtime
-# Playwright needs additional system deps for headless Chromium
+# trafilatura needs libxml2 / libxslt at runtime.  Chromium is deliberately
+# absent: browser execution lives in the locked-down browser sidecar and the
+# Harness is only a Playwright CDP client.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential libxml2-dev libxslt1-dev \
-    libnss3 libnspr4 libatk-bridge2.0-0 libatk1.0-0 libcups2 libdrm2 \
-    libdbus-1-3 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
-    libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Install Chromium for Playwright (system deps only, reuses the chromium bundle)
-# RUN python -m playwright install chromium --with-deps  # disabled: network issues
 
 # Clean up build deps (keep runtime libs)
 RUN apt-get purge -y --auto-remove build-essential libxml2-dev libxslt1-dev && \

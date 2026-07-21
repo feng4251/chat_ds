@@ -1,26 +1,92 @@
 use_default_settings:
   engines:
+    # Keep a deliberately small, key-free general-search pool. Engines that
+    # need credentials or are especially prone to blocking are not loaded.
     keep_only:
+      - baidu
+      - 360search
+      - sogou
+      - yahoo
+      - mojeek
       - bing
-      - bing news
 
 engines:
+  # Chinese-first primary. Each scraper has its own one-connection pool so
+  # concurrent agent searches queue locally instead of stampeding upstream.
+  # SearXNG still queries different engines concurrently.
+  - name: baidu
+    engine: baidu
+    baidu_category: general
+    shortcut: bd
+    disabled: false
+    weight: 2.0
+    timeout: 6.0
+    max_connections: 1
+    max_keepalive_connections: 1
+    keepalive_expiry: 30.0
+
+  - name: 360search
+    engine: 360search
+    shortcut: 360so
+    disabled: false
+    weight: 1.4
+    timeout: 8.0
+    max_connections: 1
+    max_keepalive_connections: 1
+    keepalive_expiry: 30.0
+
+  - name: sogou
+    engine: sogou
+    shortcut: sogou
+    disabled: false
+    weight: 1.3
+    timeout: 8.0
+    max_connections: 1
+    max_keepalive_connections: 1
+    keepalive_expiry: 30.0
+
+  - name: yahoo
+    engine: yahoo
+    shortcut: yh
+    disabled: false
+    weight: 1.2
+    timeout: 8.0
+    max_connections: 1
+    max_keepalive_connections: 1
+    keepalive_expiry: 30.0
+
+  - name: mojeek
+    engine: mojeek
+    shortcut: mjk
+    categories: [general, web]
+    disabled: false
+    weight: 1.0
+    timeout: 8.0
+    max_connections: 1
+    max_keepalive_connections: 1
+    keepalive_expiry: 30.0
+
+  # Bing has returned HTTP-200 result pages containing unrelated results, which
+  # is not a transport failure. Keep it at low weight in the requested general
+  # engine pool; Harness quality checks reject polluted individual results.
   - name: bing
     engine: bing
     shortcut: bi
     base_url: https://www.bing.com
     disabled: false
-
-  - name: bing news
-    engine: bing_news
-    shortcut: bin
-    base_url: https://www.bing.com
-    disabled: false
+    weight: 0.2
+    timeout: 6.0
+    max_connections: 1
+    max_keepalive_connections: 1
+    keepalive_expiry: 30.0
 
 server:
   bind_address: "0.0.0.0"
   port: 8080
   secret_key: "${SEARXNG_SECRET:-chat-ds-local-searxng-change-me}"
+  # The built-in limiter protects this instance from inbound clients; it does
+  # not rate-limit requests per upstream engine. Compose enables it and the
+  # production Harness is explicitly pass-listed in limiter.toml.
   limiter: false
   public_instance: false
   image_proxy: false
@@ -30,13 +96,36 @@ search:
   safe_search: 1
   autocomplete: ""
   default_lang: "auto"
+  # Back off hard on explicit upstream denials. Ordinary parser/transport
+  # failures retain a short bounded ban and can be served by other engines.
+  ban_time_on_fail: 15
+  max_ban_time_on_fail: 300
+  suspended_times:
+    SearxEngineAccessDenied: 21600
+    SearxEngineCaptcha: 86400
+    SearxEngineTooManyRequests: 3600
+    cf_SearxEngineCaptcha: 1296000
+    cf_SearxEngineAccessDenied: 86400
+    recaptcha_SearxEngineCaptcha: 604800
   formats:
     - html
     - json
 
 outgoing:
   request_timeout: 8.0
-  max_request_timeout: 12.0
+  # Stay below the Harness's default 10-second SearXNG request budget so a
+  # slow engine is reported by SearXNG instead of aborting the whole provider.
+  max_request_timeout: 9.0
+  pool_connections: 12
+  pool_maxsize: 6
+  keepalive_expiry: 30.0
+  retries: 0
+  enable_http2: true
 
+# Required by SearXNG's optional inbound limiter and available to built-in
+# state that uses Valkey. Query-result caching/singleflight belongs in the
+# Harness broker; SearXNG does not cache general SERPs here. The local-search
+# Compose profile enables this through SEARXNG_VALKEY_URL; keeping the file
+# default false also lets the config be used safely without that profile.
 valkey:
   url: false

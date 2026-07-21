@@ -917,6 +917,9 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
         task_text="read a file",
         verified_preloaded_input_receipt=None,
         persistent_tool_surface=False,
+        required_tool_surface=False,
+        requested_max_tokens=None,
+        provider_context_length=64_000,
     ):
         """Run provider turns with an optional explicit-repair fallback."""
         requests = []
@@ -1005,7 +1008,7 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
             "api_key": "EMPTY",
             "protocol": "openai",
             "provider": "mock",
-            "context_length": 64_000,
+            "context_length": provider_context_length,
             "is_multimodal": False,
             "supports_thinking_toggle": True,
             "thinking_enabled_by_default": True,
@@ -1017,11 +1020,15 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
                 return_value=DirectToolExposure(
                     tools=(enabled_tool,) if enabled_tool else (),
                     reasons=("test_persistent_tool_surface",),
-                    required_groups=(),
+                    required_groups=(
+                        ((enabled_tool,),)
+                        if required_tool_surface and enabled_tool
+                        else ()
+                    ),
                     missing_requirements=(),
                 ),
             )
-            if persistent_tool_surface
+            if persistent_tool_surface or required_tool_surface
             else nullcontext()
         )
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1068,6 +1075,7 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
                         verified_preloaded_input_receipt=(
                             verified_preloaded_input_receipt
                         ),
+                        max_tokens=requested_max_tokens,
                     )
                 ]
         return requests, dispatch_mock, events
@@ -1078,9 +1086,15 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
         *,
         tool_name="read_file",
         argument_name=None,
+        arguments=None,
     ):
         argument_name = argument_name or (
             "query" if tool_name == "web_search" else "filepath"
+        )
+        tool_arguments = (
+            arguments
+            if arguments is not None
+            else {argument_name: value}
         )
         return [
             "data: " + json.dumps({
@@ -1092,7 +1106,7 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
                             "type": "function",
                             "function": {
                                 "name": tool_name,
-                                "arguments": json.dumps({argument_name: value}),
+                                "arguments": json.dumps(tool_arguments),
                             },
                         }],
                     },
@@ -5673,7 +5687,7 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual("error", events[-1]["type"])
 
-    async def test_primary_reasoning_only_stream_interrupt_does_not_recover(self):
+    async def test_primary_reasoning_only_stream_interrupt_recovers_as_new_turn(self):
         interrupted = [
             "data: " + json.dumps({
                 "choices": [{
@@ -5684,23 +5698,349 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
             asyncio.TimeoutError("fixture stream timeout"),
         ]
         requests, dispatch_mock, events = await self._run_stream_sequence(
+            [interrupted, self._stop_lines("bounded primary answer")],
+            max_iterations=3,
+            delegated=False,
+            enabled_tool="",
+            task_text="Explain the bounded result.",
+            requested_max_tokens=262_144,
+            provider_context_length=303_872,
+        )
+
+        self.assertEqual(["stream", "stream"], [
+            request["kind"] for request in requests
+        ])
+        dispatch_mock.assert_not_awaited()
+        self.assertNotIn(
+            "primary-analysis",
+            json.dumps(requests[1]["body"]["messages"], ensure_ascii=False),
+        )
+        recovery_history = json.dumps(
+            requests[1]["body"]["messages"], ensure_ascii=False
+        )
+        self.assertIn("new logical turn, not an HTTP replay", recovery_history)
+        self.assertNotIn("chat_template_kwargs", requests[0]["body"])
+        self.assertEqual(
+            {"enable_thinking": False},
+            requests[1]["body"].get("chat_template_kwargs"),
+        )
+        self.assertEqual(262_144, requests[1]["body"].get("max_tokens"))
+        recovery_debug = next(
+            event for event in events
+            if event.get("event_type") == "debug.llm.request"
+            and event.get("payload", {}).get(
+                "primary_reasoning_only_stream_recovery"
+            )
+        )["payload"]
+        self.assertIsNone(recovery_debug["primary_phase_max_tokens"])
+        self.assertEqual(262_144, recovery_debug["requested_max_tokens"])
+        gate = next(
+            event for event in events
+            if event.get("event_type") == "debug.gate.continuation"
+            and event.get("payload", {}).get("gate")
+            == "primary_reasoning_only_stream_recovery"
+        )
+        self.assertEqual(0, gate["payload"]["current_turn_dispatch_count"])
+        self.assertFalse(gate["payload"]["http_request_replayed"])
+        self.assertTrue(gate["payload"]["logical_recovery_turn"])
+        self.assertTrue(gate["payload"]["prior_runtime_state_preserved"])
+        self.assertTrue(any(
+            event.get("event_type") == "debug.gate.continuation"
+            and event.get("payload", {}).get("gate")
+            == "primary_reasoning_only_stream_recovery"
+            for event in events
+        ))
+        self.assertTrue(any(
+            event.get("event_type")
+            == "debug.primary.reasoning_only_stream_recovery.requested"
+            for event in events
+        ))
+        self.assertFalse(any(
+            event.get("event_type") == "run.failed" for event in events
+        ))
+        self.assertEqual("done", events[-1]["type"])
+
+    async def test_primary_mandatory_frontier_has_phase_budget_and_no_thinking(self):
+        requests, dispatch_mock, events = await self._run_stream_sequence(
+            [
+                self._valid_tool_lines("bounded.md"),
+                self._stop_lines("read completed"),
+            ],
+            max_iterations=3,
+            delegated=False,
+            enabled_tool="read_file",
+            task_text="read a file",
+            requested_max_tokens=262_144,
+            provider_context_length=303_872,
+        )
+
+        self.assertEqual(2, len(requests))
+        dispatch_mock.assert_awaited_once()
+        first = requests[0]["body"]
+        self.assertEqual("required", first.get("tool_choice"))
+        self.assertEqual(8_192, first.get("max_tokens"))
+        self.assertEqual(
+            {"enable_thinking": False},
+            first.get("chat_template_kwargs"),
+        )
+        # The cap is phase-local: terminal synthesis retains the caller's
+        # larger allowance when the provider context can admit it.
+        self.assertGreater(requests[1]["body"].get("max_tokens", 0), 8_192)
+        first_debug = next(
+            event for event in events
+            if event.get("event_type") == "debug.llm.request"
+            and event.get("payload", {}).get("iteration") == 1
+        )["payload"]
+        self.assertTrue(first_debug["primary_mandatory_control_tool_frontier"])
+        self.assertTrue(first_debug["primary_bounded_argument_tool_frontier"])
+        self.assertEqual(8_192, first_debug["primary_phase_max_tokens"])
+        self.assertEqual(262_144, first_debug["caller_requested_max_tokens"])
+        self.assertEqual(8_192, first_debug["requested_max_tokens"])
+        self.assertTrue(first_debug["thinking_disabled"])
+
+    async def test_primary_large_argument_frontier_keeps_caller_budget_and_no_thinking(self):
+        requests, dispatch_mock, events = await self._run_stream_sequence(
+            [
+                self._valid_tool_lines(
+                    tool_name="write_file",
+                    arguments={
+                        "filepath": "large-report.md",
+                        "content": "complete report body",
+                    },
+                ),
+                *[
+                    self._stop_lines(
+                        f"artifact enforcement fixture stop {index}"
+                    )
+                    for index in range(12)
+                ],
+            ],
+            # The dispatch mock intentionally does not materialize a file, so
+            # artifact enforcement may consume its bounded follow-up turns.
+            # Those fixture turns are irrelevant to the first wire request.
+            max_iterations=3,
+            delegated=False,
+            enabled_tool="write_file",
+            task_text="write a file named x.md",
+            required_tool_surface=True,
+            requested_max_tokens=262_144,
+            provider_context_length=303_872,
+        )
+
+        self.assertGreaterEqual(len(requests), 1)
+        dispatch_mock.assert_awaited_once()
+        first = requests[0]["body"]
+        self.assertEqual("required", first.get("tool_choice"))
+        # write_file carries the artifact in its arguments.  The mandatory
+        # control boundary still disables hidden thinking, but must not apply
+        # the 8K small-argument cap and truncate the content payload.
+        self.assertEqual(262_144, first.get("max_tokens"))
+        self.assertEqual(
+            {"enable_thinking": False},
+            first.get("chat_template_kwargs"),
+        )
+        first_debug = next(
+            event for event in events
+            if event.get("event_type") == "debug.llm.request"
+            and event.get("payload", {}).get("iteration") == 1
+        )["payload"]
+        self.assertTrue(first_debug["primary_mandatory_control_tool_frontier"])
+        self.assertFalse(first_debug["primary_bounded_argument_tool_frontier"])
+        self.assertIsNone(first_debug["primary_phase_max_tokens"])
+        self.assertEqual(262_144, first_debug["requested_max_tokens"])
+        self.assertEqual(262_144, first_debug["caller_requested_max_tokens"])
+        self.assertTrue(first_debug["thinking_disabled"])
+
+    async def test_primary_reasoning_recovery_preserves_prior_dispatch_state(self):
+        interrupted = [
+            "data: " + json.dumps({
+                "choices": [{
+                    "delta": {
+                        "reasoning_content": "discarded-synthesis-analysis",
+                    },
+                    "finish_reason": None,
+                }],
+            }),
+            asyncio.TimeoutError("fixture post-dispatch reasoning timeout"),
+        ]
+        requests, dispatch_mock, events = await self._run_stream_sequence(
+            [
+                self._valid_tool_lines("bounded.md"),
+                interrupted,
+                self._stop_lines("read completed from retained result"),
+            ],
+            max_iterations=4,
+            delegated=False,
+            enabled_tool="read_file",
+            task_text="read a file",
+            requested_max_tokens=262_144,
+            provider_context_length=303_872,
+        )
+
+        self.assertEqual(3, len(requests))
+        dispatch_mock.assert_awaited_once()
+        recovery_messages = requests[2]["body"]["messages"]
+        self.assertTrue(any(
+            message.get("role") == "tool" for message in recovery_messages
+        ))
+        self.assertNotIn(
+            "discarded-synthesis-analysis",
+            json.dumps(recovery_messages, ensure_ascii=False),
+        )
+        self.assertEqual(
+            {"enable_thinking": False},
+            requests[2]["body"].get("chat_template_kwargs"),
+        )
+        self.assertEqual(262_144, requests[2]["body"].get("max_tokens"))
+        gate = next(
+            event for event in events
+            if event.get("event_type") == "debug.gate.continuation"
+            and event.get("payload", {}).get("gate")
+            == "primary_reasoning_only_stream_recovery"
+        )
+        self.assertEqual(0, gate["payload"]["current_turn_dispatch_count"])
+        self.assertEqual(1, gate["payload"]["prior_dispatch_count_preserved"])
+        self.assertFalse(gate["payload"]["mandatory_control_tool_frontier"])
+        self.assertTrue(gate["payload"]["prior_runtime_state_preserved"])
+        self.assertFalse(any(
+            event.get("event_type") == "run.failed" for event in events
+        ))
+
+    async def test_primary_reasoning_only_recovery_second_interrupt_is_terminal(self):
+        def interrupted(secret):
+            return [
+                "data: " + json.dumps({
+                    "choices": [{
+                        "delta": {"reasoning_content": secret},
+                        "finish_reason": None,
+                    }],
+                }),
+                asyncio.TimeoutError("fixture stream timeout"),
+            ]
+
+        requests, dispatch_mock, events = await self._run_stream_sequence(
+            [
+                interrupted("first-primary-analysis"),
+                interrupted("second-primary-analysis"),
+                self._stop_lines("must not be requested"),
+            ],
+            max_iterations=4,
+            delegated=False,
+            enabled_tool="",
+            task_text="Explain the bounded result.",
+        )
+
+        self.assertEqual(["stream", "stream"], [
+            request["kind"] for request in requests
+        ])
+        dispatch_mock.assert_not_awaited()
+        self.assertEqual(1, sum(
+            event.get("event_type") == "debug.gate.continuation"
+            and event.get("payload", {}).get("gate")
+            == "primary_reasoning_only_stream_recovery"
+            for event in events
+        ))
+        failed = next(
+            event for event in events if event.get("event_type") == "run.failed"
+        )
+        self.assertEqual(
+            "primary_reasoning_only_stream_recovery_exhausted",
+            failed["payload"]["finish_reason"],
+        )
+        self.assertEqual(1, failed["payload"][
+            "primary_reasoning_only_recovery_count"
+        ])
+        self.assertTrue(failed["payload"][
+            "primary_reasoning_only_recovery_turn"
+        ])
+        self.assertFalse(failed["payload"]["http_request_replayed"])
+        exhausted = next(
+            event for event in events
+            if event.get("event_type")
+            == "debug.primary.reasoning_only_stream_recovery.exhausted"
+        )
+        self.assertEqual(1, exhausted["payload"]["recovery_count"])
+        self.assertFalse(exhausted["payload"]["http_request_replayed"])
+        self.assertEqual("error", events[-1]["type"])
+
+    async def test_primary_partial_visible_content_never_uses_reasoning_recovery(self):
+        interrupted = [
+            "data: " + json.dumps({
+                "choices": [{
+                    "delta": {
+                        "content": "visible-prefix",
+                        "reasoning_content": "primary-analysis",
+                    },
+                    "finish_reason": None,
+                }],
+            }),
+            asyncio.TimeoutError("fixture stream timeout"),
+        ]
+        requests, dispatch_mock, events = await self._run_stream_sequence(
             [interrupted, self._stop_lines("must not be requested")],
             max_iterations=3,
             delegated=False,
+            enabled_tool="",
+            task_text="Explain the bounded result.",
         )
 
         self.assertEqual(["stream"], [request["kind"] for request in requests])
         dispatch_mock.assert_not_awaited()
         self.assertFalse(any(
             event.get("event_type") == "debug.gate.continuation"
-            and str(event.get("payload", {}).get("gate") or "").startswith(
-                "delegate_reasoning_only"
-            )
+            and event.get("payload", {}).get("gate")
+            == "primary_reasoning_only_stream_recovery"
             for event in events
         ))
         failed = next(
             event for event in events if event.get("event_type") == "run.failed"
         )
+        self.assertEqual(
+            "stream_interrupted_after_partial",
+            failed["payload"]["finish_reason"],
+        )
+
+    async def test_primary_tool_fragment_never_uses_reasoning_recovery(self):
+        interrupted = [
+            "data: " + json.dumps({
+                "choices": [{
+                    "delta": {
+                        "reasoning_content": "primary-analysis",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "partial-call",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": '{"filepath":"partial',
+                            },
+                        }],
+                    },
+                    "finish_reason": None,
+                }],
+            }),
+            asyncio.TimeoutError("fixture stream timeout"),
+        ]
+        requests, dispatch_mock, events = await self._run_stream_sequence(
+            [interrupted, self._stop_lines("must not be requested")],
+            max_iterations=3,
+            delegated=False,
+            enabled_tool="read_file",
+            task_text="read a file",
+        )
+
+        self.assertEqual(["stream"], [request["kind"] for request in requests])
+        dispatch_mock.assert_not_awaited()
+        self.assertFalse(any(
+            event.get("event_type") == "debug.gate.continuation"
+            and event.get("payload", {}).get("gate")
+            == "primary_reasoning_only_stream_recovery"
+            for event in events
+        ))
+        failed = next(
+            event for event in events if event.get("event_type") == "run.failed"
+        )
+        self.assertGreater(failed["payload"]["stream_fragment_count"], 0)
         self.assertEqual(
             "stream_interrupted_after_partial",
             failed["payload"]["finish_reason"],

@@ -7,7 +7,8 @@ every dispatch.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -24,6 +25,14 @@ class ToolContext:
     source: str = "chat"
     enabled_user_skills: tuple[str, ...] = ()
     run_id: str | None = None
+    # Some compatibility entry points do not assign a durable AgentRun ID.
+    # This runtime-generated token still gives browser state an unforgeable,
+    # per-run isolation dimension. ``dataclasses.replace`` preserves it as the
+    # tool surface narrows during one run.
+    browser_run_scope_id: str = field(
+        default_factory=lambda: uuid.uuid4().hex,
+        repr=False,
+    )
     root_run_id: str | None = None
     parent_run_id: str | None = None
     agent_kind: str = "primary"
@@ -66,6 +75,10 @@ class ToolContext:
     # Method-level subset of the literal HTTPS ledger. A prefix enters this
     # set only when canonical Skill text explicitly declares POST/GraphQL.
     allowed_skill_http_post_prefixes: tuple[tuple[str, str], ...] = ()
+    # Exact private HTTP(S) origins compiled from the intersection of the
+    # deployment allowlist and explicit URLs in this primary user turn.  This
+    # never comes from Skill prose or model-authored tool arguments.
+    allowed_browser_private_origins: tuple[str, ...] = ()
     # Standard Agent Skills have a free-form Markdown body.  After that body
     # is disclosed in full, the model may narrow this finite runtime-owned
     # catalog through submit_skill_capability_plan.  The catalog contains no

@@ -12,6 +12,7 @@ from schemas import ConversationOut, ConversationTitle
 from auth import get_current_user
 from workspace import atomic_write_bytes, ensure_workspace, safe_workspace_path
 from hooks import emit_event
+from config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -308,7 +309,10 @@ async def _cleanup_harness_session(user_id: str, session_id: str) -> dict:
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             response = await client.post(
-                "http://harness:8020/internal/session/cleanup",
+                f"{settings.harness_url}/internal/session/cleanup",
+                headers={
+                    "X-Internal-Token": settings.internal_api_token,
+                },
                 params={"user_id": user_id, "session_id": session_id},
             )
         if response.status_code < 400:
