@@ -26,13 +26,17 @@ services:
     container_name: chat_acits_executor
     restart: unless-stopped
     network_mode: none
+    user: "65534:65534"
     read_only: true
+    pids_limit: 64
+    mem_limit: 3g
+    cpus: 2.0
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: ["CMD", "python", "-c", "import os; raise SystemExit(0 if os.path.exists('/run/chat-ds-executor/executor.sock') else 1)"]
+      test: ["CMD", "python", "-I", "/app/server.py", "--healthcheck"]
       interval: 2s
       timeout: 2s
       retries: 15
@@ -50,13 +54,24 @@ services:
       executor:
         condition: service_healthy
     environment:
-      DEEPSEEK_PRO_URL: http://10.10.132.126:1025/v1
-      QWEN3_5_URL: http://10.10.132.128:1025/v1
+      # Backward-compatible env key; this endpoint serves AgentModel (GLM-5.2).
+      DEEPSEEK_PRO_URL: ${DEEPSEEK_PRO_URL:-http://10.10.132.2:1025/v1}
+      QWEN3_5_URL: ${QWEN3_5_URL:-http://10.10.132.128:1025/v1}
       BACKEND_INTERNAL_URL: http://backend:8010
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-chat-ds-internal-token}
       AGENT_DEBUG_TRACE: ${AGENT_DEBUG_TRACE:-true}
       AGENT_DEBUG_TRACE_RESULT_CHARS: ${AGENT_DEBUG_TRACE_RESULT_CHARS:-4000}
       AGENT_DEBUG_TRACE_WORKSPACE: ${AGENT_DEBUG_TRACE_WORKSPACE:-true}
+      # Process-local AgentModel admission. The weighted budget is calibrated
+      # for this deployment's provider capacity; it is not a Skill threshold.
+      PROVIDER_ADMISSION_MAX_INFLIGHT_REQUESTS: ${PROVIDER_ADMISSION_MAX_INFLIGHT_REQUESTS:-3}
+      PROVIDER_ADMISSION_MAX_INFLIGHT_ESTIMATED_TOKENS: ${PROVIDER_ADMISSION_MAX_INFLIGHT_ESTIMATED_TOKENS:-240000}
+      PROVIDER_ADMISSION_ESTIMATE_SAFETY_FACTOR: ${PROVIDER_ADMISSION_ESTIMATE_SAFETY_FACTOR:-1.10}
+      # Zero means wait until ordinary run/batch cancellation.
+      PROVIDER_ADMISSION_WAIT_TIMEOUT_SECONDS: ${PROVIDER_ADMISSION_WAIT_TIMEOUT_SECONDS:-0}
+      # Allows multiple admission cohorts in one complex delegated batch;
+      # each child/model/tool path retains its own tighter bounded controls.
+      DELEGATION_BATCH_TIMEOUT_SECONDS: ${DELEGATION_BATCH_TIMEOUT_SECONDS:-3600}
       WEB_SEARCH_PROVIDERS: ${WEB_SEARCH_PROVIDERS:-searxng,ddg}
       SEARXNG_BASE_URL: ${SEARXNG_BASE_URL:-http://searxng:8080}
       SEARXNG_TIMEOUT_SECONDS: ${SEARXNG_TIMEOUT_SECONDS:-10}
@@ -81,9 +96,9 @@ services:
       # Override JWT secret in production. Generate with: python -c 'import secrets; print(secrets.token_urlsafe(48))'
       SECRET_KEY: ${SECRET_KEY:-chat-acits-CHANGE-ME-IN-PRODUCTION}
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-chat-ds-internal-token}
-      # Internal LLM endpoints (override here if they change)
-      DEEPSEEK_PRO_BASE_URL: http://10.10.132.126:1025/v1
-      QWEN3_5_BASE_URL: http://10.10.132.128:1025/v1
+      # Primary AgentModel (GLM-5.2) and auxiliary multimodal endpoint.
+      DEEPSEEK_PRO_BASE_URL: ${DEEPSEEK_PRO_BASE_URL:-http://10.10.132.2:1025/v1}
+      QWEN3_5_BASE_URL: ${QWEN3_5_BASE_URL:-http://10.10.132.128:1025/v1}
       AGENT_DEBUG_TRACE: ${AGENT_DEBUG_TRACE:-true}
       AGENT_EVENT_IMMEDIATE_PERSIST: ${AGENT_EVENT_IMMEDIATE_PERSIST:-true}
     volumes:

@@ -1,16 +1,40 @@
 from tools.registry import register
 from tools.web_search import web_search
 from tools.web_extract import web_extract
+from tools.skill_http import (
+    skill_http_get,
+    skill_http_post_json,
+    RUN_SKILL_HTTP_GET_SCHEMA,
+    RUN_SKILL_HTTP_POST_JSON_SCHEMA,
+)
 from tools.code_execution import execute_code, EXECUTE_CODE_SCHEMA
-from tools.skill_python import run_skill_python, RUN_SKILL_PYTHON_SCHEMA
-from tools.file_tools import read_file, write_file, patch_file, search_files
+from tools.skill_python import (
+    run_skill_python,
+    preflight_run_skill_python_args,
+    RUN_SKILL_PYTHON_SCHEMA,
+)
+from tools.skill_script import run_skill_script, RUN_SKILL_SCRIPT_SCHEMA
+from tools.declared_command import run_declared_command, RUN_DECLARED_COMMAND_SCHEMA
+from tools.skill_capability_plan import (
+    submit_skill_capability_plan,
+    SUBMIT_SKILL_CAPABILITY_PLAN_SCHEMA,
+)
+from tools.file_tools import read_file, write_file, patch_file, merge_files, search_files
 from tools.file_tools import (
-    READ_FILE_SCHEMA, WRITE_FILE_SCHEMA, PATCH_FILE_SCHEMA, SEARCH_FILES_SCHEMA,
+    READ_FILE_SCHEMA, WRITE_FILE_SCHEMA, PATCH_FILE_SCHEMA, MERGE_FILES_SCHEMA,
+    SEARCH_FILES_SCHEMA,
 )
 from tools.todo import todo, TODO_SCHEMA
 from tools.clarify import clarify, CLARIFY_SCHEMA
 from tools.memory import memory, MEMORY_SCHEMA
-from tools.skills import skills_list, skill_view, SKILLS_LIST_SCHEMA, SKILL_VIEW_SCHEMA
+from tools.skills import (
+    skills_list,
+    skill_view,
+    skill_copy_resource,
+    SKILLS_LIST_SCHEMA,
+    SKILL_VIEW_SCHEMA,
+    SKILL_COPY_RESOURCE_SCHEMA,
+)
 from tools.skill_manage import skill_manage, SKILL_MANAGE_SCHEMA
 from tools.browser import (
     browser_navigate, browser_snapshot, browser_click,
@@ -87,6 +111,27 @@ register(
     parallel_safe=True,
 )
 
+register(
+    "skill_http_get",
+    RUN_SKILL_HTTP_GET_SCHEMA,
+    skill_http_get,
+    is_read_only=True,
+    parallel_safe=False,
+    emoji="🔐",
+)
+
+register(
+    "skill_http_post_json",
+    RUN_SKILL_HTTP_POST_JSON_SCHEMA,
+    skill_http_post_json,
+    is_read_only=False,
+    is_destructive=True,
+    parallel_safe=False,
+    allow_in_parallel_child=True,
+    mutates_workspace=False,
+    emoji="🔐",
+)
+
 # ── Phase 2: New tools ───────────────────────────────────────────────────────
 
 register(
@@ -104,11 +149,44 @@ register(
     "run_skill_python",
     RUN_SKILL_PYTHON_SCHEMA,
     run_skill_python,
+    args_preflight_fn=preflight_run_skill_python_args,
     is_read_only=False,
     parallel_safe=False,
     path_scoped=True,
     emoji="🐍",
     allow_in_parallel_child=False,
+)
+
+register(
+    "run_skill_script",
+    RUN_SKILL_SCRIPT_SCHEMA,
+    run_skill_script,
+    is_read_only=False,
+    parallel_safe=False,
+    path_scoped=True,
+    emoji="⚙️",
+    allow_in_parallel_child=False,
+)
+
+register(
+    "run_declared_command",
+    RUN_DECLARED_COMMAND_SCHEMA,
+    run_declared_command,
+    is_read_only=False,
+    parallel_safe=False,
+    path_scoped=True,
+    emoji="⌨️",
+    allow_in_parallel_child=False,
+)
+
+register(
+    "submit_skill_capability_plan",
+    SUBMIT_SKILL_CAPABILITY_PLAN_SCHEMA,
+    submit_skill_capability_plan,
+    is_read_only=True,
+    parallel_safe=False,
+    allow_in_child=False,
+    emoji="🧭",
 )
 
 register(
@@ -142,6 +220,18 @@ register(
     parallel_safe=False,
     path_scoped=True,
     emoji="🩹",
+    allow_in_parallel_child=False,
+)
+
+register(
+    "merge_files",
+    MERGE_FILES_SCHEMA,
+    merge_files,
+    is_read_only=False,
+    is_destructive=True,
+    parallel_safe=False,
+    path_scoped=True,
+    emoji="🧩",
     allow_in_parallel_child=False,
 )
 
@@ -199,6 +289,16 @@ register(
     parallel_safe=True,
     path_scoped=True,
     emoji="📖",
+)
+
+register(
+    "skill_copy_resource",
+    SKILL_COPY_RESOURCE_SCHEMA,
+    skill_copy_resource,
+    is_read_only=False,
+    parallel_safe=False,
+    path_scoped=True,
+    emoji="📎",
 )
 
 register(

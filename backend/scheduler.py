@@ -19,6 +19,10 @@ from sqlalchemy import select
 from config import settings
 from database import async_session
 from hooks import emit_event
+from model_routing import (
+    canonical_agent_model_id,
+    filter_agentic_fallback_model_ids,
+)
 from models import (
     Conversation,
     CustomModelConfig,
@@ -155,6 +159,15 @@ def _provider_payload(model_id: str, config: dict) -> dict:
         "protocol": config.get("protocol", "openai"),
         "is_multimodal": config.get("is_multimodal", False),
         "context_length": config.get("context_length", 262144),
+        "agentic_auxiliary_only": config.get(
+            "agentic_auxiliary_only", False
+        ),
+        "supports_thinking_toggle": config.get(
+            "supports_thinking_toggle", False
+        ),
+        "thinking_enabled_by_default": config.get(
+            "thinking_enabled_by_default", True
+        ),
     }
 
 
@@ -253,12 +266,24 @@ async def execute_job(job_id: str, *, force: bool = False) -> None:
             await db.commit()
 
         ensure_workspace(job.user_id, conv.id)
-        model_id = job.model_id or conv.model_id or "deepseek_v4_pro"
+        model_id = canonical_agent_model_id(
+            job.model_id or conv.model_id or "deepseek_v4_pro"
+        )
         provider_config = await _resolve_job_model(db, job.user_id, model_id)
         fallback_configs: list[dict] = []
-        for fallback_id in serialize_json_list(conv.fallback_model_ids, []):
-            if fallback_id == model_id:
-                continue
+        fallback_ids, removed_fallback_ids = filter_agentic_fallback_model_ids(
+            serialize_json_list(conv.fallback_model_ids, []),
+            requested_model_id=model_id,
+        )
+        if removed_fallback_ids:
+            logger.info(
+                "Filtered auxiliary/duplicate agentic fallbacks job=%s "
+                "requested_model=%s removed=%s",
+                job.id,
+                model_id,
+                removed_fallback_ids,
+            )
+        for fallback_id in fallback_ids:
             try:
                 fallback_configs.append(
                     await _resolve_job_model(db, job.user_id, fallback_id)
@@ -271,8 +296,8 @@ async def execute_job(job_id: str, *, force: bool = False) -> None:
                 )
         tools = serialize_json_list(job.enabled_tools, [])
         if not tools:
-            from routers.workspace_router import DEFAULT_TOOLS
-            tools = [t for t in DEFAULT_TOOLS if t not in {"cronjob", "clarify", "delegate_task"}]
+            from native_tools import UNATTENDED_DEFAULT_NATIVE_TOOLS
+            tools = list(UNATTENDED_DEFAULT_NATIVE_TOOLS)
 
         user_message = Message(
             conversation_id=conv.id,

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 import json
 import logging
 import os
 import re
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from tools.approval import check_code_danger, check_code_warnings
 from tools.omission_guard import compacted_history_omission_error, contains_compacted_history_omission
@@ -36,15 +37,264 @@ _NETWORK_IMPORT_RE = re.compile(
     re.IGNORECASE,
 )
 _NETWORK_CALL_RE = re.compile(r"(?:requests|httpx)\.(?:get|post|put|delete|request|stream)\s*\(|urllib\.request\.urlopen\s*\(|aiohttp\.ClientSession\s*\(|socket\.(?:create_connection|socket)\s*\(|subprocess\.(?:run|Popen|call)\([^\n]*(?:curl|wget)", re.IGNORECASE)
-_FILE_WRITE_RE = re.compile(r"\.write_text\s*\(|\.write_bytes\s*\(|\.mkdir\s*\(|\bopen\s*\([^\n)]*(?:['\"]w['\"]|['\"]a['\"]|['\"]x['\"]|mode\s*=\s*['\"][wax+])|\bos\.makedirs\s*\(|\bshutil\.(?:copy|copyfile|copytree|move)\s*\(", re.IGNORECASE)
-_EXTERNAL_PATH_RE = re.compile(r"/(?:app/data/skills|app/workspace|nfs/temp/chat_ds|tmp/exec_[A-Za-z0-9_]+)[^'\"\s)]*")
+_EXTERNAL_PATH_RE = re.compile(r'''/(?:app/data/skills|app/workspace|nfs/temp/chat_ds|tmp/exec_[A-Za-z0-9_]+)[^'"\s)]*''')
+_REMOTE_URI_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+
+_PANDAS_READERS = {"read_csv", "read_json", "read_excel", "read_parquet"}
+_PANDAS_WRITERS = {"to_csv", "to_json", "to_excel", "to_parquet"}
+_NUMPY_READERS = {"load", "loadtxt"}
+_NUMPY_WRITERS = {"save", "savetxt"}
+_PATH_READ_METHODS = {
+    "read_text", "read_bytes", "stat", "exists", "is_file", "is_dir",
+    "iterdir", "glob", "rglob", "open",
+}
+_PATH_WRITE_METHODS = {
+    "write_text", "write_bytes", "mkdir", "touch", "unlink", "rmdir",
+    "rename", "replace", "chmod", "symlink_to", "hardlink_to",
+}
+_OS_READERS = {
+    "os.listdir", "os.scandir", "os.stat", "os.walk", "os.chdir",
+    "os.path.getsize", "os.path.exists", "os.path.isfile", "os.path.isdir",
+    "glob.glob", "glob.iglob",
+}
+_OS_WRITERS = {
+    "os.makedirs", "os.mkdir", "os.remove", "os.unlink", "os.rmdir",
+    "os.rename", "os.replace",
+}
+_SHUTIL_WRITERS = {
+    "shutil.copy", "shutil.copy2", "shutil.copyfile", "shutil.copytree",
+    "shutil.move", "shutil.rmtree", "shutil.copymode", "shutil.copystat",
+}
+
+
+class _ExplicitFileOperationVisitor(ast.NodeVisitor):
+    """Find actual file API calls, without matching comments or string contents."""
+
+    def __init__(self) -> None:
+        self.aliases: dict[str, str] = {}
+        self.values: dict[str, str] = {}
+        self.path_objects: set[str] = set()
+        self.paths: list[str] = []
+        self.has_read = False
+        self.has_write = False
+        self.has_remote = False
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for item in node.names:
+            self.aliases[item.asname or item.name.split(".", 1)[0]] = item.name
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        if node.module:
+            for item in node.names:
+                self.aliases[item.asname or item.name] = f"{node.module}.{item.name}"
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        value = self._path_value(node.value)
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                if self._is_path_expression(node.value):
+                    self.path_objects.add(target.id)
+                else:
+                    self.path_objects.discard(target.id)
+                if value is None:
+                    self.values.pop(target.id, None)
+                else:
+                    self.values[target.id] = value
+        self.generic_visit(node.value)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        if isinstance(node.target, ast.Name) and node.value is not None:
+            if self._is_path_expression(node.value):
+                self.path_objects.add(node.target.id)
+            else:
+                self.path_objects.discard(node.target.id)
+            value = self._path_value(node.value)
+            if value is None:
+                self.values.pop(node.target.id, None)
+            else:
+                self.values[node.target.id] = value
+            self.visit(node.value)
+
+    def _qualified_name(self, node: ast.AST) -> str | None:
+        if isinstance(node, ast.Name):
+            return self.aliases.get(node.id, node.id)
+        if isinstance(node, ast.Attribute):
+            base = self._qualified_name(node.value)
+            return f"{base}.{node.attr}" if base else node.attr
+        return None
+
+    def _path_value(self, node: ast.AST) -> str | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.JoinedStr) and all(isinstance(item, ast.Constant) for item in node.values):
+            return "".join(str(item.value) for item in node.values)
+        if isinstance(node, ast.Name):
+            return self.values.get(node.id)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Div)):
+            left, right = self._path_value(node.left), self._path_value(node.right)
+            if left is None or right is None:
+                return None
+            if isinstance(node.op, ast.Add):
+                return left + right
+            return str(PurePosixPath(left) / right)
+        if isinstance(node, ast.Call):
+            name = self._qualified_name(node.func) or ""
+            if name in {"str", "os.fspath"} and node.args:
+                return self._path_value(node.args[0])
+            if name in {"pathlib.Path", "pathlib.PurePath", "pathlib.PurePosixPath", "Path", "PurePath", "PurePosixPath"}:
+                return self._path_value(node.args[0]) if node.args else "."
+            if name in {"pathlib.Path.cwd", "Path.cwd"}:
+                return "."
+            if name == "os.path.join" and node.args:
+                parts = [self._path_value(arg) for arg in node.args]
+                if all(part is not None for part in parts):
+                    return str(PurePosixPath(parts[0], *parts[1:]))
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "joinpath":
+                base = self._path_value(node.func.value)
+                parts = [self._path_value(arg) for arg in node.args]
+                if base is not None and all(part is not None for part in parts):
+                    return str(PurePosixPath(base, *parts))
+        return None
+
+    def _is_path_expression(self, node: ast.AST) -> bool:
+        if isinstance(node, ast.Name):
+            return node.id in self.path_objects
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            return self._is_path_expression(node.left)
+        if isinstance(node, ast.Attribute) and node.attr in {"parent", "parents"}:
+            return self._is_path_expression(node.value)
+        if isinstance(node, ast.Call):
+            name = self._qualified_name(node.func) or ""
+            if name in {
+                "pathlib.Path", "pathlib.PurePath", "pathlib.PurePosixPath",
+                "Path", "PurePath", "PurePosixPath", "pathlib.Path.cwd", "Path.cwd",
+            }:
+                return True
+            if isinstance(node.func, ast.Attribute) and node.func.attr in {
+                "joinpath", "resolve", "absolute", "with_name", "with_suffix",
+            }:
+                return self._is_path_expression(node.func.value)
+        return False
+
+    @staticmethod
+    def _argument(node: ast.Call, position: int, keywords: tuple[str, ...] = ()) -> ast.AST | None:
+        if len(node.args) > position:
+            return node.args[position]
+        for keyword in node.keywords:
+            if keyword.arg in keywords:
+                return keyword.value
+        return None
+
+    def _record(self, expr: ast.AST | None, *, write: bool, remote_is_network: bool = False) -> None:
+        # An omitted optional output path (for example DataFrame.to_json()) returns
+        # in-memory data and is not a workspace operation.
+        if expr is None:
+            return
+        value = self._path_value(expr)
+        if value is not None:
+            stripped = value.strip()
+            # Literal JSON/CSV bodies are data, not filenames.
+            if not stripped or "\x00" in stripped or "\n" in stripped or "\r" in stripped:
+                return
+            if stripped.startswith(("{", "[")):
+                return
+            if _REMOTE_URI_RE.match(stripped):
+                if remote_is_network:
+                    self.has_remote = True
+                return
+            self.paths.append(stripped)
+        elif isinstance(expr, ast.Call) and (self._qualified_name(expr.func) or "").endswith(("StringIO", "BytesIO")):
+            return
+        # A dynamic argument to a real file API is still file I/O, not pure computation.
+        if write:
+            self.has_write = True
+        else:
+            self.has_read = True
+
+    def visit_Call(self, node: ast.Call) -> None:
+        name = self._qualified_name(node.func) or ""
+        terminal = name.rsplit(".", 1)[-1]
+
+        if (
+            isinstance(node.func, ast.Name) and name in {"open", "builtins.open"}
+        ) or name == "io.open":
+            mode_node = self._argument(node, 1, ("mode",))
+            mode = self._path_value(mode_node) if mode_node is not None else "r"
+            self._record(self._argument(node, 0, ("file",)), write=bool(mode and any(flag in mode for flag in "wax+")))
+        elif name.startswith("pandas.") and terminal in _PANDAS_READERS:
+            self._record(self._argument(node, 0, ("filepath_or_buffer", "path_or_buf", "io", "excel_file", "path")), write=False, remote_is_network=True)
+        elif terminal in _PANDAS_WRITERS:
+            self._record(self._argument(node, 0, ("path_or_buf", "excel_writer", "path")), write=True, remote_is_network=True)
+        elif name.startswith("numpy.") and terminal in _NUMPY_READERS:
+            self._record(self._argument(node, 0, ("file", "fname")), write=False)
+        elif name.startswith("numpy.") and terminal in _NUMPY_WRITERS:
+            self._record(self._argument(node, 0, ("file", "fname")), write=True)
+        elif name in _OS_READERS:
+            self._record(self._argument(node, 0, ("path", "top", "pathname", "root_dir")), write=False)
+        elif name in _OS_WRITERS:
+            self._record(self._argument(node, 0, ("path", "name", "src")), write=True)
+            if terminal in {"rename", "replace"}:
+                self._record(self._argument(node, 1, ("dst",)), write=True)
+        elif name in _SHUTIL_WRITERS:
+            self._record(self._argument(node, 0, ("src", "path")), write=True)
+            if terminal != "rmtree":
+                self._record(self._argument(node, 1, ("dst",)), write=True)
+        elif (
+            isinstance(node.func, ast.Attribute)
+            and terminal in _PATH_READ_METHODS | _PATH_WRITE_METHODS
+            and (
+                self._path_value(node.func.value) is not None
+                or self._is_path_expression(node.func.value)
+            )
+        ):
+            path_method_writes = terminal in _PATH_WRITE_METHODS
+            if terminal == "open":
+                mode_node = self._argument(node, 0, ("mode",))
+                mode = self._path_value(mode_node) if mode_node is not None else "r"
+                path_method_writes = bool(mode and any(flag in mode for flag in "wax+"))
+            self._record(node.func.value, write=path_method_writes)
+            if terminal in {"glob", "rglob"}:
+                # The pattern is interpreted relative to the Path base and can itself
+                # contain traversal components, so include it in boundary validation.
+                self._record(self._argument(node, 0, ("pattern",)), write=False)
+            if terminal in {"rename", "replace", "symlink_to", "hardlink_to"}:
+                self._record(self._argument(node, 0, ("target",)), write=True)
+        elif name in {"subprocess.run", "subprocess.Popen", "subprocess.call"} and node.args:
+            command = node.args[0]
+            values: list[str] = []
+            if isinstance(command, (ast.List, ast.Tuple)):
+                values = [value for item in command.elts if (value := self._path_value(item)) is not None]
+            elif (value := self._path_value(command)) is not None:
+                values = value.split()
+            if values and PurePosixPath(values[0]).name in {"cat", "wc", "stat", "ls", "find", "grep", "head", "tail", "cp", "mv"}:
+                self.has_read = True
+                for value in values[1:]:
+                    if not value.startswith("-"):
+                        self._record(ast.Constant(value), write=PurePosixPath(values[0]).name in {"cp", "mv"})
+
+        self.generic_visit(node)
+
+
+def _inspect_file_operations(code: str) -> tuple[bool, bool, bool, tuple[str, ...]]:
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError, TypeError):
+        return False, False, False, ()
+    visitor = _ExplicitFileOperationVisitor()
+    visitor.visit(tree)
+    return visitor.has_read, visitor.has_write, visitor.has_remote, tuple(visitor.paths)
 
 
 def _managed_runtime_reason(code: str) -> str | None:
     if _NETWORK_IMPORT_RE.search(code) or _NETWORK_CALL_RE.search(code):
         return "network/API code"
-    if _FILE_WRITE_RE.search(code):
+    has_read, has_write, has_remote, _ = _inspect_file_operations(code)
+    if has_remote:
+        return "network/API code"
+    if has_write:
         return "workspace file-write code"
+    if has_read:
+        return "workspace file operation code"
     return None
 
 
@@ -72,6 +322,27 @@ def _execution_boundary_error(code: str, user_id: str, session_id: str) -> str |
             "Absolute paths are limited to the current session workspace/skills. Use stable relative paths "
             "under skills/... and workspace/...; do not access another session or host path."
         )
+    _, _, _, explicit_paths = _inspect_file_operations(code)
+    for path in explicit_paths:
+        posix = PurePosixPath(path)
+        windows = PureWindowsPath(path)
+        if ".." in posix.parts or ".." in windows.parts:
+            return (
+                "Relative workspace paths must not traverse outside the session workspace; "
+                "remove '..' path components and retry."
+            )
+        if posix.is_absolute():
+            if path == "/app/workspace" or path.startswith("/app/workspace/") or _is_current_session_absolute_path(path, user_id, session_id):
+                continue
+            return (
+                "Absolute paths are limited to the current session workspace/skills. Use stable relative paths "
+                "under skills/... and workspace/...; do not access another session or host path."
+            )
+        if windows.is_absolute():
+            return (
+                "Absolute paths are limited to the current session workspace/skills. Use stable relative paths "
+                "under skills/... and workspace/...; do not access host paths."
+            )
     return None
 
 
@@ -161,17 +432,6 @@ def _session_snapshot(user_id: str, session_id: str, code: str = "") -> list[dic
     budget = {"files": 0, "bytes": 0}
     for path, root, prefix in _referenced_session_files(code, user_id, session_id):
         _snapshot_file(path, root, prefix, files, budget)
-    _snapshot_files_from_root(sandbox_dir(user_id, session_id, sub="workspace"), "workspace", files, budget)
-    skill_root = (SKILL_DATA_ROOT / user_id / session_id).resolve()
-    try:
-        skill_root.relative_to(SKILL_DATA_ROOT.resolve())
-    except ValueError:
-        return files
-    for pattern in ("SKILL.md", "__manifest__", "*.py", "*.json", "*.csv", "*.md"):
-        for path in sorted(skill_root.rglob(pattern)):
-            if budget["files"] >= MAX_SNAPSHOT_FILES or budget["bytes"] >= MAX_SNAPSHOT_TOTAL_BYTES:
-                return files
-            _snapshot_file(path, skill_root, "skills", files, budget)
     return files
 
 
@@ -217,13 +477,34 @@ def _rewrite_session_absolute_paths(code: str, user_id: str, session_id: str) ->
     return rewritten.replace(skill_abs_prefix, "skills/").replace(workspace_abs_prefix, "workspace/")
 
 
+def _rewrite_isolated_session_paths(code: str, user_id: str, session_id: str) -> str:
+    """Map public session paths to the sidecar's disposable directory layout."""
+
+    rewritten = code.replace("/app/workspace/", "./").replace("/app/workspace", ".")
+    rewritten = re.sub(r'''([(['"])(?:\./)?workspace/''', r"\1./", rewritten)
+    if user_id and user_id != "default" and session_id and session_id != "default":
+        workspace_abs_prefix = f"{SANDBOX_ROOT}/{user_id}/{session_id}/workspace/"
+        skill_abs_prefix = f"{SKILL_DATA_ROOT}/{user_id}/{session_id}/"
+        rewritten = rewritten.replace(workspace_abs_prefix, "./")
+        rewritten = rewritten.replace(skill_abs_prefix, "../skills/")
+    return re.sub(r'''([(['"])(?:\./)?skills/''', r"\1../skills/", rewritten)
+
+
+def _references_session_skills(code: str, user_id: str, session_id: str) -> bool:
+    if re.search(r'''(?:^|[(['"\s])(?:\./)?skills/''', code):
+        return True
+    if user_id and user_id != "default" and session_id and session_id != "default":
+        return f"{SKILL_DATA_ROOT}/{user_id}/{session_id}/" in code
+    return False
+
+
 async def execute_code(
     code: str,
     timeout: int = DEFAULT_TIMEOUT,
     user_id: str = "default",
     session_id: str = "default",
 ) -> str:
-    """Run Python in a separate container with no network namespace, or managed runtime for network code."""
+    """Run Python only in a dedicated container with no network namespace."""
     if not code or not code.strip():
         return json.dumps({"status": "error", "error": "No code provided."})
     if contains_compacted_history_omission(code):
@@ -241,19 +522,55 @@ async def execute_code(
     timeout = max(1, min(int(timeout), MAX_TIMEOUT))
     managed_reason = _managed_runtime_reason(code)
     if managed_reason:
-        from tools.skill_python import run_managed_python_code
-        managed_code = _rewrite_session_absolute_paths(code, user_id, session_id)
-        result = json.loads(await run_managed_python_code(
-            managed_code,
-            timeout=timeout,
-            user_id=user_id,
-            session_id=session_id,
-        ))
-        result["execution_runtime"] = "managed_session_python"
-        result["execution_note"] = (
-            f"execute_code detected {managed_reason} and ran it in the managed session Python runtime. "
-            "Pure read-only calculations still use the network-disabled executor."
+        from tools.isolated_skill_executor import (
+            IsolatedSkillExecutorError,
+            execute_isolated_session_code,
         )
+
+        workspace = sandbox_dir(user_id, session_id, sub="workspace")
+        session_skills = SKILL_DATA_ROOT / user_id / session_id
+        skills_root = (
+            session_skills
+            if _references_session_skills(code, user_id, session_id) and session_skills.is_dir()
+            else None
+        )
+        isolated_code = _rewrite_isolated_session_paths(code, user_id, session_id)
+        try:
+            result = await execute_isolated_session_code(
+                workspace=workspace,
+                code=isolated_code,
+                timeout=timeout,
+                skills_root=skills_root,
+            )
+        except IsolatedSkillExecutorError as exc:
+            logger.warning("Isolated session-code request failed safely: %s", exc.code)
+            result = {
+                "status": "error",
+                "error_code": exc.code,
+                "error": str(exc),
+                "network": "disabled",
+                "artifacts": [],
+                "workspace_applied": False,
+            }
+        stdout = str(result.get("stdout", ""))
+        stderr = str(result.get("stderr", ""))
+        result.setdefault("output", stdout)
+        if result.get("status") == "error" and stderr:
+            result["output"] = stdout + ("\n--- stderr ---\n" if stdout else "") + stderr
+        if "returncode" in result:
+            result.setdefault("exit_code", result["returncode"])
+        result["execution_runtime"] = "isolated_session_python"
+        result["execution_note"] = (
+            f"execute_code detected {managed_reason} and ran it only in the disposable, "
+            "network-disabled session executor. Workspace changes were content-verified before "
+            "atomic application; execution never falls back to the harness container."
+        )
+        if managed_reason == "network/API code":
+            result["network_access"] = "unavailable"
+            result["degraded_reason"] = (
+                "Network access is disabled for model-authored code. Use an explicitly authorized "
+                "web/API tool or declared Skill capability; execute_code will not retry in harness."
+            )
         warnings = check_code_warnings(code)
         if warnings:
             result["warnings"] = warnings
@@ -297,12 +614,13 @@ EXECUTE_CODE_SCHEMA = {
     "name": "execute_code",
     "description": (
         "Run Python code for calculations and data processing. By default this uses a dedicated, "
-        "ephemeral container with networking disabled and a read-only snapshot of the current session "
-        "workspace under ./workspace and installed session skill resources under ./skills. If the code "
-        "imports/calls network libraries such as requests/httpx/urllib/aiohttp/socket, or writes files, "
-        "execute_code automatically runs that single call in the managed session Python runtime instead; "
-        "pure read-only calculations still use the offline executor. Inline pip install is never allowed; declared skill dependencies are "
-        "installed by the managed runtime. Do not use execute_code to carry long Markdown/report bodies; "
+        "ephemeral container with networking disabled and only explicitly referenced session files "
+        "snapshotted under ./workspace or ./skills. If the code imports/calls network libraries such as "
+        "requests/httpx/urllib/aiohttp/socket, writes files, or reads/stats/globs workspace files, "
+        "execute_code runs that single call in a disposable session-aware sidecar, still with networking "
+        "disabled; verified file changes are atomically applied to the session workspace. It never falls "
+        "back to Python inside the harness container. Network requests fail explicitly; use an authorized "
+        "web/API capability instead. Inline pip install is never allowed. Do not use execute_code to carry long Markdown/report bodies; "
         "write large artifacts with write_file/patch_file or run a real workspace/skill script with run_skill_python. "
         "Use stable relative paths under skills/... and workspace/...; "
         "do not access other sessions or reuse /tmp/exec_* paths from prior calls. "

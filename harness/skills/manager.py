@@ -14,7 +14,10 @@ Simplified from hermes-agent:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import mimetypes
 import time
 from pathlib import Path
 from typing import Any
@@ -24,6 +27,11 @@ from skills.scanner import (
     USER_SKILLS_BASE,
 )
 from skills.loader import load_skill_content
+from skills.path_safety import (
+    iter_safe_regular_files,
+    validate_skill_resource,
+    validate_skill_root,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +40,13 @@ MAX_SKILLS_PROMPT_CHARS = 8000
 
 # Per-skill char cap when building the prompt block.
 MAX_SINGLE_SKILL_CHARS = 4000
+
+# Resource manifests are discovery indexes, not execution closures.  Page the
+# canonical inventory so a standards-compliant asset-heavy Skill remains
+# inspectable without serializing every path into one model/tool result.
+DEFAULT_SKILL_MANIFEST_PAGE_ENTRIES = 128
+MAX_SKILL_MANIFEST_PAGE_ENTRIES = 512
+MAX_SKILL_MANIFEST_OFFSET_ENTRIES = 1_000_000
 
 
 class SkillsManager:
@@ -127,12 +142,12 @@ class SkillsManager:
         lines.append("## Available Skills")
         lines.append("")
         lines.append(
-            "Skills provide specialized knowledge and workflows. "
+            "Skills provide specialized instructions, knowledge, and resources. "
             "Session-scope skills were uploaded or installed for this conversation and should be "
-            "treated as task-specific workflow resources when relevant. Load relevant skills with "
-            "`skill_view(name)` before executing the task, and inspect linked files with "
-            "`skill_view(name, file_path=...)` when the skill references workflows, templates, "
-            "or domain-specific guidance. Use `skills_list()` to browse all skills."
+            "treated as task-specific instructions and resources when relevant. Load a selected "
+            "Skill with `skill_view(name)`, and inspect only relevant linked files with "
+            "`skill_view(name, file_path=...)`. Use `skills_list()` only when catalog browsing "
+            "is explicitly needed."
         )
         lines.append("")
 
@@ -198,6 +213,8 @@ class SkillsManager:
         session_id: str = "default",
         include_optional: bool = False,
         enabled_user_skills: list[str] | None = None,
+        offset: int | None = None,
+        limit: int | None = None,
     ) -> dict[str, Any]:
         """Load full skill content by name, optionally reading a linked file.
 
@@ -213,7 +230,13 @@ class SkillsManager:
         Returns:
             Dict with skill content or error information.
         """
-        skill_md = resolve_skill_path(name, user_id, session_id, include_optional=include_optional)
+        skill_md = resolve_skill_path(
+            name,
+            user_id,
+            session_id,
+            include_optional=include_optional,
+            enabled_user_skills=enabled_user_skills,
+        )
         if skill_md is None:
             available = [s["name"] for s in find_all_skills(
                 user_id, session_id, include_optional,
@@ -255,7 +278,17 @@ class SkillsManager:
         # If a linked file is requested, serve that instead
         if file_path:
             if file_path == "__manifest__":
-                return self._load_resource_manifest(skill_md, skill_dir, name, session_id)
+                return self._load_resource_manifest(
+                    skill_md,
+                    skill_dir,
+                    name,
+                    session_id,
+                    offset=0 if offset is None else offset,
+                    limit=(
+                        DEFAULT_SKILL_MANIFEST_PAGE_ENTRIES
+                        if limit is None else limit
+                    ),
+                )
             return self._load_linked_file(skill_dir, file_path, name)
 
         result = load_skill_content(
@@ -271,9 +304,9 @@ class SkillsManager:
         try:
             for d in get_skills_dirs(user_id, session_id, include_optional):
                 try:
-                    result["path"] = str(skill_md.relative_to(d))
+                    result["path"] = str(skill_md.relative_to(d.resolve(strict=True)))
                     break
-                except ValueError:
+                except (FileNotFoundError, OSError, RuntimeError, ValueError):
                     continue
         except Exception:
             result["path"] = skill_md.name
@@ -282,9 +315,11 @@ class SkillsManager:
         result["skill_dir"] = str(skill_dir)
         if result.get("linked_files"):
             result["usage_hint"] = (
-                "To inspect workflow resources, call skill_view(name, file_path='__manifest__') "
-                "for a compact resource graph, then call skill_view(name, file_path=...) "
-                "for relevant files such as orchestrators, workers, references, templates, or scripts."
+                "Use skill_view(name, file_path='__manifest__') for a compact index of "
+                "the Skill's bundled resources, then read only the references, assets, "
+                "templates, scripts, or compiled workflow files relevant to this request. "
+                "Bundled files are supporting resources; their presence alone does not "
+                "require delegation, multiple output files, or a merge step."
             )
 
         return result
@@ -295,6 +330,9 @@ class SkillsManager:
         skill_dir: Path,
         skill_name: str,
         session_id: str,
+        *,
+        offset: int = 0,
+        limit: int = DEFAULT_SKILL_MANIFEST_PAGE_ENTRIES,
     ) -> dict[str, Any]:
         result = load_skill_content(
             skill_md,
@@ -304,31 +342,119 @@ class SkillsManager:
         if "error" in result:
             return {"success": False, **result}
         workflow_contract = result.get("workflow_contract") or {}
-        output_contract = workflow_contract.get("output_contract") or {}
-        next_steps = [
-            "Load orchestrator/workflow files from workflow_contract.orchestrator_files or resource_graph.suggested_files.",
-            "Load every declared worker file from workflow_contract.worker_files before final synthesis.",
-            "Collect evidence for each declared worker using the available tools/MCP/database/search resources named by the skill.",
-            "Generate declared modular artifacts/checklists in the current session workspace when workflow_contract.artifact_patterns is present.",
-            "Run or reproduce declared merge/sanity steps, preferring run_skill_python for skill-provided scripts.",
-            "Use skill_view(name, file_path=...) for all skill resources; workspace file tools cannot read skill files.",
-        ]
+        execution_contract = result.get("execution_contract") or {}
+        compiled_output_contract = (
+            execution_contract.get("output_contract")
+            if isinstance(execution_contract.get("output_contract"), dict)
+            else {}
+        )
+        output_contract = (
+            compiled_output_contract or workflow_contract.get("output_contract") or {}
+        )
+        linked_files = result.get("linked_files") or {}
+        entries = sorted(
+            (
+                str(category),
+                str(path),
+            )
+            for category, paths in linked_files.items()
+            if isinstance(category, str) and isinstance(paths, list)
+            for path in paths
+            if isinstance(path, str)
+        )
+        total_entries = len(entries)
+        if (
+            not isinstance(offset, int)
+            or isinstance(offset, bool)
+            or offset < 0
+            or offset > MAX_SKILL_MANIFEST_OFFSET_ENTRIES
+        ):
+            return {
+                "success": False,
+                "reason": "invalid_manifest_offset",
+                "error": (
+                    "Skill manifest offset must be an integer from 0 through "
+                    f"{MAX_SKILL_MANIFEST_OFFSET_ENTRIES}."
+                ),
+            }
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or limit < 1
+            or limit > MAX_SKILL_MANIFEST_PAGE_ENTRIES
+        ):
+            return {
+                "success": False,
+                "reason": "invalid_manifest_limit",
+                "error": (
+                    "Skill manifest limit must be an integer from 1 through "
+                    f"{MAX_SKILL_MANIFEST_PAGE_ENTRIES}."
+                ),
+            }
+        if offset > total_entries:
+            return {
+                "success": False,
+                "reason": "manifest_offset_out_of_range",
+                "error": (
+                    f"Skill manifest offset {offset} exceeds its "
+                    f"{total_entries}-resource inventory."
+                ),
+            }
+
+        page_entries = entries[offset:offset + limit]
+        page_linked_files: dict[str, list[str]] = {}
+        for category, path in page_entries:
+            page_linked_files.setdefault(category, []).append(path)
+        next_offset = offset + len(page_entries)
+        has_more = next_offset < total_entries
+        manifest_sha256 = hashlib.sha256(json.dumps(
+            entries,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+
+        next_steps, manifest_hint = _build_manifest_guidance(
+            linked_files=linked_files,
+            resource_graph=result.get("resource_graph") or {},
+            workflow_contract=workflow_contract,
+            execution_contract=execution_contract,
+            output_contract=output_contract,
+        )
         execution_plan_hint = _build_execution_plan_hint(output_contract)
         payload = {
             "success": True,
             "name": skill_name,
             "file": "__manifest__",
             "skill_dir": str(skill_dir),
-            "linked_files": result.get("linked_files") or {},
+            # Bind every manifest page to the exact canonical instruction
+            # document that produced its compiled inventory/contract view.
+            "skill_md_sha256": result.get("skill_md_sha256"),
+            "skill_md_chars": result.get("skill_md_chars"),
+            "linked_files": page_linked_files,
+            "linked_file_count": total_entries,
+            "manifest_sha256": manifest_sha256,
+            "manifest_pagination": {
+                "offset": offset,
+                "limit": limit,
+                "returned_entries": len(page_entries),
+                "total_entries": total_entries,
+                "has_more": has_more,
+                "next_offset": next_offset if has_more else None,
+            },
             "resource_graph": result.get("resource_graph") or {},
             "workflow_contract": workflow_contract,
+            "execution_contract": execution_contract,
             "next_steps": next_steps,
-            "hint": (
-                "For complex deliverables, treat workflow_contract as the execution contract, not just reference material. "
-                "Inspect orchestrators, workers, formats, scripts, and supporting resources before drafting; then produce the "
-                "declared workspace artifacts and merged final deliverable before stopping."
-            ),
+            "hint": manifest_hint,
         }
+        if has_more:
+            payload["hint"] = (
+                str(payload.get("hint") or "")
+                + " Continue the canonical resource manifest with "
+                f"skill_view(name={skill_name!r}, file_path='__manifest__', "
+                f"offset={next_offset}, limit={limit}); use only that exact "
+                "next_offset and verify manifest_sha256 remains unchanged."
+            ).strip()
         if output_contract:
             payload["output_contract"] = output_contract
         if execution_plan_hint:
@@ -342,34 +468,74 @@ class SkillsManager:
         skill_name: str,
     ) -> dict[str, Any]:
         """Load a linked file within a skill directory."""
-        # Prevent path traversal
-        if ".." in file_path:
+        root_check = validate_skill_root(skill_dir)
+        if not root_check.valid or root_check.path is None:
             return {
                 "success": False,
-                "error": "Path traversal ('..') is not allowed.",
+                "error": root_check.message or "Skill package root failed validation.",
+            }
+        skill_dir = root_check.path
+
+        file_check = validate_skill_resource(
+            skill_dir,
+            file_path,
+            expected_kind="file",
+            require_relative=True,
+        )
+        directory_check = validate_skill_resource(
+            skill_dir,
+            file_path,
+            expected_kind="directory",
+            require_relative=True,
+        )
+        if not file_check.valid and not directory_check.valid:
+            code = file_check.code or directory_check.code
+            if code == "missing_resource":
+                return {
+                    "success": False,
+                    "error": f"File '{file_path}' not found in skill '{skill_name}'.",
+                    "available_files": self._available_resource_files(skill_dir),
+                    "hint": "Use one of the available file paths listed above or call skill_view(name, file_path='__manifest__')",
+                }
+            return {
+                "success": False,
+                "error": file_check.message or directory_check.message or "Unsafe Skill resource path.",
+                "reason": code,
                 "hint": "Use a relative path within the skill directory",
             }
 
-        target = skill_dir / file_path
-
-        # Verify resolved path stays within skill_dir
-        try:
-            target.resolve().relative_to(skill_dir.resolve())
-        except ValueError:
+        if directory_check.valid and directory_check.path is not None:
+            files = [
+                str(path.relative_to(skill_dir))
+                for path in iter_safe_regular_files(
+                    skill_dir,
+                    directory_check.path,
+                    excluded_dirs={"__pycache__", "node_modules", ".git"},
+                )
+                if not any(
+                    part.startswith(".") or part in {"__pycache__", "node_modules"}
+                    for part in path.relative_to(skill_dir).parts
+                )
+            ]
             return {
-                "success": False,
-                "error": "Path traversal detected — resolved path is outside skill directory.",
-                "hint": "Use a relative path within the skill directory",
+                "success": True,
+                "name": skill_name,
+                "file": file_path.rstrip("/"),
+                "is_directory": True,
+                "files": files[:200],
+                "file_count": len(files),
+                "truncated": len(files) > 200,
+                "hint": (
+                    "This resource is a directory. Inspect the relevant listed files "
+                    "with skill_view(name, file_path=...) before relying on their contents."
+                ),
             }
 
-        if not target.exists():
-            return {
-                "success": False,
-                "error": f"File '{file_path}' not found in skill '{skill_name}'.",
-                "available_files": self._available_resource_files(skill_dir),
-                "hint": "Use one of the available file paths listed above or call skill_view(name, file_path='__manifest__')",
-            }
-
+        target = file_check.path
+        assert target is not None
+        size_bytes = target.stat().st_size
+        sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+        media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
         try:
             content = target.read_text(encoding="utf-8")
         except UnicodeDecodeError:
@@ -377,8 +543,15 @@ class SkillsManager:
                 "success": True,
                 "name": skill_name,
                 "file": file_path,
-                "content": f"[Binary file: {target.name}, size: {target.stat().st_size} bytes]",
+                "content": f"[Binary file: {target.name}, size: {size_bytes} bytes]",
                 "is_binary": True,
+                "size_bytes": size_bytes,
+                "sha256": sha256,
+                "media_type": media_type,
+                "hint": (
+                    "Use skill_copy_resource with this Skill name and source path "
+                    "to preserve the exact bytes in the session workspace."
+                ),
             }
 
         return {
@@ -387,28 +560,217 @@ class SkillsManager:
             "file": file_path,
             "content": content,
             "file_type": target.suffix,
+            "size_bytes": size_bytes,
+            "sha256": sha256,
+            "media_type": media_type,
         }
 
     def _available_resource_files(self, skill_dir: Path) -> dict[str, list[str]]:
         available: dict[str, list[str]] = {}
-        for subdir in sorted(p for p in skill_dir.iterdir() if p.is_dir()):
+        try:
+            candidates = sorted(skill_dir.iterdir())
+        except OSError:
+            candidates = []
+        for subdir in candidates:
+            directory_check = validate_skill_resource(
+                skill_dir, subdir, expected_kind="directory"
+            )
+            if not directory_check.valid or directory_check.path is None:
+                continue
+            subdir = directory_check.path
             if subdir.name.startswith(".") or subdir.name in {"__pycache__", "node_modules"}:
                 continue
             files = [
                 str(f.relative_to(skill_dir))
-                for f in subdir.rglob("*")
-                if f.is_file()
+                for f in iter_safe_regular_files(
+                    skill_dir,
+                    subdir,
+                    excluded_dirs={"__pycache__", "node_modules", ".git"},
+                )
             ]
             if files:
                 available[subdir.name] = sorted(files)[:100]
         root_files = [
-            str(f.relative_to(skill_dir))
-            for f in skill_dir.iterdir()
-            if f.is_file() and f.name != "SKILL.md"
+            str(check.path.relative_to(skill_dir))
+            for f in candidates
+            if f.name != "SKILL.md"
+            for check in [validate_skill_resource(skill_dir, f, expected_kind="file")]
+            if check.valid and check.path is not None
         ]
         if root_files:
             available["root_files"] = sorted(root_files)
         return available
+
+
+def _as_manifest_list(value: Any) -> list[Any]:
+    """Return a bounded list view without treating strings as iterables."""
+    if isinstance(value, list):
+        return value[:200]
+    if isinstance(value, tuple):
+        return list(value[:200])
+    return []
+
+
+def _build_manifest_guidance(
+    *,
+    linked_files: dict[str, Any],
+    resource_graph: dict[str, Any],
+    workflow_contract: dict[str, Any],
+    execution_contract: dict[str, Any],
+    output_contract: dict[str, Any],
+) -> tuple[list[str], str]:
+    """Build declaration-driven manifest guidance for any Skill shape.
+
+    A resource directory is not execution authority.  In particular, worker-like
+    filenames, a broad user task, or the mere presence of several files must not
+    manufacture delegation, a modular artifact set, or a merge requirement.
+    """
+    steps: list[str] = []
+    has_resources = bool(linked_files or resource_graph.get("categories"))
+    workflow_files = _as_manifest_list(workflow_contract.get("workflow_files"))
+    orchestrator_files = _as_manifest_list(
+        workflow_contract.get("orchestrator_files")
+    )
+    script_candidates = _as_manifest_list(
+        workflow_contract.get("script_candidates")
+    )
+    routes = _as_manifest_list(execution_contract.get("routes"))
+    workers = _as_manifest_list(execution_contract.get("workers"))
+    aggregation = execution_contract.get("aggregation")
+    bootstrap = execution_contract.get("knowledge_bootstrap")
+    declared_sources = _as_manifest_list(
+        workflow_contract.get("declared_external_sources")
+    )
+
+    if has_resources:
+        steps.append(
+            "Inspect only request-relevant bundled resources with "
+            "skill_view(name, file_path=...); workspace file tools cannot read "
+            "files inside a Skill package."
+        )
+    if orchestrator_files or workflow_files:
+        steps.append(
+            "Read the compiled workflow/orchestrator files required by the selected "
+            "route or instructions; do not load unrelated package files."
+        )
+    if routes:
+        steps.append(
+            "Match the request to exactly one declared execution_contract route "
+            "using its compiled selection policy and load only that route's resources."
+        )
+    if workers:
+        steps.append(
+            "Execute only workers required by the selected compiled route/worker "
+            "graph, respecting its declared waves and dependencies. Use delegate_task "
+            "only when that tool is exposed, and retain persisted result_path values "
+            "for declared downstream consumers."
+        )
+    if isinstance(aggregation, dict) and aggregation:
+        steps.append(
+            "Run only the compiled aggregation steps whose declared inputs are ready, "
+            "respecting their dependency order and checks."
+        )
+    if bootstrap or declared_sources:
+        steps.append(
+            "Gather the evidence or prerequisite inputs explicitly declared by the "
+            "active contract using only its exposed capabilities."
+        )
+    if script_candidates:
+        steps.append(
+            "Run a bundled script only when the active instructions or compiled "
+            "contract select that exact entrypoint and the corresponding runner is exposed."
+        )
+
+    modular = _as_manifest_list(output_contract.get("declared_modular_files"))
+    deliverables = _as_manifest_list(output_contract.get("declared_artifacts"))
+    ancillary = _as_manifest_list(output_contract.get("declared_ancillary_files"))
+    artifact_patterns = _as_manifest_list(
+        workflow_contract.get("artifact_patterns")
+    )
+    artifact_set_policies = _as_manifest_list(
+        output_contract.get("artifact_set_policies")
+    )
+    artifact_set_policy = output_contract.get("artifact_set_policy")
+    declared_file_count = output_contract.get("declared_file_count")
+    declares_artifact_set = bool(
+        modular
+        or deliverables
+        or ancillary
+        or artifact_patterns
+        or artifact_set_policies
+        or isinstance(artifact_set_policy, dict)
+        or declared_file_count
+        or workflow_contract.get("requires_modular_artifacts") is True
+    )
+    if declares_artifact_set:
+        steps.append(
+            "Produce exactly the declared artifact set in the session workspace; "
+            "do not add, omit, or rename members unless the contract permits it."
+        )
+
+    merge_declared = bool(
+        workflow_contract.get("requires_merge") is True
+        or workflow_contract.get("merge_requirements")
+        or output_contract.get("merge_mandatory") is True
+        or output_contract.get("merge_command")
+        or output_contract.get("merge_input_order")
+        or output_contract.get("merge_declarations")
+    )
+    if merge_declared:
+        steps.append(
+            "Perform the declared workspace-scoped merge/concatenation with "
+            "merge_files using the exact compiled input order, then verify the declared "
+            "output. If no exact order was compiled, do not invent one."
+        )
+
+    checks = (
+        _as_manifest_list(output_contract.get("post_merge_checks"))
+        + _as_manifest_list(workflow_contract.get("sanity_checks"))
+    )
+    if checks:
+        steps.append(
+            "Run the declared validation and completion checks against the resulting artifacts."
+        )
+
+    categories = resource_graph.get("categories")
+    if isinstance(categories, dict) and any(
+        str(name).casefold() in {"assets", "templates"}
+        for name in categories
+    ):
+        steps.append(
+            "When the instructions require an exact template or binary asset, use "
+            "skill_copy_resource to preserve its bytes; do not reconstruct it from a preview."
+        )
+
+    has_compiled_execution = bool(routes or workers or aggregation)
+    if not has_compiled_execution and not declares_artifact_set and not merge_declared:
+        hint = (
+            "No compiled orchestration or multi-artifact/merge contract is declared. "
+            "Follow SKILL.md and the user's requested output shape, using bundled files "
+            "only as relevant supporting resources. Do not infer delegation, multiple "
+            "artifacts, or a merge step from package size or filenames."
+        )
+    else:
+        enabled_parts: list[str] = []
+        if routes:
+            enabled_parts.append("route selection")
+        if workers:
+            enabled_parts.append("worker execution")
+        if aggregation:
+            enabled_parts.append("aggregation")
+        if declares_artifact_set:
+            enabled_parts.append("artifact-set production")
+        if merge_declared:
+            enabled_parts.append("merge")
+        if checks:
+            enabled_parts.append("validation")
+        hint = (
+            "This manifest exposes only execution shapes declared by the compiled Skill "
+            f"contract ({', '.join(enabled_parts)}). Execute those parts when selected; "
+            "do not invent undeclared routes, workers, artifacts, or merge operations."
+        )
+    return steps, hint
+
 
 def _build_execution_plan_hint(output_contract: dict[str, Any]) -> str:
     """Turn the skill's declared output contract into a concrete execution instruction.
@@ -421,29 +783,60 @@ def _build_execution_plan_hint(output_contract: dict[str, Any]) -> str:
         return ""
     parts: list[str] = []
     file_count = output_contract.get("declared_file_count")
-    modular = output_contract.get("declared_modular_files") or []
+    modular = _as_manifest_list(output_contract.get("declared_modular_files"))
+    deliverables = _as_manifest_list(output_contract.get("declared_artifacts"))
+    ancillary = _as_manifest_list(output_contract.get("declared_ancillary_files"))
     if modular:
         parts.append(
-            f"Write the {len(modular)} declared modular files "
+            f"Produce the {len(modular)} declared modular artifacts "
             f"({', '.join(modular[:4])}{', …' if len(modular) > 4 else ''}) into the session workspace."
         )
-    elif file_count:
-        parts.append(f"Write the declared modular content files ({file_count} total artifacts expected).")
-    merge_command = output_contract.get("merge_command")
-    final_artifact = output_contract.get("declared_final_artifact")
-    if merge_command:
-        mandatory = " (mandatory)" if output_contract.get("merge_mandatory") else ""
+    elif deliverables or ancillary:
+        declared = [str(item) for item in (deliverables + ancillary)]
         parts.append(
-            f"Then run the skill's declared merge step{mandatory} with the Bash tool exactly as the skill specifies "
-            f"(do NOT rewrite the large report with the write_file tool): `{merge_command}`."
+            f"Produce the {len(declared)} declared artifacts "
+            f"({', '.join(declared[:4])}{', …' if len(declared) > 4 else ''}) in the session workspace."
         )
+    elif file_count:
+        parts.append(f"Produce the declared artifact set ({file_count} total artifacts expected).")
+    merge_command = output_contract.get("merge_command")
+    merge_input_order = _as_manifest_list(output_contract.get("merge_input_order"))
+    merge_declared = bool(
+        merge_command
+        or merge_input_order
+        or output_contract.get("merge_mandatory") is True
+        or output_contract.get("merge_declarations")
+    )
+    final_artifact = output_contract.get("declared_final_artifact")
+    if merge_declared:
+        mandatory = " (mandatory)" if output_contract.get("merge_mandatory") else ""
+        order_hint = ""
+        if merge_input_order:
+            rendered_order = ", ".join(str(item) for item in merge_input_order[:8])
+            if len(merge_input_order) > 8:
+                rendered_order += ", …"
+            order_hint = f" Exact declared input order: {rendered_order}."
+        else:
+            order_hint = " Use only the exact input order compiled from the declaration; do not infer one."
+        parts.append(
+            f"Then reproduce the skill's declared merge order{mandatory} with the workspace-scoped "
+            f"`merge_files` tool (do NOT rewrite the large final artifact with write_file/execute_code). "
+            f"{order_hint.strip()}"
+        )
+        if merge_command:
+            parts.append(
+                f"The package's original command is reference-only: `{merge_command}`."
+            )
     elif final_artifact:
         parts.append(f"Then produce the declared final artifact `{final_artifact}`.")
     checks = output_contract.get("post_merge_checks") or []
     if checks:
-        parts.append("Verify the merged report against the skill's post-merge checks: " + "; ".join(checks[:5]) + ".")
+        parts.append("Verify the resulting artifacts against the Skill's declared checks: " + "; ".join(checks[:5]) + ".")
     if final_artifact:
-        parts.append(f"Completion requires `{final_artifact}` to exist in the workspace and pass those checks.")
+        completion = f"Completion requires `{final_artifact}` to exist in the workspace"
+        if checks:
+            completion += " and pass those checks"
+        parts.append(completion + ".")
     return " ".join(parts)
 
 

@@ -4,7 +4,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from agent_loop import _session_mcp_definitions_for_tools
 from tools import mcp_client
+from tools.context import ToolContext
+from tools.delegation import _run_child
 
 
 class MCPSessionRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -28,6 +31,23 @@ class MCPSessionRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "inputSchema": {
                 "type": "object",
                 "properties": {"value": {"type": "string"}},
+            },
+        }]
+        return state
+
+    def _named_state(self, server_name: str, tool_name: str, marker: str):
+        state = mcp_client.MCPServerState(
+            server_name,
+            {"command": "python", "args": ["server.py"], "marker": marker},
+        )
+        state.connected = True
+        state.tools = [{
+            "name": tool_name,
+            "description": marker,
+            "inputSchema": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
             },
         }]
         return state
@@ -57,6 +77,118 @@ class MCPSessionRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 "mcp_same-name_echo", {"value": "x"}, "user", "b"
             ))
         self.assertEqual(result["marker"], "session-b")
+
+    async def test_child_mcp_allowlist_and_schema_include_only_exact_declared_tool(self):
+        declared_state = self._named_state("evidence", "lookup", "declared")
+        hidden_state = self._named_state("admin", "mutate", "hidden")
+        mcp_client._mcp_states[("user", "session")] = {
+            "evidence": declared_state,
+            "admin": hidden_state,
+        }
+        declared_name = "mcp_evidence_lookup"
+        hidden_name = "mcp_admin_mutate"
+
+        definitions = _session_mcp_definitions_for_tools(
+            "user",
+            "session",
+            [declared_name],
+            allow_all=False,
+        )
+        self.assertEqual(
+            [item["function"]["name"] for item in definitions],
+            [declared_name],
+        )
+        self.assertEqual(
+            definitions[0]["function"]["parameters"],
+            {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        )
+
+        observed: dict[str, object] = {}
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            observed["tools"] = list(tools)
+            observed["allow_session_mcp"] = kwargs.get("allow_session_mcp")
+            yield {"type": "delta", "content": "retrieved evidence " * 30}
+            yield {"type": "done", "finish_reason": "stop"}
+
+        context = ToolContext(
+            user_id="user",
+            session_id="session",
+            model_id="model",
+            provider_config={"base_url": "http://example", "api_model": "model"},
+            enabled_tools=(declared_name, hidden_name),
+            run_id="parent",
+            root_run_id="root",
+        )
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                return_value="results/delegate_mcp.txt",
+            ),
+        ):
+            result = await _run_child(
+                {
+                    "goal": "query the declared evidence capability",
+                    "step_type": "knowledge_bootstrap",
+                    "tools": [declared_name],
+                },
+                context,
+                0,
+                parallel_child=True,
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(observed["tools"], [declared_name])
+        self.assertFalse(observed["allow_session_mcp"])
+        self.assertNotIn(hidden_name, observed["tools"])
+
+    async def test_child_cannot_receive_mcp_tool_from_another_session(self):
+        state_a = self._named_state("evidence", "lookup", "session-a")
+        mcp_client._mcp_states[("user", "a")] = {"evidence": state_a}
+        tool_name = "mcp_evidence_lookup"
+
+        context = ToolContext(
+            user_id="user",
+            session_id="b",
+            model_id="model",
+            provider_config={"base_url": "http://example", "api_model": "model"},
+            enabled_tools=(tool_name,),
+            run_id="parent",
+            root_run_id="root",
+        )
+        with (
+            patch("agent_loop.run_stream") as run_stream,
+            patch(
+                "tools.delegation.persist_result_for_history",
+                return_value="results/delegate_mcp.txt",
+            ),
+        ):
+            result = await _run_child(
+                {
+                    "goal": "attempt a cross-session capability",
+                    "step_type": "knowledge_bootstrap",
+                    "tools": [tool_name],
+                },
+                context,
+                0,
+                parallel_child=True,
+            )
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["rejected_tools"], [tool_name])
+        self.assertIn("exact session", result["error"])
+        run_stream.assert_not_called()
+        self.assertEqual(
+            _session_mcp_definitions_for_tools(
+                "user", "b", [tool_name], allow_all=False,
+            ),
+            [],
+        )
 
     def test_config_layers_do_not_copy_inherited_servers(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -6,10 +6,13 @@ import ast
 import configparser
 import json
 import re
+import shlex
 import sys
 import tomllib
 from pathlib import Path
 from typing import Any
+
+from packaging.requirements import InvalidRequirement, Requirement
 
 from skills.loader import parse_frontmatter
 
@@ -20,6 +23,7 @@ MANIFEST_NAMES = {
     "environment.yml",
     "environment.yaml",
 }
+RUNTIME_REQUIREMENTS_NAME = "requirements.txt"
 PYTHON_EXTENSIONS = {".py"}
 EXCLUDED_DIRS = {
     ".git",
@@ -93,6 +97,13 @@ def scan_skill_dependencies(skill_dir: str | Path) -> dict[str, Any]:
     sources: list[dict[str, str]] = []
 
     _scan_frontmatter(root, packages, entrypoints, unsupported, warnings, sources)
+    _scan_compiled_activation_contract(
+        root,
+        packages,
+        unsupported,
+        warnings,
+        sources,
+    )
     _scan_manifests(root, packages, unsupported, warnings, sources)
     _scan_mcp_entrypoints(root, entrypoints, warnings, sources)
     heuristic_imports = _scan_python_imports(root, packages, warnings)
@@ -107,6 +118,51 @@ def scan_skill_dependencies(skill_dir: str | Path) -> dict[str, Any]:
         "warnings": _dedupe(warnings),
         "sources": sources,
         "heuristic_imports": heuristic_imports,
+    }
+
+
+def scan_declared_skill_dependencies(skill_dir: str | Path) -> dict[str, Any]:
+    """Scan only package-wide, machine-declared Skill dependencies.
+
+    Public script runners use this lightweight report immediately before an
+    isolated execution. Route-specific worker/bootstrap/aggregation contracts
+    are already checked by activation preflight; re-compiling all nested route
+    requirements here would incorrectly let an unrelated route block the
+    selected entrypoint. Import heuristics are intentionally excluded because
+    they are observations, not declarative installation requirements.
+    """
+
+    root = Path(skill_dir).resolve()
+    if not root.is_dir():
+        return {
+            "python_packages": [],
+            "entrypoints": [],
+            "unsupported": [],
+            "warnings": [f"Skill directory not found: {skill_dir}"],
+            "sources": [],
+            "heuristic_imports": [],
+        }
+    packages: list[str] = []
+    entrypoints: list[str] = []
+    unsupported: list[str] = []
+    warnings: list[str] = []
+    sources: list[dict[str, str]] = []
+    _scan_frontmatter(
+        root,
+        packages,
+        entrypoints,
+        unsupported,
+        warnings,
+        sources,
+    )
+    _scan_manifests(root, packages, unsupported, warnings, sources)
+    return {
+        "python_packages": _dedupe(packages),
+        "entrypoints": _dedupe(entrypoints),
+        "unsupported": _dedupe(unsupported),
+        "warnings": _dedupe(warnings),
+        "sources": sources,
+        "heuristic_imports": [],
     }
 
 
@@ -181,7 +237,16 @@ def _scan_frontmatter(
     metadata = frontmatter.get("metadata") if isinstance(frontmatter, dict) else None
     if not isinstance(metadata, dict):
         metadata = {}
-    candidates = [metadata.get("python"), frontmatter.get("python")]
+    candidates = [
+        metadata.get("python"),
+        frontmatter.get("python"),
+        frontmatter.get("dependencies"),
+        frontmatter.get("prerequisites"),
+        frontmatter.get("requirements"),
+    ]
+    hermes = metadata.get("hermes")
+    if isinstance(hermes, dict):
+        candidates.append(hermes.get("prerequisites"))
     openclaw = metadata.get("openclaw")
     if isinstance(openclaw, dict):
         candidates.extend([openclaw.get("requires"), openclaw.get("install")])
@@ -189,6 +254,84 @@ def _scan_frontmatter(
         _extract_structured_dependency_value(candidate, packages, entrypoints, unsupported)
     if any(candidate for candidate in candidates):
         sources.append({"path": "SKILL.md", "kind": "frontmatter"})
+
+
+def _scan_compiled_activation_contract(
+    root: Path,
+    packages: list[str],
+    unsupported: list[str],
+    warnings: list[str],
+    sources: list[dict[str, str]],
+) -> None:
+    """Forward compiler-owned package prerequisites to the managed runtime.
+
+    Nested worker/bootstrap/aggregation declarations are not visible to a
+    flat frontmatter scanner. Reusing the bounded Skill compiler prevents a
+    second YAML interpretation from confusing worker-DAG dependencies with
+    Python packages.
+    """
+    try:
+        from skills.loader import load_skill_content
+
+        loaded = load_skill_content(
+            root / "SKILL.md",
+            skill_dir=str(root),
+        )
+    except Exception as exc:
+        warnings.append(
+            f"Could not compile activation dependency contract: {type(exc).__name__}: {exc}"
+        )
+        return
+    execution = loaded.get("execution_contract") if isinstance(loaded, dict) else None
+    if not isinstance(execution, dict):
+        return
+    diagnostics = execution.get("diagnostics")
+    if isinstance(diagnostics, dict):
+        for item in diagnostics.get("errors") or []:
+            code = item.get("code") if isinstance(item, dict) else "invalid_contract"
+            unsupported.append(f"invalid_skill_contract:{code}")
+
+    environments: list[dict[str, Any]] = []
+    package_environment = execution.get("environment_contract")
+    if isinstance(package_environment, dict):
+        environments.append(package_environment)
+    for worker in execution.get("workers") or []:
+        environment = (
+            worker.get("environment_contract")
+            if isinstance(worker, dict) else None
+        )
+        if isinstance(environment, dict):
+            environments.append(environment)
+    bootstrap = execution.get("knowledge_bootstrap")
+    if isinstance(bootstrap, dict):
+        for source in bootstrap.get("sources") or []:
+            environment = (
+                source.get("environment_contract")
+                if isinstance(source, dict) else None
+            )
+            if isinstance(environment, dict):
+                environments.append(environment)
+    aggregation = execution.get("aggregation")
+    if isinstance(aggregation, dict):
+        for step in aggregation.get("steps") or []:
+            environment = (
+                step.get("environment_contract")
+                if isinstance(step, dict) else None
+            )
+            if isinstance(environment, dict):
+                environments.append(environment)
+
+    compiled_packages = [
+        str(item.get("requirement"))
+        for environment in environments
+        for item in environment.get("packages") or []
+        if isinstance(item, dict)
+        and item.get("optional") is not True
+        and item.get("requirement")
+    ]
+    if compiled_packages:
+        packages.extend(compiled_packages)
+        sources.append({"path": "SKILL.md", "kind": "activation_contract"})
 
 
 def _extract_structured_dependency_value(
@@ -245,11 +388,23 @@ def _scan_manifests(
     warnings: list[str],
     sources: list[dict[str, str]],
 ) -> None:
-    for path in _iter_files(root):
+    """Read only package-root runtime manifests.
+
+    Agent Skill resources are disclosed and selected on demand.  A manifest
+    nested below ``assets/``, ``references/``, ``examples/``, ``tests/``, or an
+    unselected script subtree therefore cannot be treated as a package-wide
+    runtime declaration.  Doing so lets inert examples install packages or
+    block every entrypoint in the Skill.  Component-specific dependencies must
+    instead be declared by the selected execution contract (or be self-contained
+    in the selected script); only conventional package-root manifests have
+    package-wide authority here.
+    """
+
+    for path in _iter_package_runtime_manifests(root):
         name = path.name
         rel = _rel(path, root)
         try:
-            if name.startswith("requirements") and name.endswith(".txt"):
+            if name == RUNTIME_REQUIREMENTS_NAME:
                 parsed = _requirements_from_text(path.read_text(encoding="utf-8", errors="replace"))
                 if parsed:
                     packages.extend(parsed)
@@ -282,17 +437,64 @@ def _scan_manifests(
             warnings.append(f"Failed to parse {rel}: {exc}")
 
 
+def _iter_package_runtime_manifests(root: Path):
+    """Yield exact root-level manifests with unambiguous runtime semantics."""
+
+    try:
+        children = sorted(root.iterdir())
+    except OSError:
+        return
+    for path in children:
+        if not path.is_file() or path.is_symlink():
+            continue
+        if path.name == RUNTIME_REQUIREMENTS_NAME or path.name in MANIFEST_NAMES:
+            yield path
+
+
 def _requirements_from_text(text: str) -> list[str]:
     deps: list[str] = []
-    for raw in re.split(r"[\n,]", text):
-        line = raw.strip().strip("'\"")
+    for raw in text.splitlines() or [text]:
+        line = raw.strip()
+        if len(line) >= 2 and line[0] == line[-1] and line[0] in {"'", '"'}:
+            line = line[1:-1].strip()
         if not line or REQ_OPTION_RE.match(line):
             continue
-        if line.startswith(("http://", "https://", "git+", "file:")) or " @ " in line:
-            deps.append(line)
-            continue
-        match = REQ_NAME_RE.match(line)
-        if match:
+        try:
+            Requirement(line)
+        except InvalidRequirement:
+            candidates: list[str] = []
+            try:
+                tokens = [token for token in shlex.split(line) if not token.startswith("-")]
+            except ValueError:
+                tokens = []
+            if len(tokens) > 1:
+                try:
+                    for token in tokens:
+                        Requirement(token)
+                except InvalidRequirement:
+                    candidates = []
+                else:
+                    candidates = tokens
+            if not candidates and "," in line:
+                comma_parts = [part.strip() for part in line.split(",") if part.strip()]
+                try:
+                    for part in comma_parts:
+                        Requirement(part)
+                except InvalidRequirement:
+                    comma_parts = []
+                candidates = comma_parts
+            if candidates:
+                deps.extend(candidates)
+            elif (
+                REQ_NAME_RE.match(line)
+                or line.startswith(("http://", "https://", "git+", "file:"))
+                or " @ " in line
+            ):
+                # Preserve invalid/direct declarations so the sidecar's PEP
+                # 508 evaluator can reject them explicitly; silently dropping
+                # an unparseable dependency would be an unsafe success.
+                deps.append(line)
+        else:
             deps.append(line)
     return deps
 
@@ -302,11 +504,8 @@ def _pyproject_dependencies(parsed: dict[str, Any]) -> list[str]:
     project = parsed.get("project")
     if isinstance(project, dict):
         deps.extend(str(item) for item in project.get("dependencies") or [] if item)
-        optional = project.get("optional-dependencies")
-        if isinstance(optional, dict):
-            for values in optional.values():
-                if isinstance(values, list):
-                    deps.extend(str(item) for item in values if item)
+        # Optional dependency groups are not package-wide runtime requirements.
+        # A selected route may declare one explicitly in its execution contract.
     poetry = (((parsed.get("tool") or {}).get("poetry") or {}) if isinstance(parsed.get("tool"), dict) else {})
     poetry_deps = poetry.get("dependencies") if isinstance(poetry, dict) else None
     if isinstance(poetry_deps, dict):
@@ -338,17 +537,13 @@ def _setup_cfg_dependencies(path: Path) -> list[str]:
     deps: list[str] = []
     if parser.has_option("options", "install_requires"):
         deps.extend(_requirements_from_text(parser.get("options", "install_requires")))
-    for section in parser.sections():
-        if section.startswith("options.extras_require"):
-            for _, value in parser.items(section):
-                deps.extend(_requirements_from_text(value))
     return deps
 
 
 def _pipfile_dependencies(path: Path) -> list[str]:
     parsed = tomllib.loads(path.read_text(encoding="utf-8", errors="replace"))
     deps: list[str] = []
-    for section in ("packages", "dev-packages"):
+    for section in ("packages",):
         values = parsed.get(section)
         if not isinstance(values, dict):
             continue

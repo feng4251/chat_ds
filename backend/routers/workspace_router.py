@@ -43,22 +43,13 @@ from workspace import (
     workspace_file_metadata,
 )
 from hooks import emit_event
+from native_tools import DEFAULT_NATIVE_TOOL_SET, DEFAULT_NATIVE_TOOLS
+from model_routing import (
+    canonical_agent_model_id,
+    filter_agentic_fallback_model_ids,
+)
 
 router = APIRouter(prefix="/api/conversations", tags=["workspace"])
-
-DEFAULT_TOOLS = [
-    "web_search", "web_extract", "execute_code", "run_skill_python",
-    "read_file", "write_file", "patch_file", "search_files",
-    "todo", "clarify", "memory",
-    "skills_list", "skill_view", "skill_manage",
-    "browser_navigate", "browser_snapshot", "browser_click",
-    "browser_type", "browser_scroll", "browser_back",
-    "session_search", "sessions_list", "sessions_history", "sessions_send",
-    "sessions_fork", "session_status",
-    "delegate_task", "cronjob", "get_goal", "create_goal", "update_goal",
-    "image_generate", "vision_analyze",
-    "mcp_server_list", "mcp_server_status",
-]
 
 
 async def _conversation(cid: str, user_id: str, db: AsyncSession) -> Conversation:
@@ -206,10 +197,14 @@ async def get_conversation_settings(
     db=Depends(get_db),
 ):
     conv = await _conversation(cid, user.id, db)
+    fallback_model_ids, _ = filter_agentic_fallback_model_ids(
+        serialize_json_list(conv.fallback_model_ids, []),
+        requested_model_id=conv.model_id,
+    )
     return {
-        "model_id": conv.model_id,
-        "enabled_tools": serialize_json_list(conv.enabled_tools, DEFAULT_TOOLS),
-        "fallback_model_ids": serialize_json_list(conv.fallback_model_ids, []),
+        "model_id": canonical_agent_model_id(conv.model_id),
+        "enabled_tools": serialize_json_list(conv.enabled_tools, DEFAULT_NATIVE_TOOLS),
+        "fallback_model_ids": fallback_model_ids,
         "enabled_user_skills": serialize_json_list(conv.enabled_user_skills, []),
         "usage": {
             "input_tokens": conv.input_tokens,
@@ -228,11 +223,12 @@ async def update_conversation_settings(
 ):
     conv = await _conversation(cid, user.id, db)
     if payload.model_id is not None:
-        if not await _model_exists(payload.model_id, user.id, db):
+        canonical_model_id = canonical_agent_model_id(payload.model_id)
+        if not await _model_exists(canonical_model_id, user.id, db):
             raise HTTPException(400, f"Unknown model: {payload.model_id}")
-        conv.model_id = payload.model_id
+        conv.model_id = canonical_model_id
     if payload.enabled_tools is not None:
-        unknown_tools = set(payload.enabled_tools) - set(DEFAULT_TOOLS)
+        unknown_tools = set(payload.enabled_tools) - DEFAULT_NATIVE_TOOL_SET
         if unknown_tools:
             raise HTTPException(400, f"Unknown tools: {sorted(unknown_tools)}")
         conv.enabled_tools = json.dumps(list(dict.fromkeys(payload.enabled_tools)))
@@ -240,9 +236,11 @@ async def update_conversation_settings(
         for model_id in payload.fallback_model_ids:
             if not await _model_exists(model_id, user.id, db):
                 raise HTTPException(400, f"Unknown fallback model: {model_id}")
-        conv.fallback_model_ids = json.dumps(
-            [m for m in dict.fromkeys(payload.fallback_model_ids) if m != conv.model_id]
+        allowed_fallbacks, _ = filter_agentic_fallback_model_ids(
+            payload.fallback_model_ids,
+            requested_model_id=conv.model_id,
         )
+        conv.fallback_model_ids = json.dumps(allowed_fallbacks)
     if payload.enabled_user_skills is not None:
         existing_names = (await db.execute(
             select(SkillPackage.name).where(
@@ -663,7 +661,7 @@ async def export_trajectory(
             "updated_at": str(conv.updated_at),
         },
         "settings": {
-            "enabled_tools": serialize_json_list(conv.enabled_tools, DEFAULT_TOOLS),
+            "enabled_tools": serialize_json_list(conv.enabled_tools, DEFAULT_NATIVE_TOOLS),
             "fallback_model_ids": serialize_json_list(conv.fallback_model_ids, []),
         },
         "goal": await get_goal(cid, user, db),

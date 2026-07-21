@@ -19,6 +19,7 @@ ALLOWED_EVENTS = {
     "*",
     "session.created", "session.forked", "session.deleted",
     "message.created", "run.started", "run.completed", "run.failed",
+    "run.cancelled",
     "goal.updated", "cron.created", "cron.started", "cron.completed", "cron.failed",
 }
 

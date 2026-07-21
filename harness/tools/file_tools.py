@@ -5,15 +5,18 @@ Each user+session gets an isolated workspace directory under
 Path traversal attacks (..) are rejected. Operations:
   - read_file: read file content with optional offset/limit
   - write_file: write/overwrite a file
+  - merge_files: atomically concatenate workspace files
   - search_files: search file contents (ripgrep) or find files by name (glob)
 """
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
-import subprocess
 import os
+import stat
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -260,6 +263,288 @@ async def patch_file(
         "path": filepath,
         "replacements": count if replace_all else 1,
         "size": len(updated),
+    }, ensure_ascii=False)
+
+
+def _normalize_merge_pattern(pattern: str) -> str:
+    """Return a workspace-relative POSIX glob pattern or raise ValueError."""
+    if not isinstance(pattern, str) or not pattern.strip():
+        raise ValueError("Merge glob patterns must be non-empty strings.")
+    clean = pattern
+    if clean.startswith("workspace/"):
+        clean = clean[len("workspace/"):]
+    if not clean or clean.startswith("/"):
+        raise ValueError(f"Absolute paths are not allowed in merge patterns: {pattern}")
+    parts = clean.split("/")
+    if ".." in parts:
+        raise ValueError(f"Path traversal detected in merge pattern: {pattern}")
+    if "\x00" in clean:
+        raise ValueError("NUL bytes are not allowed in merge patterns.")
+    return clean
+
+
+def _matches_merge_pattern(relative_path: str, pattern: str) -> bool:
+    """Match a POSIX workspace path against a glob with recursive ``**``."""
+    path_parts = tuple(part for part in relative_path.split("/") if part not in {"", "."})
+    pattern_parts = tuple(part for part in pattern.split("/") if part not in {"", "."})
+    memo: dict[tuple[int, int], bool] = {}
+
+    def _match(pattern_index: int, path_index: int) -> bool:
+        key = (pattern_index, path_index)
+        if key in memo:
+            return memo[key]
+        if pattern_index == len(pattern_parts):
+            result = path_index == len(path_parts)
+        elif pattern_parts[pattern_index] == "**":
+            result = _match(pattern_index + 1, path_index) or (
+                path_index < len(path_parts)
+                and _match(pattern_index, path_index + 1)
+            )
+        else:
+            result = (
+                path_index < len(path_parts)
+                and fnmatch.fnmatchcase(path_parts[path_index], pattern_parts[pattern_index])
+                and _match(pattern_index + 1, path_index + 1)
+            )
+        memo[key] = result
+        return result
+
+    return _match(0, 0)
+
+
+def _workspace_file_candidates(workspace: Path) -> list[tuple[str, Path, bool]]:
+    """List workspace files without following directory symlinks."""
+    candidates: list[tuple[str, Path, bool]] = []
+    for current, dirnames, filenames in os.walk(workspace, topdown=True, followlinks=False):
+        current_path = Path(current)
+        dirnames[:] = sorted(
+            name for name in dirnames
+            if not (current_path / name).is_symlink()
+        )
+        for filename in sorted(filenames):
+            path = current_path / filename
+            relative = path.relative_to(workspace).as_posix()
+            candidates.append((relative, path, path.is_symlink()))
+    return sorted(candidates, key=lambda item: item[0])
+
+
+def _text_file_summary(path: Path) -> dict:
+    """Return bounded, deterministic acceptance metadata for a text file."""
+    lines = 0
+    first_nonempty: str | None = None
+    last_nonempty: str | None = None
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            lines += 1
+            stripped = line.strip()
+            if stripped:
+                if first_nonempty is None:
+                    first_nonempty = stripped
+                last_nonempty = stripped
+
+    max_metadata_chars = 2_000
+
+    def _bounded(value: str | None) -> tuple[str | None, bool]:
+        if value is None or len(value) <= max_metadata_chars:
+            return value, False
+        return value[:max_metadata_chars] + "…", True
+
+    first_value, first_truncated = _bounded(first_nonempty)
+    last_value, last_truncated = _bounded(last_nonempty)
+    return {
+        "bytes": path.stat().st_size,
+        "lines": lines,
+        "first_nonempty_line": first_value,
+        "last_nonempty_line": last_value,
+        "first_nonempty_line_chars": len(first_nonempty or ""),
+        "last_nonempty_line_chars": len(last_nonempty or ""),
+        "metadata_truncated": first_truncated or last_truncated,
+    }
+
+
+async def merge_files(
+    output_filepath: str,
+    input_files: list[str] | None = None,
+    patterns: list[str] | None = None,
+    separator: str = "",
+    user_id: str = "default",
+    session_id: str = "default",
+) -> str:
+    """Atomically concatenate workspace files in a deterministic order.
+
+    Explicit ``input_files`` retain caller order. Each glob pattern is then
+    expanded in lexicographic workspace-relative order. Files selected more
+    than once are included only at their first occurrence.
+    """
+    if input_files is not None and not isinstance(input_files, list):
+        return json.dumps({"error": "input_files must be an array of workspace paths."})
+    if patterns is not None and not isinstance(patterns, list):
+        return json.dumps({"error": "patterns must be an array of workspace glob patterns."})
+    if not isinstance(separator, str):
+        return json.dumps({"error": "separator must be a string."})
+    if not input_files and not patterns:
+        return json.dumps({
+            "error": "Provide at least one input file or glob pattern.",
+            "reason": "missing_inputs",
+        })
+    if any(not isinstance(item, str) for item in (input_files or [])):
+        return json.dumps({"error": "Every input_files item must be a string."})
+    if any(not isinstance(item, str) for item in (patterns or [])):
+        return json.dumps({"error": "Every patterns item must be a string."})
+
+    try:
+        output_path = _resolve(output_filepath, user_id, session_id)
+        workspace = _sandbox_dir(user_id, session_id).resolve()
+        output_relative = output_path.relative_to(workspace).as_posix()
+        normalized_patterns = [
+            _normalize_merge_pattern(pattern)
+            for pattern in (patterns or [])
+        ]
+    except (ValueError, OSError) as exc:
+        return json.dumps({"error": str(exc)})
+
+    if output_path.exists() and output_path.is_dir():
+        return json.dumps({"error": f"Output path is a directory: {output_filepath}"})
+    safety_err = check_file_write_safety(str(output_path))
+    if safety_err:
+        return json.dumps({"error": safety_err})
+
+    matching_output_patterns = [
+        pattern
+        for pattern in normalized_patterns
+        if _matches_merge_pattern(output_relative, pattern)
+    ]
+    if matching_output_patterns:
+        return json.dumps({
+            "error": (
+                "Output path matches an input glob pattern and could be merged "
+                "into itself on this or a later run."
+            ),
+            "reason": "output_matches_input_pattern",
+            "output_filepath": output_relative,
+            "matching_patterns": matching_output_patterns,
+        }, ensure_ascii=False)
+
+    selected: list[tuple[str, Path]] = []
+    seen: set[Path] = set()
+
+    def _add_input(relative: str, path: Path) -> None:
+        canonical = path.resolve()
+        if canonical == output_path:
+            raise ValueError(f"Output file cannot also be an input: {relative}")
+        if canonical not in seen:
+            seen.add(canonical)
+            selected.append((relative, canonical))
+
+    try:
+        for filepath in input_files or []:
+            path = _resolve(filepath, user_id, session_id)
+            if not path.exists():
+                raise ValueError(f"Input file not found: {filepath}")
+            if path.is_symlink():
+                raise ValueError(f"Symlinks are not allowed: {filepath}")
+            if not path.is_file():
+                raise ValueError(f"Input is not a regular file: {filepath}")
+            relative = path.relative_to(workspace).as_posix()
+            _add_input(relative, path)
+
+        if normalized_patterns:
+            candidates = _workspace_file_candidates(workspace)
+            for pattern in normalized_patterns:
+                matched = 0
+                for relative, candidate, is_symlink in candidates:
+                    if not _matches_merge_pattern(relative, pattern):
+                        continue
+                    if is_symlink:
+                        raise ValueError(
+                            f"Glob pattern matched a symlink, which is not allowed: {relative}"
+                        )
+                    resolved = _resolve(relative, user_id, session_id)
+                    if not resolved.is_file():
+                        continue
+                    _add_input(relative, resolved)
+                    matched += 1
+                if matched == 0:
+                    raise ValueError(f"Merge glob pattern matched no files: {pattern}")
+    except (ValueError, OSError) as exc:
+        return json.dumps({"error": str(exc)})
+
+    if not selected:
+        return json.dumps({
+            "error": "No regular workspace files were selected for merging.",
+            "reason": "no_matching_inputs",
+        })
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: str | None = None
+    input_metadata: list[dict] = []
+    separator_bytes = separator.encode("utf-8")
+    try:
+        fd, temp_path = tempfile.mkstemp(prefix=".merge_", dir=str(output_path.parent))
+        with os.fdopen(fd, "wb") as destination:
+            for index, (relative, source_path) in enumerate(selected):
+                if index:
+                    destination.write(separator_bytes)
+
+                flags = os.O_RDONLY
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                source_fd = os.open(source_path, flags)
+                source_bytes = 0
+                line_break_count = 0
+                last_byte = b""
+                previous_ended_cr = False
+                with os.fdopen(source_fd, "rb") as source:
+                    source_stat = os.fstat(source.fileno())
+                    if not stat.S_ISREG(source_stat.st_mode):
+                        raise ValueError(f"Input is not a regular file: {relative}")
+                    while True:
+                        chunk = source.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        destination.write(chunk)
+                        source_bytes += len(chunk)
+                        line_break_count += (
+                            chunk.count(b"\n")
+                            + chunk.count(b"\r")
+                            - chunk.count(b"\r\n")
+                        )
+                        if previous_ended_cr and chunk.startswith(b"\n"):
+                            line_break_count -= 1
+                        previous_ended_cr = chunk.endswith(b"\r")
+                        last_byte = chunk[-1:]
+                input_metadata.append({
+                    "path": relative,
+                    "bytes": source_bytes,
+                    "lines": line_break_count + (
+                        1 if source_bytes and last_byte not in {b"\n", b"\r"} else 0
+                    ),
+                })
+            destination.flush()
+            os.fsync(destination.fileno())
+
+        summary = _text_file_summary(Path(temp_path))
+        os.replace(temp_path, output_path)
+        temp_path = None
+        _make_workspace_path_readable(output_path)
+    except Exception as exc:
+        return json.dumps({"error": f"Cannot merge files: {exc}"})
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+    return json.dumps({
+        "status": "merged",
+        "path": output_relative,
+        "input_count": len(selected),
+        "input_files": [relative for relative, _ in selected],
+        "inputs": input_metadata,
+        "separator_chars": len(separator),
+        "separator_bytes": len(separator_bytes),
+        **summary,
     }, ensure_ascii=False)
 
 
@@ -582,6 +867,48 @@ PATCH_FILE_SCHEMA = {
             },
         },
         "required": ["filepath", "old_text", "new_text"],
+    },
+}
+
+MERGE_FILES_SCHEMA = {
+    "name": "merge_files",
+    "description": (
+        "Safely and atomically concatenate text files inside the session workspace. "
+        "Use this instead of generating a large merge script or assuming a shell/cat tool. "
+        "Provide explicit input_files, glob patterns, or both. Explicit files retain their "
+        "given order; every pattern expands in lexicographic order; overlapping matches are "
+        "deduplicated. Each pattern must match at least one file. The output path must not be "
+        "an explicit input or match any input pattern, which prevents recursive self-merges. "
+        "Returns acceptance metadata including selected inputs, bytes, lines, and first/last "
+        "non-empty output lines."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "output_filepath": {
+                "type": "string",
+                "description": "Relative workspace path for the atomically replaced output file.",
+            },
+            "input_files": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional ordered list of relative workspace input files.",
+            },
+            "patterns": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional workspace-relative glob patterns. Supports recursive **. "
+                    "Matches are appended in lexicographic order."
+                ),
+            },
+            "separator": {
+                "type": "string",
+                "description": "Text inserted between adjacent input files. Defaults to empty.",
+                "default": "",
+            },
+        },
+        "required": ["output_filepath"],
     },
 }
 

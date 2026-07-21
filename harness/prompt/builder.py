@@ -96,60 +96,76 @@ SKILLS_GUIDANCE = (
 )
 
 SESSION_SKILL_USAGE_GUIDANCE = (
-    "# Session skill workflow\n"
+    "# Session Skill execution\n"
     "Session-level skills were uploaded or installed specifically for this session. "
     "Treat them as task-specific instructions when they are relevant to the user's request.\n"
-    "- For complex domain tasks, simulations, multi-file deliverables, or requests that match "
-    "an available skill description, call `skill_view(name)` before doing broad research, "
-    "writing files, running code, or producing the final answer.\n"
+    "- Ordinary chat, simple OCR, image description, and direct question answering do not "
+    "become Skill workflows merely because session Skills are available. Answer those requests "
+    "directly; do not call skills_list or skill_view merely to browse. A Skill becomes active when "
+    "the user explicitly names it or the harness selects it as a high-confidence match.\n"
+    "- The harness may temporarily expose an exact `skill_view(name)` inspection for at most one "
+    "selected session Skill. Follow that boundary; do not substitute a different catalog entry. "
+    "Description relevance authorizes inspection/compilation only. It does not authorize scripts, "
+    "commands, network access, delegation, or workspace mutation. If no Skill clears the bounded "
+    "selection threshold, continue without activating one.\n"
     "- Do not rely only on the skill name or short description; the full skill content may "
     "contain required workflow steps, templates, tool names, constraints, and verification rules.\n"
-    "- If the skill points to linked files, workflows, orchestrators, workers, references, "
-    "or templates that are relevant to the user's request, inspect the resource graph with "
+    "- A standard instruction-only Skill may have free-form prose in any language. When the "
+    "harness exposes `submit_skill_capability_plan`, first read every contiguous SKILL.md page, "
+    "then classify only the finite backend-issued capability IDs as required or optional and "
+    "record unsupported instructions explicitly. Never invent a tool, script path/hash, command "
+    "or argv, URL prefix, MCP name, or resource grant. The planning call is selection, not authority.\n"
+    "- Use progressive disclosure. First read SKILL.md. If it points to relevant bundled "
+    "references, assets, templates, scripts, or compiled workflow files, inspect the index with "
     "`skill_view(name, file_path='__manifest__')`, then inspect the relevant files with "
-    "`skill_view(name, file_path=...)` before drafting the final artifact. If the manifest "
-    "contains `workflow_contract`, treat it as the execution contract: load declared "
-    "orchestrator/workflow files, load every declared worker file, gather real evidence/tool "
-    "results for worker stages using MCP/database/search/script tools named by the skill, "
-    "write declared modular/checklist artifacts into the current session workspace, and "
-    "create the declared merged/full final report before stopping.\n"
-    "- For broad planning, research, simulation, clinical/regulatory, legal, financial, "
-    "or other multi-discipline deliverables, decompose the work into stage-specific "
-    "sections or worker-like passes, gather evidence/tool results for each stage, and "
-    "then synthesize one coherent final artifact instead of stopping after a short search summary.\n"
+    "`skill_view(name, file_path=...)`. Read only resources needed for the active instructions. "
+    "A directory name or resource count is not execution authority.\n"
+    "- Treat a compiled execution contract as authoritative and conditional. Select a route only "
+    "when routes are declared. Execute worker waves with `delegate_task` only when the compiled "
+    "contract or explicit user request requires worker decomposition and the harness exposes that "
+    "tool. Produce a modular artifact set only when the output contract or explicit request declares "
+    "its members or count. Call `merge_files` only when the contract or explicit request declares a "
+    "merge with an exact input set/order. Run only declared validation checks. Never "
+    "infer multi-agent work, multiple files, or a merge merely because a request is broad, "
+    "multi-domain, or persistent.\n"
+    "- An instruction-only Skill without compiled orchestration remains instruction-only: follow "
+    "its prose and use only the actions authorized by the user's request and exposed tools. Preserve "
+    "the user's requested output shape instead of converting it into a report pipeline.\n"
     "- When writing a requested file, write the complete artifact or a clearly continued "
-    "multi-part artifact; do not leave placeholders, stubs, or many unrelated scratch files "
+    "multi-part artifact when multiple parts are actually requested; do not leave placeholders, "
+    "stubs, or unrelated scratch files "
     "as the final deliverable.\n"
-    "- If you choose not to use an available session skill, state the concrete reason before "
-    "continuing. Otherwise, load the relevant skill and follow its workflow.\n"
+    "- Once the harness selects and compiles a relevant Skill, follow its exact instructions and "
+    "any compiled contract. "
+    "Do not independently choose another catalog entry. This does not apply to ordinary direct chat.\n"
     "- If tool arguments fail validation, inspect the tool schema and retry with all required "
     "arguments; do not repeat the same empty or malformed call."
 )
 
 IMAGE_SKILL_MCP_GUIDANCE = (
-    "# Image handling — skill/MCP first\n"
-    "When the user uploads or references an image, follow this decision process "
-    "BEFORE answering:\n"
-    "1. **Check for session skills FIRST** — call skills_list() to see if any "
-    "installed skill is relevant to the image domain (e.g. pathology, radiology, "
-    "OCR, face recognition, etc.).\n"
-    "2. **If a relevant skill exists** — call skill_view(name) to read its "
-    "instructions. The skill will tell you which MCP tools or workflows to use. "
-    "Follow the skill's instructions exactly.\n"
-    "  2a. MCP servers bundled with skills are registered by the runtime on upload. "
+    "# Image handling — direct chat versus workflow\n"
+    "The presence of an image is not, by itself, a reason to discover or load Skills. "
+    "For simple OCR/transcription, a general image description, or a direct question about "
+    "the image, answer directly from the supplied multimodal input; use vision_analyze only "
+    "when an additional image-tool pass is actually needed. Do not call skills_list or "
+    "skill_view merely because an image exists.\n"
+    "Explore a specialized session Skill only when the user explicitly asks to use/follow it, "
+    "or the harness selects it for a nontrivial image workflow. When that condition applies:\n"
+    "1. Inspect the relevant Skill with skill_view(name), then follow its declared instructions.\n"
+    "2. MCP servers bundled with skills are registered by the runtime on upload. "
     "The mcp_* tools should already be available — try calling them directly. "
     "If they are missing, inspect mcp_server_status and report the runtime error; "
     "do not mutate MCP configuration from the agent turn.\n"
-    "3. **If no relevant skill exists but MCP tools are available** — check "
+    "3. If no relevant Skill exists but an already-available MCP tool clearly applies to the "
+    "activated workflow, check "
     "mcp_server_list / mcp_server_status to see if any connected MCP server "
     "provides image-processing tools.\n"
-    "4. **Only if no skill AND no MCP tool applies** — use vision_analyze as "
-    "the fallback for general-purpose image understanding.\n"
-    "CRITICAL: Never answer an image-based question from the pre-analysis text "
-    "description alone when a domain-specific skill or MCP tool is available. "
-    "The pre-analysis is a lossy summary — specialized tools (pathology MCP, "
-    "OCR services, etc.) see the full-resolution image and apply domain-specific "
-    "models that are far more accurate than a general vision description.\n"
+    "4. If no specialized workflow tool applies, use the supplied multimodal input or "
+    "vision_analyze for general-purpose image understanding.\n"
+    "Within an activated specialized image workflow, never substitute the lossy "
+    "pre-analysis text description for a required domain-specific Skill or MCP call. "
+    "For ordinary direct image chat, use the original multimodal input when available, "
+    "or vision_analyze when the model needs an image-tool pass.\n"
     "When a skill says '仅供研究辅助使用' or similar, you MUST echo that "
     "disclaimer in your response."
 )
@@ -169,7 +185,7 @@ MCP_GUIDANCE = (
     "available — try calling them directly.\n"
     "- If `mcp_server_list` says no MCP servers are configured, the installed "
     "skills may be REST/API or script-based rather than MCP-backed. In that case, "
-    "use the skill's documented scripts with `run_skill_python`, or use web_search/"
+    "use the Skill's declared scripts with `run_skill_script`, or use web_search/"
     "web_extract for general web research; do not invent mcp_* tool names.\n"
     "- If the expected mcp_* tools are missing, use mcp_server_status to "
     "check connection state and report the concrete error. MCP configuration "
@@ -200,25 +216,41 @@ MCP_GUIDANCE = (
 )
 
 PYTHON_RUNTIME_GUIDANCE = (
-    "# Python execution boundary\n"
+    "# Skill script and Python execution boundary\n"
     "- `execute_code` is for calculation and data processing. Its default executor is "
     "network-disabled and cannot install packages. If a single `execute_code` call imports "
     "or calls network libraries such as requests/httpx/urllib/aiohttp/socket, the harness "
-    "automatically runs that call in the managed session Python runtime; the offline executor "
-    "itself remains isolated.\n"
-    "- Inline `pip install` is not allowed. Session skill dependencies are installed by the "
-    "managed runtime from declared skill manifests/metadata.\n"
-    "- If a session skill provides a Python script, use `run_skill_python` with a real path "
-    "from `skill_view` or the tool error's `available_skill_scripts`, e.g. "
-    "`skills/<skill>/scripts/<file>.py`.\n"
+    "still runs that call only in the disposable network-disabled sidecar; network requests fail "
+    "explicitly and never fall back to Python inside the harness container. Workspace changes "
+    "are accepted only from validated artifact receipts.\n"
+    "- Inline `pip install` is not allowed. Declared Skill scripts use their separately governed "
+    "runtime/dependency contract.\n"
+    "- If a session Skill declares a .py, .sh, .bash, .js, or .mjs entrypoint, use "
+    "`run_skill_script` with its exact `skills/<skill>/<path>` and a JSON argv list. "
+    "Never pass a command line, interpreter, shell expression, or copied script body; the "
+    "harness selects only an extension-allowlisted interpreter.\n"
+    "- Use `run_skill_python` only for a public top-level function or public class method "
+    "declared by the exact Skill script. Supply the documented function/class/method name "
+    "and JSON-compatible constructor/call arguments; never author wrapper/import code. Do "
+    "not use an argument-free demo `main()` as evidence for a different task.\n"
+    "- `run_declared_command` is available only when the compiler exposes an exact command "
+    "grant catalog. Copy its skill_name and command_id exactly, pass only a JSON argv list "
+    "after the fixed prefix, and choose cwd workspace or skill. It executes with shell=false: "
+    "never pass a command line, executable path, redirection, interpolation, or pipeline.\n"
     "- Do not paste descriptive skill documentation, pseudo-code, copied snippets from "
     "skill_view, or long Markdown report bodies into `execute_code`. Use real executable code only; "
     "write large Markdown artifacts with `write_file`/`patch_file` or a real workspace/skill script, "
-    "then use `run_skill_python` for script execution.\n"
-    "- If `run_skill_python` or managed `execute_code` fails, read its JSON stdout/stderr/error "
+    "then use `run_skill_script` for a declared supported Skill entrypoint.\n"
+    "- If `run_declared_command`, `run_skill_script`, `run_skill_python`, or isolated `execute_code` fails, read its JSON stdout/stderr/error "
     "fields and fix the script path, cwd, imports, arguments, or output location before finishing.\n"
-    "- For general literature/current web search not tied to a skill script, use "
-    "web_search/web_extract."
+    "- When `skill_http_get` or `skill_http_post_json` is exposed, use it only for an exact "
+    "REST/API HTTPS endpoint and method declared "
+    "by the active Skill. This is also the bounded fallback when a declared helper script is "
+    "valid but its network-isolated execution cannot reach that API. The POST bridge accepts "
+    "only a bounded credential-free JSON object and never follows redirects. Both return "
+    "a request_sent receipt; never claim "
+    "an API was attempted unless such a dispatch receipt exists. For general literature/current "
+    "web search not tied to a Skill endpoint, use web_search/web_extract."
 )
 
 # ---------------------------------------------------------------------------
@@ -355,16 +387,16 @@ OUTPUT_FORMATTING_GUIDANCE = (
     "```\n"
     "我已经读取了目录下的所有 markdown 文件，以下是每个文件的内容：\n\n"
     "## 📄 README.md\n\n"
-    "# Clinical Trial Design\n\n"
-    "This document describes the clinical trial design for...\n\n"
-    "## Study Objectives\n\n"
-    "- Primary: Evaluate safety and efficacy\n"
-    "- Secondary: Assess pharmacokinetics\n\n"
+    "# Project Handbook\n\n"
+    "This document describes the project conventions and workflows.\n\n"
+    "## Getting started\n\n"
+    "- Install the declared dependencies\n"
+    "- Run the documented validation command\n\n"
     "---\n\n"
-    "## 📄 protocol.md\n\n"
-    "# Trial Protocol\n\n"
-    "## Phase I\n\n"
-    "The Phase I portion of the trial will enroll...\n"
+    "## 📄 operations.md\n\n"
+    "# Operations Guide\n\n"
+    "## Release process\n\n"
+    "Follow the repository's declared release checks before publishing.\n"
     "```\n\n"
     "Notice how each markdown file's content is rendered directly (not in a "
     "code block), with a clear header (`## 📄 filename.md`) and a horizontal "
@@ -410,6 +442,7 @@ def build_system_prompt(
     workspace_context: str | None = None,
     goal: dict | None = None,
     enabled_user_skills: list[str] | None = None,
+    include_session_context: bool = True,
 ) -> str:
     """Assemble the full system prompt from stable, context, and volatile tiers.
 
@@ -422,6 +455,10 @@ def build_system_prompt(
         provider: Provider name (e.g. "vllm").
         task_completion_guidance: Inject TASK_COMPLETION_GUIDANCE.
         tool_use_enforcement: "auto", True, False, or list of model substrings.
+        include_session_context: When false, omit caller/workspace context,
+            persistent memory, timestamp/session metadata, and standing goals.
+            The stable minimal identity remains. Defaults to the existing full
+            session-aware behavior.
 
     Returns:
         Full system prompt string.
@@ -465,7 +502,11 @@ def build_system_prompt(
     # 4b. Output formatting guidance — markdown preview mode
     if tools:
         stable.append(OUTPUT_FORMATTING_GUIDANCE)
-        if "execute_code" in tools or "run_skill_python" in tools:
+        if any(name in tools for name in (
+            "execute_code", "run_skill_python", "run_skill_script", "skill_http_get",
+            "skill_http_post_json",
+            "run_declared_command",
+        )):
             stable.append(PYTHON_RUNTIME_GUIDANCE)
 
     # 5. MCP guidance (when MCP management tools are available)
@@ -491,42 +532,45 @@ def build_system_prompt(
     parts.append("\n\n".join(p.strip() for p in stable if p and p.strip()))
 
     # ── Context tier ───────────────────────────────────────────────────
-    context: list[str] = []
-    if system_message:
-        context.append(system_message)
-    if workspace_context:
-        context.append(workspace_context)
-    parts.append("\n\n".join(p.strip() for p in context if p and p.strip()))
+    if include_session_context:
+        context: list[str] = []
+        if system_message:
+            context.append(system_message)
+        if workspace_context:
+            context.append(workspace_context)
+        parts.append("\n\n".join(p.strip() for p in context if p and p.strip()))
 
     # ── Volatile tier ──────────────────────────────────────────────────
     volatile: list[str] = []
 
     # Memory snapshot
-    mem_block = _build_memory_block(user_id)
-    if mem_block:
-        volatile.append(mem_block)
+    if include_session_context:
+        mem_block = _build_memory_block(user_id)
+        if mem_block:
+            volatile.append(mem_block)
 
     # Timestamp + session info
-    now = datetime.now(tz=timezone.utc)
-    timestamp_line = f"Current date: {now.strftime('%A, %B %d, %Y')}"
-    if session_id and session_id != "default":
-        timestamp_line += f"\nSession ID: {session_id}"
+    if include_session_context:
+        now = datetime.now(tz=timezone.utc)
+        timestamp_line = f"Current date: {now.strftime('%A, %B %d, %Y')}"
+        if session_id and session_id != "default":
+            timestamp_line += f"\nSession ID: {session_id}"
     # Show the user-facing display name (e.g. "GLM-5.2 (主模型)") rather than
     # the internal model_id (e.g. "deepseek_v4_pro"). The internal id is a
     # historical routing key, not a model-identity claim — exposing it caused
     # the model to confidently assert "I am DeepSeek" when asked who it was.
-    display = model_id
-    try:
-        from config import PROVIDERS
-        cfg = PROVIDERS.get(model_id) or {}
-        if cfg.get("display_name"):
-            display = cfg["display_name"]
-    except Exception:
-        pass
-    if display:
-        timestamp_line += f"\nModel: {display}"
-    volatile.append(timestamp_line)
-    if goal and goal.get("objective"):
+        display = model_id
+        try:
+            from config import PROVIDERS
+            cfg = PROVIDERS.get(model_id) or {}
+            if cfg.get("display_name"):
+                display = cfg["display_name"]
+        except Exception:
+            pass
+        if display:
+            timestamp_line += f"\nModel: {display}"
+        volatile.append(timestamp_line)
+    if include_session_context and goal and goal.get("objective"):
         goal_lines = [
             "# Current Session Goal",
             f"Status: {goal.get('status') or 'active'}",
@@ -544,7 +588,8 @@ def build_system_prompt(
         )
         volatile.append("\n".join(goal_lines))
 
-    parts.append("\n\n".join(p.strip() for p in volatile if p and p.strip()))
+    if include_session_context:
+        parts.append("\n\n".join(p.strip() for p in volatile if p and p.strip()))
 
     return "\n\n".join(p for p in parts if p)
 

@@ -6,7 +6,7 @@ Key changes from hermes:
   - Async HTTP calls via httpx instead of sync call_llm()
   - No redaction (we don't handle secrets)
   - Simplified token estimation (chars / 4)
-  - No image/media handling (text-only conversations)
+  - Shares multimodal-aware token budgeting with the provider request path
   - No summary-model fallback (single model)
   - Retains core algorithm: prune tool results, token-budget tail protection,
     structured summary template, iterative updates
@@ -19,11 +19,13 @@ import json
 import logging
 import re
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
 from context.engine import ContextEngine
+from context.token_estimator import estimate_message_tokens, is_image_content_part
 
 logger = logging.getLogger(__name__)
 
@@ -68,8 +70,18 @@ _DEFAULT_CONTEXT_LENGTH = 131_072  # Default for models without known context le
 _CONTENT_MAX = 6000
 _CONTENT_HEAD = 4000
 _CONTENT_TAIL = 1500
-_TOOL_ARGS_MAX = 1500
-_TOOL_ARGS_HEAD = 1200
+_IMAGE_METADATA_TEXT_MAX = 500
+_IMAGE_METADATA_ITEMS_MAX = 30
+
+# Canonical Skill instructions are loader-owned tool data, not summary text.
+# Reserve a separate, context-derived allowance for exact skill_view pairs so
+# compression can never silently trade instruction integrity for a smaller
+# summary.  The ceiling prevents a collection of Skills from consuming an
+# unbounded share of a large model context.
+_PROTECTED_SKILL_CONTEXT_RATIO = 0.20
+_PROTECTED_SKILL_TOKENS_FLOOR = 2_000
+_PROTECTED_SKILL_TOKENS_CEILING = 32_000
+_SHA256_RE = re.compile(r"[0-9a-fA-F]{64}\Z")
 
 
 # ---------------------------------------------------------------------------
@@ -82,20 +94,8 @@ def _estimate_tokens(text: str) -> int:
 
 
 def _estimate_messages_tokens(messages: list[dict]) -> int:
-    """Rough token estimate for a message list."""
-    total = 0
-    for msg in messages:
-        content = msg.get("content") or ""
-        if isinstance(content, str):
-            total += len(content)
-        elif isinstance(content, list):
-            total += sum(len(p.get("text", "")) if isinstance(p, dict) else len(str(p)) for p in content)
-        else:
-            total += len(str(content))
-        for tc in msg.get("tool_calls") or []:
-            args = tc.get("function", {}).get("arguments", "")
-            total += len(args)
-    return total // _CHARS_PER_TOKEN
+    """Use the same multimodal-aware estimate as the provider request path."""
+    return sum(estimate_message_tokens(msg) for msg in messages)
 
 
 def _content_length_for_budget(raw_content: Any) -> int:
@@ -113,6 +113,554 @@ def _content_length_for_budget(raw_content: Any) -> int:
         else:
             total += len(str(p))
     return total
+
+
+def _bounded_image_metadata(value: Any, *, depth: int = 0) -> Any:
+    """Keep useful image metadata while removing transport bytes and URLs."""
+    if depth >= 4:
+        return "[metadata depth omitted]"
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for index, (raw_key, item) in enumerate(value.items()):
+            if index >= _IMAGE_METADATA_ITEMS_MAX:
+                result["_truncated"] = True
+                break
+            key = str(raw_key)
+            if key.casefold() in {"data", "url"}:
+                continue
+            if key.casefold() == "image_url" and isinstance(item, str):
+                result[key] = "[image transport omitted]"
+                continue
+            result[key] = _bounded_image_metadata(item, depth=depth + 1)
+        return result
+    if isinstance(value, (list, tuple)):
+        return [
+            _bounded_image_metadata(item, depth=depth + 1)
+            for item in list(value)[:_IMAGE_METADATA_ITEMS_MAX]
+        ]
+    if isinstance(value, str):
+        if value.lstrip().casefold().startswith("data:image/"):
+            return "[image transport omitted]"
+        if len(value) > _IMAGE_METADATA_TEXT_MAX:
+            return value[:_IMAGE_METADATA_TEXT_MAX] + "... [metadata truncated]"
+        return value
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return str(value)[:_IMAGE_METADATA_TEXT_MAX]
+
+
+def _serialize_content_for_summary(raw_content: Any) -> str:
+    """Render multimodal content without ever copying image transport data."""
+    if isinstance(raw_content, str):
+        return raw_content
+    if is_image_content_part(raw_content):
+        metadata = _bounded_image_metadata(raw_content)
+        return "[IMAGE OMITTED; metadata=" + json.dumps(
+            metadata,
+            ensure_ascii=False,
+            default=str,
+        ) + "]"
+    if isinstance(raw_content, list):
+        rendered: list[str] = []
+        for part in raw_content:
+            if isinstance(part, str):
+                rendered.append(part)
+            elif is_image_content_part(part):
+                rendered.append(_serialize_content_for_summary(part))
+            elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                # Preserve ordinary multimodal text exactly; its surrounding
+                # type metadata does not add useful context to the summary.
+                rendered.append(part["text"])
+            else:
+                rendered.append(json.dumps(
+                    _bounded_image_metadata(part),
+                    ensure_ascii=False,
+                    default=str,
+                ))
+        return "\n".join(rendered)
+    if isinstance(raw_content, dict):
+        return json.dumps(
+            _bounded_image_metadata(raw_content),
+            ensure_ascii=False,
+            default=str,
+        )
+    return str(raw_content or "")
+
+
+# ---------------------------------------------------------------------------
+# Canonical Skill activation ledger
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _CanonicalSkillViewReceipt:
+    """One integrity-addressed main SKILL.md tool-call/result pair."""
+
+    skill_name: str
+    document_sha256: str
+    offset: int
+    next_offset: int | None
+    has_more: bool
+    total_chars: int
+    is_paged: bool
+    content: str
+    assistant_index: int
+    call_position: int
+    result_index: int
+    tool_call: Any
+    tool_result: dict[str, Any]
+
+    @property
+    def occurrence(self) -> tuple[int, int, int]:
+        return (self.result_index, self.assistant_index, self.call_position)
+
+
+def _tool_call_identity(tool_call: Any) -> tuple[str, str, str] | None:
+    """Return (id, name, arguments-json) for one native tool call."""
+    if isinstance(tool_call, dict):
+        call_id = str(
+            tool_call.get("call_id") or tool_call.get("id") or ""
+        )
+        function = tool_call.get("function")
+        if not isinstance(function, dict):
+            return None
+        name = function.get("name")
+        arguments = function.get("arguments")
+    else:
+        call_id = str(
+            getattr(tool_call, "call_id", None)
+            or getattr(tool_call, "id", None)
+            or ""
+        )
+        function = getattr(tool_call, "function", None)
+        name = getattr(function, "name", None) if function is not None else None
+        arguments = (
+            getattr(function, "arguments", None)
+            if function is not None else None
+        )
+    if not call_id or not isinstance(name, str) or not isinstance(arguments, str):
+        return None
+    return call_id, name, arguments
+
+
+def _strict_json_object(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, str):
+        return None
+    try:
+        value = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _coherent_receipt_field(
+    result: dict[str, Any],
+    pagination: dict[str, Any] | None,
+    field: str,
+) -> tuple[bool, bool, Any]:
+    """Read duplicated top-level/pagination metadata without ambiguity."""
+    values: list[Any] = []
+    if field in result:
+        values.append(result[field])
+    if pagination is not None and field in pagination:
+        values.append(pagination[field])
+    if not values:
+        return True, False, None
+    first = values[0]
+    if any(type(value) is not type(first) or value != first for value in values[1:]):
+        return False, True, None
+    return True, True, first
+
+
+def _validated_canonical_skill_receipt(
+    *,
+    assistant_index: int,
+    call_position: int,
+    tool_call: Any,
+    result_index: int,
+    tool_result: dict[str, Any],
+) -> _CanonicalSkillViewReceipt | None:
+    """Validate a successful, integrity-addressed main SKILL.md read.
+
+    Supporting resources deliberately fail this predicate.  The tool result
+    must be one complete JSON object; persisted/truncated pointer wrappers and
+    compacted-history records therefore cannot masquerade as an activation.
+    """
+    identity = _tool_call_identity(tool_call)
+    if identity is None:
+        return None
+    _, tool_name, raw_arguments = identity
+    if tool_name != "skill_view":
+        return None
+    arguments = _strict_json_object(raw_arguments)
+    if arguments is None:
+        return None
+
+    skill_name = arguments.get("name")
+    if not isinstance(skill_name, str) or not skill_name.strip():
+        return None
+    skill_name = skill_name.strip()
+    if "filepath" in arguments:
+        return None
+    requested_path = arguments.get("file_path")
+    if requested_path not in (None, "", "SKILL.md"):
+        return None
+    requested_offset = arguments.get("offset", 0)
+    if (
+        not isinstance(requested_offset, int)
+        or isinstance(requested_offset, bool)
+        or requested_offset < 0
+    ):
+        return None
+    requested_limit = arguments.get("limit")
+    if requested_limit is not None and (
+        not isinstance(requested_limit, int)
+        or isinstance(requested_limit, bool)
+        or requested_limit <= 0
+    ):
+        return None
+    if requested_path in (None, "") and (
+        requested_offset != 0 or "offset" in arguments or "limit" in arguments
+    ):
+        return None
+
+    result = _strict_json_object(tool_result.get("content"))
+    if result is None or result.get("success") is not True:
+        return None
+    if result.get("error") not in (None, ""):
+        return None
+    # These are model-history/persistence receipts, not literal skill_view
+    # results.  Do not follow a pointer while compacting model context.
+    if any(
+        key in result
+        for key in (
+            "history_result_path",
+            "history_result_chars",
+            "content_omitted",
+            "_chatds_argument_omitted",
+        )
+    ):
+        return None
+    if result.get("name") != skill_name or result.get("is_binary") is True:
+        return None
+    content = result.get("content")
+    if not isinstance(content, str) or not content:
+        return None
+
+    response_file = result.get("file")
+    if requested_path == "SKILL.md":
+        if response_file != "SKILL.md":
+            return None
+    elif response_file not in (None, "SKILL.md"):
+        return None
+
+    skill_digest = result.get("skill_md_sha256")
+    resource_digest = result.get("sha256")
+    for value in (skill_digest, resource_digest):
+        if value is not None and (
+            not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None
+        ):
+            return None
+    if requested_path == "SKILL.md":
+        digest = resource_digest
+    else:
+        digest = skill_digest
+    if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
+        return None
+    digests = [
+        value.casefold()
+        for value in (skill_digest, resource_digest)
+        if isinstance(value, str) and _SHA256_RE.fullmatch(value) is not None
+    ]
+    if not digests or any(value != digests[0] for value in digests[1:]):
+        return None
+    digest = digest.casefold()
+
+    pagination_value = result.get("pagination")
+    if pagination_value is not None and not isinstance(pagination_value, dict):
+        return None
+    pagination = pagination_value if isinstance(pagination_value, dict) else None
+    is_paged = (
+        pagination is not None
+        or result.get("main_document_paged") is True
+        or any(
+            field in result
+            for field in (
+                "offset", "returned_chars", "total_chars", "next_offset", "has_more"
+            )
+        )
+    )
+
+    if is_paged:
+        if (
+            pagination is None
+            or pagination.get("unit") != "unicode_codepoints"
+        ):
+            return None
+        fields: dict[str, Any] = {}
+        for field in (
+            "offset", "limit", "returned_chars", "total_chars", "next_offset", "has_more"
+        ):
+            coherent, present, value = _coherent_receipt_field(
+                result, pagination, field
+            )
+            if not coherent or not present:
+                return None
+            fields[field] = value
+        offset = fields["offset"]
+        limit = fields["limit"]
+        returned_chars = fields["returned_chars"]
+        total_chars = fields["total_chars"]
+        next_offset = fields["next_offset"]
+        has_more = fields["has_more"]
+        if any(
+            not isinstance(value, int) or isinstance(value, bool)
+            for value in (offset, limit, returned_chars, total_chars)
+        ):
+            return None
+        if (
+            offset < 0
+            or limit <= 0
+            or returned_chars != len(content)
+            or returned_chars > limit
+            or total_chars < offset + returned_chars
+            or offset != requested_offset
+        ):
+            return None
+        if requested_limit is not None and limit != requested_limit:
+            return None
+        if not isinstance(has_more, bool):
+            return None
+        expected_next = offset + returned_chars
+        if has_more:
+            if (
+                returned_chars <= 0
+                or not isinstance(next_offset, int)
+                or isinstance(next_offset, bool)
+                or next_offset != expected_next
+                or next_offset >= total_chars
+            ):
+                return None
+        elif next_offset is not None or expected_next != total_chars:
+            return None
+        if "truncated" in result and result.get("truncated") is not has_more:
+            return None
+        skill_chars = result.get("skill_md_chars")
+        if skill_chars is not None and (
+            not isinstance(skill_chars, int)
+            or isinstance(skill_chars, bool)
+            or skill_chars != total_chars
+        ):
+            return None
+    else:
+        # A non-paged main view carries the parsed Markdown body while the
+        # loader-owned digest/length address the complete document including
+        # frontmatter.  Those fields are the verifiable whole-document receipt.
+        if requested_offset != 0:
+            return None
+        if result.get("has_more") not in (None, False):
+            return None
+        if result.get("next_offset") is not None:
+            return None
+        skill_chars = result.get("skill_md_chars")
+        if (
+            not isinstance(skill_chars, int)
+            or isinstance(skill_chars, bool)
+            or skill_chars <= 0
+        ):
+            return None
+        offset = 0
+        next_offset = None
+        has_more = False
+        total_chars = skill_chars
+
+    return _CanonicalSkillViewReceipt(
+        skill_name=skill_name,
+        document_sha256=digest,
+        offset=offset,
+        next_offset=next_offset,
+        has_more=has_more,
+        total_chars=total_chars,
+        is_paged=is_paged,
+        content=content,
+        assistant_index=assistant_index,
+        call_position=call_position,
+        result_index=result_index,
+        tool_call=tool_call,
+        tool_result=tool_result,
+    )
+
+
+def _canonical_skill_view_receipts(
+    messages: list[dict[str, Any]],
+) -> list[_CanonicalSkillViewReceipt]:
+    """Find native one-to-one canonical skill_view call/result pairs."""
+    call_counts: dict[str, int] = {}
+    result_indices: dict[str, list[int]] = {}
+    for index, message in enumerate(messages):
+        if message.get("role") == "assistant":
+            for tool_call in message.get("tool_calls") or []:
+                identity = _tool_call_identity(tool_call)
+                if identity is not None:
+                    call_counts[identity[0]] = call_counts.get(identity[0], 0) + 1
+        elif message.get("role") == "tool":
+            call_id = message.get("tool_call_id")
+            if isinstance(call_id, str) and call_id:
+                result_indices.setdefault(call_id, []).append(index)
+
+    receipts: list[_CanonicalSkillViewReceipt] = []
+    for assistant_index, message in enumerate(messages):
+        if message.get("role") != "assistant":
+            continue
+        for call_position, tool_call in enumerate(message.get("tool_calls") or []):
+            identity = _tool_call_identity(tool_call)
+            if identity is None:
+                continue
+            call_id = identity[0]
+            matching_results = result_indices.get(call_id) or []
+            if call_counts.get(call_id) != 1 or len(matching_results) != 1:
+                continue
+            result_index = matching_results[0]
+            if result_index <= assistant_index:
+                continue
+            if any(
+                messages[index].get("role") != "tool"
+                for index in range(assistant_index + 1, result_index + 1)
+            ):
+                continue
+            tool_result = messages[result_index]
+            receipt = _validated_canonical_skill_receipt(
+                assistant_index=assistant_index,
+                call_position=call_position,
+                tool_call=tool_call,
+                result_index=result_index,
+                tool_result=tool_result,
+            )
+            if receipt is not None:
+                receipts.append(receipt)
+    return receipts
+
+
+def _select_latest_contiguous_skill_receipts(
+    receipts: list[_CanonicalSkillViewReceipt],
+) -> list[_CanonicalSkillViewReceipt]:
+    """Keep one latest digest and one latest exact page per offset per Skill."""
+    grouped: dict[
+        tuple[str, str], dict[int, _CanonicalSkillViewReceipt]
+    ] = {}
+    group_occurrence: dict[tuple[str, str], tuple[int, int, int]] = {}
+    for receipt in receipts:
+        key = (receipt.skill_name, receipt.document_sha256)
+        pages = grouped.setdefault(key, {})
+        prior = pages.get(receipt.offset)
+        if prior is None or receipt.occurrence > prior.occurrence:
+            pages[receipt.offset] = receipt
+        group_occurrence[key] = max(
+            group_occurrence.get(key, (-1, -1, -1)),
+            receipt.occurrence,
+        )
+
+    viable: dict[
+        tuple[str, str], tuple[tuple[int, int, int], list[_CanonicalSkillViewReceipt]]
+    ] = {}
+    for key, pages in grouped.items():
+        first = pages.get(0)
+        if first is None:
+            continue
+        chain: list[_CanonicalSkillViewReceipt] = []
+        cursor = 0
+        total_chars = first.total_chars
+        seen: set[int] = set()
+        while cursor not in seen:
+            seen.add(cursor)
+            page = pages.get(cursor)
+            if page is None or page.total_chars != total_chars:
+                break
+            chain.append(page)
+            if not page.has_more:
+                break
+            if page.next_offset is None:
+                break
+            cursor = page.next_offset
+        if (
+            chain
+            and chain[0].is_paged
+            and not chain[-1].has_more
+            and hashlib.sha256(
+                "".join(page.content for page in chain).encode("utf-8")
+            ).hexdigest() != key[1]
+        ):
+            continue
+        if chain:
+            viable[key] = (group_occurrence[key], chain)
+
+    selected_by_skill: dict[
+        str, tuple[tuple[int, int, int], str, list[_CanonicalSkillViewReceipt]]
+    ] = {}
+    for (skill_name, digest), (occurrence, chain) in viable.items():
+        candidate = (occurrence, digest, chain)
+        current = selected_by_skill.get(skill_name)
+        if current is None or candidate[:2] > current[:2]:
+            selected_by_skill[skill_name] = candidate
+
+    ordered = sorted(
+        selected_by_skill.values(),
+        key=lambda item: (item[0], item[1]),
+    )
+    return [receipt for _, _, chain in ordered for receipt in chain]
+
+
+def _strip_canonical_skill_receipts(
+    messages: list[dict[str, Any]],
+    receipts: list[_CanonicalSkillViewReceipt],
+) -> list[dict[str, Any]]:
+    """Remove exact valid receipts before pruning/summarization."""
+    calls_by_assistant: dict[int, set[int]] = {}
+    result_indices: set[int] = set()
+    for receipt in receipts:
+        calls_by_assistant.setdefault(receipt.assistant_index, set()).add(
+            receipt.call_position
+        )
+        result_indices.add(receipt.result_index)
+
+    stripped: list[dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        if index in result_indices:
+            continue
+        removed_positions = calls_by_assistant.get(index)
+        if not removed_positions:
+            stripped.append(message.copy())
+            continue
+        tool_calls = list(message.get("tool_calls") or [])
+        retained_calls = [
+            tool_call
+            for position, tool_call in enumerate(tool_calls)
+            if position not in removed_positions
+        ]
+        updated = message.copy()
+        if retained_calls:
+            updated["tool_calls"] = retained_calls
+            stripped.append(updated)
+            continue
+        updated.pop("tool_calls", None)
+        if updated.get("content") not in (None, ""):
+            stripped.append(updated)
+    return stripped
+
+
+def _native_skill_receipt_messages(
+    receipts: list[_CanonicalSkillViewReceipt],
+) -> list[dict[str, Any]]:
+    """Render selected receipts only in their native assistant/tool roles."""
+    protected: list[dict[str, Any]] = []
+    for receipt in receipts:
+        protected.append({
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [receipt.tool_call],
+        })
+        protected.append(receipt.tool_result.copy())
+    return protected
 
 
 # ---------------------------------------------------------------------------
@@ -191,25 +739,26 @@ def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) ->
     return f"[{tool_name}]{first_arg} ({content_len:,} chars result)"
 
 
-def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
-    """Shrink long string values inside tool-call arguments JSON."""
+_SUMMARY_SAFE_TOOL_ARGUMENT_KEYS = (
+    "filepath", "file_path", "path", "script_path", "name", "query", "url",
+    "action", "pattern", "offset", "limit", "timeout",
+)
+
+
+def _summarize_tool_call_args_json(args: str) -> str:
+    """Render identifiers only; never place executable payloads in summaries."""
     try:
         parsed = json.loads(args)
     except (ValueError, TypeError):
-        return args
-
-    def _shrink(obj: Any) -> Any:
-        if isinstance(obj, str):
-            if len(obj) > head_chars:
-                return obj[:head_chars] + "...[truncated]"
-            return obj
-        if isinstance(obj, dict):
-            return {k: _shrink(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [_shrink(v) for v in obj]
-        return obj
-
-    return json.dumps(_shrink(parsed), ensure_ascii=False)
+        return "(arguments unavailable)"
+    if not isinstance(parsed, dict):
+        return "(arguments unavailable)"
+    summary: dict[str, Any] = {}
+    for key in _SUMMARY_SAFE_TOOL_ARGUMENT_KEYS:
+        value = parsed.get(key)
+        if isinstance(value, (str, int, float, bool)):
+            summary[key] = value[:240] if isinstance(value, str) else value
+    return json.dumps(summary, ensure_ascii=False) if summary else "(payload withheld)"
 
 
 # ============================================================================
@@ -281,6 +830,8 @@ class ContextCompressor(ContextEngine):
         self._last_summary_fallback_used: bool = False
         self._last_compress_aborted: bool = False
         self._summary_failure_cooldown_until: float = 0.0
+        self._last_protected_skill_receipt_count: int = 0
+        self._last_protected_skill_tokens: int = 0
 
         logger.info(
             "ContextCompressor initialized: context_length=%d threshold=%d (%.0f%%) "
@@ -299,6 +850,25 @@ class ContextCompressor(ContextEngine):
             "total_tokens",
             self.last_prompt_tokens + self.last_completion_tokens,
         )
+
+    def get_status(self) -> dict[str, Any]:
+        status = super().get_status()
+        status.update({
+            "last_compress_aborted": self._last_compress_aborted,
+            "protected_skill_budget_exceeded": bool(
+                self._last_compress_aborted
+                and self._last_summary_error
+                and self._last_summary_error.startswith(
+                    "protected_skill_context_budget_exceeded:"
+                )
+            ),
+            "protected_skill_receipt_count": (
+                self._last_protected_skill_receipt_count
+            ),
+            "protected_skill_tokens": self._last_protected_skill_tokens,
+            "protected_skill_token_budget": self._protected_skill_token_budget(),
+        })
+        return status
 
     def should_compress(self, prompt_tokens: int | None = None) -> bool:
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
@@ -322,6 +892,17 @@ class ContextCompressor(ContextEngine):
         self._last_compression_savings_pct = 100.0
         self._ineffective_compression_count = 0
         self._summary_failure_cooldown_until = 0.0
+        self._last_protected_skill_receipt_count = 0
+        self._last_protected_skill_tokens = 0
+
+    def _protected_skill_token_budget(self) -> int:
+        return max(
+            _PROTECTED_SKILL_TOKENS_FLOOR,
+            min(
+                int(self.context_length * _PROTECTED_SKILL_CONTEXT_RATIO),
+                _PROTECTED_SKILL_TOKENS_CEILING,
+            ),
+        )
 
     # -- Pruning ---------------------------------------------------------------
 
@@ -360,13 +941,7 @@ class ContextCompressor(ContextEngine):
             min_protect = min(protect_tail_count, len(result))
             for i in range(len(result) - 1, -1, -1):
                 msg = result[i]
-                raw_content = msg.get("content") or ""
-                content_len = _content_length_for_budget(raw_content)
-                msg_tokens = content_len // _CHARS_PER_TOKEN + 10
-                for tc in msg.get("tool_calls") or []:
-                    if isinstance(tc, dict):
-                        args = tc.get("function", {}).get("arguments", "")
-                        msg_tokens += len(args) // _CHARS_PER_TOKEN
+                msg_tokens = estimate_message_tokens(msg) + 10
                 if accumulated + msg_tokens > protect_tail_tokens and (len(result) - i) >= min_protect:
                     boundary = i
                     break
@@ -411,25 +986,6 @@ class ContextCompressor(ContextEngine):
                 result[i] = {**msg, "content": summary}
                 pruned += 1
 
-        # Pass 3: Truncate large tool_call arguments
-        for i in range(prune_boundary):
-            msg = result[i]
-            if msg.get("role") != "assistant" or not msg.get("tool_calls"):
-                continue
-            new_tcs = []
-            modified = False
-            for tc in msg["tool_calls"]:
-                if isinstance(tc, dict):
-                    args = tc.get("function", {}).get("arguments", "")
-                    if len(args) > 500:
-                        new_args = _truncate_tool_call_args_json(args)
-                        if new_args != args:
-                            tc = {**tc, "function": {**tc["function"], "arguments": new_args}}
-                            modified = True
-                new_tcs.append(tc)
-            if modified:
-                result[i] = {**msg, "tool_calls": new_tcs}
-
         return result, pruned
 
     # -- Summarization ---------------------------------------------------------
@@ -444,7 +1000,7 @@ class ContextCompressor(ContextEngine):
         parts = []
         for msg in turns:
             role = msg.get("role", "unknown")
-            content = msg.get("content") or ""
+            content = _serialize_content_for_summary(msg.get("content") or "")
 
             if role == "tool":
                 tool_id = msg.get("tool_call_id", "")
@@ -464,9 +1020,9 @@ class ContextCompressor(ContextEngine):
                             fn = tc.get("function", {})
                             name = fn.get("name", "?")
                             args = fn.get("arguments", "")
-                            if len(args) > _TOOL_ARGS_MAX:
-                                args = args[:_TOOL_ARGS_HEAD] + "..."
-                            tc_parts.append(f"  {name}({args})")
+                            tc_parts.append(
+                                f"  {name}({_summarize_tool_call_args_json(args)})"
+                            )
                         else:
                             fn = getattr(tc, "function", None)
                             name = getattr(fn, "name", "?") if fn else "?"
@@ -725,13 +1281,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
 
         for i in range(n - 1, head_end - 1, -1):
             msg = messages[i]
-            raw_content = msg.get("content") or ""
-            content_len = _content_length_for_budget(raw_content)
-            msg_tokens = content_len // _CHARS_PER_TOKEN + 10
-            for tc in msg.get("tool_calls") or []:
-                if isinstance(tc, dict):
-                    args = tc.get("function", {}).get("arguments", "")
-                    msg_tokens += len(args) // _CHARS_PER_TOKEN
+            msg_tokens = estimate_message_tokens(msg) + 10
             if accumulated + msg_tokens > soft_ceiling and (n - i) >= min_tail:
                 break
             accumulated += msg_tokens
@@ -757,45 +1307,66 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         return getattr(tc, "call_id", "") or getattr(tc, "id", "") or ""
 
     def _sanitize_tool_pairs(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Fix orphaned tool_call / tool_result pairs after compression."""
-        surviving_call_ids: set[str] = set()
-        for msg in messages:
-            if msg.get("role") == "assistant":
-                for tc in msg.get("tool_calls") or []:
-                    cid = self._get_tool_call_id(tc)
-                    if cid:
-                        surviving_call_ids.add(cid)
-
-        result: list[dict[str, Any]] = []
-        for msg in messages:
-            if msg.get("role") == "tool":
-                cid = msg.get("tool_call_id", "")
-                if cid and cid not in surviving_call_ids:
-                    continue  # orphaned tool result — drop it
-            result.append(msg)
-
-        # Insert stub results for orphaned assistant tool_calls
+        """Return native, adjacent one-result-per-call tool groups only."""
         final: list[dict[str, Any]] = []
-        for msg in result:
-            final.append(msg)
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                for tc in msg["tool_calls"]:
-                    cid = self._get_tool_call_id(tc)
-                    # Check if there's a following tool message with this id
-                    has_result = False
-                    for next_msg in result[result.index(msg) + 1:]:
-                        if next_msg.get("role") == "tool":
-                            if next_msg.get("tool_call_id") == cid:
-                                has_result = True
-                                break
-                        elif next_msg.get("role") != "tool":
-                            break
-                    if cid and not has_result:
-                        final.append({
-                            "role": "tool",
-                            "tool_call_id": cid,
-                            "content": "[Result from earlier conversation — see context summary above]",
-                        })
+        index = 0
+        while index < len(messages):
+            message = messages[index]
+            if message.get("role") == "tool":
+                # A tool result without the immediately preceding assistant
+                # call group is an orphan even if the same id appears earlier.
+                index += 1
+                continue
+            if message.get("role") != "assistant" or not message.get("tool_calls"):
+                final.append(message)
+                index += 1
+                continue
+
+            valid_calls: list[Any] = []
+            expected_ids: list[str] = []
+            seen_ids: set[str] = set()
+            for tool_call in message.get("tool_calls") or []:
+                call_id = self._get_tool_call_id(tool_call)
+                if not call_id or call_id in seen_ids:
+                    continue
+                seen_ids.add(call_id)
+                expected_ids.append(call_id)
+                valid_calls.append(tool_call)
+
+            assistant = message.copy()
+            if valid_calls:
+                assistant["tool_calls"] = valid_calls
+                final.append(assistant)
+            else:
+                assistant.pop("tool_calls", None)
+                if assistant.get("content") not in (None, ""):
+                    final.append(assistant)
+
+            following_results: dict[str, dict[str, Any]] = {}
+            next_index = index + 1
+            while (
+                next_index < len(messages)
+                and messages[next_index].get("role") == "tool"
+            ):
+                tool_result = messages[next_index]
+                call_id = tool_result.get("tool_call_id")
+                if (
+                    isinstance(call_id, str)
+                    and call_id in seen_ids
+                    and call_id not in following_results
+                ):
+                    following_results[call_id] = tool_result
+                next_index += 1
+
+            for call_id in expected_ids:
+                final.append(following_results.get(call_id) or {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": (
+                        "[Result from earlier conversation — see context summary above]"
+                    ),
+                })
+            index = next_index
 
         return final
 
@@ -817,11 +1388,15 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         self._last_summary_fallback_used = False
         self._last_summary_error = None
         self._last_compress_aborted = False
+        self._last_protected_skill_receipt_count = 0
+        self._last_protected_skill_tokens = 0
 
         if force and self._summary_failure_cooldown_until > 0.0:
             self._summary_failure_cooldown_until = 0.0
 
-        n_messages = len(messages)
+        original_messages = messages
+        original_message_count = len(messages)
+        n_messages = original_message_count
         _min_for_compress = self._protect_head_size(messages) + 3 + 1
         if n_messages <= _min_for_compress:
             logger.warning("Cannot compress: only %d messages (need > %d)",
@@ -829,6 +1404,44 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             return messages
 
         display_tokens = current_tokens or self.last_prompt_tokens or _estimate_messages_tokens(messages)
+
+        # Canonical Skill instructions must stay in their original trust role.
+        # Extract all structurally valid main-document receipts before either
+        # the generic tool pruner or the summary model can see them.  Only the
+        # latest digest's contiguous offset-0 chain is reinserted.
+        canonical_receipts = _canonical_skill_view_receipts(messages)
+        protected_receipts = _select_latest_contiguous_skill_receipts(
+            canonical_receipts
+        )
+        protected_skill_messages = _native_skill_receipt_messages(
+            protected_receipts
+        )
+        protected_skill_tokens = _estimate_messages_tokens(
+            protected_skill_messages
+        ) if protected_skill_messages else 0
+        protected_skill_budget = self._protected_skill_token_budget()
+        self._last_protected_skill_receipt_count = len(protected_receipts)
+        self._last_protected_skill_tokens = protected_skill_tokens
+        if protected_skill_tokens > protected_skill_budget:
+            self._last_compress_aborted = True
+            self._last_summary_error = (
+                "protected_skill_context_budget_exceeded: "
+                f"required={protected_skill_tokens} limit={protected_skill_budget}"
+            )
+            logger.error(
+                "Context compression aborted: %d protected canonical Skill "
+                "receipt(s) require %d tokens, exceeding dedicated budget %d",
+                len(protected_receipts),
+                protected_skill_tokens,
+                protected_skill_budget,
+            )
+            return original_messages
+
+        messages = _strip_canonical_skill_receipts(
+            messages,
+            canonical_receipts,
+        )
+        n_messages = len(messages)
 
         # Phase 1: Prune old tool results
         messages, pruned_count = self._prune_old_tool_results(
@@ -845,7 +1458,9 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
 
         if compress_start >= compress_end:
-            return messages
+            # No safe middle range exists.  Return the untouched input rather
+            # than a pruned/ledger-stripped partial transformation.
+            return original_messages
 
         turns_to_summarize = messages[compress_start:compress_end]
 
@@ -915,6 +1530,11 @@ The user has requested that this compaction PRIORITISE preserving all informatio
 
         compressed.append({"role": summary_role, "content": summary})
 
+        # Keep canonical instructions as native tool data.  They are never
+        # promoted into system/user messages and were never exposed to the
+        # summarizer, including when summary generation fell back.
+        compressed.extend(protected_skill_messages)
+
         for i in range(compress_end, n_messages):
             compressed.append(messages[i].copy())
 
@@ -934,7 +1554,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
 
         logger.info(
             "Compressed: %d -> %d messages (~%d tokens saved, %.0f%%)",
-            n_messages, len(compressed), saved_estimate, savings_pct,
+            original_message_count, len(compressed), saved_estimate, savings_pct,
         )
 
         return compressed

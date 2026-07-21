@@ -4,6 +4,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
+
 from agent_loop import _build_provider_request, _iter_provider_stream, _sanitize_messages
 from tools.file_tools import patch_file
 from tools.tool_search import DeferredCatalog, bridge_schemas, estimate_tokens
@@ -17,6 +19,13 @@ class _StreamingResponse:
     async def aiter_lines(self):
         for line in self._lines:
             yield line
+
+
+def _anthropic_stream(*events):
+    lines = []
+    for event in events:
+        lines.extend(("data: " + json.dumps(event), ""))
+    return _StreamingResponse(lines)
 
 
 class SessionWorkspaceFeatureTests(unittest.IsolatedAsyncioTestCase):
@@ -164,17 +173,138 @@ class SessionWorkspaceFeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stripped[0]["content"], [{"type": "text", "text": "inspect"}])
 
     async def test_anthropic_stream_normalization(self):
-        response = _StreamingResponse([
-            'data: {"type":"message_start","message":{"usage":{"input_tokens":5}}}',
-            'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool_1","name":"read_file"}}',
-            'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"filepath\\":"}}',
-            'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\\"a.txt\\"}"}}',
-            'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7}}',
-        ])
+        response = _anthropic_stream(
+            {
+                "type": "message_start",
+                "message": {"usage": {"input_tokens": 5}},
+            },
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "tool_1",
+                    "name": "read_file",
+                    "input": {},
+                },
+            },
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": '{"filepath":',
+                },
+            },
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": '"a.txt"}',
+                },
+            },
+            {"type": "content_block_stop", "index": 0},
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use"},
+                "usage": {"output_tokens": 7},
+            },
+            {"type": "message_stop"},
+        )
         events = [event async for event in _iter_provider_stream(response, "anthropic")]
         self.assertEqual(events[1]["tool_calls"][0]["function"]["name"], "read_file")
+        arguments = "".join(
+            event["tool_calls"][0]["function"]["arguments"]
+            for event in events
+            if event.get("tool_calls")
+        )
+        self.assertEqual(arguments, '{"filepath":"a.txt"}')
         self.assertEqual(events[-1]["finish_reason"], "tool_calls")
         self.assertEqual(events[-1]["usage"]["total_tokens"], 12)
+
+    async def test_anthropic_error_event_fails_closed(self):
+        response = _anthropic_stream({
+            "type": "error",
+            "error": {"type": "overloaded_error", "message": "busy"},
+        })
+
+        with self.assertRaisesRegex(httpx.RemoteProtocolError, "error event"):
+            _ = [
+                event
+                async for event in _iter_provider_stream(response, "anthropic")
+            ]
+
+    async def test_anthropic_content_delta_before_start_fails_closed(self):
+        response = _anthropic_stream(
+            {
+                "type": "message_start",
+                "message": {"usage": {"input_tokens": 1}},
+            },
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "lost"},
+            },
+        )
+
+        with self.assertRaisesRegex(httpx.RemoteProtocolError, "before start"):
+            _ = [
+                event
+                async for event in _iter_provider_stream(response, "anthropic")
+            ]
+
+    async def test_anthropic_content_delta_after_block_stop_fails_closed(self):
+        response = _anthropic_stream(
+            {
+                "type": "message_start",
+                "message": {"usage": {"input_tokens": 1}},
+            },
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+            {"type": "content_block_stop", "index": 0},
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "late"},
+            },
+        )
+
+        with self.assertRaisesRegex(httpx.RemoteProtocolError, "after stop"):
+            _ = [
+                event
+                async for event in _iter_provider_stream(response, "anthropic")
+            ]
+
+    async def test_anthropic_content_after_terminal_delta_fails_closed(self):
+        response = _anthropic_stream(
+            {
+                "type": "message_start",
+                "message": {"usage": {"input_tokens": 1}},
+            },
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 1},
+            },
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": "late"},
+            },
+        )
+
+        with self.assertRaisesRegex(
+            httpx.RemoteProtocolError,
+            "outside message content",
+        ):
+            _ = [
+                event
+                async for event in _iter_provider_stream(response, "anthropic")
+            ]
 
 
 if __name__ == "__main__":

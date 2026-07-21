@@ -60,8 +60,8 @@ async def _validate_model_id(model_id: str | None, user_id: str, db) -> None:
 def _validate_enabled_tools(enabled_tools: list[str] | None) -> None:
     if enabled_tools is None:
         return
-    from routers.workspace_router import DEFAULT_TOOLS
-    unknown = set(enabled_tools) - set(DEFAULT_TOOLS)
+    from native_tools import DEFAULT_NATIVE_TOOL_SET
+    unknown = set(enabled_tools) - DEFAULT_NATIVE_TOOL_SET
     if unknown:
         raise HTTPException(400, f"Unknown tools: {sorted(unknown)}")
 

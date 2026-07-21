@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import stat
 import zipfile
 from pathlib import Path
 from typing import Optional
@@ -27,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from auth import get_current_user
 from database import get_db
 from models import Conversation, SkillPackage, User
+from skill_frontmatter import SkillFrontmatterError, parse_skill_frontmatter
 
 logger = logging.getLogger(__name__)
 
@@ -36,17 +38,20 @@ router = APIRouter(prefix="/api/skills", tags=["skills"])
 
 SKILLS_DATA_DIR = Path("data/skills")
 MAX_ZIP_SIZE = 10 * 1024 * 1024  # 10 MB
-MAX_FILE_SIZE = 1 * 1024 * 1024  # 1 MB per file inside zip
+MAX_FILE_SIZE = 32 * 1024 * 1024  # bounded binary/template resources
+MAX_UNCOMPRESSED_ZIP_SIZE = 64 * 1024 * 1024
+MAX_ZIP_ENTRIES = 4096
 
-ALLOWED_EXTENSIONS = frozenset({
-    ".md", ".py", ".yaml", ".yml", ".json", ".txt",
-    ".js", ".ts", ".html", ".css", ".toml", ".sh",
-    ".cfg", ".ini", ".env.example", ".csv", ".xml",
-    ".sql", ".graphql", ".proto",
+# A Skill package is a resource bundle, not merely a text bundle.  Unknown
+# extensions are preserved as inert resources so PDF/XLSX/DOCX templates and
+# other standards-compliant assets are never silently discarded.  This set is
+# only a presentation hint; execution remains controlled by explicit tools.
+KNOWN_BINARY_EXTENSIONS = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff",
+    ".ico", ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".zip", ".gz", ".tgz", ".tar", ".7z", ".woff", ".woff2", ".ttf",
+    ".otf", ".mp3", ".wav", ".mp4", ".mov", ".avi", ".parquet",
 })
-
-# Files inside a skill zip that shouldn't count against the text-only check
-ALLOWED_BINARY_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico"})
 
 DEPENDENCY_MANIFEST_NAMES = frozenset({
     "pyproject.toml", "setup.cfg", "Pipfile", "environment.yml", "environment.yaml",
@@ -114,27 +119,99 @@ def _copy_bundle_dependency_manifests(
 
 
 def _parse_frontmatter(text: str) -> dict:
-    """Simple YAML frontmatter parser (regex-based fallback, no PyYAML needed)."""
-    m = re.match(r'^---\s*\n(.*?)\n---\s*\n', text, re.DOTALL)
-    if not m:
-        return {}
-    fm: dict = {}
-    for line in m.group(1).split('\n'):
-        line = line.strip()
-        if ':' in line:
-            k, v = line.split(':', 1)
-            fm[k.strip()] = v.strip().strip('"').strip("'")
-    return fm
+    """Parse untrusted Skill YAML metadata with bounded SafeLoader semantics."""
+    return parse_skill_frontmatter(text)
 
 
 def _validate_skill_name(name: str) -> str:
-    """Validate skill name is safe for filesystem use."""
-    if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$', name):
+    """Validate the standard Agent Skill canonical name grammar."""
+    if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name) is None or len(name) > 64:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid skill name '{name}'. Must be 1-64 chars, alphanumeric + . _ -",
+            detail=(
+                f"Invalid skill name '{name}'. Agent Skill names must be 1-64 "
+                "lowercase ASCII letters/digits separated by single hyphens"
+            ),
         )
     return name
+
+
+def _validate_standard_manifest_fields(frontmatter: dict, source_path: str) -> None:
+    """Fail upload early when standard Agent Skill metadata is malformed.
+
+    The source ZIP directory may differ because installation canonicalizes it
+    to ``name``; the installed package seen by scanner/loader always matches.
+    Established harness compatibility extensions mirror the loader and remain
+    bounded instead of being silently reinterpreted as standard metadata.
+    """
+
+    description = frontmatter.get("description")
+    if not isinstance(description, str) or not description.strip():
+        raise HTTPException(
+            status_code=400,
+            detail=f"{source_path} frontmatter must have a non-empty string 'description' field",
+        )
+    if len(description) > 1024:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{source_path} frontmatter 'description' exceeds 1024 characters",
+        )
+
+    compatibility = frontmatter.get("compatibility")
+    if compatibility is not None and (
+        not isinstance(compatibility, str)
+        or not compatibility.strip()
+        or len(compatibility) > 500
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{source_path} frontmatter 'compatibility' must be a 1-500 character string",
+        )
+    license_value = frontmatter.get("license")
+    if license_value is not None and not isinstance(license_value, str):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{source_path} frontmatter 'license' must be a string",
+        )
+
+    metadata = frontmatter.get("metadata")
+    if metadata is not None:
+        if not isinstance(metadata, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{source_path} frontmatter 'metadata' must be a string-to-string mapping",
+            )
+        for key, value in metadata.items():
+            compatible_mapping = (
+                key in {"hermes", "openclaw"} and isinstance(value, dict)
+            )
+            if not isinstance(key, str) or not (
+                isinstance(value, str) or compatible_mapping
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"{source_path} frontmatter 'metadata' values must be strings; "
+                        "only bounded hermes/openclaw mappings are compatibility extensions"
+                    ),
+                )
+
+    allowed_tools = frontmatter.get("allowed-tools")
+    compatible_sequence = bool(
+        isinstance(allowed_tools, list)
+        and len(allowed_tools) <= 256
+        and all(isinstance(item, str) for item in allowed_tools)
+    )
+    if allowed_tools is not None and not (
+        isinstance(allowed_tools, str) or compatible_sequence
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{source_path} frontmatter 'allowed-tools' must be a space-separated "
+                "string (or the bounded compatibility string list)"
+            ),
+        )
 
 
 def _skill_dir_exists(user_id: str, name: str, session_id: str | None = None) -> bool:
@@ -190,9 +267,34 @@ class SkillUploadJson(BaseModel):
 
 def _zip_file_entries(zf: zipfile.ZipFile) -> list[tuple[zipfile.ZipInfo, str]]:
     entries: list[tuple[zipfile.ZipInfo, str]] = []
+    total_uncompressed = 0
+    seen_paths: dict[str, str] = {}
     for info in zf.infolist():
         if info.is_dir():
             continue
+        mode = info.external_attr >> 16
+        if mode and stat.S_ISLNK(mode):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Symbolic links are not allowed in Skill packages: {info.filename}",
+            )
+        if info.file_size > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Skill resource too large: {info.filename} "
+                    f"(max {MAX_FILE_SIZE // 1024 // 1024}MB)"
+                ),
+            )
+        total_uncompressed += int(info.file_size)
+        if total_uncompressed > MAX_UNCOMPRESSED_ZIP_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Skill package expands beyond the uncompressed size limit "
+                    f"({MAX_UNCOMPRESSED_ZIP_SIZE // 1024 // 1024}MB)"
+                ),
+            )
         norm = info.filename.replace("\\", "/").lstrip("/")
         parts: list[str] = []
         for part in norm.split("/"):
@@ -202,36 +304,98 @@ def _zip_file_entries(zf: zipfile.ZipFile) -> list[tuple[zipfile.ZipInfo, str]]:
                 raise HTTPException(status_code=400, detail=f"Path traversal detected: {info.filename}")
             parts.append(part)
         if parts:
-            entries.append((info, "/".join(parts)))
+            normalized = "/".join(parts)
+            folded = normalized.casefold()
+            if folded in seen_paths:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Skill package contains duplicate or case-colliding paths: "
+                        f"{seen_paths[folded]} and {normalized}"
+                    ),
+                )
+            seen_paths[folded] = normalized
+            entries.append((info, normalized))
+            if len(entries) > MAX_ZIP_ENTRIES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Skill package contains more than {MAX_ZIP_ENTRIES} files",
+                )
     return entries
 
 
 def _is_allowed_skill_file(rel_path: str) -> tuple[bool, bool]:
+    """Return storage eligibility and a best-effort binary presentation hint.
+
+    All safely named, bounded regular files are eligible.  Extension filtering
+    used to silently drop valid Skill assets; callers must not use this hint as
+    an execution authorization decision.
+    """
     lower = rel_path.lower()
-    is_binary = any(lower.endswith(ext) for ext in ALLOWED_BINARY_EXTENSIONS)
-    is_text = any(lower.endswith(ext) for ext in ALLOWED_EXTENSIONS)
-    return is_text or is_binary, is_binary
+    is_binary = any(lower.endswith(ext) for ext in KNOWN_BINARY_EXTENSIONS)
+    return True, is_binary
 
 
 def _discover_skill_manifests(
     zf: zipfile.ZipFile,
     entries: list[tuple[zipfile.ZipInfo, str]],
 ) -> list[dict]:
+    """Discover pairwise non-overlapping Skill roots in one ZIP bundle.
+
+    A recognized Skill owns its full directory resource closure.  In
+    particular, a tutorial or fixture named ``references/.../SKILL.md`` is a
+    resource of that parent, not an implicit nested package.  Multiple sibling
+    roots remain an explicit ZIP bundle and are installed independently.
+    """
     manifests: list[dict] = []
     seen_names: dict[str, str] = {}
+    recognized_roots: list[str] = []
+    candidates: list[tuple[int, str, zipfile.ZipInfo]] = []
     for info, norm in entries:
         parts = norm.split("/")
-        if parts[-1] != "SKILL.md":
+        if parts[-1] == "SKILL.md":
+            candidates.append((len(parts) - 1, norm, info))
+
+    # Parents must be recognized before descendants can be classified as
+    # ordinary resources.  ZIP member ordering is neither semantic nor stable.
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    for _depth, norm, info in candidates:
+        parts = norm.split("/")
+        root = "/".join(parts[:-1])
+        if any(
+            _entry_is_under_skill_root(root, parent_root)
+            for parent_root in recognized_roots
+        ):
             continue
         if info.file_size > MAX_FILE_SIZE:
             raise HTTPException(status_code=400, detail=f"SKILL.md too large: {norm}")
 
-        skill_md_content = zf.read(info.filename).decode("utf-8", errors="replace")
-        fm = _parse_frontmatter(skill_md_content)
-        skill_name = fm.get("name", "").strip()
+        try:
+            skill_md_content = zf.read(info.filename).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"SKILL.md must be valid UTF-8: {norm}",
+            ) from exc
+        try:
+            fm = _parse_frontmatter(skill_md_content)
+        except SkillFrontmatterError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid YAML frontmatter in {norm}: {exc}",
+            ) from exc
+
+        raw_name = fm.get("name", "")
+        if raw_name is not None and not isinstance(raw_name, str):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{norm} frontmatter 'name' must be a string",
+            )
+        skill_name = str(raw_name or "").strip()
         if not skill_name:
             raise HTTPException(status_code=400, detail=f"{norm} frontmatter must have a 'name' field")
         _validate_skill_name(skill_name)
+        _validate_standard_manifest_fields(fm, norm)
         if skill_name in seen_names:
             raise HTTPException(
                 status_code=400,
@@ -239,17 +403,30 @@ def _discover_skill_manifests(
             )
         seen_names[skill_name] = norm
 
-        root = "/".join(parts[:-1])
+        raw_description = fm.get("description", "")
+        if raw_description is not None and not isinstance(raw_description, str):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{norm} frontmatter 'description' must be a string",
+            )
+        raw_version = fm.get("version", "")
+        if isinstance(raw_version, (dict, list, tuple, set)):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{norm} frontmatter 'version' must be a scalar",
+            )
+
         path_category = "/".join(parts[:-2]) or None
         manifests.append({
             "name": skill_name,
-            "description": fm.get("description", "").strip(),
-            "version": fm.get("version", ""),
+            "description": str(raw_description or "").strip(),
+            "version": "" if raw_version is None else str(raw_version),
             "root": root,
             "skill_md": norm,
             "skill_md_content": skill_md_content,
             "category": path_category,
         })
+        recognized_roots.append(root)
 
     if not manifests:
         raise HTTPException(status_code=400, detail="SKILL.md not found in zip")
@@ -364,22 +541,15 @@ async def _process_skill_zip(
                 if not rel:
                     continue
 
-                allowed, is_binary = _is_allowed_skill_file(rel)
-                if not allowed:
-                    logger.warning("Skipping file with disallowed extension: %s", rel)
-                    continue
-                if info.file_size > MAX_FILE_SIZE:
-                    logger.warning("Skipping oversized file (%d bytes): %s", info.file_size, rel)
-                    continue
+                allowed, _binary_hint = _is_allowed_skill_file(rel)
+                if not allowed:  # defensive: current policy preserves all bounded files
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Unsupported Skill resource: {rel}",
+                    )
 
                 safe_path = _validate_bundle_rel_path(rel, target_dir)
                 file_bytes = zf.read(info.filename)
-                if not is_binary:
-                    try:
-                        file_bytes.decode("utf-8")
-                    except UnicodeDecodeError:
-                        logger.warning("Skipping non-UTF-8 file: %s", rel)
-                        continue
 
                 safe_path.parent.mkdir(parents=True, exist_ok=True)
                 safe_path.write_bytes(file_bytes)

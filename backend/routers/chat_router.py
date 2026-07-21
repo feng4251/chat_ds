@@ -3,13 +3,14 @@ import hashlib
 import json
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Awaitable, Callable, Optional, TypeVar
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, func
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from config import settings
 
@@ -28,28 +29,231 @@ from models import (
 from schemas import ChatRequest
 from workspace import ensure_workspace, safe_workspace_path, serialize_json_list, workspace_file_metadata
 from hooks import emit_event
-# All tools available to the agent harness for native tool-calling.
-AGENT_TOOLS = [
-    "web_search", "web_extract", "execute_code", "run_skill_python",
-    "read_file", "write_file", "patch_file", "search_files",
-    "todo", "clarify", "memory",
-    "skills_list", "skill_view", "skill_manage",
-    "browser_navigate", "browser_snapshot", "browser_click",
-    "browser_type", "browser_scroll", "browser_back",
-    "session_search",
-    "sessions_list", "sessions_history", "sessions_send", "sessions_fork",
-    "session_status",
-    "delegate_task", "cronjob",
-    "get_goal", "create_goal", "update_goal",
-    "image_generate", "vision_analyze",
-    "mcp_server_list", "mcp_server_status",
-]
+from native_tools import DEFAULT_NATIVE_TOOLS
+from model_routing import (
+    canonical_agent_model_id,
+    filter_agentic_fallback_model_ids,
+)
 from auth import get_current_user
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 # Background tasks (keep references so they don't get GC'd before completion).
 _background_tasks: set[asyncio.Task] = set()
+
+
+class _ConversationTurnState:
+    """In-process serialization and projection barrier for one conversation."""
+
+    __slots__ = ("lock", "references", "projection_tasks")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.references = 0
+        self.projection_tasks: set[asyncio.Task] = set()
+
+
+class _ConversationTurnLease:
+    """Single-release token for a retained conversation turn state."""
+
+    __slots__ = ("state", "released")
+
+    def __init__(self, state: _ConversationTurnState) -> None:
+        self.state = state
+        self.released = False
+
+
+class _ConversationProjectionBarrierError(RuntimeError):
+    pass
+
+
+# A turn owns its conversation lock from before history is read until its
+# terminal assistant/run projection is durable.  References include lock
+# waiters, which prevents a release/wait race from replacing the state object.
+_conversation_turn_states: dict[str, _ConversationTurnState] = {}
+
+
+def _cleanup_conversation_turn_state(
+    conv_id: str,
+    state: _ConversationTurnState,
+) -> None:
+    if state.references or state.lock.locked() or state.projection_tasks:
+        return
+    if _conversation_turn_states.get(conv_id) is state:
+        _conversation_turn_states.pop(conv_id, None)
+
+
+async def _drain_conversation_projection_tasks(
+    conv_id: str,
+    state: _ConversationTurnState,
+) -> None:
+    """Wait for terminal projections left running by a disconnected client."""
+
+    while True:
+        pending = [task for task in state.projection_tasks if not task.done()]
+        if not pending:
+            return
+        # The projection belongs to the conversation, not to the next request.
+        # Shielding it ensures cancellation of that waiter cannot cancel the
+        # durable write it is waiting for.
+        results = await asyncio.gather(
+            *(asyncio.shield(task) for task in pending),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise _ConversationProjectionBarrierError(
+                    "A prior terminal conversation projection failed."
+                ) from result
+            if result is not True:
+                raise _ConversationProjectionBarrierError(
+                    "A prior terminal conversation projection was not durable."
+                )
+
+
+async def _acquire_conversation_turn(conv_id: str) -> _ConversationTurnLease:
+    state = _conversation_turn_states.get(conv_id)
+    if state is None:
+        state = _ConversationTurnState()
+        _conversation_turn_states[conv_id] = state
+    state.references += 1
+    acquired = False
+    try:
+        await state.lock.acquire()
+        acquired = True
+        # A disconnected predecessor releases the turn lock after registering
+        # its shielded projection.  Drain that projection before reading any
+        # history for this turn.
+        await _drain_conversation_projection_tasks(conv_id, state)
+        return _ConversationTurnLease(state)
+    except BaseException:
+        if acquired:
+            state.lock.release()
+        state.references -= 1
+        _cleanup_conversation_turn_state(conv_id, state)
+        raise
+
+
+def _release_conversation_turn(
+    conv_id: str,
+    lease: _ConversationTurnLease,
+) -> None:
+    if lease.released:
+        return
+    lease.released = True
+    state = lease.state
+    if state.lock.locked():
+        state.lock.release()
+    state.references = max(0, state.references - 1)
+    _cleanup_conversation_turn_state(conv_id, state)
+
+
+def _track_conversation_projection(
+    conv_id: str,
+    operation: Awaitable[bool],
+) -> asyncio.Task:
+    state = _conversation_turn_states.get(conv_id)
+    if state is None:
+        # Keep standalone/internal callers safe as well.  Ordinary chat turns
+        # already retained this state before arriving here.
+        state = _ConversationTurnState()
+        _conversation_turn_states[conv_id] = state
+    task = asyncio.create_task(operation)
+    state.projection_tasks.add(task)
+    _background_tasks.add(task)
+
+    def finish(completed: asyncio.Task) -> None:
+        _background_tasks.discard(completed)
+        state.projection_tasks.discard(completed)
+        try:
+            error = completed.exception()
+        except asyncio.CancelledError:
+            error = None
+        if error is not None:
+            logger.error(
+                "Uncaught terminal conversation projection failure conv=%s",
+                conv_id,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+        _cleanup_conversation_turn_state(conv_id, state)
+
+    task.add_done_callback(finish)
+    return task
+
+# SQLite permits only one writer at a time.  Agent events arrive in bursts and
+# used to create one unconstrained writer task per event, which made both the
+# child-run bootstrap row and the task/event projections race each other.  Keep
+# ordering and backpressure local to a conversation while still allowing
+# unrelated sessions to persist independently.
+_agent_event_persist_locks: dict[str, asyncio.Lock] = {}
+_agent_event_persist_tasks: dict[
+    tuple[str, str], set[asyncio.Task]
+] = {}
+_SQLITE_PERSIST_MAX_ATTEMPTS = 4
+_SQLITE_PERSIST_RETRY_BASE_SECONDS = 0.05
+_PersistResult = TypeVar("_PersistResult")
+
+
+def _agent_event_persist_lock(conv_id: str) -> asyncio.Lock:
+    lock = _agent_event_persist_locks.get(conv_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _agent_event_persist_locks[conv_id] = lock
+    return lock
+
+
+def _cleanup_agent_event_persist_lock(conv_id: str, lock: asyncio.Lock) -> None:
+    if lock.locked():
+        return
+    if any(
+        key[0] == conv_id and any(not task.done() for task in tasks)
+        for key, tasks in _agent_event_persist_tasks.items()
+    ):
+        return
+    if _agent_event_persist_locks.get(conv_id) is lock:
+        _agent_event_persist_locks.pop(conv_id, None)
+
+
+def _retryable_sqlite_persist_error(exc: BaseException) -> bool:
+    message = str(exc).casefold()
+    if isinstance(exc, OperationalError):
+        return "database is locked" in message or "database table is locked" in message
+    if isinstance(exc, IntegrityError):
+        # A competing process may have committed the natural run/task/artifact
+        # key after this transaction read its initial snapshot.  Retrying starts
+        # a new transaction, whose ordinary idempotence checks then see it.
+        return "unique constraint failed" in message
+    return False
+
+
+async def _run_sqlite_persist_with_retry(
+    operation: Callable[[], Awaitable[_PersistResult]],
+    *,
+    description: str,
+) -> _PersistResult:
+    for attempt in range(1, _SQLITE_PERSIST_MAX_ATTEMPTS + 1):
+        try:
+            return await operation()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if (
+                not _retryable_sqlite_persist_error(exc)
+                or attempt >= _SQLITE_PERSIST_MAX_ATTEMPTS
+            ):
+                raise
+            delay = _SQLITE_PERSIST_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+            logger.warning(
+                "Retrying %s after transient SQLite contention "
+                "(attempt %s/%s, delay %.2fs): %s",
+                description,
+                attempt,
+                _SQLITE_PERSIST_MAX_ATTEMPTS,
+                delay,
+                exc,
+            )
+            await asyncio.sleep(delay)
+    raise RuntimeError(f"Unreachable SQLite retry state for {description}")
 
 
 def _event_payload(event: dict) -> dict:
@@ -60,10 +264,16 @@ def _event_key(event: dict, run_id: str) -> str:
     return f"{run_id}:{event.get('event_type') or 'unknown'}:{int(event.get('seq') or 0)}"
 
 
-def _agent_event_terminal_status(agent_events: list[dict]) -> tuple[str | None, str | None]:
+def _agent_event_terminal_status(
+    agent_events: list[dict],
+    *,
+    run_id: str | None = None,
+) -> tuple[str | None, str | None]:
     terminal_type = None
     terminal_error = None
     for event in sorted(agent_events or [], key=lambda item: int(item.get("seq") or 0)):
+        if run_id is not None and str(event.get("run_id") or "") != run_id:
+            continue
         event_type = str(event.get("event_type") or "")
         if event_type == "run.completed":
             terminal_type = event_type
@@ -72,11 +282,90 @@ def _agent_event_terminal_status(agent_events: list[dict]) -> tuple[str | None, 
             terminal_type = event_type
             payload = _event_payload(event)
             terminal_error = str(payload.get("error") or "Agent run failed.")[:4000]
+        elif event_type == "run.cancelled":
+            terminal_type = event_type
+            terminal_error = None
     if terminal_type == "run.failed":
         return "failed", terminal_error or "Agent run failed."
     if terminal_type == "run.completed":
         return "succeeded", None
+    if terminal_type == "run.cancelled":
+        return "cancelled", None
     return None, None
+
+
+def _normalized_usage(value: object) -> dict[str, int]:
+    """Return one non-negative, internally consistent usage snapshot."""
+
+    payload = value if isinstance(value, dict) else {}
+    normalized: dict[str, int] = {}
+    for key in ("input_tokens", "output_tokens", "total_tokens"):
+        try:
+            normalized[key] = max(0, int(payload.get(key, 0) or 0))
+        except (TypeError, ValueError, OverflowError):
+            normalized[key] = 0
+    normalized["total_tokens"] = max(
+        normalized["total_tokens"],
+        normalized["input_tokens"] + normalized["output_tokens"],
+    )
+    return normalized
+
+
+def _reconciled_root_run_usage(
+    usage: object,
+    agent_events: list[dict],
+    *,
+    run_id: str,
+) -> dict[str, int]:
+    """Reconcile cumulative usage using events owned by the root run only.
+
+    Event delivery and the standalone usage chunk are independent stream
+    records.  A terminal event can therefore be durable even when the usage
+    chunk that would normally follow it is lost.  Values are cumulative, so
+    element-wise maxima are idempotent and cannot double-count replays.  Child
+    run totals are deliberately excluded from the root conversation total.
+    """
+
+    reconciled = _normalized_usage(usage)
+    for event in sorted(
+        agent_events or [],
+        key=lambda item: int(item.get("seq") or 0),
+    ):
+        if str(event.get("run_id") or "") != run_id:
+            continue
+        event_type = str(event.get("event_type") or "")
+        payload = _event_payload(event)
+        if event_type == "usage.updated":
+            candidate = _normalized_usage(payload)
+        elif event_type in {"run.completed", "run.failed", "run.cancelled"}:
+            candidate = _normalized_usage(payload.get("usage"))
+        else:
+            continue
+        for key in ("input_tokens", "output_tokens", "total_tokens"):
+            reconciled[key] = max(reconciled[key], candidate[key])
+    reconciled["total_tokens"] = max(
+        reconciled["total_tokens"],
+        reconciled["input_tokens"] + reconciled["output_tokens"],
+    )
+    return reconciled
+
+
+def _merge_monotonic_run_usage(run: AgentRun, value: object) -> None:
+    """Project one cumulative per-run snapshot without allowing regressions."""
+
+    current = _normalized_usage({
+        "input_tokens": run.input_tokens,
+        "output_tokens": run.output_tokens,
+        "total_tokens": run.total_tokens,
+    })
+    candidate = _normalized_usage(value)
+    run.input_tokens = max(current["input_tokens"], candidate["input_tokens"])
+    run.output_tokens = max(current["output_tokens"], candidate["output_tokens"])
+    run.total_tokens = max(
+        current["total_tokens"],
+        candidate["total_tokens"],
+        run.input_tokens + run.output_tokens,
+    )
 
 
 def _file_sha256(path: Path) -> str:
@@ -155,7 +444,13 @@ def _task_key_for_event(event: dict, payload: dict, run_id: str) -> str | None:
         verifier_kind = str(payload.get("verifier_kind") or "generic")
         target_run_id = str(payload.get("target_run_id") or run_id)
         return str(payload.get("task_key") or payload.get("verifier_key") or f"verifier:{target_run_id}:{verifier_kind}")
-    if event_type in {"agent.spawned", "run.started", "run.completed", "run.failed"}:
+    if event_type in {
+        "agent.spawned",
+        "run.started",
+        "run.completed",
+        "run.failed",
+        "run.cancelled",
+    }:
         return f"run:{run_id}"
     return None
 
@@ -221,6 +516,13 @@ def _project_task_event(
     elif event_type == "run.failed":
         task.status = "failed"
         task.error = str(payload.get("error") or "Unknown error")
+        task.ended_at = now
+    elif event_type == "run.cancelled":
+        task.status = "cancelled"
+        task.error = None
+        task.summary = str(
+            payload.get("terminal_reason") or "task_cancelled"
+        )[:4000]
         task.ended_at = now
     elif event_type == "verifier.completed":
         verdict = str(payload.get("verdict") or "inconclusive")
@@ -326,9 +628,7 @@ async def _persist_agent_events(
             if payload.get("enabled_tools") is not None:
                 run.effective_tools = json.dumps(payload.get("enabled_tools"), ensure_ascii=False)
         elif event.get("event_type") == "usage.updated":
-            run.input_tokens = int(payload.get("input_tokens", run.input_tokens) or 0)
-            run.output_tokens = int(payload.get("output_tokens", run.output_tokens) or 0)
-            run.total_tokens = int(payload.get("total_tokens", run.total_tokens) or 0)
+            _merge_monotonic_run_usage(run, payload)
             run.resolved_model_id = str(payload.get("model") or run.resolved_model_id or resolved_model_id)
         elif event.get("event_type") == "model.switch":
             run.resolved_model_id = str(payload.get("to_model") or run.resolved_model_id or resolved_model_id)
@@ -336,13 +636,32 @@ async def _persist_agent_events(
             run.status = "succeeded"
             run.finish_reason = str(payload.get("finish_reason") or "stop")
             usage_payload = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
-            run.input_tokens = int(usage_payload.get("input_tokens", run.input_tokens) or 0)
-            run.output_tokens = int(usage_payload.get("output_tokens", run.output_tokens) or 0)
-            run.total_tokens = int(usage_payload.get("total_tokens", run.total_tokens) or 0)
+            _merge_monotonic_run_usage(run, usage_payload)
             run.ended_at = datetime.utcnow()
         elif event.get("event_type") == "run.failed":
             run.status = "failed"
             run.error = str(payload.get("error") or "Unknown error")
+            usage_payload = (
+                payload.get("usage")
+                if isinstance(payload.get("usage"), dict)
+                else {}
+            )
+            _merge_monotonic_run_usage(run, usage_payload)
+            run.ended_at = datetime.utcnow()
+        elif event.get("event_type") == "run.cancelled":
+            run.status = "cancelled"
+            run.finish_reason = str(
+                payload.get("finish_reason")
+                or payload.get("terminal_reason")
+                or "task_cancelled"
+            )
+            usage_payload = (
+                payload.get("usage")
+                if isinstance(payload.get("usage"), dict)
+                else {}
+            )
+            _merge_monotonic_run_usage(run, usage_payload)
+            run.error = None
             run.ended_at = datetime.utcnow()
         await _project_artifact_event(
             s,
@@ -399,7 +718,7 @@ def _should_persist_agent_event_immediately(event_type: str) -> bool:
     ))
 
 
-async def _persist_agent_event_immediate(
+async def _persist_agent_event_once(
     *,
     conv_id: str,
     user_id: str,
@@ -407,26 +726,22 @@ async def _persist_agent_event_immediate(
     requested_model_id: str,
     resolved_model_id: str,
     event: dict,
-) -> None:
-    run_id = str(event.get("run_id") or "")
-    event_type = str(event.get("event_type") or "")
-    seq = int(event.get("seq") or 0)
-    if not user_id or not run_id or not event_type or seq <= 0:
-        return
-    if not _should_persist_agent_event_immediately(event_type):
-        return
+) -> bool:
     async with async_session() as s:
-        exists = (await s.execute(
-            select(AgentRunEvent.id).where(
-                AgentRunEvent.conversation_id == conv_id,
-                AgentRunEvent.run_id == run_id,
-                AgentRunEvent.event_type == event_type,
-                AgentRunEvent.seq == seq,
-            )
-        )).scalar_one_or_none()
-        if exists:
-            return
         try:
+            run_id = str(event.get("run_id") or "")
+            event_type = str(event.get("event_type") or "")
+            seq = int(event.get("seq"))
+            exists = (await s.execute(
+                select(AgentRunEvent.id).where(
+                    AgentRunEvent.conversation_id == conv_id,
+                    AgentRunEvent.run_id == run_id,
+                    AgentRunEvent.event_type == event_type,
+                    AgentRunEvent.seq == seq,
+                )
+            )).scalar_one_or_none()
+            if exists:
+                return True
             await _persist_agent_events(
                 s,
                 conv_id=conv_id,
@@ -437,44 +752,217 @@ async def _persist_agent_event_immediate(
                 events=[event],
             )
             await s.commit()
-        except Exception:
+            return True
+        except BaseException:
             await s.rollback()
-            logger.debug(
-                "Immediate agent event persist failed conv=%s run=%s type=%s seq=%s",
-                conv_id, run_id, event_type, seq, exc_info=True,
+            raise
+
+
+async def _persist_agent_event_immediate(
+    *,
+    conv_id: str,
+    user_id: str,
+    root_run_id: str,
+    requested_model_id: str,
+    resolved_model_id: str,
+    event: dict,
+) -> bool:
+    run_id = str(event.get("run_id") or "")
+    event_type = str(event.get("event_type") or "")
+    raw_seq = event.get("seq")
+    try:
+        seq = int(raw_seq)
+    except (TypeError, ValueError):
+        return False
+    if not user_id or not run_id or not event_type or raw_seq is None or seq < 0:
+        return False
+    if not _should_persist_agent_event_immediately(event_type):
+        return False
+    lock = _agent_event_persist_lock(conv_id)
+    try:
+        async with lock:
+            return await _run_sqlite_persist_with_retry(
+                lambda: _persist_agent_event_once(
+                    conv_id=conv_id,
+                    user_id=user_id,
+                    root_run_id=root_run_id,
+                    requested_model_id=requested_model_id,
+                    resolved_model_id=resolved_model_id,
+                    event=event,
+                ),
+                description=(
+                    f"agent event conv={conv_id} run={run_id} "
+                    f"type={event_type} seq={seq}"
+                ),
             )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(
+            "Immediate agent event persist failed after retries "
+            "conv=%s run=%s type=%s seq=%s",
+            conv_id,
+            run_id,
+            event_type,
+            seq,
+        )
+        return False
+    finally:
+        _cleanup_agent_event_persist_lock(conv_id, lock)
 
 
-async def _persist_after_stream(
+def _spawn_agent_event_immediate_persist(
+    *,
+    conv_id: str,
+    user_id: str,
+    root_run_id: str,
+    requested_model_id: str,
+    resolved_model_id: str,
+    event: dict,
+) -> asyncio.Task:
+    task = asyncio.create_task(_persist_agent_event_immediate(
+        conv_id=conv_id,
+        user_id=user_id,
+        root_run_id=root_run_id,
+        requested_model_id=requested_model_id,
+        resolved_model_id=resolved_model_id,
+        event=event,
+    ))
+    key = (conv_id, root_run_id)
+    pending = _agent_event_persist_tasks.setdefault(key, set())
+    pending.add(task)
+    _background_tasks.add(task)
+
+    def finish(completed: asyncio.Task) -> None:
+        _background_tasks.discard(completed)
+        tracked = _agent_event_persist_tasks.get(key)
+        if tracked is not None:
+            tracked.discard(completed)
+            if not tracked:
+                _agent_event_persist_tasks.pop(key, None)
+        try:
+            error = completed.exception()
+        except asyncio.CancelledError:
+            error = None
+        if error is not None:
+            logger.error(
+                "Uncaught immediate agent event persist task failure "
+                "conv=%s root_run=%s",
+                conv_id,
+                root_run_id,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+        lock = _agent_event_persist_locks.get(conv_id)
+        if lock is not None:
+            _cleanup_agent_event_persist_lock(conv_id, lock)
+
+    task.add_done_callback(finish)
+    return task
+
+
+async def _drain_agent_event_immediate_persists(
+    conv_id: str,
+    root_run_id: str,
+) -> None:
+    key = (conv_id, root_run_id)
+    while True:
+        tasks = [
+            task
+            for task in _agent_event_persist_tasks.get(key, set())
+            if not task.done()
+        ]
+        if not tasks:
+            return
+        await asyncio.gather(
+            *(asyncio.shield(task) for task in tasks),
+            return_exceptions=True,
+        )
+
+
+async def _next_message_created_at(
+    db: AsyncSession,
+    conv_id: str,
+) -> datetime:
+    """Return a strictly increasing timestamp for new messages in a session."""
+
+    latest = (await db.execute(
+        select(func.max(Message.created_at)).where(
+            Message.conversation_id == conv_id
+        )
+    )).scalar_one_or_none()
+    now = datetime.utcnow()
+    if latest is not None and now <= latest:
+        return latest + timedelta(microseconds=1)
+    return now
+
+
+async def _assert_no_unprojected_primary_turn(
+    db: AsyncSession,
+    conv_id: str,
+) -> None:
+    """Fail closed if a prior chat turn exhausted terminal persistence."""
+
+    latest_run = (await db.execute(
+        select(AgentRun.id, AgentRun.status, AgentRun.ended_at).where(
+            AgentRun.conversation_id == conv_id,
+            AgentRun.source == "chat",
+            AgentRun.parent_run_id.is_(None),
+        ).order_by(AgentRun.started_at.desc(), AgentRun.id.desc()).limit(1)
+    )).one_or_none()
+    latest_message_role = (await db.execute(
+        select(Message.role).where(
+            Message.conversation_id == conv_id
+        ).order_by(Message.created_at.desc(), Message.id.desc()).limit(1)
+    )).scalar_one_or_none()
+    unprojected = bool(
+        latest_run is not None
+        and (
+            latest_run.status == "running"
+            or (
+                latest_message_role == "user"
+                and latest_run.status != "cancelled"
+                and latest_run.ended_at is not None
+            )
+        )
+    )
+    if unprojected:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "A previous conversation turn has no durable terminal "
+                "projection; this turn was not started."
+            ),
+        )
+
+
+async def _persist_stream_projection_once(
     conv_id: str,
     model_id: str,
     content: str,
     reasoning: str,
     tool_progress: str,
-    first_user_content: str,
     run_id: str,
     resolved_model_id: str,
     usage: dict,
     finish_reason: str,
     error_message: str | None,
-    agent_events: list[dict] | None = None,
-):
-    """Save the assistant message (with reasoning + tool_progress) + maybe
-    generate title. Runs in its own db session so it survives the original
-    request being cancelled (e.g. user refreshes mid-stream)."""
+    agent_events: list[dict],
+) -> tuple[str | None, str | None]:
     async with async_session() as s:
         assistant_message = None
         event_user_id = None
         try:
-            agent_events = agent_events or []
-            terminal_status, terminal_error = _agent_event_terminal_status(agent_events)
-            if terminal_status == "failed" and not error_message:
-                error_message = terminal_error
-            elif terminal_status is None and not error_message:
-                error_message = "Harness stream ended without a terminal run event."
-            input_tokens = int(usage.get("input_tokens", 0) or 0)
-            output_tokens = int(usage.get("output_tokens", 0) or 0)
-            total_tokens = int(usage.get("total_tokens", 0) or 0)
+            terminal_status, _ = _agent_event_terminal_status(
+                agent_events, run_id=run_id
+            )
+            reconciled_usage = _reconciled_root_run_usage(
+                usage,
+                agent_events,
+                run_id=run_id,
+            )
+            input_tokens = reconciled_usage["input_tokens"]
+            output_tokens = reconciled_usage["output_tokens"]
+            total_tokens = reconciled_usage["total_tokens"]
             if content or reasoning:
                 assistant_message = Message(
                     conversation_id=conv_id,
@@ -486,6 +974,7 @@ async def _persist_after_stream(
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     total_tokens=total_tokens,
+                    created_at=await _next_message_created_at(s, conv_id),
                 )
                 s.add(assistant_message)
             conv = (await s.execute(
@@ -525,9 +1014,14 @@ async def _persist_after_stream(
                 run.depth = run.depth or 0
                 run.workspace_scope = run.workspace_scope or "shared_session"
                 run.resolved_model_id = resolved_model_id or model_id
-                run.status = "failed" if error_message else "succeeded"
-                run.finish_reason = finish_reason
-                run.error = error_message
+                if terminal_status == "cancelled":
+                    run.status = "cancelled"
+                    run.finish_reason = "task_cancelled"
+                    run.error = None
+                else:
+                    run.status = "failed" if error_message else "succeeded"
+                    run.finish_reason = finish_reason
+                    run.error = error_message
                 run.tool_events = json.dumps(
                     tool_progress.splitlines() if tool_progress else [],
                     ensure_ascii=False,
@@ -537,21 +1031,105 @@ async def _persist_after_stream(
                 run.total_tokens = total_tokens
                 run.ended_at = datetime.utcnow()
             await s.commit()
-        except Exception:
-            return
-        if assistant_message is not None and event_user_id:
+            return (
+                assistant_message.id if assistant_message is not None else None,
+                str(event_user_id) if event_user_id else None,
+            )
+        except BaseException:
+            await s.rollback()
+            raise
+
+
+async def _persist_after_stream(
+    conv_id: str,
+    model_id: str,
+    content: str,
+    reasoning: str,
+    tool_progress: str,
+    first_user_content: str,
+    run_id: str,
+    resolved_model_id: str,
+    usage: dict,
+    finish_reason: str,
+    error_message: str | None,
+    agent_events: list[dict] | None = None,
+) -> bool:
+    """Durably project one completed stream after its live event writers drain."""
+
+    complete_events = list(agent_events or [])
+    terminal_status, terminal_error = _agent_event_terminal_status(
+        complete_events,
+        run_id=run_id,
+    )
+    if terminal_status == "failed" and not error_message:
+        error_message = terminal_error
+    elif terminal_status == "cancelled":
+        error_message = None
+        finish_reason = "task_cancelled"
+    elif terminal_status is None and not error_message:
+        error_message = "Harness stream ended without a terminal run event."
+
+    # Every live projection for this root run was registered before the stream
+    # entered its finally block.  Await them first so the complete ordered
+    # event list below is a true terminal backfill rather than another racing
+    # SQLite writer.
+    await _drain_agent_event_immediate_persists(conv_id, run_id)
+    lock = _agent_event_persist_lock(conv_id)
+    try:
+        async with lock:
+            assistant_message_id, event_user_id = (
+                await _run_sqlite_persist_with_retry(
+                    lambda: _persist_stream_projection_once(
+                        conv_id,
+                        model_id,
+                        content,
+                        reasoning,
+                        tool_progress,
+                        run_id,
+                        resolved_model_id,
+                        usage,
+                        finish_reason,
+                        error_message,
+                        complete_events,
+                    ),
+                    description=(
+                        f"terminal stream projection conv={conv_id} run={run_id}"
+                    ),
+                )
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(
+            "Terminal stream projection failed after retries conv=%s run=%s",
+            conv_id,
+            run_id,
+        )
+        return False
+    finally:
+        _cleanup_agent_event_persist_lock(conv_id, lock)
+
+    if assistant_message_id is not None and event_user_id:
+        try:
             await emit_event(
                 event_user_id,
                 "message.created",
                 {
                     "conversation_id": conv_id,
-                    "message_id": assistant_message.id,
+                    "message_id": assistant_message_id,
                     "role": "assistant",
                     "model_id": resolved_model_id or model_id,
                     "source": "chat",
                 },
                 conv_id,
             )
+        except Exception:
+            logger.exception(
+                "Post-persist message event failed conv=%s run=%s",
+                conv_id,
+                run_id,
+            )
+    async with async_session() as s:
         try:
             cnt = (await s.execute(
                 select(func.count(Message.id)).where(Message.conversation_id == conv_id)
@@ -561,6 +1139,7 @@ async def _persist_after_stream(
                 await _generate_title(conv_id, first_user_content, content, s)
         except Exception as e:
             logger.exception("title generation failed: %s", e)
+    return True
 
 
 def _spawn_persist(
@@ -600,28 +1179,60 @@ def _spawn_persist_then_emit(
     finish_reason: str,
     error_message: str | None,
     agent_events: list[dict] | None = None,
-) -> None:
-    async def persist_then_emit() -> None:
-        await _persist_after_stream(
+) -> asyncio.Task:
+    async def persist_then_emit() -> bool:
+        reconciled_usage = _reconciled_root_run_usage(
+            usage,
+            agent_events or [],
+            run_id=run_id,
+        )
+        terminal_status, terminal_error = _agent_event_terminal_status(
+            agent_events or [],
+            run_id=run_id,
+        )
+        effective_error = error_message
+        if terminal_status == "failed" and not effective_error:
+            effective_error = terminal_error or "Agent run failed."
+        elif terminal_status == "cancelled":
+            effective_error = None
+        persisted = await _persist_after_stream(
             conv_id, model_id, content, reasoning, tool_progress, first_user_content,
-            run_id, resolved_model_id, usage, finish_reason, error_message, agent_events,
+            run_id, resolved_model_id, usage, finish_reason, effective_error, agent_events,
         )
-        await emit_event(
-            user_id,
-            "run.failed" if error_message else "run.completed",
-            {
-                "conversation_id": conv_id,
-                "run_id": run_id,
-                "model_id": resolved_model_id,
-                "usage": usage,
-                "error": error_message,
-            },
-            conv_id,
-        )
+        if not persisted:
+            raise RuntimeError(
+                f"Terminal stream projection was not durable conv={conv_id} run={run_id}"
+            )
+        try:
+            await emit_event(
+                user_id,
+                (
+                    "run.cancelled"
+                    if terminal_status == "cancelled"
+                    else "run.failed"
+                    if terminal_status == "failed" or effective_error
+                    else "run.completed"
+                ),
+                {
+                    "conversation_id": conv_id,
+                    "run_id": run_id,
+                    "model_id": resolved_model_id,
+                    "usage": reconciled_usage,
+                    "error": effective_error,
+                },
+                conv_id,
+            )
+        except Exception:
+            # The database projection is the history barrier.  A best-effort
+            # notification failure must not make a durable turn look missing.
+            logger.exception(
+                "Post-projection terminal event failed conv=%s run=%s",
+                conv_id,
+                run_id,
+            )
+        return True
 
-    t = asyncio.create_task(persist_then_emit())
-    _background_tasks.add(t)
-    t.add_done_callback(_background_tasks.discard)
+    return _track_conversation_projection(conv_id, persist_then_emit())
 
 
 BUILTIN = {
@@ -634,6 +1245,9 @@ BUILTIN = {
         "max_tokens": 262144,
         "display_name": "GLM-5.2 (主模型)",
         "is_default": True,
+        "agentic_auxiliary_only": False,
+        "supports_thinking_toggle": True,
+        "thinking_enabled_by_default": True,
         "capabilities": ["text", "tools", "reasoning"],
         "provider": "builtin",
         "protocol": "openai",
@@ -648,6 +1262,9 @@ BUILTIN = {
         "max_tokens": 65536,
         "display_name": "Qwen3-5 (397B 多模态)",
         "is_default": False,
+        "agentic_auxiliary_only": True,
+        "supports_thinking_toggle": True,
+        "thinking_enabled_by_default": False,
         "capabilities": ["text", "vision", "tools"],
         "provider": "builtin",
         "protocol": "openai",
@@ -663,6 +1280,7 @@ DEFAULT_CUSTOM_MAX_TOKENS = 32768
 
 async def resolve_model(model_id: str, cur_user: User, db: AsyncSession):
     """Return (base_url, api_key, is_multimodal, max_tokens, api_model)."""
+    model_id = canonical_agent_model_id(model_id)
     if model_id in BUILTIN:
         c = BUILTIN[model_id]
         return c["base_url"], c["api_key"], c["is_multimodal"], c["max_tokens"], c["api_model"]
@@ -679,6 +1297,7 @@ async def resolve_model(model_id: str, cur_user: User, db: AsyncSession):
 
 
 async def resolve_model_config(model_id: str, cur_user: User, db: AsyncSession) -> dict:
+    model_id = canonical_agent_model_id(model_id)
     if model_id in BUILTIN:
         cfg = BUILTIN[model_id]
         return {
@@ -690,6 +1309,15 @@ async def resolve_model_config(model_id: str, cur_user: User, db: AsyncSession) 
             "protocol": cfg.get("protocol", "openai"),
             "is_multimodal": cfg["is_multimodal"],
             "context_length": cfg.get("context_length", 262144),
+            "agentic_auxiliary_only": cfg.get(
+                "agentic_auxiliary_only", False
+            ),
+            "supports_thinking_toggle": cfg.get(
+                "supports_thinking_toggle", False
+            ),
+            "thinking_enabled_by_default": cfg.get(
+                "thinking_enabled_by_default", True
+            ),
         }
     custom = (await db.execute(
         select(CustomModelConfig).where(
@@ -849,39 +1477,107 @@ async def _generate_title(
 
 
 async def _chat_stream(req: ChatRequest, cur_user: User, db: AsyncSession):
-    # Create or verify conversation
+    # Serialize a conversation before verifying it or loading history.  A
+    # different conversation receives a distinct lock and is unaffected.
     conv_id = req.conversation_id
-    if not conv_id:
-        model_id = await _detect_model(req, str(cur_user.id))
-        conv = Conversation(user_id=cur_user.id, model_id=model_id)
-        db.add(conv)
-        await db.commit()
-        await db.refresh(conv)
-        conv_id = conv.id
-        ensure_workspace(cur_user.id, conv_id)
-        await emit_event(cur_user.id, "session.created", {"conversation_id": conv_id}, conv_id)
-    else:
-        conv = (await db.execute(
-            select(Conversation).where(
-                Conversation.id == conv_id, Conversation.user_id == cur_user.id
+    turn_lease: _ConversationTurnLease | None = None
+    try:
+        if conv_id:
+            turn_lease = await _acquire_conversation_turn(conv_id)
+            conv = (await db.execute(
+                select(Conversation).where(
+                    Conversation.id == conv_id,
+                    Conversation.user_id == cur_user.id,
+                )
+            )).scalar_one_or_none()
+            if not conv:
+                raise HTTPException(404, "Conversation not found")
+            model_id = canonical_agent_model_id(
+                req.model_id
+                or conv.model_id
+                or await _detect_model(req, str(cur_user.id))
             )
-        )).scalar_one_or_none()
-        if not conv:
-            raise HTTPException(404, "Conversation not found")
-        model_id = req.model_id or conv.model_id or await _detect_model(req, str(cur_user.id))
-        if req.model_id and req.model_id != conv.model_id:
-            conv.model_id = req.model_id
+            if model_id != conv.model_id:
+                # Repair historic persisted `AgentModel` aliases on the next
+                # ordinary turn. qwen3_5 is intentionally not canonicalized
+                # here: the harness may retain it for an explicit image turn.
+                conv.model_id = model_id
+                await db.commit()
+            ensure_workspace(cur_user.id, conv_id)
+        else:
+            model_id = canonical_agent_model_id(
+                await _detect_model(req, str(cur_user.id))
+            )
+            conv = Conversation(user_id=cur_user.id, model_id=model_id)
+            db.add(conv)
             await db.commit()
-        ensure_workspace(cur_user.id, conv_id)
+            await db.refresh(conv)
+            conv_id = conv.id
+            turn_lease = await _acquire_conversation_turn(conv_id)
+            ensure_workspace(cur_user.id, conv_id)
+            await emit_event(
+                cur_user.id,
+                "session.created",
+                {"conversation_id": conv_id},
+                conv_id,
+            )
+
+        return await _chat_stream_with_turn(
+            req,
+            cur_user,
+            db,
+            conv=conv,
+            conv_id=conv_id,
+            model_id=model_id,
+            turn_lease=turn_lease,
+        )
+    except _ConversationProjectionBarrierError as exc:
+        if turn_lease is not None:
+            _release_conversation_turn(conv_id, turn_lease)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The previous conversation turn could not be durably projected; "
+                "this turn was not started."
+            ),
+        ) from exc
+    except BaseException:
+        if turn_lease is not None:
+            _release_conversation_turn(conv_id, turn_lease)
+        raise
+
+
+async def _chat_stream_with_turn(
+    req: ChatRequest,
+    cur_user: User,
+    db: AsyncSession,
+    *,
+    conv: Conversation,
+    conv_id: str,
+    model_id: str,
+    turn_lease: _ConversationTurnLease,
+):
+    await _assert_no_unprojected_primary_turn(db, conv_id)
 
     provider_config = await resolve_model_config(model_id, cur_user, db)
     max_tokens = (
         BUILTIN.get(model_id, {}).get("max_tokens")
         if model_id in BUILTIN else DEFAULT_CUSTOM_MAX_TOKENS
     ) or DEFAULT_CUSTOM_MAX_TOKENS
-    enabled_tools = serialize_json_list(conv.enabled_tools, AGENT_TOOLS)
+    enabled_tools = serialize_json_list(conv.enabled_tools, DEFAULT_NATIVE_TOOLS)
     enabled_user_skills = serialize_json_list(conv.enabled_user_skills, [])
-    fallback_ids = serialize_json_list(conv.fallback_model_ids, [])
+    fallback_ids, removed_fallback_ids = filter_agentic_fallback_model_ids(
+        serialize_json_list(conv.fallback_model_ids, []),
+        requested_model_id=model_id,
+    )
+    if removed_fallback_ids:
+        logger.info(
+            "Filtered auxiliary/duplicate agentic fallbacks conversation=%s "
+            "requested_model=%s removed=%s",
+            conv_id,
+            model_id,
+            removed_fallback_ids,
+        )
     fallback_configs = []
     for fallback_id in fallback_ids:
         if fallback_id == model_id:
@@ -895,7 +1591,10 @@ async def _chat_stream(req: ChatRequest, cur_user: User, db: AsyncSession):
 
     # Load history before saving the new user message
     history_msgs = (await db.execute(
-        select(Message).where(Message.conversation_id == conv_id).order_by(Message.created_at)
+        select(Message).where(Message.conversation_id == conv_id).order_by(
+            Message.created_at,
+            Message.id,
+        )
     )).scalars().all()
     history = []
     for m in history_msgs:
@@ -911,6 +1610,7 @@ async def _chat_stream(req: ChatRequest, cur_user: User, db: AsyncSession):
         history.append(entry)
 
     # Save user message synchronously — must persist even if stream cancelled
+    user_created_at = await _next_message_created_at(db, conv_id)
     user_msg = Message(
         conversation_id=conv_id,
         role="user",
@@ -918,6 +1618,7 @@ async def _chat_stream(req: ChatRequest, cur_user: User, db: AsyncSession):
         image_urls=json.dumps(req.image_urls) if req.image_urls else None,
         model_id=model_id,
         source="chat",
+        created_at=user_created_at,
     )
     db.add(user_msg)
     run = AgentRun(
@@ -933,6 +1634,7 @@ async def _chat_stream(req: ChatRequest, cur_user: User, db: AsyncSession):
         workspace_scope="shared_session",
         requested_tools=json.dumps(enabled_tools, ensure_ascii=False),
         effective_tools=json.dumps(enabled_tools, ensure_ascii=False),
+        started_at=user_created_at,
     )
     db.add(run)
     await db.commit()
@@ -967,11 +1669,14 @@ async def _chat_stream(req: ChatRequest, cur_user: User, db: AsyncSession):
         usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         agent_events: list[dict] = []
         seen_agent_events: set[tuple[str, str, int]] = set()
-
-        # Emit routed_model event so the frontend knows which model was chosen
-        yield f"data: {json.dumps({'routed_model': model_id, 'conversation_id': conv_id})}\n\n"
+        cancelled = False
+        stream_aborted = False
 
         try:
+            # Establish cleanup before the first yield: a client may disconnect
+            # immediately after receiving routing metadata.
+            yield f"data: {json.dumps({'routed_model': model_id, 'conversation_id': conv_id})}\n\n"
+
             # Build messages: system prompt + history + user message.
             # Images are passed as proper image_url content parts. The harness
             # handles image routing: for text-only models (deepseek_v4_pro), it
@@ -1063,16 +1768,14 @@ async def _chat_stream(req: ChatRequest, cur_user: User, db: AsyncSession):
                                                 payload = _event_payload(agent_event)
                                                 error_message = str(payload.get("error") or "Agent run failed.")[:4000]
                                             if _should_persist_agent_event_immediately(event_type):
-                                                t = asyncio.create_task(_persist_agent_event_immediate(
+                                                _spawn_agent_event_immediate_persist(
                                                     conv_id=conv_id,
                                                     user_id=cur_user.id,
                                                     root_run_id=run.id,
                                                     requested_model_id=model_id,
                                                     resolved_model_id=resolved_model_id,
                                                     event=agent_event,
-                                                ))
-                                                _background_tasks.add(t)
-                                                t.add_done_callback(_background_tasks.discard)
+                                                )
                                             yield f"data: {json.dumps({'agent_event': agent_event, 'conversation_id': conv_id})}\n\n"
                                     # Harness tool_progress
                                     tp = delta.get("tool_progress")
@@ -1121,7 +1824,10 @@ async def _chat_stream(req: ChatRequest, cur_user: User, db: AsyncSession):
             except Exception as e:
                 error_message = f"调用 Harness 时出错:{type(e).__name__}: {e}"
 
-            terminal_status, terminal_error = _agent_event_terminal_status(agent_events)
+            terminal_status, terminal_error = _agent_event_terminal_status(
+                agent_events,
+                run_id=run.id,
+            )
             if terminal_status == "failed" and not error_message:
                 error_message = terminal_error
             elif terminal_status is None and not error_message:
@@ -1140,24 +1846,87 @@ async def _chat_stream(req: ChatRequest, cur_user: User, db: AsyncSession):
                     # Surface the error as the assistant's content so the user sees it
                     full_content = f"⚠️ {error_message}"
                     yield f"data: {json.dumps({'delta': full_content, 'conversation_id': conv_id})}\n\n"
-        finally:
-            if not full_content and not full_reasoning and not error_message:
-                error_message = "Stream ended before producing a response."
-            _spawn_persist_then_emit(
-                user_id=cur_user.id,
-                conv_id=conv_id,
-                model_id=model_id,
-                content=full_content,
-                reasoning=full_reasoning,
-                tool_progress=full_tool_progress,
-                first_user_content=req.content,
-                run_id=run.id,
-                resolved_model_id=resolved_model_id,
-                usage=usage,
-                finish_reason=finish_reason,
-                error_message=error_message,
-                agent_events=list(agent_events),
+        except (asyncio.CancelledError, GeneratorExit):
+            stream_aborted = True
+            root_terminal_status, _root_terminal_error = (
+                _agent_event_terminal_status(agent_events, run_id=run.id)
             )
+            if root_terminal_status is None:
+                cancelled = True
+                finish_reason = "task_cancelled"
+                root_seq = max(
+                    (
+                        int(event.get("seq") or 0)
+                        for event in agent_events
+                        if str(event.get("run_id") or "") == run.id
+                    ),
+                    default=0,
+                )
+                cancellation_event = {
+                    "type": "agent_event",
+                    "event_type": "run.cancelled",
+                    "run_id": run.id,
+                    "root_run_id": run.id,
+                    "parent_run_id": None,
+                    "agent_kind": "primary",
+                    "agent_name": "primary",
+                    "depth": 0,
+                    "workspace_scope": "shared_session",
+                    "seq": root_seq + 1,
+                    "payload": {
+                        "finish_reason": "task_cancelled",
+                        "terminal_reason": "task_cancelled",
+                        "usage": dict(usage),
+                    },
+                }
+                agent_events.append(cancellation_event)
+                seen_agent_events.add(
+                    (run.id, "run.cancelled", root_seq + 1)
+                )
+            # Client disconnect is control flow.  Starlette normally cancels
+            # the streaming task, while explicit async-generator cleanup can
+            # arrive as GeneratorExit; both must close the harness stream and
+            # persist the same root cancellation boundary.
+            raise
+        finally:
+            root_terminal_status, _root_terminal_error = (
+                _agent_event_terminal_status(agent_events, run_id=run.id)
+            )
+            if (
+                not cancelled
+                and root_terminal_status is None
+                and not full_content
+                and not full_reasoning
+                and not error_message
+            ):
+                error_message = "Stream ended before producing a response."
+            projection_task: asyncio.Task | None = None
+            try:
+                projection_task = _spawn_persist_then_emit(
+                    user_id=cur_user.id,
+                    conv_id=conv_id,
+                    model_id=model_id,
+                    content=full_content,
+                    reasoning=full_reasoning,
+                    tool_progress=full_tool_progress,
+                    first_user_content=req.content,
+                    run_id=run.id,
+                    resolved_model_id=resolved_model_id,
+                    usage=usage,
+                    finish_reason=finish_reason,
+                    error_message=error_message,
+                    agent_events=list(agent_events),
+                )
+                if not stream_aborted:
+                    projected = await asyncio.shield(projection_task)
+                    if projected is not True:
+                        raise _ConversationProjectionBarrierError(
+                            "Terminal conversation projection was not durable."
+                        )
+            finally:
+                # On disconnect the shielded task remains registered.  The
+                # next turn acquires this lock and drains it before history.
+                _release_conversation_turn(conv_id, turn_lease)
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
