@@ -124,6 +124,16 @@ def wrap_result(
     return summary
 
 
+def persist_result_for_history(
+    raw_result: str,
+    tool_name: str,
+    user_id: str = "default",
+    session_id: str = "default",
+) -> str:
+    """Persist a result whose executable arguments will be removed from history."""
+    return _persist(tool_name, raw_result, user_id, session_id)
+
+
 def get_tool_caps() -> dict[str, int]:
     """Return a copy of the per-tool cap configuration (for debugging)."""
     return dict(_TOOL_CAPS)

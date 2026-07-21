@@ -38,7 +38,9 @@ class Conversation(Base):
         String(32), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
     title: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
-    model_id: Mapped[str] = mapped_column(String(64), nullable=False, default="AgentModel")
+    model_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="deepseek_v4_pro"
+    )
     enabled_tools: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     fallback_model_ids: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     enabled_user_skills: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

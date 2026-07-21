@@ -15,7 +15,7 @@ from typing import Optional
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 
-from config import PROVIDERS
+from config import DEFAULT_AGENT_MODEL_ID, PROVIDERS, canonical_provider_id
 from agent_loop import run_stream
 import tools  # noqa: F401 — triggers tool registration
 
@@ -190,7 +190,7 @@ async def list_models():
 @app.post("/v1/chat/completions")
 async def chat_completions(req: Request):
     body = await req.json()
-    model_id = body.get("model", "AgentModel")
+    model_id = canonical_provider_id(body.get("model") or DEFAULT_AGENT_MODEL_ID)
     messages: list[dict] = body.get("messages", [])
     stream: bool = body.get("stream", False)
     tools: Optional[list[str]] = body.get("tools")
