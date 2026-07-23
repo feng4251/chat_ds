@@ -7,6 +7,8 @@ content-addressed regular files over a bounded Unix socket request, validates
 the complete response, and atomically replaces each returned workspace file.
 Skill Python may run as a CLI or as one strictly data-described public
 top-level function call; neither form accepts model-authored wrapper code.
+The additive protocol-v2 API retains authenticated persistent CLI processes
+and strictly declared public class/factory objects in trusted runtime state.
 """
 
 from __future__ import annotations
@@ -14,11 +16,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+from dataclasses import dataclass, field
 import hashlib
 import hmac
 import json
 import os
 import re
+import secrets
 import socket
 import stat
 import tempfile
@@ -26,12 +30,15 @@ import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from tools.workspace_lock import workspace_mutation_guard
+
 
 EXECUTOR_SOCKET = os.environ.get(
     "EXECUTOR_SOCKET", "/run/chat-ds-executor/executor.sock"
 )
 PROTOCOL_VERSION = 1
-MAX_REQUEST_BYTES = 64 * 1024 * 1024
+PROCESS_PROTOCOL_VERSION = 2
+MAX_REQUEST_BYTES = 96 * 1024 * 1024
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_STDOUT_BYTES = 80_000
 MAX_STDERR_BYTES = 20_000
@@ -52,10 +59,10 @@ MAX_SKILL_FILES = 1_024
 MAX_SKILL_FILE_BYTES = 8 * 1024 * 1024
 MAX_SKILL_TOTAL_BYTES = 24 * 1024 * 1024
 MAX_WORKSPACE_FILES = 512
-MAX_WORKSPACE_FILE_BYTES = 8 * 1024 * 1024
-MAX_WORKSPACE_TOTAL_BYTES = 16 * 1024 * 1024
+MAX_WORKSPACE_FILE_BYTES = 24 * 1024 * 1024
+MAX_WORKSPACE_TOTAL_BYTES = 32 * 1024 * 1024
 MAX_OUTPUT_FILES = 512
-MAX_OUTPUT_FILE_BYTES = 8 * 1024 * 1024
+MAX_OUTPUT_FILE_BYTES = 24 * 1024 * 1024
 MAX_OUTPUT_TOTAL_BYTES = 24 * 1024 * 1024
 MAX_SNAPSHOT_ENTRIES = 4_096
 MAX_RUNTIME_REQUIREMENTS = 80
@@ -64,8 +71,14 @@ MAX_RUNTIME_ENVIRONMENT_VARIABLES = 80
 MAX_RUNTIME_PLATFORM_GROUPS = 32
 MAX_RUNTIME_PLATFORMS_PER_GROUP = 32
 MAX_RUNTIME_DECLARATION_CHARS = 512
+MAX_PROCESS_LEASE_TTL_SECONDS = 3_600
+MAX_PROCESS_RUNTIME_SECONDS = 3_600
+MAX_PROCESS_STDIN_CHUNK_BYTES = 64 * 1024
+MAX_PROCESS_CALL_BYTES = 4 * 1024
+MAX_PROCESS_READ_BYTES = 256 * 1024
+MAX_PROCESS_READ_WAIT_MS = 60_000
 
-SUPPORTED_EXTENSIONS = frozenset({".py", ".sh", ".bash", ".js", ".mjs"})
+SUPPORTED_EXTENSIONS = frozenset({".py", ".sh", ".bash", ".js", ".mjs", ".cjs"})
 PUBLIC_FUNCTION_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
 RUNTIME_COMMAND_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]{0,127}$")
 RUNTIME_ENVIRONMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
@@ -86,6 +99,132 @@ class IsolatedSkillExecutorError(ValueError):
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
+
+
+@dataclass(frozen=True, slots=True)
+class _SkillSnapshotFile:
+    """One immutable regular file captured by the bounded tree walker."""
+
+    path: str
+    content: bytes = field(repr=False)
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class SkillPackageSnapshot:
+    """Immutable exact Skill bytes shared by authorization, routing and send.
+
+    The constructor is public only as a Python type boundary; consumers must
+    obtain values from :func:`snapshot_skill_package`.  Every protocol use
+    revalidates the complete object before serializing it, so a hand-built or
+    otherwise corrupted instance cannot become executor input.
+    """
+
+    files: tuple[_SkillSnapshotFile, ...] = field(repr=False)
+    sha256: str
+
+    @property
+    def paths(self) -> tuple[str, ...]:
+        return tuple(item.path for item in self.files)
+
+    def read_bytes(self, relative_path: str) -> bytes:
+        for item in self.files:
+            if item.path == relative_path:
+                return item.content
+        raise KeyError(relative_path)
+
+    def file_sha256(self, relative_path: str) -> str:
+        for item in self.files:
+            if item.path == relative_path:
+                return item.sha256
+        raise KeyError(relative_path)
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessOwnerScope:
+    """Trusted runtime identity; never expose its token in a model tool schema."""
+
+    user_id: str
+    session_id: str
+    root_run_id: str
+    _authority_token: str = field(repr=False)
+
+    def _protocol_value(self) -> dict[str, str]:
+        return {
+            "user_id": self.user_id,
+            "session_id": self.session_id,
+            "root_run_id": self.root_run_id,
+            "authority_token": self._authority_token,
+        }
+
+
+@dataclass(slots=True)
+class IsolatedProcessLease:
+    """Opaque client-side capability retained by trusted Harness runtime state."""
+
+    handle: str
+    skill_sha256: str
+    script_sha256: str
+    entrypoint: str
+    invocation_mode: str
+    class_name: str | None
+    factory_name: str | None
+    _owner_scope: ProcessOwnerScope = field(repr=False)
+    _workspace: Path = field(repr=False)
+    _socket_path: str = field(repr=False)
+    _baseline: dict[str, tuple[int, str]] = field(repr=False)
+    _pending_sync_operation: str | None = field(default=None, repr=False)
+    _pending_sync_prepare_op_id: str | None = field(default=None, repr=False)
+    _pending_sync_response: dict[str, Any] | None = field(default=None, repr=False)
+    _pending_sync_artifacts: list[tuple[str, bytes, dict[str, Any]]] | None = field(
+        default=None,
+        repr=False,
+    )
+    _pending_sync_ack_op_id: str | None = field(default=None, repr=False)
+    _pending_sync_applied: list[dict[str, Any]] | None = field(
+        default=None,
+        repr=False,
+    )
+    closed: bool = False
+
+
+def create_process_owner_scope(
+    *,
+    user_id: str,
+    session_id: str,
+    root_run_id: str,
+) -> ProcessOwnerScope:
+    """Create a non-model-facing owner capability from ToolContext identity."""
+
+    values = {
+        "user_id": user_id,
+        "session_id": session_id,
+        "root_run_id": root_run_id,
+    }
+    for field_name, value in values.items():
+        if not isinstance(value, str) or not value or "\x00" in value:
+            raise IsolatedSkillExecutorError(
+                "invalid_owner_scope",
+                f"{field_name} must be a non-empty runtime identity string.",
+            )
+        try:
+            encoded = value.encode("utf-8", errors="strict")
+        except UnicodeError as exc:
+            raise IsolatedSkillExecutorError(
+                "invalid_owner_scope",
+                f"{field_name} must be valid UTF-8.",
+            ) from exc
+        if len(encoded) > 256 or any(ord(character) < 0x20 for character in value):
+            raise IsolatedSkillExecutorError(
+                "invalid_owner_scope",
+                f"{field_name} is outside the bounded runtime identity policy.",
+            )
+    return ProcessOwnerScope(
+        user_id=user_id,
+        session_id=session_id,
+        root_run_id=root_run_id,
+        _authority_token=secrets.token_urlsafe(32),
+    )
 
 
 def _safe_relative_path(value: Any, *, field: str) -> str:
@@ -514,6 +653,284 @@ def _validated_invocation(
     return invocation
 
 
+def _canonical_snapshot_digest(snapshot: list[dict[str, Any]]) -> str:
+    manifest = [
+        {
+            "path": item["path"],
+            "size_bytes": item["size_bytes"],
+            "sha256": item["sha256"],
+        }
+        for item in sorted(snapshot, key=lambda item: item["path"])
+    ]
+    encoded = json.dumps(
+        manifest,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _snapshot_protocol_files(
+    snapshot: SkillPackageSnapshot,
+) -> list[dict[str, Any]]:
+    """Validate and serialize one immutable Skill package capability."""
+
+    if not isinstance(snapshot, SkillPackageSnapshot):
+        raise IsolatedSkillExecutorError(
+            "invalid_skill_snapshot",
+            "A trusted immutable SkillPackageSnapshot is required.",
+        )
+    if not snapshot.files or len(snapshot.files) > MAX_SKILL_FILES:
+        raise IsolatedSkillExecutorError(
+            "invalid_skill_snapshot",
+            "The immutable Skill snapshot has an invalid file count.",
+        )
+    records: list[dict[str, Any]] = []
+    total_bytes = 0
+    previous_path = ""
+    for item in snapshot.files:
+        if not isinstance(item, _SkillSnapshotFile):
+            raise IsolatedSkillExecutorError(
+                "invalid_skill_snapshot",
+                "The immutable Skill snapshot contains an invalid file record.",
+            )
+        safe_path = _safe_relative_path(item.path, field="skill snapshot path")
+        if safe_path <= previous_path:
+            raise IsolatedSkillExecutorError(
+                "invalid_skill_snapshot",
+                "Skill snapshot paths must be unique and canonically sorted.",
+            )
+        previous_path = safe_path
+        if (
+            not isinstance(item.content, bytes)
+            or len(item.content) > MAX_SKILL_FILE_BYTES
+        ):
+            raise IsolatedSkillExecutorError(
+                "invalid_skill_snapshot",
+                f"Skill snapshot file exceeds its bound: {safe_path}",
+            )
+        digest = hashlib.sha256(item.content).hexdigest()
+        if not hmac.compare_digest(digest, str(item.sha256 or "")):
+            raise IsolatedSkillExecutorError(
+                "invalid_skill_snapshot",
+                f"Skill snapshot content digest is invalid: {safe_path}",
+            )
+        total_bytes += len(item.content)
+        if total_bytes > MAX_SKILL_TOTAL_BYTES:
+            raise IsolatedSkillExecutorError(
+                "invalid_skill_snapshot",
+                "The immutable Skill snapshot exceeds its aggregate byte bound.",
+            )
+        records.append({
+            "path": safe_path,
+            "content_b64": base64.b64encode(item.content).decode("ascii"),
+            "size_bytes": len(item.content),
+            "sha256": digest,
+        })
+    actual_digest = _canonical_snapshot_digest(records)
+    if not hmac.compare_digest(actual_digest, str(snapshot.sha256 or "")):
+        raise IsolatedSkillExecutorError(
+            "invalid_skill_snapshot",
+            "The immutable Skill snapshot package digest is invalid.",
+        )
+    if "SKILL.md" not in {item["path"] for item in records}:
+        raise IsolatedSkillExecutorError(
+            "invalid_skill_snapshot",
+            "The verified Skill root must contain SKILL.md.",
+        )
+    return records
+
+
+def snapshot_skill_package(skill_root: Path) -> SkillPackageSnapshot:
+    """Capture one bounded package exactly once for routing and execution."""
+
+    records = _snapshot_tree(
+        Path(skill_root),
+        field="skill_root",
+        max_files=MAX_SKILL_FILES,
+        max_file_bytes=MAX_SKILL_FILE_BYTES,
+        max_total_bytes=MAX_SKILL_TOTAL_BYTES,
+    )
+    if "SKILL.md" not in {item["path"] for item in records}:
+        raise IsolatedSkillExecutorError(
+            "invalid_skill_snapshot",
+            "The verified Skill root must contain SKILL.md.",
+        )
+    files = tuple(
+        _SkillSnapshotFile(
+            path=str(item["path"]),
+            content=base64.b64decode(
+                str(item["content_b64"]).encode("ascii"),
+                validate=True,
+            ),
+            sha256=str(item["sha256"]),
+        )
+        for item in records
+    )
+    snapshot = SkillPackageSnapshot(
+        files=files,
+        sha256=_canonical_snapshot_digest(records),
+    )
+    # Keep one validation boundary even though the source records were built
+    # locally.  This makes future callers unable to rely on unchecked fields.
+    _snapshot_protocol_files(snapshot)
+    return snapshot
+
+
+def compute_skill_package_digest(skill_root: Path) -> str:
+    """Return the canonical digest used to authorize an exact Skill package.
+
+    This public helper deliberately uses the same safe tree walk, limits, and
+    manifest encoding as process-lease creation.  Callers can therefore bind
+    package authority before opening a lease without maintaining a second,
+    subtly different digest implementation.
+    """
+
+    return snapshot_skill_package(Path(skill_root)).sha256
+
+
+def _process_auth_key() -> bytes:
+    token = os.environ.get("EXECUTOR_V2_AUTH_TOKEN", "")
+    try:
+        encoded = token.encode("utf-8", errors="strict")
+    except UnicodeError as exc:
+        raise IsolatedSkillExecutorError(
+            "v2_auth_unavailable",
+            "Persistent process protocol authentication is not configured safely.",
+        ) from exc
+    if len(encoded) < 32 or len(encoded) > 4_096:
+        raise IsolatedSkillExecutorError(
+            "v2_auth_unavailable",
+            "Persistent process protocol authentication is not configured safely.",
+        )
+    return encoded
+
+
+def _encode_process_request(payload: dict[str, Any]) -> bytes:
+    unsigned = dict(payload)
+    unsigned.pop("auth_hmac", None)
+    try:
+        canonical = json.dumps(
+            unsigned,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise IsolatedSkillExecutorError(
+            "invalid_process_request",
+            "Process request must contain bounded valid JSON.",
+        ) from exc
+    payload["auth_hmac"] = hmac.new(
+        _process_auth_key(),
+        canonical,
+        hashlib.sha256,
+    ).hexdigest()
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+    if len(encoded) > MAX_REQUEST_BYTES:
+        raise IsolatedSkillExecutorError(
+            "request_limit_exceeded",
+            "Encoded process executor request exceeds its protocol limit.",
+        )
+    return encoded
+
+
+def _validated_persistent_open_invocation(
+    *,
+    entrypoint: str,
+    cli_args: list[str],
+    class_name: str | None,
+    factory_name: str | None,
+    constructor_args: list[Any] | None,
+    constructor_kwargs: dict[str, Any] | None,
+) -> dict[str, Any]:
+    fields_present = any(
+        value is not None
+        for value in (class_name, factory_name, constructor_args, constructor_kwargs)
+    )
+    if not fields_present:
+        return {"mode": "cli"}
+    if (class_name is None) == (factory_name is None):
+        raise IsolatedSkillExecutorError(
+            "invalid_function_call",
+            "Exactly one of class_name or factory_name is required for a persistent object.",
+        )
+    invocation_mode = "instance" if class_name is not None else "factory"
+    selected_name = class_name if class_name is not None else factory_name
+    if (
+        PurePosixPath(entrypoint).suffix != ".py"
+        or cli_args
+        or not isinstance(selected_name, str)
+        or selected_name.startswith("_")
+        or PUBLIC_FUNCTION_RE.fullmatch(selected_name) is None
+    ):
+        raise IsolatedSkillExecutorError(
+            "invalid_function_call",
+            "Persistent object mode requires one public class/factory in a Python entrypoint and no CLI args.",
+        )
+    positional = [] if constructor_args is None else constructor_args
+    keywords = {} if constructor_kwargs is None else constructor_kwargs
+    if not isinstance(positional, list) or len(positional) > MAX_FUNCTION_ARGS:
+        raise IsolatedSkillExecutorError(
+            "invalid_function_call",
+            f"constructor_args must contain at most {MAX_FUNCTION_ARGS} JSON values.",
+        )
+    if not isinstance(keywords, dict) or len(keywords) > MAX_FUNCTION_KWARGS:
+        raise IsolatedSkillExecutorError(
+            "invalid_function_call",
+            f"constructor_kwargs must contain at most {MAX_FUNCTION_KWARGS} JSON values.",
+        )
+    for key in keywords:
+        if (
+            not isinstance(key, str)
+            or key.startswith("_")
+            or PUBLIC_FUNCTION_RE.fullmatch(key) is None
+        ):
+            raise IsolatedSkillExecutorError(
+                "invalid_function_call",
+                "constructor_kwargs keys must be public Python identifiers.",
+            )
+    _validate_function_json(positional, field="constructor_args")
+    _validate_function_json(keywords, field="constructor_kwargs")
+    try:
+        encoded = json.dumps(
+            {"args": positional, "kwargs": keywords},
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise IsolatedSkillExecutorError(
+            "invalid_function_call",
+            "Constructor arguments must be finite valid JSON.",
+        ) from exc
+    if len(encoded) > MAX_FUNCTION_INPUT_BYTES:
+        raise IsolatedSkillExecutorError(
+            "invalid_function_call",
+            "Constructor argument JSON exceeds its byte limit.",
+        )
+    if invocation_mode == "instance":
+        return {
+            "mode": "instance",
+            "class_name": selected_name,
+            "constructor_args": positional,
+            "constructor_kwargs": keywords,
+        }
+    return {
+        "mode": "factory",
+        "factory_name": selected_name,
+        "factory_args": positional,
+        "factory_kwargs": keywords,
+    }
+
+
 def build_skill_script_request(
     *,
     skill_root: Path,
@@ -531,6 +948,7 @@ def build_skill_script_request(
     constructor_kwargs: dict[str, Any] | None = None,
     method_args: list[Any] | None = None,
     method_kwargs: dict[str, Any] | None = None,
+    expected_skill_sha256: str | None = None,
     request_id: str | None = None,
 ) -> tuple[dict[str, Any], bytes]:
     """Build one bounded, content-addressed protocol request."""
@@ -539,7 +957,7 @@ def build_skill_script_request(
     if PurePosixPath(safe_entrypoint).suffix not in SUPPORTED_EXTENSIONS:
         raise IsolatedSkillExecutorError(
             "unsupported_script_type",
-            "entrypoint must end in .py, .sh, .bash, .js, or .mjs.",
+            "entrypoint must end in .py, .sh, .bash, .js, .mjs, or .cjs.",
         )
     safe_args = _validated_args(args)
     invocation = _validated_invocation(
@@ -589,6 +1007,25 @@ def build_skill_script_request(
         raise IsolatedSkillExecutorError(
             "missing_entrypoint", "entrypoint is not a regular file in the verified Skill root."
         )
+    if expected_skill_sha256 is not None:
+        if (
+            not isinstance(expected_skill_sha256, str)
+            or len(expected_skill_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in expected_skill_sha256
+            )
+        ):
+            raise IsolatedSkillExecutorError(
+                "invalid_authority",
+                "expected_skill_sha256 must be a lowercase SHA-256 digest.",
+            )
+        actual_skill_sha256 = _canonical_snapshot_digest(skill_files)
+        if not hmac.compare_digest(actual_skill_sha256, expected_skill_sha256):
+            raise IsolatedSkillExecutorError(
+                "authority_digest_mismatch",
+                "The execution snapshot no longer matches authorized Skill package bytes.",
+            )
     workspace_files = _snapshot_tree(
         Path(workspace),
         field="workspace",
@@ -620,6 +1057,196 @@ def build_skill_script_request(
             "request_limit_exceeded", "Encoded Skill executor request exceeds its protocol limit."
         )
     return payload, encoded
+
+
+def build_process_lease_open_request(
+    *,
+    owner_scope: ProcessOwnerScope,
+    skill_root: Path,
+    workspace: Path,
+    entrypoint: str,
+    args: list[str] | None = None,
+    cwd: str = "workspace",
+    idle_ttl_seconds: int = 300,
+    max_runtime_seconds: int = MAX_PROCESS_RUNTIME_SECONDS,
+    class_name: str | None = None,
+    factory_name: str | None = None,
+    constructor_args: list[Any] | None = None,
+    constructor_kwargs: dict[str, Any] | None = None,
+    request_id: str | None = None,
+    op_id: str | None = None,
+    skill_snapshot: SkillPackageSnapshot | None = None,
+) -> tuple[dict[str, Any], bytes]:
+    """Build a signed v2 lease-open request from trusted runtime state."""
+
+    if not isinstance(owner_scope, ProcessOwnerScope):
+        raise IsolatedSkillExecutorError(
+            "invalid_owner_scope",
+            "owner_scope must be created from trusted runtime context.",
+        )
+    safe_entrypoint = _safe_relative_path(entrypoint, field="entrypoint")
+    if PurePosixPath(safe_entrypoint).suffix not in SUPPORTED_EXTENSIONS:
+        raise IsolatedSkillExecutorError(
+            "unsupported_script_type",
+            "entrypoint must end in .py, .sh, .bash, .js, .mjs, or .cjs.",
+        )
+    safe_args = _validated_args(args)
+    invocation = _validated_persistent_open_invocation(
+        entrypoint=safe_entrypoint,
+        cli_args=safe_args,
+        class_name=class_name,
+        factory_name=factory_name,
+        constructor_args=constructor_args,
+        constructor_kwargs=constructor_kwargs,
+    )
+    if cwd not in {"workspace", "script", "skill"}:
+        raise IsolatedSkillExecutorError(
+            "invalid_cwd",
+            "cwd must be exactly 'workspace', 'script', or 'skill'.",
+        )
+    for field_name, value, maximum in (
+        ("idle_ttl_seconds", idle_ttl_seconds, MAX_PROCESS_LEASE_TTL_SECONDS),
+        ("max_runtime_seconds", max_runtime_seconds, MAX_PROCESS_RUNTIME_SECONDS),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
+            raise IsolatedSkillExecutorError(
+                "invalid_process_quota",
+                f"{field_name} must be between 1 and {maximum}.",
+            )
+    try:
+        safe_request_id = str(uuid.UUID(request_id)) if request_id is not None else str(uuid.uuid4())
+        safe_op_id = str(uuid.UUID(op_id)) if op_id is not None else str(uuid.uuid4())
+    except (ValueError, AttributeError) as exc:
+        raise IsolatedSkillExecutorError(
+            "invalid_request_id",
+            "request_id and op_id must be UUID strings.",
+        ) from exc
+    skill_files = (
+        _snapshot_protocol_files(skill_snapshot)
+        if skill_snapshot is not None
+        else _snapshot_protocol_files(
+            snapshot_skill_package(Path(skill_root))
+        )
+    )
+    skill_paths = {item["path"] for item in skill_files}
+    if "SKILL.md" not in skill_paths:
+        raise IsolatedSkillExecutorError(
+            "invalid_skill_snapshot",
+            "The verified Skill root must contain SKILL.md.",
+        )
+    if safe_entrypoint not in skill_paths:
+        raise IsolatedSkillExecutorError(
+            "missing_entrypoint",
+            "entrypoint is not a regular file in the verified Skill root.",
+        )
+    workspace_files = _snapshot_tree(
+        Path(workspace),
+        field="workspace",
+        max_files=MAX_WORKSPACE_FILES,
+        max_file_bytes=MAX_WORKSPACE_FILE_BYTES,
+        max_total_bytes=MAX_WORKSPACE_TOTAL_BYTES,
+        skip_dirs=WORKSPACE_SKIP_DIRS,
+    )
+    entrypoint_record = next(
+        item for item in skill_files if item["path"] == safe_entrypoint
+    )
+    payload: dict[str, Any] = {
+        "protocol_version": PROCESS_PROTOCOL_VERSION,
+        "kind": "process_lease",
+        "operation": "open",
+        "request_id": safe_request_id,
+        "op_id": safe_op_id,
+        "owner_scope": owner_scope._protocol_value(),
+        "entrypoint": safe_entrypoint,
+        "argv": safe_args,
+        "invocation": invocation,
+        "cwd": cwd,
+        "idle_ttl_seconds": idle_ttl_seconds,
+        "max_runtime_seconds": max_runtime_seconds,
+        "skill_sha256": _canonical_snapshot_digest(skill_files),
+        "script_sha256": entrypoint_record["sha256"],
+        "skill_files": skill_files,
+        "workspace_files": workspace_files,
+    }
+    return payload, _encode_process_request(payload)
+
+
+def _build_process_operation_request(
+    lease: IsolatedProcessLease,
+    operation: str,
+    *,
+    request_id: str | None = None,
+    op_id: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], bytes]:
+    if not isinstance(lease, IsolatedProcessLease):
+        raise IsolatedSkillExecutorError(
+            "invalid_lease",
+            "A trusted IsolatedProcessLease capability is required.",
+        )
+    if lease.closed and operation != "close":
+        raise IsolatedSkillExecutorError("lease_closed", "The process lease is closed.")
+    try:
+        safe_request_id = str(uuid.UUID(request_id)) if request_id is not None else str(uuid.uuid4())
+        safe_op_id = str(uuid.UUID(op_id)) if op_id is not None else str(uuid.uuid4())
+    except (ValueError, AttributeError) as exc:
+        raise IsolatedSkillExecutorError(
+            "invalid_request_id",
+            "request_id and op_id must be UUID strings.",
+        ) from exc
+    payload: dict[str, Any] = {
+        "protocol_version": PROCESS_PROTOCOL_VERSION,
+        "kind": "process_lease",
+        "operation": operation,
+        "request_id": safe_request_id,
+        "op_id": safe_op_id,
+        "owner_scope": lease._owner_scope._protocol_value(),
+        "lease_handle": lease.handle,
+        "skill_sha256": lease.skill_sha256,
+        "script_sha256": lease.script_sha256,
+    }
+    if extra:
+        overlap = set(payload).intersection(extra)
+        if overlap:
+            raise IsolatedSkillExecutorError(
+                "invalid_process_request",
+                f"Process operation attempted to replace bound fields: {sorted(overlap)!r}.",
+            )
+        payload.update(extra)
+    return payload, _encode_process_request(payload)
+
+
+def build_process_reap_request(
+    *,
+    request_id: str | None = None,
+    op_id: str | None = None,
+) -> tuple[dict[str, Any], bytes]:
+    """Build the authenticated, model-inaccessible startup reap request."""
+
+    try:
+        safe_request_id = (
+            str(uuid.UUID(request_id))
+            if request_id is not None
+            else str(uuid.uuid4())
+        )
+        safe_op_id = (
+            str(uuid.UUID(op_id))
+            if op_id is not None
+            else str(uuid.uuid4())
+        )
+    except (ValueError, AttributeError) as exc:
+        raise IsolatedSkillExecutorError(
+            "invalid_request_id",
+            "request_id and op_id must be UUID strings.",
+        ) from exc
+    payload: dict[str, Any] = {
+        "protocol_version": PROCESS_PROTOCOL_VERSION,
+        "kind": "process_lease",
+        "operation": "reap_all",
+        "request_id": safe_request_id,
+        "op_id": safe_op_id,
+    }
+    return payload, _encode_process_request(payload)
 
 
 def build_declared_command_request(
@@ -956,6 +1583,201 @@ def _decode_artifacts(response: dict[str, Any]) -> list[tuple[str, bytes, dict[s
     return decoded
 
 
+def validate_process_lease_response(
+    response: Any,
+    *,
+    request: dict[str, Any],
+) -> tuple[dict[str, Any], list[tuple[str, bytes, dict[str, Any]]]]:
+    if not isinstance(response, dict):
+        raise IsolatedSkillExecutorError(
+            "invalid_response",
+            "Executor process response must be an object.",
+        )
+    operation = request.get("operation")
+    if (
+        response.get("protocol_version") != PROCESS_PROTOCOL_VERSION
+        or response.get("kind") != "process_lease_result"
+        or response.get("operation") != operation
+        or response.get("request_id") != request.get("request_id")
+        or response.get("network") != "disabled"
+        or "auth_hmac" in response
+    ):
+        raise IsolatedSkillExecutorError(
+            "invalid_response",
+            "Executor process protocol, identity, or isolation policy does not match.",
+        )
+    status = response.get("status")
+    if status not in {"success", "error"}:
+        raise IsolatedSkillExecutorError(
+            "invalid_response",
+            "Executor process response status is invalid.",
+        )
+    if status == "error":
+        if (
+            not isinstance(response.get("error_code"), str)
+            or not isinstance(response.get("error"), str)
+        ):
+            raise IsolatedSkillExecutorError(
+                "invalid_response",
+                "Executor process error is malformed.",
+            )
+        return dict(response), []
+
+    if operation == "reap_all":
+        runtime_profile = response.get("runtime_profile")
+        network_policy = response.get("network_policy")
+        if (
+            runtime_profile not in {"base-v1", "browser-automation-v1"}
+            or not isinstance(network_policy, dict)
+            or set(network_policy) != {"direct", "egress"}
+            or network_policy.get("direct") != "disabled"
+            or network_policy.get("egress") not in {"none", "policy_proxy"}
+            or isinstance(response.get("reaped_leases"), bool)
+            or not isinstance(response.get("reaped_leases"), int)
+            or response["reaped_leases"] < 0
+            or response.get("worker_processes_empty") is not True
+            or response.get("lease_handle") is not None
+            or response.get("artifacts") not in (None, [])
+        ):
+            raise IsolatedSkillExecutorError(
+                "invalid_response",
+                "Executor startup reap receipt is malformed or unconfined.",
+            )
+        return dict(response), []
+
+    handle = response.get("lease_handle")
+    if (
+        not isinstance(handle, str)
+        or len(handle) > 128
+        or re.fullmatch(r"pl2_[A-Za-z0-9_-]+_[0-9a-f]{32}", handle) is None
+        or (
+            operation != "open"
+            and handle != request.get("lease_handle")
+        )
+    ):
+        raise IsolatedSkillExecutorError(
+            "invalid_response",
+            "Executor returned an invalid or mismatched lease handle.",
+        )
+    for field_name in ("scope_digest", "skill_sha256", "script_sha256"):
+        value = response.get(field_name)
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise IsolatedSkillExecutorError(
+                "invalid_response",
+                f"Executor returned an invalid {field_name}.",
+            )
+    if (
+        response.get("skill_sha256") != request.get("skill_sha256")
+        or response.get("script_sha256") != request.get("script_sha256")
+        or response.get("state") not in {
+            "open",
+            "running",
+            "exited",
+            "closing",
+            "closed",
+        }
+    ):
+        raise IsolatedSkillExecutorError(
+            "invalid_response",
+            "Executor process content authority or state does not match.",
+        )
+    runtime_profile = response.get("runtime_profile")
+    network_policy = response.get("network_policy")
+    if (
+        runtime_profile not in {"base-v1", "browser-automation-v1"}
+        or not isinstance(network_policy, dict)
+        or set(network_policy) != {"direct", "egress"}
+        or network_policy.get("direct") != "disabled"
+        or network_policy.get("egress") not in {"none", "policy_proxy"}
+    ):
+        raise IsolatedSkillExecutorError(
+            "invalid_response",
+            "Executor process runtime/network profile receipt is invalid.",
+        )
+    replay = response.get("idempotent_replay")
+    if replay is not None and not isinstance(replay, bool):
+        raise IsolatedSkillExecutorError(
+            "invalid_response",
+            "Executor idempotency receipt must be boolean.",
+        )
+    artifacts = _decode_artifacts(response) if operation in {"sync", "close"} else []
+    if operation not in {"sync", "close"} and response.get("artifacts") not in (None, []):
+        raise IsolatedSkillExecutorError(
+            "invalid_response",
+            "Unexpected artifacts in process operation response.",
+        )
+    if operation in {"sync", "close"}:
+        sync_token = response.get("sync_token")
+        if (
+            not isinstance(sync_token, str)
+            or not 32 <= len(sync_token) <= 128
+            or re.fullmatch(r"[A-Za-z0-9_-]+", sync_token) is None
+            or response.get("sync_pending") is not True
+        ):
+            raise IsolatedSkillExecutorError(
+                "invalid_response",
+                "Executor artifact batch is missing its bounded pending-sync receipt.",
+            )
+    elif operation == "ack":
+        if (
+            response.get("sync_acknowledged") is not True
+            or response.get("acknowledged_operation") not in {"sync", "close"}
+            or response.get("sync_token") is not None
+            or response.get("sync_pending") is not None
+        ):
+            raise IsolatedSkillExecutorError(
+                "invalid_response",
+                "Executor artifact acknowledgement receipt is malformed.",
+            )
+    if operation == "stdin_close":
+        if (
+            response.get("stdin_closed") is not True
+            or not isinstance(response.get("already_closed"), bool)
+        ):
+            raise IsolatedSkillExecutorError(
+                "invalid_response",
+                "Executor stdin-close receipt is malformed.",
+            )
+    if operation == "read":
+        for stream_name in ("stdout", "stderr"):
+            encoded = response.get(f"{stream_name}_b64")
+            if not isinstance(encoded, str):
+                raise IsolatedSkillExecutorError(
+                    "invalid_response",
+                    f"Executor {stream_name} chunk is malformed.",
+                )
+            try:
+                content = base64.b64decode(encoded.encode("ascii"), validate=True)
+            except (UnicodeError, binascii.Error, ValueError) as exc:
+                raise IsolatedSkillExecutorError(
+                    "invalid_response",
+                    f"Executor {stream_name} chunk is invalid base64.",
+                ) from exc
+            if len(content) > MAX_PROCESS_READ_BYTES:
+                raise IsolatedSkillExecutorError(
+                    "invalid_response",
+                    f"Executor {stream_name} chunk exceeds its bound.",
+                )
+            for suffix in ("start_offset", "next_offset", "end_offset"):
+                value = response.get(f"{stream_name}_{suffix}")
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise IsolatedSkillExecutorError(
+                        "invalid_response",
+                        f"Executor {stream_name} offsets are malformed.",
+                    )
+            for suffix in ("data_loss", "truncated", "eof"):
+                if not isinstance(response.get(f"{stream_name}_{suffix}"), bool):
+                    raise IsolatedSkillExecutorError(
+                        "invalid_response",
+                        f"Executor {stream_name} flags are malformed.",
+                    )
+    return dict(response), artifacts
+
+
 def validate_skill_script_response(
     response: Any,
     *,
@@ -1119,9 +1941,19 @@ def validate_runtime_capabilities_response(
         "network",
         "dependency_install",
     }
+    allowed_identity_fields = expected_identity_fields | {
+        "runtime_profile",
+        "network_policy",
+        "display_backend",
+        "headed_browser",
+        "x11",
+        "execution_identity",
+    }
     if (
         not isinstance(identity, dict)
-        or set(identity) != expected_identity_fields
+        or not expected_identity_fields.issubset(identity)
+        or not set(identity).issubset(allowed_identity_fields)
+        or (("runtime_profile" in identity) != ("network_policy" in identity))
         or identity.get("execution_runtime") != "isolated_skill_executor"
         or identity.get("network") != "disabled"
         or identity.get("dependency_install") != "disabled"
@@ -1135,6 +1967,76 @@ def validate_runtime_capabilities_response(
         raise IsolatedSkillExecutorError(
             "invalid_response", "Executor runtime identity is invalid."
         )
+    if "runtime_profile" in identity:
+        network_policy = identity.get("network_policy")
+        runtime_profile = identity.get("runtime_profile")
+        expected_display = (
+            ("wayland-headless", True, False)
+            if runtime_profile == "browser-automation-v1"
+            else ("none", False, False)
+        )
+        if (
+            runtime_profile not in {"base-v1", "browser-automation-v1"}
+            or not isinstance(network_policy, dict)
+            or set(network_policy) != {"direct", "egress"}
+            or network_policy.get("direct") != "disabled"
+            or network_policy.get("egress") not in {"none", "policy_proxy"}
+            or (
+                identity.get("display_backend"),
+                identity.get("headed_browser"),
+                identity.get("x11"),
+            ) != expected_display
+        ):
+            raise IsolatedSkillExecutorError(
+                "invalid_response",
+                "Executor runtime network/profile identity is invalid.",
+            )
+    execution_identity = identity.get("execution_identity")
+    if execution_identity is not None:
+        if (
+            not isinstance(execution_identity, dict)
+            or not {
+                "controller_uid",
+                "controller_gid",
+                "worker_uid",
+                "worker_gid",
+                "uid_isolated",
+                "resource_launcher",
+            }.issubset(execution_identity)
+            or not set(execution_identity).issubset({
+                "controller_uid",
+                "controller_gid",
+                "worker_uid",
+                "worker_gid",
+                "uid_isolated",
+                "resource_launcher",
+                "shared_state_isolated",
+            })
+            or any(
+                isinstance(execution_identity.get(field), bool)
+                or not isinstance(execution_identity.get(field), int)
+                or execution_identity[field] < 0
+                for field in (
+                    "controller_uid",
+                    "controller_gid",
+                    "worker_uid",
+                    "worker_gid",
+                )
+            )
+            or not isinstance(execution_identity.get("uid_isolated"), bool)
+            or execution_identity.get("resource_launcher") != "prlimit"
+            or (
+                "shared_state_isolated" in execution_identity
+                and not isinstance(
+                    execution_identity.get("shared_state_isolated"),
+                    bool,
+                )
+            )
+        ):
+            raise IsolatedSkillExecutorError(
+                "invalid_response",
+                "Executor process-identity attestation is invalid.",
+            )
 
     requirement_results = response.get("requirements")
     expected_requirements = request.get("requirements") or []
@@ -1276,21 +2178,25 @@ def _ensure_safe_parent(root: Path, relative: str) -> Path:
     return current
 
 
-def apply_artifacts_atomically(
+def _apply_artifact_batch_locked(
     workspace: Path,
     artifacts: list[tuple[str, bytes, dict[str, Any]]],
     *,
     baseline: dict[str, tuple[int, str]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Validate all targets, stage all bytes, then atomically replace each file.
-
-    When ``baseline`` is supplied, refuse to overwrite a target that changed
-    after the request snapshot.  This prevents concurrent session workers from
-    silently clobbering one another's artifacts.
-    """
+    """Validate/stage a batch, then atomically replace each individual file."""
 
     root = _verified_directory(Path(workspace), field="workspace")
-    staged: list[tuple[Path, Path, dict[str, Any]]] = []
+    staged: list[
+        tuple[
+            Path,
+            Path,
+            dict[str, Any],
+            tuple[int, str] | None,
+        ]
+    ] = []
+    already_applied: set[str] = set()
+    replaced: set[str] = set()
     try:
         for relative, content, metadata in artifacts:
             parent = _ensure_safe_parent(root, relative)
@@ -1312,6 +2218,27 @@ def apply_artifacts_atomically(
                     "unsafe_workspace_path",
                     f"Artifact target must be an independent regular file: {relative}",
                 )
+            current_identity: tuple[int, str] | None = None
+            if target_stat is not None:
+                current = _read_snapshot_file(
+                    target,
+                    display_path=relative,
+                    max_file_bytes=MAX_WORKSPACE_FILE_BYTES,
+                )
+                current_identity = (
+                    len(current),
+                    hashlib.sha256(current).hexdigest(),
+                )
+            desired_identity = (
+                metadata["size_bytes"],
+                metadata["sha256"],
+            )
+            # A previous attempt may have atomically replaced an earlier file
+            # before a later replace failed. Recognize that exact content as
+            # an idempotently applied member of the same authenticated batch.
+            if current_identity == desired_identity:
+                already_applied.add(relative)
+                continue
             if baseline is not None:
                 expected = baseline.get(relative)
                 change = metadata.get("change")
@@ -1327,12 +2254,6 @@ def apply_artifacts_atomically(
                             "workspace_concurrent_modification",
                             f"Workspace target disappeared after the execution snapshot: {relative}",
                         )
-                    current = _read_snapshot_file(
-                        target,
-                        display_path=relative,
-                        max_file_bytes=MAX_WORKSPACE_FILE_BYTES,
-                    )
-                    current_identity = (len(current), hashlib.sha256(current).hexdigest())
                     if current_identity != expected:
                         raise IsolatedSkillExecutorError(
                             "workspace_concurrent_modification",
@@ -1351,16 +2272,67 @@ def apply_artifacts_atomically(
             except Exception:
                 temporary.unlink(missing_ok=True)
                 raise
-            staged.append((temporary, target, metadata))
+            staged.append((temporary, target, metadata, current_identity))
 
         applied: list[dict[str, Any]] = []
-        for temporary, target, metadata in staged:
+        # Staging can involve several bounded files. Re-check the complete
+        # target cohort immediately before the first replace so a
+        # non-cooperating writer cannot slip between the initial CAS and
+        # commit while bytes are being fsynced.
+        for _, target, metadata, validated_identity in staged:
+            relative = metadata["path"]
+            parent = _ensure_safe_parent(root, relative)
+            current_target = parent / relative.split("/")[-1]
+            if current_target != target:
+                raise IsolatedSkillExecutorError(
+                    "workspace_concurrent_modification",
+                    f"Workspace target path changed before artifact apply: {relative}",
+                )
+            try:
+                target_stat = target.lstat()
+            except FileNotFoundError:
+                current_identity = None
+            except OSError as exc:
+                raise IsolatedSkillExecutorError(
+                    "artifact_apply_failed",
+                    f"Cannot re-inspect artifact target: {relative}",
+                ) from exc
+            else:
+                if (
+                    stat.S_ISLNK(target_stat.st_mode)
+                    or not stat.S_ISREG(target_stat.st_mode)
+                    or target_stat.st_nlink != 1
+                ):
+                    raise IsolatedSkillExecutorError(
+                        "unsafe_workspace_path",
+                        f"Artifact target must remain an independent regular file: {relative}",
+                    )
+                current = _read_snapshot_file(
+                    target,
+                    display_path=relative,
+                    max_file_bytes=MAX_WORKSPACE_FILE_BYTES,
+                )
+                current_identity = (
+                    len(current),
+                    hashlib.sha256(current).hexdigest(),
+                )
+            if current_identity != validated_identity:
+                raise IsolatedSkillExecutorError(
+                    "workspace_concurrent_modification",
+                    f"Workspace target changed during artifact staging: {relative}",
+                )
+
+        for temporary, target, metadata, _ in staged:
             try:
                 os.replace(temporary, target)
             except OSError as exc:
                 raise IsolatedSkillExecutorError(
                     "artifact_apply_failed", f"Cannot atomically apply artifact: {metadata['path']}"
                 ) from exc
+            replaced.add(metadata["path"])
+        for _, _, metadata in artifacts:
+            if metadata["path"] not in already_applied | replaced:
+                continue
             applied.append({
                 "kind": "file",
                 "path": metadata["path"],
@@ -1371,8 +2343,590 @@ def apply_artifacts_atomically(
             })
         return applied
     finally:
-        for temporary, _, _ in staged:
+        for temporary, _, _, _ in staged:
             temporary.unlink(missing_ok=True)
+
+
+def apply_artifacts_atomically(
+    workspace: Path,
+    artifacts: list[tuple[str, bytes, dict[str, Any]]],
+    *,
+    baseline: dict[str, tuple[int, str]] | None = None,
+) -> list[dict[str, Any]]:
+    """CAS-apply a recoverable artifact batch under the workspace lock.
+
+    When ``baseline`` is supplied, a changed target is rejected. All targets
+    are validated and staged before the first replace. Individual file
+    replacements are atomic; a multi-file batch is deliberately recoverable
+    and idempotent rather than falsely represented as one filesystem
+    transaction. An exact retry recognizes already-applied desired bytes and
+    completes the authenticated batch.
+
+    The historical function name is retained for compatibility and refers to
+    atomic file replacement, not all-or-none batch commit.
+    """
+
+    root = _verified_directory(Path(workspace), field="workspace")
+    with workspace_mutation_guard(root):
+        return _apply_artifact_batch_locked(
+            root,
+            artifacts,
+            baseline=baseline,
+        )
+
+
+async def _exchange_process_request(
+    payload: dict[str, Any],
+    encoded: bytes,
+    *,
+    socket_path: str,
+    timeout: float,
+) -> tuple[dict[str, Any], list[tuple[str, bytes, dict[str, Any]]]]:
+    last_transport_error: BaseException | None = None
+    # One bounded transparent transport retry is safe because the exact same
+    # signed request, request_id, and op_id bytes are replayed. The executor
+    # serializes the lease and returns its cached operation result instead of
+    # dispatching a write/signal/call twice.
+    for attempt in range(2):
+        writer: asyncio.StreamWriter | None = None
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_unix_connection(
+                    socket_path,
+                    limit=MAX_RESPONSE_BYTES + 1,
+                ),
+                timeout=3,
+            )
+            writer.write(encoded)
+            await writer.drain()
+            raw = await asyncio.wait_for(reader.readline(), timeout=timeout)
+            if not raw:
+                raise IsolatedSkillExecutorError(
+                    "executor_unavailable",
+                    "Executor closed the process socket without a response.",
+                )
+            if len(raw) > MAX_RESPONSE_BYTES or not raw.endswith(b"\n"):
+                raise IsolatedSkillExecutorError(
+                    "invalid_response",
+                    "Executor process response exceeds the bounded line protocol.",
+                )
+            try:
+                response = json.loads(raw.decode("utf-8"))
+            except (UnicodeError, json.JSONDecodeError) as exc:
+                raise IsolatedSkillExecutorError(
+                    "invalid_response",
+                    "Executor process response is invalid JSON.",
+                ) from exc
+            return validate_process_lease_response(response, request=payload)
+        except IsolatedSkillExecutorError as exc:
+            if exc.code != "executor_unavailable" or attempt:
+                raise
+            last_transport_error = exc
+        except (OSError, asyncio.TimeoutError, ValueError) as exc:
+            last_transport_error = exc
+            if attempt:
+                break
+        finally:
+            if writer is not None:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except (OSError, ConnectionError):
+                    pass
+    exc = last_transport_error
+    raise IsolatedSkillExecutorError(
+        "executor_unavailable",
+        "The isolated process executor remained unavailable after one "
+        f"idempotent transport retry ({type(exc).__name__ if exc is not None else 'unknown'}).",
+    ) from exc
+
+
+def _require_process_success(response: dict[str, Any]) -> dict[str, Any]:
+    if response.get("status") == "success":
+        return response
+    raise IsolatedSkillExecutorError(
+        str(response.get("error_code") or "process_error"),
+        str(response.get("error") or "Persistent process operation failed."),
+    )
+
+
+async def open_isolated_process_lease(
+    *,
+    owner_scope: ProcessOwnerScope,
+    skill_root: Path,
+    workspace: Path,
+    entrypoint: str,
+    args: list[str] | None = None,
+    cwd: str = "workspace",
+    idle_ttl_seconds: int = 300,
+    max_runtime_seconds: int = MAX_PROCESS_RUNTIME_SECONDS,
+    class_name: str | None = None,
+    factory_name: str | None = None,
+    constructor_args: list[Any] | None = None,
+    constructor_kwargs: dict[str, Any] | None = None,
+    socket_path: str = EXECUTOR_SOCKET,
+    op_id: str | None = None,
+    skill_snapshot: SkillPackageSnapshot | None = None,
+) -> tuple[IsolatedProcessLease, dict[str, Any]]:
+    payload, encoded = build_process_lease_open_request(
+        owner_scope=owner_scope,
+        skill_root=skill_root,
+        workspace=workspace,
+        entrypoint=entrypoint,
+        args=args,
+        cwd=cwd,
+        idle_ttl_seconds=idle_ttl_seconds,
+        max_runtime_seconds=max_runtime_seconds,
+        class_name=class_name,
+        factory_name=factory_name,
+        constructor_args=constructor_args,
+        constructor_kwargs=constructor_kwargs,
+        op_id=op_id,
+        skill_snapshot=skill_snapshot,
+    )
+    response, _ = await _exchange_process_request(
+        payload,
+        encoded,
+        socket_path=socket_path,
+        timeout=10,
+    )
+    _require_process_success(response)
+    baseline = {
+        item["path"]: (item["size_bytes"], item["sha256"])
+        for item in payload["workspace_files"]
+    }
+    invocation = payload["invocation"]
+    lease = IsolatedProcessLease(
+        handle=response["lease_handle"],
+        skill_sha256=payload["skill_sha256"],
+        script_sha256=payload["script_sha256"],
+        entrypoint=payload["entrypoint"],
+        invocation_mode=invocation["mode"],
+        class_name=invocation.get("class_name"),
+        factory_name=invocation.get("factory_name"),
+        _owner_scope=owner_scope,
+        _workspace=Path(workspace),
+        _socket_path=socket_path,
+        _baseline=baseline,
+    )
+    return lease, response
+
+
+async def reap_isolated_executor_leases(
+    *,
+    socket_path: str = EXECUTOR_SOCKET,
+    op_id: str | None = None,
+) -> dict[str, Any]:
+    """Reap orphan leases before a replacement Harness begins serving."""
+
+    payload, encoded = build_process_reap_request(op_id=op_id)
+    response, _ = await _exchange_process_request(
+        payload,
+        encoded,
+        socket_path=socket_path,
+        timeout=15,
+    )
+    return _require_process_success(response)
+
+
+async def _execute_process_operation(
+    lease: IsolatedProcessLease,
+    operation: str,
+    *,
+    op_id: str | None = None,
+    extra: dict[str, Any] | None = None,
+    timeout: float = 10,
+) -> tuple[dict[str, Any], list[tuple[str, bytes, dict[str, Any]]]]:
+    payload, encoded = _build_process_operation_request(
+        lease,
+        operation,
+        op_id=op_id,
+        extra=extra,
+    )
+    response, artifacts = await _exchange_process_request(
+        payload,
+        encoded,
+        socket_path=lease._socket_path,
+        timeout=timeout,
+    )
+    _require_process_success(response)
+    return response, artifacts
+
+
+async def start_isolated_process_lease(
+    lease: IsolatedProcessLease,
+    *,
+    op_id: str | None = None,
+) -> dict[str, Any]:
+    response, _ = await _execute_process_operation(lease, "start", op_id=op_id)
+    return response
+
+
+async def write_isolated_process_stdin(
+    lease: IsolatedProcessLease,
+    data: bytes | str,
+    *,
+    op_id: str | None = None,
+) -> dict[str, Any]:
+    if isinstance(data, str):
+        try:
+            content = data.encode("utf-8", errors="strict")
+        except UnicodeError as exc:
+            raise IsolatedSkillExecutorError(
+                "invalid_stdin",
+                "stdin text must be valid UTF-8.",
+            ) from exc
+    elif isinstance(data, bytes):
+        content = data
+    else:
+        raise IsolatedSkillExecutorError(
+            "invalid_stdin",
+            "stdin data must be bytes or text.",
+        )
+    if not content or len(content) > MAX_PROCESS_STDIN_CHUNK_BYTES:
+        raise IsolatedSkillExecutorError(
+            "invalid_stdin",
+            f"stdin data must contain 1 to {MAX_PROCESS_STDIN_CHUNK_BYTES} bytes.",
+        )
+    response, _ = await _execute_process_operation(
+        lease,
+        "write",
+        op_id=op_id,
+        extra={"stdin_b64": base64.b64encode(content).decode("ascii")},
+    )
+    return response
+
+
+async def close_isolated_process_stdin(
+    lease: IsolatedProcessLease,
+    *,
+    op_id: str | None = None,
+) -> dict[str, Any]:
+    """Deliver EOF without terminating the leased process."""
+
+    if lease.invocation_mode != "cli":
+        raise IsolatedSkillExecutorError(
+            "invalid_invocation",
+            "Explicit stdin EOF is available only for CLI process leases.",
+        )
+    response, _ = await _execute_process_operation(
+        lease,
+        "stdin_close",
+        op_id=op_id,
+    )
+    return response
+
+
+async def call_isolated_process_instance(
+    lease: IsolatedProcessLease,
+    *,
+    method_name: str,
+    method_args: list[Any] | None = None,
+    method_kwargs: dict[str, Any] | None = None,
+    op_id: str | None = None,
+) -> dict[str, Any]:
+    if lease.invocation_mode not in {"instance", "factory"}:
+        raise IsolatedSkillExecutorError(
+            "invalid_invocation",
+            "Structured calls require a persistent public-object lease.",
+        )
+    if (
+        not isinstance(method_name, str)
+        or method_name.startswith("_")
+        or PUBLIC_FUNCTION_RE.fullmatch(method_name) is None
+    ):
+        raise IsolatedSkillExecutorError(
+            "invalid_function_call",
+            "method_name must be one public, non-dotted Python identifier.",
+        )
+    positional = [] if method_args is None else method_args
+    keywords = {} if method_kwargs is None else method_kwargs
+    if not isinstance(positional, list) or len(positional) > MAX_FUNCTION_ARGS:
+        raise IsolatedSkillExecutorError(
+            "invalid_function_call",
+            f"method_args must contain at most {MAX_FUNCTION_ARGS} JSON values.",
+        )
+    if not isinstance(keywords, dict) or len(keywords) > MAX_FUNCTION_KWARGS:
+        raise IsolatedSkillExecutorError(
+            "invalid_function_call",
+            f"method_kwargs must contain at most {MAX_FUNCTION_KWARGS} JSON values.",
+        )
+    for key in keywords:
+        if (
+            not isinstance(key, str)
+            or key.startswith("_")
+            or PUBLIC_FUNCTION_RE.fullmatch(key) is None
+        ):
+            raise IsolatedSkillExecutorError(
+                "invalid_function_call",
+                "method_kwargs keys must be public Python identifiers.",
+            )
+    _validate_function_json(positional, field="method_args")
+    _validate_function_json(keywords, field="method_kwargs")
+    try:
+        encoded = json.dumps(
+            {"args": positional, "kwargs": keywords},
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise IsolatedSkillExecutorError(
+            "invalid_function_call",
+            "Method arguments must be finite valid JSON.",
+        ) from exc
+    if len(encoded) > MAX_PROCESS_CALL_BYTES:
+        raise IsolatedSkillExecutorError(
+            "invalid_function_call",
+            "Method call JSON exceeds the atomic process-call byte limit.",
+        )
+    response, _ = await _execute_process_operation(
+        lease,
+        "call",
+        op_id=op_id,
+        extra={
+            "method_name": method_name,
+            "method_args": positional,
+            "method_kwargs": keywords,
+        },
+    )
+    return response
+
+
+async def read_isolated_process_output(
+    lease: IsolatedProcessLease,
+    *,
+    stdout_offset: int = 0,
+    stderr_offset: int = 0,
+    max_bytes: int = MAX_PROCESS_READ_BYTES,
+    wait_ms: int = 0,
+    op_id: str | None = None,
+) -> dict[str, Any]:
+    for field_name, value in (
+        ("stdout_offset", stdout_offset),
+        ("stderr_offset", stderr_offset),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise IsolatedSkillExecutorError(
+                "invalid_stream_offset",
+                f"{field_name} must be a non-negative integer.",
+            )
+    if (
+        isinstance(max_bytes, bool)
+        or not isinstance(max_bytes, int)
+        or not 1 <= max_bytes <= MAX_PROCESS_READ_BYTES
+    ):
+        raise IsolatedSkillExecutorError(
+            "invalid_read_limit",
+            f"max_bytes must be between 1 and {MAX_PROCESS_READ_BYTES}.",
+        )
+    if (
+        isinstance(wait_ms, bool)
+        or not isinstance(wait_ms, int)
+        or not 0 <= wait_ms <= MAX_PROCESS_READ_WAIT_MS
+    ):
+        raise IsolatedSkillExecutorError(
+            "invalid_read_wait",
+            f"wait_ms must be between 0 and {MAX_PROCESS_READ_WAIT_MS}.",
+        )
+    response, _ = await _execute_process_operation(
+        lease,
+        "read",
+        op_id=op_id,
+        extra={
+            "stdout_offset": stdout_offset,
+            "stderr_offset": stderr_offset,
+            "max_bytes": max_bytes,
+            "wait_ms": wait_ms,
+        },
+        timeout=wait_ms / 1_000 + 10,
+    )
+    result = dict(response)
+    for stream_name in ("stdout", "stderr"):
+        result[f"{stream_name}_bytes"] = base64.b64decode(
+            response[f"{stream_name}_b64"].encode("ascii"),
+            validate=True,
+        )
+    return result
+
+
+def _apply_process_artifacts(
+    lease: IsolatedProcessLease,
+    response: dict[str, Any],
+    artifacts: list[tuple[str, bytes, dict[str, Any]]],
+) -> dict[str, Any]:
+    applied = apply_artifacts_atomically(
+        lease._workspace,
+        artifacts,
+        baseline=lease._baseline,
+    ) if artifacts else []
+    for _, _, metadata in artifacts:
+        lease._baseline[metadata["path"]] = (
+            metadata["size_bytes"],
+            metadata["sha256"],
+        )
+    result = dict(response)
+    result["artifacts"] = applied
+    result["workspace_applied"] = True
+    return result
+
+
+async def _prepare_pending_process_sync(
+    lease: IsolatedProcessLease,
+    *,
+    operation: str,
+    op_id: str | None,
+) -> None:
+    if lease._pending_sync_operation is None:
+        try:
+            prepare_op_id = (
+                str(uuid.UUID(op_id))
+                if op_id is not None
+                else str(uuid.uuid4())
+            )
+        except (ValueError, AttributeError) as exc:
+            raise IsolatedSkillExecutorError(
+                "invalid_request_id",
+                "op_id must be a UUID string.",
+            ) from exc
+        lease._pending_sync_operation = operation
+        lease._pending_sync_prepare_op_id = prepare_op_id
+        lease._pending_sync_ack_op_id = str(uuid.uuid4())
+    elif lease._pending_sync_operation != operation:
+        raise IsolatedSkillExecutorError(
+            "sync_ack_required",
+            "A previous artifact batch is still pending local apply/ack.",
+        )
+    if lease._pending_sync_response is not None:
+        return
+    prepare_op_id = lease._pending_sync_prepare_op_id
+    if prepare_op_id is None:
+        raise IsolatedSkillExecutorError(
+            "invalid_lease_state",
+            "The pending artifact prepare operation lost its idempotency identity.",
+        )
+    # Retain prepare_op_id before transport. If both exact transport attempts
+    # lose their responses after server dispatch, a later lifecycle retry
+    # replays the same operation and recovers the cached sync token.
+    response, artifacts = await _execute_process_operation(
+        lease,
+        operation,
+        op_id=prepare_op_id,
+    )
+    lease._pending_sync_response = dict(response)
+    lease._pending_sync_artifacts = artifacts
+    lease._pending_sync_applied = None
+
+
+async def _finish_pending_process_sync(
+    lease: IsolatedProcessLease,
+) -> dict[str, Any]:
+    operation = lease._pending_sync_operation
+    response = lease._pending_sync_response
+    artifacts = lease._pending_sync_artifacts
+    ack_op_id = lease._pending_sync_ack_op_id
+    if (
+        operation not in {"sync", "close"}
+        or response is None
+        or artifacts is None
+        or ack_op_id is None
+    ):
+        raise IsolatedSkillExecutorError(
+            "invalid_lease_state",
+            "The pending artifact transaction is incomplete.",
+        )
+
+    if lease._pending_sync_applied is None:
+        applied_result = _apply_process_artifacts(lease, response, artifacts)
+        lease._pending_sync_applied = list(applied_result["artifacts"])
+
+    ack_response, _ = await _execute_process_operation(
+        lease,
+        "ack",
+        op_id=ack_op_id,
+        extra={"sync_token": response["sync_token"]},
+    )
+    result = dict(response)
+    result.pop("sync_token", None)
+    result["artifacts"] = list(lease._pending_sync_applied)
+    result["workspace_applied"] = True
+    result["sync_pending"] = False
+    result["sync_acknowledged"] = True
+    result["acknowledged_operation"] = ack_response["acknowledged_operation"]
+    result["state"] = ack_response["state"]
+
+    lease._pending_sync_operation = None
+    lease._pending_sync_prepare_op_id = None
+    lease._pending_sync_response = None
+    lease._pending_sync_artifacts = None
+    lease._pending_sync_ack_op_id = None
+    lease._pending_sync_applied = None
+    if operation == "close":
+        lease.closed = True
+    return result
+
+
+async def sync_isolated_process_artifacts(
+    lease: IsolatedProcessLease,
+    *,
+    op_id: str | None = None,
+) -> dict[str, Any]:
+    if lease._pending_sync_operation == "close":
+        raise IsolatedSkillExecutorError(
+            "lease_closing",
+            "The process lease has a pending close transaction.",
+        )
+    await _prepare_pending_process_sync(
+        lease,
+        operation="sync",
+        op_id=op_id,
+    )
+    return await _finish_pending_process_sync(lease)
+
+
+async def signal_isolated_process(
+    lease: IsolatedProcessLease,
+    selected_signal: str,
+    *,
+    op_id: str | None = None,
+) -> dict[str, Any]:
+    if selected_signal not in {"interrupt", "terminate", "kill"}:
+        raise IsolatedSkillExecutorError(
+            "invalid_signal",
+            "selected_signal must be interrupt, terminate, or kill.",
+        )
+    response, _ = await _execute_process_operation(
+        lease,
+        "signal",
+        op_id=op_id,
+        extra={"signal": selected_signal},
+    )
+    return response
+
+
+async def close_isolated_process_lease(
+    lease: IsolatedProcessLease,
+    *,
+    op_id: str | None = None,
+) -> dict[str, Any]:
+    if lease.closed:
+        raise IsolatedSkillExecutorError(
+            "lease_closed",
+            "The process lease is already closed.",
+        )
+    if lease._pending_sync_operation == "sync":
+        await _prepare_pending_process_sync(
+            lease,
+            operation="sync",
+            op_id=None,
+        )
+        await _finish_pending_process_sync(lease)
+    await _prepare_pending_process_sync(
+        lease,
+        operation="close",
+        op_id=op_id,
+    )
+    return await _finish_pending_process_sync(lease)
 
 
 def probe_isolated_runtime_capabilities(
@@ -1454,6 +3008,7 @@ async def execute_isolated_skill_script(
     constructor_kwargs: dict[str, Any] | None = None,
     method_args: list[Any] | None = None,
     method_kwargs: dict[str, Any] | None = None,
+    expected_skill_sha256: str | None = None,
     socket_path: str = EXECUTOR_SOCKET,
     apply_artifacts: bool = True,
 ) -> dict[str, Any]:
@@ -1475,6 +3030,7 @@ async def execute_isolated_skill_script(
         constructor_kwargs=constructor_kwargs,
         method_args=method_args,
         method_kwargs=method_kwargs,
+        expected_skill_sha256=expected_skill_sha256,
     )
     writer: asyncio.StreamWriter | None = None
     try:

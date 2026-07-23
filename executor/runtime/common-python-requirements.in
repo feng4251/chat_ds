@@ -1,0 +1,25 @@
+# Common dependency surface for exact Skill Python entrypoints.
+#
+# The base executor installs this manifest directly. Specialized immutable
+# profiles must resolve this complete set into their own hash-checked lock and
+# tests enforce that the set cannot silently drift.
+packaging==25.0
+numpy
+scipy
+pandas
+matplotlib
+scikit-learn
+sympy
+networkx
+Pillow
+PyYAML
+requests
+httpx
+statsmodels
+pypdf
+pdfplumber
+reportlab
+python-docx
+python-pptx
+openpyxl
+xlsxwriter

@@ -32,7 +32,11 @@ from tools.omission_guard import (
     contains_compacted_history_omission,
 )
 from tools.path_security import sandbox_dir, validate_path
-from tools.skill_script import SkillScriptError, _resolve_session_skill_script
+from tools.skill_script import (
+    SkillScriptError,
+    _expected_skill_package_sha256,
+    _resolve_session_skill_script,
+)
 
 DEFAULT_TIMEOUT = 120
 MAX_TIMEOUT = 300
@@ -190,6 +194,7 @@ async def run_skill_python(
     user_id: str = "default",
     session_id: str = "default",
     enabled_user_skills: list[str] | None = None,
+    context: ToolContext | None = None,
 ) -> str:
     invocation_mode = _requested_invocation_mode(
         function_name=function_name,
@@ -249,6 +254,10 @@ async def run_skill_python(
             user_id,
             session_id,
             enabled_user_skills,
+        )
+        expected_skill_sha256 = _expected_skill_package_sha256(
+            context,
+            skill_name,
         )
         if script.suffix != ".py":
             raise ValueError("script_path must point to a .py file.")
@@ -422,6 +431,11 @@ async def run_skill_python(
             constructor_kwargs=(instance_payload or {}).get("constructor_kwargs"),
             method_args=(instance_payload or {}).get("method_args"),
             method_kwargs=(instance_payload or {}).get("method_kwargs"),
+            **(
+                {"expected_skill_sha256": expected_skill_sha256}
+                if expected_skill_sha256 is not None
+                else {}
+            ),
         )
     except IsolatedSkillExecutorError as exc:
         return json.dumps({

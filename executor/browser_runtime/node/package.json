@@ -1,0 +1,12 @@
+{
+  "name": "chatds-browser-runtime-node",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned Node dependencies for the ChatDS browser automation worker.",
+  "engines": {
+    "node": "22.18.0"
+  },
+  "dependencies": {
+    "playwright": "1.61.0"
+  }
+}

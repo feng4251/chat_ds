@@ -40,6 +40,75 @@ def _terminal(event_type: str, run_id: str, seq: int) -> dict:
     }
 
 
+class ChatStreamFailureClassificationTests(unittest.TestCase):
+    def test_child_and_provisional_failures_do_not_override_root_success(self):
+        child_failed = _terminal("run.failed", "child", 90)
+        child_failed["payload"].update({
+            "error": "child output contract failed",
+            "authoritative": True,
+        })
+        provisional_root_failed = _terminal("run.failed", "root", 1)
+        provisional_root_failed["payload"].update({
+            "error": "provisional convergence failure",
+            "authoritative": False,
+        })
+        root_completed = _terminal("run.completed", "root", 2)
+        root_completed["payload"]["authoritative"] = True
+        events = [child_failed, provisional_root_failed, root_completed]
+
+        self.assertEqual(
+            ("succeeded", None),
+            chat_router._agent_event_terminal_status(events, run_id="root"),
+        )
+        self.assertEqual(
+            (None, False),
+            chat_router._reconcile_root_stream_error(
+                events,
+                run_id="root",
+                stream_error="late socket close",
+            ),
+        )
+
+    def test_execution_failure_and_stream_interruption_have_distinct_notices(self):
+        root_failed = _terminal("run.failed", "root", 1)
+        root_failed["payload"].update({
+            "error": "root verifier exhausted",
+            "authoritative": True,
+        })
+        error, execution_failed = chat_router._reconcile_root_stream_error(
+            [root_failed],
+            run_id="root",
+            stream_error="transport symptom",
+        )
+        execution_notice = chat_router._chat_stream_failure_notice(
+            error or "",
+            execution_failed=execution_failed,
+            has_partial_content=True,
+        )
+        self.assertIn("本次任务执行失败", execution_notice)
+        self.assertNotIn("流式输出过程中中断", execution_notice)
+        self.assertIn("root verifier exhausted", execution_notice)
+
+        error, execution_failed = chat_router._reconcile_root_stream_error(
+            [],
+            run_id="root",
+            stream_error="Harness 服务响应超时。",
+        )
+        stream_notice = chat_router._chat_stream_failure_notice(
+            error or "",
+            execution_failed=execution_failed,
+            has_partial_content=True,
+        )
+        self.assertIn("流式输出过程中中断", stream_notice)
+        self.assertNotIn("本次任务执行失败", stream_notice)
+
+    def test_default_backend_timeout_exceeds_harness_provider_deadline(self):
+        self.assertGreater(
+            chat_router.settings.harness_stream_timeout_seconds,
+            2400,
+        )
+
+
 class ChatCancellationProjectionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -132,6 +201,7 @@ class ChatCancellationProjectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_explicit_sse_close_closes_harness_stream_and_marks_root_cancelled(self):
         harness_stream_closed = False
         persisted_calls: list[dict] = []
+        observed_client_timeout = None
 
         class FakeHarnessResponse:
             status_code = 200
@@ -170,7 +240,8 @@ class ChatCancellationProjectionTests(unittest.IsolatedAsyncioTestCase):
 
         class FakeClient:
             def __init__(self, *args, **kwargs):
-                pass
+                nonlocal observed_client_timeout
+                observed_client_timeout = kwargs.get("timeout")
 
             async def __aenter__(self):
                 return self
@@ -228,6 +299,10 @@ class ChatCancellationProjectionTests(unittest.IsolatedAsyncioTestCase):
                 await iterator.aclose()
 
         self.assertTrue(harness_stream_closed)
+        self.assertEqual(
+            observed_client_timeout,
+            chat_router.settings.harness_stream_timeout_seconds,
+        )
         self.assertEqual(len(persisted_calls), 1)
         persisted = persisted_calls[0]
         root_run_id = persisted["run_id"]

@@ -1,0 +1,111 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "browser executor controller must start as root" >&2
+  exit 78
+fi
+case "${EXECUTOR_WORKER_UID:-}" in
+  ""|0)
+    echo "browser executor requires a distinct non-root worker UID" >&2
+    exit 78
+    ;;
+esac
+
+bridge_pid=""
+server_pid=""
+readiness_root=""
+
+cleanup() {
+  trap - EXIT
+  for pid in "${server_pid}" "${bridge_pid}"; do
+    if [ -n "${pid}" ]; then
+      kill -TERM "${pid}" 2>/dev/null || true
+    fi
+  done
+  if [ -n "${readiness_root}" ]; then
+    rm -rf -- "${readiness_root}"
+  fi
+  for pid in "${server_pid}" "${bridge_pid}"; do
+    if [ -n "${pid}" ]; then
+      wait "${pid}" 2>/dev/null || true
+    fi
+  done
+}
+trap cleanup EXIT
+trap 'exit 143' HUP INT TERM
+
+attempt=0
+while [ ! -S "/run/chatds-skill-egress/proxy.sock" ]; do
+  attempt=$((attempt + 1))
+  if [ "${attempt}" -ge 200 ]; then
+    echo "fixed policy-proxy socket did not become ready" >&2
+    exit 70
+  fi
+  sleep 0.05
+done
+
+/usr/local/bin/chatds-skill-egress-bridge &
+bridge_pid=$!
+
+attempt=0
+while ! /usr/local/bin/python -I -c \
+  'import socket; socket.create_connection(("127.0.0.1", 18080), 0.2).close()' \
+  >/dev/null 2>&1; do
+  if ! kill -0 "${bridge_pid}" 2>/dev/null; then
+    echo "controller proxy bridge exited before becoming ready" >&2
+    exit 70
+  fi
+  attempt=$((attempt + 1))
+  if [ "${attempt}" -ge 100 ]; then
+    echo "controller proxy bridge did not become ready" >&2
+    exit 70
+  fi
+  sleep 0.05
+done
+
+# Gate controller readiness on all three real headed browser clients. Each
+# launcher owns a short-lived Weston compositor and private Wayland socket
+# under the untrusted worker UID.
+readiness_root="$(mktemp -d /tmp/chatds-browser-readiness.XXXXXX)"
+install -d \
+  -o "${EXECUTOR_WORKER_UID}" \
+  -g "${EXECUTOR_WORKER_GID:-${EXECUTOR_WORKER_UID}}" \
+  -m 0700 \
+  "${readiness_root}/home" \
+  "${readiness_root}/tmp"
+chown \
+  "${EXECUTOR_WORKER_UID}:${EXECUTOR_WORKER_GID:-${EXECUTOR_WORKER_UID}}" \
+  "${readiness_root}"
+chmod 0700 "${readiness_root}"
+/usr/bin/setpriv \
+  --reuid="${EXECUTOR_WORKER_UID}" \
+  --regid="${EXECUTOR_WORKER_GID:-${EXECUTOR_WORKER_UID}}" \
+  --clear-groups \
+  --no-new-privs \
+  -- /usr/bin/env \
+  HOME="${readiness_root}/home" \
+  TMPDIR="${readiness_root}/tmp" \
+  /usr/local/bin/chatds-browser-runtime-health --browser-smoke
+rm -rf -- "${readiness_root}"
+readiness_root=""
+
+/usr/local/bin/python -I /app/server.py &
+server_pid=$!
+
+while
+  kill -0 "${server_pid}" 2>/dev/null &&
+  kill -0 "${bridge_pid}" 2>/dev/null
+do
+  sleep 1
+done
+
+if ! kill -0 "${server_pid}" 2>/dev/null; then
+  set +e
+  wait "${server_pid}"
+  status=$?
+  set -e
+  exit "${status}"
+fi
+echo "browser executor controller dependency exited unexpectedly" >&2
+exit 70

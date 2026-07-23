@@ -159,6 +159,9 @@ def _provider_payload(model_id: str, config: dict) -> dict:
         "protocol": config.get("protocol", "openai"),
         "is_multimodal": config.get("is_multimodal", False),
         "context_length": config.get("context_length", 262144),
+        "discover_runtime_metadata": bool(
+            config.get("discover_runtime_metadata", False)
+        ),
         "agentic_auxiliary_only": config.get(
             "agentic_auxiliary_only", False
         ),
@@ -202,8 +205,17 @@ async def _resolve_job_model(
         "protocol": "anthropic" if custom.provider == "anthropic" else "openai",
         "is_multimodal": custom.is_multimodal,
         "context_length": 128000,
+        "discover_runtime_metadata": True,
         "extra_headers": extra_headers,
     }
+
+
+def _harness_client() -> httpx.AsyncClient:
+    """Create the scheduler client with the shared long-run Harness deadline."""
+
+    return httpx.AsyncClient(
+        timeout=settings.harness_stream_timeout_seconds
+    )
 
 
 async def execute_job(job_id: str, *, force: bool = False) -> None:
@@ -336,7 +348,7 @@ async def execute_job(job_id: str, *, force: bool = False) -> None:
         resolved_model = model_id
         error = None
         try:
-            async with httpx.AsyncClient(timeout=900) as client:
+            async with _harness_client() as client:
                 response = await client.post(
                     f"{settings.harness_url}/v1/chat/completions",
                     headers={

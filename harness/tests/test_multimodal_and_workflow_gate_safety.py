@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import unittest
@@ -32,6 +33,7 @@ from agent_loop import (
     _looks_like_complex_artifact_request,
     _looks_like_file_artifact_request,
     _preferred_initial_required_capability_tools,
+    _profile_bound_child_runner_kwargs,
     _retry_max_tokens_from_context_overflow,
     _should_recover_tool_failure,
     _skill_documentation_tool_exposure,
@@ -42,6 +44,11 @@ from agent_loop import (
     _workflow_gate_tool_policy,
     run_stream,
 )
+from tools.context import ToolContext
+from tools.registry import delegated_resource_boundary_error
+from tools.skill_runtime_profile import (
+    compile_skill_runtime_profile_manifest,
+)
 from context.compressor import ContextCompressor, _estimate_messages_tokens
 from config import (
     DEFAULT_AGENT_MODEL_ID,
@@ -49,6 +56,7 @@ from config import (
     canonical_provider_id,
 )
 from prompt.builder import IMAGE_SKILL_MCP_GUIDANCE, SESSION_SKILL_USAGE_GUIDANCE
+from tools.web_extract import web_extract
 
 
 class MultimodalTokenSafetyTests(unittest.TestCase):
@@ -229,6 +237,31 @@ class MultimodalTokenSafetyTests(unittest.TestCase):
         adjusted, budget = _retry_max_tokens_from_context_overflow(reducible, 8192)
         self.assertEqual(adjusted, 976)
         self.assertEqual(budget["effective_max_tokens"], 976)
+
+    def test_vllm_max_total_tokens_error_adapts_stale_model_capacity(self):
+        limit_fragments = (
+            "max_model_len=max_total_tokens=250368",
+            "max_model_len=250368",
+            "max_total_tokens=250368",
+        )
+        for limit_fragment in limit_fragments:
+            with self.subTest(limit_fragment=limit_fragment):
+                error = (
+                    "max_tokens=262144 cannot be greater than "
+                    f"{limit_fragment}. Please request fewer output tokens. "
+                    "(parameter=max_tokens, value=262144)"
+                )
+
+                adjusted, budget = _retry_max_tokens_from_context_overflow(
+                    error,
+                    262_144,
+                    518,
+                )
+
+                self.assertEqual(233_466, adjusted)
+                self.assertEqual(250_368, budget["context_length"])
+                self.assertEqual(518, budget["prompt_tokens"])
+                self.assertEqual("vllm_max_total_tokens", budget["source"])
 
     def test_stream_retry_is_forbidden_after_visible_or_reasoning_delta(self):
         self.assertTrue(_stream_retry_is_safe("", ""))
@@ -2147,7 +2180,42 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
         self.assertEqual("skill_workflow", state.execution_mode())
 
     def test_database_skill_query_uses_declared_runner_not_query_word_web(self):
-        scripts = (("scripts/query.sh", "a" * 64),)
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        root = Path(tempdir.name)
+        (root / "scripts").mkdir()
+        (root / "SKILL.md").write_text(
+            "# Catalog\nRun `scripts/query.sh`.\n",
+            encoding="utf-8",
+        )
+        script = root / "scripts/query.sh"
+        script.write_text("#!/bin/sh\nprintf query\n", encoding="utf-8")
+        digest = hashlib.sha256(script.read_bytes()).hexdigest()
+        scripts = (("scripts/query.sh", digest),)
+        loaded = {
+            "name": "catalog-database",
+            "skill_dir": str(root),
+            "skill_md_sha256": hashlib.sha256(
+                (root / "SKILL.md").read_bytes()
+            ).hexdigest(),
+            "runtime_profile_manifest": (
+                compile_skill_runtime_profile_manifest(
+                    root,
+                    ("scripts/query.sh",),
+                )
+            ),
+            "linked_files": {"scripts": ["scripts/query.sh"]},
+            "workflow_contract": {
+                "script_candidates": ["scripts/query.sh"],
+                "resource_authority": {
+                    "reasons": {
+                        "scripts/query.sh": [
+                            "explicit_skill_reference",
+                        ],
+                    },
+                },
+            },
+        }
         exposure = _bounded_skill_execution_exposure(
             "请使用 catalog-database 查询 SKU-42",
             [
@@ -2155,13 +2223,7 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
                 "run_skill_python", "web_search", "delegate_task",
             ],
             {"catalog-database"},
-            {
-                "catalog-database": {
-                    "name": "catalog-database",
-                    "linked_files": {"scripts": ["scripts/query.sh"]},
-                    "workflow_contract": None,
-                },
-            },
+            {"catalog-database": loaded},
             {"catalog-database": scripts},
         )
 
@@ -2173,9 +2235,11 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
             (("run_skill_script",),), exposure.required_groups,
         )
         self.assertEqual(
-            (("catalog-database", "scripts/query.sh", "a" * 64),),
+            (("catalog-database", "scripts/query.sh", digest),),
             exposure.allowed_skill_scripts,
         )
+        self.assertTrue(exposure.allowed_skill_script_authorities)
+        self.assertTrue(exposure.allowed_skill_package_digests)
 
         web_augmented = _bounded_skill_execution_exposure(
             (
@@ -2187,13 +2251,7 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
                 "web_search", "delegate_task",
             ],
             {"catalog-database"},
-            {
-                "catalog-database": {
-                    "name": "catalog-database",
-                    "linked_files": {"scripts": ["scripts/query.sh"]},
-                    "workflow_contract": None,
-                },
-            },
+            {"catalog-database": loaded},
             {"catalog-database": scripts},
         )
         self.assertIn("run_skill_script", web_augmented.tools)
@@ -2201,7 +2259,21 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
         self.assertIn(("web_search",), web_augmented.required_groups)
 
     def test_pure_function_skill_exposes_exact_python_entrypoint(self):
-        scripts = (("scripts/normalize.py", "b" * 64),)
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        root = Path(tempdir.name)
+        (root / "scripts").mkdir()
+        (root / "SKILL.md").write_text(
+            "# Math\nRun `scripts/normalize.py`.\n",
+            encoding="utf-8",
+        )
+        script = root / "scripts/normalize.py"
+        script.write_text(
+            "def normalize_score(value):\n    return value\n",
+            encoding="utf-8",
+        )
+        digest = hashlib.sha256(script.read_bytes()).hexdigest()
+        scripts = (("scripts/normalize.py", digest),)
         exposure = _bounded_skill_execution_exposure(
             "Use math-functions to call normalize_score(7)",
             [
@@ -2212,8 +2284,29 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
             {
                 "math-functions": {
                     "name": "math-functions",
+                    "skill_dir": str(root),
+                    "skill_md_sha256": hashlib.sha256(
+                        (root / "SKILL.md").read_bytes()
+                    ).hexdigest(),
+                    "runtime_profile_manifest": (
+                        compile_skill_runtime_profile_manifest(
+                            root,
+                            ("scripts/normalize.py",),
+                        )
+                    ),
                     "linked_files": {"scripts": ["scripts/normalize.py"]},
-                    "workflow_contract": None,
+                    "workflow_contract": {
+                        "script_candidates": [
+                            "scripts/normalize.py",
+                        ],
+                        "resource_authority": {
+                            "reasons": {
+                                "scripts/normalize.py": [
+                                    "explicit_skill_reference",
+                                ],
+                            },
+                        },
+                    },
                 },
             },
             {"math-functions": scripts},
@@ -2223,9 +2316,268 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
         self.assertIn("run_skill_script", exposure.tools)
         self.assertNotIn("web_search", exposure.tools)
         self.assertEqual(
-            (("math-functions", "scripts/normalize.py", "b" * 64),),
+            (("math-functions", "scripts/normalize.py", digest),),
             exposure.allowed_skill_scripts,
         )
+
+    def test_structured_mixed_runtime_grants_and_child_routing_are_exact(
+        self,
+    ):
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        root = Path(tempdir.name)
+        (root / "scripts").mkdir()
+        (root / "orchestration").mkdir()
+        skill_text = "# Mixed\nUse `orchestration/main.yaml`.\n"
+        (root / "SKILL.md").write_text(skill_text, encoding="utf-8")
+        declaration = root / "orchestration/main.yaml"
+        declaration.write_text(
+            "scripts:\n"
+            "  - scripts/base.cjs\n"
+            "  - scripts/browser.cjs\n",
+            encoding="utf-8",
+        )
+        base = root / "scripts/base.cjs"
+        browser = root / "scripts/browser.cjs"
+        base.write_text(
+            'const fs = require("fs");\nmodule.exports = fs;\n',
+            encoding="utf-8",
+        )
+        browser.write_text(
+            'const { chromium } = require("playwright");\n'
+            "module.exports = chromium;\n",
+            encoding="utf-8",
+        )
+        (root / "package.json").write_text(
+            json.dumps({
+                "dependencies": {"playwright": "^1.60.0"},
+            }),
+            encoding="utf-8",
+        )
+        base_digest = hashlib.sha256(base.read_bytes()).hexdigest()
+        browser_digest = hashlib.sha256(browser.read_bytes()).hexdigest()
+        script_paths = (
+            "scripts/base.cjs",
+            "scripts/browser.cjs",
+        )
+        workflow = {
+            "script_candidates": list(script_paths),
+            "resource_authority": {
+                "reasons": {
+                    path: ["declared_by:orchestration/main.yaml"]
+                    for path in script_paths
+                },
+            },
+            "execution_contract": {
+                "schema_version": 1,
+                "environment_contract": {},
+            },
+        }
+        manifest = compile_skill_runtime_profile_manifest(
+            root,
+            script_paths,
+        )
+        loaded = {
+            "name": "mixed-runtime",
+            "skill_dir": str(root),
+            "skill_md_sha256": hashlib.sha256(
+                (root / "SKILL.md").read_bytes()
+            ).hexdigest(),
+            "runtime_profile_manifest": manifest,
+            "workflow_contract": workflow,
+            "linked_files": {
+                "scripts": list(script_paths),
+                "orchestration": ["orchestration/main.yaml"],
+            },
+        }
+        plan = {
+            "selection": "selected",
+            "route_id": "mixed",
+            "workers": {},
+            "required_workers": [],
+            "bootstrap_sources": [{
+                "id": "run-both",
+                "local_resources": list(script_paths),
+            }],
+            "aggregation_steps": [],
+        }
+        exposure = _bounded_skill_execution_exposure(
+            "Use mixed-runtime",
+            [
+                "skill_view",
+                "run_skill_process",
+                "run_skill_script",
+                "run_skill_python",
+                "delegate_task",
+            ],
+            {"mixed-runtime"},
+            {"mixed-runtime": loaded},
+            {
+                "mixed-runtime": (
+                    ("scripts/base.cjs", base_digest),
+                    ("scripts/browser.cjs", browser_digest),
+                ),
+            },
+            selected_skill_names=("mixed-runtime",),
+            compiled_plans={"mixed-runtime": plan},
+        )
+
+        base_grant = (
+            "mixed-runtime",
+            "scripts/base.cjs",
+            base_digest,
+        )
+        browser_grant = (
+            "mixed-runtime",
+            "scripts/browser.cjs",
+            browser_digest,
+        )
+        self.assertEqual(
+            {base_grant, browser_grant},
+            set(exposure.allowed_skill_scripts),
+        )
+        self.assertEqual(
+            (browser_grant,),
+            exposure.process_only_skill_scripts,
+        )
+        self.assertIn("run_skill_process", exposure.tools)
+        self.assertIn("run_skill_script", exposure.tools)
+        self.assertEqual(
+            {("mixed-runtime", manifest["package_sha256"])},
+            set(exposure.allowed_skill_package_digests),
+        )
+        self.assertEqual(
+            {"orchestration/main.yaml"},
+            {
+                row[2]
+                for row in exposure.allowed_skill_script_authorities
+            },
+        )
+
+        context = ToolContext(
+            user_id="u",
+            session_id="s",
+            skill_execution_resource_boundary=True,
+            allowed_skill_scripts=exposure.allowed_skill_scripts,
+            process_only_skill_scripts=(
+                exposure.process_only_skill_scripts
+            ),
+            allowed_skill_script_authorities=(
+                exposure.allowed_skill_script_authorities
+            ),
+            allowed_skill_package_digests=(
+                exposure.allowed_skill_package_digests
+            ),
+        )
+        mixed_child_tools = _declared_child_tools(
+            {
+                "run_skill_process",
+                "run_skill_script",
+                "run_skill_python",
+            },
+            {"skill": "mixed-runtime"},
+            **_profile_bound_child_runner_kwargs(
+                context,
+                ["mixed-runtime"],
+            ),
+        )
+        self.assertEqual(
+            {"run_skill_process", "run_skill_script"},
+            set(mixed_child_tools),
+        )
+        browser_local_tools = _declared_child_tools(
+            {
+                "run_skill_process",
+                "run_skill_script",
+                "run_skill_python",
+            },
+            {"local_resources": ["scripts/browser.cjs"]},
+            **_profile_bound_child_runner_kwargs(
+                context,
+                [],
+                local_skill_name="mixed-runtime",
+            ),
+        )
+        self.assertEqual(
+            ["run_skill_process"],
+            browser_local_tools,
+        )
+
+        with patch(
+            "skills.scanner.resolve_skill_path",
+            return_value=root / "SKILL.md",
+        ):
+            self.assertIsNone(delegated_resource_boundary_error(
+                "run_skill_script",
+                {"script_path": "skills/mixed-runtime/scripts/base.cjs"},
+                context,
+            ))
+            browser_error = delegated_resource_boundary_error(
+                "run_skill_script",
+                {
+                    "script_path": (
+                        "skills/mixed-runtime/scripts/browser.cjs"
+                    ),
+                },
+                context,
+            )
+            self.assertIn("only through run_skill_process", browser_error)
+            self.assertIsNone(delegated_resource_boundary_error(
+                "run_skill_process",
+                {
+                    "operation": "start",
+                    "script_path": (
+                        "skills/mixed-runtime/scripts/browser.cjs"
+                    ),
+                },
+                context,
+            ))
+
+        # The old loaded contract/manifest cannot mint fresh authority from a
+        # later package snapshot, even when both script bytes are unchanged.
+        (root / "SKILL.md").write_text(
+            skill_text + "\nChanged.\n",
+            encoding="utf-8",
+        )
+        root_changed = _bounded_skill_execution_exposure(
+            "Use mixed-runtime",
+            exposure.tools,
+            {"mixed-runtime"},
+            {"mixed-runtime": loaded},
+            {
+                "mixed-runtime": (
+                    ("scripts/base.cjs", base_digest),
+                    ("scripts/browser.cjs", browser_digest),
+                ),
+            },
+            selected_skill_names=("mixed-runtime",),
+            compiled_plans={"mixed-runtime": plan},
+        )
+        self.assertFalse(root_changed.allowed_skill_scripts)
+        (root / "SKILL.md").write_text(skill_text, encoding="utf-8")
+        declaration.write_text(
+            "scripts: []\n",
+            encoding="utf-8",
+        )
+        changed = _bounded_skill_execution_exposure(
+            "Use mixed-runtime",
+            exposure.tools,
+            {"mixed-runtime"},
+            {"mixed-runtime": loaded},
+            {
+                "mixed-runtime": (
+                    ("scripts/base.cjs", base_digest),
+                    ("scripts/browser.cjs", browser_digest),
+                ),
+            },
+            selected_skill_names=("mixed-runtime",),
+            compiled_plans={"mixed-runtime": plan},
+        )
+        self.assertFalse(changed.allowed_skill_scripts)
+        self.assertTrue(any(
+            "loaded_skill_snapshot_authority_mismatch" in item
+            for item in changed.missing_requirements
+        ))
 
     def test_declared_result_schema_preserves_non_research_native_types(self):
         schema = {
@@ -3103,6 +3455,63 @@ class SimpleChatStopLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Recovering failed tool step", progress)
 
 
+class WebExtractFallbackSignalTests(unittest.IsolatedAsyncioTestCase):
+    async def _extract_with_response(self, status_code, text):
+        class Response:
+            def __init__(self):
+                self.status_code = status_code
+                self.text = text
+
+        class Client:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, url):
+                return Response()
+
+        with patch("tools.web_extract.httpx.AsyncClient", Client):
+            return await web_extract("https://example.test/article")
+
+    async def test_http_202_recommends_browser_fallback(self):
+        result = json.loads(await self._extract_with_response(202, "pending"))
+
+        self.assertEqual("error", result["status"])
+        self.assertEqual(202, result["http_status"])
+        self.assertEqual("dynamic_page_pending", result["failure_kind"])
+        self.assertTrue(result["browser_fallback_recommended"])
+        self.assertEqual("https://example.test/article", result["url"])
+
+    async def test_dynamic_javascript_shell_recommends_browser_fallback(self):
+        result = json.loads(await self._extract_with_response(
+            200,
+            "<html><body><div id='root'></div><script>boot()</script></body></html>",
+        ))
+
+        self.assertEqual("dynamic_page_shell", result["failure_kind"])
+        self.assertTrue(result["browser_fallback_recommended"])
+
+    async def test_access_and_rate_failures_never_recommend_browser(self):
+        for status, failure_kind in ((403, "access_denied"), (429, "rate_limited")):
+            with self.subTest(status=status):
+                result = json.loads(
+                    await self._extract_with_response(status, "blocked")
+                )
+                self.assertEqual(failure_kind, result["failure_kind"])
+                self.assertFalse(result["browser_fallback_recommended"])
+
+    async def test_empty_static_response_does_not_recommend_browser(self):
+        result = json.loads(await self._extract_with_response(200, ""))
+
+        self.assertEqual("empty_response", result["failure_kind"])
+        self.assertFalse(result["browser_fallback_recommended"])
+
+
 class DirectRequiredToolGateTests(unittest.IsolatedAsyncioTestCase):
     provider = {
         "id": "mock-direct-tool",
@@ -3126,8 +3535,95 @@ class DirectRequiredToolGateTests(unittest.IsolatedAsyncioTestCase):
             },
         },
     }]
+    url_read_schemas = [
+        {
+            "type": "function",
+            "function": {
+                "name": "web_extract",
+                "description": "extract",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"url": {"type": "string"}},
+                    "required": ["url"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "browser_navigate",
+                "description": "navigate",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"url": {"type": "string"}},
+                    "required": ["url"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "browser_snapshot",
+                "description": "snapshot",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"full": {"type": "boolean"}},
+                },
+            },
+        },
+    ]
 
-    async def _run_with_responses(self, responses, *, tools=None, dispatch_result=None):
+    @staticmethod
+    def _tool_turn(call_id, name, arguments):
+        return [
+            "data: " + json.dumps({
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": call_id,
+                            "function": {
+                                "name": name,
+                                "arguments": json.dumps(arguments),
+                            },
+                        }],
+                    },
+                    "finish_reason": None,
+                }],
+            }),
+            "data: " + json.dumps({
+                "choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+            }),
+            "data: [DONE]",
+        ]
+
+    @staticmethod
+    def _stop_turn(content):
+        return [
+            "data: " + json.dumps({
+                "choices": [{
+                    "delta": {"content": content},
+                    "finish_reason": None,
+                }],
+            }),
+            "data: " + json.dumps({
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+            }),
+            "data: [DONE]",
+        ]
+
+    async def _run_with_responses(
+        self,
+        responses,
+        *,
+        tools=None,
+        dispatch_result=None,
+        dispatch_side_effect=None,
+        schemas=None,
+        user_text="请搜索最新 GLM 版本",
+        max_iterations=4,
+        debug_trace=False,
+    ):
         request_bodies = []
 
         class FakeResponse:
@@ -3163,33 +3659,298 @@ class DirectRequiredToolGateTests(unittest.IsolatedAsyncioTestCase):
                 return FakeResponse(responses.pop(0))
 
         dispatch_mock = AsyncMock(
-            return_value=dispatch_result or json.dumps({"status": "ok"})
+            side_effect=dispatch_side_effect,
+            return_value=dispatch_result or json.dumps({"status": "ok"}),
         )
+        schema_catalog = schemas or self.web_schema
+
+        def schemas_for(names):
+            selected = set(names)
+            return [
+                schema for schema in schema_catalog
+                if schema["function"]["name"] in selected
+            ]
+
         with tempfile.TemporaryDirectory() as temp_dir:
             with (
                 patch("workspace_context.WORKSPACE_ROOT", Path(temp_dir)),
                 patch("agent_loop.httpx.AsyncClient", FakeAsyncClient),
                 patch("agent_loop.dispatch", dispatch_mock),
-                patch("agent_loop.get_schemas", return_value=self.web_schema),
+                patch("agent_loop.get_schemas", side_effect=schemas_for),
                 patch("agent_loop.build_system_prompt", return_value="system"),
                 patch("agent_loop.load_workspace_context", return_value=""),
                 patch("agent_loop._fetch_goal", AsyncMock(return_value=None)),
+                patch("agent_loop.settings.agent_debug_trace", debug_trace),
                 patch("skills.scanner.find_all_skills", return_value=[]),
             ):
                 events = [
                     event
                     async for event in run_stream(
                         "mock-direct-tool",
-                        [{"role": "user", "content": "请搜索最新 GLM 版本"}],
+                        [{"role": "user", "content": user_text}],
                         tools or ["web_search"],
                         provider_override=self.provider,
                         allow_session_mcp=False,
                         user_id="u-direct-required",
                         session_id="s-direct-required",
-                        max_iterations=4,
+                        max_iterations=max_iterations,
                     )
                 ]
         return request_bodies, dispatch_mock, events
+
+    async def test_static_url_read_stays_on_web_extract_only(self):
+        target_url = "https://example.test/article"
+        bodies, dispatch_mock, events = await self._run_with_responses(
+            [
+                self._tool_turn(
+                    "extract-static", "web_extract", {"url": target_url}
+                ),
+                self._stop_turn("已根据静态页面正文完成总结。"),
+            ],
+            tools=[
+                "web_extract", "browser_navigate", "browser_snapshot"
+            ],
+            dispatch_result="Static article body",
+            schemas=self.url_read_schemas,
+            user_text=f"请读取并总结 {target_url}",
+        )
+
+        self.assertEqual(2, len(bodies))
+        self.assertEqual(
+            {"web_extract"},
+            {
+                item["function"]["name"]
+                for item in bodies[0].get("tools") or []
+            },
+        )
+        self.assertNotIn("tools", bodies[1])
+        dispatch_mock.assert_awaited_once_with(
+            "web_extract", {"url": target_url}, context=ANY
+        )
+        self.assertEqual({"type": "done", "finish_reason": "stop"}, events[-1])
+
+    async def test_dynamic_url_read_auto_dispatches_same_url_browser_snapshot(self):
+        target_url = "https://example.test/dynamic?record=1"
+        extract_error = json.dumps({
+            "status": "error",
+            "url": target_url,
+            "http_status": 202,
+            "failure_kind": "dynamic_page_pending",
+            "browser_fallback_recommended": True,
+            "error": f"Failed to fetch {target_url}: HTTP 202",
+        })
+
+        async def dispatch_side_effect(name, args, *, context):
+            if name == "web_extract":
+                return extract_error
+            if name == "browser_navigate":
+                return json.dumps({
+                    "status": "success",
+                    "url": target_url,
+                    "visible_text": "Rendered shell",
+                })
+            if name == "browser_snapshot":
+                return json.dumps({
+                    "status": "success",
+                    "url": target_url,
+                    "snapshot": "Rendered article body",
+                })
+            raise AssertionError(name)
+
+        bodies, dispatch_mock, events = await self._run_with_responses(
+            [
+                self._tool_turn(
+                    "extract-dynamic", "web_extract", {"url": target_url}
+                ),
+                self._stop_turn("已根据浏览器渲染后的正文完成总结。"),
+            ],
+            tools=[
+                "web_extract", "browser_navigate", "browser_snapshot"
+            ],
+            dispatch_side_effect=dispatch_side_effect,
+            schemas=self.url_read_schemas,
+            user_text=f"请读取并总结 {target_url}",
+            max_iterations=5,
+            debug_trace=True,
+        )
+
+        self.assertEqual(2, len(bodies))
+        self.assertEqual(
+            {"web_extract"},
+            {
+                item["function"]["name"]
+                for item in bodies[0].get("tools") or []
+            },
+        )
+        self.assertNotIn("tools", bodies[1])
+        self.assertEqual(
+            ["web_extract", "browser_navigate", "browser_snapshot"],
+            [call.args[0] for call in dispatch_mock.await_args_list],
+        )
+        self.assertEqual(
+            {"url": target_url},
+            dispatch_mock.await_args_list[1].args[1],
+        )
+        self.assertEqual(
+            {"full": False},
+            dispatch_mock.await_args_list[2].args[1],
+        )
+        fallback_events = [
+            event for event in events
+            if event.get("event_type")
+            == "debug.direct_url.browser_fallback"
+        ]
+        self.assertEqual(2, len(fallback_events))
+        serialized = json.dumps(fallback_events, ensure_ascii=False)
+        self.assertNotIn(target_url, serialized)
+        self.assertIn(hashlib.sha256(target_url.encode()).hexdigest(), serialized)
+        self.assertEqual({"type": "done", "finish_reason": "stop"}, events[-1])
+
+    async def test_access_denial_and_rate_limit_never_escalate_to_browser(self):
+        target_url = "https://example.test/protected"
+        for status, failure_kind in ((403, "access_denied"), (429, "rate_limited")):
+            with self.subTest(status=status):
+                extract_error = json.dumps({
+                    "status": "error",
+                    "url": target_url,
+                    "http_status": status,
+                    "failure_kind": failure_kind,
+                    "browser_fallback_recommended": False,
+                    "error": f"Failed to fetch {target_url}: HTTP {status}",
+                })
+                bodies, dispatch_mock, events = await self._run_with_responses(
+                    [
+                        self._tool_turn(
+                            f"extract-{status}",
+                            "web_extract",
+                            {"url": target_url},
+                        ),
+                        self._stop_turn("已报告网页访问失败。"),
+                    ],
+                    tools=[
+                        "web_extract", "browser_navigate", "browser_snapshot"
+                    ],
+                    dispatch_result=extract_error,
+                    schemas=self.url_read_schemas,
+                    user_text=f"请读取并总结 {target_url}",
+                )
+
+                self.assertEqual(2, len(bodies))
+                dispatch_mock.assert_awaited_once_with(
+                    "web_extract", {"url": target_url}, context=ANY
+                )
+                self.assertEqual(
+                    {"type": "done", "finish_reason": "stop"}, events[-1]
+                )
+
+    async def test_browser_fallback_requires_exact_tool_and_result_url_match(self):
+        target_url = "https://example.test/requested"
+        mismatched_url = "https://example.test/other"
+        extract_error = json.dumps({
+            "status": "error",
+            "url": mismatched_url,
+            "http_status": 202,
+            "failure_kind": "dynamic_page_pending",
+            "browser_fallback_recommended": True,
+            "error": f"Failed to fetch {mismatched_url}: HTTP 202",
+        })
+        bodies, dispatch_mock, events = await self._run_with_responses(
+            [
+                self._tool_turn(
+                    "extract-mismatch", "web_extract", {"url": target_url}
+                ),
+                self._stop_turn("已报告返回地址不一致，未升级浏览器。"),
+            ],
+            tools=[
+                "web_extract", "browser_navigate", "browser_snapshot"
+            ],
+            dispatch_result=extract_error,
+            schemas=self.url_read_schemas,
+            user_text=f"请读取并总结 {target_url}",
+        )
+
+        self.assertEqual(2, len(bodies))
+        dispatch_mock.assert_awaited_once_with(
+            "web_extract", {"url": target_url}, context=ANY
+        )
+        self.assertEqual({"type": "done", "finish_reason": "stop"}, events[-1])
+
+    async def test_multiple_distinct_user_urls_disable_deterministic_fallback(self):
+        first_url = "https://example.test/first"
+        second_url = "https://example.test/second"
+        extract_error = json.dumps({
+            "status": "error",
+            "url": first_url,
+            "http_status": 202,
+            "failure_kind": "dynamic_page_pending",
+            "browser_fallback_recommended": True,
+            "error": f"Failed to fetch {first_url}: HTTP 202",
+        })
+        bodies, dispatch_mock, events = await self._run_with_responses(
+            [
+                self._tool_turn(
+                    "extract-first", "web_extract", {"url": first_url}
+                ),
+                self._stop_turn("请求包含多个地址，已停止确定性浏览器升级。"),
+            ],
+            tools=[
+                "web_extract", "browser_navigate", "browser_snapshot"
+            ],
+            dispatch_result=extract_error,
+            schemas=self.url_read_schemas,
+            user_text=f"请读取 {first_url} 并与 {second_url} 比较",
+        )
+
+        self.assertEqual(2, len(bodies))
+        dispatch_mock.assert_awaited_once_with(
+            "web_extract", {"url": first_url}, context=ANY
+        )
+        self.assertEqual({"type": "done", "finish_reason": "stop"}, events[-1])
+
+    async def test_browser_navigation_failure_preserves_both_failures_without_snapshot(self):
+        target_url = "https://example.test/dynamic"
+        extract_error = json.dumps({
+            "status": "error",
+            "url": target_url,
+            "http_status": 202,
+            "failure_kind": "dynamic_page_pending",
+            "browser_fallback_recommended": True,
+            "error": "STATIC_PATH_HTTP_202",
+        })
+
+        async def dispatch_side_effect(name, args, *, context):
+            if name == "web_extract":
+                return extract_error
+            if name == "browser_navigate":
+                return "Browser navigate error: RENDERED_PATH_FAILED"
+            raise AssertionError(name)
+
+        bodies, dispatch_mock, events = await self._run_with_responses(
+            [
+                self._tool_turn(
+                    "extract-browser-failure",
+                    "web_extract",
+                    {"url": target_url},
+                ),
+                self._stop_turn("静态读取与浏览器渲染均失败。"),
+            ],
+            tools=[
+                "web_extract", "browser_navigate", "browser_snapshot"
+            ],
+            dispatch_side_effect=dispatch_side_effect,
+            schemas=self.url_read_schemas,
+            user_text=f"请读取并总结 {target_url}",
+            max_iterations=5,
+        )
+
+        self.assertEqual(
+            ["web_extract", "browser_navigate"],
+            [call.args[0] for call in dispatch_mock.await_args_list],
+        )
+        synthesis_input = json.dumps(bodies[1]["messages"], ensure_ascii=False)
+        self.assertIn("STATIC_PATH_HTTP_202", synthesis_input)
+        self.assertIn("RENDERED_PATH_FAILED", synthesis_input)
+        self.assertEqual({"type": "done", "finish_reason": "stop"}, events[-1])
 
     async def test_provider_stop_without_explicit_tool_fails_closed_after_one_nudge(self):
         stop = lambda content: [

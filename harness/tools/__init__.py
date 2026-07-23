@@ -14,6 +14,11 @@ from tools.skill_python import (
     RUN_SKILL_PYTHON_SCHEMA,
 )
 from tools.skill_script import run_skill_script, RUN_SKILL_SCRIPT_SCHEMA
+from tools.skill_process import (
+    run_skill_process,
+    preflight_run_skill_process_args,
+    RUN_SKILL_PROCESS_SCHEMA,
+)
 from tools.declared_command import run_declared_command, RUN_DECLARED_COMMAND_SCHEMA
 from tools.skill_capability_plan import (
     submit_skill_capability_plan,
@@ -84,6 +89,7 @@ register(
     web_search,
     is_read_only=True,
     parallel_safe=False,
+    external_interaction=True,
 )
 
 register(
@@ -109,6 +115,7 @@ register(
     web_extract,
     is_read_only=True,
     parallel_safe=True,
+    external_interaction=True,
 )
 
 register(
@@ -117,6 +124,7 @@ register(
     skill_http_get,
     is_read_only=True,
     parallel_safe=False,
+    external_interaction=True,
     emoji="🔐",
 )
 
@@ -129,6 +137,7 @@ register(
     parallel_safe=False,
     allow_in_parallel_child=True,
     mutates_workspace=False,
+    external_interaction=True,
     emoji="🔐",
 )
 
@@ -169,6 +178,24 @@ register(
 )
 
 register(
+    "run_skill_process",
+    RUN_SKILL_PROCESS_SCHEMA,
+    run_skill_process,
+    args_preflight_fn=preflight_run_skill_process_args,
+    is_read_only=False,
+    is_destructive=True,
+    parallel_safe=False,
+    path_scoped=True,
+    allow_in_child=True,
+    allow_in_parallel_child=False,
+    mutates_workspace=True,
+    mutates_global_state=False,
+    salvage_safe=False,
+    external_interaction=True,
+    emoji="🧰",
+)
+
+register(
     "run_declared_command",
     RUN_DECLARED_COMMAND_SCHEMA,
     run_declared_command,
@@ -196,6 +223,7 @@ register(
     is_read_only=True,
     parallel_safe=True,
     path_scoped=True,
+    salvage_safe=True,
     emoji="📖",
 )
 
@@ -242,6 +270,7 @@ register(
     is_read_only=True,
     parallel_safe=True,
     path_scoped=True,
+    salvage_safe=True,
     emoji="🔍",
 )
 
@@ -278,6 +307,7 @@ register(
     skills_list,
     is_read_only=True,
     parallel_safe=True,
+    salvage_safe=True,
     emoji="📚",
 )
 
@@ -288,6 +318,7 @@ register(
     is_read_only=True,
     parallel_safe=True,
     path_scoped=True,
+    salvage_safe=True,
     emoji="📖",
 )
 
@@ -311,6 +342,8 @@ register(
     path_scoped=True,
     emoji="🛠️",
     allow_in_parallel_child=False,
+    mutates_workspace=False,
+    mutates_global_state=True,
 )
 
 # ── Phase 7: Browser tools ────────────────────────────────────────────────────
@@ -321,6 +354,7 @@ register(
     browser_navigate,
     is_read_only=True,
     parallel_safe=False,
+    external_interaction=True,
     emoji="🌐",
 )
 
@@ -330,6 +364,7 @@ register(
     browser_snapshot,
     is_read_only=True,
     parallel_safe=False,
+    external_interaction=True,
     emoji="📸",
 )
 
@@ -337,6 +372,7 @@ register(
     "browser_click",
     BROWSER_CLICK_SCHEMA,
     browser_click,
+    external_interaction=True,
     emoji="🖱️",
 )
 
@@ -344,6 +380,7 @@ register(
     "browser_type",
     BROWSER_TYPE_SCHEMA,
     browser_type,
+    external_interaction=True,
     emoji="⌨️",
 )
 
@@ -351,6 +388,7 @@ register(
     "browser_scroll",
     BROWSER_SCROLL_SCHEMA,
     browser_scroll,
+    external_interaction=True,
     emoji="📜",
 )
 
@@ -358,6 +396,7 @@ register(
     "browser_back",
     BROWSER_BACK_SCHEMA,
     browser_back,
+    external_interaction=True,
     emoji="⬅️",
 )
 
@@ -367,6 +406,7 @@ register(
     "image_generate",
     IMAGE_GENERATE_SCHEMA,
     image_generate,
+    external_interaction=True,
     emoji="🎨",
 )
 
@@ -374,6 +414,7 @@ register(
     "vision_analyze",
     VISION_ANALYZE_SCHEMA,
     vision_analyze,
+    external_interaction=True,
     emoji="👁️",
 )
 

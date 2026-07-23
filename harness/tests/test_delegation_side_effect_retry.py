@@ -182,6 +182,55 @@ class DelegationSideEffectRetryTests(unittest.IsolatedAsyncioTestCase):
         )
         persist_result.assert_not_called()
 
+    async def test_mutation_receipt_overrides_runtime_output_contract_retry(self):
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            call_id = "write-before-contract-failure"
+            yield _started("write_file", call_id)
+            yield _dispatch_started("write_file", call_id)
+            yield _completed("write_file", call_id)
+            error = "The delegated typed output repair remained invalid."
+            yield {
+                "type": "agent_event",
+                "event_type": "run.failed",
+                "payload": {
+                    "error": error,
+                    "finish_reason": (
+                        "delegated_output_contract_repair_continuation_invalid"
+                    ),
+                    "failure_class": "agent_contract_noncompliance",
+                    # Even an optimistic inner hint cannot override the
+                    # parent-owned mutation receipt.
+                    "retryable": True,
+                },
+            }
+            yield {"type": "error", "msg": error}
+
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch("tools.delegation.persist_result_for_history") as persist_result,
+        ):
+            result = await _run_child(
+                {
+                    "goal": "write one artifact and return its typed receipt",
+                    "tools": ["write_file"],
+                    "required_result_fields": ["artifact_path"],
+                },
+                _context("write_file"),
+                0,
+            )
+
+        self.assertEqual("error", result["status"])
+        self.assertFalse(result["retryable"])
+        self.assertEqual(
+            "agent_contract_noncompliance",
+            result["failure_class"],
+        )
+        self.assertEqual(
+            ["write_file"],
+            result["dispatch_receipt_audit"]["mutating_tool_names"],
+        )
+        persist_result.assert_not_called()
+
     async def test_batch_timeout_uses_parent_receipts_and_exact_step_ids(self):
         cancelled: set[str] = set()
         continued_after_cancel: set[str] = set()

@@ -8,6 +8,8 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from tools import skill_script
+from tools.context import ToolContext
+from tools.isolated_skill_executor import compute_skill_package_digest
 from tools.registry import get_metadata, get_schemas
 
 
@@ -60,7 +62,7 @@ class SkillScriptTests(unittest.IsolatedAsyncioTestCase):
     def test_schema_and_registry_expose_only_declarative_controls(self) -> None:
         properties = skill_script.RUN_SKILL_SCRIPT_SCHEMA["parameters"]["properties"]
         self.assertEqual(
-            {".py", ".sh", ".bash", ".js", ".mjs"},
+            {".py", ".sh", ".bash", ".js", ".mjs", ".cjs"},
             set(skill_script.SUPPORTED_EXTENSIONS),
         )
         self.assertNotIn("interpreter", properties)
@@ -100,6 +102,41 @@ class SkillScriptTests(unittest.IsolatedAsyncioTestCase):
             args=["literal"],
             timeout=25,
             cwd="script",
+        )
+
+    async def test_runtime_package_grant_is_forwarded_outside_public_schema(
+        self,
+    ) -> None:
+        self.write_script("task.py", "print('isolated')\n")
+        package_digest = compute_skill_package_digest(self.skill)
+        context = ToolContext(
+            user_id=self.user_id,
+            session_id=self.session_id,
+            allowed_skill_package_digests=((
+                "portable-skill",
+                package_digest,
+            ),),
+        )
+        isolated = AsyncMock(return_value={
+            "status": "success",
+            "stdout": "isolated\n",
+            "artifacts": [],
+            "interpreter": "python",
+            "network": "disabled",
+        })
+        with patch.object(skill_script, "execute_isolated_skill_script", isolated):
+            result = await self.call(
+                script_path="skills/portable-skill/scripts/task.py",
+                context=context,
+            )
+        self.assertEqual("success", result["status"])
+        self.assertEqual(
+            package_digest,
+            isolated.await_args.kwargs["expected_skill_sha256"],
+        )
+        self.assertNotIn(
+            "expected_skill_sha256",
+            skill_script.RUN_SKILL_SCRIPT_SCHEMA["parameters"]["properties"],
         )
 
     async def test_promoted_user_skill_runs_only_when_runtime_enabled(self) -> None:

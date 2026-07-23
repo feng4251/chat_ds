@@ -62,6 +62,23 @@ class ToolContext:
     # (canonical Skill name, package-relative script path, sha256 at compile/
     # dispatch boundary).  Reading SKILL.md never grants script execution.
     allowed_skill_scripts: tuple[tuple[str, str, str], ...] = ()
+    # Browser-profile scripts share the exact script ledger above because the
+    # persistent process adapter reuses it, but these triples may never cross
+    # a one-shot/base-executor bridge.
+    process_only_skill_scripts: tuple[tuple[str, str, str], ...] = ()
+    # Standard-Skill reference amendments additionally bind each script grant
+    # to its complete instruction chain:
+    # (skill, root_sha256, declaring_resource, declaring_sha256,
+    #  script_resource, script_sha256).
+    # Legacy compiler grants may leave this empty; amended grants never do.
+    allowed_skill_script_authorities: tuple[
+        tuple[str, str, str, str, str, str], ...
+    ] = ()
+    # Persistent process execution snapshots the complete Skill package.
+    # Each runtime-owned entry is (canonical Skill name, canonical package
+    # SHA-256).  This closes the helper-file/additional-file mutation gap left
+    # by an entrypoint-only digest chain.
+    allowed_skill_package_digests: tuple[tuple[str, str], ...] = ()
     # Declarative command authority is separate from script authority. Each
     # entry is (canonical Skill name, stable grant id, PATH executable,
     # immutable argv prefix). The model never supplies the executable.
@@ -92,3 +109,8 @@ class ToolContext:
     # with an empty tuple deliberately authorizes no direct artifact writes.
     artifact_write_boundary: bool = False
     allowed_artifact_write_patterns: tuple[str, ...] = ()
+    # Runtime-only UUID derived from the current provider/native tool_call_id.
+    # It is replaced immediately before a real dispatch and is never accepted
+    # from model arguments or serialized into conversation history. Stateful
+    # adapters use it to make a transport retry idempotent.
+    tool_operation_id: str | None = field(default=None, repr=False)

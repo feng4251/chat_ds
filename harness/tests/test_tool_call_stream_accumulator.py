@@ -151,6 +151,78 @@ class ToolCallStreamAccumulatorTests(unittest.TestCase):
         self.assertEqual((), assembly.calls)
         self.assertIn("tool_name_conflict", assembly.errors)
 
+    def test_complete_call_is_retained_for_review_when_peer_is_malformed(self):
+        accumulator = ToolCallStreamAccumulator({"read_file"})
+        accumulator.add_fragment(_fragment(
+            call_id="complete",
+            index=0,
+            name="read_file",
+            arguments='{"filepath":"evidence.md"}',
+        ))
+        accumulator.add_fragment(_fragment(
+            call_id="malformed",
+            index=1,
+            name="read_file",
+            arguments='{"filepath":',
+        ))
+
+        assembly = accumulator.finalize(iteration=8)
+
+        self.assertFalse(assembly.ok)
+        self.assertEqual((), assembly.calls)
+        self.assertEqual(1, len(assembly.complete_calls))
+        self.assertEqual("read_file", assembly.complete_calls[0].name)
+        self.assertEqual(
+            {"filepath": "evidence.md"},
+            json.loads(assembly.complete_calls[0].arguments),
+        )
+        self.assertEqual(1, assembly.debug["complete_call_count"])
+        encoded_debug = json.dumps(assembly.debug, ensure_ascii=False)
+        self.assertNotIn("evidence.md", encoded_debug)
+        self.assertNotIn('"complete"', encoded_debug)
+
+    def test_reused_provider_id_with_conflicting_arguments_is_not_complete(self):
+        accumulator = ToolCallStreamAccumulator({"read_file"})
+        for index, filepath in enumerate(("first.md", "second.md")):
+            accumulator.add_fragment(_fragment(
+                call_id="reused-provider-id",
+                index=index,
+                name="read_file" if index == 0 else None,
+                arguments=json.dumps({"filepath": filepath}),
+            ))
+
+        assembly = accumulator.finalize(iteration=8)
+
+        self.assertFalse(assembly.ok)
+        self.assertEqual((), assembly.calls)
+        self.assertEqual((), assembly.complete_calls)
+        self.assertIn("ambiguous_arguments_json", assembly.errors)
+
+    def test_batch_limit_error_disables_all_complete_call_review(self):
+        with patch(
+            "tool_call_stream._MAX_ARGUMENT_CHARS_PER_BATCH",
+            20,
+        ):
+            accumulator = ToolCallStreamAccumulator({"read_file"})
+            accumulator.add_fragment(_fragment(
+                call_id="first",
+                index=0,
+                name="read_file",
+                arguments='{"filepath":"first.md"}',
+            ))
+            accumulator.add_fragment(_fragment(
+                call_id="second",
+                index=1,
+                name="read_file",
+                arguments='{"filepath":"second.md"}',
+            ))
+
+            assembly = accumulator.finalize(iteration=8)
+
+        self.assertFalse(assembly.ok)
+        self.assertEqual((), assembly.complete_calls)
+        self.assertIn("tool_argument_batch_limit_exceeded", assembly.errors)
+
     def test_missing_streamed_name_is_not_inferred_from_single_exposed_tool(self):
         accumulator = ToolCallStreamAccumulator({"read_file"})
         accumulator.add_fragment(_fragment(
@@ -236,6 +308,46 @@ class ToolCallStreamAccumulatorTests(unittest.TestCase):
         encoded = json.dumps(assembly.debug, ensure_ascii=False)
         self.assertNotIn("duplicate-secret-id", encoded)
         self.assertNotIn("filepath", encoded)
+
+    def test_nonstream_complete_call_is_retained_when_peer_is_malformed(self):
+        payload = {
+            "choices": [{
+                "message": {
+                    "tool_calls": [
+                        {
+                            "id": "complete-fallback",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": '{"filepath":"evidence.md"}',
+                            },
+                        },
+                        {
+                            "id": "malformed-fallback",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": '{"filepath":',
+                            },
+                        },
+                    ],
+                },
+            }],
+        }
+
+        assembly = validate_nonstream_tool_call_batch(payload, {"read_file"})
+
+        self.assertFalse(assembly.ok)
+        self.assertEqual((), assembly.calls)
+        self.assertEqual(1, len(assembly.complete_calls))
+        self.assertEqual(
+            {"filepath": "evidence.md"},
+            json.loads(assembly.complete_calls[0].arguments),
+        )
+        self.assertEqual(1, assembly.debug["complete_call_count"])
+        encoded = json.dumps(assembly.debug, ensure_ascii=False)
+        self.assertNotIn("evidence.md", encoded)
+        self.assertNotIn("complete-fallback", encoded)
 
     def test_cumulative_argument_snapshot_replaces_instead_of_duplicates(self):
         accumulator = ToolCallStreamAccumulator({"read_file"})
@@ -920,6 +1032,7 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
         required_tool_surface=False,
         requested_max_tokens=None,
         provider_context_length=64_000,
+        fallback_overrides=None,
     ):
         """Run provider turns with an optional explicit-repair fallback."""
         requests = []
@@ -1076,9 +1189,156 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
                             verified_preloaded_input_receipt
                         ),
                         max_tokens=requested_max_tokens,
+                        fallback_overrides=fallback_overrides,
                     )
                 ]
         return requests, dispatch_mock, events
+
+    async def test_live_runtime_capacity_clamps_the_first_wire_request(self):
+        async def resolve_runtime(provider):
+            resolved = dict(provider)
+            resolved["context_length"] = 250_368
+            return resolved, {
+                "status": "runtime_catalog",
+                "context_length": 250_368,
+                "metadata_applied": True,
+            }
+
+        with (
+            patch(
+                "agent_loop.resolve_provider_runtime_metadata",
+                side_effect=resolve_runtime,
+            ),
+            patch("agent_loop._estimate_payload_tokens", return_value=518),
+        ):
+            requests, dispatch_mock, events = await self._run_stream_sequence(
+                [self._stop_lines("bounded answer")],
+                max_iterations=1,
+                enabled_tool="",
+                task_text="answer directly",
+                requested_max_tokens=262_144,
+                provider_context_length=303_872,
+            )
+
+        dispatch_mock.assert_not_awaited()
+        self.assertEqual(233_466, requests[0]["body"]["max_tokens"])
+        metadata = [
+            event["payload"]
+            for event in events
+            if event.get("event_type")
+            == "debug.provider.metadata.resolved"
+        ]
+        self.assertEqual("initial_primary", metadata[0]["resolution_boundary"])
+        self.assertEqual(250_368, metadata[0]["context_length"])
+
+    async def test_overflow_feedback_updates_context_before_forced_compression(self):
+        overflow_error = (
+            "maximum context length is 10000 tokens; requested 256 output "
+            "tokens; prompt contains at least 8800 input tokens"
+        )
+        with (
+            patch(
+                "agent_loop.ContextCompressor.set_context_length",
+                autospec=True,
+            ) as set_context_length,
+            patch(
+                "agent_loop.record_provider_context_limit",
+            ) as record_context_limit,
+        ):
+            _requests, dispatch_mock, events = await self._run_stream_sequence(
+                [_FakeHTTPErrorLineResponse(400, overflow_error)],
+                max_iterations=1,
+                enabled_tool="",
+                task_text="answer directly",
+                requested_max_tokens=256,
+                provider_context_length=303_872,
+            )
+
+        dispatch_mock.assert_not_awaited()
+        self.assertEqual(
+            10_000,
+            set_context_length.call_args.args[1],
+        )
+        self.assertEqual(
+            10_000,
+            record_context_limit.call_args.args[1],
+        )
+        corrected = [
+            event["payload"]
+            for event in events
+            if event.get("event_type")
+            == "debug.provider.metadata.corrected"
+        ]
+        self.assertEqual(1, len(corrected))
+        self.assertEqual(10_000, corrected[0]["context_length"])
+        self.assertIsNone(corrected[0]["effective_max_tokens"])
+        self.assertEqual(
+            "force_compression",
+            corrected[0]["recovery_action"],
+        )
+
+    async def test_fallback_runtime_metadata_is_resolved_only_at_switch(self):
+        resolved_ids = []
+
+        async def resolve_runtime(provider):
+            resolved_ids.append(str(provider.get("id") or ""))
+            resolved = dict(provider)
+            resolved["context_length"] = (
+                120_000
+                if resolved.get("id") == "fallback-runtime"
+                else 250_368
+            )
+            return resolved, {
+                "status": "runtime_catalog",
+                "context_length": resolved["context_length"],
+                "metadata_applied": True,
+            }
+
+        fallback = {
+            "id": "fallback-runtime",
+            "base_url": "http://fallback.invalid/v1",
+            "api_model": "fallback-runtime",
+            "api_key": "EMPTY",
+            "protocol": "openai",
+            "provider": "mock",
+            "context_length": 303_872,
+            "is_multimodal": False,
+        }
+        with patch(
+            "agent_loop.resolve_provider_runtime_metadata",
+            side_effect=resolve_runtime,
+        ):
+            requests, dispatch_mock, events = await self._run_stream_sequence(
+                [
+                    _FakeHTTPErrorLineResponse(401, "unauthorized"),
+                    self._stop_lines("fallback answer"),
+                ],
+                max_iterations=2,
+                enabled_tool="",
+                task_text="answer directly",
+                fallback_overrides=[fallback],
+            )
+
+        dispatch_mock.assert_not_awaited()
+        self.assertEqual(
+            ["mock-tool-stream-repair", "fallback-runtime"],
+            resolved_ids,
+        )
+        self.assertEqual(
+            ["http://model.invalid/v1/chat/completions",
+             "http://fallback.invalid/v1/chat/completions"],
+            [request["url"] for request in requests],
+        )
+        metadata_boundaries = [
+            event["payload"]["resolution_boundary"]
+            for event in events
+            if event.get("event_type")
+            == "debug.provider.metadata.resolved"
+        ]
+        self.assertEqual(
+            ["initial_primary", "provider_switch"],
+            metadata_boundaries,
+        )
 
     @staticmethod
     def _valid_tool_lines(
@@ -1433,6 +1693,10 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2048, repair_request["payload"]["effective_max_tokens"])
 
     async def test_large_argument_write_repair_keeps_normal_budget_thinking_off(self):
+        # write_file is not a read-only tool, so no batch here is ever
+        # salvageable; every corrupt sample burns one no-progress recovery
+        # until the bounded ladder (3 consecutive no-progress recoveries) is
+        # exhausted with no trusted tool result available for synthesis.
         requests, dispatch_mock, events = await self._run_stream_sequence(
             [
                 self._partial_corrupt_lines(
@@ -1444,14 +1708,34 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
                     tool_name="write_file",
                     argument_name="content",
                 ),
+                self._partial_corrupt_lines(
+                    content="third-corrupt-write-anchor",
+                    tool_name="write_file",
+                    argument_name="content",
+                ),
+                self._partial_corrupt_lines(
+                    content="fourth-corrupt-write-anchor",
+                    tool_name="write_file",
+                    argument_name="content",
+                ),
+                self._partial_corrupt_lines(
+                    content="fifth-corrupt-write-anchor",
+                    tool_name="write_file",
+                    argument_name="content",
+                ),
             ],
             enabled_tool="write_file",
             delegated=True,
+            max_iterations=15,
         )
 
-        self.assertEqual(["stream", "stream", "fallback"], [
-            request["kind"] for request in requests
-        ])
+        self.assertEqual(
+            [
+                "stream", "stream", "fallback", "stream", "fallback",
+                "stream", "fallback",
+            ],
+            [request["kind"] for request in requests],
+        )
         repair_body = requests[1]["body"]
         self.assertEqual(8192, repair_body.get("max_tokens"))
         self.assertEqual("required", repair_body.get("tool_choice"))
@@ -1478,8 +1762,12 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
             event for event in events if event.get("event_type") == "run.failed"
         )
         self.assertEqual(
-            "provider_tool_stream_corrupt_after_repair",
+            "provider_tool_stream_recovery_exhausted",
             terminal["payload"]["finish_reason"],
+        )
+        self.assertEqual(
+            "consecutive_no_progress_limit_exhausted",
+            terminal["payload"]["replan_unavailable_reason"],
         )
 
     async def test_visible_length_after_tool_stream_repair_closes_once(self):
@@ -1523,29 +1811,40 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("tools", requests[-1]["body"])
         self.assertEqual(events[-1]["type"], "done")
 
-    async def test_repair_multi_call_batch_is_terminal_and_dispatches_nothing(self):
+    async def test_repair_multi_call_batch_salvages_and_dispatches_both_calls(self):
+        # A two-call repair batch is no longer discarded wholesale: both calls
+        # are read-only, so they are salvaged from the "wrong call count"
+        # batch. The first dispatches immediately; the second is unresolved
+        # (the repair gate expects exactly one call) and is replanned once
+        # under the same closed schema, then dispatched too.
         requests, dispatch_mock, events = await self._run_stream_sequence([
             self._partial_corrupt_lines(),
             self._valid_parallel_tool_lines(),
-        ])
+            self._valid_tool_lines("second.md"),
+            self._stop_lines("done"),
+        ], max_iterations=10)
 
-        self.assertEqual(["stream", "stream"], [
+        self.assertEqual(["stream", "stream", "stream", "stream"], [
             request["kind"] for request in requests
         ])
         self.assertIs(False, requests[1]["body"].get("parallel_tool_calls"))
-        dispatch_mock.assert_not_awaited()
-        self.assertFalse(any(event.get("type") == "tool_progress" and
-                             str(event.get("msg", "")).startswith("🔧")
-                             for event in events))
-        failed = next(
-            event for event in events if event.get("event_type") == "run.failed"
-        )
+        self.assertEqual(2, dispatch_mock.await_count)
         self.assertEqual(
-            "provider_tool_stream_repair_call_count_mismatch",
-            failed["payload"]["finish_reason"],
+            [{"filepath": "first.md"}, {"filepath": "second.md"}],
+            [call.args[1] for call in dispatch_mock.await_args_list],
         )
-        self.assertEqual(1, failed["payload"]["expected_logical_call_count"])
-        self.assertEqual(2, failed["payload"]["actual_logical_call_count"])
+        salvage_accepted = [
+            event for event in events
+            if event.get("event_type") == "debug.tool.stream.salvage.accepted"
+        ]
+        self.assertEqual(1, len(salvage_accepted))
+        self.assertEqual(
+            "repair_call_count_mismatch",
+            salvage_accepted[0]["payload"]["source"],
+        )
+        self.assertTrue(any(
+            event.get("event_type") == "run.completed" for event in events
+        ))
 
     async def test_rejected_parallel_hint_keeps_local_exact_one_gate(self):
         requests, dispatch_mock, events = await self._run_stream_sequence([
@@ -1582,7 +1881,11 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
             fallback_debug["payload"]["fallback"],
         )
 
-    async def test_rejected_parallel_hint_does_not_allow_multi_call_repair(self):
+    async def test_rejected_parallel_hint_salvages_and_dispatches_both_calls(self):
+        # Even after the parallel_tool_calls compat fallback, a two-call batch
+        # is salvaged (both calls are read-only) rather than discarded: the
+        # first call dispatches immediately and the second is replanned once
+        # under the same closed schema before it also dispatches.
         requests, dispatch_mock, events = await self._run_stream_sequence([
             self._partial_corrupt_lines(),
             _FakeHTTPErrorLineResponse(
@@ -1590,22 +1893,30 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
                 '{"error":"unsupported parameter parallel_tool_calls"}',
             ),
             self._valid_parallel_tool_lines(),
-        ])
+            self._valid_tool_lines("second.md"),
+            self._stop_lines("done"),
+        ], max_iterations=10)
 
-        self.assertEqual(3, len(requests))
+        self.assertEqual(5, len(requests))
         self.assertIs(False, requests[1]["body"].get("parallel_tool_calls"))
         self.assertNotIn("parallel_tool_calls", requests[2]["body"])
-        dispatch_mock.assert_not_awaited()
-        failed = next(
-            event for event in events if event.get("event_type") == "run.failed"
-        )
+        self.assertEqual(2, dispatch_mock.await_count)
         self.assertEqual(
-            "provider_tool_stream_repair_call_count_mismatch",
-            failed["payload"]["finish_reason"],
+            [{"filepath": "first.md"}, {"filepath": "second.md"}],
+            [call.args[1] for call in dispatch_mock.await_args_list],
         )
-        self.assertEqual(2, failed["payload"]["actual_logical_call_count"])
+        self.assertTrue(any(
+            event.get("event_type") == "run.completed" for event in events
+        ))
 
     async def test_second_corrupt_batch_after_continuation_is_terminal(self):
+        # A second corrupt batch no longer fails closed immediately: each
+        # further corrupt repair-turn sample first gets one bounded exact-one
+        # replan attempt (progress_made=False each time, since every sample is
+        # corrupt), consuming the no-progress recovery budget. Only once that
+        # budget (_MAX_TOOL_STREAM_CONSECUTIVE_NO_PROGRESS_RECOVERIES == 3) is
+        # exhausted, with no trusted tool result to synthesize from, does the
+        # run terminate.
         requests, dispatch_mock, events = await self._run_stream_sequence([
             self._partial_corrupt_lines(),
             self._partial_corrupt_lines(
@@ -1613,11 +1924,30 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
                 reasoning="second-hidden-reasoning",
                 argument_secret="second-raw-argument",
             ),
-        ])
+            self._partial_corrupt_lines(
+                content="third-safe-anchor",
+                reasoning="third-hidden-reasoning",
+                argument_secret="third-raw-argument",
+            ),
+            self._partial_corrupt_lines(
+                content="fourth-safe-anchor",
+                reasoning="fourth-hidden-reasoning",
+                argument_secret="fourth-raw-argument",
+            ),
+            self._partial_corrupt_lines(
+                content="fifth-safe-anchor",
+                reasoning="fifth-hidden-reasoning",
+                argument_secret="fifth-raw-argument",
+            ),
+        ], max_iterations=10)
 
-        self.assertEqual(["stream", "stream", "fallback"], [
-            request["kind"] for request in requests
-        ])
+        self.assertEqual(
+            [
+                "stream", "stream", "fallback", "stream", "fallback",
+                "stream", "fallback",
+            ],
+            [request["kind"] for request in requests],
+        )
         self.assertEqual("required", requests[1]["body"].get("tool_choice"))
         self.assertIs(False, requests[1]["body"].get("parallel_tool_calls"))
         self.assertEqual(8192, requests[1]["body"].get("max_tokens"))
@@ -1638,8 +1968,20 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
             event for event in events if event.get("event_type") == "run.failed"
         )
         self.assertEqual(
-            "provider_tool_stream_corrupt_after_repair",
+            "provider_tool_stream_recovery_exhausted",
             failed["payload"]["finish_reason"],
+        )
+        self.assertEqual(3, failed["payload"]["run_recovery_count"])
+        self.assertEqual(
+            3, failed["payload"]["consecutive_no_progress_recoveries"]
+        )
+        self.assertEqual(
+            "consecutive_no_progress_limit_exhausted",
+            failed["payload"]["replan_unavailable_reason"],
+        )
+        self.assertEqual(
+            "no_trusted_successful_tool_result",
+            failed["payload"]["synthesis_unavailable_reason"],
         )
         terminal_usage = failed["payload"]["usage"]
         self.assertGreater(terminal_usage["input_tokens"], 0)
@@ -1654,14 +1996,15 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
             if event.get("event_type")
             == "debug.tool.stream.continuation_repair.failed"
         ]
-        self.assertEqual(1, len(repair_failures))
-        self.assertEqual(
-            "second_corrupt_batch",
-            repair_failures[0]["payload"]["reason"],
-        )
-        self.assertTrue(
-            repair_failures[0]["payload"]["bounded_atomic_tool_call_turn"]
-        )
+        self.assertEqual(3, len(repair_failures))
+        for repair_failure in repair_failures:
+            self.assertEqual(
+                "corrupt_replan_sample",
+                repair_failure["payload"]["reason"],
+            )
+            self.assertTrue(
+                repair_failure["payload"]["bounded_atomic_tool_call_turn"]
+            )
 
     async def test_new_corruption_after_repaired_dispatch_gets_new_episode(self):
         requests, dispatch_mock, events = await self._run_stream_sequence(
@@ -2002,29 +2345,30 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
             [
                 self._partial_corrupt_lines(),
                 self._partial_corrupt_lines(content="discarded repair text"),
+                self._valid_tool_lines("second.md"),
+                self._stop_lines("done"),
             ],
             repair_fallback_payload=fallback_payload,
+            max_iterations=5,
         )
 
         self.assertEqual(
-            ["stream", "stream", "fallback"],
+            ["stream", "stream", "fallback", "stream", "stream"],
             [request["kind"] for request in requests],
         )
-        dispatch_mock.assert_not_awaited()
-        self.assertFalse(any(
-            event.get("event_type") == "tool.dispatch_started"
+        self.assertEqual(2, dispatch_mock.await_count)
+        self.assertEqual(
+            [{"filepath": "first.md"}, {"filepath": "second.md"}],
+            [call.args[1] for call in dispatch_mock.await_args_list],
+        )
+        self.assertEqual(1, sum(
+            event.get("event_type") == "debug.tool.stream.salvage.accepted"
             for event in events
         ))
-        failed = next(
-            event for event in events if event.get("event_type") == "run.failed"
-        )
-        self.assertEqual(
-            "provider_tool_stream_repair_call_count_mismatch",
-            failed["payload"]["finish_reason"],
-        )
-        self.assertEqual(1, failed["payload"]["expected_logical_call_count"])
-        self.assertEqual(2, failed["payload"]["actual_logical_call_count"])
-        self.assertIs(True, failed["payload"]["transport_replacement_used"])
+        self.assertTrue(any(
+            event.get("event_type") == "run.completed"
+            for event in events
+        ))
 
     async def test_nonstream_repair_replacement_keeps_pure_preflight(self):
         fallback_payload = {
@@ -2080,42 +2424,59 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
         ))
 
     async def test_nonstream_repair_transport_failure_is_bounded(self):
+        # Every non-stream repair attempt hits the same transport failure, so
+        # no batch is ever salvageable via the fallback path either; each
+        # corrupt sample burns one no-progress recovery until the bounded
+        # ladder (3 consecutive no-progress recoveries) is exhausted with no
+        # trusted tool result available for synthesis.
         requests, dispatch_mock, events = await self._run_stream_sequence(
             [
                 self._partial_corrupt_lines(),
-                self._partial_corrupt_lines(content="discarded repair text"),
+                self._partial_corrupt_lines(content="second-corrupt-anchor"),
+                self._partial_corrupt_lines(content="third-corrupt-anchor"),
+                self._partial_corrupt_lines(content="fourth-corrupt-anchor"),
+                self._partial_corrupt_lines(content="fifth-corrupt-anchor"),
             ],
             repair_fallback_payload=_FakeJSONResponse({}, status_code=503),
+            max_iterations=15,
         )
 
         self.assertEqual(
-            ["stream", "stream", "fallback"],
+            [
+                "stream", "stream", "fallback", "stream", "fallback",
+                "stream", "fallback",
+            ],
             [request["kind"] for request in requests],
         )
         dispatch_mock.assert_not_awaited()
-        failed_transport = next(
+        failed_transport = [
             event for event in events
             if event.get("event_type")
             == (
                 "debug.tool.stream.continuation_repair."
                 "transport_fallback.failed"
             )
-        )
+        ]
+        self.assertEqual(3, len(failed_transport))
         self.assertEqual(
-            "http_error", failed_transport["payload"]["failure_kind"]
+            "http_error", failed_transport[0]["payload"]["failure_kind"]
         )
-        self.assertEqual(503, failed_transport["payload"]["http_status"])
+        self.assertEqual(503, failed_transport[0]["payload"]["http_status"])
         iteration_events = [
             event for event in events
             if event.get("event_type") == "debug.iteration.started"
         ]
-        self.assertEqual(2, len(iteration_events))
+        self.assertEqual(4, len(iteration_events))
         terminal = next(
             event for event in events if event.get("event_type") == "run.failed"
         )
         self.assertEqual(
-            "provider_tool_stream_corrupt_after_repair",
+            "provider_tool_stream_recovery_exhausted",
             terminal["payload"]["finish_reason"],
+        )
+        self.assertEqual(
+            "consecutive_no_progress_limit_exhausted",
+            terminal["payload"]["replan_unavailable_reason"],
         )
 
     async def test_delegated_post_dispatch_repair_failure_synthesizes_once(self):
@@ -2541,13 +2902,18 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
             [
                 self._partial_corrupt_lines(),
                 self._partial_corrupt_lines(content="still-corrupt"),
+                self._partial_corrupt_lines(content="third-corrupt"),
+                self._partial_corrupt_lines(content="fourth-corrupt"),
             ],
             max_iterations=5,
             delegated=True,
         )
 
         self.assertEqual(
-            ["stream", "stream", "fallback"],
+            [
+                "stream", "stream", "fallback", "stream", "fallback",
+                "stream", "fallback",
+            ],
             [request["kind"] for request in requests],
         )
         dispatch_mock.assert_not_awaited()
@@ -2561,7 +2927,7 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
             event for event in events if event.get("event_type") == "run.failed"
         )
         self.assertEqual(
-            "provider_tool_stream_corrupt_after_repair",
+            "provider_tool_stream_recovery_exhausted",
             failed["payload"]["finish_reason"],
         )
 
@@ -2571,6 +2937,8 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
                 self._valid_tool_lines("outside-compiled-closure.md"),
                 self._partial_corrupt_lines(),
                 self._partial_corrupt_lines(content="repair-still-corrupt"),
+                self._partial_corrupt_lines(content="third-corrupt"),
+                self._partial_corrupt_lines(content="fourth-corrupt"),
             ],
             max_iterations=5,
             delegated=True,
@@ -2579,7 +2947,10 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(
-            ["stream", "stream", "stream", "fallback"],
+            [
+                "stream", "stream", "stream", "fallback",
+                "stream", "fallback", "stream", "fallback",
+            ],
             [request["kind"] for request in requests],
         )
         dispatch_mock.assert_not_awaited()
@@ -2601,7 +2972,7 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
             event for event in events if event.get("event_type") == "run.failed"
         )
         self.assertEqual(
-            "provider_tool_stream_corrupt_after_repair",
+            "provider_tool_stream_recovery_exhausted",
             failed["payload"]["finish_reason"],
         )
 
@@ -6256,18 +6627,28 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
 
         requests, dispatch_mock, events = await self._run_case(fallback_payload)
 
-        # One corrupt stream plus exactly one non-stream fallback.  The invalid
-        # fallback never re-enters MAX_RETRIES or starts a model continuation.
+        # One corrupt stream plus exactly one non-stream fallback.  With the
+        # default tiny iteration budget in this fixture, no exact-one replan
+        # or evidence synthesis has budget remaining, so the bounded recovery
+        # ladder is exhausted immediately after the single fallback attempt.
         self.assertEqual(2, len(requests))
         dispatch_mock.assert_not_awaited()
         self.assertEqual("error", events[-1]["type"])
-        self.assertIn("single non-stream recovery batch", events[-1]["msg"])
+        self.assertIn("bounded recovery ladder", events[-1]["msg"])
         failed = next(
             event for event in events if event.get("event_type") == "run.failed"
         )
         self.assertEqual(
-            "provider_tool_stream_corrupt",
+            "provider_tool_stream_recovery_exhausted",
             failed["payload"]["finish_reason"],
+        )
+        self.assertEqual(
+            "iteration_budget_exhausted",
+            failed["payload"]["replan_unavailable_reason"],
+        )
+        self.assertEqual(
+            "iteration_budget_exhausted",
+            failed["payload"]["synthesis_unavailable_reason"],
         )
         fallback_events = [
             event for event in events

@@ -15,6 +15,7 @@ async def submit_skill_capability_plan(
     required: list[str],
     optional: list[str],
     unsupported: list[dict[str, str]],
+    catalog_sha256: str | None = None,
     context: ToolContext | None = None,
 ) -> str:
     """Select only capabilities issued in the current runtime catalog."""
@@ -31,6 +32,7 @@ async def submit_skill_capability_plan(
             required=required,
             optional=optional,
             unsupported=unsupported,
+            catalog_sha256=catalog_sha256,
         )
         return json.dumps(result.payload, ensure_ascii=False)
     try:
@@ -64,6 +66,43 @@ async def submit_skill_capability_plan(
             "expected_body_sha256": catalog.get("body_sha256"),
             "current_body_sha256": current_digest,
         }, ensure_ascii=False)
+    authority_documents = catalog.get("authority_documents") or []
+    if authority_documents:
+        try:
+            from skills.path_safety import validate_skill_resource
+
+            package_root = current_main.parent.resolve(strict=True)
+            for document in authority_documents:
+                if not isinstance(document, dict):
+                    raise ValueError("malformed catalog authority document")
+                resource_path = document.get("resource_path")
+                expected_digest = document.get("sha256")
+                checked = validate_skill_resource(
+                    package_root,
+                    resource_path,
+                    expected_kind="file",
+                    require_relative=True,
+                )
+                if not checked.valid or checked.path is None:
+                    raise ValueError(
+                        f"authority resource is unavailable: {resource_path}"
+                    )
+                actual_digest = __import__("hashlib").sha256(
+                    checked.path.read_bytes()
+                ).hexdigest()
+                if actual_digest != expected_digest:
+                    raise ValueError(
+                        f"authority resource changed: {resource_path}"
+                    )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            return json.dumps({
+                "status": "error",
+                "error_code": "capability_plan_authority_changed",
+                "error": (
+                    "A content-addressed reference changed after disclosure; "
+                    f"read it again before amending the plan: {exc}"
+                ),
+            }, ensure_ascii=False)
     result = validate_capability_plan(
         catalog,
         skill_name=skill_name,
@@ -71,6 +110,7 @@ async def submit_skill_capability_plan(
         required=required,
         optional=optional,
         unsupported=unsupported,
+        catalog_sha256=catalog_sha256,
     )
     return json.dumps(result.payload, ensure_ascii=False)
 
@@ -81,7 +121,9 @@ SUBMIT_SKILL_CAPABILITY_PLAN_SCHEMA: dict[str, Any] = {
         "After reading every page of the selected standard Skill's canonical "
         "SKILL.md, classify only backend-issued capability IDs as required or "
         "optional and record instructions unsupported by the finite catalog. "
-        "This tool cannot create grants."
+        "If the Harness later exposes a content-addressed catalog amendment, "
+        "submit one replacement plan with its exact catalog_sha256. This tool "
+        "cannot create grants."
     ),
     "parameters": {
         "type": "object",
@@ -95,6 +137,14 @@ SUBMIT_SKILL_CAPABILITY_PLAN_SCHEMA: dict[str, Any] = {
                 "type": "string",
                 "pattern": "^[0-9a-f]{64}$",
             },
+            "catalog_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": (
+                    "Required for a non-zero catalog revision; copy the exact "
+                    "content-addressed catalog digest."
+                ),
+            },
             "required": {
                 "type": "array",
                 "items": {"type": "string", "minLength": 1, "maxLength": 64},
@@ -103,7 +153,7 @@ SUBMIT_SKILL_CAPABILITY_PLAN_SCHEMA: dict[str, Any] = {
             "optional": {
                 "type": "array",
                 "items": {"type": "string", "minLength": 1, "maxLength": 64},
-                "maxItems": 256,
+                "maxItems": 32,
             },
             "unsupported": {
                 "type": "array",

@@ -1,0 +1,4 @@
+#!/usr/local/bin/python -I
+from chatds_browser_runtime.healthcheck import main
+
+raise SystemExit(main())

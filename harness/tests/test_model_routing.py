@@ -179,7 +179,13 @@ class AgenticModelRoutingRunStreamTests(unittest.IsolatedAsyncioTestCase):
         requests, events = await self._run([
             {"role": "user", "content": "Explain deterministic routing."},
         ])
-        self.assertEqual("AgentModel", requests[0]["body"]["model"])
+        model_requests = [
+            request
+            for request in requests
+            if isinstance(request.get("body"), dict)
+            and request["url"].endswith("/chat/completions")
+        ]
+        self.assertEqual("AgentModel", model_requests[0]["body"]["model"])
         started = next(
             event for event in events
             if event.get("event_type") == "run.started"
@@ -211,7 +217,13 @@ class AgenticModelRoutingRunStreamTests(unittest.IsolatedAsyncioTestCase):
                 },
             ],
         }])
-        self.assertEqual("qwen3_5", requests[0]["body"]["model"])
+        model_requests = [
+            request
+            for request in requests
+            if isinstance(request.get("body"), dict)
+            and request["url"].endswith("/chat/completions")
+        ]
+        self.assertEqual("qwen3_5", model_requests[0]["body"]["model"])
         started = next(
             event for event in events
             if event.get("event_type") == "run.started"

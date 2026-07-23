@@ -967,7 +967,9 @@ def delegated_resource_boundary_error(
     at registry dispatch as well as prompt level so a model cannot widen it by
     inventing arguments or by using the deferred-tool wrapper.
     """
-    runner_tools = {"run_skill_python", "run_skill_script"}
+    runner_tools = {
+        "run_skill_process", "run_skill_python", "run_skill_script",
+    }
     if context is None:
         if name in runner_tools:
             return (
@@ -982,7 +984,7 @@ def delegated_resource_boundary_error(
         return None
     bounded_resource_tools = {
         "skill_view", "skill_copy_resource", "read_file",
-        "run_skill_python", "run_skill_script",
+        "run_skill_process", "run_skill_python", "run_skill_script",
     }
     if name not in bounded_resource_tools:
         return None
@@ -993,6 +995,14 @@ def delegated_resource_boundary_error(
         )
 
     if name in runner_tools:
+        if (
+            name == "run_skill_process"
+            and str(args.get("operation") or "") != "start"
+        ):
+            # A process handle is runtime-issued, owner-scoped authority. The
+            # process tool must revalidate that opaque lease and op_id; package
+            # path authorization applies only to start.
+            return None
         raw_script_path = _canonical_boundary_path(args.get("script_path"))
         if (
             raw_script_path is None
@@ -1046,7 +1056,103 @@ def delegated_resource_boundary_error(
                     if checked.valid and checked.path is not None:
                         actual = hashlib.sha256(checked.path.read_bytes()).hexdigest()
                         if actual in grants:
-                            return None
+                            exact_grant = (
+                                skill_name,
+                                script_resource,
+                                actual,
+                            )
+                            if (
+                                name in {
+                                    "run_skill_python",
+                                    "run_skill_script",
+                                }
+                                and exact_grant
+                                in set(
+                                    context.process_only_skill_scripts
+                                )
+                            ):
+                                return (
+                                    "This exact Skill entrypoint is bound to "
+                                    "the browser-automation runtime and may be "
+                                    "executed only through run_skill_process; "
+                                    "the one-shot/base executor is not an "
+                                    "authorized fallback."
+                                )
+                            package_grants = {
+                                package_digest
+                                for granted_skill, package_digest
+                                in context.allowed_skill_package_digests
+                                if granted_skill == skill_name
+                            }
+                            if name == "run_skill_process" or package_grants:
+                                if not package_grants:
+                                    return (
+                                        "Persistent Skill execution requires "
+                                        "a runtime-owned complete package "
+                                        "digest. Recompile the exact Skill "
+                                        "before starting it."
+                                    )
+                                from tools.isolated_skill_executor import (
+                                    compute_skill_package_digest,
+                                )
+
+                                package_digest = compute_skill_package_digest(
+                                    package_root
+                                )
+                                if package_digest not in package_grants:
+                                    return (
+                                        f"Delegated resource boundary rejected "
+                                        f"{name} because the authorized Skill "
+                                        "package changed after compilation: "
+                                        f"{raw_script_path}. Recompile the "
+                                        "Skill before executing it."
+                                    )
+                            authorities = [
+                                row
+                                for row in context.allowed_skill_script_authorities
+                                if (
+                                    len(row) == 6
+                                    and row[0] == skill_name
+                                    and row[4] == script_resource
+                                    and row[5] == actual
+                                )
+                            ]
+                            if not authorities:
+                                if name == "run_skill_process":
+                                    return (
+                                        "Persistent Skill execution requires "
+                                        "the exact root/reference/script "
+                                        "authority chain. Recompile the Skill "
+                                        "before starting it."
+                                    )
+                                return None
+                            current_root_digest = hashlib.sha256(
+                                skill_md.read_bytes()
+                            ).hexdigest()
+                            for (
+                                _granted_skill,
+                                root_digest,
+                                declaring_resource,
+                                declaring_digest,
+                                _script_resource,
+                                _script_digest,
+                            ) in authorities:
+                                if current_root_digest != root_digest:
+                                    continue
+                                declaring = validate_skill_resource(
+                                    package_root,
+                                    declaring_resource,
+                                    expected_kind="file",
+                                    require_relative=True,
+                                )
+                                if (
+                                    declaring.valid
+                                    and declaring.path is not None
+                                    and hashlib.sha256(
+                                        declaring.path.read_bytes()
+                                    ).hexdigest() == declaring_digest
+                                ):
+                                    return None
                 except (OSError, RuntimeError, ValueError):
                     pass
                 return (
@@ -1324,7 +1430,7 @@ class ToolEntry:
         "accepts_enabled_user_skills", "is_read_only", "is_destructive",
         "parallel_safe", "path_scoped", "allow_in_child",
         "allow_in_parallel_child", "mutates_workspace", "mutates_global_state",
-        "requires_user_visibility",
+        "requires_user_visibility", "salvage_safe", "external_interaction",
     )
 
     def __init__(
@@ -1347,6 +1453,8 @@ class ToolEntry:
         mutates_workspace: bool | None = None,
         mutates_global_state: bool = False,
         requires_user_visibility: bool = False,
+        salvage_safe: bool = False,
+        external_interaction: bool = False,
     ):
         self.name = name
         self.toolset = toolset
@@ -1380,6 +1488,13 @@ class ToolEntry:
         self.mutates_workspace = (not is_read_only and path_scoped) if mutates_workspace is None else mutates_workspace
         self.mutates_global_state = mutates_global_state
         self.requires_user_visibility = requires_user_visibility
+        # ``read_only`` describes the tool's data mutation contract.  It does
+        # not by itself make a call safe to recover from a structurally corrupt
+        # provider batch: network reads, browser navigation, and other
+        # externally observable operations may still be costly or stateful.
+        # Corrupt-batch salvage is therefore an explicit, narrower opt-in.
+        self.salvage_safe = bool(salvage_safe)
+        self.external_interaction = bool(external_interaction)
 
 
 # ── ToolRegistry ───────────────────────────────────────────────────────────
@@ -1412,6 +1527,8 @@ class ToolRegistry:
         mutates_workspace: bool | None = None,
         mutates_global_state: bool = False,
         requires_user_visibility: bool = False,
+        salvage_safe: bool = False,
+        external_interaction: bool = False,
     ):
         """Register a tool. Called at module-import time by each tool file."""
         existing = self._tools.get(name)
@@ -1439,6 +1556,8 @@ class ToolRegistry:
             mutates_workspace=mutates_workspace,
             mutates_global_state=mutates_global_state,
             requires_user_visibility=requires_user_visibility,
+            salvage_safe=salvage_safe,
+            external_interaction=external_interaction,
         )
 
     def deregister(self, name: str) -> None:
@@ -1507,6 +1626,8 @@ class ToolRegistry:
             "mutates_workspace": entry.mutates_workspace,
             "mutates_global_state": entry.mutates_global_state,
             "requires_user_visibility": entry.requires_user_visibility,
+            "salvage_safe": entry.salvage_safe,
+            "external_interaction": entry.external_interaction,
             "toolset": entry.toolset,
         }
 
@@ -2015,6 +2136,8 @@ def register(
     mutates_workspace: bool | None = None,
     mutates_global_state: bool = False,
     requires_user_visibility: bool = False,
+    salvage_safe: bool = False,
+    external_interaction: bool = False,
 ):
     """Register a tool with the default registry."""
     registry.register(
@@ -2036,6 +2159,8 @@ def register(
         mutates_workspace=mutates_workspace,
         mutates_global_state=mutates_global_state,
         requires_user_visibility=requires_user_visibility,
+        salvage_safe=salvage_safe,
+        external_interaction=external_interaction,
     )
 
 
