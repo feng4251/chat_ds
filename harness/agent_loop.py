@@ -25,6 +25,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, AsyncIterator, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -108,6 +109,7 @@ from tools.omission_guard import (
 from tools.registry import (
     JSON_SCHEMA_LOSSLESS_KEYWORDS,
     dispatch,
+    get_metadata,
     get_schemas,
     json_schema_shape_error,
     preflight as preflight_tool,
@@ -319,6 +321,11 @@ _MAX_DELEGATE_SYNTHESIS_LENGTH_CONTINUATIONS = 1
 # reasoning-only recovery.  It remains distinct from the reserved final
 # synthesis continuation above and never increases the iteration budget.
 _MAX_DELEGATE_VISIBLE_LENGTH_RECOVERIES = 1
+# Tool-protocol recovery is bounded both by consecutive no-progress turns and
+# by a run-wide ceiling. A real handler dispatch resets only the consecutive
+# counter; the run-wide limit remains an absolute convergence guard.
+_MAX_TOOL_STREAM_CONSECUTIVE_NO_PROGRESS_RECOVERIES = 3
+_MAX_TOOL_STREAM_RUN_RECOVERIES = 8
 _VERIFIED_PRELOADED_INPUT_RECEIPT_VERSION = 1
 _MAX_VERIFIED_PRELOADED_INPUT_SOURCES = 128
 _VERIFIED_PRELOADED_INPUT_KINDS = frozenset({"read_file", "skill_view"})
@@ -846,6 +853,12 @@ def _omitted_argument_summary(kind: str, chars: int) -> dict[str, Any]:
 
 def _compact_tool_argument_value(value: Any, *, tool_name: str, key: str = "", filepath: str = "") -> Any:
     if isinstance(value, str):
+        if key == "url" and tool_name in {"web_extract", "browser_navigate"}:
+            return {
+                "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+                "chars": len(value),
+                "reason": "URL omitted from observability payload",
+            }
         omit_written_content = (
             tool_name in {"write_file", "patch_file", "skill_manage"}
             and key in {"content", "old_text", "new_text", "file_content"}
@@ -7377,6 +7390,180 @@ def _declared_workflow_batch_preflight(
     return prepared, failures, audit
 
 
+@dataclass(frozen=True)
+class _CorruptToolCallSalvage:
+    calls: tuple[AssembledStreamToolCall, ...]
+    unresolved_count: int
+    debug: dict[str, Any]
+
+
+def _classify_corrupt_tool_call_salvage(
+    assembly: ToolCallStreamAssembly,
+    *,
+    exposed_tool_names: set[str],
+    tool_context: ToolContext,
+    workflow_policy: dict[str, Any] | None,
+    max_safe_calls: int | None = None,
+) -> _CorruptToolCallSalvage:
+    """Select only independently complete, side-effect-free native calls."""
+
+    safe_calls: list[AssembledStreamToolCall] = []
+    seen_read_only_calls: set[tuple[str, str]] = set()
+    duplicate_count = 0
+    side_effect_blocked_count = 0
+    preflight_rejected_count = 0
+    workflow_rejected_count = 0
+    safe_call_limit_count = 0
+    logical_call_count = max(
+        len(assembly.complete_calls),
+        int(assembly.debug.get("logical_call_count") or 0),
+    )
+    incomplete_count = max(
+        0,
+        logical_call_count - len(assembly.complete_calls),
+    )
+
+    for candidate in assembly.complete_calls:
+        metadata = get_metadata(candidate.name)
+        if not (
+            candidate.name in exposed_tool_names
+            and isinstance(metadata, dict)
+            and metadata.get("read_only") is True
+            and metadata.get("destructive") is False
+            and metadata.get("mutates_workspace") is False
+            and metadata.get("mutates_global_state") is False
+        ):
+            side_effect_blocked_count += 1
+            continue
+
+        parsed_args = _safe_parse_args(candidate.arguments)
+        if (
+            not isinstance(parsed_args, dict)
+            or "__tool_arg_parse_error" in parsed_args
+        ):
+            preflight_rejected_count += 1
+            continue
+        try:
+            canonical_args = json.dumps(
+                parsed_args,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError, UnicodeError):
+            preflight_rejected_count += 1
+            continue
+
+        duplicate_key = (candidate.name, canonical_args)
+        if duplicate_key in seen_read_only_calls:
+            duplicate_count += 1
+            continue
+        seen_read_only_calls.add(duplicate_key)
+
+        validation = preflight_tool(
+            candidate.name,
+            parsed_args,
+            context=tool_context,
+            allowed_tool_names=exposed_tool_names,
+        )
+        if not validation.ok:
+            preflight_rejected_count += 1
+            continue
+        normalized_args = (
+            validation.args if isinstance(validation.args, dict) else {}
+        )
+        workflow_error = _workflow_gate_call_error(
+            workflow_policy,
+            candidate.name,
+            normalized_args,
+            prior_call_count=len(safe_calls),
+        )
+        if workflow_error:
+            workflow_rejected_count += 1
+            continue
+        if max_safe_calls is not None and len(safe_calls) >= max_safe_calls:
+            safe_call_limit_count += 1
+            continue
+
+        safe_calls.append(AssembledStreamToolCall(
+            call_id=candidate.call_id,
+            name=candidate.name,
+            arguments=canonical_args,
+        ))
+
+    unresolved_count = (
+        incomplete_count
+        + side_effect_blocked_count
+        + preflight_rejected_count
+        + workflow_rejected_count
+        + safe_call_limit_count
+    )
+    debug = {
+        "source_logical_call_count": logical_call_count,
+        "complete_candidate_count": len(assembly.complete_calls),
+        "safe_call_count": len(safe_calls),
+        "duplicate_read_only_call_count": duplicate_count,
+        "incomplete_call_count": incomplete_count,
+        "side_effect_blocked_count": side_effect_blocked_count,
+        "preflight_rejected_count": preflight_rejected_count,
+        "workflow_rejected_count": workflow_rejected_count,
+        "safe_call_limit_count": safe_call_limit_count,
+        "unresolved_call_count": unresolved_count,
+    }
+    return _CorruptToolCallSalvage(
+        calls=tuple(safe_calls),
+        unresolved_count=unresolved_count,
+        debug=debug,
+    )
+
+
+def _dedupe_identical_read_only_tool_calls(
+    calls: tuple[AssembledStreamToolCall, ...],
+) -> tuple[tuple[AssembledStreamToolCall, ...], int]:
+    """Collapse canonical-equal read-only calls without touching other calls."""
+
+    retained: list[AssembledStreamToolCall] = []
+    seen: set[tuple[str, str]] = set()
+    duplicate_count = 0
+    for candidate in calls:
+        metadata = get_metadata(candidate.name)
+        if not (
+            isinstance(metadata, dict)
+            and metadata.get("read_only") is True
+            and metadata.get("destructive") is False
+            and metadata.get("mutates_workspace") is False
+            and metadata.get("mutates_global_state") is False
+        ):
+            retained.append(candidate)
+            continue
+        parsed_args = _safe_parse_args(candidate.arguments)
+        if (
+            not isinstance(parsed_args, dict)
+            or "__tool_arg_parse_error" in parsed_args
+        ):
+            retained.append(candidate)
+            continue
+        try:
+            canonical_args = json.dumps(
+                parsed_args,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError, UnicodeError):
+            retained.append(candidate)
+            continue
+        duplicate_key = (candidate.name, canonical_args)
+        if duplicate_key in seen:
+            duplicate_count += 1
+            continue
+        seen.add(duplicate_key)
+        retained.append(candidate)
+    return tuple(retained), duplicate_count
+
+
 def _normalize_skill_file_path(path: str) -> str:
     """Normalize a skill-relative file path for consistent viewed/required matching.
 
@@ -9667,6 +9854,7 @@ async def run_stream(
     previous_length_content = ""
     forced_workflow_policy: dict[str, Any] | None = None
     pending_workflow_auto_call: dict[str, Any] | None = None
+    direct_url_browser_fallback: dict[str, Any] | None = None
     pending_workflow_contract_compile_failure: dict[str, Any] | None = None
     # A streamed tool-call batch that also contains provider text/reasoning
     # cannot be repaired by grafting a second sample onto the first one. One
@@ -9682,6 +9870,12 @@ async def run_stream(
     tool_stream_continuation_repair_attempted = False
     tool_stream_continuation_repair_episode_count = 0
     pending_tool_stream_continuation_repair: dict[str, Any] | None = None
+    tool_stream_recovery_count = 0
+    tool_stream_consecutive_no_progress_recoveries = 0
+    tool_stream_replan_count = 0
+    tool_stream_evidence_synthesis_count = 0
+    pending_tool_stream_evidence_synthesis = False
+    trusted_dispatched_tool_result_count = 0
     # Deterministic prerequisite reads and agent execution phases have separate
     # bounded allowances. Local Skill reads do not consume LLM iterations or
     # crowd intent/bootstrap/worker/aggregation/synthesis/merge out of the
@@ -11316,6 +11510,28 @@ async def run_stream(
         tool_exposure_reasons = list(direct_exposure.reasons)
         direct_required_tool_groups = list(direct_exposure.required_groups)
         direct_missing_requirements = list(direct_exposure.missing_requirements)
+        if (
+            run_state.execution_mode() == "direct_chat"
+            and "explicit_url_read" in direct_exposure.reasons
+            and "explicit_browser" not in direct_exposure.reasons
+            and {"browser_navigate", "browser_snapshot"}.issubset(
+                set(skill_compiler_tool_universe)
+            )
+        ):
+            direct_url_target = _unique_direct_http_url(
+                run_state.original_user_text
+            )
+            if direct_url_target is not None:
+                direct_url_literal, direct_url_canonical = direct_url_target
+                direct_url_browser_fallback = {
+                    "literal_url": direct_url_literal,
+                    "canonical_url": direct_url_canonical,
+                    "url_sha256": hashlib.sha256(
+                        direct_url_canonical.encode("utf-8")
+                    ).hexdigest(),
+                    "stage": "web_extract",
+                    "attempted": False,
+                }
         direct_mcp_policy = direct_exposure.mcp_policy
         direct_mcp_exact_names = direct_exposure.mcp_exact_names
         effective_allow_session_mcp = bool(
@@ -12184,6 +12400,215 @@ async def run_stream(
             ),
             "recovery_count": 1,
             "max_recoveries": 1,
+            "tools_exposed_next_turn": 0,
+        }
+
+    def queue_tool_stream_exact_one_replan(
+        reason: str,
+        *,
+        closed_tool_schemas: list[dict[str, Any]],
+        closed_deferred_catalog: Any,
+        workflow_policy: dict[str, Any] | None,
+        progress_made: bool,
+        assistant_anchor: str = "",
+        unresolved_count: int = 0,
+    ) -> dict[str, Any]:
+        """Queue one sanitized exact-one call under the unchanged schema surface."""
+
+        nonlocal tool_stream_continuation_repair_attempted
+        nonlocal tool_stream_continuation_repair_episode_count
+        nonlocal pending_tool_stream_continuation_repair
+        nonlocal tool_stream_recovery_count
+        nonlocal tool_stream_consecutive_no_progress_recoveries
+        nonlocal tool_stream_replan_count
+        nonlocal forced_workflow_policy
+        nonlocal previous_length_content
+
+        if budget.remaining <= 0:
+            return {"queued": False, "reason": "iteration_budget_exhausted"}
+        if not closed_tool_schemas:
+            return {"queued": False, "reason": "no_closed_tool_schema"}
+        if tool_stream_recovery_count >= _MAX_TOOL_STREAM_RUN_RECOVERIES:
+            return {"queued": False, "reason": "run_recovery_limit_exhausted"}
+        next_no_progress = (
+            0
+            if progress_made
+            else tool_stream_consecutive_no_progress_recoveries + 1
+        )
+        if (
+            next_no_progress
+            > _MAX_TOOL_STREAM_CONSECUTIVE_NO_PROGRESS_RECOVERIES
+        ):
+            return {
+                "queued": False,
+                "reason": "consecutive_no_progress_limit_exhausted",
+            }
+
+        if progress_made:
+            tool_stream_consecutive_no_progress_recoveries = 0
+        else:
+            tool_stream_consecutive_no_progress_recoveries = next_no_progress
+        tool_stream_recovery_count += 1
+        tool_stream_replan_count += 1
+        if not tool_stream_continuation_repair_attempted:
+            tool_stream_continuation_repair_episode_count += 1
+        tool_stream_continuation_repair_attempted = True
+        pending_tool_stream_continuation_repair = {
+            "tool_schemas": copy.deepcopy(closed_tool_schemas),
+            "deferred_catalog": closed_deferred_catalog,
+            "recovery_reason": reason,
+            "unresolved_count": max(0, int(unresolved_count)),
+        }
+        forced_workflow_policy = copy.deepcopy(workflow_policy)
+        previous_length_content = ""
+        if assistant_anchor.strip():
+            conversation.append({
+                "role": "assistant",
+                "content": assistant_anchor,
+            })
+        conversation.append({
+            "role": "user",
+            "content": (
+                "The preceding provider tool-call batch was structurally invalid. "
+                "Every malformed or unresolved call fragment and all hidden "
+                "reasoning from that batch were discarded. Any complete read-only "
+                "calls already returned as ordinary tool results remain authoritative "
+                "and must not be repeated. Emit exactly one fresh, complete tool "
+                "call: the single currently most necessary unresolved call for "
+                "making progress, using only the currently exposed schemas. Do not "
+                "emit multiple calls, prose, explanation, or tool syntax in text. "
+                "Reconstruct arguments only from the original task, trusted "
+                "conversation context, and existing tool results; never quote, "
+                "continue, or reuse a rejected argument fragment."
+            ),
+        })
+        return {
+            "queued": True,
+            "gate": "tool_stream_continuation_repair",
+            "reason": reason,
+            "iteration": budget.used,
+            "remaining_iterations": budget.remaining,
+            "repair_episode": tool_stream_continuation_repair_episode_count,
+            "replan_count": tool_stream_replan_count,
+            "run_recovery_count": tool_stream_recovery_count,
+            "max_run_recoveries": _MAX_TOOL_STREAM_RUN_RECOVERIES,
+            "consecutive_no_progress_recoveries": (
+                tool_stream_consecutive_no_progress_recoveries
+            ),
+            "max_consecutive_no_progress_recoveries": (
+                _MAX_TOOL_STREAM_CONSECUTIVE_NO_PROGRESS_RECOVERIES
+            ),
+            "progress_made_before_replan": progress_made,
+            "unresolved_call_count": max(0, int(unresolved_count)),
+            "closed_tool_schema_count": len(closed_tool_schemas),
+            "tool_choice": "required",
+            "parallel_tool_calls": False,
+            "required_logical_call_count": 1,
+        }
+
+    def queue_tool_stream_evidence_synthesis(
+        reason: str,
+    ) -> dict[str, Any]:
+        """Close tools and synthesize only when trusted evidence is sufficient."""
+
+        nonlocal pending_tool_stream_evidence_synthesis
+        nonlocal tool_stream_evidence_synthesis_count
+        nonlocal tool_stream_recovery_count
+        nonlocal tool_stream_continuation_repair_attempted
+        nonlocal forced_workflow_policy
+        nonlocal previous_length_content
+
+        direct_unsatisfied = [
+            group for group in direct_required_tool_groups
+            if not (set(group) & direct_called_tools)
+        ]
+        standard_unsatisfied = unsatisfied_standard_required_capabilities()
+        delegate_required_unsatisfied = bool(
+            delegated_subtask
+            and delegated_required_capability_tools
+            and not (
+                set(delegated_required_capability_tools)
+                & delegate_attempted_tool_names
+            )
+        )
+        workflow_incomplete, workflow_reason = (
+            run_state.needs_more_skill_workflow()
+        )
+        unavailable_reason = ""
+        if budget.remaining <= 0:
+            unavailable_reason = "iteration_budget_exhausted"
+        elif trusted_dispatched_tool_result_count <= 0:
+            unavailable_reason = "no_trusted_successful_tool_result"
+        elif direct_unsatisfied:
+            unavailable_reason = "direct_required_receipt_unsatisfied"
+        elif standard_unsatisfied:
+            unavailable_reason = "standard_required_receipt_unsatisfied"
+        elif delegate_required_unsatisfied:
+            unavailable_reason = "delegated_required_receipt_unsatisfied"
+        elif workflow_incomplete:
+            unavailable_reason = "declared_workflow_incomplete"
+        elif tool_stream_evidence_synthesis_count >= 1:
+            unavailable_reason = "evidence_synthesis_limit_exhausted"
+        elif tool_stream_recovery_count >= _MAX_TOOL_STREAM_RUN_RECOVERIES:
+            unavailable_reason = "run_recovery_limit_exhausted"
+        if unavailable_reason:
+            return {
+                "queued": False,
+                "reason": unavailable_reason,
+                "workflow_reason": workflow_reason if workflow_incomplete else "",
+                "direct_unsatisfied_count": len(direct_unsatisfied),
+                "standard_unsatisfied_count": len(standard_unsatisfied),
+                "delegate_required_unsatisfied": delegate_required_unsatisfied,
+            }
+
+        tool_stream_recovery_count += 1
+        tool_stream_evidence_synthesis_count += 1
+        pending_tool_stream_evidence_synthesis = True
+        tool_stream_continuation_repair_attempted = False
+        forced_workflow_policy = None
+        previous_length_content = ""
+        footer_instruction = ""
+        if delegated_required_result_fields:
+            footer_instruction = (
+                " End with exactly one terminal non-empty line in the form "
+                "`RESULT_FIELDS_JSON: {json}` with no trailing prose. Its JSON "
+                "object must contain every and only these exact keys: "
+                + json.dumps(
+                    list(delegated_required_result_fields),
+                    ensure_ascii=False,
+                )
+                + "."
+                + delegate_result_field_value_instruction()
+            )
+        conversation.append({
+            "role": "user",
+            "content": (
+                "The provider repeatedly failed to emit a structurally valid "
+                "remaining tool call. The invalid generation, hidden reasoning, "
+                "and malformed call fragments were discarded. All required "
+                "capability and resource receipts are already satisfied, and the "
+                "successful tool results in context are authoritative. No tools "
+                "are available on this final recovery turn. Synthesize the "
+                "completed answer only from those existing results. Preserve "
+                "provenance and state concrete limitations or degraded gaps; do "
+                "not invent evidence, narrate future actions, retry tools, or emit "
+                "tool-call syntax."
+                + footer_instruction
+            ),
+        })
+        return {
+            "queued": True,
+            "gate": "tool_stream_evidence_synthesis",
+            "reason": reason,
+            "iteration": budget.used,
+            "remaining_iterations": budget.remaining,
+            "trusted_successful_tool_result_count": (
+                trusted_dispatched_tool_result_count
+            ),
+            "synthesis_count": tool_stream_evidence_synthesis_count,
+            "max_syntheses": 1,
+            "run_recovery_count": tool_stream_recovery_count,
+            "max_run_recoveries": _MAX_TOOL_STREAM_RUN_RECOVERIES,
             "tools_exposed_next_turn": 0,
         }
 
@@ -13296,17 +13721,32 @@ async def run_stream(
             deterministic_skill_inspection = bool(
                 auto_call.get("deterministic_skill_inspection")
             )
+            direct_url_fallback_stage = str(
+                auto_call.get("direct_url_browser_fallback_stage") or ""
+            )
             auto_args = auto_call.get("arguments")
             if not isinstance(auto_args, dict):
                 auto_args = {}
             auto_call_id = "workflow_auto_" + uuid.uuid4().hex
             auto_args_json = json.dumps(auto_args, ensure_ascii=False, default=str)
+            auto_observability_args = auto_call.get("observability_arguments")
+            auto_observability_json = json.dumps(
+                (
+                    auto_observability_args
+                    if isinstance(auto_observability_args, dict)
+                    else auto_args
+                ),
+                ensure_ascii=False,
+                default=str,
+            )
             run_state.tool_call_count += 1
             yield await emit_agent_event("tool.started", {
                 "tool_name": auto_tool_name,
                 "tool_call_id": auto_call_id,
                 "args_compacted": _debug_payload(
-                    _compact_tool_call_arguments(auto_tool_name, auto_args_json)
+                    _compact_tool_call_arguments(
+                        auto_tool_name, auto_observability_json
+                    )
                 ),
                 "args_representation": "observability_redaction",
                 "args_are_dispatch_payload": False,
@@ -13316,7 +13756,7 @@ async def run_stream(
             yield {
                 "type": "tool_progress",
                 "msg": (
-                    f"🔧 {auto_tool_name}({_safe_tool_argument_record(auto_args_json)}) "
+                    f"🔧 {auto_tool_name}({_safe_tool_argument_record(auto_observability_json)}) "
                     "[contract auto-dispatch]"
                 ),
             }
@@ -13337,7 +13777,9 @@ async def run_stream(
                 "tool_name": auto_tool_name,
                 "tool_call_id": auto_call_id,
                 "arguments_compacted": _debug_payload(
-                    _compact_tool_call_arguments(auto_tool_name, auto_args_json)
+                    _compact_tool_call_arguments(
+                        auto_tool_name, auto_observability_json
+                    )
                 ),
                 "arguments_representation": "observability_redaction",
                 "arguments_are_dispatch_payload": False,
@@ -13511,6 +13953,9 @@ async def run_stream(
                     delegate_attempted_tool_names.add(auto_tool_name)
                 _collapse_tool_turn_history(conversation, auto_history_index)
             if auto_outcome == "success":
+                if auto_actual_dispatch_attempted:
+                    trusted_dispatched_tool_result_count += 1
+                    tool_stream_consecutive_no_progress_recoveries = 0
                 conversation.append({
                     "role": "assistant",
                         "content": (
@@ -13595,6 +14040,70 @@ async def run_stream(
             if safe_auto_detail:
                 progress += f" — {safe_auto_detail[:240]}"
             yield {"type": "tool_progress", "msg": progress}
+
+            if (
+                direct_url_fallback_stage == "browser_navigate"
+                and isinstance(direct_url_browser_fallback, dict)
+            ):
+                if auto_outcome == "success":
+                    direct_url_browser_fallback["stage"] = "browser_snapshot"
+                    forced_workflow_policy = {
+                        "tools": ["browser_snapshot"],
+                        "max_calls": 1,
+                        "reason": "direct URL dynamic-page rendered snapshot",
+                    }
+                    pending_workflow_auto_call = {
+                        "name": "browser_snapshot",
+                        "arguments": {"full": False},
+                        "direct_url_browser_fallback_stage": (
+                            "browser_snapshot"
+                        ),
+                    }
+                    for debug_evt in await debug_stream_event(
+                        "direct_url.browser_fallback",
+                        {
+                            "stage": "browser_navigate",
+                            "outcome": "success",
+                            "url_sha256": direct_url_browser_fallback[
+                                "url_sha256"
+                            ],
+                            "next_stage": "browser_snapshot",
+                        },
+                    ):
+                        yield debug_evt
+                    continue
+                direct_url_browser_fallback["stage"] = "failed"
+                for debug_evt in await debug_stream_event(
+                    "direct_url.browser_fallback",
+                    {
+                        "stage": "browser_navigate",
+                        "outcome": "error",
+                        "url_sha256": direct_url_browser_fallback[
+                            "url_sha256"
+                        ],
+                        "next_stage": "synthesis",
+                    },
+                ):
+                    yield debug_evt
+            elif (
+                direct_url_fallback_stage == "browser_snapshot"
+                and isinstance(direct_url_browser_fallback, dict)
+            ):
+                direct_url_browser_fallback["stage"] = (
+                    "completed" if auto_outcome == "success" else "failed"
+                )
+                for debug_evt in await debug_stream_event(
+                    "direct_url.browser_fallback",
+                    {
+                        "stage": "browser_snapshot",
+                        "outcome": auto_outcome,
+                        "url_sha256": direct_url_browser_fallback[
+                            "url_sha256"
+                        ],
+                        "next_stage": "synthesis",
+                    },
+                ):
+                    yield debug_evt
 
             if deterministic_skill_inspection and auto_outcome != "success":
                 msg = (
@@ -13704,6 +14213,10 @@ async def run_stream(
         )
         iteration_tool_stream_repair = pending_tool_stream_continuation_repair
         pending_tool_stream_continuation_repair = None
+        iteration_tool_stream_evidence_synthesis = bool(
+            pending_tool_stream_evidence_synthesis
+        )
+        pending_tool_stream_evidence_synthesis = False
         iteration_reasoning_only_recovery = (
             pending_delegate_reasoning_only_recovery
         )
@@ -13963,6 +14476,12 @@ async def run_stream(
                     "max_calls": 0,
                     "reason": "explicit direct action already satisfied",
                 }
+        if iteration_tool_stream_evidence_synthesis:
+            iteration_workflow_policy = {
+                "tools": [],
+                "max_calls": 0,
+                "reason": "tool stream recovery synthesis from trusted evidence",
+            }
         delegate_required_capability_candidates = [
             name
             for name in delegated_required_capability_tools
@@ -14332,6 +14851,9 @@ async def run_stream(
             ),
             "delegate_post_dispatch_synthesis_terminal_contract_audit": (
                 iteration_post_dispatch_synthesis_terminal_contract_audit
+            ),
+            "tool_stream_evidence_synthesis": (
+                iteration_tool_stream_evidence_synthesis
             ),
             "delegate_quarantined_tools": sorted(delegate_quarantined_tools),
         }
@@ -17179,13 +17701,27 @@ async def run_stream(
         # one same-request non-stream attempt before dispatching anything.  The
         # replacement batch remains atomic: every call must pass preflight.
         stream_corrupt_debug: dict[str, Any] | None = None
+        corrupt_tool_call_assembly: ToolCallStreamAssembly | None = None
+        tool_stream_salvage_replan_context: dict[str, Any] | None = None
+        tool_stream_salvage_progress_made = False
+        tool_stream_salvage_active = False
         if finish_reason == "tool_calls" and tool_call_assembly is None:
             candidate_assembly = tool_call_accumulator.finalize(iteration=budget.used)
             if not candidate_assembly.ok:
+                corrupt_tool_call_assembly = candidate_assembly
                 stream_corrupt_debug = dict(candidate_assembly.debug)
         elif tool_call_accumulator.fragment_count:
             mismatch_assembly = tool_call_accumulator.finalize(iteration=budget.used)
-            stream_corrupt_debug = dict(mismatch_assembly.debug)
+            corrupt_tool_call_assembly = ToolCallStreamAssembly(
+                calls=(),
+                errors=tuple(sorted({
+                    *mismatch_assembly.errors,
+                    "finish_reason_mismatch",
+                })),
+                debug=dict(mismatch_assembly.debug),
+                complete_calls=mismatch_assembly.complete_calls,
+            )
+            stream_corrupt_debug = dict(corrupt_tool_call_assembly.debug)
             mismatch_errors = set(stream_corrupt_debug.get("error_codes") or [])
             mismatch_errors.add("finish_reason_mismatch")
             stream_corrupt_debug["error_codes"] = sorted(mismatch_errors)
@@ -17198,6 +17734,95 @@ async def run_stream(
                 stream_corrupt_debug,
             ):
                 yield debug_evt
+
+        salvage_eligible_turn = bool(
+            stream_corrupt_debug is not None
+            and corrupt_tool_call_assembly is not None
+            and not corrupt_tool_call_assembly.ok
+            and iteration_exposed_tools
+            and not iteration_result_footer_repair
+            and not iteration_post_dispatch_stream_synthesis
+            and not iteration_post_dispatch_synthesis_continuation
+            and not iteration_output_contract_repair
+            and not iteration_visible_length_recovery
+            and not iteration_tool_stream_evidence_synthesis
+            and not main_model_skill_selection_pending
+            and tool_stream_recovery_count < _MAX_TOOL_STREAM_RUN_RECOVERIES
+        )
+        if salvage_eligible_turn:
+            policy_max_calls = (
+                iteration_workflow_policy.get("max_calls")
+                if isinstance(iteration_workflow_policy, dict)
+                else None
+            )
+            salvage = _classify_corrupt_tool_call_salvage(
+                corrupt_tool_call_assembly,
+                exposed_tool_names=iteration_exposed_tools,
+                tool_context=tool_context,
+                workflow_policy=iteration_workflow_policy,
+                max_safe_calls=(
+                    policy_max_calls
+                    if isinstance(policy_max_calls, int)
+                    and not isinstance(policy_max_calls, bool)
+                    else None
+                ),
+            )
+            for debug_evt in await debug_stream_event(
+                "tool.stream.salvage.reviewed",
+                {
+                    **salvage.debug,
+                    "iteration": budget.used,
+                    "run_recovery_count": tool_stream_recovery_count,
+                    "max_run_recoveries": _MAX_TOOL_STREAM_RUN_RECOVERIES,
+                },
+            ):
+                yield debug_evt
+            if salvage.calls:
+                tool_stream_recovery_count += 1
+                full_content = ""
+                full_reasoning = ""
+                scrubber.reset()
+                salvage_debug = {
+                    "corrupt": False,
+                    "fragment_count": 0,
+                    "logical_call_count": len(salvage.calls),
+                    "complete_call_count": len(salvage.calls),
+                    "argument_chars_total": sum(
+                        len(call.arguments) for call in salvage.calls
+                    ),
+                    "compatibility_source": "corrupt_read_only_salvage",
+                    "salvage": dict(salvage.debug),
+                }
+                tool_call_assembly = ToolCallStreamAssembly(
+                    calls=salvage.calls,
+                    errors=(),
+                    debug=salvage_debug,
+                )
+                tool_stream_salvage_active = True
+                finish_reason = "tool_calls"
+                stream_corrupt_debug = None
+                if salvage.unresolved_count > 0:
+                    tool_stream_salvage_replan_context = {
+                        "reason": "corrupt_batch_unresolved_after_read_only_salvage",
+                        "unresolved_count": salvage.unresolved_count,
+                        "tool_schemas": copy.deepcopy(tool_schemas),
+                        "deferred_catalog": deferred_catalog,
+                        "workflow_policy": copy.deepcopy(
+                            iteration_workflow_policy
+                        ),
+                        "salvage_debug": dict(salvage.debug),
+                    }
+                for debug_evt in await debug_stream_event(
+                    "tool.stream.salvage.accepted",
+                    {
+                        **salvage.debug,
+                        "iteration": budget.used,
+                        "run_recovery_count": tool_stream_recovery_count,
+                        "max_run_recoveries": _MAX_TOOL_STREAM_RUN_RECOVERIES,
+                        "replan_pending": salvage.unresolved_count > 0,
+                    },
+                ):
+                    yield debug_evt
 
         if (
             stream_corrupt_debug is not None
@@ -17260,6 +17885,51 @@ async def run_stream(
                 "failure_class": "agent_contract_noncompliance",
                 "retryable": False,
                 "usage": run_usage,
+                **failed_debug,
+            })
+            yield {"type": "error", "msg": msg}
+            return
+
+        if (
+            stream_corrupt_debug is not None
+            and iteration_tool_stream_evidence_synthesis
+        ):
+            failed_debug = {
+                "reason": "provider_emitted_tool_protocol",
+                "iteration": budget.used,
+                "remaining_iterations": budget.remaining,
+                "provider_finish_reason": finish_reason,
+                "content_chars_discarded": len(full_content),
+                "reasoning_chars_discarded": len(full_reasoning),
+                "stream_fragment_count": tool_call_accumulator.fragment_count,
+                "stream_error_codes": list(
+                    stream_corrupt_debug.get("error_codes") or []
+                ),
+                "trusted_successful_tool_result_count": (
+                    trusted_dispatched_tool_result_count
+                ),
+                "synthesis_count": tool_stream_evidence_synthesis_count,
+                "max_syntheses": 1,
+            }
+            for debug_evt in await debug_stream_event(
+                "tool.stream.evidence_synthesis.failed",
+                failed_debug,
+            ):
+                yield debug_evt
+            await notify_turn_boundary("finished", {
+                **turn_finished_payload,
+                "finish_reason": "tool_calls",
+            })
+            msg = (
+                "Provider emitted tool-call protocol on the single tools-closed "
+                "evidence synthesis turn. No call was dispatched and no further "
+                "tool-stream recovery was queued."
+            )
+            yield await emit_agent_event("run.failed", {
+                "error": msg,
+                "finish_reason": (
+                    "provider_tool_stream_evidence_synthesis_failed"
+                ),
                 **failed_debug,
             })
             yield {"type": "error", "msg": msg}
@@ -17687,7 +18357,7 @@ async def run_stream(
             # other cases fail immediately.
             if tool_stream_continuation_repair_attempted:
                 failed_debug = {
-                    "reason": "second_corrupt_batch",
+                    "reason": "corrupt_replan_sample",
                     "bounded_atomic_tool_call_turn": bool(
                         iteration_tool_stream_repair is not None
                     ),
@@ -17699,7 +18369,7 @@ async def run_stream(
                     ),
                     "iteration": budget.used,
                     "remaining_iterations": budget.remaining,
-                    "content_chars": len(full_content),
+                    "content_chars_discarded": len(full_content),
                     "reasoning_chars_discarded": len(full_reasoning),
                     "stream_fragment_count": tool_call_accumulator.fragment_count,
                     "stream_logical_call_count": (
@@ -17707,6 +18377,14 @@ async def run_stream(
                     ),
                     "stream_error_codes": list(
                         stream_corrupt_debug.get("error_codes") or []
+                    ),
+                    "run_recovery_count": tool_stream_recovery_count,
+                    "max_run_recoveries": _MAX_TOOL_STREAM_RUN_RECOVERIES,
+                    "consecutive_no_progress_recoveries": (
+                        tool_stream_consecutive_no_progress_recoveries
+                    ),
+                    "max_consecutive_no_progress_recoveries": (
+                        _MAX_TOOL_STREAM_CONSECUTIVE_NO_PROGRESS_RECOVERIES
                     ),
                 }
                 for debug_evt in await debug_stream_event(
@@ -17716,7 +18394,7 @@ async def run_stream(
                     yield debug_evt
                 post_dispatch_recovery = (
                     queue_delegate_post_dispatch_stream_synthesis(
-                        "provider_tool_stream_corrupt_after_repair"
+                        "provider_tool_stream_corrupt_after_replan"
                     )
                 )
                 if post_dispatch_recovery is not None:
@@ -17734,7 +18412,7 @@ async def run_stream(
                         "type": "tool_progress",
                         "msg": (
                             "↻ Synthesizing once from already-returned delegated "
-                            "tool results after stream repair failure"
+                            "tool results after a malformed replanning turn"
                         ),
                     }
                     await notify_turn_boundary("finished", {
@@ -17742,17 +18420,90 @@ async def run_stream(
                         "finish_reason": "tool_calls",
                     })
                     continue
+                synthesis_debug = queue_tool_stream_evidence_synthesis(
+                    "provider_tool_stream_corrupt_after_replan"
+                )
+                if synthesis_debug.get("queued"):
+                    for debug_evt in await debug_stream_event(
+                        "gate.continuation",
+                        synthesis_debug,
+                    ):
+                        yield debug_evt
+                    for debug_evt in await debug_stream_event(
+                        "tool.stream.evidence_synthesis.requested",
+                        synthesis_debug,
+                    ):
+                        yield debug_evt
+                    yield {
+                        "type": "tool_progress",
+                        "msg": (
+                            "↻ Synthesizing from already-returned tool evidence "
+                            "after a malformed replanning turn"
+                        ),
+                    }
+                    await notify_turn_boundary("finished", {
+                        **turn_finished_payload,
+                        "finish_reason": "tool_calls",
+                    })
+                    continue
+
+                replan_debug = queue_tool_stream_exact_one_replan(
+                    "provider_tool_stream_corrupt_after_replan",
+                    closed_tool_schemas=list(tool_schemas),
+                    closed_deferred_catalog=deferred_catalog,
+                    workflow_policy=iteration_workflow_policy,
+                    progress_made=False,
+                    unresolved_count=max(
+                        1,
+                        int(
+                            stream_corrupt_debug.get("logical_call_count") or 0
+                        ),
+                    ),
+                )
+                if replan_debug.get("queued"):
+                    for debug_evt in await debug_stream_event(
+                        "gate.continuation",
+                        replan_debug,
+                    ):
+                        yield debug_evt
+                    for debug_evt in await debug_stream_event(
+                        "tool.stream.continuation_repair.requested",
+                        replan_debug,
+                    ):
+                        yield debug_evt
+                    yield {
+                        "type": "tool_progress",
+                        "msg": (
+                            "↻ Replanning one unresolved tool call again under "
+                            "the unchanged closed schema"
+                        ),
+                    }
+                    await notify_turn_boundary("finished", {
+                        **turn_finished_payload,
+                        "finish_reason": "tool_calls",
+                    })
+                    continue
+
+                terminal_debug = {
+                    **failed_debug,
+                    "synthesis_unavailable_reason": str(
+                        synthesis_debug.get("reason") or ""
+                    ),
+                    "replan_unavailable_reason": str(
+                        replan_debug.get("reason") or ""
+                    ),
+                }
                 msg = (
-                    "Provider returned a second corrupt streamed tool-call batch "
-                    "after the single bounded continuation repair; no tool was "
-                    "dispatched."
+                    "Provider repeatedly returned corrupt tool-call batches and "
+                    "the bounded no-progress recovery limit was exhausted while "
+                    "required receipts or unresolved calls remained."
                 )
                 yield await emit_agent_event("run.failed", {
                     "error": msg,
-                    "finish_reason": "provider_tool_stream_corrupt_after_repair",
-                    "partial_content_chars": len(full_content),
-                    "partial_reasoning_chars": len(full_reasoning),
-                    "tool_stream": stream_corrupt_debug,
+                    "finish_reason": (
+                        "provider_tool_stream_recovery_exhausted"
+                    ),
+                    **terminal_debug,
                 })
                 yield {"type": "error", "msg": msg}
                 return
@@ -17987,14 +18738,114 @@ async def run_stream(
                 return
 
             if tool_stream_fallback_attempted:
+                # The single same-request non-stream replacement has already
+                # been spent earlier in this run. Later corrupt batches move
+                # to the bounded exact-one replan ladder instead of failing.
+                replan_debug = queue_tool_stream_exact_one_replan(
+                    "provider_tool_stream_corrupt_repeat",
+                    closed_tool_schemas=list(tool_schemas),
+                    closed_deferred_catalog=deferred_catalog,
+                    workflow_policy=iteration_workflow_policy,
+                    progress_made=False,
+                    unresolved_count=max(
+                        1,
+                        int(
+                            stream_corrupt_debug.get("logical_call_count") or 0
+                        ),
+                    ),
+                )
+                if replan_debug.get("queued"):
+                    for debug_evt in await debug_stream_event(
+                        "gate.continuation",
+                        replan_debug,
+                    ):
+                        yield debug_evt
+                    for debug_evt in await debug_stream_event(
+                        "tool.stream.continuation_repair.requested",
+                        replan_debug,
+                    ):
+                        yield debug_evt
+                    yield {
+                        "type": "tool_progress",
+                        "msg": (
+                            "↻ Replanning one tool call after another corrupt "
+                            "streamed batch"
+                        ),
+                    }
+                    await notify_turn_boundary("finished", {
+                        **turn_finished_payload,
+                        "finish_reason": "tool_calls",
+                    })
+                    continue
+                post_dispatch_recovery = (
+                    queue_delegate_post_dispatch_stream_synthesis(
+                        "provider_tool_stream_corrupt_repeat"
+                    )
+                )
+                if post_dispatch_recovery is not None:
+                    for debug_evt in await debug_stream_event(
+                        "gate.continuation",
+                        post_dispatch_recovery,
+                    ):
+                        yield debug_evt
+                    for debug_evt in await debug_stream_event(
+                        "tool.stream.post_dispatch_synthesis.requested",
+                        post_dispatch_recovery,
+                    ):
+                        yield debug_evt
+                    yield {
+                        "type": "tool_progress",
+                        "msg": (
+                            "↻ Synthesizing once from already-returned delegated "
+                            "tool results after repeated corrupt streamed batches"
+                        ),
+                    }
+                    await notify_turn_boundary("finished", {
+                        **turn_finished_payload,
+                        "finish_reason": "tool_calls",
+                    })
+                    continue
+                synthesis_debug = queue_tool_stream_evidence_synthesis(
+                    "provider_tool_stream_corrupt_repeat"
+                )
+                if synthesis_debug.get("queued"):
+                    for debug_evt in await debug_stream_event(
+                        "gate.continuation",
+                        synthesis_debug,
+                    ):
+                        yield debug_evt
+                    for debug_evt in await debug_stream_event(
+                        "tool.stream.evidence_synthesis.requested",
+                        synthesis_debug,
+                    ):
+                        yield debug_evt
+                    yield {
+                        "type": "tool_progress",
+                        "msg": (
+                            "↻ Synthesizing from already-returned tool evidence "
+                            "after repeated corrupt streamed batches"
+                        ),
+                    }
+                    await notify_turn_boundary("finished", {
+                        **turn_finished_payload,
+                        "finish_reason": "tool_calls",
+                    })
+                    continue
                 msg = (
                     "Provider returned a corrupt streamed tool-call batch after its "
-                    "single recovery attempt; no tool was dispatched."
+                    "single recovery attempt and the bounded recovery ladder was "
+                    "exhausted; no tool was dispatched."
                 )
                 yield await emit_agent_event("run.failed", {
                     "error": msg,
-                    "finish_reason": "provider_tool_stream_corrupt",
+                    "finish_reason": "provider_tool_stream_recovery_exhausted",
                     "tool_stream": stream_corrupt_debug,
+                    "replan_unavailable_reason": str(
+                        replan_debug.get("reason") or ""
+                    ),
+                    "synthesis_unavailable_reason": str(
+                        synthesis_debug.get("reason") or ""
+                    ),
                 })
                 yield {"type": "error", "msg": msg}
                 return
@@ -18041,19 +18892,209 @@ async def run_stream(
                     failed_debug,
                 ):
                     yield debug_evt
-                msg = (
-                    "Provider returned a corrupt streamed tool-call batch and its "
-                    "single non-stream recovery batch failed validation; no tool was "
-                    "dispatched."
+
+                fallback_salvage = (
+                    _classify_corrupt_tool_call_salvage(
+                        fallback_assembly,
+                        exposed_tool_names=iteration_exposed_tools,
+                        tool_context=tool_context,
+                        workflow_policy=iteration_workflow_policy,
+                        max_safe_calls=(
+                            iteration_workflow_policy.get("max_calls")
+                            if isinstance(iteration_workflow_policy, dict)
+                            and isinstance(
+                                iteration_workflow_policy.get("max_calls"), int
+                            )
+                            and not isinstance(
+                                iteration_workflow_policy.get("max_calls"), bool
+                            )
+                            else None
+                        ),
+                    )
+                    if fallback_assembly is not None
+                    else None
                 )
-                yield await emit_agent_event("run.failed", {
-                    "error": msg,
-                    "finish_reason": "provider_tool_stream_corrupt",
-                    "tool_stream": stream_corrupt_debug,
-                    "fallback": failed_debug,
-                })
-                yield {"type": "error", "msg": msg}
-                return
+                if fallback_salvage is not None and fallback_salvage.calls:
+                    tool_stream_recovery_count += 1
+                    for debug_evt in await debug_stream_event(
+                        "tool.stream.salvage.reviewed",
+                        {
+                            **fallback_salvage.debug,
+                            "iteration": budget.used,
+                            "run_recovery_count": tool_stream_recovery_count,
+                            "max_run_recoveries": _MAX_TOOL_STREAM_RUN_RECOVERIES,
+                            "source": "nonstream_fallback",
+                        },
+                    ):
+                        yield debug_evt
+                    tool_call_assembly = ToolCallStreamAssembly(
+                        calls=fallback_salvage.calls,
+                        errors=(),
+                        debug={
+                            "corrupt": False,
+                            "fragment_count": 0,
+                            "logical_call_count": len(fallback_salvage.calls),
+                            "complete_call_count": len(fallback_salvage.calls),
+                            "argument_chars_total": sum(
+                                len(call.arguments)
+                                for call in fallback_salvage.calls
+                            ),
+                            "compatibility_source": (
+                                "corrupt_fallback_read_only_salvage"
+                            ),
+                            "salvage": dict(fallback_salvage.debug),
+                        },
+                    )
+                    tool_stream_salvage_active = True
+                    finish_reason = "tool_calls"
+                    stream_corrupt_debug = None
+                    if fallback_salvage.unresolved_count > 0:
+                        tool_stream_salvage_replan_context = {
+                            "reason": (
+                                "corrupt_fallback_batch_unresolved_after_"
+                                "read_only_salvage"
+                            ),
+                            "unresolved_count": (
+                                fallback_salvage.unresolved_count
+                            ),
+                            "tool_schemas": copy.deepcopy(tool_schemas),
+                            "deferred_catalog": deferred_catalog,
+                            "workflow_policy": copy.deepcopy(
+                                iteration_workflow_policy
+                            ),
+                            "salvage_debug": dict(fallback_salvage.debug),
+                        }
+                    for debug_evt in await debug_stream_event(
+                        "tool.stream.salvage.accepted",
+                        {
+                            **fallback_salvage.debug,
+                            "iteration": budget.used,
+                            "run_recovery_count": tool_stream_recovery_count,
+                            "max_run_recoveries": _MAX_TOOL_STREAM_RUN_RECOVERIES,
+                            "replan_pending": (
+                                fallback_salvage.unresolved_count > 0
+                            ),
+                            "source": "nonstream_fallback",
+                        },
+                    ):
+                        yield debug_evt
+                else:
+                    replan_debug = queue_tool_stream_exact_one_replan(
+                        "provider_tool_stream_fallback_invalid",
+                        closed_tool_schemas=list(tool_schemas),
+                        closed_deferred_catalog=deferred_catalog,
+                        workflow_policy=iteration_workflow_policy,
+                        progress_made=False,
+                        unresolved_count=max(
+                            1,
+                            int(
+                                stream_corrupt_debug.get("logical_call_count")
+                                or 0
+                            ),
+                        ),
+                    )
+                    if replan_debug.get("queued"):
+                        for debug_evt in await debug_stream_event(
+                            "gate.continuation",
+                            replan_debug,
+                        ):
+                            yield debug_evt
+                        for debug_evt in await debug_stream_event(
+                            "tool.stream.continuation_repair.requested",
+                            replan_debug,
+                        ):
+                            yield debug_evt
+                        yield {
+                            "type": "tool_progress",
+                            "msg": (
+                                "↻ Replanning one tool call after the "
+                                "non-stream recovery batch also failed "
+                                "validation"
+                            ),
+                        }
+                        await notify_turn_boundary("finished", {
+                            **turn_finished_payload,
+                            "finish_reason": "tool_calls",
+                        })
+                        continue
+                    post_dispatch_recovery = (
+                        queue_delegate_post_dispatch_stream_synthesis(
+                            "provider_tool_stream_fallback_invalid"
+                        )
+                    )
+                    if post_dispatch_recovery is not None:
+                        for debug_evt in await debug_stream_event(
+                            "gate.continuation",
+                            post_dispatch_recovery,
+                        ):
+                            yield debug_evt
+                        for debug_evt in await debug_stream_event(
+                            "tool.stream.post_dispatch_synthesis.requested",
+                            post_dispatch_recovery,
+                        ):
+                            yield debug_evt
+                        yield {
+                            "type": "tool_progress",
+                            "msg": (
+                                "↻ Synthesizing once from already-returned "
+                                "delegated tool results after the non-stream "
+                                "recovery batch also failed validation"
+                            ),
+                        }
+                        await notify_turn_boundary("finished", {
+                            **turn_finished_payload,
+                            "finish_reason": "tool_calls",
+                        })
+                        continue
+                    synthesis_debug = queue_tool_stream_evidence_synthesis(
+                        "provider_tool_stream_fallback_invalid"
+                    )
+                    if synthesis_debug.get("queued"):
+                        for debug_evt in await debug_stream_event(
+                            "gate.continuation",
+                            synthesis_debug,
+                        ):
+                            yield debug_evt
+                        for debug_evt in await debug_stream_event(
+                            "tool.stream.evidence_synthesis.requested",
+                            synthesis_debug,
+                        ):
+                            yield debug_evt
+                        yield {
+                            "type": "tool_progress",
+                            "msg": (
+                                "↻ Synthesizing from already-returned tool "
+                                "evidence after the non-stream recovery batch "
+                                "also failed validation"
+                            ),
+                        }
+                        await notify_turn_boundary("finished", {
+                            **turn_finished_payload,
+                            "finish_reason": "tool_calls",
+                        })
+                        continue
+                    msg = (
+                        "Provider returned a corrupt streamed tool-call batch and "
+                        "its single non-stream recovery batch failed validation; "
+                        "the bounded recovery ladder was exhausted and no tool was "
+                        "dispatched."
+                    )
+                    yield await emit_agent_event("run.failed", {
+                        "error": msg,
+                        "finish_reason": (
+                            "provider_tool_stream_recovery_exhausted"
+                        ),
+                        "tool_stream": stream_corrupt_debug,
+                        "fallback": failed_debug,
+                        "replan_unavailable_reason": str(
+                            replan_debug.get("reason") or ""
+                        ),
+                        "synthesis_unavailable_reason": str(
+                            synthesis_debug.get("reason") or ""
+                        ),
+                    })
+                    yield {"type": "error", "msg": msg}
+                    return
 
             # Ignore fallback content completely; retain any content already
             # emitted by the original stream and replace only its corrupt calls.
@@ -18079,6 +19120,37 @@ async def run_stream(
                 },
             ):
                 yield debug_evt
+
+        if tool_call_assembly is not None and tool_call_assembly.ok:
+            deduped_calls, duplicate_read_only_call_count = (
+                _dedupe_identical_read_only_tool_calls(
+                    tool_call_assembly.calls
+                )
+            )
+            if duplicate_read_only_call_count:
+                deduped_debug = {
+                    **tool_call_assembly.debug,
+                    "logical_call_count": len(deduped_calls),
+                    "deduplicated_read_only_call_count": (
+                        duplicate_read_only_call_count
+                    ),
+                }
+                tool_call_assembly = ToolCallStreamAssembly(
+                    calls=deduped_calls,
+                    errors=(),
+                    debug=deduped_debug,
+                )
+                for debug_evt in await debug_stream_event(
+                    "tool.stream.read_only_duplicates_deduplicated",
+                    {
+                        "iteration": budget.used,
+                        "retained_call_count": len(deduped_calls),
+                        "deduplicated_call_count": (
+                            duplicate_read_only_call_count
+                        ),
+                    },
+                ):
+                    yield debug_evt
 
         await notify_turn_boundary("finished", {
             **turn_finished_payload,
@@ -18146,20 +19218,152 @@ async def run_stream(
                         ),
                     }
                     continue
-                msg = (
-                    "Provider emitted a tool-call count other than exactly one on "
-                    "the single bounded continuation repair turn; the entire batch "
-                    "was rejected and no tool was dispatched."
+
+                repair_mismatch_salvage = _classify_corrupt_tool_call_salvage(
+                    tool_call_assembly,
+                    exposed_tool_names=iteration_exposed_tools,
+                    tool_context=tool_context,
+                    workflow_policy=iteration_workflow_policy,
                 )
-                yield await emit_agent_event("run.failed", {
-                    "error": msg,
-                    "finish_reason": (
+                if repair_mismatch_salvage.calls:
+                    tool_stream_recovery_count += 1
+                    for debug_evt in await debug_stream_event(
+                        "tool.stream.salvage.reviewed",
+                        {
+                            **repair_mismatch_salvage.debug,
+                            "iteration": budget.used,
+                            "run_recovery_count": tool_stream_recovery_count,
+                            "max_run_recoveries": _MAX_TOOL_STREAM_RUN_RECOVERIES,
+                            "source": "repair_call_count_mismatch",
+                        },
+                    ):
+                        yield debug_evt
+                    tool_call_assembly = ToolCallStreamAssembly(
+                        calls=repair_mismatch_salvage.calls,
+                        errors=(),
+                        debug={
+                            "corrupt": False,
+                            "fragment_count": 0,
+                            "logical_call_count": len(
+                                repair_mismatch_salvage.calls
+                            ),
+                            "complete_call_count": len(
+                                repair_mismatch_salvage.calls
+                            ),
+                            "argument_chars_total": sum(
+                                len(call.arguments)
+                                for call in repair_mismatch_salvage.calls
+                            ),
+                            "compatibility_source": (
+                                "repair_call_count_mismatch_read_only_salvage"
+                            ),
+                            "salvage": dict(repair_mismatch_salvage.debug),
+                        },
+                    )
+                    tool_stream_salvage_active = True
+                    if repair_mismatch_salvage.unresolved_count > 0:
+                        tool_stream_salvage_replan_context = {
+                            "reason": (
+                                "repair_call_count_mismatch_unresolved_after_"
+                                "read_only_salvage"
+                            ),
+                            "unresolved_count": (
+                                repair_mismatch_salvage.unresolved_count
+                            ),
+                            "tool_schemas": copy.deepcopy(tool_schemas),
+                            "deferred_catalog": deferred_catalog,
+                            "workflow_policy": copy.deepcopy(
+                                iteration_workflow_policy
+                            ),
+                            "salvage_debug": dict(
+                                repair_mismatch_salvage.debug
+                            ),
+                        }
+                    for debug_evt in await debug_stream_event(
+                        "tool.stream.salvage.accepted",
+                        {
+                            **repair_mismatch_salvage.debug,
+                            "iteration": budget.used,
+                            "run_recovery_count": tool_stream_recovery_count,
+                            "max_run_recoveries": _MAX_TOOL_STREAM_RUN_RECOVERIES,
+                            "replan_pending": (
+                                repair_mismatch_salvage.unresolved_count > 0
+                            ),
+                            "source": "repair_call_count_mismatch",
+                        },
+                    ):
+                        yield debug_evt
+                else:
+                    replan_debug = queue_tool_stream_exact_one_replan(
+                        "provider_tool_stream_repair_call_count_mismatch",
+                        closed_tool_schemas=list(tool_schemas),
+                        closed_deferred_catalog=deferred_catalog,
+                        workflow_policy=iteration_workflow_policy,
+                        progress_made=False,
+                        unresolved_count=max(1, repair_logical_call_count),
+                    )
+                    if replan_debug.get("queued"):
+                        for debug_evt in await debug_stream_event(
+                            "gate.continuation",
+                            replan_debug,
+                        ):
+                            yield debug_evt
+                        for debug_evt in await debug_stream_event(
+                            "tool.stream.continuation_repair.requested",
+                            replan_debug,
+                        ):
+                            yield debug_evt
+                        yield {
+                            "type": "tool_progress",
+                            "msg": (
+                                "↻ Replanning one tool call after the repair "
+                                "batch had the wrong call count"
+                            ),
+                        }
+                        continue
+                    synthesis_debug = queue_tool_stream_evidence_synthesis(
                         "provider_tool_stream_repair_call_count_mismatch"
-                    ),
-                    **failed_debug,
-                })
-                yield {"type": "error", "msg": msg}
-                return
+                    )
+                    if synthesis_debug.get("queued"):
+                        for debug_evt in await debug_stream_event(
+                            "gate.continuation",
+                            synthesis_debug,
+                        ):
+                            yield debug_evt
+                        for debug_evt in await debug_stream_event(
+                            "tool.stream.evidence_synthesis.requested",
+                            synthesis_debug,
+                        ):
+                            yield debug_evt
+                        yield {
+                            "type": "tool_progress",
+                            "msg": (
+                                "↻ Synthesizing from already-returned tool "
+                                "evidence after the repair batch had the "
+                                "wrong call count"
+                            ),
+                        }
+                        continue
+                    msg = (
+                        "Provider emitted a tool-call count other than exactly one on "
+                        "the single bounded continuation repair turn; the entire batch "
+                        "was rejected and the bounded recovery ladder was exhausted."
+                    )
+                    yield await emit_agent_event("run.failed", {
+                        "error": msg,
+                        "finish_reason": (
+                            "provider_tool_stream_recovery_exhausted"
+                        ),
+                        "replan_unavailable_reason": str(
+                            replan_debug.get("reason") or ""
+                        ),
+                        "synthesis_unavailable_reason": str(
+                            synthesis_debug.get("reason") or ""
+                        ),
+                        **failed_debug,
+                    })
+                    yield {"type": "error", "msg": msg}
+                    return
             if tool_stream_continuation_repair_attempted:
                 # The corruption episode is a transport/assembly concern.  A
                 # complete exact-one repaired batch resolves it even when the
@@ -18231,13 +19435,69 @@ async def run_stream(
                     ),
                 }
                 continue
+            replan_debug = queue_tool_stream_exact_one_replan(
+                "provider_tool_stream_repair_not_emitted",
+                closed_tool_schemas=list(tool_schemas),
+                closed_deferred_catalog=deferred_catalog,
+                workflow_policy=iteration_workflow_policy,
+                progress_made=False,
+                unresolved_count=1,
+            )
+            if replan_debug.get("queued"):
+                for debug_evt in await debug_stream_event(
+                    "gate.continuation",
+                    replan_debug,
+                ):
+                    yield debug_evt
+                for debug_evt in await debug_stream_event(
+                    "tool.stream.continuation_repair.requested",
+                    replan_debug,
+                ):
+                    yield debug_evt
+                yield {
+                    "type": "tool_progress",
+                    "msg": (
+                        "↻ Replanning one tool call after the repair turn "
+                        "produced no tool batch"
+                    ),
+                }
+                continue
+            synthesis_debug = queue_tool_stream_evidence_synthesis(
+                "provider_tool_stream_repair_not_emitted"
+            )
+            if synthesis_debug.get("queued"):
+                for debug_evt in await debug_stream_event(
+                    "gate.continuation",
+                    synthesis_debug,
+                ):
+                    yield debug_evt
+                for debug_evt in await debug_stream_event(
+                    "tool.stream.evidence_synthesis.requested",
+                    synthesis_debug,
+                ):
+                    yield debug_evt
+                yield {
+                    "type": "tool_progress",
+                    "msg": (
+                        "↻ Synthesizing from already-returned tool evidence "
+                        "after the repair turn produced no tool batch"
+                    ),
+                }
+                continue
             msg = (
                 "Provider did not emit a valid tool-call batch on the single "
-                "bounded continuation repair turn; no tool was dispatched."
+                "bounded continuation repair turn and the bounded recovery "
+                "ladder was exhausted."
             )
             yield await emit_agent_event("run.failed", {
                 "error": msg,
-                "finish_reason": "provider_tool_stream_repair_not_emitted",
+                "finish_reason": "provider_tool_stream_recovery_exhausted",
+                "replan_unavailable_reason": str(
+                    replan_debug.get("reason") or ""
+                ),
+                "synthesis_unavailable_reason": str(
+                    synthesis_debug.get("reason") or ""
+                ),
                 **failed_debug,
             })
             yield {"type": "error", "msg": msg}
@@ -21372,6 +22632,70 @@ async def run_stream(
                     result = str(result) + "\n\n" + hint
                 outcome, outcome_detail = _tool_outcome_summary(str(result))
                 safe_outcome_detail = _redact_debug_text(outcome_detail)
+                if (
+                    actual_dispatch_attempted
+                    and display_tool_name == "web_extract"
+                    and isinstance(executed_args, dict)
+                    and isinstance(direct_url_browser_fallback, dict)
+                    and direct_url_browser_fallback.get("stage") == "web_extract"
+                    and direct_url_browser_fallback.get("attempted") is False
+                ):
+                    extract_result = _json_object(str(result))
+                    requested_url = _canonical_direct_http_url(
+                        executed_args.get("url")
+                    )
+                    result_url = _canonical_direct_http_url(
+                        extract_result.get("url")
+                        if isinstance(extract_result, dict) else None
+                    )
+                    target_url = str(
+                        direct_url_browser_fallback.get("canonical_url") or ""
+                    )
+                    if (
+                        isinstance(extract_result, dict)
+                        and extract_result.get("status") == "error"
+                        and extract_result.get("browser_fallback_recommended") is True
+                        and requested_url == target_url
+                        and result_url == target_url
+                    ):
+                        browser_tools = [
+                            name for name in skill_compiler_tool_universe
+                            if name in {"browser_navigate", "browser_snapshot"}
+                        ]
+                        if {"browser_navigate", "browser_snapshot"}.issubset(
+                            set(browser_tools)
+                        ):
+                            tools = list(dict.fromkeys([*tools, *browser_tools]))
+                            run_state.available_tools = set(tools)
+                            tool_context = replace(
+                                tool_context,
+                                enabled_tools=tuple(tools),
+                            )
+                            direct_url_browser_fallback.update({
+                                "attempted": True,
+                                "stage": "browser_navigate",
+                            })
+                            forced_workflow_policy = {
+                                "tools": ["browser_navigate"],
+                                "max_calls": 1,
+                                "reason": "direct URL dynamic-page browser fallback",
+                            }
+                            pending_workflow_auto_call = {
+                                "name": "browser_navigate",
+                                "arguments": {
+                                    "url": direct_url_browser_fallback[
+                                        "literal_url"
+                                    ],
+                                },
+                                "observability_arguments": {
+                                    "url_sha256": direct_url_browser_fallback[
+                                        "url_sha256"
+                                    ],
+                                },
+                                "direct_url_browser_fallback_stage": (
+                                    "browser_navigate"
+                                ),
+                            }
                 placeholder_retry_failure: dict[str, Any] | None = None
                 if outcome != "success":
                     run_state.tool_error_count += 1
@@ -21686,6 +23010,11 @@ async def run_stream(
                         ):
                             yield debug_evt
                 if outcome == "success":
+                    if actual_dispatch_attempted:
+                        trusted_dispatched_tool_result_count += 1
+                        tool_stream_consecutive_no_progress_recoveries = 0
+                        if tool_stream_salvage_active:
+                            tool_stream_salvage_progress_made = True
                     if delegated_subtask:
                         # A later, actually-dispatched success from the same
                         # bridge in this model batch proves that the bridge is
@@ -22664,6 +23993,141 @@ async def run_stream(
                     })
                     yield {"type": "error", "msg": msg}
                     return
+
+            if (
+                tool_stream_salvage_replan_context is not None
+                and pending_workflow_auto_call is None
+                and not needs_workflow_gate_after_tools
+            ):
+                replan_debug = queue_tool_stream_exact_one_replan(
+                    str(
+                        tool_stream_salvage_replan_context.get("reason")
+                        or "corrupt_batch_unresolved_after_read_only_salvage"
+                    ),
+                    closed_tool_schemas=list(
+                        tool_stream_salvage_replan_context.get("tool_schemas")
+                        or []
+                    ),
+                    closed_deferred_catalog=(
+                        tool_stream_salvage_replan_context.get(
+                            "deferred_catalog"
+                        )
+                    ),
+                    workflow_policy=(
+                        tool_stream_salvage_replan_context.get(
+                            "workflow_policy"
+                        )
+                        if isinstance(
+                            tool_stream_salvage_replan_context.get(
+                                "workflow_policy"
+                            ),
+                            dict,
+                        )
+                        else None
+                    ),
+                    progress_made=tool_stream_salvage_progress_made,
+                    unresolved_count=int(
+                        tool_stream_salvage_replan_context.get(
+                            "unresolved_count"
+                        )
+                        or 0
+                    ),
+                )
+                if replan_debug.get("queued"):
+                    for debug_evt in await debug_stream_event(
+                        "gate.continuation",
+                        replan_debug,
+                    ):
+                        yield debug_evt
+                    for debug_evt in await debug_stream_event(
+                        "tool.stream.continuation_repair.requested",
+                        replan_debug,
+                    ):
+                        yield debug_evt
+                    yield {
+                        "type": "tool_progress",
+                        "msg": (
+                            "↻ Replanning one unresolved tool call after "
+                            "preserving completed read-only results"
+                        ),
+                    }
+                else:
+                    synthesis_debug = queue_tool_stream_evidence_synthesis(
+                        "tool_stream_replan_unavailable_after_salvage"
+                    )
+                    if synthesis_debug.get("queued"):
+                        for debug_evt in await debug_stream_event(
+                            "gate.continuation",
+                            synthesis_debug,
+                        ):
+                            yield debug_evt
+                        for debug_evt in await debug_stream_event(
+                            "tool.stream.evidence_synthesis.requested",
+                            synthesis_debug,
+                        ):
+                            yield debug_evt
+                        yield {
+                            "type": "tool_progress",
+                            "msg": (
+                                "↻ Synthesizing from preserved tool evidence "
+                                "after bounded replanning was exhausted"
+                            ),
+                        }
+                    else:
+                        salvage_debug = (
+                            tool_stream_salvage_replan_context.get(
+                                "salvage_debug"
+                            )
+                            or {}
+                        )
+                        failed_debug = {
+                            "reason": str(
+                                replan_debug.get("reason")
+                                or "tool_stream_replan_unavailable"
+                            ),
+                            "iteration": budget.used,
+                            "remaining_iterations": budget.remaining,
+                            "salvaged_call_count": int(
+                                salvage_debug.get("safe_call_count") or 0
+                            ),
+                            "unresolved_call_count": int(
+                                tool_stream_salvage_replan_context.get(
+                                    "unresolved_count"
+                                )
+                                or 0
+                            ),
+                            "run_recovery_count": tool_stream_recovery_count,
+                            "max_run_recoveries": _MAX_TOOL_STREAM_RUN_RECOVERIES,
+                            "consecutive_no_progress_recoveries": (
+                                tool_stream_consecutive_no_progress_recoveries
+                            ),
+                            "max_consecutive_no_progress_recoveries": (
+                                _MAX_TOOL_STREAM_CONSECUTIVE_NO_PROGRESS_RECOVERIES
+                            ),
+                            "synthesis_unavailable_reason": str(
+                                synthesis_debug.get("reason") or ""
+                            ),
+                        }
+                        for debug_evt in await debug_stream_event(
+                            "tool.stream.recovery.failed",
+                            failed_debug,
+                        ):
+                            yield debug_evt
+                        msg = (
+                            "Provider tool-call recovery exhausted its bounded "
+                            "replan path while unresolved calls or required "
+                            "receipts remained. Preserved read-only results were "
+                            "not replayed."
+                        )
+                        yield await emit_agent_event("run.failed", {
+                            "error": msg,
+                            "finish_reason": (
+                                "provider_tool_stream_recovery_exhausted"
+                            ),
+                            **failed_debug,
+                        })
+                        yield {"type": "error", "msg": msg}
+                        return
 
             # ── Context compression check ────────────────────────────
             if compressor.should_compress():
@@ -24459,6 +25923,14 @@ def _tool_outcome_summary(raw: str) -> tuple[str, str]:
         return "error", raw_text.strip("()")
     if raw_lower.startswith("(failed to fetch "):
         return "error", raw_text.strip("()")
+    if raw_lower.startswith((
+        "browser navigation blocked:",
+        "browser navigate error:",
+        "browser snapshot blocked:",
+        "browser snapshot error:",
+        "no active browser session.",
+    )):
+        return "error", raw_text
     data = _json_object(raw)
     if data is None:
         return "success", ""
@@ -27444,13 +28916,99 @@ def _standard_skill_uses_semantic_capability_plan(
     )
 
 
+def _standard_skill_catalog_native_tools(
+    loaded_package: dict[str, Any],
+    available_tools: list[str] | tuple[str, ...] | set[str],
+) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    available_order = [
+        str(name) for name in available_tools if isinstance(name, str) and name
+    ]
+    directives = _standard_skill_directive_text(
+        loaded_package.get("content")
+    )
+    inferred = _standard_skill_body_capability_plan(
+        loaded_package.get("content"),
+        available_order,
+    )
+    explicitly_supported = set(inferred.tools)
+    for name in available_order:
+        if re.search(
+            rf"(?<![\w-]){re.escape(name)}(?![\w-])",
+            directives,
+            re.IGNORECASE,
+        ):
+            explicitly_supported.add(name)
+
+    selected: list[str] = []
+    metadata_by_tool: dict[str, dict[str, Any]] = {}
+    for name in available_order:
+        metadata = dict(get_metadata(name) or {})
+        metadata_by_tool[name] = metadata
+        requires_directive = bool(
+            name == "execute_code"
+            or metadata.get("destructive")
+            or metadata.get("mutates_workspace")
+            or metadata.get("mutates_global_state")
+            or name in {"browser_click", "browser_type"}
+        )
+        if requires_directive and name not in explicitly_supported:
+            continue
+        selected.append(name)
+    return selected, metadata_by_tool
+
+
+def _standard_skill_directives_reference_path(directives: str, path: str) -> bool:
+    if not directives or not path:
+        return False
+    token_chars = (
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "0123456789_./-${}"
+    )
+    for token in (f"${{SKILL_DIR}}/{path}", f"./{path}", path):
+        start = 0
+        while True:
+            index = directives.find(token, start)
+            if index < 0:
+                break
+            before = directives[index - 1] if index else ""
+            after_index = index + len(token)
+            after = directives[after_index] if after_index < len(directives) else ""
+            if before not in token_chars and after not in token_chars:
+                return True
+            start = index + 1
+    return False
+
+
+def _standard_skill_runnable_scripts(
+    loaded_package: dict[str, Any],
+    runnable_scripts: tuple[tuple[str, str], ...],
+) -> tuple[tuple[str, str], ...]:
+    directives = _standard_skill_directive_text(loaded_package.get("content"))
+    if not directives:
+        return ()
+    result: list[tuple[str, str]] = []
+    remote_markers = re.compile(
+        r"(?:https?://|\b(?:browser|browse|website|web\s*page|remote|network|online)\b|"
+        r"浏览器|网页|网站|远程|联网|网络)",
+        re.IGNORECASE,
+    )
+    for path, digest in runnable_scripts:
+        if not _standard_skill_directives_reference_path(directives, path):
+            continue
+        path_lines = [line for line in directives.splitlines() if path in line]
+        if any(remote_markers.search(line) for line in path_lines):
+            continue
+        result.append((path, digest))
+    return tuple(result)
+
+
 def _build_standard_skill_capability_catalog(
     skill_name: str,
     loaded_package: dict[str, Any],
     available_tools: list[str] | tuple[str, ...] | set[str],
     runnable_scripts: tuple[tuple[str, str], ...],
 ) -> dict[str, Any]:
-    """Compile current exact candidates without interpreting natural language."""
+    """Compile current exact candidates with runtime-owned policy metadata."""
 
     from skills.command_grants import all_compiled_command_grants
     from skills.http_grants import (
@@ -27471,7 +29029,16 @@ def _build_standard_skill_capability_catalog(
         and str(group.get("source_file") or "") == "SKILL.md"
         for group in environment.get("allowed_tool_groups") or []
     )
-    candidate_tools = list(available_tools)
+    candidate_tools, native_tool_metadata = (
+        _standard_skill_catalog_native_tools(
+            loaded_package,
+            available_tools,
+        )
+    )
+    filtered_runnable_scripts = _standard_skill_runnable_scripts(
+        loaded_package,
+        runnable_scripts,
+    )
     if explicitly_empty:
         candidate_tools = [
             name for name in candidate_tools
@@ -27487,9 +29054,10 @@ def _build_standard_skill_capability_catalog(
         skill_name=skill_name,
         loaded_package=loaded_package,
         available_tools=candidate_tools,
-        runnable_scripts=runnable_scripts,
+        runnable_scripts=filtered_runnable_scripts,
         command_grants=commands,
         exact_mcp_names=exact_mcp_names,
+        native_tool_metadata=native_tool_metadata,
     )
     referenced_paths = [
         str(candidate.get("resource_path") or "")
@@ -27512,11 +29080,12 @@ def _build_standard_skill_capability_catalog(
         skill_name=skill_name,
         loaded_package=loaded_package,
         available_tools=candidate_tools,
-        runnable_scripts=runnable_scripts,
+        runnable_scripts=filtered_runnable_scripts,
         command_grants=commands,
         http_prefixes=http_prefixes,
         http_post_prefixes=http_post_prefixes,
         exact_mcp_names=exact_mcp_names,
+        native_tool_metadata=native_tool_metadata,
     )
 
 
@@ -29027,6 +30596,49 @@ def _positive_direct_clauses(
             continue
         matches.append(clause)
     return matches
+
+
+def _canonical_direct_http_url(value: Any) -> str | None:
+    if not isinstance(value, str) or not value or value != value.strip():
+        return None
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    scheme = parsed.scheme.casefold()
+    if scheme not in {"http", "https"}:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    hostname = parsed.hostname
+    if not hostname or any(ord(char) < 32 for char in hostname):
+        return None
+    try:
+        canonical_host = hostname.rstrip(".").encode("idna").decode("ascii").casefold()
+    except (UnicodeError, ValueError):
+        return None
+    if not canonical_host:
+        return None
+    if ":" in canonical_host and not canonical_host.startswith("["):
+        canonical_host = f"[{canonical_host}]"
+    default_port = 80 if scheme == "http" else 443
+    netloc = canonical_host + ("" if port in {None, default_port} else f":{port}")
+    return urlunsplit((scheme, netloc, parsed.path or "", parsed.query, ""))
+
+
+def _unique_direct_http_url(text: str) -> tuple[str, str] | None:
+    trailing = ".,;:!?)]}。，；：！？）】》"
+    by_canonical: dict[str, str] = {}
+    for match in re.finditer(r"https?://[^\s<>\"']+", str(text or ""), re.IGNORECASE):
+        literal = match.group(0).rstrip(trailing)
+        canonical = _canonical_direct_http_url(literal)
+        if canonical is not None:
+            by_canonical.setdefault(canonical, literal)
+    if len(by_canonical) != 1:
+        return None
+    canonical, literal = next(iter(by_canonical.items()))
+    return literal, canonical
 
 
 def _direct_chat_tool_exposure(

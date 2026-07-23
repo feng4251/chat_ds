@@ -125,6 +125,53 @@ def _dedupe_candidates(candidates: Iterable[dict[str, Any]]) -> list[dict[str, A
     return result
 
 
+def _native_capability_family(name: str) -> str:
+    if name.startswith("browser_"):
+        return "browser"
+    if name.startswith("web_"):
+        return "web_retrieval"
+    if name in {"read_file", "search_files"}:
+        return "workspace_read"
+    if name in {"write_file", "patch_file", "merge_files", "skill_copy_resource"}:
+        return "workspace_write"
+    if name == "execute_code":
+        return "compute"
+    if name == "delegate_task":
+        return "delegation"
+    if name.startswith("image_") or name == "vision_analyze":
+        return "media"
+    if name.startswith("session") or name.startswith("sessions_"):
+        return "session"
+    return "native"
+
+
+def _native_execution_environment(name: str) -> str:
+    family = _native_capability_family(name)
+    if family == "browser":
+        return "browser_sidecar"
+    if family == "compute":
+        return "isolated_compute"
+    if family in {"workspace_read", "workspace_write"}:
+        return "workspace"
+    if family == "web_retrieval":
+        return "network_client"
+    return "harness_runtime"
+
+
+def _native_impact_level(name: str, metadata: dict[str, Any]) -> str:
+    if metadata.get("destructive"):
+        return "destructive"
+    if name == "execute_code":
+        return "isolated_execution"
+    if metadata.get("mutates_global_state"):
+        return "global_mutation"
+    if metadata.get("mutates_workspace"):
+        return "workspace_mutation"
+    if metadata.get("read_only"):
+        return "read_only"
+    return "external_interaction"
+
+
 def build_capability_catalog(
     *,
     skill_name: str,
@@ -135,6 +182,7 @@ def build_capability_catalog(
     http_prefixes: Iterable[tuple[str, str]] = (),
     http_post_prefixes: Iterable[tuple[str, str]] = (),
     exact_mcp_names: Iterable[str] = (),
+    native_tool_metadata: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build a finite catalog from backend-authorized, current capabilities.
 
@@ -169,6 +217,7 @@ def build_capability_catalog(
     available = set(ordered_tools)
     candidates: list[dict[str, Any]] = []
 
+    metadata_by_tool = native_tool_metadata or {}
     for name in ordered_tools:
         if (
             name in _PLANNING_CONTROL_TOOLS
@@ -176,10 +225,15 @@ def build_capability_catalog(
             or name.startswith("mcp_")
         ):
             continue
+        metadata = dict(metadata_by_tool.get(name) or {})
         candidates.append({
             "id": _stable_id("tool", name),
             "kind": "native_tool",
             "tool_name": name,
+            "capability_family": _native_capability_family(name),
+            "execution_environment": _native_execution_environment(name),
+            "impact_level": _native_impact_level(name, metadata),
+            "read_only": bool(metadata.get("read_only")),
             "description": (
                 "Backend-authorized native tool. Selecting it only narrows the "
                 "existing run surface; it creates no additional authority."

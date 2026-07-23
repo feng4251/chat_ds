@@ -68,11 +68,12 @@ class AssembledStreamToolCall:
 
 @dataclass(frozen=True)
 class ToolCallStreamAssembly:
-    """Atomic result of finalizing a streamed tool-call batch."""
+    """Atomic batch plus locally complete calls for bounded recovery review."""
 
     calls: tuple[AssembledStreamToolCall, ...]
     errors: tuple[str, ...]
     debug: dict[str, Any]
+    complete_calls: tuple[AssembledStreamToolCall, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -200,13 +201,15 @@ class ToolCallStreamAccumulator:
                 self._merge_arguments(call, arguments_fragment)
 
     def finalize(self, *, iteration: int) -> ToolCallStreamAssembly:
-        """Validate all calls atomically and return no calls on any error."""
+        """Validate atomically while retaining independently complete calls."""
         errors = set(self._global_errors)
         if not self._calls:
             errors.add("missing_tool_calls")
 
         tentative: list[AssembledStreamToolCall] = []
+        complete_calls: list[AssembledStreamToolCall] = []
         used_ids: set[str] = set()
+        duplicated_ids: set[str] = set()
         for call in self._calls:
             if call.name_fragment_count == 0:
                 name, name_error = None, "missing_tool_name"
@@ -228,6 +231,7 @@ class ToolCallStreamAccumulator:
             call_id = call.provider_id or f"call_{iteration}_{call.ordinal}"
             if call_id in used_ids:
                 errors.add("duplicate_call_id")
+                duplicated_ids.add(call_id)
             used_ids.add(call_id)
             tentative.append(AssembledStreamToolCall(
                 call_id=call_id,
@@ -235,14 +239,30 @@ class ToolCallStreamAccumulator:
                 arguments=raw_arguments,
             ))
 
-        if sum(self._argument_chars(call) for call in self._calls) > _MAX_ARGUMENT_CHARS_PER_BATCH:
+        batch_limit_exceeded = bool(
+            sum(self._argument_chars(call) for call in self._calls)
+            > _MAX_ARGUMENT_CHARS_PER_BATCH
+        )
+        if batch_limit_exceeded:
             errors.add("tool_argument_batch_limit_exceeded")
 
+        if not self._global_errors and not batch_limit_exceeded:
+            for call, assembled in zip(self._calls, tentative):
+                if (
+                    not call.error_codes
+                    and assembled.call_id not in duplicated_ids
+                    and assembled.name in self._exposed_names
+                    and call.selected_arguments is not None
+                ):
+                    complete_calls.append(assembled)
+
         debug = self._debug_summary(errors)
+        debug["complete_call_count"] = len(complete_calls)
         return ToolCallStreamAssembly(
             calls=tuple() if errors else tuple(tentative),
             errors=tuple(sorted(errors)),
             debug=debug,
+            complete_calls=tuple(complete_calls),
         )
 
     def debug_summary(self) -> dict[str, Any]:
@@ -1062,10 +1082,18 @@ def validate_nonstream_tool_call_batch(
                         errors.add("fallback_tool_calls_missing")
 
     tentative: list[AssembledStreamToolCall] = []
+    complete_calls: list[AssembledStreamToolCall] = []
+    per_call_errors: list[set[str]] = []
     used_ids: set[str] = set()
+    duplicated_ids: set[str] = set()
     call_debug: list[dict[str, Any]] = []
+    envelope_errors = set(errors)
+    call_limit_exceeded = bool(
+        isinstance(raw_calls, list)
+        and len(raw_calls) > _MAX_LOGICAL_TOOL_CALLS
+    )
     if isinstance(raw_calls, list):
-        if len(raw_calls) > _MAX_LOGICAL_TOOL_CALLS:
+        if call_limit_exceeded:
             errors.add("fallback_tool_call_limit_exceeded")
         for ordinal, raw_call in enumerate(raw_calls):
             call_errors: set[str] = set()
@@ -1083,6 +1111,7 @@ def validate_nonstream_tool_call_batch(
                     call_id = raw_id
                     if call_id in used_ids:
                         call_errors.add("fallback_duplicate_tool_call_id")
+                        duplicated_ids.add(call_id)
                     used_ids.add(call_id)
 
                 raw_type = raw_call.get("type", "function")
@@ -1123,6 +1152,7 @@ def validate_nonstream_tool_call_batch(
                                     call_errors.add("fallback_" + structure_error)
 
             errors.update(call_errors)
+            per_call_errors.append(call_errors)
             call_debug.append({
                 "ordinal": ordinal,
                 "has_provider_id": bool(call_id),
@@ -1136,8 +1166,17 @@ def validate_nonstream_tool_call_batch(
                 arguments=raw_arguments,
             ))
 
-    if sum(len(call.arguments) for call in tentative) > _MAX_ARGUMENT_CHARS_PER_BATCH:
+    batch_limit_exceeded = bool(
+        sum(len(call.arguments) for call in tentative)
+        > _MAX_ARGUMENT_CHARS_PER_BATCH
+    )
+    if batch_limit_exceeded:
         errors.add("fallback_argument_batch_limit_exceeded")
+
+    if not envelope_errors and not call_limit_exceeded and not batch_limit_exceeded:
+        for assembled, call_errors in zip(tentative, per_call_errors):
+            if not call_errors and assembled.call_id not in duplicated_ids:
+                complete_calls.append(assembled)
 
     debug = {
         "choice_count": choice_count,
@@ -1148,12 +1187,14 @@ def validate_nonstream_tool_call_batch(
         ),
         "corrupt": bool(errors),
         "error_codes": sorted(errors),
+        "complete_call_count": len(complete_calls),
         "calls": call_debug,
     }
     return ToolCallStreamAssembly(
         calls=tuple() if errors else tuple(tentative),
         errors=tuple(sorted(errors)),
         debug=debug,
+        complete_calls=tuple(complete_calls),
     )
 
 
