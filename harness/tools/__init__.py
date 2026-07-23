@@ -319,6 +319,8 @@ register(
     "browser_navigate",
     BROWSER_NAVIGATE_SCHEMA,
     browser_navigate,
+    is_read_only=True,
+    parallel_safe=False,
     emoji="🌐",
 )
 
@@ -326,6 +328,8 @@ register(
     "browser_snapshot",
     BROWSER_SNAPSHOT_SCHEMA,
     browser_snapshot,
+    is_read_only=True,
+    parallel_safe=False,
     emoji="📸",
 )
 
