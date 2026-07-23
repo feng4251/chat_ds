@@ -7,8 +7,9 @@
 - 工作目录：`/nfs/yangbb/codes/chat_ds`。
 - 分支：`fix/generic-skill-harness-20260717`。
 - 本轮开始时 HEAD：`d224db33 feat: recover corrupt tool streams generically`。
+- 本轮功能提交：`b0744a33 feat: add generic profile-aware skill sandboxes`。
 - 本轮通用 Skill Harness、process protocol v2、profile-aware preflight、base/browser executor 和 browser egress proxy 已完成实现、全量回归与真实容器验收。
-- 独立 reviewer 已给出代码/测试 `GO`；当前正在做选择性本地 commit 和分阶段生产部署。
+- 独立 reviewer 已给出代码/测试 `GO`；功能提交已按 canary 顺序部署到生产，并通过非模型 smoke。
 - 不自动执行模型重型 V2.3 E2E。V2.3 是用户手工业务验收用例，不是 Harness 特判目标。
 - Git 只做本地 commit，不向 remote push。
 
@@ -107,7 +108,7 @@
 - 最终 Shell/profile 定向：`78 passed, 40 subtests passed`；独立 reviewer 的 23-case Bash 矩阵也通过。
 - `py_compile`、`git diff --check`、默认 Compose config、`local-search` profile config 均通过。
 
-真实容器验收镜像（尚未代表生产部署状态）：
+真实容器验收与生产部署使用同一组 executor/proxy 镜像：
 
 - browser：`sha256:76acea01fdf89f324fef6c48e44d6270841bbb8127887e8cf2e082cd76a84b90`
 - base：`sha256:a7afa67c6c2f0ffe08e27cd8b5b5101b08444e71e6008b85efacf9c6784ad14f`
@@ -134,17 +135,39 @@
   - UID 65528/65529 当前无宿主进程冲突；
   - 根盘约 87 GiB 可用，内存约 26 GiB available；
   - Compose 2.32.4 支持当前声明。
-- 当前代码/测试已获部署 `GO`，但本节写入时新双-executor 拓扑尚未切入生产。部署完成后必须更新本节和镜像/smoke 证据。
+- 2026-07-23 17:47（Asia/Shanghai）完成生产切换。固定使用 project `chat_ds` 和原 bind/data 路径，没有重建 Frontend、DB 或 search。
+- `.env` 已原子生成独立 `EXECUTOR_V2_AUTH_TOKEN`，mode 为 0600；base/browser/Harness 三方值一致且长度合规，值未输出或写入 Git。
+- Harness stream ceiling 为 2400 秒，Backend proxy deadline 为 3000 秒。
 
-部署必须分阶段：
+当前生产镜像：
 
-1. 固定 project `chat_ds` 和原工作目录/bind mounts，不使用新 release 目录指向空 data。
-2. 原子确保 `.env` 中存在独立高熵 `EXECUTOR_V2_AUTH_TOKEN`，并验证 Backend deadline 大于 Harness stream ceiling；不输出值。
-3. 保留旧镜像/compose 回滚点；加载或构建与验收一致的 final executor/browser/proxy 镜像。
-4. 先启动 socket init、proxy、browser executor canary；再切 base executor 和 legacy browser。
-5. 确认无活跃 AgentRun/SSE 后切 Harness，最后切 Backend；不重建 Frontend/DB/search。
-6. 运行非模型 smoke：service health、双 UDS capabilities/reap、真实 base/browser `run_skill_process`、public proxy/private deny、legacy browser、Harness 内部鉴权、Backend/Frontend HTTP。
-7. 不运行 V2.3 模型 E2E。
+| 服务 | Image ID | 状态 |
+|---|---|---|
+| `chat_acits_executor` | `sha256:a7afa67c6c2f0ffe08e27cd8b5b5101b08444e71e6008b85efacf9c6784ad14f` | healthy |
+| `chat_acits_skill_egress_proxy` | `sha256:c5ee4fdc2ee785868f15036706f01d327b05b358f2b7812fcca8bfb7454f9c05` | healthy |
+| `chat_acits_skill_browser_executor` | `sha256:76acea01fdf89f324fef6c48e44d6270841bbb8127887e8cf2e082cd76a84b90` | healthy |
+| `chat_acits_browser` | `sha256:dfe9e49d893e2618c9fec58c095a8254d5e91da4f4f06ce032e0090fe56d6fca` | healthy |
+| `chat_acits_harness` | `sha256:35ad1fbeaede8f0c3843c0375678645e07c4516db4f8e23da1790fe432c4d992` | healthy |
+| `chat_acits_backend` | `sha256:4da7df118bcd06f7b30e57191f0d0a275e238f27beb12ee10a0510e6d32134fb` | running / `/api/health` 200 |
+
+生产 smoke 证据：
+
+- browser worker 只有 loopback、无 route、UID/GID 65529、零 capabilities；直连 public/private/metadata 均失败。
+- proxy public HTTPS 成功；loopback/private/metadata 均为 403；worker 无 controller/proxy UDS authority。
+- 真实 `run_skill_process` 四路通过：base identity、`${SKILL_DIR}` Bash direct helper、headed Node Playwright、persistent Python BrowserProbe；snapshot digest 全匹配，cleanup retained=0。
+- legacy CDP browser 真实打开 `https://example.com/` 并得到 `Example Domain`。
+- Harness `/health` 和 `/v1/models` 正常；未鉴权 `/internal/*` 为 401，Backend 持有的正确 token 为 200。
+- Frontend `/` 与 `/api/health` 均为 200。
+- SearXNG 真实查询返回 46 条结果，前十条 provenance 包括 360search、Baidu、Mojeek、Sogou。
+- worker UID 65528/65529 在 smoke 后宿主任务数均为 0；Harness 镜像内 baked runtime-data 文件数为 0。
+- 切换前 DB 中存在 7 月 20 日遗留的 stale `running` 投影，但最近 30 分钟 AgentRun/TaskItem/ScheduledRun 均为 0，Harness/Backend 也无 established provider/SSE 连接。
+- 本轮没有运行模型重型 V2.3 E2E。
+
+回滚点：
+
+- 原 executor/browser/Harness/Backend 镜像保留 tag `rollback-20260723-pre-process-v2`。
+- 可重建的旧 Harness 代码镜像：`chat_ds-harness:rollback-d224db33`，image `sha256:e7d16ee538fc69e638f20bb93035df90d76008721116ebfedb7d07ccb986abef`。
+- 精确部署 bundle 和构建日志位于 `/nfs/temp/chat_ds_deploy_b0744a33/`，不属于 Git；确认稳定后可按运维保留策略清理。
 
 ## 7. Git/worktree 边界
 
