@@ -1539,7 +1539,7 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, persisted.count("RESULT_FIELDS_JSON:"))
         self.assertTrue(persisted.rstrip().endswith(valid_footer))
 
-    async def test_visible_footer_bridge_failure_is_never_persisted(self):
+    async def test_visible_footer_bridge_failure_is_retryable_without_mutation(self):
         async def fake_run_stream(model_id, messages, tools, **kwargs):
             boundary_sink = kwargs["turn_boundary_sink"]
             await boundary_sink({"phase": "started", "iteration": 1})
@@ -1614,11 +1614,11 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual("error", result["status"])
-        self.assertFalse(result["retryable"])
+        self.assertTrue(result["retryable"])
         self.assertIsNone(result["result_path"])
         persist_result.assert_not_called()
 
-    async def test_invalid_accumulated_recovery_footer_is_nonretryable_and_not_persisted(self):
+    async def test_invalid_accumulated_recovery_footer_is_retryable_without_mutation(self):
         partial = (
             "# Findings\n"
             "PASS: The retained delegated body records verified evidence, source "
@@ -1686,7 +1686,7 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["summary"], "")
         self.assertEqual(result["result_excerpt"], "")
         persist_result.assert_not_called()
-        self.assertFalse(result["retryable"])
+        self.assertTrue(result["retryable"])
         self.assertEqual(
             result["failure_class"],
             "agent_contract_noncompliance",
@@ -2655,6 +2655,8 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("", result["summary"])
         self.assertEqual("", result["result_excerpt"])
         self.assertIsNone(result["result_path"])
+        self.assertFalse(result["retryable"])
+        self.assertEqual("provider_protocol", result["failure_class"])
         persist_result.assert_not_called()
 
     async def test_abandoned_reasoning_is_excluded_from_outer_child_result(self):
@@ -3070,6 +3072,11 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("", result["summary"])
         self.assertEqual("", result["result_excerpt"])
         self.assertIsNone(result["result_path"])
+        self.assertTrue(result["retryable"])
+        self.assertEqual(
+            "agent_contract_noncompliance",
+            result["failure_class"],
+        )
         persist_result.assert_not_called()
 
     async def test_output_contract_repair_raw_continuation_is_atomic_outer(self):
@@ -3168,10 +3175,10 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("", result["summary"])
         self.assertEqual("", result["result_excerpt"])
         self.assertIsNone(result["result_path"])
-        self.assertFalse(result["retryable"])
+        self.assertTrue(result["retryable"])
         persist_result.assert_not_called()
 
-    async def test_post_dispatch_recovery_missing_footer_is_not_retryable(self):
+    async def test_recovery_missing_footer_without_mutation_is_retryable(self):
         async def fake_run_stream(model_id, messages, tools, **kwargs):
             yield {
                 "type": "delta",
@@ -3212,7 +3219,7 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "error")
         self.assertIsNone(result["result_path"])
         persist_result.assert_not_called()
-        self.assertFalse(result["retryable"])
+        self.assertTrue(result["retryable"])
         self.assertEqual(
             "agent_contract_noncompliance",
             result["failure_class"],
@@ -3223,7 +3230,7 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("RESULT_FIELDS_JSON", result["error"])
 
-    async def test_post_dispatch_output_repair_failure_is_not_retryable(self):
+    async def test_read_only_output_repair_failure_is_retryable(self):
         async def fake_run_stream(model_id, messages, tools, **kwargs):
             yield _tool_started(
                 "web_search", "call-output-repair", query="registry"
@@ -3274,7 +3281,7 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual("error", result["status"])
-        self.assertFalse(result["retryable"])
+        self.assertTrue(result["retryable"])
         self.assertEqual(
             "agent_contract_noncompliance",
             result["failure_class"],
@@ -3334,7 +3341,7 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
         )
         persist_result.assert_not_called()
 
-    async def test_post_dispatch_recovery_pseudo_tool_is_not_retryable(self):
+    async def test_recovery_pseudo_tool_without_mutation_is_retryable(self):
         async def fake_run_stream(model_id, messages, tools, **kwargs):
             yield {
                 "type": "delta",
@@ -3377,7 +3384,7 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "error")
         self.assertIsNone(result["result_path"])
         persist_result.assert_not_called()
-        self.assertFalse(result["retryable"])
+        self.assertTrue(result["retryable"])
         self.assertEqual(
             "agent_contract_noncompliance",
             result["failure_class"],

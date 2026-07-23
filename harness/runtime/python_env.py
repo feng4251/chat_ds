@@ -80,6 +80,7 @@ def preflight_isolated_skill_runtime(
     commands: list[str] | tuple[str, ...] | None = None,
     environment_variables: list[str] | tuple[str, ...] | None = None,
     platform_groups: list[dict[str, Any] | list[str] | tuple[str, ...]] | None = None,
+    runtime_profile: str | None = None,
 ) -> dict[str, Any]:
     """Fail closed against the exact network-disabled Skill executor image.
 
@@ -129,6 +130,7 @@ def preflight_isolated_skill_runtime(
         or required_commands
         or required_environment
         or allowed_groups
+        or runtime_profile is not None
     )
     if not checked:
         return {
@@ -138,6 +140,45 @@ def preflight_isolated_skill_runtime(
             "blockers": [],
             "packages": {"requirements": [], "status": "not_declared"},
         }
+
+    runtime_binding: dict[str, str] | None = None
+    socket_path: str | None = None
+    if runtime_profile is not None:
+        try:
+            from tools.skill_runtime_profile import (
+                runtime_profile_socket_binding,
+            )
+
+            binding = runtime_profile_socket_binding(runtime_profile)
+            socket_path = binding.socket_path
+            runtime_binding = {
+                "runtime_profile": binding.runtime_profile,
+                "socket_identity_sha256": (
+                    binding.socket_identity_sha256
+                ),
+            }
+        except (ImportError, ValueError) as exc:
+            error_code = str(
+                getattr(exc, "code", None)
+                or "runtime_profile_client_unavailable"
+            )
+            return {
+                "valid": False,
+                "checked": True,
+                "execution_runtime": "isolated_skill_executor",
+                "runtime_binding": {
+                    "runtime_profile": str(runtime_profile or ""),
+                },
+                "blockers": [{
+                    "code": "isolated_executor_preflight_unavailable",
+                    "items": [error_code],
+                }],
+                "packages": {
+                    "requirements": required_packages,
+                    "status": "executor_unavailable",
+                },
+                "error_code": error_code,
+            }
 
     try:
         from tools.isolated_skill_executor import (
@@ -161,11 +202,16 @@ def preflight_isolated_skill_runtime(
             "error_code": error_code,
         }
     try:
+        probe_kwargs: dict[str, Any] = {
+            "requirements": required_packages,
+            "commands": required_commands,
+            "environment_variables": required_environment,
+            "platform_groups": allowed_groups,
+        }
+        if socket_path is not None:
+            probe_kwargs["socket_path"] = socket_path
         response = probe_isolated_runtime_capabilities(
-            requirements=required_packages,
-            commands=required_commands,
-            environment_variables=required_environment,
-            platform_groups=allowed_groups,
+            **probe_kwargs,
         )
     except IsolatedSkillExecutorError as exc:
         error_code = exc.code
@@ -183,6 +229,45 @@ def preflight_isolated_skill_runtime(
             },
             "error_code": str(error_code),
         }
+
+    response_identity = response.get("runtime_identity")
+    if runtime_profile is not None and (
+        not isinstance(response_identity, dict)
+        or response_identity.get("runtime_profile") != runtime_profile
+    ):
+        return {
+            "valid": False,
+            "checked": True,
+            "execution_runtime": "isolated_skill_executor",
+            "runtime_identity": response_identity,
+            "runtime_binding": runtime_binding,
+            "blockers": [{
+                "code": "isolated_executor_runtime_profile_mismatch",
+                "items": [str(runtime_profile)],
+            }],
+            "packages": {
+                "requirements": required_packages,
+                "status": "executor_unavailable",
+            },
+            "error_code": "runtime_profile_mismatch",
+        }
+    if runtime_binding is not None:
+        capability_identity = {
+            "runtime_profile": runtime_binding["runtime_profile"],
+            "socket_identity_sha256": runtime_binding[
+                "socket_identity_sha256"
+            ],
+            "runtime_identity": response_identity,
+        }
+        runtime_binding["capability_identity_sha256"] = hashlib.sha256(
+            json.dumps(
+                capability_identity,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
 
     missing_commands = [
         str(item["name"])
@@ -244,6 +329,10 @@ def preflight_isolated_skill_runtime(
         "checked": True,
         "execution_runtime": "isolated_skill_executor",
         "runtime_identity": response.get("runtime_identity"),
+        **(
+            {"runtime_binding": runtime_binding}
+            if runtime_binding is not None else {}
+        ),
         "blockers": blockers,
         "packages": {
             "requirements": required_packages,
@@ -283,6 +372,121 @@ def preflight_declared_skill_dependencies(skill_dir: str | Path) -> dict[str, An
     result = preflight_isolated_skill_runtime(requirements=requirements)
     result["declaration_sources"] = report.get("sources") or []
     result["warnings"] = report.get("warnings") or []
+    return result
+
+
+def preflight_skill_entrypoint_runtime(
+    skill_dir: str | Path,
+    entrypoint: str,
+    *,
+    expected_package_sha256: str | None = None,
+    expected_script_sha256: str | None = None,
+    requirements: list[str] | tuple[str, ...] | None = None,
+    commands: list[str] | tuple[str, ...] | None = None,
+    environment_variables: list[str] | tuple[str, ...] | None = None,
+    platform_groups: (
+        list[dict[str, Any] | list[str] | tuple[str, ...]] | None
+    ) = None,
+) -> dict[str, Any]:
+    """Preflight the executor selected from one immutable exact entrypoint.
+
+    The package snapshot is also the profile-selection authority.  Optional
+    expected digests let a capability catalog prove that this activation
+    check still addresses the same bytes it authorized.
+    """
+
+    try:
+        from tools.isolated_skill_executor import (
+            IsolatedSkillExecutorError,
+            snapshot_skill_package,
+        )
+        from tools.skill_runtime_profile import (
+            select_skill_runtime_profile,
+        )
+
+        snapshot = snapshot_skill_package(Path(skill_dir))
+        selection = select_skill_runtime_profile(snapshot, entrypoint)
+    except (ImportError, ValueError) as exc:
+        error_code = str(
+            getattr(exc, "code", None)
+            or "skill_runtime_profile_unavailable"
+        )
+        return {
+            "valid": False,
+            "checked": True,
+            "execution_runtime": "isolated_skill_executor",
+            "blockers": [{
+                "code": "isolated_executor_preflight_unavailable",
+                "items": [error_code],
+            }],
+            "packages": {
+                "requirements": list(requirements or ()),
+                "status": "executor_unavailable",
+            },
+            "error_code": error_code,
+        }
+
+    digest_mismatches: list[str] = []
+    if (
+        expected_package_sha256 is not None
+        and selection.package_sha256 != expected_package_sha256
+    ):
+        digest_mismatches.append("package_sha256")
+    if (
+        expected_script_sha256 is not None
+        and selection.script_sha256 != expected_script_sha256
+    ):
+        digest_mismatches.append("script_sha256")
+    if digest_mismatches:
+        return {
+            "valid": False,
+            "checked": True,
+            "execution_runtime": "isolated_skill_executor",
+            "runtime_profile": selection.runtime_profile,
+            "package_sha256": selection.package_sha256,
+            "script_sha256": selection.script_sha256,
+            "blockers": [{
+                "code": "skill_runtime_profile_authority_mismatch",
+                "items": digest_mismatches,
+            }],
+            "packages": {
+                "requirements": list(requirements or ()),
+                "status": "executor_unavailable",
+            },
+            "error_code": "skill_runtime_profile_authority_mismatch",
+        }
+
+    required_packages = list(dict.fromkeys([
+        *(str(item) for item in selection.runtime_requirements),
+        *(
+            str(item).strip()
+            for item in requirements or ()
+            if str(item).strip()
+        ),
+    ]))
+    required_commands = list(dict.fromkeys([
+        *(str(item) for item in selection.runtime_commands),
+        *(
+            str(item).strip()
+            for item in commands or ()
+            if str(item).strip()
+        ),
+    ]))
+    result = preflight_isolated_skill_runtime(
+        requirements=required_packages,
+        commands=required_commands,
+        environment_variables=environment_variables,
+        platform_groups=platform_groups,
+        runtime_profile=selection.runtime_profile,
+    )
+    result["entrypoint_runtime"] = {
+        "entrypoint": selection.entrypoint,
+        "runtime_profile": selection.runtime_profile,
+        "package_sha256": selection.package_sha256,
+        "script_sha256": selection.script_sha256,
+        "reachable_sources": list(selection.reachable_sources),
+        "required_cwd": selection.required_cwd,
+    }
     return result
 
 

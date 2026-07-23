@@ -26,6 +26,7 @@ from tools.omission_guard import (
     compacted_history_omission_error,
     contains_compacted_history_omission,
 )
+from tools.workspace_lock import workspace_mutation_guard
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +171,23 @@ async def write_file(
         return json.dumps({"error": "content must be a string"})
     if contains_compacted_history_omission(content):
         return json.dumps(compacted_history_omission_error("content"), ensure_ascii=False)
+    workspace = _sandbox_dir(user_id, session_id).resolve()
+    with workspace_mutation_guard(workspace):
+        return await _write_file_locked(
+            filepath,
+            content,
+            user_id=user_id,
+            session_id=session_id,
+        )
+
+
+async def _write_file_locked(
+    filepath: str,
+    content: str,
+    user_id: str,
+    session_id: str,
+) -> str:
+    """Perform one write while the session workspace mutation lock is held."""
 
     try:
         path = _resolve(filepath, user_id, session_id)
@@ -192,11 +210,23 @@ async def write_file(
                 "existing_size": existing_size,
             }, ensure_ascii=False)
 
-    # Create parent directories
-    path.parent.mkdir(parents=True, exist_ok=True)
-
+    temp_path: str | None = None
     try:
-        path.write_text(content, encoding="utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Re-resolve after parent creation so a concurrently introduced link
+        # cannot redirect the final rename.
+        path = _resolve(filepath, user_id, session_id)
+        descriptor, temp_path = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".write.tmp",
+            dir=str(path.parent),
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, path)
+        temp_path = None
         _make_workspace_path_readable(path)
         return json.dumps({
             "status": "written",
@@ -205,6 +235,12 @@ async def write_file(
         }, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": f"Cannot write file: {e}"})
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
 
 async def patch_file(
@@ -222,6 +258,29 @@ async def patch_file(
         return json.dumps(compacted_history_omission_error("old_text"), ensure_ascii=False)
     if contains_compacted_history_omission(new_text):
         return json.dumps(compacted_history_omission_error("new_text"), ensure_ascii=False)
+    workspace = _sandbox_dir(user_id, session_id).resolve()
+    with workspace_mutation_guard(workspace):
+        return await _patch_file_locked(
+            filepath,
+            old_text,
+            new_text,
+            replace_all=replace_all,
+            user_id=user_id,
+            session_id=session_id,
+        )
+
+
+async def _patch_file_locked(
+    filepath: str,
+    old_text: str,
+    new_text: str,
+    *,
+    replace_all: bool,
+    user_id: str,
+    session_id: str,
+) -> str:
+    """Read/CAS-replace one file while the workspace lock is held."""
+
     try:
         path = _resolve(filepath, user_id, session_id)
     except ValueError as exc:
@@ -376,6 +435,28 @@ async def merge_files(
     expanded in lexicographic workspace-relative order. Files selected more
     than once are included only at their first occurrence.
     """
+    workspace = _sandbox_dir(user_id, session_id).resolve()
+    with workspace_mutation_guard(workspace):
+        return await _merge_files_locked(
+            output_filepath,
+            input_files=input_files,
+            patterns=patterns,
+            separator=separator,
+            user_id=user_id,
+            session_id=session_id,
+        )
+
+
+async def _merge_files_locked(
+    output_filepath: str,
+    input_files: list[str] | None,
+    patterns: list[str] | None,
+    separator: str,
+    user_id: str,
+    session_id: str,
+) -> str:
+    """Read inputs and atomically replace output under the workspace lock."""
+
     if input_files is not None and not isinstance(input_files, list):
         return json.dumps({"error": "input_files must be an array of workspace paths."})
     if patterns is not None and not isinstance(patterns, list):

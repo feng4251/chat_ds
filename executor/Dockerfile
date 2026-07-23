@@ -10,39 +10,20 @@ RUN sed -i 's|http://deb.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g; s|ht
 # Skill JavaScript entrypoints use a fixed interpreter selected by extension.
 # The service still runs with network_mode: none; callers cannot select a binary.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends nodejs \
+    && apt-get install -y --no-install-recommends nodejs util-linux \
     && rm -rf /var/lib/apt/lists/*
 
-# Install common scientific computing & data libraries so execute_code can
-# run numpy/scipy/pandas/matplotlib/sklearn workloads out of the box.
-# The executor has network_mode: none, so all dependencies must be baked in
-# at build time.  Use the Tsinghua PyPI mirror for speed & reliability in CN.
+# Install the shared exact-Skill dependency manifest. Specialized runtime
+# profiles resolve this same manifest into their immutable lock so browser and
+# non-browser routes cannot silently expose different common Python surfaces.
+COPY runtime/common-python-requirements.in /tmp/common-python-requirements.in
 RUN pip install --no-cache-dir \
     -i https://pypi.tuna.tsinghua.edu.cn/simple \
-    packaging \
-    numpy \
-    scipy \
-    pandas \
-    matplotlib \
-    scikit-learn \
-    sympy \
-    networkx \
-    Pillow \
-    PyYAML \
-    requests \
-    httpx \
-    statsmodels \
-    pypdf \
-    pdfplumber \
-    reportlab \
-    python-docx \
-    python-pptx \
-    openpyxl \
-    xlsxwriter
+    -r /tmp/common-python-requirements.in
 
 COPY server.py /app/server.py
 
-RUN mkdir -p /run/chat-ds-executor && chmod 0777 /run/chat-ds-executor
+RUN mkdir -p /run/chat-ds-executor && chmod 0755 /run/chat-ds-executor
 
 # Matplotlib needs a writable config dir; the container root is read-only.
 ENV MPLCONFIGDIR=/tmp/matplotlib

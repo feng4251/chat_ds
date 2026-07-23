@@ -112,6 +112,7 @@ PROVIDERS: dict[str, dict] = {
         "thinking_enabled_by_default": True,
         "protocol": "openai",
         "context_length": 303872,
+        "discover_runtime_metadata": True,
     },
     "qwen3_5": {
         "base_url": settings.qwen3_5_url,
@@ -130,6 +131,7 @@ PROVIDERS: dict[str, dict] = {
         "thinking_enabled_by_default": False,
         "protocol": "openai",
         "context_length": 262144,
+        "discover_runtime_metadata": True,
     },
 }
 

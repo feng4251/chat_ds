@@ -35,6 +35,7 @@ from skills.manager import (
 from skills.path_safety import validate_skill_resource
 from skills.scanner import find_all_skills
 from tools.path_security import validate_path
+from tools.workspace_lock import workspace_mutation_guard
 
 logger = logging.getLogger(__name__)
 
@@ -1510,6 +1511,36 @@ async def skill_copy_resource(
     atomic copy, and the receipt includes an integrity hash for downstream
     artifact verification.
     """
+    workspace = validate_path(
+        ".",
+        user_id,
+        session_id,
+        sub="workspace",
+    )
+    with workspace_mutation_guard(workspace):
+        return await _skill_copy_resource_locked(
+            name,
+            source_path,
+            destination_path,
+            overwrite=overwrite,
+            user_id=user_id,
+            session_id=session_id,
+            enabled_user_skills=enabled_user_skills,
+        )
+
+
+async def _skill_copy_resource_locked(
+    name: str,
+    source_path: str,
+    destination_path: str,
+    *,
+    overwrite: bool,
+    user_id: str,
+    session_id: str,
+    enabled_user_skills: list[str] | None,
+) -> str:
+    """Perform the final no-clobber copy under the workspace mutation lock."""
+
     try:
         loaded = get_manager().load_skill(
             name=name,

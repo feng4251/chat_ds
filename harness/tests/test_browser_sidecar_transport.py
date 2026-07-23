@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+import sys
 import tempfile
+from types import ModuleType
 import unittest
 from unittest.mock import patch
 from urllib.parse import urlsplit
@@ -251,6 +253,27 @@ class _FakeStarter:
         return self.playwright
 
 
+def _patched_playwright(playwright):
+    """Install the smallest import-compatible Playwright fixture.
+
+    The Harness imports Playwright lazily.  Keep these transport unit tests
+    runnable in a dependency-light checkout while still exercising that real
+    lazy-import boundary.
+    """
+    package = ModuleType("playwright")
+    package.__path__ = []
+    async_api = ModuleType("playwright.async_api")
+    async_api.async_playwright = lambda: _FakeStarter(playwright)
+    package.async_api = async_api
+    return patch.dict(
+        sys.modules,
+        {
+            "playwright": package,
+            "playwright.async_api": async_api,
+        },
+    )
+
+
 class _FakeRelay:
     instances = []
 
@@ -291,10 +314,7 @@ class BrowserSidecarConnectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_get_browser_uses_only_connect_over_cdp(self):
         fake_pw = _FakePlaywright()
         with (
-            patch(
-                "playwright.async_api.async_playwright",
-                return_value=_FakeStarter(fake_pw),
-            ),
+            _patched_playwright(fake_pw),
             patch("tools.browser._UnixSocketTcpRelay", _FakeRelay),
             patch.object(
                 browser_tools.settings,
@@ -324,10 +344,7 @@ class BrowserSidecarConnectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_connection_failure_closes_driver_and_relay(self):
         fake_pw = _FakePlaywright(error=RuntimeError("CDP unavailable"))
         with (
-            patch(
-                "playwright.async_api.async_playwright",
-                return_value=_FakeStarter(fake_pw),
-            ),
+            _patched_playwright(fake_pw),
             patch("tools.browser._UnixSocketTcpRelay", _FakeRelay),
             patch.object(
                 browser_tools.settings,
@@ -359,10 +376,7 @@ class BrowserSidecarConnectionTests(unittest.IsolatedAsyncioTestCase):
 
         fresh_pw = _FakePlaywright()
         with (
-            patch(
-                "playwright.async_api.async_playwright",
-                return_value=_FakeStarter(fresh_pw),
-            ),
+            _patched_playwright(fresh_pw),
             patch("tools.browser._UnixSocketTcpRelay", _FakeRelay),
             patch.object(
                 browser_tools.settings,

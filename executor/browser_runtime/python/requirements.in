@@ -1,0 +1,4 @@
+-r ../../runtime/common-python-requirements.in
+
+playwright==1.61.0
+selenium==4.46.0

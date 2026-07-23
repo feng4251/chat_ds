@@ -859,6 +859,45 @@ def load_skill_content(
         content,
         frontmatter=frontmatter,
     )
+    runtime_profile_manifest: dict[str, Any] | None = None
+    script_candidates = (
+        workflow_contract.get("script_candidates")
+        if isinstance(workflow_contract, dict) else None
+    )
+    if isinstance(script_candidates, list) and script_candidates:
+        # This runtime-owned manifest is derived from one immutable package
+        # snapshot. Route activation later selects only exact entrypoints from
+        # the chosen plan, so an unrelated browser helper cannot change a
+        # different route's executor profile.
+        try:
+            from tools.skill_runtime_profile import (
+                compile_skill_runtime_profile_manifest,
+            )
+
+            runtime_profile_manifest = (
+                compile_skill_runtime_profile_manifest(
+                    skill_dir_path,
+                    tuple(
+                        str(path)
+                        for path in script_candidates
+                        if isinstance(path, str) and path
+                    ),
+                )
+            )
+        except (ImportError, RuntimeError, ValueError) as exc:
+            runtime_profile_manifest = {
+                "schema_version": 1,
+                "valid": False,
+                "error_code": str(
+                    getattr(exc, "code", None)
+                    or "skill_runtime_profile_unavailable"
+                ),
+                "scripts": [],
+            }
+        workflow_contract = dict(workflow_contract)
+        workflow_contract["_chatds_runtime_profile_manifest"] = (
+            runtime_profile_manifest
+        )
     execution_contract = workflow_contract.get("execution_contract") or {}
     package_diagnostics = workflow_contract.get("package_diagnostics") or {}
     manifest_notices = {
@@ -882,6 +921,10 @@ def load_skill_content(
         "name": name,
         "description": description,
         "content": content,
+        # Preserve the canonical validated package root for runtime-owned
+        # capability compilation. Persistent process grants must hash the
+        # entire package with the same algorithm used by lease creation.
+        "skill_dir": str(skill_dir_path),
         # Capability-plan identity covers the complete canonical document,
         # including frontmatter fields such as allowed-tools/compatibility.
         # Hashing only the Markdown body would accept a stale plan after an
@@ -893,6 +936,7 @@ def load_skill_content(
         "linked_files": linked_files if linked_files else None,
         "resource_graph": resource_graph if resource_graph else None,
         "workflow_contract": workflow_contract if workflow_contract else None,
+        "runtime_profile_manifest": runtime_profile_manifest,
         "execution_contract": execution_contract if execution_contract else None,
         "package_diagnostics": package_diagnostics if package_diagnostics else None,
         "frontmatter": frontmatter,
@@ -8022,7 +8066,7 @@ def _discover_workflow_contract(
         and (
             path.startswith("scripts/")
             or PurePosixPath(path).suffix.casefold()
-            in {".py", ".sh", ".bash", ".js", ".mjs"}
+            in {".py", ".sh", ".bash", ".js", ".mjs", ".cjs"}
         )
     ]
 

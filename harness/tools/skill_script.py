@@ -20,6 +20,7 @@ from typing import Any
 from runtime.python_env import preflight_declared_skill_dependencies
 from skills.path_safety import validate_skill_resource, validate_skill_root
 from skills import scanner as skill_scanner
+from tools.context import ToolContext
 from tools.omission_guard import (
     compacted_history_omission_error,
     find_compacted_history_omission_path,
@@ -49,6 +50,7 @@ SUPPORTED_INTERPRETERS = {
     ".bash": "bash",
     ".js": "node",
     ".mjs": "node",
+    ".cjs": "node",
 }
 SUPPORTED_EXTENSIONS = tuple(SUPPORTED_INTERPRETERS)
 SYSTEM_INTERPRETER_PATH = os.pathsep.join(("/usr/local/bin", "/usr/bin", "/bin"))
@@ -78,6 +80,37 @@ class SkillScriptError(ValueError):
         self.code = code
 
 
+def _expected_skill_package_sha256(
+    context: ToolContext | None,
+    skill_name: str,
+) -> str | None:
+    """Return one runtime-owned package grant, never a model argument."""
+
+    if context is None:
+        return None
+    digests = {
+        digest
+        for granted_skill, digest in context.allowed_skill_package_digests
+        if granted_skill == skill_name
+    }
+    if not digests:
+        return None
+    if (
+        len(digests) != 1
+        or any(
+            len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            for digest in digests
+        )
+    ):
+        raise SkillScriptError(
+            "skill_package_authority_mismatch",
+            "The runtime package authority is ambiguous or malformed. "
+            "Recompile the exact Skill before executing it.",
+        )
+    return next(iter(digests))
+
+
 def _error(code: str, message: str, **extra: Any) -> str:
     payload: dict[str, Any] = {
         "status": "error",
@@ -96,6 +129,7 @@ async def run_skill_script(
     user_id: str = "default",
     session_id: str = "default",
     enabled_user_skills: list[str] | None = None,
+    context: ToolContext | None = None,
 ) -> str:
     """Run one script from an installed Skill selected for this run."""
 
@@ -122,6 +156,10 @@ async def run_skill_script(
             user_id,
             session_id,
             enabled_user_skills,
+        )
+        expected_skill_sha256 = _expected_skill_package_sha256(
+            context,
+            skill_name,
         )
     except SkillScriptError as exc:
         return _error(
@@ -155,6 +193,11 @@ async def run_skill_script(
             args=safe_args,
             timeout=safe_timeout,
             cwd=safe_cwd,
+            **(
+                {"expected_skill_sha256": expected_skill_sha256}
+                if expected_skill_sha256 is not None
+                else {}
+            ),
         )
     except IsolatedSkillExecutorError as exc:
         return _error(
@@ -619,7 +662,7 @@ RUN_SKILL_SCRIPT_SCHEMA = {
     "name": "run_skill_script",
     "description": (
         "Run a real script declared inside the exact installed Skill selected for this run. "
-        "Supported extensions are .py, .sh, .bash, .js, and .mjs. The harness "
+        "Supported extensions are .py, .sh, .bash, .js, .mjs, and .cjs. The harness "
         "sends an immutable, content-addressed Skill/workspace snapshot to a "
         "network-disabled sidecar and selects a fixed Python, bash, or node "
         "interpreter from the extension. Provide argv as "

@@ -843,6 +843,31 @@ class ContextCompressor(ContextEngine):
 
     # -- ContextEngine interface -----------------------------------------------
 
+    def set_context_length(self, context_length: Any) -> None:
+        """Update run-local budgets after authoritative provider feedback."""
+
+        if isinstance(context_length, bool):
+            return
+        try:
+            resolved = int(context_length)
+        except (TypeError, ValueError, OverflowError):
+            return
+        if resolved <= 0:
+            return
+        self.context_length = resolved
+        self.threshold_tokens = max(
+            int(self.context_length * self.threshold_percent),
+            64_000,
+        )
+        target_tokens = int(
+            self.threshold_tokens * self.summary_target_ratio
+        )
+        self.tail_token_budget = target_tokens
+        self.max_summary_tokens = min(
+            int(self.context_length * 0.05),
+            _SUMMARY_TOKENS_CEILING,
+        )
+
     def update_from_response(self, usage: dict[str, Any]) -> None:
         self.last_prompt_tokens = usage.get("prompt_tokens", 0)
         self.last_completion_tokens = usage.get("completion_tokens", 0)

@@ -7,6 +7,8 @@ from agent_loop import (
     _collapse_tool_turn_history,
     _compact_tool_call_arguments,
     _debug_payload,
+    _history_message_fingerprint,
+    _reset_delegated_output_contract_history,
     _safe_tool_result_record,
     _sanitize_model_history_tool_payloads,
     _tool_debug_result,
@@ -359,6 +361,87 @@ class ModelHistorySafetyTests(unittest.TestCase):
         self.assertNotIn("HIDDEN", serialized)
         self.assertNotIn("raw_excerpt", payload)
         self.assertEqual(len("password=HIDDEN"), payload["stdout_chars"])
+
+    def test_tool_debug_result_hashes_complete_signed_urls(self):
+        signed_url = (
+            "https://internal.example.invalid/export?"
+            "signature=VERYSECRET&expires=999999"
+        )
+        payload = _tool_debug_result(json.dumps({
+            "status": "error",
+            "error": f"GET {signed_url} returned 403",
+        }))
+
+        serialized = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn("internal.example.invalid", serialized)
+        self.assertNotIn("VERYSECRET", serialized)
+        self.assertNotIn("expires=999999", serialized)
+        self.assertIn("[url sha256=", serialized)
+
+    def test_output_contract_clean_restart_keeps_task_and_tool_evidence(self):
+        base = [
+            {"role": "system", "content": "bounded system"},
+            {"role": "user", "content": "produce the typed evidence result"},
+        ]
+        base_fingerprints = {
+            _history_message_fingerprint(message) for message in base
+        }
+        conversation = [
+            *base,
+            {
+                "role": "assistant",
+                "content": "untrusted prose attached to a real call",
+                "tool_calls": [{
+                    "id": "call-evidence",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"filepath":"evidence.md"}',
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-evidence",
+                "content": '{"status":"success","content":"bounded evidence"}',
+            },
+            {
+                "role": "assistant",
+                "content": "REJECTED_DRAFT <tool_call>bad protocol</tool_call>",
+            },
+            {
+                "role": "user",
+                "content": "[CHATDS CONTINUATION] continue the rejected prefix",
+            },
+            {
+                "role": "user",
+                "content": (
+                    "[Harness machine-owned unresolved HTTP evidence receipt] "
+                    "coverage is partial"
+                ),
+            },
+        ]
+
+        audit = _reset_delegated_output_contract_history(
+            conversation,
+            base_message_fingerprints=base_fingerprints,
+        )
+
+        serialized = json.dumps(conversation, ensure_ascii=False)
+        self.assertNotIn("REJECTED_DRAFT", serialized)
+        self.assertNotIn("bad protocol", serialized)
+        self.assertNotIn("continue the rejected prefix", serialized)
+        self.assertNotIn("untrusted prose attached", serialized)
+        self.assertIn("produce the typed evidence result", serialized)
+        self.assertIn("evidence.md", serialized)
+        self.assertIn("bounded evidence", serialized)
+        self.assertIn("coverage is partial", serialized)
+        call_message = next(
+            message for message in conversation if message.get("tool_calls")
+        )
+        self.assertIsNone(call_message["content"])
+        self.assertEqual(2, audit["removed_messages"])
+        self.assertEqual(1, audit["retained_tool_call_count"])
 
     def test_no_usage_provider_updates_compressor_from_estimates(self):
         recorder = _UsageRecorder()

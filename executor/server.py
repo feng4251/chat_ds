@@ -6,6 +6,8 @@ session-code and Skill-script requests (including declarative public-function
 calls); a legacy source-only calculation form remains for compatibility.
 Skill execution receives immutable Skill file bytes plus a disposable
 session-workspace snapshot; neither host tree is mounted into the executor.
+Protocol-v2 adds authenticated, scope/digest-bound persistent process leases
+without changing protocol-v1 one-shot semantics.
 """
 
 from __future__ import annotations
@@ -13,12 +15,14 @@ from __future__ import annotations
 import ast
 import base64
 import binascii
+from collections import OrderedDict
+import ctypes
+from dataclasses import dataclass, field
 import hashlib
 import hmac
 import importlib.metadata
 import json
 import os
-import resource
 import re
 import shutil
 import signal
@@ -26,6 +30,7 @@ import socket
 import socketserver
 import stat
 import subprocess
+import secrets
 import sys
 import tempfile
 import threading
@@ -43,7 +48,8 @@ SOCKET_PATH = Path(os.environ.get(
 ))
 
 PROTOCOL_VERSION = 1
-MAX_REQUEST_BYTES = 64 * 1024 * 1024
+PROCESS_PROTOCOL_VERSION = 2
+MAX_REQUEST_BYTES = 96 * 1024 * 1024
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_STDOUT_BYTES = 80_000
 MAX_STDERR_BYTES = 20_000
@@ -68,10 +74,10 @@ MAX_SKILL_FILES = 1_024
 MAX_SKILL_FILE_BYTES = 8 * 1024 * 1024
 MAX_SKILL_TOTAL_BYTES = 24 * 1024 * 1024
 MAX_WORKSPACE_FILES = 512
-MAX_WORKSPACE_FILE_BYTES = 8 * 1024 * 1024
-MAX_WORKSPACE_TOTAL_BYTES = 16 * 1024 * 1024
+MAX_WORKSPACE_FILE_BYTES = 24 * 1024 * 1024
+MAX_WORKSPACE_TOTAL_BYTES = 32 * 1024 * 1024
 MAX_OUTPUT_FILES = 512
-MAX_OUTPUT_FILE_BYTES = 8 * 1024 * 1024
+MAX_OUTPUT_FILE_BYTES = 24 * 1024 * 1024
 MAX_OUTPUT_TOTAL_BYTES = 24 * 1024 * 1024
 MAX_OUTPUT_ENTRIES = 4_096
 MAX_RUNTIME_REQUIREMENTS = 80
@@ -81,9 +87,61 @@ MAX_RUNTIME_PLATFORM_GROUPS = 32
 MAX_RUNTIME_PLATFORMS_PER_GROUP = 32
 MAX_RUNTIME_DECLARATION_CHARS = 512
 
-MAX_ADDRESS_SPACE_BYTES = int(os.environ.get(
-    "EXECUTOR_MAX_ADDRESS_SPACE_BYTES", str(2 * 1024 * 1024 * 1024)
-))
+# Protocol-v2 is an additive, stateful process protocol.  Protocol-v1 remains
+# unchanged for existing one-shot callers.  A lease still runs inside this
+# network-disabled container and can only execute an entrypoint from the exact
+# content-addressed Skill snapshot supplied when the lease is opened.
+MAX_PROCESS_LEASES = 1
+MAX_PROCESS_LEASES_PER_SCOPE = 1
+MIN_PROCESS_LEASE_TTL_SECONDS = 1
+MAX_PROCESS_LEASE_TTL_SECONDS = 3_600
+MAX_PROCESS_RUNTIME_SECONDS = 3_600
+MAX_PROCESS_STDIN_CHUNK_BYTES = 64 * 1024
+MAX_PROCESS_STDIN_TOTAL_BYTES = 4 * 1024 * 1024
+MAX_PROCESS_CALL_BYTES = 4 * 1024
+MAX_PROCESS_STREAM_BYTES = 2 * 1024 * 1024
+MAX_PROCESS_READ_BYTES = 256 * 1024
+MAX_PROCESS_READ_WAIT_MS = 60_000
+MAX_PROCESS_OPERATIONS = 1_024
+MAX_PROCESS_OPERATION_CACHE_BYTES = 96 * 1024 * 1024
+MAX_PROCESS_CLOSE_CACHE_RESERVE_BYTES = (
+    ((MAX_OUTPUT_TOTAL_BYTES + 2) // 3) * 4
+    + 2 * 1024 * 1024
+)
+PROCESS_TOMBSTONE_SECONDS = 60
+PROCESS_JANITOR_INTERVAL_SECONDS = 1.0
+MAX_PROCESS_OWNER_ID_BYTES = 256
+TRUSTED_RESOURCE_LAUNCHER = Path("/usr/bin/prlimit")
+TRUSTED_BROWSER_RUNTIME_LAUNCHER = Path(
+    "/usr/local/bin/chatds-browser-runtime-exec"
+)
+
+_ADDRESS_SPACE_LIMIT_RAW = os.environ.get(
+    "EXECUTOR_MAX_ADDRESS_SPACE_BYTES",
+    str(2 * 1024 * 1024 * 1024),
+).strip()
+if _ADDRESS_SPACE_LIMIT_RAW == "unlimited":
+    if os.environ.get("EXECUTOR_RUNTIME_PROFILE") != "browser-automation-v1":
+        raise RuntimeError(
+            "An unlimited address-space rlimit is valid only for the "
+            "browser-automation-v1 profile."
+        )
+    # Chromium/V8 uses very large sparse virtual mappings. Physical memory is
+    # still hard-bounded by the container cgroup; a finite RLIMIT_AS is not a
+    # reliable resident-memory control for this runtime.
+    MAX_ADDRESS_SPACE_BYTES: int | None = None
+else:
+    try:
+        MAX_ADDRESS_SPACE_BYTES = int(_ADDRESS_SPACE_LIMIT_RAW)
+    except ValueError as exc:
+        raise RuntimeError(
+            "EXECUTOR_MAX_ADDRESS_SPACE_BYTES must be a positive integer or "
+            "the exact browser-profile value 'unlimited'."
+        ) from exc
+    if MAX_ADDRESS_SPACE_BYTES <= 0:
+        raise RuntimeError(
+            "EXECUTOR_MAX_ADDRESS_SPACE_BYTES must be positive."
+        )
 
 SUPPORTED_INTERPRETERS = {
     ".py": "python",
@@ -91,7 +149,18 @@ SUPPORTED_INTERPRETERS = {
     ".bash": "bash",
     ".js": "node",
     ".mjs": "node",
+    ".cjs": "node",
 }
+
+
+def _immutable_snapshot_file_mode(path: Path, *, group_only: bool) -> int:
+    """Keep exact Skill scripts executable without making data executable."""
+
+    executable = path.suffix.casefold() in SUPPORTED_INTERPRETERS
+    if group_only:
+        return 0o550 if executable else 0o440
+    return 0o555 if executable else 0o444
+
 
 RESERVED_WORKSPACE_ROOTS = frozenset({
     ".chatds",
@@ -132,6 +201,7 @@ SKILL_RUNTIME_ENVIRONMENT_VARIABLES = frozenset({
     "CHATDS_WORKSPACE",
     "CHATDS_SKILL_DIR",
     "CHATDS_SKILL_ROOT",
+    "SKILL_DIR",
     "CHATDS_OUTPUT_DIR",
     *BLAS_THREAD_ENV,
 })
@@ -459,6 +529,255 @@ raise SystemExit(main())
 '''
 
 
+PERSISTENT_INSTANCE_RUNNER_SOURCE = r'''
+from __future__ import annotations
+import asyncio
+import contextlib
+import importlib.util
+import inspect
+import io
+import json
+from pathlib import Path
+import re
+import sys
+import traceback
+
+
+PUBLIC_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
+
+
+class BoundedText(io.TextIOBase):
+    def __init__(self, limit):
+        self.limit = limit
+        self.parts = []
+        self.size = 0
+        self.truncated = False
+
+    def writable(self):
+        return True
+
+    def write(self, value):
+        rendered = str(value)
+        remaining = max(0, self.limit - self.size)
+        if remaining:
+            self.parts.append(rendered[:remaining])
+            self.size += min(len(rendered), remaining)
+        if len(rendered) > remaining:
+            self.truncated = True
+        return len(rendered)
+
+    def getvalue(self):
+        return "".join(self.parts)
+
+
+def emit(value):
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+    sys.__stdout__.write(encoded + "\n")
+    sys.__stdout__.flush()
+
+
+def close_event_loop(loop):
+    try:
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(
+                asyncio.gather(*pending, return_exceptions=True)
+            )
+        loop.run_until_complete(loop.shutdown_asyncgens())
+    except BaseException:
+        pass
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+
+
+def main():
+    if len(sys.argv) != 9:
+        raise SystemExit("trusted persistent instance runner received invalid argv")
+    skill_root = Path(sys.argv[1]).resolve(strict=True)
+    entrypoint = Path(sys.argv[2]).resolve(strict=True)
+    constructor_path = Path(sys.argv[3]).resolve(strict=True)
+    invocation_mode = sys.argv[4]
+    selected_name = sys.argv[5]
+    max_input_bytes = int(sys.argv[6])
+    max_result_chars = int(sys.argv[7])
+    max_capture_chars = int(sys.argv[8])
+    try:
+        entrypoint.relative_to(skill_root)
+    except ValueError as exc:
+        raise SystemExit("entrypoint is outside the exact Skill snapshot") from exc
+    if (
+        invocation_mode not in {"instance", "factory"}
+        or not PUBLIC_NAME.fullmatch(selected_name)
+        or selected_name.startswith("_")
+    ):
+        raise SystemExit("invalid public persistent-object identity")
+
+    import_roots = [entrypoint.parent, skill_root]
+    inherited = [item for item in sys.path if item]
+    sys.path[:] = []
+    for candidate in [*import_roots, *inherited]:
+        rendered = str(candidate)
+        if rendered not in sys.path:
+            sys.path.append(rendered)
+
+    request = json.loads(constructor_path.read_text(encoding="utf-8"))
+    constructor_args = request.get("args")
+    constructor_kwargs = request.get("kwargs")
+    if not isinstance(constructor_args, list) or not isinstance(constructor_kwargs, dict):
+        raise SystemExit("invalid constructor envelope")
+
+    captured_out = BoundedText(max_capture_chars)
+    captured_err = BoundedText(max_capture_chars)
+    event_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(event_loop)
+    try:
+        with contextlib.redirect_stdout(captured_out), contextlib.redirect_stderr(captured_err):
+            module_name = "_chatds_persistent_skill"
+            spec = importlib.util.spec_from_file_location(module_name, entrypoint)
+            if spec is None or spec.loader is None:
+                raise RuntimeError("cannot load exact Skill entrypoint")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+            if invocation_mode == "instance":
+                selected_class = getattr(module, selected_name, None)
+                if (
+                    not inspect.isclass(selected_class)
+                    or selected_class.__module__ != module_name
+                    or selected_class.__qualname__ != selected_name
+                ):
+                    raise TypeError("Imported or replaced classes are not callable")
+                instance = selected_class(*constructor_args, **constructor_kwargs)
+            else:
+                selected_factory = getattr(module, selected_name, None)
+                if (
+                    not inspect.isfunction(selected_factory)
+                    or selected_factory.__module__ != module_name
+                    or selected_factory.__qualname__ != selected_name
+                ):
+                    raise TypeError("Imported, replaced, or decorated factories are not callable")
+                instance = selected_factory(*constructor_args, **constructor_kwargs)
+                if inspect.isawaitable(instance):
+                    instance = event_loop.run_until_complete(instance)
+                instance_type = type(instance)
+                if (
+                    instance_type.__module__ != module_name
+                    or instance_type.__qualname__ != instance_type.__name__
+                    or not PUBLIC_NAME.fullmatch(instance_type.__name__)
+                ):
+                    raise TypeError("Factory must return a public top-level object declared by the entrypoint")
+            class_name = type(instance).__name__
+    except BaseException as exc:
+        emit({
+            "event": "constructor_error",
+            "invocation_mode": invocation_mode,
+            "selected_name": selected_name,
+            "error_type": type(exc).__name__,
+            "error": str(exc)[:max_result_chars],
+            "stdout": captured_out.getvalue(),
+            "stderr": captured_err.getvalue(),
+            "stdout_truncated": captured_out.truncated,
+            "stderr_truncated": captured_err.truncated,
+        })
+        close_event_loop(event_loop)
+        return 1
+
+    emit({
+        "event": "ready",
+        "class_name": class_name,
+        "invocation_mode": invocation_mode,
+        **({"factory_name": selected_name} if invocation_mode == "factory" else {}),
+        "stdout": captured_out.getvalue(),
+        "stderr": captured_err.getvalue(),
+        "stdout_truncated": captured_out.truncated,
+        "stderr_truncated": captured_err.truncated,
+    })
+    while True:
+        raw = sys.stdin.buffer.readline(max_input_bytes + 1)
+        if not raw:
+            close_event_loop(event_loop)
+            return 0
+        if len(raw) > max_input_bytes or not raw.endswith(b"\n"):
+            emit({"event": "protocol_error", "error": "call envelope exceeded its bound"})
+            close_event_loop(event_loop)
+            return 2
+        try:
+            call = json.loads(raw.decode("utf-8"))
+            if not isinstance(call, dict) or set(call) != {"call_id", "method", "args", "kwargs"}:
+                raise ValueError("invalid call envelope")
+            call_id = call["call_id"]
+            method_name = call["method"]
+            positional = call["args"]
+            keywords = call["kwargs"]
+            if (
+                not isinstance(call_id, str)
+                or not isinstance(method_name, str)
+                or method_name.startswith("_")
+                or not PUBLIC_NAME.fullmatch(method_name)
+                or not isinstance(positional, list)
+                or not isinstance(keywords, dict)
+            ):
+                raise ValueError("invalid public method call")
+            selected = getattr(instance, method_name, None)
+            function = getattr(selected, "__func__", None)
+            if (
+                not inspect.ismethod(selected)
+                or getattr(selected, "__self__", None) is not instance
+                or function is None
+                or function.__module__ != "_chatds_persistent_skill"
+                or function.__qualname__ != f"{type(instance).__qualname__}.{method_name}"
+            ):
+                raise TypeError("Imported, replaced, decorated, or unbound methods are not callable")
+            captured_out = BoundedText(max_capture_chars)
+            captured_err = BoundedText(max_capture_chars)
+            with contextlib.redirect_stdout(captured_out), contextlib.redirect_stderr(captured_err):
+                result = selected(*positional, **keywords)
+                if inspect.isawaitable(result):
+                    result = event_loop.run_until_complete(result)
+            envelope = {
+                "event": "call_result",
+                "call_id": call_id,
+                "method": method_name,
+                "status": "success",
+                "result": result,
+                "stdout": captured_out.getvalue(),
+                "stderr": captured_err.getvalue(),
+                "stdout_truncated": captured_out.truncated,
+                "stderr_truncated": captured_err.truncated,
+            }
+            rendered = json.dumps(
+                envelope,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+            if len(rendered) > max_result_chars:
+                raise ValueError("method result exceeded its JSON bound")
+            sys.__stdout__.write(rendered + "\n")
+            sys.__stdout__.flush()
+        except BaseException as exc:
+            emit({
+                "event": "call_result",
+                "call_id": call.get("call_id") if isinstance(call, dict) else None,
+                "method": call.get("method") if isinstance(call, dict) else None,
+                "status": "error",
+                "error_type": type(exc).__name__,
+                "error": str(exc)[:max_result_chars],
+            })
+
+
+raise SystemExit(main())
+'''
+
+
 class ProtocolError(ValueError):
     """A stable validation failure safe to return across the socket."""
 
@@ -467,15 +786,1226 @@ class ProtocolError(ValueError):
         self.code = code
 
 
-def _child_limits(cpu_seconds: int = 125) -> None:
-    os.setsid()
-    cpu = max(1, min(int(cpu_seconds), MAX_SKILL_TIMEOUT + 5))
-    resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
-    resource.setrlimit(resource.RLIMIT_AS, (MAX_ADDRESS_SPACE_BYTES,) * 2)
-    resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_OUTPUT_FILE_BYTES,) * 2)
-    resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
-    resource.setrlimit(resource.RLIMIT_NPROC, (32, 32))
-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+@dataclass
+class _ProcessStreamBuffer:
+    """A bounded byte ring with absolute offsets for incremental reads."""
+
+    limit: int
+    data: bytearray = field(default_factory=bytearray)
+    start_offset: int = 0
+    end_offset: int = 0
+    truncated: bool = False
+    eof: bool = False
+
+    def append(self, content: bytes) -> None:
+        if not content:
+            return
+        self.data.extend(content)
+        self.end_offset += len(content)
+        overflow = len(self.data) - self.limit
+        if overflow > 0:
+            del self.data[:overflow]
+            self.start_offset += overflow
+            self.truncated = True
+
+    def read(self, offset: int, limit: int) -> tuple[bytes, int, bool]:
+        data_loss = offset < self.start_offset
+        effective_offset = max(offset, self.start_offset)
+        index = min(len(self.data), effective_offset - self.start_offset)
+        content = bytes(self.data[index:index + limit])
+        return content, effective_offset + len(content), data_loss
+
+
+@dataclass
+class _ProcessLease:
+    handle: str
+    scope_digest: str
+    skill_sha256: str
+    script_sha256: str
+    open_op_id: str
+    open_fingerprint: str
+    entrypoint_relative: str
+    entrypoint_bytes: bytes
+    argv: list[str]
+    cwd_policy: str
+    invocation_mode: str
+    class_name: str | None
+    factory_name: str | None
+    runtime_profile: str
+    egress_policy: str
+    interpreter: str
+    command: list[str]
+    workdir: Path
+    environment: dict[str, str]
+    temp_dir: Path
+    skill_root: Path
+    workspace: Path
+    runtime_root: Path
+    workspace_baseline: dict[str, tuple[int, str]]
+    created_at: float
+    last_activity: float
+    idle_ttl_seconds: int
+    max_runtime_seconds: int
+    absolute_expires_at: float
+    state: str = "open"
+    process: subprocess.Popen[bytes] | None = None
+    process_group_id: int | None = None
+    stdin_bytes_written: int = 0
+    stdin_closed: bool = False
+    stdout: _ProcessStreamBuffer = field(
+        default_factory=lambda: _ProcessStreamBuffer(MAX_PROCESS_STREAM_BYTES)
+    )
+    stderr: _ProcessStreamBuffer = field(
+        default_factory=lambda: _ProcessStreamBuffer(MAX_PROCESS_STREAM_BYTES)
+    )
+    reader_threads: list[threading.Thread] = field(default_factory=list)
+    operations: OrderedDict[str, tuple[str, dict[str, Any]]] = field(
+        default_factory=OrderedDict
+    )
+    operation_cache_bytes: int = 0
+    pending_sync_token: str | None = None
+    pending_sync_state: dict[str, tuple[int, str]] | None = None
+    pending_sync_close: bool = False
+    closed_at: float | None = None
+    close_reason: str | None = None
+    pending_expiry_reason: str | None = None
+    stopping: bool = False
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    condition: threading.Condition = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.condition = threading.Condition(self.lock)
+
+    @property
+    def idle_expires_at(self) -> float:
+        return self.last_activity + self.idle_ttl_seconds
+
+
+_PROCESS_LEASES: dict[str, _ProcessLease] = {}
+_PROCESS_OPEN_OPERATIONS: dict[tuple[str, str], tuple[str, str]] = {}
+_PROCESS_LEASES_LOCK = threading.RLock()
+_PROCESS_HANDLE_SECRET = secrets.token_bytes(32)
+DAEMON_DUMPABILITY_HARDENED = False
+_EXECUTION_ADMISSION_LOCK = threading.RLock()
+_V1_EXECUTION_LOCK = threading.Lock()
+_ACTIVE_PROCESS_LEASE_HANDLE: str | None = None
+_ACTIVE_V1_EXECUTION = False
+
+
+def _canonical_snapshot_digest(files: dict[str, bytes]) -> str:
+    manifest = [
+        {
+            "path": path,
+            "size_bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        }
+        for path, content in sorted(files.items())
+    ]
+    encoded = json.dumps(
+        manifest,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validated_sha256(value: Any, *, field_name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ProtocolError("invalid_authority", f"{field_name} must be a lowercase SHA-256 digest.")
+    return value
+
+
+def _validated_process_owner_scope(value: Any) -> str:
+    """Return a digest of runtime-injected owner identity and its secret nonce.
+
+    The owner fields are never accepted as model-facing process arguments.
+    They arrive over the executor-only UDS from trusted Harness runtime state.
+    The per-scope authority token makes a copied user/session/run tuple
+    insufficient to claim an existing handle.
+    """
+
+    expected = {"user_id", "session_id", "root_run_id", "authority_token"}
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ProtocolError(
+            "invalid_owner_scope",
+            "owner_scope must be the exact runtime-injected owner identity.",
+        )
+    normalized: dict[str, str] = {}
+    for field_name in ("user_id", "session_id", "root_run_id"):
+        item = value.get(field_name)
+        if not isinstance(item, str) or not item or "\x00" in item:
+            raise ProtocolError(
+                "invalid_owner_scope",
+                f"owner_scope.{field_name} must be a non-empty bounded string.",
+            )
+        try:
+            encoded = item.encode("utf-8", errors="strict")
+        except UnicodeError as exc:
+            raise ProtocolError(
+                "invalid_owner_scope",
+                f"owner_scope.{field_name} must be valid UTF-8.",
+            ) from exc
+        if (
+            len(encoded) > MAX_PROCESS_OWNER_ID_BYTES
+            or any(ord(character) < 0x20 for character in item)
+        ):
+            raise ProtocolError(
+                "invalid_owner_scope",
+                f"owner_scope.{field_name} is outside the bounded identity policy.",
+            )
+        normalized[field_name] = item
+    authority_token = value.get("authority_token")
+    if (
+        not isinstance(authority_token, str)
+        or not 32 <= len(authority_token) <= 128
+        or re.fullmatch(r"[A-Za-z0-9_-]+", authority_token) is None
+    ):
+        raise ProtocolError(
+            "invalid_owner_scope",
+            "owner_scope.authority_token must be a runtime-generated opaque token.",
+        )
+    normalized["authority_token"] = authority_token
+    encoded_scope = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded_scope).hexdigest()
+
+
+def _validated_process_op_id(value: Any) -> str:
+    if not isinstance(value, str) or len(value) > 64:
+        raise ProtocolError("invalid_op_id", "op_id must be a bounded UUID string.")
+    try:
+        return str(uuid.UUID(value))
+    except (ValueError, AttributeError) as exc:
+        raise ProtocolError("invalid_op_id", "op_id must be a UUID string.") from exc
+
+
+def _validated_process_seconds(
+    value: Any,
+    *,
+    field_name: str,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise ProtocolError(
+            "invalid_process_quota",
+            f"{field_name} must be an integer between {minimum} and {maximum}.",
+        )
+    return value
+
+
+def _process_operation_fingerprint(payload: dict[str, Any]) -> str:
+    canonical = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"request_id", "auth_hmac"}
+    }
+    try:
+        encoded = json.dumps(
+            canonical,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise ProtocolError(
+            "invalid_process_request",
+            "Process operation must contain bounded valid JSON.",
+        ) from exc
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _process_request_auth_key() -> bytes:
+    token = os.environ.get("EXECUTOR_V2_AUTH_TOKEN", "")
+    try:
+        encoded = token.encode("utf-8", errors="strict")
+    except UnicodeError as exc:
+        raise ProtocolError(
+            "v2_auth_unavailable",
+            "Persistent process protocol authentication is not configured safely.",
+        ) from exc
+    if len(encoded) < 32 or len(encoded) > 4_096:
+        raise ProtocolError(
+            "v2_auth_unavailable",
+            "Persistent process protocol authentication is not configured safely.",
+        )
+    return encoded
+
+
+def _process_request_auth_message(payload: dict[str, Any]) -> bytes:
+    canonical = {
+        key: value
+        for key, value in payload.items()
+        if key != "auth_hmac"
+    }
+    try:
+        return json.dumps(
+            canonical,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise ProtocolError(
+            "invalid_process_request",
+            "Process request must contain bounded valid JSON.",
+        ) from exc
+
+
+def _validate_process_request_auth(payload: dict[str, Any]) -> None:
+    provided = payload.get("auth_hmac")
+    if (
+        not isinstance(provided, str)
+        or len(provided) != 64
+        or any(character not in "0123456789abcdef" for character in provided)
+    ):
+        raise ProtocolError(
+            "v2_auth_failed",
+            "Persistent process request authentication failed.",
+        )
+    expected = hmac.new(
+        _process_request_auth_key(),
+        _process_request_auth_message(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(provided, expected):
+        raise ProtocolError(
+            "v2_auth_failed",
+            "Persistent process request authentication failed.",
+        )
+
+
+def _new_process_handle(
+    *,
+    scope_digest: str,
+    skill_sha256: str,
+    script_sha256: str,
+) -> str:
+    nonce = secrets.token_urlsafe(24)
+    binding = f"{nonce}:{scope_digest}:{skill_sha256}:{script_sha256}".encode("ascii")
+    mac = hmac.new(_PROCESS_HANDLE_SECRET, binding, hashlib.sha256).hexdigest()[:32]
+    return f"pl2_{nonce}_{mac}"
+
+
+def _process_error(
+    request_id: str | None,
+    operation: str | None,
+    code: str,
+    message: str,
+    *,
+    handle: str | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    response: dict[str, Any] = {
+        "protocol_version": PROCESS_PROTOCOL_VERSION,
+        "kind": "process_lease_result",
+        "operation": operation,
+        "request_id": request_id,
+        "status": "error",
+        "error_code": code,
+        "error": message,
+        "network": "disabled",
+    }
+    if handle is not None:
+        response["lease_handle"] = handle
+    response.update(extra)
+    return response
+
+
+def _process_success(
+    request_id: str,
+    operation: str,
+    lease: _ProcessLease,
+    **extra: Any,
+) -> dict[str, Any]:
+    response: dict[str, Any] = {
+        "protocol_version": PROCESS_PROTOCOL_VERSION,
+        "kind": "process_lease_result",
+        "operation": operation,
+        "request_id": request_id,
+        "status": "success",
+        "lease_handle": lease.handle,
+        "scope_digest": lease.scope_digest,
+        "skill_sha256": lease.skill_sha256,
+        "script_sha256": lease.script_sha256,
+        "state": lease.state,
+        "network": "disabled",
+        "runtime_profile": lease.runtime_profile,
+        "network_policy": {
+            "direct": "disabled",
+            "egress": lease.egress_policy,
+        },
+    }
+    response.update(extra)
+    return response
+
+
+def _trusted_resource_launcher() -> str:
+    """Return the fixed, controller-verified rlimit launcher path."""
+
+    try:
+        item = TRUSTED_RESOURCE_LAUNCHER.lstat()
+        resolved = TRUSTED_RESOURCE_LAUNCHER.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ProtocolError(
+            "resource_launcher_unavailable",
+            "The fixed executor resource-limit launcher is unavailable.",
+        ) from exc
+    if (
+        resolved != TRUSTED_RESOURCE_LAUNCHER
+        or not stat.S_ISREG(item.st_mode)
+        or item.st_uid != 0
+        or item.st_mode & 0o022
+        or not os.access(TRUSTED_RESOURCE_LAUNCHER, os.X_OK)
+    ):
+        raise ProtocolError(
+            "resource_launcher_unavailable",
+            "The fixed executor resource-limit launcher failed its trust policy.",
+        )
+    return str(TRUSTED_RESOURCE_LAUNCHER)
+
+
+def _native_worker_popen_kwargs() -> dict[str, Any]:
+    """Use subprocess's native credential/session setup, never preexec_fn."""
+
+    options: dict[str, Any] = {"start_new_session": True}
+    if (
+        os.environ.get("EXECUTOR_WORKER_UID") is None
+        and os.environ.get("EXECUTOR_WORKER_GID") is None
+    ):
+        return options
+    worker_uid, worker_gid = _configured_worker_identity(require_explicit=True)
+    if os.geteuid() != 0:
+        raise ProtocolError(
+            "controller_identity_unavailable",
+            "Configured worker identity requires a root executor controller.",
+        )
+    options.update(
+        user=worker_uid,
+        group=worker_gid,
+        extra_groups=[],
+    )
+    return options
+
+
+def _resource_limited_command(
+    command: list[str],
+    *,
+    cpu_seconds: int,
+    persistent: bool,
+) -> list[str]:
+    """Wrap one fixed command with native prlimit before dropping identity."""
+
+    if persistent:
+        configured_cpu = _trusted_process_limit(
+            "EXECUTOR_PROCESS_MAX_CPU_SECONDS",
+            default=900,
+            minimum=30,
+            maximum=MAX_PROCESS_RUNTIME_SECONDS,
+        )
+        cpu = max(1, min(int(cpu_seconds), configured_cpu))
+        max_processes = _trusted_process_limit(
+            "EXECUTOR_PROCESS_MAX_NPROC",
+            default=64,
+            minimum=16,
+            # Browser automation legitimately needs hundreds of threads, but
+            # only the trusted profile configuration may raise this value.
+            # The base lane keeps the 64-process default and each container's
+            # cgroup pids_limit remains the independent hard ceiling.
+            maximum=512,
+        )
+        max_files = _trusted_process_limit(
+            "EXECUTOR_PROCESS_MAX_NOFILE",
+            default=128,
+            minimum=64,
+            maximum=1_024,
+        )
+    else:
+        cpu = max(1, min(int(cpu_seconds), MAX_SKILL_TIMEOUT + 5))
+        max_processes = 32
+        max_files = 64
+    if MAX_ADDRESS_SPACE_BYTES is None:
+        if (
+            not persistent
+            or _configured_runtime_profile() != "browser-automation-v1"
+        ):
+            raise ProtocolError(
+                "invalid_resource_limit",
+                "Unlimited sparse address space is restricted to persistent "
+                "browser-profile processes.",
+            )
+        address_space_limit = "unlimited"
+    else:
+        address_space_limit = str(MAX_ADDRESS_SPACE_BYTES)
+    return [
+        _trusted_resource_launcher(),
+        f"--cpu={cpu}:{cpu}",
+        f"--as={address_space_limit}:{address_space_limit}",
+        f"--fsize={MAX_OUTPUT_FILE_BYTES}:{MAX_OUTPUT_FILE_BYTES}",
+        f"--nofile={max_files}:{max_files}",
+        f"--nproc={max_processes}:{max_processes}",
+        "--core=0:0",
+        "--",
+        *command,
+    ]
+
+
+def _trusted_process_limit(
+    environment_name: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    try:
+        value = int(os.environ.get(environment_name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(value, maximum))
+
+
+def _configured_worker_identity(*, require_explicit: bool = False) -> tuple[int, int]:
+    raw_uid = os.environ.get("EXECUTOR_WORKER_UID")
+    raw_gid = os.environ.get("EXECUTOR_WORKER_GID")
+    if (raw_uid is None) != (raw_gid is None):
+        raise ProtocolError(
+            "worker_identity_unavailable",
+            "Executor worker UID and GID must be configured together.",
+        )
+    if raw_uid is None:
+        if require_explicit:
+            raise ProtocolError(
+                "worker_identity_unavailable",
+                "Persistent process protocol requires explicit worker UID/GID isolation.",
+            )
+        return os.geteuid(), os.getegid()
+    try:
+        worker_uid = int(raw_uid)
+        worker_gid = int(raw_gid)
+    except (TypeError, ValueError) as exc:
+        raise ProtocolError(
+            "worker_identity_unavailable",
+            "Executor worker UID/GID configuration is invalid.",
+        ) from exc
+    if not (1 <= worker_uid <= 2**31 - 1 and 1 <= worker_gid <= 2**31 - 1):
+        raise ProtocolError(
+            "worker_identity_unavailable",
+            "Executor worker UID/GID is outside the supported numeric policy.",
+        )
+    return worker_uid, worker_gid
+
+
+def _process_protocol_enabled() -> bool:
+    raw = os.environ.get("EXECUTOR_ALLOWED_REQUEST_KINDS", "")
+    if not raw.strip():
+        return False
+    return "process_lease" in {
+        item.strip()
+        for item in raw.split(",")
+        if item.strip()
+    }
+
+
+def _untrusted_execution_enabled() -> bool:
+    raw = os.environ.get("EXECUTOR_ALLOWED_REQUEST_KINDS", "")
+    if not raw.strip():
+        return True
+    allowed = {item.strip() for item in raw.split(",") if item.strip()}
+    return bool(allowed.intersection({
+        "legacy_code",
+        "session_code",
+        "skill_script",
+        "declared_command",
+        "process_lease",
+    }))
+
+
+def _validate_worker_controller_security(*, require_root: bool) -> tuple[int, int]:
+    _trusted_resource_launcher()
+    worker_uid, worker_gid = _configured_worker_identity(require_explicit=True)
+    controller_uid = os.geteuid()
+    controller_gid = os.getegid()
+    if controller_uid == worker_uid or controller_gid == worker_gid:
+        raise ProtocolError(
+            "worker_identity_unavailable",
+            "Executor controller and untrusted worker must use distinct UID/GID identities.",
+        )
+    if require_root and controller_uid != 0:
+        raise ProtocolError(
+            "controller_identity_unavailable",
+            "Enabled persistent process protocol requires a root controller that drops child identity.",
+        )
+    if require_root:
+        _validate_controller_capabilities()
+        if os.environ.get(
+            "EXECUTOR_ENFORCE_SHARED_STATE_ISOLATION"
+        ) != "1":
+            raise ProtocolError(
+                "worker_shared_state_unavailable",
+                "Executor shared-state isolation is not enabled.",
+            )
+    return worker_uid, worker_gid
+
+
+def _validate_process_controller_security(*, require_root: bool = False) -> tuple[int, int]:
+    _process_request_auth_key()
+    return _validate_worker_controller_security(require_root=require_root)
+
+
+def _validate_controller_capabilities() -> None:
+    """Fail closed when Linux stripped capabilities needed for containment."""
+
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        status = Path("/proc/self/status").read_text(
+            encoding="utf-8",
+            errors="strict",
+        )
+        raw = next(
+            line.split(":", 1)[1].strip()
+            for line in status.splitlines()
+            if line.startswith("CapEff:")
+        )
+        effective = int(raw, 16)
+    except (OSError, UnicodeError, StopIteration, ValueError) as exc:
+        raise ProtocolError(
+            "controller_capability_unavailable",
+            "Executor cannot attest its effective controller capabilities.",
+        ) from exc
+    required = {
+        0: "CHOWN",
+        1: "DAC_OVERRIDE",
+        3: "FOWNER",
+        5: "KILL",
+        6: "SETGID",
+        7: "SETUID",
+    }
+    missing = [name for bit, name in required.items() if not effective & (1 << bit)]
+    if missing:
+        raise ProtocolError(
+            "controller_capability_unavailable",
+            "Executor controller is missing required containment capabilities.",
+        )
+
+
+def _worker_uid_processes(worker_uid: int) -> set[int]:
+    matches: set[int] = set()
+    proc_root = Path("/proc")
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError as exc:
+        raise ProtocolError(
+            "worker_containment_failed",
+            "Executor cannot inspect its PID namespace for worker cleanup.",
+        ) from exc
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid():
+            continue
+        try:
+            status = (entry / "status").read_text(encoding="utf-8", errors="strict")
+        except (OSError, UnicodeError) as exc:
+            if entry.exists():
+                raise ProtocolError(
+                    "worker_containment_failed",
+                    "Executor could not inspect a live PID during worker cleanup.",
+                ) from exc
+            continue
+        uid_line = next(
+            (line for line in status.splitlines() if line.startswith("Uid:")),
+            None,
+        )
+        if uid_line is None:
+            if entry.exists():
+                raise ProtocolError(
+                    "worker_containment_failed",
+                    "A live PID did not expose a valid UID record during cleanup.",
+                )
+            continue
+        try:
+            identities = [int(value) for value in uid_line.split()[1:5]]
+        except (TypeError, ValueError) as exc:
+            if entry.exists():
+                raise ProtocolError(
+                    "worker_containment_failed",
+                    "A live PID exposed a malformed UID record during cleanup.",
+                ) from exc
+            continue
+        if len(identities) != 4:
+            raise ProtocolError(
+                "worker_containment_failed",
+                "A live PID exposed an incomplete UID record during cleanup.",
+            )
+        if worker_uid in identities:
+            matches.add(pid)
+    return matches
+
+
+def _reap_worker_children() -> None:
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except (ChildProcessError, OSError):
+            return
+        if pid <= 0:
+            return
+
+
+def _sweep_configured_worker_uid(*, timeout_seconds: float = 2.0) -> None:
+    """Quiesce and kill the dedicated UID, requiring two empty rescans.
+
+    SIGSTOP closes the fork race before SIGKILL.  Requiring two consecutive
+    empty scans prevents a just-forked/double-forked descendant from becoming
+    the next execution's same-UID peer between cleanup and slot release.
+    """
+
+    if os.environ.get("EXECUTOR_WORKER_UID") is None:
+        return
+    worker_uid, _ = _configured_worker_identity(require_explicit=True)
+    deadline = time.monotonic() + max(0.1, min(timeout_seconds, 5.0))
+    consecutive_empty_scans = 0
+    while True:
+        matches = _worker_uid_processes(worker_uid)
+        if not matches:
+            _reap_worker_children()
+            consecutive_empty_scans += 1
+            if consecutive_empty_scans >= 2:
+                return
+            if time.monotonic() >= deadline:
+                raise ProtocolError(
+                    "worker_containment_failed",
+                    "Executor could not confirm two empty worker-identity scans.",
+                )
+            time.sleep(0.02)
+            continue
+        consecutive_empty_scans = 0
+        stopped: set[int] = set()
+        while True:
+            new_matches = _worker_uid_processes(worker_uid) - stopped
+            if not new_matches:
+                break
+            for pid in new_matches:
+                try:
+                    os.kill(pid, signal.SIGSTOP)
+                except ProcessLookupError:
+                    pass
+                except (PermissionError, OSError) as exc:
+                    raise ProtocolError(
+                        "worker_containment_failed",
+                        "Executor controller could not stop a worker-identity process.",
+                    ) from exc
+            stopped.update(new_matches)
+        # Include processes that exited between scans; ProcessLookupError is
+        # harmless. Every still-live UID peer is now stopped and cannot fork.
+        stopped.update(_worker_uid_processes(worker_uid))
+        for pid in stopped:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except (PermissionError, OSError) as exc:
+                raise ProtocolError(
+                    "worker_containment_failed",
+                    "Executor controller could not kill a worker-identity process.",
+                ) from exc
+        _reap_worker_children()
+        if time.monotonic() >= deadline:
+            remaining = _worker_uid_processes(worker_uid)
+            if remaining:
+                raise ProtocolError(
+                    "worker_containment_failed",
+                    "Worker-identity processes survived bounded executor cleanup.",
+                )
+            _reap_worker_children()
+            time.sleep(0.02)
+            if _worker_uid_processes(worker_uid):
+                raise ProtocolError(
+                    "worker_containment_failed",
+                    "A worker-identity process appeared during final cleanup confirmation.",
+                )
+            return
+        time.sleep(0.02)
+
+
+def _configured_execution_temp_root() -> Path:
+    raw = os.environ.get("EXECUTOR_EXECUTION_TEMP_ROOT", "/tmp").strip()
+    if not raw or "\x00" in raw:
+        raise ProtocolError(
+            "worker_shared_state_unavailable",
+            "Executor execution temp root is invalid.",
+        )
+    root = Path(raw)
+    if not root.is_absolute():
+        raise ProtocolError(
+            "worker_shared_state_unavailable",
+            "Executor execution temp root must be absolute.",
+        )
+    try:
+        root_stat = root.lstat()
+        resolved = root.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ProtocolError(
+            "worker_shared_state_unavailable",
+            "Executor execution temp root is unavailable.",
+        ) from exc
+    if (
+        stat.S_ISLNK(root_stat.st_mode)
+        or not stat.S_ISDIR(root_stat.st_mode)
+        or resolved != root
+    ):
+        raise ProtocolError(
+            "worker_shared_state_unavailable",
+            "Executor execution temp root is not a canonical directory.",
+        )
+    return root
+
+
+def _make_execution_temp_dir(prefix: str) -> Path:
+    return Path(
+        tempfile.mkdtemp(
+            prefix=prefix,
+            dir=str(_configured_execution_temp_root()),
+        )
+    )
+
+
+def _worker_shared_state_roots() -> tuple[Path, ...]:
+    roots = [
+        _configured_execution_temp_root(),
+        Path("/tmp"),
+        Path("/dev/shm"),
+    ]
+    if _configured_runtime_profile() == "browser-automation-v1":
+        roots.append(Path("/workspace"))
+    return tuple(dict.fromkeys(roots))
+
+
+def _validate_worker_shared_state_roots(
+    *,
+    worker_uid: int,
+    worker_gid: int,
+) -> None:
+    """Prove fixed shared roots cannot be mutated by the worker identity."""
+
+    for root in _worker_shared_state_roots():
+        try:
+            root_stat = root.lstat()
+        except OSError as exc:
+            raise ProtocolError(
+                "worker_shared_state_unavailable",
+                "Executor shared-state root is unavailable.",
+            ) from exc
+        if (
+            stat.S_ISLNK(root_stat.st_mode)
+            or not stat.S_ISDIR(root_stat.st_mode)
+            or root_stat.st_uid == worker_uid
+            or root_stat.st_mode & 0o002
+            or (
+                root_stat.st_gid == worker_gid
+                and root_stat.st_mode & 0o020
+            )
+        ):
+            raise ProtocolError(
+                "worker_shared_state_unavailable",
+                "Executor shared-state root is writable by the fixed worker.",
+            )
+
+
+def _worker_owned_shared_entries(
+    *,
+    worker_uid: int,
+    worker_gid: int,
+) -> list[Path]:
+    """Boundedly audit fixed container paths shared by consecutive leases."""
+
+    _validate_worker_shared_state_roots(
+        worker_uid=worker_uid,
+        worker_gid=worker_gid,
+    )
+    owned: list[Path] = []
+    inspected = 0
+    for root in _worker_shared_state_roots():
+        stack = [root]
+        while stack:
+            directory = stack.pop()
+            try:
+                children = list(os.scandir(directory))
+            except OSError as exc:
+                raise ProtocolError(
+                    "worker_shared_state_unavailable",
+                    "Executor cannot inspect a shared-state root.",
+                ) from exc
+            for child in children:
+                inspected += 1
+                if inspected > MAX_OUTPUT_ENTRIES:
+                    raise ProtocolError(
+                        "worker_shared_state_unavailable",
+                        "Executor shared-state audit exceeded its entry bound.",
+                    )
+                path = Path(child.path)
+                try:
+                    item = child.stat(follow_symlinks=False)
+                except OSError as exc:
+                    raise ProtocolError(
+                        "worker_shared_state_unavailable",
+                        "Executor cannot inspect a shared-state entry.",
+                    ) from exc
+                if item.st_uid == worker_uid:
+                    owned.append(path)
+                    # Removing the top worker-owned directory also removes its
+                    # bounded descendants; do not collect duplicate children.
+                    if stat.S_ISDIR(item.st_mode):
+                        continue
+                elif (
+                    stat.S_ISLNK(item.st_mode)
+                    or item.st_mode & 0o002
+                    or (
+                        item.st_gid == worker_gid
+                        and item.st_mode & 0o020
+                    )
+                ):
+                    # A fixed worker can mutate a regular file owned by
+                    # another identity just as easily as a directory.  A
+                    # persistent symlink can also redirect a later lease into
+                    # state outside the audited root, so neither form is an
+                    # acceptable clean boundary.
+                    raise ProtocolError(
+                        "worker_shared_state_unavailable",
+                        "A shared-state entry is writable or redirectable by the fixed worker.",
+                    )
+                if stat.S_ISDIR(item.st_mode):
+                    stack.append(path)
+    return owned
+
+
+def _purge_configured_worker_shared_state() -> None:
+    """Remove fixed-UID residue, then prove all shared roots are clean."""
+
+    if (
+        os.environ.get("EXECUTOR_WORKER_UID") is None
+        or os.environ.get(
+            "EXECUTOR_ENFORCE_SHARED_STATE_ISOLATION"
+        ) != "1"
+    ):
+        return
+    worker_uid, worker_gid = _configured_worker_identity(
+        require_explicit=True
+    )
+    for _ in range(2):
+        owned = _worker_owned_shared_entries(
+            worker_uid=worker_uid,
+            worker_gid=worker_gid,
+        )
+        if not owned:
+            # Two clean scans close the same create/delete observation window
+            # as process cleanup. No worker process is live at this boundary.
+            continue
+        for path in sorted(owned, key=lambda item: len(item.parts), reverse=True):
+            try:
+                item = path.lstat()
+                if item.st_uid != worker_uid:
+                    raise ProtocolError(
+                        "worker_containment_failed",
+                        "Shared-state ownership changed during cleanup.",
+                    )
+                if stat.S_ISDIR(item.st_mode):
+                    if not _remove_process_tree(path):
+                        raise ProtocolError(
+                            "worker_containment_failed",
+                            "Worker-owned shared directory could not be removed.",
+                        )
+                else:
+                    path.unlink()
+            except FileNotFoundError:
+                continue
+            except ProtocolError:
+                raise
+            except OSError as exc:
+                raise ProtocolError(
+                    "worker_containment_failed",
+                    "Worker-owned shared state could not be removed.",
+                ) from exc
+    if _worker_owned_shared_entries(
+        worker_uid=worker_uid,
+        worker_gid=worker_gid,
+    ):
+        raise ProtocolError(
+            "worker_containment_failed",
+            "Worker-owned shared state survived bounded cleanup.",
+        )
+
+
+def _reserve_process_admission(reservation: str) -> None:
+    global _ACTIVE_PROCESS_LEASE_HANDLE
+    with _EXECUTION_ADMISSION_LOCK:
+        if _ACTIVE_V1_EXECUTION or _ACTIVE_PROCESS_LEASE_HANDLE is not None:
+            raise ProtocolError(
+                "worker_busy",
+                "The dedicated worker identity is already assigned to another execution.",
+            )
+        _ACTIVE_PROCESS_LEASE_HANDLE = reservation
+
+
+def _commit_process_admission(reservation: str, handle: str) -> None:
+    global _ACTIVE_PROCESS_LEASE_HANDLE
+    with _EXECUTION_ADMISSION_LOCK:
+        if _ACTIVE_PROCESS_LEASE_HANDLE != reservation:
+            raise ProtocolError(
+                "worker_admission_lost",
+                "The dedicated worker admission reservation was lost.",
+            )
+        _ACTIVE_PROCESS_LEASE_HANDLE = handle
+
+
+def _release_process_admission(handle: str) -> None:
+    global _ACTIVE_PROCESS_LEASE_HANDLE
+    # Sweep before releasing the unique UID so an escaped/session-detached
+    # process can never overlap the next execution.
+    _sweep_configured_worker_uid()
+    _purge_configured_worker_shared_state()
+    with _EXECUTION_ADMISSION_LOCK:
+        if _ACTIVE_PROCESS_LEASE_HANDLE in {handle, f"opening:{handle}"}:
+            _ACTIVE_PROCESS_LEASE_HANDLE = None
+
+
+def _cancel_process_admission(reservation: str) -> None:
+    """Release an open reservation that never started a worker process."""
+
+    global _ACTIVE_PROCESS_LEASE_HANDLE
+    with _EXECUTION_ADMISSION_LOCK:
+        if _ACTIVE_PROCESS_LEASE_HANDLE == reservation:
+            _ACTIVE_PROCESS_LEASE_HANDLE = None
+
+
+def _v1_execution_error(
+    payload: dict[str, Any],
+    code: str,
+    message: str,
+) -> dict[str, Any]:
+    request_id = (
+        payload.get("request_id")
+        if isinstance(payload.get("request_id"), str)
+        else None
+    )
+    kind = payload.get("kind")
+    if kind == "skill_script":
+        return _skill_error(request_id, code, message)
+    if kind == "declared_command":
+        return _declared_command_error(
+            request_id,
+            code,
+            message,
+            executable=(
+                payload.get("executable")
+                if isinstance(payload.get("executable"), str)
+                else None
+            ),
+            cwd=payload.get("cwd") if isinstance(payload.get("cwd"), str) else None,
+        )
+    if kind == "session_code":
+        return _session_code_error(request_id, code, message)
+    return {
+        "status": "error",
+        "error_code": code,
+        "error": message,
+        "network": "disabled",
+    }
+
+
+def _run_v1_serialized(
+    payload: dict[str, Any],
+    runner: Any,
+) -> dict[str, Any]:
+    """Serialize every one-shot child with the same dedicated UID slot."""
+
+    global _ACTIVE_V1_EXECUTION
+    with _V1_EXECUTION_LOCK:
+        with _EXECUTION_ADMISSION_LOCK:
+            if _ACTIVE_V1_EXECUTION or _ACTIVE_PROCESS_LEASE_HANDLE is not None:
+                return _v1_execution_error(
+                    payload,
+                    "worker_busy",
+                    "The dedicated worker identity is already assigned to another execution.",
+                )
+            _ACTIVE_V1_EXECUTION = True
+
+        result: dict[str, Any] | None = None
+        execution_error: BaseException | None = None
+        containment_error: ProtocolError | None = None
+        try:
+            result = runner(payload)
+        except BaseException as exc:
+            execution_error = exc
+        finally:
+            try:
+                _sweep_configured_worker_uid()
+                _purge_configured_worker_shared_state()
+            except ProtocolError as exc:
+                containment_error = exc
+            else:
+                with _EXECUTION_ADMISSION_LOCK:
+                    _ACTIVE_V1_EXECUTION = False
+        if containment_error is not None:
+            return _v1_execution_error(
+                payload,
+                containment_error.code,
+                str(containment_error),
+            )
+        if execution_error is not None:
+            raise execution_error
+        if result is None:
+            raise RuntimeError("One-shot executor returned no result.")
+        return result
+
+
+def _prepare_worker_tree(
+    temp_root: Path,
+    *,
+    immutable_roots: tuple[Path, ...] = (),
+    writable_roots: tuple[Path, ...] = (),
+    root_group_writable: bool = False,
+) -> None:
+    """Assign only child-visible trees to the fixed worker identity."""
+
+    if os.environ.get("EXECUTOR_WORKER_UID") is None:
+        return
+    worker_uid, worker_gid = _configured_worker_identity(require_explicit=True)
+    controller_uid = os.geteuid()
+    os.chown(temp_root, controller_uid, worker_gid, follow_symlinks=False)
+    os.chmod(temp_root, 0o730 if root_group_writable else 0o710)
+
+    def prepare(root: Path, *, immutable: bool) -> None:
+        for directory, _, files in os.walk(root, topdown=True, followlinks=False):
+            directory_path = Path(directory)
+            os.chown(
+                directory_path,
+                controller_uid if immutable else worker_uid,
+                worker_gid,
+                follow_symlinks=False,
+            )
+            os.chmod(directory_path, 0o550 if immutable else 0o700)
+            for filename in files:
+                path = directory_path / filename
+                item = path.lstat()
+                if not stat.S_ISREG(item.st_mode) or item.st_nlink != 1:
+                    raise ProtocolError(
+                        "unsafe_execution_tree",
+                        "Executor ownership preparation encountered a non-regular file.",
+                    )
+                os.chown(
+                    path,
+                    controller_uid if immutable else worker_uid,
+                    worker_gid,
+                    follow_symlinks=False,
+                )
+                os.chmod(
+                    path,
+                    (
+                        _immutable_snapshot_file_mode(
+                            path,
+                            group_only=True,
+                        )
+                        if immutable
+                        else 0o600
+                    ),
+                )
+
+    for root in immutable_roots:
+        prepare(root, immutable=True)
+    for root in writable_roots:
+        prepare(root, immutable=False)
+
+
+def _configured_runtime_profile() -> str:
+    profile = os.environ.get("EXECUTOR_RUNTIME_PROFILE", "base-v1")
+    if profile not in {"base-v1", "browser-automation-v1"}:
+        raise ProtocolError(
+            "runtime_profile_unavailable",
+            "Executor runtime profile is not a supported fixed profile.",
+        )
+    return profile
+
+
+def _bounded_runtime_environment_value(name: str) -> str | None:
+    value = os.environ.get(name)
+    if value is None or "\x00" in value:
+        return None
+    try:
+        if len(value.encode("utf-8", errors="strict")) > 4_096:
+            return None
+    except UnicodeError:
+        return None
+    return value
+
+
+def _profile_process_environment() -> tuple[str, str, dict[str, str]]:
+    profile = _configured_runtime_profile()
+    if profile != "browser-automation-v1":
+        return profile, "none", {}
+    forwarded: dict[str, str] = {}
+    for name in (
+        "NODE_PATH",
+        "PLAYWRIGHT_BROWSERS_PATH",
+        "BROWSER_EXECUTABLE",
+        "CHROME_BIN",
+    ):
+        value = _bounded_runtime_environment_value(name)
+        if value is not None:
+            forwarded[name] = value
+    for name in (
+        "SE_OFFLINE",
+        "SE_AVOID_STATS",
+        "SE_AVOID_BROWSER_DOWNLOAD",
+    ):
+        value = _bounded_runtime_environment_value(name)
+        if value is not None:
+            forwarded[name] = value
+    proxy = _bounded_runtime_environment_value("SKILL_EGRESS_PROXY_URL")
+    if proxy:
+        forwarded["SKILL_EGRESS_PROXY_URL"] = proxy
+        for name in (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ):
+            forwarded[name] = proxy
+        # Only loopback is exempt so Selenium can reach its local driver.
+        # Chromium's external traffic remains forced through the policy proxy.
+        loopback_only = "localhost,127.0.0.1,[::1]"
+        forwarded["NO_PROXY"] = loopback_only
+        forwarded["no_proxy"] = loopback_only
+        return profile, "policy_proxy", forwarded
+    return profile, "none", forwarded
+
+
+def _request_kind_allowed(kind: str) -> bool:
+    raw = os.environ.get("EXECUTOR_ALLOWED_REQUEST_KINDS", "")
+    if not raw.strip():
+        return kind != "process_lease"
+    allowed = {
+        item.strip()
+        for item in raw.split(",")
+        if item.strip()
+    }
+    return kind in allowed
 
 
 def _kill_process_group(proc: subprocess.Popen[bytes]) -> None:
@@ -535,12 +2065,13 @@ def _communicate_capped(
             _kill_process_group(proc)
 
     # A Skill may fork children which outlive its entrypoint. Every child is
-    # placed in a fresh process group by _child_limits; reap that entire group
+    # placed in a fresh session by native Popen options; reap that group
     # after the leader exits so no background code survives one request.
     try:
         os.killpg(proc.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
         pass
+    _sweep_configured_worker_uid()
 
     for thread in threads:
         thread.join(timeout=5)
@@ -590,7 +2121,7 @@ def _run_code(payload: dict[str, Any]) -> dict[str, Any]:
         return {"status": "error", "error": "No code provided."}
 
     started = time.monotonic()
-    temp_dir = Path(tempfile.mkdtemp(prefix="exec_", dir="/tmp"))
+    temp_dir = _make_execution_temp_dir("exec_")
     script = temp_dir / "script.py"
     script.write_text(code, encoding="utf-8")
     os.chmod(script, 0o444)
@@ -604,17 +2135,22 @@ def _run_code(payload: dict[str, Any]) -> dict[str, Any]:
         "PYTHONUTF8": "1",
         **BLAS_THREAD_ENV,
     }
+    _prepare_worker_tree(temp_dir, root_group_writable=True)
 
     try:
         proc = subprocess.Popen(
-            [sys.executable, "-I", "-B", str(script)],
+            _resource_limited_command(
+                [sys.executable, "-I", "-B", str(script)],
+                cpu_seconds=timeout + 5,
+                persistent=False,
+            ),
             cwd=temp_dir,
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            preexec_fn=lambda: _child_limits(timeout + 5),
             close_fds=True,
+            **_native_worker_popen_kwargs(),
         )
         stdout, stderr, stdout_truncated, stderr_truncated, timed_out = (
             _communicate_capped(proc, timeout=timeout)
@@ -734,7 +2270,17 @@ def _materialize_snapshot(root: Path, files: dict[str, bytes], *, immutable: boo
         destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         with destination.open("xb") as stream:
             stream.write(content)
-        os.chmod(destination, 0o444 if immutable else 0o600)
+        os.chmod(
+            destination,
+            (
+                _immutable_snapshot_file_mode(
+                    destination,
+                    group_only=False,
+                )
+                if immutable
+                else 0o600
+            ),
+        )
     if immutable:
         directories = [root]
         directories.extend(path for path in root.rglob("*") if path.is_dir())
@@ -1022,10 +2568,19 @@ def _run_runtime_capabilities(payload: dict[str, Any]) -> dict[str, Any]:
             }
             for name in commands
         ]
+        runtime_profile, egress_policy, profile_environment = _profile_process_environment()
+        available_environment = set(SKILL_RUNTIME_ENVIRONMENT_VARIABLES)
+        available_environment.update(profile_environment)
+        if runtime_profile == "browser-automation-v1":
+            # The trusted launcher creates these values per lease after it
+            # starts the private non-root Wayland compositor.  DISPLAY is
+            # deliberately not advertised: this profile has no shared X11
+            # server and must not claim one is available.
+            available_environment.update({"WAYLAND_DISPLAY", "XDG_RUNTIME_DIR"})
         environment_results = [
             {
                 "name": name,
-                "available": name in SKILL_RUNTIME_ENVIRONMENT_VARIABLES,
+                "available": name in available_environment,
             }
             for name in environment_variables
         ]
@@ -1044,6 +2599,11 @@ def _run_runtime_capabilities(payload: dict[str, Any]) -> dict[str, Any]:
             and all(item["available"] for item in environment_results)
             and all(item["satisfied"] for item in platform_results)
         )
+        worker_uid, worker_gid = _configured_worker_identity()
+        worker_configured = (
+            os.environ.get("EXECUTOR_WORKER_UID") is not None
+            and os.environ.get("EXECUTOR_WORKER_GID") is not None
+        )
         return {
             "protocol_version": PROTOCOL_VERSION,
             "kind": "runtime_capabilities_result",
@@ -1056,7 +2616,35 @@ def _run_runtime_capabilities(payload: dict[str, Any]) -> dict[str, Any]:
                 "python_version": ".".join(str(part) for part in sys.version_info[:3]),
                 "platform": current_platform,
                 "network": "disabled",
+                "runtime_profile": runtime_profile,
+                "network_policy": {
+                    "direct": "disabled",
+                    "egress": egress_policy,
+                },
+                "display_backend": (
+                    "wayland-headless"
+                    if runtime_profile == "browser-automation-v1"
+                    else "none"
+                ),
+                "headed_browser": runtime_profile == "browser-automation-v1",
+                "x11": False,
                 "dependency_install": "disabled",
+                "execution_identity": {
+                    "controller_uid": os.geteuid(),
+                    "controller_gid": os.getegid(),
+                    "worker_uid": worker_uid,
+                    "worker_gid": worker_gid,
+                    "uid_isolated": (
+                        worker_configured
+                        and worker_uid != os.geteuid()
+                    ),
+                    "resource_launcher": "prlimit",
+                    "shared_state_isolated": (
+                        os.environ.get(
+                            "EXECUTOR_ENFORCE_SHARED_STATE_ISOLATION"
+                        ) == "1"
+                    ),
+                },
             },
             "requirements": requirement_results,
             "commands": command_results,
@@ -1331,6 +2919,7 @@ def _interpreter_command(
     *,
     skill_root: Path,
     runtime_root: Path,
+    runtime_profile: str = "base-v1",
 ) -> tuple[str, list[str]]:
     kind = SUPPORTED_INTERPRETERS.get(entrypoint.suffix)
     if kind == "python":
@@ -1338,28 +2927,66 @@ def _interpreter_command(
         with runner_path.open("xb") as stream:
             stream.write(CLI_RUNNER_SOURCE.encode("utf-8"))
         os.chmod(runner_path, 0o400)
+        arguments = [str(skill_root), str(entrypoint)]
+        if runtime_profile == "browser-automation-v1":
+            return kind, _browser_runtime_command(runner_path, arguments)
         return kind, [
             sys.executable,
             "-I",
             "-B",
             str(runner_path),
-            str(skill_root),
-            str(entrypoint),
+            *arguments,
         ]
     if kind == "bash":
+        if runtime_profile == "browser-automation-v1":
+            return kind, _browser_runtime_command(entrypoint, [])
         executable = Path("/bin/bash")
         if not executable.is_file():
             raise ProtocolError("interpreter_unavailable", "The fixed bash interpreter is unavailable.")
         return kind, [str(executable), "--noprofile", "--norc", str(entrypoint)]
     if kind == "node":
+        if runtime_profile == "browser-automation-v1":
+            return kind, _browser_runtime_command(entrypoint, [])
         executable = Path("/usr/bin/node")
         if not executable.is_file():
             raise ProtocolError("interpreter_unavailable", "The fixed Node.js interpreter is unavailable.")
         return kind, [str(executable), str(entrypoint)]
     raise ProtocolError(
         "unsupported_script_type",
-        "entrypoint must end in .py, .sh, .bash, .js, or .mjs.",
+        "entrypoint must end in .py, .sh, .bash, .js, .mjs, or .cjs.",
     )
+
+
+def _browser_runtime_command(
+    script: Path,
+    arguments: list[str],
+) -> list[str]:
+    """Wrap every browser-profile entrypoint in its private display launcher."""
+
+    try:
+        item = TRUSTED_BROWSER_RUNTIME_LAUNCHER.lstat()
+        resolved = TRUSTED_BROWSER_RUNTIME_LAUNCHER.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ProtocolError(
+            "browser_runtime_unavailable",
+            "The fixed browser runtime launcher is unavailable.",
+        ) from exc
+    if (
+        resolved != TRUSTED_BROWSER_RUNTIME_LAUNCHER
+        or not stat.S_ISREG(item.st_mode)
+        or item.st_uid != 0
+        or item.st_mode & 0o022
+        or not os.access(TRUSTED_BROWSER_RUNTIME_LAUNCHER, os.X_OK)
+    ):
+        raise ProtocolError(
+            "browser_runtime_unavailable",
+            "The fixed browser runtime launcher failed its trust policy.",
+        )
+    return [
+        str(TRUSTED_BROWSER_RUNTIME_LAUNCHER),
+        str(script),
+        *arguments,
+    ]
 
 
 def _read_regular_file(path: Path, *, display_path: str) -> tuple[bytes, os.stat_result]:
@@ -1396,12 +3023,13 @@ def _read_regular_file(path: Path, *, display_path: str) -> tuple[bytes, os.stat
         os.close(descriptor)
 
 
-def _collect_workspace_artifacts(
+def _collect_workspace_artifacts_with_state(
     workspace: Path,
     initial: dict[str, tuple[int, str]],
-) -> tuple[list[dict[str, Any]], int]:
+) -> tuple[list[dict[str, Any]], int, dict[str, tuple[int, str]]]:
     artifacts: list[dict[str, Any]] = []
     observed: set[str] = set()
+    current: dict[str, tuple[int, str]] = {}
     output_total = 0
     entries = 0
     stack: list[tuple[Path, str, int]] = [(workspace, "", 0)]
@@ -1443,6 +3071,7 @@ def _collect_workspace_artifacts(
             observed.add(safe_relative)
             content, stable_stat = _read_regular_file(Path(child.path), display_path=safe_relative)
             digest = hashlib.sha256(content).hexdigest()
+            current[safe_relative] = (stable_stat.st_size, digest)
             previous = initial.get(safe_relative)
             if previous == (stable_stat.st_size, digest):
                 continue
@@ -1458,7 +3087,18 @@ def _collect_workspace_artifacts(
             })
 
     artifacts.sort(key=lambda item: item["path"])
-    return artifacts, len(set(initial) - observed)
+    return artifacts, len(set(initial) - observed), current
+
+
+def _collect_workspace_artifacts(
+    workspace: Path,
+    initial: dict[str, tuple[int, str]],
+) -> tuple[list[dict[str, Any]], int]:
+    artifacts, deleted_count, _ = _collect_workspace_artifacts_with_state(
+        workspace,
+        initial,
+    )
+    return artifacts, deleted_count
 
 
 def _skill_error(
@@ -1561,7 +3201,7 @@ def _run_declared_command(payload: dict[str, Any]) -> dict[str, Any]:
             max_total_bytes=MAX_WORKSPACE_TOTAL_BYTES,
         )
 
-        temp_dir = Path(tempfile.mkdtemp(prefix="declared_command_", dir="/tmp"))
+        temp_dir = _make_execution_temp_dir("declared_command_")
         skill_root = temp_dir / "skill"
         workspace = temp_dir / "workspace"
         runtime_root = temp_dir / "runtime"
@@ -1599,20 +3239,30 @@ def _run_declared_command(payload: dict[str, Any]) -> dict[str, Any]:
             "CHATDS_WORKSPACE": str(workspace),
             "CHATDS_SKILL_DIR": str(skill_root),
             "CHATDS_SKILL_ROOT": str(skill_root),
+            "SKILL_DIR": str(skill_root),
             "CHATDS_OUTPUT_DIR": str(output_dir),
             **BLAS_THREAD_ENV,
         }
+        _prepare_worker_tree(
+            temp_dir,
+            immutable_roots=(skill_root,),
+            writable_roots=(workspace, runtime_root),
+        )
         try:
             proc = subprocess.Popen(
-                [resolved_executable, *argv],
+                _resource_limited_command(
+                    [resolved_executable, *argv],
+                    cpu_seconds=timeout + 5,
+                    persistent=False,
+                ),
                 shell=False,
                 cwd=workspace if cwd_policy == "workspace" else skill_root,
                 env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                preexec_fn=lambda: _child_limits(timeout + 5),
                 close_fds=True,
+                **_native_worker_popen_kwargs(),
             )
         except (FileNotFoundError, PermissionError, OSError) as exc:
             raise ProtocolError(
@@ -1744,7 +3394,7 @@ def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
             max_total_bytes=MAX_WORKSPACE_TOTAL_BYTES,
         )
 
-        temp_dir = Path(tempfile.mkdtemp(prefix="skill_exec_", dir="/tmp"))
+        temp_dir = _make_execution_temp_dir("skill_exec_")
         skill_root = temp_dir / "skill"
         workspace = temp_dir / "workspace"
         runtime_root = temp_dir / "runtime"
@@ -1815,20 +3465,30 @@ def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
             "CHATDS_WORKSPACE": str(workspace),
             "CHATDS_SKILL_DIR": str(skill_root),
             "CHATDS_SKILL_ROOT": str(skill_root),
+            "SKILL_DIR": str(skill_root),
             "CHATDS_OUTPUT_DIR": str(output_dir),
             **BLAS_THREAD_ENV,
         }
+        _prepare_worker_tree(
+            temp_dir,
+            immutable_roots=(skill_root,),
+            writable_roots=(workspace, runtime_root),
+        )
 
         try:
             proc = subprocess.Popen(
-                [*command, *argv] if invocation_mode == "cli" else command,
+                _resource_limited_command(
+                    [*command, *argv] if invocation_mode == "cli" else command,
+                    cpu_seconds=timeout + 5,
+                    persistent=False,
+                ),
                 cwd=workdir,
                 env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                preexec_fn=lambda: _child_limits(timeout + 5),
                 close_fds=True,
+                **_native_worker_popen_kwargs(),
             )
         except (FileNotFoundError, PermissionError, OSError) as exc:
             raise ProtocolError(
@@ -2034,7 +3694,7 @@ def _run_session_code(payload: dict[str, Any]) -> dict[str, Any]:
             max_total_bytes=MAX_WORKSPACE_TOTAL_BYTES,
         )
 
-        temp_dir = Path(tempfile.mkdtemp(prefix="session_code_", dir="/tmp"))
+        temp_dir = _make_execution_temp_dir("session_code_")
         skills_root = temp_dir / "skills"
         workspace = temp_dir / "workspace"
         runtime_root = temp_dir / "runtime"
@@ -2072,16 +3732,25 @@ def _run_session_code(payload: dict[str, Any]) -> dict[str, Any]:
             "CHATDS_OUTPUT_DIR": str(output_dir),
             **BLAS_THREAD_ENV,
         }
+        _prepare_worker_tree(
+            temp_dir,
+            immutable_roots=(skills_root,),
+            writable_roots=(workspace, runtime_root, code_root),
+        )
         try:
             proc = subprocess.Popen(
-                [sys.executable, "-I", "-B", str(script)],
+                _resource_limited_command(
+                    [sys.executable, "-I", "-B", str(script)],
+                    cpu_seconds=timeout + 5,
+                    persistent=False,
+                ),
                 cwd=workspace,
                 env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                preexec_fn=lambda: _child_limits(timeout + 5),
                 close_fds=True,
+                **_native_worker_popen_kwargs(),
             )
         except (FileNotFoundError, PermissionError, OSError) as exc:
             raise ProtocolError(
@@ -2143,19 +3812,1665 @@ def _run_session_code(payload: dict[str, Any]) -> dict[str, Any]:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def _drain_process_stream(
+    lease: _ProcessLease,
+    stream_name: str,
+    stream: Any,
+) -> None:
+    buffer = lease.stdout if stream_name == "stdout" else lease.stderr
+    try:
+        while True:
+            chunk = stream.read(64 * 1024)
+            if not chunk:
+                break
+            while not lease.stopping:
+                if lease.lock.acquire(timeout=0.1):
+                    try:
+                        buffer.append(chunk)
+                        lease.condition.notify_all()
+                    finally:
+                        lease.lock.release()
+                    break
+            if lease.stopping:
+                break
+    except (OSError, ValueError):
+        pass
+    finally:
+        if lease.stopping:
+            # The stopper owns the lease lock and joins this thread before
+            # releasing it. These simple flags are safe under the GIL and
+            # avoid a lock/join cycle.
+            buffer.eof = True
+        else:
+            with lease.condition:
+                buffer.eof = True
+                _refresh_process_state_locked(lease)
+                lease.condition.notify_all()
+
+
+def _refresh_process_state_locked(lease: _ProcessLease) -> None:
+    process = lease.process
+    if (
+        lease.state == "running"
+        and process is not None
+        and process.poll() is not None
+        and lease.stdout.eof
+        and lease.stderr.eof
+    ):
+        lease.state = "exited"
+
+
+def _signal_process_group(
+    process: subprocess.Popen[bytes],
+    selected_signal: int,
+    *,
+    process_group_id: int | None = None,
+) -> bool:
+    group_id = process.pid if process_group_id is None else process_group_id
+    if group_id <= 0:
+        return False
+    try:
+        os.killpg(group_id, selected_signal)
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+    return True
+
+
+def _stop_process_lease_locked(lease: _ProcessLease) -> None:
+    process = lease.process
+    if process is None:
+        return
+    lease.stopping = True
+    if process.stdin is not None:
+        try:
+            process.stdin.close()
+        except (OSError, ValueError):
+            pass
+    lease.stdin_closed = True
+    if process.poll() is None:
+        _signal_process_group(
+            process,
+            signal.SIGTERM,
+            process_group_id=lease.process_group_id,
+        )
+        try:
+            process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            _signal_process_group(
+                process,
+                signal.SIGKILL,
+                process_group_id=lease.process_group_id,
+            )
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                _kill_process_group(process)
+    # The leader may already have exited while descendants inherited its
+    # process group. Always kill the original group ID before releasing the
+    # lease; relying on process.poll() would leak those descendants.
+    try:
+        os.killpg(lease.process_group_id or process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    for stream in (process.stdout, process.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
+    for thread in lease.reader_threads:
+        thread.join(timeout=1)
+    _refresh_process_state_locked(lease)
+
+
+def _remove_process_tree(root: Path) -> bool:
+    """Remove an owned snapshot after restoring only real directory modes."""
+
+    if not root.exists():
+        return True
+    try:
+        for directory, _, _ in os.walk(root, topdown=True, followlinks=False):
+            try:
+                os.chmod(directory, 0o700, follow_symlinks=False)
+            except (NotImplementedError, OSError):
+                pass
+        shutil.rmtree(root)
+    except OSError:
+        # Cleanup is retried by the janitor/tombstone path. Never follow a
+        # Skill-created link merely to make deletion succeed.
+        return not root.exists()
+    return not root.exists()
+
+
+def _expire_process_lease_locked(
+    lease: _ProcessLease,
+    *,
+    now: float,
+    reason: str,
+) -> None:
+    if lease.state in {"closed", "expired"}:
+        return
+    _stop_process_lease_locked(lease)
+    try:
+        _sweep_configured_worker_uid()
+        if not _remove_process_tree(lease.temp_dir):
+            raise ProtocolError(
+                "worker_containment_failed",
+                "Expired worker tree could not be removed safely.",
+            )
+        _release_process_admission(lease.handle)
+    except ProtocolError:
+        # Keep the unique worker slot permanently reserved if containment
+        # cannot be proven. This is safer than overlapping another same-UID
+        # execution; shutdown/operator intervention can then recover it.
+        lease.state = "quarantined"
+        lease.close_reason = "worker_containment_failed"
+        lease.pending_expiry_reason = reason
+        lease.closed_at = None
+    else:
+        lease.state = "expired"
+        lease.close_reason = reason
+        lease.pending_expiry_reason = None
+        lease.closed_at = now
+    lease.condition.notify_all()
+
+
+def _retry_quarantined_process_lease_locked(
+    lease: _ProcessLease,
+    *,
+    now: float,
+) -> bool:
+    if lease.state != "quarantined":
+        return False
+    try:
+        _sweep_configured_worker_uid()
+        if not _remove_process_tree(lease.temp_dir):
+            raise ProtocolError(
+                "worker_containment_failed",
+                "Quarantined worker tree could not be removed safely.",
+            )
+        _release_process_admission(lease.handle)
+    except ProtocolError:
+        return False
+    lease.state = "expired"
+    lease.close_reason = lease.pending_expiry_reason or "worker_containment_recovered"
+    lease.pending_expiry_reason = None
+    lease.closed_at = now
+    lease.condition.notify_all()
+    return True
+
+
+def _cleanup_expired_process_leases(*, now: float | None = None) -> int:
+    current = time.monotonic() if now is None else now
+    cleaned = 0
+    with _PROCESS_LEASES_LOCK:
+        for handle, lease in list(_PROCESS_LEASES.items()):
+            with lease.lock:
+                if lease.state == "quarantined":
+                    if _retry_quarantined_process_lease_locked(
+                        lease,
+                        now=current,
+                    ):
+                        cleaned += 1
+                    else:
+                        continue
+                if lease.state not in {"closed", "expired"}:
+                    if current >= lease.absolute_expires_at:
+                        _expire_process_lease_locked(
+                            lease,
+                            now=current,
+                            reason="max_runtime_expired",
+                        )
+                        if lease.state == "expired":
+                            cleaned += 1
+                    elif current >= lease.idle_expires_at:
+                        _expire_process_lease_locked(
+                            lease,
+                            now=current,
+                            reason="idle_ttl_expired",
+                        )
+                        if lease.state == "expired":
+                            cleaned += 1
+                if (
+                    lease.state in {"closed", "expired"}
+                    and lease.closed_at is not None
+                ):
+                    if lease.temp_dir.exists():
+                        _remove_process_tree(lease.temp_dir)
+                    if (
+                        not lease.temp_dir.exists()
+                        and current - lease.closed_at >= PROCESS_TOMBSTONE_SECONDS
+                    ):
+                        _PROCESS_LEASES.pop(handle, None)
+                        _PROCESS_OPEN_OPERATIONS.pop(
+                            (lease.scope_digest, lease.open_op_id),
+                            None,
+                        )
+    return cleaned
+
+
+def _shutdown_all_process_leases() -> None:
+    """Best-effort daemon/test cleanup; no process survives server shutdown."""
+
+    global _ACTIVE_PROCESS_LEASE_HANDLE, _ACTIVE_V1_EXECUTION
+    with _PROCESS_LEASES_LOCK:
+        leases = list(_PROCESS_LEASES.values())
+        for lease in leases:
+            with lease.lock:
+                _stop_process_lease_locked(lease)
+        try:
+            _sweep_configured_worker_uid()
+        except ProtocolError:
+            pass
+        for lease in leases:
+            with lease.lock:
+                _remove_process_tree(lease.temp_dir)
+                lease.state = "closed"
+                lease.close_reason = "executor_shutdown"
+                lease.closed_at = time.monotonic()
+                lease.condition.notify_all()
+        _PROCESS_LEASES.clear()
+        _PROCESS_OPEN_OPERATIONS.clear()
+    with _EXECUTION_ADMISSION_LOCK:
+        _ACTIVE_PROCESS_LEASE_HANDLE = None
+        _ACTIVE_V1_EXECUTION = False
+
+
+def _controller_reap_process_leases() -> int:
+    """Authenticated startup cleanup for a replacement Harness process.
+
+    Process capabilities intentionally live only in Harness memory. If that
+    process crashes, a new Harness instance must be able to prove that the
+    fixed worker UID is empty before accepting traffic instead of waiting for
+    an orphan lease's idle timeout.
+    """
+
+    global _ACTIVE_PROCESS_LEASE_HANDLE
+    with _EXECUTION_ADMISSION_LOCK:
+        if _ACTIVE_V1_EXECUTION:
+            raise ProtocolError(
+                "worker_busy",
+                "A one-shot worker is active; controller startup reap was refused.",
+            )
+        active_handle = _ACTIVE_PROCESS_LEASE_HANDLE
+    with _PROCESS_LEASES_LOCK:
+        leases = list(_PROCESS_LEASES.values())
+        known_handles = {lease.handle for lease in leases}
+        if (
+            active_handle is not None
+            and active_handle not in known_handles
+        ):
+            raise ProtocolError(
+                "worker_busy",
+                "A lease-open reservation is active; controller startup reap was refused.",
+            )
+        for lease in leases:
+            with lease.lock:
+                _stop_process_lease_locked(lease)
+        _sweep_configured_worker_uid()
+        failed: list[_ProcessLease] = []
+        for lease in leases:
+            with lease.lock:
+                if not _remove_process_tree(lease.temp_dir):
+                    lease.state = "quarantined"
+                    lease.close_reason = "worker_containment_failed"
+                    lease.pending_expiry_reason = "controller_startup_reap"
+                    lease.closed_at = None
+                    lease.condition.notify_all()
+                    failed.append(lease)
+        if failed:
+            raise ProtocolError(
+                "worker_containment_failed",
+                "Controller startup reap could not remove every orphan worker tree.",
+            )
+        _purge_configured_worker_shared_state()
+        _PROCESS_LEASES.clear()
+        _PROCESS_OPEN_OPERATIONS.clear()
+        with _EXECUTION_ADMISSION_LOCK:
+            _ACTIVE_PROCESS_LEASE_HANDLE = None
+    # A second bounded sweep after releasing all tree references proves that
+    # no child appeared during cleanup.
+    _sweep_configured_worker_uid()
+    _purge_configured_worker_shared_state()
+    return len(leases)
+
+
+def _process_lease_janitor(stop_event: threading.Event) -> None:
+    while not stop_event.wait(PROCESS_JANITOR_INTERVAL_SECONDS):
+        _cleanup_expired_process_leases()
+
+
+def _cached_process_response(
+    lease: _ProcessLease,
+    *,
+    op_id: str,
+    fingerprint: str,
+    request_id: str,
+) -> dict[str, Any] | None:
+    cached = lease.operations.get(op_id)
+    if cached is None:
+        return None
+    cached_fingerprint, cached_response = cached
+    if not hmac.compare_digest(cached_fingerprint, fingerprint):
+        raise ProtocolError(
+            "op_id_conflict",
+            "op_id was already used for a different process operation.",
+        )
+    response = json.loads(json.dumps(cached_response))
+    response["request_id"] = request_id
+    response["idempotent_replay"] = True
+    return response
+
+
+def _cache_process_response(
+    lease: _ProcessLease,
+    *,
+    op_id: str,
+    fingerprint: str,
+    response: dict[str, Any],
+) -> None:
+    if len(lease.operations) >= MAX_PROCESS_OPERATIONS:
+        raise ProtocolError(
+            "operation_limit_exceeded",
+            "Process lease exhausted its bounded operation budget.",
+        )
+    encoded = json.dumps(
+        response,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if lease.operation_cache_bytes + len(encoded) > MAX_PROCESS_OPERATION_CACHE_BYTES:
+        raise ProtocolError(
+            "operation_cache_limit_exceeded",
+            "Process lease exhausted its bounded idempotency-cache byte budget.",
+        )
+    lease.operations[op_id] = (
+        fingerprint,
+        json.loads(encoded),
+    )
+    lease.operation_cache_bytes += len(encoded)
+
+
+def _process_cache_reservation(payload: dict[str, Any], operation: str) -> int:
+    if operation in {"sync", "close"}:
+        return MAX_PROCESS_CLOSE_CACHE_RESERVE_BYTES
+    if operation == "read":
+        requested = payload.get("max_bytes", MAX_PROCESS_READ_BYTES)
+        if isinstance(requested, bool) or not isinstance(requested, int):
+            requested = MAX_PROCESS_READ_BYTES
+        bounded = max(1, min(requested, MAX_PROCESS_READ_BYTES))
+        return ((bounded * 2 + 2) // 3) * 4 + 128 * 1024
+    return 64 * 1024
+
+
+def _validated_process_binding(
+    payload: dict[str, Any],
+    lease: _ProcessLease,
+) -> None:
+    scope_digest = _validated_process_owner_scope(payload.get("owner_scope"))
+    skill_sha256 = _validated_sha256(
+        payload.get("skill_sha256"),
+        field_name="skill_sha256",
+    )
+    script_sha256 = _validated_sha256(
+        payload.get("script_sha256"),
+        field_name="script_sha256",
+    )
+    if not (
+        hmac.compare_digest(scope_digest, lease.scope_digest)
+        and hmac.compare_digest(skill_sha256, lease.skill_sha256)
+        and hmac.compare_digest(script_sha256, lease.script_sha256)
+    ):
+        raise ProtocolError(
+            "lease_scope_mismatch",
+            "Lease owner scope or content authority does not match the opened lease.",
+        )
+
+
+def _validated_persistent_invocation(
+    value: Any,
+    *,
+    entrypoint_relative: str,
+    entrypoint_bytes: bytes,
+    argv: list[str],
+) -> tuple[str, str | None, str | None, bytes | None]:
+    if value is None or value == {"mode": "cli"}:
+        return "cli", None, None, None
+    instance_fields = {
+        "mode",
+        "class_name",
+        "constructor_args",
+        "constructor_kwargs",
+    }
+    factory_fields = {
+        "mode",
+        "factory_name",
+        "factory_args",
+        "factory_kwargs",
+    }
+    if (
+        not isinstance(value, dict)
+        or (
+            not (set(value) == instance_fields and value.get("mode") == "instance")
+            and not (set(value) == factory_fields and value.get("mode") == "factory")
+        )
+    ):
+        raise ProtocolError(
+            "invalid_invocation",
+            "Persistent invocation must be exact CLI, public-class, or public-factory JSON.",
+        )
+    if PurePosixPath(entrypoint_relative).suffix != ".py" or argv:
+        raise ProtocolError(
+            "invalid_function_call",
+            "Persistent object invocation requires a Python entrypoint and no CLI argv.",
+        )
+    invocation_mode = str(value.get("mode"))
+    identity_field = "class_name" if invocation_mode == "instance" else "factory_name"
+    selected_name = value.get(identity_field)
+    if (
+        not isinstance(selected_name, str)
+        or selected_name.startswith("_")
+        or PUBLIC_FUNCTION_RE.fullmatch(selected_name) is None
+    ):
+        raise ProtocolError(
+            "invalid_function_call",
+            f"{identity_field} must be one public, non-dotted Python identifier.",
+        )
+    positional_field = "constructor_args" if invocation_mode == "instance" else "factory_args"
+    keywords_field = "constructor_kwargs" if invocation_mode == "instance" else "factory_kwargs"
+    positional = value.get(positional_field)
+    keywords = value.get(keywords_field)
+    if not isinstance(positional, list) or len(positional) > MAX_FUNCTION_ARGS:
+        raise ProtocolError(
+            "invalid_function_call",
+            f"{positional_field} must contain at most {MAX_FUNCTION_ARGS} JSON values.",
+        )
+    if not isinstance(keywords, dict) or len(keywords) > MAX_FUNCTION_KWARGS:
+        raise ProtocolError(
+            "invalid_function_call",
+            f"{keywords_field} must contain at most {MAX_FUNCTION_KWARGS} JSON values.",
+        )
+    for key in keywords:
+        if (
+            not isinstance(key, str)
+            or key.startswith("_")
+            or PUBLIC_FUNCTION_RE.fullmatch(key) is None
+        ):
+            raise ProtocolError(
+                "invalid_function_call",
+                f"{keywords_field} keys must be public Python identifiers.",
+            )
+    _validate_json_value(positional, field=positional_field)
+    _validate_json_value(keywords, field=keywords_field)
+    try:
+        source = entrypoint_bytes.decode("utf-8")
+        tree = ast.parse(source, filename=entrypoint_relative)
+    except (UnicodeError, SyntaxError) as exc:
+        raise ProtocolError(
+            "invalid_function_call",
+            "Persistent instance entrypoint must be valid UTF-8 Python source.",
+        ) from exc
+    if invocation_mode == "instance":
+        matching_declarations = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == selected_name
+            and not node.decorator_list
+        ]
+    else:
+        matching_declarations = [
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == selected_name
+            and not node.decorator_list
+        ]
+    if len(matching_declarations) != 1:
+        raise ProtocolError(
+            "invalid_function_call",
+            f"Public top-level {invocation_mode} {selected_name!r} is not uniquely declared by the selected entrypoint.",
+        )
+    try:
+        constructor_request = json.dumps(
+            {"args": positional, "kwargs": keywords},
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise ProtocolError(
+            "invalid_function_call",
+            "Persistent object arguments must be finite valid JSON.",
+        ) from exc
+    if len(constructor_request) > MAX_FUNCTION_INPUT_BYTES:
+        raise ProtocolError(
+            "invalid_function_call",
+            "Persistent object argument JSON exceeds its byte limit.",
+        )
+    return (
+        invocation_mode,
+        selected_name if invocation_mode == "instance" else None,
+        selected_name if invocation_mode == "factory" else None,
+        constructor_request,
+    )
+
+
+def _validated_persistent_method_call(
+    payload: dict[str, Any],
+    lease: _ProcessLease,
+    *,
+    call_id: str,
+) -> bytes:
+    if lease.invocation_mode not in {"instance", "factory"}:
+        raise ProtocolError(
+            "invalid_invocation",
+            "Structured method calls require a persistent public-object lease.",
+        )
+    method_name = payload.get("method_name")
+    if (
+        not isinstance(method_name, str)
+        or method_name.startswith("_")
+        or PUBLIC_FUNCTION_RE.fullmatch(method_name) is None
+    ):
+        raise ProtocolError(
+            "invalid_function_call",
+            "method_name must be one public, non-dotted Python identifier.",
+        )
+    positional = payload.get("method_args", [])
+    keywords = payload.get("method_kwargs", {})
+    if not isinstance(positional, list) or len(positional) > MAX_FUNCTION_ARGS:
+        raise ProtocolError(
+            "invalid_function_call",
+            f"method_args must contain at most {MAX_FUNCTION_ARGS} JSON values.",
+        )
+    if not isinstance(keywords, dict) or len(keywords) > MAX_FUNCTION_KWARGS:
+        raise ProtocolError(
+            "invalid_function_call",
+            f"method_kwargs must contain at most {MAX_FUNCTION_KWARGS} JSON values.",
+        )
+    for key in keywords:
+        if (
+            not isinstance(key, str)
+            or key.startswith("_")
+            or PUBLIC_FUNCTION_RE.fullmatch(key) is None
+        ):
+            raise ProtocolError(
+                "invalid_function_call",
+                "method_kwargs keys must be public Python identifiers.",
+            )
+    _validate_json_value(positional, field="method_args")
+    _validate_json_value(keywords, field="method_kwargs")
+    try:
+        source = lease.entrypoint_bytes.decode("utf-8")
+        tree = ast.parse(source, filename=lease.entrypoint_relative)
+    except (UnicodeError, SyntaxError) as exc:
+        raise ProtocolError(
+            "invalid_function_call",
+            "Persistent instance entrypoint is no longer valid Python source.",
+        ) from exc
+    if lease.invocation_mode == "instance":
+        matching_classes = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == lease.class_name
+            and not node.decorator_list
+        ]
+        if len(matching_classes) != 1:
+            raise ProtocolError(
+                "invalid_function_call",
+                "Persistent instance class identity is not uniquely declared.",
+            )
+    else:
+        matching_factories = [
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == lease.factory_name
+            and not node.decorator_list
+        ]
+        if len(matching_factories) != 1:
+            raise ProtocolError(
+                "invalid_function_call",
+                "Persistent factory identity is not uniquely declared.",
+            )
+        matching_classes = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and not node.decorator_list
+            and any(
+                isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and method.name == method_name
+                and not method.decorator_list
+                and bool([*method.args.posonlyargs, *method.args.args])
+                for method in node.body
+            )
+        ]
+        if len(matching_classes) != 1:
+            raise ProtocolError(
+                "invalid_function_call",
+                "A factory method must map to one unique public top-level class declaration.",
+            )
+    selected_class = matching_classes[0]
+    matching_methods = [
+        node
+        for node in selected_class.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == method_name
+        and not node.decorator_list
+        and bool([*node.args.posonlyargs, *node.args.args])
+    ]
+    if len(matching_methods) != 1:
+        raise ProtocolError(
+            "invalid_function_call",
+            f"Public plain method {selected_class.name}.{method_name} is not uniquely declared.",
+        )
+    try:
+        encoded = json.dumps(
+            {
+                "call_id": call_id,
+                "method": method_name,
+                "args": positional,
+                "kwargs": keywords,
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise ProtocolError(
+            "invalid_function_call",
+            "Method arguments must be finite valid JSON.",
+        ) from exc
+    if len(encoded) > MAX_PROCESS_CALL_BYTES:
+        raise ProtocolError(
+            "invalid_function_call",
+            "Method call JSON exceeds the atomic process-call byte limit.",
+        )
+    return encoded
+
+
+def _open_process_lease(
+    payload: dict[str, Any],
+    *,
+    request_id: str,
+    op_id: str,
+    scope_digest: str,
+    fingerprint: str,
+) -> dict[str, Any]:
+    temp_dir: Path | None = None
+    admission_reservation: str | None = None
+    admission_handle: str | None = None
+    lease_published = False
+    with _PROCESS_LEASES_LOCK:
+        previous = _PROCESS_OPEN_OPERATIONS.get((scope_digest, op_id))
+        if previous is not None:
+            previous_fingerprint, previous_handle = previous
+            if not hmac.compare_digest(previous_fingerprint, fingerprint):
+                raise ProtocolError(
+                    "op_id_conflict",
+                    "op_id was already used for a different lease-open operation.",
+                )
+            previous_lease = _PROCESS_LEASES.get(previous_handle)
+            if previous_lease is None:
+                raise ProtocolError(
+                    "lease_lost",
+                    "The idempotent lease-open result is no longer retained.",
+                )
+            return _process_success(
+                request_id,
+                "open",
+                previous_lease,
+                idempotent_replay=True,
+                entrypoint=previous_lease.entrypoint_relative,
+                interpreter=previous_lease.interpreter,
+                idle_ttl_seconds=previous_lease.idle_ttl_seconds,
+                max_runtime_seconds=previous_lease.max_runtime_seconds,
+                invocation_mode=previous_lease.invocation_mode,
+                **(
+                    {"class_name": previous_lease.class_name}
+                    if previous_lease.class_name is not None
+                    else {}
+                ),
+                **(
+                    {"factory_name": previous_lease.factory_name}
+                    if previous_lease.factory_name is not None
+                    else {}
+                ),
+            )
+
+        active = [
+            lease
+            for lease in _PROCESS_LEASES.values()
+            if lease.state not in {"closed", "expired"}
+        ]
+        max_leases = _trusted_process_limit(
+            "EXECUTOR_MAX_PROCESS_LEASES",
+            default=MAX_PROCESS_LEASES,
+            minimum=1,
+            maximum=MAX_PROCESS_LEASES,
+        )
+        max_per_scope = _trusted_process_limit(
+            "EXECUTOR_MAX_PROCESS_LEASES_PER_SCOPE",
+            default=MAX_PROCESS_LEASES_PER_SCOPE,
+            minimum=1,
+            maximum=MAX_PROCESS_LEASES_PER_SCOPE,
+        )
+        if len(active) >= max_leases:
+            raise ProtocolError(
+                "lease_quota_exceeded",
+                "Executor has reached its bounded active process-lease quota.",
+            )
+        if sum(lease.scope_digest == scope_digest for lease in active) >= max_per_scope:
+            raise ProtocolError(
+                "lease_quota_exceeded",
+                "Owner scope has reached its bounded active process-lease quota.",
+            )
+
+        entrypoint_relative = _safe_relative_path(
+            payload.get("entrypoint"),
+            field="entrypoint",
+        )
+        argv = _validated_args(payload.get("argv", []))
+        cwd_policy = payload.get("cwd", "workspace")
+        if cwd_policy not in {"workspace", "script", "skill"}:
+            raise ProtocolError(
+                "invalid_cwd",
+                "cwd must be exactly 'workspace', 'script', or 'skill'.",
+            )
+        idle_ttl_seconds = _validated_process_seconds(
+            payload.get("idle_ttl_seconds", 300),
+            field_name="idle_ttl_seconds",
+            minimum=MIN_PROCESS_LEASE_TTL_SECONDS,
+            maximum=MAX_PROCESS_LEASE_TTL_SECONDS,
+        )
+        max_runtime_seconds = _validated_process_seconds(
+            payload.get("max_runtime_seconds", MAX_PROCESS_RUNTIME_SECONDS),
+            field_name="max_runtime_seconds",
+            minimum=MIN_PROCESS_LEASE_TTL_SECONDS,
+            maximum=MAX_PROCESS_RUNTIME_SECONDS,
+        )
+        skill_files = _decode_snapshot(
+            payload.get("skill_files"),
+            field="skill_files",
+            max_files=MAX_SKILL_FILES,
+            max_file_bytes=MAX_SKILL_FILE_BYTES,
+            max_total_bytes=MAX_SKILL_TOTAL_BYTES,
+        )
+        if "SKILL.md" not in skill_files:
+            raise ProtocolError(
+                "invalid_skill_snapshot",
+                "The Skill snapshot must contain root SKILL.md.",
+            )
+        if entrypoint_relative not in skill_files:
+            raise ProtocolError(
+                "missing_entrypoint",
+                "entrypoint is not present in the exact Skill snapshot.",
+            )
+        workspace_files = _decode_snapshot(
+            payload.get("workspace_files", []),
+            field="workspace_files",
+            max_files=MAX_WORKSPACE_FILES,
+            max_file_bytes=MAX_WORKSPACE_FILE_BYTES,
+            max_total_bytes=MAX_WORKSPACE_TOTAL_BYTES,
+        )
+        skill_sha256 = _canonical_snapshot_digest(skill_files)
+        script_sha256 = hashlib.sha256(skill_files[entrypoint_relative]).hexdigest()
+        expected_skill_sha256 = _validated_sha256(
+            payload.get("skill_sha256"),
+            field_name="skill_sha256",
+        )
+        expected_script_sha256 = _validated_sha256(
+            payload.get("script_sha256"),
+            field_name="script_sha256",
+        )
+        if not (
+            hmac.compare_digest(skill_sha256, expected_skill_sha256)
+            and hmac.compare_digest(script_sha256, expected_script_sha256)
+        ):
+            raise ProtocolError(
+                "authority_digest_mismatch",
+                "Lease content does not match the authorized Skill/script digests.",
+            )
+        (
+            invocation_mode,
+            class_name,
+            factory_name,
+            constructor_request,
+        ) = _validated_persistent_invocation(
+            payload.get("invocation"),
+            entrypoint_relative=entrypoint_relative,
+            entrypoint_bytes=skill_files[entrypoint_relative],
+            argv=argv,
+        )
+        runtime_profile, egress_policy, profile_environment = _profile_process_environment()
+        admission_reservation = f"opening:{op_id}"
+        _reserve_process_admission(admission_reservation)
+
+        try:
+            temp_dir = _make_execution_temp_dir("skill_process_")
+            skill_root = temp_dir / "skill"
+            workspace = temp_dir / "workspace"
+            runtime_root = temp_dir / "runtime"
+            _materialize_snapshot(skill_root, skill_files, immutable=True)
+            _materialize_snapshot(workspace, workspace_files, immutable=False)
+            runtime_root.mkdir(mode=0o700)
+            (runtime_root / "home").mkdir(mode=0o700)
+            (runtime_root / "tmp").mkdir(mode=0o700)
+            output_dir = workspace / "output_result"
+            if output_dir.exists() and not output_dir.is_dir():
+                raise ProtocolError(
+                    "invalid_workspace_snapshot",
+                    "workspace/output_result must be a directory.",
+                )
+            output_dir.mkdir(mode=0o700, exist_ok=True)
+            entrypoint = skill_root.joinpath(*entrypoint_relative.split("/"))
+            if invocation_mode in {"instance", "factory"}:
+                interpreter = "python"
+                runner_path = runtime_root / "persistent_instance_runner.py"
+                constructor_path = runtime_root / "constructor.json"
+                with runner_path.open("xb") as stream:
+                    stream.write(PERSISTENT_INSTANCE_RUNNER_SOURCE.encode("utf-8"))
+                with constructor_path.open("xb") as stream:
+                    stream.write(constructor_request or b"")
+                os.chmod(runner_path, 0o400)
+                os.chmod(constructor_path, 0o400)
+                runner_arguments = [
+                    str(skill_root),
+                    str(entrypoint),
+                    str(constructor_path),
+                    invocation_mode,
+                    str(class_name or factory_name or ""),
+                    str(MAX_FUNCTION_INPUT_BYTES),
+                    str(MAX_FUNCTION_RESULT_CHARS),
+                    str(max(MAX_STDOUT_BYTES, MAX_STDERR_BYTES)),
+                ]
+                command = (
+                    _browser_runtime_command(runner_path, runner_arguments)
+                    if runtime_profile == "browser-automation-v1"
+                    else [
+                        sys.executable,
+                        "-I",
+                        "-B",
+                        str(runner_path),
+                        *runner_arguments,
+                    ]
+                )
+            else:
+                interpreter, command = _interpreter_command(
+                    entrypoint,
+                    skill_root=skill_root,
+                    runtime_root=runtime_root,
+                    runtime_profile=runtime_profile,
+                )
+            workdir = (
+                workspace
+                if cwd_policy == "workspace"
+                else skill_root
+                if cwd_policy == "skill"
+                else entrypoint.parent
+            )
+            environment = {
+                "PATH": "/usr/local/bin:/usr/bin:/bin",
+                "HOME": str(runtime_root / "home"),
+                "TMPDIR": str(runtime_root / "tmp"),
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONIOENCODING": "utf-8",
+                "PYTHONUTF8": "1",
+                "CHATDS_WORKSPACE": str(workspace),
+                "CHATDS_SKILL_DIR": str(skill_root),
+                "CHATDS_SKILL_ROOT": str(skill_root),
+                "SKILL_DIR": str(skill_root),
+                "CHATDS_OUTPUT_DIR": str(output_dir),
+                **BLAS_THREAD_ENV,
+            }
+            environment.update(profile_environment)
+            _prepare_worker_tree(
+                temp_dir,
+                immutable_roots=(skill_root,),
+                writable_roots=(workspace, runtime_root),
+            )
+            initial = {
+                relative: (len(content), hashlib.sha256(content).hexdigest())
+                for relative, content in workspace_files.items()
+            }
+            now = time.monotonic()
+            handle = _new_process_handle(
+                scope_digest=scope_digest,
+                skill_sha256=skill_sha256,
+                script_sha256=script_sha256,
+            )
+            lease = _ProcessLease(
+                handle=handle,
+                scope_digest=scope_digest,
+                skill_sha256=skill_sha256,
+                script_sha256=script_sha256,
+                open_op_id=op_id,
+                open_fingerprint=fingerprint,
+                entrypoint_relative=entrypoint_relative,
+                entrypoint_bytes=skill_files[entrypoint_relative],
+                argv=argv,
+                cwd_policy=cwd_policy,
+                invocation_mode=invocation_mode,
+                class_name=class_name,
+                factory_name=factory_name,
+                runtime_profile=runtime_profile,
+                egress_policy=egress_policy,
+                interpreter=interpreter,
+                command=[*command, *argv],
+                workdir=workdir,
+                environment=environment,
+                temp_dir=temp_dir,
+                skill_root=skill_root,
+                workspace=workspace,
+                runtime_root=runtime_root,
+                workspace_baseline=initial,
+                created_at=now,
+                last_activity=now,
+                idle_ttl_seconds=idle_ttl_seconds,
+                max_runtime_seconds=max_runtime_seconds,
+                absolute_expires_at=now + max_runtime_seconds,
+            )
+            _commit_process_admission(admission_reservation, handle)
+            admission_handle = handle
+            _PROCESS_LEASES[handle] = lease
+            _PROCESS_OPEN_OPERATIONS[(scope_digest, op_id)] = (fingerprint, handle)
+            lease_published = True
+            temp_dir = None
+            return _process_success(
+                request_id,
+                "open",
+                lease,
+                entrypoint=entrypoint_relative,
+                interpreter=interpreter,
+                idle_ttl_seconds=idle_ttl_seconds,
+                max_runtime_seconds=max_runtime_seconds,
+                invocation_mode=invocation_mode,
+                **({"class_name": class_name} if class_name is not None else {}),
+                **({"factory_name": factory_name} if factory_name is not None else {}),
+            )
+        finally:
+            if temp_dir is not None:
+                _remove_process_tree(temp_dir)
+            if not lease_published:
+                if admission_handle is not None:
+                    _cancel_process_admission(admission_handle)
+                elif admission_reservation is not None:
+                    _cancel_process_admission(admission_reservation)
+
+
+def _start_process_lease(
+    lease: _ProcessLease,
+    *,
+    request_id: str,
+) -> dict[str, Any]:
+    if lease.state != "open" or lease.process is not None:
+        raise ProtocolError(
+            "process_already_started",
+            "The exact lease entrypoint can only be started once.",
+        )
+    try:
+        process = subprocess.Popen(
+            _resource_limited_command(
+                lease.command,
+                cpu_seconds=lease.max_runtime_seconds,
+                persistent=True,
+            ),
+            cwd=lease.workdir,
+            env=lease.environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            close_fds=True,
+            **_native_worker_popen_kwargs(),
+        )
+    except (FileNotFoundError, PermissionError, OSError) as exc:
+        raise ProtocolError(
+            "interpreter_spawn_failed",
+            f"Could not start the fixed interpreter ({type(exc).__name__}).",
+        ) from exc
+    lease.process = process
+    # start_new_session creates a fresh process group before exec, so the
+    # leader PID is also the stable process-group ID even after leader exit.
+    lease.process_group_id = process.pid
+    lease.state = "running"
+    if process.stdin is not None:
+        try:
+            os.set_blocking(process.stdin.fileno(), False)
+        except (AttributeError, OSError):
+            pass
+    for stream_name, stream in (("stdout", process.stdout), ("stderr", process.stderr)):
+        if stream is None:
+            continue
+        thread = threading.Thread(
+            target=_drain_process_stream,
+            args=(lease, stream_name, stream),
+            daemon=True,
+            name=f"skill-process-{stream_name}",
+        )
+        lease.reader_threads.append(thread)
+        thread.start()
+    return _process_success(
+        request_id,
+        "start",
+        lease,
+        interpreter=lease.interpreter,
+        entrypoint=lease.entrypoint_relative,
+        invocation_mode=lease.invocation_mode,
+        **({"class_name": lease.class_name} if lease.class_name is not None else {}),
+        **({"factory_name": lease.factory_name} if lease.factory_name is not None else {}),
+    )
+
+
+def _write_process_bytes(
+    content: bytes,
+    lease: _ProcessLease,
+    *,
+    request_id: str,
+    operation: str,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not content or len(content) > MAX_PROCESS_STDIN_CHUNK_BYTES:
+        raise ProtocolError(
+            "invalid_stdin",
+            f"Each stdin write must contain 1 to {MAX_PROCESS_STDIN_CHUNK_BYTES} bytes.",
+        )
+    if lease.stdin_bytes_written + len(content) > MAX_PROCESS_STDIN_TOTAL_BYTES:
+        raise ProtocolError(
+            "stdin_limit_exceeded",
+            "Process lease exhausted its aggregate stdin quota.",
+        )
+    if lease.stdin_closed:
+        raise ProtocolError(
+            "stdin_closed",
+            "Process stdin has been explicitly closed.",
+        )
+    process = lease.process
+    if lease.state != "running" or process is None or process.poll() is not None:
+        _refresh_process_state_locked(lease)
+        raise ProtocolError("process_not_running", "Cannot write stdin because the process is not running.")
+    if process.stdin is None or process.stdin.closed:
+        raise ProtocolError("stdin_closed", "Process stdin is closed.")
+    try:
+        written = os.write(process.stdin.fileno(), content)
+    except BlockingIOError as exc:
+        raise ProtocolError(
+            "stdin_backpressure",
+            "Process stdin is temporarily full; retry remaining bytes with a new op_id.",
+        ) from exc
+    except (BrokenPipeError, OSError, ValueError) as exc:
+        raise ProtocolError("stdin_closed", "Process stdin is no longer writable.") from exc
+    lease.stdin_bytes_written += written
+    return _process_success(
+        request_id,
+        operation,
+        lease,
+        bytes_written=written,
+        requested_bytes=len(content),
+        partial=written != len(content),
+        stdin_total_bytes=lease.stdin_bytes_written,
+        **(extra or {}),
+    )
+
+
+def _write_process_lease(
+    payload: dict[str, Any],
+    lease: _ProcessLease,
+    *,
+    request_id: str,
+) -> dict[str, Any]:
+    if lease.invocation_mode != "cli":
+        raise ProtocolError(
+            "invalid_invocation",
+            "Raw stdin writes are disabled for structured instance leases; use call.",
+        )
+    encoded = payload.get("stdin_b64")
+    if not isinstance(encoded, str):
+        raise ProtocolError("invalid_stdin", "stdin_b64 must be a bounded base64 string.")
+    try:
+        content = base64.b64decode(encoded.encode("ascii"), validate=True)
+    except (UnicodeError, binascii.Error, ValueError) as exc:
+        raise ProtocolError("invalid_stdin", "stdin_b64 is not valid base64.") from exc
+    return _write_process_bytes(
+        content,
+        lease,
+        request_id=request_id,
+        operation="write",
+    )
+
+
+def _close_process_stdin(
+    lease: _ProcessLease,
+    *,
+    request_id: str,
+) -> dict[str, Any]:
+    if lease.invocation_mode != "cli":
+        raise ProtocolError(
+            "invalid_invocation",
+            "Explicit stdin EOF is available only for CLI process leases.",
+        )
+    process = lease.process
+    if process is None:
+        raise ProtocolError(
+            "process_not_started",
+            "The lease process has not been started.",
+        )
+    already_closed = lease.stdin_closed
+    if not lease.stdin_closed:
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+        lease.stdin_closed = True
+    _refresh_process_state_locked(lease)
+    return _process_success(
+        request_id,
+        "stdin_close",
+        lease,
+        stdin_closed=True,
+        already_closed=already_closed,
+    )
+
+
+def _call_process_instance(
+    payload: dict[str, Any],
+    lease: _ProcessLease,
+    *,
+    request_id: str,
+    op_id: str,
+) -> dict[str, Any]:
+    encoded = _validated_persistent_method_call(payload, lease, call_id=op_id)
+    return _write_process_bytes(
+        encoded,
+        lease,
+        request_id=request_id,
+        operation="call",
+        extra={
+            "call_id": op_id,
+            "class_name": lease.class_name,
+            "factory_name": lease.factory_name,
+            "method_name": payload.get("method_name"),
+        },
+    )
+
+
+def _read_process_lease(
+    payload: dict[str, Any],
+    lease: _ProcessLease,
+    *,
+    request_id: str,
+) -> dict[str, Any]:
+    offsets: dict[str, int] = {}
+    for stream_name in ("stdout", "stderr"):
+        value = payload.get(f"{stream_name}_offset", 0)
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 2**63 - 1:
+            raise ProtocolError(
+                "invalid_stream_offset",
+                f"{stream_name}_offset must be a non-negative bounded integer.",
+            )
+        offsets[stream_name] = value
+    max_bytes = payload.get("max_bytes", MAX_PROCESS_READ_BYTES)
+    if (
+        isinstance(max_bytes, bool)
+        or not isinstance(max_bytes, int)
+        or not 1 <= max_bytes <= MAX_PROCESS_READ_BYTES
+    ):
+        raise ProtocolError(
+            "invalid_read_limit",
+            f"max_bytes must be between 1 and {MAX_PROCESS_READ_BYTES}.",
+        )
+    wait_ms = payload.get("wait_ms", 0)
+    if (
+        isinstance(wait_ms, bool)
+        or not isinstance(wait_ms, int)
+        or not 0 <= wait_ms <= MAX_PROCESS_READ_WAIT_MS
+    ):
+        raise ProtocolError(
+            "invalid_read_wait",
+            f"wait_ms must be between 0 and {MAX_PROCESS_READ_WAIT_MS}.",
+        )
+    for stream_name, buffer in (("stdout", lease.stdout), ("stderr", lease.stderr)):
+        if offsets[stream_name] > buffer.end_offset:
+            raise ProtocolError(
+                "invalid_stream_offset",
+                f"{stream_name}_offset is beyond the emitted stream.",
+            )
+
+    if wait_ms and lease.state == "running":
+        deadline = time.monotonic() + wait_ms / 1_000
+        while (
+            lease.state == "running"
+            and offsets["stdout"] >= lease.stdout.end_offset
+            and offsets["stderr"] >= lease.stderr.end_offset
+        ):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            lease.condition.wait(timeout=remaining)
+            _refresh_process_state_locked(lease)
+
+    stdout, stdout_next, stdout_loss = lease.stdout.read(
+        offsets["stdout"],
+        max_bytes,
+    )
+    stderr, stderr_next, stderr_loss = lease.stderr.read(
+        offsets["stderr"],
+        max_bytes,
+    )
+    _refresh_process_state_locked(lease)
+    returncode = lease.process.poll() if lease.process is not None else None
+    return _process_success(
+        request_id,
+        "read",
+        lease,
+        stdout_b64=base64.b64encode(stdout).decode("ascii"),
+        stderr_b64=base64.b64encode(stderr).decode("ascii"),
+        stdout_start_offset=max(offsets["stdout"], lease.stdout.start_offset),
+        stderr_start_offset=max(offsets["stderr"], lease.stderr.start_offset),
+        stdout_next_offset=stdout_next,
+        stderr_next_offset=stderr_next,
+        stdout_end_offset=lease.stdout.end_offset,
+        stderr_end_offset=lease.stderr.end_offset,
+        stdout_data_loss=stdout_loss,
+        stderr_data_loss=stderr_loss,
+        stdout_truncated=lease.stdout.truncated,
+        stderr_truncated=lease.stderr.truncated,
+        stdout_eof=lease.stdout.eof,
+        stderr_eof=lease.stderr.eof,
+        returncode=returncode,
+    )
+
+
+def _sync_process_lease(
+    lease: _ProcessLease,
+    *,
+    request_id: str,
+    operation: str = "sync",
+) -> dict[str, Any]:
+    if lease.pending_sync_token is not None:
+        raise ProtocolError(
+            "sync_ack_required",
+            "The previous artifact batch must be acknowledged before another sync.",
+        )
+    artifacts, deleted_count, current = _collect_workspace_artifacts_with_state(
+        lease.workspace,
+        lease.workspace_baseline,
+    )
+    sync_token = secrets.token_urlsafe(32)
+    lease.pending_sync_token = sync_token
+    lease.pending_sync_state = current
+    lease.pending_sync_close = operation == "close"
+    return _process_success(
+        request_id,
+        operation,
+        lease,
+        artifacts=artifacts,
+        sync_token=sync_token,
+        sync_pending=True,
+        deleted_workspace_files_ignored=deleted_count,
+    )
+
+
+def _signal_process_lease(
+    payload: dict[str, Any],
+    lease: _ProcessLease,
+    *,
+    request_id: str,
+) -> dict[str, Any]:
+    signal_name = payload.get("signal")
+    signals = {
+        "interrupt": signal.SIGINT,
+        "terminate": signal.SIGTERM,
+        "kill": signal.SIGKILL,
+    }
+    if signal_name not in signals:
+        raise ProtocolError(
+            "invalid_signal",
+            "signal must be exactly 'interrupt', 'terminate', or 'kill'.",
+        )
+    if lease.process is None:
+        raise ProtocolError("process_not_started", "The lease process has not been started.")
+    delivered = _signal_process_group(
+        lease.process,
+        signals[str(signal_name)],
+        process_group_id=lease.process_group_id,
+    )
+    _refresh_process_state_locked(lease)
+    return _process_success(
+        request_id,
+        "signal",
+        lease,
+        signal=signal_name,
+        signal_delivered=delivered,
+    )
+
+
+def _close_process_lease(
+    lease: _ProcessLease,
+    *,
+    request_id: str,
+) -> dict[str, Any]:
+    _stop_process_lease_locked(lease)
+    _sweep_configured_worker_uid()
+    lease.state = "closing"
+    response = _sync_process_lease(
+        lease,
+        request_id=request_id,
+        operation="close",
+    )
+    response["returncode"] = (
+        lease.process.poll()
+        if lease.process is not None
+        else None
+    )
+    lease.condition.notify_all()
+    return response
+
+
+def _ack_process_sync(
+    payload: dict[str, Any],
+    lease: _ProcessLease,
+    *,
+    request_id: str,
+) -> dict[str, Any]:
+    token = payload.get("sync_token")
+    if (
+        not isinstance(token, str)
+        or lease.pending_sync_token is None
+        or not hmac.compare_digest(token, lease.pending_sync_token)
+        or lease.pending_sync_state is None
+    ):
+        raise ProtocolError(
+            "invalid_sync_ack",
+            "sync_token does not match the pending artifact batch.",
+        )
+    acknowledged_close = lease.pending_sync_close
+    if acknowledged_close:
+        _sweep_configured_worker_uid()
+        if not _remove_process_tree(lease.temp_dir):
+            raise ProtocolError(
+                "worker_containment_failed",
+                "Closed worker tree could not be removed safely.",
+            )
+        _release_process_admission(lease.handle)
+    # Deletions remain ignored. Retaining prior entries means a later
+    # recreation is reported as a modification against the host copy.
+    lease.workspace_baseline.update(lease.pending_sync_state)
+    lease.pending_sync_token = None
+    lease.pending_sync_state = None
+    lease.pending_sync_close = False
+    if acknowledged_close:
+        lease.state = "closed"
+        lease.close_reason = "client_close"
+        lease.closed_at = time.monotonic()
+        lease.condition.notify_all()
+    return _process_success(
+        request_id,
+        "ack",
+        lease,
+        acknowledged_operation="close" if acknowledged_close else "sync",
+        sync_acknowledged=True,
+    )
+
+
+def _run_process_lease(payload: dict[str, Any]) -> dict[str, Any]:
+    request_id: str | None = None
+    operation = payload.get("operation") if isinstance(payload, dict) else None
+    handle = payload.get("lease_handle") if isinstance(payload, dict) else None
+    try:
+        if payload.get("protocol_version") != PROCESS_PROTOCOL_VERSION:
+            raise ProtocolError(
+                "unsupported_protocol",
+                f"process lease protocol_version must be {PROCESS_PROTOCOL_VERSION}.",
+            )
+        _validate_process_request_auth(payload)
+        _validate_process_controller_security()
+        request_id = _validated_request_id(payload.get("request_id"))
+        if operation not in {
+            "reap_all",
+            "open",
+            "start",
+            "write",
+            "stdin_close",
+            "call",
+            "read",
+            "sync",
+            "ack",
+            "signal",
+            "close",
+        }:
+            raise ProtocolError(
+                "invalid_process_operation",
+                "Unsupported process lease operation.",
+            )
+        op_id = _validated_process_op_id(payload.get("op_id"))
+        if operation == "reap_all":
+            unexpected = set(payload) - {
+                "protocol_version",
+                "kind",
+                "operation",
+                "request_id",
+                "op_id",
+                "auth_hmac",
+            }
+            if unexpected:
+                raise ProtocolError(
+                    "invalid_process_request",
+                    "Controller reap request contains unexpected fields.",
+                )
+            reaped = _controller_reap_process_leases()
+            runtime_profile, egress_policy, _ = _profile_process_environment()
+            return {
+                "protocol_version": PROCESS_PROTOCOL_VERSION,
+                "kind": "process_lease_result",
+                "operation": "reap_all",
+                "request_id": request_id,
+                "status": "success",
+                "network": "disabled",
+                "runtime_profile": runtime_profile,
+                "network_policy": {
+                    "direct": "disabled",
+                    "egress": egress_policy,
+                },
+                "reaped_leases": reaped,
+                "worker_processes_empty": True,
+            }
+        fingerprint = _process_operation_fingerprint(payload)
+        scope_digest = _validated_process_owner_scope(payload.get("owner_scope"))
+        _cleanup_expired_process_leases()
+
+        if operation == "open":
+            return _open_process_lease(
+                payload,
+                request_id=request_id,
+                op_id=op_id,
+                scope_digest=scope_digest,
+                fingerprint=fingerprint,
+            )
+        if (
+            not isinstance(handle, str)
+            or len(handle) > 128
+            or re.fullmatch(r"pl2_[A-Za-z0-9_-]+_[0-9a-f]{32}", handle) is None
+        ):
+            raise ProtocolError("invalid_lease_handle", "lease_handle is not a valid opaque handle.")
+        with _PROCESS_LEASES_LOCK:
+            lease = _PROCESS_LEASES.get(handle)
+        if lease is None:
+            raise ProtocolError("lease_lost", "The process lease is unknown or no longer retained.")
+
+        with lease.lock:
+            _validated_process_binding(payload, lease)
+            cached = _cached_process_response(
+                lease,
+                op_id=op_id,
+                fingerprint=fingerprint,
+                request_id=request_id,
+            )
+            if cached is not None:
+                return cached
+            operation_count = len(lease.operations)
+            if (
+                (
+                    operation not in {"close", "ack"}
+                    and operation_count >= MAX_PROCESS_OPERATIONS - 2
+                )
+                or (
+                    operation == "close"
+                    and operation_count >= MAX_PROCESS_OPERATIONS - 1
+                )
+                or (
+                    operation == "ack"
+                    and operation_count >= MAX_PROCESS_OPERATIONS
+                )
+            ):
+                raise ProtocolError(
+                    "operation_limit_exceeded",
+                    "Process lease exhausted its bounded operation budget.",
+                )
+            reservation = _process_cache_reservation(payload, operation)
+            close_reserve = (
+                0
+                if operation in {"close", "ack"}
+                else MAX_PROCESS_CLOSE_CACHE_RESERVE_BYTES
+            )
+            if (
+                lease.operation_cache_bytes + reservation + close_reserve
+                > MAX_PROCESS_OPERATION_CACHE_BYTES
+            ):
+                raise ProtocolError(
+                    "operation_cache_limit_exceeded",
+                    "Process lease cannot reserve a bounded idempotency result plus close receipt.",
+                )
+            if lease.state == "expired":
+                raise ProtocolError(
+                    "lease_expired",
+                    f"The process lease expired ({lease.close_reason or 'expired'}).",
+                )
+            if lease.state == "quarantined":
+                raise ProtocolError(
+                    "worker_containment_failed",
+                    "The process lease is quarantined until worker cleanup is proven.",
+                )
+            if lease.state == "closed":
+                raise ProtocolError("lease_closed", "The process lease has already been closed.")
+            if lease.state == "closing" and operation != "ack":
+                raise ProtocolError(
+                    "sync_ack_required",
+                    "The close artifact batch must be acknowledged before any other operation.",
+                )
+            if (
+                lease.pending_sync_token is not None
+                and operation in {"sync", "close"}
+            ):
+                raise ProtocolError(
+                    "sync_ack_required",
+                    "The previous artifact batch must be acknowledged before another sync or close.",
+                )
+            lease.last_activity = time.monotonic()
+
+            if operation == "start":
+                response = _start_process_lease(lease, request_id=request_id)
+            elif operation == "write":
+                response = _write_process_lease(payload, lease, request_id=request_id)
+            elif operation == "stdin_close":
+                response = _close_process_stdin(
+                    lease,
+                    request_id=request_id,
+                )
+            elif operation == "call":
+                response = _call_process_instance(
+                    payload,
+                    lease,
+                    request_id=request_id,
+                    op_id=op_id,
+                )
+            elif operation == "read":
+                response = _read_process_lease(payload, lease, request_id=request_id)
+            elif operation == "sync":
+                response = _sync_process_lease(lease, request_id=request_id)
+            elif operation == "ack":
+                response = _ack_process_sync(
+                    payload,
+                    lease,
+                    request_id=request_id,
+                )
+            elif operation == "signal":
+                response = _signal_process_lease(payload, lease, request_id=request_id)
+            else:
+                response = _close_process_lease(lease, request_id=request_id)
+            _cache_process_response(
+                lease,
+                op_id=op_id,
+                fingerprint=fingerprint,
+                response=response,
+            )
+            return response
+    except ProtocolError as exc:
+        return _process_error(
+            request_id,
+            operation if isinstance(operation, str) else None,
+            exc.code,
+            str(exc),
+            handle=handle if isinstance(handle, str) else None,
+        )
+    except Exception as exc:
+        return _process_error(
+            request_id,
+            operation if isinstance(operation, str) else None,
+            "process_internal_error",
+            f"Persistent process operation failed safely ({type(exc).__name__}).",
+            handle=handle if isinstance(handle, str) else None,
+        )
+
+
 def _run(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ProtocolError("invalid_request", "Request body must be a JSON object.")
+    request_kind = payload.get("kind") if isinstance(payload.get("kind"), str) else "legacy_code"
+    if not _request_kind_allowed(request_kind):
+        if request_kind == "process_lease":
+            return _process_error(
+                payload.get("request_id") if isinstance(payload.get("request_id"), str) else None,
+                payload.get("operation") if isinstance(payload.get("operation"), str) else None,
+                "request_kind_disabled",
+                "This executor profile does not accept persistent process requests.",
+                handle=(
+                    payload.get("lease_handle")
+                    if isinstance(payload.get("lease_handle"), str)
+                    else None
+                ),
+            )
+        if request_kind == "runtime_capabilities":
+            return _runtime_capability_error(
+                payload.get("request_id") if isinstance(payload.get("request_id"), str) else None,
+                "request_kind_disabled",
+                "This executor profile does not accept capability probes.",
+            )
+        return {
+            "status": "error",
+            "error_code": "request_kind_disabled",
+            "error": "This executor profile does not accept the requested operation.",
+            "network": "disabled",
+        }
+    if payload.get("kind") == "process_lease":
+        return _run_process_lease(payload)
     if payload.get("kind") == "runtime_capabilities":
         return _run_runtime_capabilities(payload)
     if payload.get("kind") == "skill_script":
-        return _run_skill_script(payload)
+        return _run_v1_serialized(payload, _run_skill_script)
     if payload.get("kind") == "declared_command":
-        return _run_declared_command(payload)
+        return _run_v1_serialized(payload, _run_declared_command)
     if payload.get("kind") == "session_code":
-        return _run_session_code(payload)
+        return _run_v1_serialized(payload, _run_session_code)
     if "kind" not in payload:
-        return _run_code(payload)
+        return _run_v1_serialized(payload, _run_code)
     raise ProtocolError("unsupported_request_kind", "Unsupported executor request kind.")
 
 
@@ -2199,6 +5514,22 @@ def _encode_response(response: dict[str, Any]) -> bytes:
             "response_limit_exceeded",
             "Executor response exceeded the bounded protocol limit.",
         )
+    elif response_kind == "process_lease_result":
+        fallback = _process_error(
+            request_id,
+            (
+                response.get("operation")
+                if isinstance(response.get("operation"), str)
+                else None
+            ),
+            "response_limit_exceeded",
+            "Executor response exceeded the bounded protocol limit.",
+            handle=(
+                response.get("lease_handle")
+                if isinstance(response.get("lease_handle"), str)
+                else None
+            ),
+        )
     else:
         fallback = {
             "status": "error",
@@ -2232,6 +5563,33 @@ class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
 def healthcheck() -> int:
     """Verify the live socket speaks this image's capability protocol."""
 
+    try:
+        _trusted_resource_launcher()
+    except ProtocolError:
+        return 1
+    if _untrusted_execution_enabled():
+        try:
+            _validate_worker_controller_security(require_root=True)
+            worker_uid, worker_gid = _configured_worker_identity(
+                require_explicit=True
+            )
+            # A live lease legitimately owns its private descendants beneath
+            # these fixed roots.  Startup, admission, sync/close, and teardown
+            # perform the zero-residue audit; an out-of-process Docker
+            # healthcheck cannot distinguish that active state.  Validate the
+            # immutable root boundary here and let the live capability request
+            # below prove the controller is responsive during execution.
+            _validate_worker_shared_state_roots(
+                worker_uid=worker_uid,
+                worker_gid=worker_gid,
+            )
+        except ProtocolError:
+            return 1
+    if _process_protocol_enabled():
+        try:
+            _process_request_auth_key()
+        except ProtocolError:
+            return 1
     request_id = str(uuid.uuid4())
     request = json.dumps({
         "protocol_version": PROTOCOL_VERSION,
@@ -2259,6 +5617,11 @@ def healthcheck() -> int:
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
         return 1
     identity = response.get("runtime_identity")
+    execution_identity = (
+        identity.get("execution_identity")
+        if isinstance(identity, dict)
+        else None
+    )
     return 0 if (
         response.get("protocol_version") == PROTOCOL_VERSION
         and response.get("kind") == "runtime_capabilities_result"
@@ -2268,17 +5631,135 @@ def healthcheck() -> int:
         and isinstance(identity, dict)
         and identity.get("execution_runtime") == "isolated_skill_executor"
         and identity.get("network") == "disabled"
+        and identity.get("runtime_profile") in {"base-v1", "browser-automation-v1"}
+        and isinstance(identity.get("network_policy"), dict)
+        and identity["network_policy"].get("direct") == "disabled"
+        and identity["network_policy"].get("egress") in {"none", "policy_proxy"}
+        and (
+            (
+                identity.get("runtime_profile") == "browser-automation-v1"
+                and identity.get("display_backend") == "wayland-headless"
+                and identity.get("headed_browser") is True
+                and identity.get("x11") is False
+            )
+            or (
+                identity.get("runtime_profile") == "base-v1"
+                and identity.get("display_backend") == "none"
+                and identity.get("headed_browser") is False
+                and identity.get("x11") is False
+            )
+        )
         and identity.get("dependency_install") == "disabled"
+        and isinstance(execution_identity, dict)
+        and execution_identity.get("resource_launcher") == "prlimit"
+        and isinstance(execution_identity.get("uid_isolated"), bool)
+        and execution_identity.get("shared_state_isolated") is True
+        and (
+            not _untrusted_execution_enabled()
+            or execution_identity.get("uid_isolated") is True
+        )
     ) else 1
 
 
-def main() -> None:
+def _configured_socket_mode() -> int:
+    raw = os.environ.get("EXECUTOR_SOCKET_MODE", "0600")
+    if raw not in {"0600", "0660"}:
+        raise RuntimeError("EXECUTOR_SOCKET_MODE must be exactly 0600 or 0660.")
+    return int(raw, 8)
+
+
+def _configured_socket_gid() -> int:
+    raw = os.environ.get("EXECUTOR_SOCKET_GID")
+    if raw is None:
+        return os.getegid()
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("EXECUTOR_SOCKET_GID must be a numeric GID.") from exc
+    if not 0 <= value <= 2**31 - 1:
+        raise RuntimeError("EXECUTOR_SOCKET_GID is outside the supported range.")
+    return value
+
+
+def _prepare_socket_directory() -> tuple[int, int]:
+    """Make the controller own the UDS directory without worker write access."""
+
+    mode = _configured_socket_mode()
+    socket_gid = _configured_socket_gid()
     SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        item = SOCKET_PATH.parent.lstat()
+    except OSError as exc:
+        raise RuntimeError("Executor socket directory is unavailable.") from exc
+    if stat.S_ISLNK(item.st_mode) or not stat.S_ISDIR(item.st_mode):
+        raise RuntimeError("Executor socket directory must be a real directory.")
+    controller_uid = os.geteuid()
+    if controller_uid == 0:
+        os.chown(
+            SOCKET_PATH.parent,
+            controller_uid,
+            socket_gid,
+            follow_symlinks=False,
+        )
+    elif item.st_uid != controller_uid or item.st_gid != socket_gid:
+        raise RuntimeError("Executor controller does not own its socket directory.")
+    # Group traversal is sufficient for a 0660 socket. The directory is never
+    # group-writable, so neither Harness nor the worker can unlink the UDS.
+    os.chmod(SOCKET_PATH.parent, 0o750 if mode == 0o660 else 0o700)
+    return mode, socket_gid
+
+
+def _secure_socket_file(mode: int, socket_gid: int) -> None:
+    item = SOCKET_PATH.lstat()
+    if not stat.S_ISSOCK(item.st_mode):
+        raise RuntimeError("Executor socket path is not a Unix-domain socket.")
+    if os.geteuid() == 0:
+        os.chown(SOCKET_PATH, os.geteuid(), socket_gid, follow_symlinks=False)
+    os.chmod(SOCKET_PATH, mode)
+
+
+def _harden_daemon_dumpability() -> bool:
+    """Best-effort same-UID /proc protection until deployment splits UIDs."""
+
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        # Linux prctl(2): PR_SET_DUMPABLE = 4.
+        return libc.prctl(4, 0, 0, 0, 0) == 0
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def main() -> None:
+    global DAEMON_DUMPABILITY_HARDENED
+    DAEMON_DUMPABILITY_HARDENED = _harden_daemon_dumpability()
+    _trusted_resource_launcher()
+    if _untrusted_execution_enabled():
+        _validate_worker_controller_security(require_root=True)
+        _sweep_configured_worker_uid()
+        _purge_configured_worker_shared_state()
+    if _process_protocol_enabled():
+        _process_request_auth_key()
+    socket_mode, socket_gid = _prepare_socket_directory()
     if SOCKET_PATH.exists():
         SOCKET_PATH.unlink()
-    with Server(str(SOCKET_PATH), Handler) as server:
-        os.chmod(SOCKET_PATH, 0o666)
-        server.serve_forever(poll_interval=0.2)
+    janitor_stop = threading.Event()
+    janitor = threading.Thread(
+        target=_process_lease_janitor,
+        args=(janitor_stop,),
+        daemon=True,
+        name="skill-process-lease-janitor",
+    )
+    janitor.start()
+    try:
+        with Server(str(SOCKET_PATH), Handler) as server:
+            _secure_socket_file(socket_mode, socket_gid)
+            server.serve_forever(poll_interval=0.2)
+    finally:
+        janitor_stop.set()
+        janitor.join(timeout=2)
+        _shutdown_all_process_leases()
 
 
 if __name__ == "__main__":

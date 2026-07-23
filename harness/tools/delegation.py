@@ -245,6 +245,46 @@ _VISIBLE_LENGTH_RECOVERY_TERMINAL_REASON = (
 _OUTPUT_CONTRACT_REPAIR_TERMINAL_REASON = (
     "delegated_output_contract_repair"
 )
+_DELEGATED_OUTPUT_CONTRACT_TERMINAL_PREFIXES = (
+    "delegated_output_contract_",
+    "delegated_result_footer_",
+    "delegated_visible_length_",
+)
+
+
+def _is_delegated_output_contract_noncompliance(
+    terminal_reason: str,
+    failure_class: str,
+) -> bool:
+    """Identify child failures whose unit of retry is the typed result.
+
+    The inner runtime intentionally fails closed after its bounded repair
+    budget.  The outer delegation wrapper has the authoritative dispatch
+    receipts and can safely allow the parent to resample the whole child when
+    no mutating handler was entered.  Keep this predicate narrow so provider
+    tool-stream corruption and unrelated runtime failures retain their own
+    stricter retry policy.
+    """
+
+    normalized_reason = (
+        str(terminal_reason or "").strip().casefold().replace("-", "_")
+    )
+    if normalized_reason == "delegated_output_contract_failed":
+        return True
+    if any(
+        normalized_reason.startswith(prefix)
+        for prefix in _DELEGATED_OUTPUT_CONTRACT_TERMINAL_PREFIXES
+    ):
+        return True
+    return (
+        str(failure_class or "").strip().casefold()
+        == "agent_contract_noncompliance"
+        and normalized_reason.startswith("delegated_")
+        and any(
+            marker in normalized_reason
+            for marker in ("output_contract", "result_footer", "typed_result")
+        )
+    )
 
 # Model-visible delegated output is not reusable until the outer child
 # contract (semantic fields, prerequisite/capability receipts, artifact
@@ -3730,6 +3770,31 @@ async def _run_child(
         session_id=context.session_id,
         context=context,
     )
+    allowed_script_keys = {
+        (skill, path, digest)
+        for skill, path, digest in allowed_skill_scripts
+    }
+    process_only_skill_scripts = [
+        row
+        for row in context.process_only_skill_scripts
+        if row in allowed_script_keys
+    ]
+    allowed_skill_script_authorities = [
+        row
+        for row in context.allowed_skill_script_authorities
+        if (
+            len(row) == 6
+            and (row[0], row[4], row[5]) in allowed_script_keys
+        )
+    ]
+    allowed_script_skills = {
+        skill for skill, _path, _digest in allowed_skill_scripts
+    }
+    allowed_skill_package_digests = [
+        row
+        for row in context.allowed_skill_package_digests
+        if len(row) == 2 and row[0] in allowed_script_skills
+    ]
     try:
         exact_script_entrypoint_guidance = (
             _render_exact_child_script_entrypoints(allowed_skill_scripts)
@@ -4898,6 +4963,11 @@ async def _run_child(
         delegated_resource_boundary=delegated_resource_boundary,
         allowed_skill_resources=allowed_skill_resources,
         allowed_skill_scripts=allowed_skill_scripts,
+        process_only_skill_scripts=process_only_skill_scripts,
+        allowed_skill_script_authorities=(
+            allowed_skill_script_authorities
+        ),
+        allowed_skill_package_digests=allowed_skill_package_digests,
         allowed_skill_commands=allowed_skill_commands,
         allowed_skill_http_prefixes=allowed_skill_http_prefixes,
         allowed_skill_http_post_prefixes=allowed_skill_http_post_prefixes,
@@ -5618,17 +5688,6 @@ async def _run_child(
             "failure_class": None,
             "retryable": False,
         }
-    elif dispatched_result_recovery_completed:
-        # These clean no-tool terminal turns are selected only after the child
-        # crossed a real dispatch boundary. If a typed footer, pseudo-tool
-        # audit, artifact receipt, or persistence contract then fails, the
-        # parent must not replay the child and duplicate earlier effects.
-        failure_fields = _child_failure_fields(
-            error,
-            terminal_reason,
-            failure_class="agent_contract_noncompliance",
-            retryable=False,
-        )
     elif dispatch_receipts.mutating_dispatch_observed:
         # Replaying a whole child after write/patch/execute or an unknown
         # handler boundary can duplicate a side effect. This applies to every
@@ -5647,6 +5706,27 @@ async def _run_child(
                 )
             ),
             retryable=False,
+        )
+    elif (
+        dispatched_result_recovery_completed
+        or (
+            runtime_error
+            and _is_delegated_output_contract_noncompliance(
+                normalized_terminal_reason,
+                runtime_failure_class,
+            )
+        )
+    ):
+        # Typed/output-contract repairs are model-output transactions.  Once
+        # the authoritative receipt ledger proves that no mutating handler was
+        # entered, a fresh child sample cannot duplicate an external effect.
+        # This includes read-only dispatches and the no-dispatch case.  The
+        # mutating branch above remains the fail-closed override.
+        failure_fields = _child_failure_fields(
+            error,
+            terminal_reason or "delegated_output_contract_failed",
+            failure_class="agent_contract_noncompliance",
+            retryable=True,
         )
     elif (
         runtime_error

@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "profile_id": "browser-automation-v1",
+  "description": "Prebuilt browser automation pool with a root lifecycle controller and fixed non-root Skill worker for exact .cjs/.js/.mjs/.py/.sh/.bash entrypoints.",
+  "platforms": [
+    "linux/amd64",
+    "linux/arm64"
+  ],
+  "base_images": {
+    "node_builder": "node:22.18.0-bookworm-slim@sha256:752ea8a2f758c34002a0461bd9f1cee4f9a3c36d48494586f60ffce1fc708e0e",
+    "python": "python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7"
+  },
+  "interpreters": {
+    "node": "22.18.0",
+    "python": "3.12.11"
+  },
+  "libraries": {
+    "node_playwright": "1.61.0",
+    "python_playwright": "1.61.0",
+    "selenium": "4.46.0",
+    "packaging": "25.0"
+  },
+  "common_python_manifest": "/opt/chatds-browser-runtime/common-python-requirements.in",
+  "browser": {
+    "family": "debian-chromium",
+    "driver": "debian-chromium-driver",
+    "debian_snapshot": "20260720T000000Z",
+    "browser_driver_major_must_match": true,
+    "playwright_uses_system_chromium_via_proxy_wrapper": true
+  },
+  "display_contract": {
+    "backend": "weston-headless-wayland",
+    "headed_browser": true,
+    "session_scope": "one private compositor and Wayland socket per lease process",
+    "worker_owned": true,
+    "x11": false
+  },
+  "entrypoint": "/usr/local/bin/chatds-browser-runtime-exec",
+  "script_extensions": [
+    ".cjs",
+    ".js",
+    ".mjs",
+    ".py",
+    ".sh",
+    ".bash"
+  ],
+  "identities": {
+    "controller_uid": 0,
+    "controller_gid": 0,
+    "proxy_uid": 65531,
+    "proxy_gid": 65531,
+    "proxy_bridge_gid": 65530,
+    "worker_uid": 65529,
+    "worker_gid": 65529,
+    "controller_drops_child_identity": true,
+    "worker_supplementary_groups": []
+  },
+  "runtime_installers": {
+    "npm": false,
+    "npx": false,
+    "pip": false,
+    "apt": false
+  },
+  "network_contract": {
+    "proxy_environment_variable": "SKILL_EGRESS_PROXY_URL",
+    "proxy_environment_injected_by_runtime": true,
+    "direct_egress_allowed": false,
+    "worker_network_mode": "none",
+    "controller_bridge": "fixed 127.0.0.1:18080 byte relay to /run/chatds-skill-egress/proxy.sock",
+    "proxy_socket_peer_uid": 65531,
+    "proxy_socket_bridge_gid": 65530,
+    "production_skill_lane_public_only": true,
+    "proxy_wrapper_is_defense_in_depth": true,
+    "raw_cdp_exposed_to_skill": false
+  },
+  "seccomp_contract": {
+    "source": "microsoft/playwright v1.61.0 utils/docker/seccomp_profile.json",
+    "default_action": "SCMP_ACT_ERRNO",
+    "chromium_namespace_syscalls": [
+      "clone",
+      "setns",
+      "unshare"
+    ],
+    "removed_cross_process_ipc_syscalls": [
+      "ipc",
+      "msgctl",
+      "msgget",
+      "msgrcv",
+      "msgsnd",
+      "semctl",
+      "semget",
+      "semop",
+      "semtimedop",
+      "semtimedop_time64",
+      "shmat",
+      "shmctl",
+      "shmdt",
+      "shmget",
+      "mq_getsetattr",
+      "mq_notify",
+      "mq_open",
+      "mq_timedreceive",
+      "mq_timedreceive_time64",
+      "mq_timedsend",
+      "mq_timedsend_time64",
+      "mq_unlink"
+    ],
+    "required_capabilities": [
+      "SYS_CHROOT"
+    ],
+    "sys_admin_capability": false
+  },
+  "filesystem_contract": {
+    "root_filesystem": "read-only",
+    "writable_mounts": [
+      "lease workspace",
+      "lease-private HOME and TMPDIR"
+    ],
+    "skill_package_mount": "read-only"
+  }
+}

@@ -1,0 +1,4 @@
+#!/usr/local/bin/python -I
+from chatds_browser_runtime.proxy_bridge import main
+
+raise SystemExit(main())

@@ -58,6 +58,10 @@ from provider_admission import (
     ProviderAdmissionTimeout,
     provider_admission,
 )
+from provider_metadata import (
+    record_provider_context_limit,
+    resolve_provider_runtime_metadata,
+)
 from provider_stream_deadline import (
     MaterialProgressLease,
     ProviderStreamDeadlineExceeded,
@@ -73,6 +77,7 @@ from retrieval_policy import (
 )
 from skill_capability_plan import (
     CAPABILITY_PLAN_TOOL_NAME,
+    MAX_AUTHORITY_DOCUMENT_CHARS,
     build_capability_catalog,
     capability_call_satisfies_candidate,
     capability_catalog_json,
@@ -326,6 +331,11 @@ _MAX_DELEGATE_VISIBLE_LENGTH_RECOVERIES = 1
 # counter; the run-wide limit remains an absolute convergence guard.
 _MAX_TOOL_STREAM_CONSECUTIVE_NO_PROGRESS_RECOVERIES = 3
 _MAX_TOOL_STREAM_RUN_RECOVERIES = 8
+# Even independently complete calls came from a batch whose overall transport
+# was corrupt.  Keep salvage smaller than the ordinary provider batch limit so
+# one malformed response cannot fan out into dozens of otherwise read-only
+# operations.  Exact-one repair turns apply the stricter limit of one below.
+_MAX_CORRUPT_TOOL_CALL_SALVAGE_CALLS = 8
 _VERIFIED_PRELOADED_INPUT_RECEIPT_VERSION = 1
 _MAX_VERIFIED_PRELOADED_INPUT_SOURCES = 128
 _VERIFIED_PRELOADED_INPUT_KINDS = frozenset({"read_file", "skill_view"})
@@ -382,6 +392,14 @@ _CONTEXT_OVERFLOW_RE = re.compile(
     r"maximum context length is\s+(\d+)\s+tokens.*?"
     r"requested\s+(\d+)\s+output tokens.*?"
     r"prompt contains at least\s+(\d+)\s+input tokens",
+    re.IGNORECASE | re.DOTALL,
+)
+_VLLM_MAX_TOTAL_TOKENS_RE = re.compile(
+    r"max_tokens\s*=\s*(\d+)\s+cannot\s+be\s+greater\s+than.*?"
+    r"(?:"
+    r"max_model_len\s*=\s*(?:max_total_tokens\s*=\s*)?"
+    r"|max_total_tokens\s*=\s*"
+    r")(\d+)",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -813,13 +831,25 @@ def _clamp_max_tokens_for_context(
     }
 
 
-def _retry_max_tokens_from_context_overflow(error_body: str, current_max_tokens: int) -> tuple[int | None, dict[str, int]]:
+def _retry_max_tokens_from_context_overflow(
+    error_body: str,
+    current_max_tokens: int,
+    estimated_input_tokens: int | None = None,
+) -> tuple[int | None, dict[str, Any]]:
     match = _CONTEXT_OVERFLOW_RE.search(error_body or "")
-    if not match:
-        return None, {}
-    context_limit = int(match.group(1))
-    requested_output = int(match.group(2))
-    prompt_tokens = int(match.group(3))
+    source = "provider_context_overflow"
+    if match:
+        context_limit = int(match.group(1))
+        requested_output = int(match.group(2))
+        prompt_tokens = int(match.group(3))
+    else:
+        vllm_match = _VLLM_MAX_TOTAL_TOKENS_RE.search(error_body or "")
+        if not vllm_match:
+            return None, {}
+        requested_output = int(vllm_match.group(1))
+        context_limit = int(vllm_match.group(2))
+        prompt_tokens = max(0, int(estimated_input_tokens or 0))
+        source = "vllm_max_total_tokens"
     safety_margin = _context_safety_margin(context_limit)
     available_output = context_limit - prompt_tokens - safety_margin
     minimum_useful_output = min(max(1, current_max_tokens), 512)
@@ -830,6 +860,7 @@ def _retry_max_tokens_from_context_overflow(error_body: str, current_max_tokens:
         "safety_margin": safety_margin,
         "available_output_tokens": available_output,
         "minimum_useful_output_tokens": minimum_useful_output,
+        "source": source,
     }
     if available_output < minimum_useful_output:
         return None, budget
@@ -918,6 +949,7 @@ def _dispatch_audit_args(tool_name: str, args: Any) -> dict[str, Any]:
         "write_file": ("filepath",),
         "patch_file": ("filepath",),
         "skill_view": ("name", "file_path", "offset", "limit"),
+        "run_skill_process": ("operation", "script_path"),
         "run_skill_python": ("script_path",),
         "run_skill_script": ("script_path",),
         "run_declared_command": ("skill_name", "command_id", "cwd"),
@@ -950,8 +982,12 @@ def _dispatch_audit_args(tool_name: str, args: Any) -> dict[str, Any]:
                 audit[field_name] = items
     if tool_name == "skill_view" and "name" in audit:
         audit.setdefault("file_path", "SKILL.md")
-    if tool_name in {"run_skill_python", "run_skill_script"}:
-        for identity_field in ("function_name", "class_name", "method_name"):
+    if tool_name in {
+        "run_skill_process", "run_skill_python", "run_skill_script",
+    }:
+        for identity_field in (
+            "function_name", "class_name", "factory_name", "method_name",
+        ):
             value = args.get(identity_field)
             if (
                 isinstance(value, str)
@@ -973,6 +1009,26 @@ def _dispatch_audit_args(tool_name: str, args: Any) -> dict[str, Any]:
             if isinstance(value, (list, dict)):
                 audit[count_field] = min(len(value), 10_000)
     return audit
+
+
+def _tool_dispatch_context(
+    context: ToolContext,
+    tool_call_id: str,
+) -> ToolContext:
+    """Bind one model/auto call to a stable runtime-only operation UUID."""
+
+    owner = "\0".join((
+        str(context.user_id),
+        str(context.session_id),
+        str(
+            context.root_run_id
+            or context.run_id
+            or context.browser_run_scope_id
+        ),
+        str(tool_call_id),
+    ))
+    operation_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "chatds-tool-call:" + owner))
+    return replace(context, tool_operation_id=operation_id)
 
 
 def _dispatch_audit_event_fields(
@@ -1295,6 +1351,121 @@ def _sanitize_model_history_tool_payloads(
     return cleaned, collapsed_calls
 
 
+_OUTPUT_CONTRACT_MACHINE_CONTEXT_PREFIXES = (
+    "[CHATDS RUNTIME RECORD",
+    "[CONTEXT COMPACTION — REFERENCE ONLY]",
+    "[CONTEXT SUMMARY]:",
+    "[Harness machine-owned ",
+    "[Harness Skill runtime binding blocked]",
+    "[Harness standard Skill ",
+    "[Harness typed standard Skill ",
+    "[Harness exact Skill boundary]",
+    "[Harness capability plan rejected after dispatch]",
+    "[Harness selected-route ",
+    "[Harness workflow state]",
+    "[Harness Skill routing state]",
+)
+
+
+def _history_message_fingerprint(message: Any) -> str:
+    if not isinstance(message, dict):
+        return ""
+    try:
+        rendered = json.dumps(
+            message,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    except (TypeError, ValueError):
+        rendered = repr(message)
+    return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+
+def _reset_delegated_output_contract_history(
+    conversation: list[dict],
+    *,
+    base_message_fingerprints: set[str] | frozenset[str],
+) -> dict[str, int]:
+    """Discard rejected drafts while retaining authoritative task/evidence state.
+
+    Output-contract correction is a new value transaction, not a continuation
+    of a rejected assistant draft. Preserve the original run inputs, current
+    machine-owned Skill/evidence ledgers, native structured tool-call/result
+    pairs, and compacted execution records. Remove prior visible drafts and
+    Harness continuation prompts so the correction cannot echo contaminated
+    pseudo protocol or grow quadratically across long child runs.
+    """
+
+    original_messages = list(conversation)
+    authoritative_tool_ids: set[str] = set()
+    for message in original_messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            call_id = str(call.get("id") or "")
+            if call_id:
+                authoritative_tool_ids.add(call_id)
+
+    cleaned: list[dict] = []
+    removed_messages = 0
+    removed_content_chars = 0
+    retained_tool_pairs = 0
+    for message in original_messages:
+        if not isinstance(message, dict):
+            removed_messages += 1
+            removed_content_chars += len(str(message))
+            continue
+        role = str(message.get("role") or "")
+        content = message.get("content")
+        content_text = content if isinstance(content, str) else ""
+        fingerprint = _history_message_fingerprint(message)
+        preserve = bool(
+            role == "system"
+            or fingerprint in base_message_fingerprints
+            or content_text.startswith(
+                _OUTPUT_CONTRACT_MACHINE_CONTEXT_PREFIXES
+            )
+        )
+
+        tool_calls = message.get("tool_calls")
+        if role == "assistant" and isinstance(tool_calls, list) and tool_calls:
+            retained = dict(message)
+            # Provider prose attached to a tool-call turn is not execution
+            # evidence. The structured call and its paired result are.
+            retained["content"] = None
+            cleaned.append(retained)
+            retained_tool_pairs += len(tool_calls)
+            continue
+        if (
+            role == "tool"
+            and str(message.get("tool_call_id") or "")
+            in authoritative_tool_ids
+        ):
+            cleaned.append(dict(message))
+            continue
+        if preserve:
+            cleaned.append(dict(message))
+            continue
+        removed_messages += 1
+        removed_content_chars += len(content_text)
+
+    conversation[:] = cleaned
+    return {
+        "before_messages": len(original_messages),
+        "after_messages": len(cleaned),
+        "removed_messages": removed_messages,
+        "removed_content_chars": removed_content_chars,
+        "retained_tool_call_count": retained_tool_pairs,
+    }
+
+
 _NON_SENSITIVE_DEBUG_TOKEN_KEYS = {
     "prompt_tokens",
     "completion_tokens",
@@ -1333,10 +1504,21 @@ _DEBUG_SECRET_ASSIGNMENT_RE = re.compile(
     r")(\s*[:=]\s*)([\"']?)([^\s,;}\]]{4,})"
 )
 _DEBUG_BEARER_RE = re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}")
+_DEBUG_URL_RE = re.compile(r"https?://[^\s<>{}\[\]\"']+", re.IGNORECASE)
+
+
+def _redacted_debug_url(match: re.Match[str]) -> str:
+    raw_url = match.group(0)
+    digest = hashlib.sha256(raw_url.encode("utf-8")).hexdigest()[:20]
+    return f"[url sha256={digest}]"
 
 
 def _redact_debug_text(value: str) -> str:
     text = str(value or "").replace("\x00", "")
+    # URLs in provider/tool errors can contain signed query strings, temporary
+    # credentials, internal origins, or user data even when no parameter name
+    # looks secret. Debug traces need only a stable correlation handle.
+    text = _DEBUG_URL_RE.sub(_redacted_debug_url, text)
     text = _DEBUG_BEARER_RE.sub(r"\1[redacted]", text)
     return _DEBUG_SECRET_ASSIGNMENT_RE.sub(
         lambda match: f"{match.group(1)}{match.group(2)}[redacted]",
@@ -1827,13 +2009,106 @@ def _skill_activation_preflight(
     ))
     from runtime.python_env import preflight_isolated_skill_runtime
 
-    runtime_preflight = preflight_isolated_skill_runtime(
-        requirements=package_requirements,
-        commands=required_commands,
-        environment_variables=required_environment,
-        platform_groups=required_platform_groups,
+    profile_manifest = workflow_contract.get(
+        "_chatds_runtime_profile_manifest"
     )
-    blockers.extend(runtime_preflight.get("blockers") or [])
+    profile_rows = (
+        {
+            str(item.get("entrypoint") or ""): item
+            for item in profile_manifest.get("scripts") or []
+            if (
+                isinstance(item, dict)
+                and str(item.get("entrypoint") or "")
+            )
+        }
+        if isinstance(profile_manifest, dict) else {}
+    )
+    selected_script_paths = _selected_plan_script_resources(
+        workflow_contract,
+        plan,
+    )
+    runtime_preflights: list[dict[str, Any]] = []
+    if selected_script_paths and isinstance(profile_manifest, dict):
+        for script_path in selected_script_paths:
+            profile_row = profile_rows.get(script_path)
+            if not isinstance(profile_row, dict):
+                blockers.append({
+                    "code": "skill_runtime_profile_unavailable",
+                    "items": [script_path],
+                })
+                continue
+            profile_requirements = list(dict.fromkeys([
+                *package_requirements,
+                *(
+                    str(item)
+                    for item in profile_row.get(
+                        "runtime_requirements"
+                    ) or []
+                    if str(item)
+                ),
+            ]))
+            profile_commands = list(dict.fromkeys([
+                *required_commands,
+                *(
+                    str(item)
+                    for item in profile_row.get("runtime_commands") or []
+                    if str(item)
+                ),
+            ]))
+            profile_preflight = preflight_isolated_skill_runtime(
+                requirements=profile_requirements,
+                commands=profile_commands,
+                environment_variables=required_environment,
+                platform_groups=required_platform_groups,
+                runtime_profile=str(
+                    profile_row.get("runtime_profile") or ""
+                ),
+            )
+            runtime_preflights.append({
+                "entrypoint": script_path,
+                "package_sha256": profile_row.get("package_sha256"),
+                "script_sha256": profile_row.get("script_sha256"),
+                **profile_preflight,
+            })
+    else:
+        runtime_preflights.append(preflight_isolated_skill_runtime(
+            requirements=package_requirements,
+            commands=required_commands,
+            environment_variables=required_environment,
+            platform_groups=required_platform_groups,
+        ))
+    for profile_preflight in runtime_preflights:
+        blockers.extend(profile_preflight.get("blockers") or [])
+    runtime_preflight = (
+        runtime_preflights[0]
+        if len(runtime_preflights) == 1
+        else {
+            "valid": not any(
+                item.get("valid") is not True
+                for item in runtime_preflights
+            ),
+            "checked": True,
+            "execution_runtime": "isolated_skill_executor",
+            "profiles": runtime_preflights,
+            "blockers": [
+                blocker
+                for item in runtime_preflights
+                for blocker in item.get("blockers") or []
+            ],
+            "packages": {
+                "requirements": package_requirements,
+                "status": (
+                    "satisfied"
+                    if all(
+                        (item.get("packages") or {}).get("status")
+                        in {"satisfied", "not_declared"}
+                        for item in runtime_preflights
+                    )
+                    else "unsatisfied"
+                ),
+            },
+        }
+    )
     runtime_identity = runtime_preflight.get("runtime_identity")
     current_platform = (
         runtime_identity.get("platform")
@@ -1842,7 +2117,11 @@ def _skill_activation_preflight(
     )
     return {
         "valid": not blockers,
-        "checked": bool(environments or compiled_step_selectors),
+        "checked": bool(
+            environments
+            or compiled_step_selectors
+            or selected_script_paths
+        ),
         "current_platform": current_platform,
         "blockers": blockers,
         "resolved_required_tools": resolved_required_tools,
@@ -3493,6 +3772,15 @@ class HarnessRunState:
     skill_resource_pagination_errors: dict[tuple[str, str], str] = field(
         default_factory=dict
     )
+    skill_resource_page_content: dict[tuple[str, str], str] = field(
+        default_factory=dict
+    )
+    # Complete non-main text resources eligible to amend a standard-Skill
+    # catalog.  Each record is retained only after a contiguous exact-digest
+    # read and is bounded by MAX_AUTHORITY_DOCUMENT_CHARS.
+    skill_disclosed_authority_documents: dict[
+        tuple[str, str], dict[str, str]
+    ] = field(default_factory=dict)
     # A compiler grant is bound to the exact canonical SKILL.md that the
     # model actually finished reading.  ``skill_md_sha256`` covers the whole
     # document (frontmatter included), unlike the body-only ``content`` field.
@@ -3780,6 +4068,11 @@ class HarnessRunState:
             "standard_skill_capability_plans": {
                 skill_name: {
                     "body_sha256": catalog.get("body_sha256"),
+                    "catalog_sha256": catalog.get("catalog_sha256"),
+                    "catalog_revision": catalog.get("catalog_revision", 0),
+                    "authority_documents": list(
+                        catalog.get("authority_documents") or []
+                    )[:16],
                     "candidate_count": catalog.get("candidate_count"),
                     "status": (
                         "accepted"
@@ -3887,6 +4180,8 @@ class HarnessRunState:
             self.skill_resource_page_sha256,
             self.skill_resource_page_total_chars,
             self.skill_resource_pagination_errors,
+            self.skill_resource_page_content,
+            self.skill_disclosed_authority_documents,
         ):
             for key in list(ledger):
                 if key[0] == skill_name:
@@ -4010,6 +4305,7 @@ class HarnessRunState:
                         "skill_view returned malformed or non-progressing "
                         "pagination metadata"
                     )
+                    self.skill_resource_page_content.pop(page_key, None)
                     resource_complete = False
                 elif requested_offset != expected_offset:
                     # A repeated old page or a forward skip supplies no new
@@ -4031,6 +4327,7 @@ class HarnessRunState:
                         self.skill_resource_pagination_errors[page_key] = (
                             "Skill resource changed between paginated reads"
                         )
+                        self.skill_resource_page_content.pop(page_key, None)
                         resource_complete = False
                     elif has_more:
                         if canonical_main:
@@ -4049,15 +4346,43 @@ class HarnessRunState:
                         self.skill_resource_page_sha256[page_key] = digest
                         self.skill_resource_page_total_chars[page_key] = total_chars
                         self.skill_resource_next_offsets[page_key] = next_offset
+                        if total_chars <= MAX_AUTHORITY_DOCUMENT_CHARS:
+                            prior_content = self.skill_resource_page_content.get(
+                                page_key, ""
+                            )
+                            if len(prior_content) == requested_offset:
+                                self.skill_resource_page_content[page_key] = (
+                                    prior_content + content
+                                )
+                            else:
+                                self.skill_resource_page_content.pop(
+                                    page_key, None
+                                )
                         self.skill_resource_pagination_errors.pop(page_key, None)
                         resource_complete = False
                     else:
+                        prior_content = self.skill_resource_page_content.pop(
+                            page_key, ""
+                        )
                         self.skill_resource_next_offsets.pop(page_key, None)
                         self.skill_resource_page_sha256.pop(page_key, None)
                         self.skill_resource_page_total_chars.pop(page_key, None)
                         self.skill_resource_pagination_errors.pop(page_key, None)
                         if canonical_main:
                             completed_main_digest = digest
+                        elif (
+                            total_chars <= MAX_AUTHORITY_DOCUMENT_CHARS
+                            and len(prior_content) == requested_offset
+                            and len(prior_content + content) == total_chars
+                            and hashlib.sha256(
+                                (prior_content + content).encode("utf-8")
+                            ).hexdigest() == digest
+                        ):
+                            self.skill_disclosed_authority_documents[page_key] = {
+                                "resource_path": str(file_path),
+                                "sha256": digest,
+                                "content": prior_content + content,
+                            }
 
             elif canonical_main and isinstance(result_data, dict):
                 declared_main_digest = result_data.get("skill_md_sha256")
@@ -4083,6 +4408,22 @@ class HarnessRunState:
                     completed_main_digest = declared_main_digest
                 elif valid_resource_digest:
                     completed_main_digest = resource_digest
+            elif isinstance(result_data, dict):
+                resource_digest = result_data.get("sha256")
+                content = result_data.get("content")
+                if (
+                    isinstance(content, str)
+                    and len(content) <= MAX_AUTHORITY_DOCUMENT_CHARS
+                    and isinstance(resource_digest, str)
+                    and re.fullmatch(r"[0-9a-f]{64}", resource_digest)
+                    and hashlib.sha256(content.encode("utf-8")).hexdigest()
+                    == resource_digest
+                ):
+                    self.skill_disclosed_authority_documents[page_key] = {
+                        "resource_path": str(file_path),
+                        "sha256": resource_digest,
+                        "content": content,
+                    }
 
             if resource_complete:
                 self.viewed_skill_files.setdefault(skill_name, set()).add(normalized)
@@ -5467,6 +5808,13 @@ def _clear_skill_runtime_ir_authority(
     run_state.skill_runtime_ir_sha256.pop(skill_name, None)
     run_state.skill_capability_catalogs.pop(skill_name, None)
     run_state.skill_capability_plans.pop(skill_name, None)
+    for ledger in (
+        run_state.skill_resource_page_content,
+        run_state.skill_disclosed_authority_documents,
+    ):
+        for key in list(ledger):
+            if key[0] == skill_name:
+                ledger.pop(key, None)
     run_state.skill_workflow_contracts.pop(skill_name, None)
     run_state.skill_execution_plans.pop(skill_name, None)
     run_state.skill_artifact_plans.pop(skill_name, None)
@@ -5902,6 +6250,16 @@ def _declared_child_tools(
     runnable_script_capability_skills: (
         set[str] | list[str] | tuple[str, ...]
     ) = (),
+    persistent_process_capability_skills: (
+        set[str] | list[str] | tuple[str, ...]
+    ) = (),
+    process_only_script_paths: (
+        set[str] | list[str] | tuple[str, ...]
+    ) = (),
+    one_shot_script_paths: (
+        set[str] | list[str] | tuple[str, ...]
+    ) = (),
+    bounded_script_profiles: bool = False,
     command_capability_skills: (
         set[str] | list[str] | tuple[str, ...]
     ) = (),
@@ -5930,6 +6288,7 @@ def _declared_child_tools(
     )
     declared_python_script_capability = False
     declared_generic_script_capability = False
+    declared_persistent_script_capability = False
     from skills.command_grants import grants_for_declaration
 
     has_declared_command_grant = bool(
@@ -5958,17 +6317,37 @@ def _declared_child_tools(
     }
     skill_fields = {"skill", "skills"}
     managed_bridges = {
-        "run_skill_script", "run_skill_python", "run_declared_command",
+        "run_skill_process", "run_skill_script", "run_skill_python",
+        "run_declared_command",
         "skill_http_get", "skill_http_post_json",
+    }
+    process_only_path_set = {
+        str(path) for path in process_only_script_paths if str(path)
+    }
+    one_shot_path_set = {
+        str(path) for path in one_shot_script_paths if str(path)
     }
 
     def record_script_path(candidate: str) -> None:
         nonlocal declared_python_script_capability
         nonlocal declared_generic_script_capability
+        nonlocal declared_persistent_script_capability
         suffix = PurePosixPath(candidate).suffix.casefold()
+        if suffix not in {".py", ".sh", ".bash", ".js", ".mjs", ".cjs"}:
+            return
+        if bounded_script_profiles:
+            is_process_only = candidate in process_only_path_set
+            is_one_shot = candidate in one_shot_path_set
+            if not (is_process_only or is_one_shot):
+                return
+            declared_persistent_script_capability = True
+            if not is_one_shot:
+                return
+        else:
+            declared_persistent_script_capability = True
         if suffix == ".py":
             declared_python_script_capability = True
-        elif suffix in {".sh", ".bash", ".js", ".mjs"}:
+        else:
             declared_generic_script_capability = True
 
     def collect(value: Any, *, field: str = "") -> None:
@@ -5990,7 +6369,9 @@ def _declared_child_tools(
                 return
             if field in native_authority_fields:
                 suffix = PurePosixPath(candidate).suffix.casefold()
-                if suffix in {".py", ".sh", ".bash", ".js", ".mjs"}:
+                if suffix in {
+                    ".py", ".sh", ".bash", ".js", ".mjs", ".cjs",
+                }:
                     record_script_path(candidate)
                     return
                 # Documentation/resource paths in compact ``tools`` lists are
@@ -6067,6 +6448,12 @@ def _declared_child_tools(
     has_runnable_declared_generic_skill = bool(
         runnable_script_skill_set.intersection(declared_skill_names)
     )
+    persistent_skill_set = {
+        str(name) for name in persistent_process_capability_skills
+    }
+    has_persistent_declared_skill = bool(
+        persistent_skill_set.intersection(declared_skill_names)
+    )
     if declared_python_script_capability or has_runnable_declared_skill:
         if "run_skill_script" in available:
             # All declared CLI entrypoints, including Python, share one
@@ -6084,9 +6471,21 @@ def _declared_child_tools(
             declared_generic_script_capability
             or has_runnable_declared_generic_skill
         )
-        and "run_skill_script" in available
     ):
-        resolved.append("run_skill_script")
+        if "run_skill_script" in available:
+            resolved.append("run_skill_script")
+    if (
+        declared_persistent_script_capability
+        or has_persistent_declared_skill
+        or (
+            not bounded_script_profiles
+            and (
+                has_runnable_declared_skill
+                or has_runnable_declared_generic_skill
+            )
+        )
+    ) and "run_skill_process" in available:
+        resolved.append("run_skill_process")
     if (
         (has_declared_command_grant or has_command_capability_skill)
         and "run_declared_command" in available
@@ -6104,6 +6503,61 @@ def _declared_child_tools(
     # otherwise an instruction-only capability could turn one bounded query
     # into repeated ambient searches.
     return list(dict.fromkeys(resolved))
+
+
+def _profile_bound_child_runner_kwargs(
+    context: ToolContext,
+    required_capability_skills: list[str] | tuple[str, ...],
+    *,
+    local_skill_name: str = "",
+) -> dict[str, Any]:
+    """Derive child runner families only from the parent's exact grants."""
+
+    required_skills = {
+        str(name) for name in required_capability_skills if str(name)
+    }
+    allowed = set(context.allowed_skill_scripts)
+    process_only = set(context.process_only_skill_scripts).intersection(
+        allowed
+    )
+    one_shot = allowed.difference(process_only)
+    local_process_only = {
+        row for row in process_only if row[0] == local_skill_name
+    }
+    local_one_shot = {
+        row for row in one_shot if row[0] == local_skill_name
+    }
+    capability_all = {
+        skill for skill, _path, _digest in allowed
+        if skill in required_skills
+    }
+    capability_python = {
+        skill for skill, path, _digest in one_shot
+        if (
+            skill in required_skills
+            and PurePosixPath(path).suffix.casefold() == ".py"
+        )
+    }
+    capability_generic = {
+        skill for skill, path, _digest in one_shot
+        if (
+            skill in required_skills
+            and PurePosixPath(path).suffix.casefold()
+            in {".sh", ".bash", ".js", ".mjs", ".cjs"}
+        )
+    }
+    return {
+        "runnable_capability_skills": capability_python,
+        "runnable_script_capability_skills": capability_generic,
+        "persistent_process_capability_skills": capability_all,
+        "process_only_script_paths": {
+            path for _skill, path, _digest in local_process_only
+        },
+        "one_shot_script_paths": {
+            path for _skill, path, _digest in local_one_shot
+        },
+        "bounded_script_profiles": True,
+    }
 
 
 _PREREQUISITE_READER_TOOLS = {"skill_view", "read_file", "search_files"}
@@ -6257,6 +6711,7 @@ def _canonical_tool_argument_fingerprint(arguments: Any) -> str:
 
 
 _MANAGED_CHILD_CAPABILITY_TOOLS = frozenset({
+    "run_skill_process",
     "run_skill_script",
     "run_skill_python",
     "run_declared_command",
@@ -6362,12 +6817,14 @@ def _resolve_explicit_capability_descriptor_tools(
             path_values.extend(str(item) for item in raw_value)
     if any(
         PurePosixPath(path).suffix.casefold()
-        in {".py", ".sh", ".bash", ".js", ".mjs"}
+        in {".py", ".sh", ".bash", ".js", ".mjs", ".cjs"}
         for path in path_values
     ):
         resolved.extend(
             name for name in child_tools
-            if name in {"run_skill_script", "run_skill_python"}
+            if name in {
+                "run_skill_process", "run_skill_script", "run_skill_python",
+            }
         )
 
     return list(dict.fromkeys(
@@ -6524,6 +6981,7 @@ def _preferred_initial_required_capability_tools(
         str(name) for name in required_tools if str(name)
     ))
     managed = {
+        "run_skill_process",
         "run_skill_script",
         "run_skill_python",
         "run_declared_command",
@@ -6539,7 +6997,9 @@ def _preferred_initial_required_capability_tools(
         [name for name in ordered if name == "run_declared_command"],
         [
             name for name in ordered
-            if name in {"run_skill_script", "run_skill_python"}
+            if name in {
+                "run_skill_process", "run_skill_script", "run_skill_python",
+            }
         ],
     )
     return next((tier for tier in tiers if tier), [])
@@ -7403,9 +7863,24 @@ def _classify_corrupt_tool_call_salvage(
     exposed_tool_names: set[str],
     tool_context: ToolContext,
     workflow_policy: dict[str, Any] | None,
-    max_safe_calls: int | None = None,
+    max_safe_calls: int | None = _MAX_CORRUPT_TOOL_CALL_SALVAGE_CALLS,
 ) -> _CorruptToolCallSalvage:
     """Select only independently complete, side-effect-free native calls."""
+
+    if max_safe_calls is None:
+        effective_safe_call_limit = _MAX_CORRUPT_TOOL_CALL_SALVAGE_CALLS
+    else:
+        try:
+            requested_safe_call_limit = int(max_safe_calls)
+        except (TypeError, ValueError):
+            requested_safe_call_limit = 0
+        effective_safe_call_limit = max(
+            0,
+            min(
+                requested_safe_call_limit,
+                _MAX_CORRUPT_TOOL_CALL_SALVAGE_CALLS,
+            ),
+        )
 
     safe_calls: list[AssembledStreamToolCall] = []
     seen_read_only_calls: set[tuple[str, str]] = set()
@@ -7432,6 +7907,8 @@ def _classify_corrupt_tool_call_salvage(
             and metadata.get("destructive") is False
             and metadata.get("mutates_workspace") is False
             and metadata.get("mutates_global_state") is False
+            and metadata.get("salvage_safe") is True
+            and metadata.get("external_interaction") is False
         ):
             side_effect_blocked_count += 1
             continue
@@ -7482,7 +7959,7 @@ def _classify_corrupt_tool_call_salvage(
         if workflow_error:
             workflow_rejected_count += 1
             continue
-        if max_safe_calls is not None and len(safe_calls) >= max_safe_calls:
+        if len(safe_calls) >= effective_safe_call_limit:
             safe_call_limit_count += 1
             continue
 
@@ -7509,6 +7986,7 @@ def _classify_corrupt_tool_call_salvage(
         "preflight_rejected_count": preflight_rejected_count,
         "workflow_rejected_count": workflow_rejected_count,
         "safe_call_limit_count": safe_call_limit_count,
+        "safe_call_limit": effective_safe_call_limit,
         "unresolved_call_count": unresolved_count,
     }
     return _CorruptToolCallSalvage(
@@ -7755,6 +8233,44 @@ def _selected_workflow_resource_closure(
             paths.extend(_intent_local_resource_paths(resolved_mappings))
     paths.extend(str(path) for path in selected_intent_resources if str(path))
     return _dedupe_paths(paths)
+
+
+def _selected_plan_script_resources(
+    contract: dict[str, Any],
+    plan: dict[str, Any],
+) -> list[str]:
+    """Return executable resources reachable from only the selected route."""
+
+    paths = list(_selected_workflow_resource_closure(contract, plan))
+    workers = plan.get("workers")
+    if isinstance(workers, dict):
+        for worker_id in plan.get("required_workers") or []:
+            worker = workers.get(worker_id)
+            if not isinstance(worker, dict):
+                continue
+            paths.extend(
+                str(path)
+                for path in worker.get("local_resources") or []
+                if isinstance(path, str)
+            )
+    for group in (
+        plan.get("bootstrap_sources") or [],
+        plan.get("aggregation_steps") or [],
+    ):
+        for step in group:
+            if not isinstance(step, dict):
+                continue
+            paths.extend(
+                str(path)
+                for path in step.get("local_resources") or []
+                if isinstance(path, str)
+            )
+    return [
+        path
+        for path in _dedupe_paths(paths)
+        if PurePosixPath(path).suffix.casefold()
+        in {".py", ".sh", ".bash", ".js", ".mjs", ".cjs"}
+    ]
 
 
 def _workflow_resource_closure_error(
@@ -8261,6 +8777,7 @@ def _artifact_synthesis_receipt_error(
             "write_file",
             "patch_file",
             "skill_copy_resource",
+            "run_skill_process",
             "run_skill_python",
             "run_skill_script",
             "run_declared_command",
@@ -9329,6 +9846,44 @@ def _emit_run_cancelled_on_cancellation(func):
                 # The exact-key helper is idempotent and the shielded task may
                 # still finish if a second cancellation arrives here.
                 logger.debug("Browser run cleanup did not finish synchronously", exc_info=True)
+            is_root_agent_run = bool(
+                agent_kind == "primary"
+                and depth == 0
+                and parent_run_id is None
+                and (
+                    not run_id
+                    or not root_run_id
+                    or str(root_run_id) == str(run_id)
+                )
+            )
+            if is_root_agent_run:
+                try:
+                    from tools.skill_process import cleanup_skill_process_root
+
+                    process_root_id = str(
+                        root_run_id or run_id or browser_run_scope_id
+                    )
+                    cleanup = asyncio.create_task(
+                        cleanup_skill_process_root(
+                            user_id,
+                            session_id,
+                            process_root_id,
+                        )
+                    )
+                    await asyncio.wait_for(
+                        asyncio.shield(cleanup),
+                        timeout=15.0,
+                    )
+                except BaseException:
+                    # A lease cleanup failure is observable in executor TTL/
+                    # janitor state, but must never replace the run's primary
+                    # terminal result. Delegated children intentionally skip
+                    # this block so they cannot close their root's leases.
+                    logger.debug(
+                        "Persistent Skill process cleanup did not finish "
+                        "synchronously",
+                        exc_info=True,
+                    )
 
     return wrapped
 
@@ -9363,6 +9918,13 @@ async def run_stream(
     delegated_resource_boundary: bool = False,
     allowed_skill_resources: list[tuple[str, str]] | None = None,
     allowed_skill_scripts: list[tuple[str, str, str]] | None = None,
+    process_only_skill_scripts: list[
+        tuple[str, str, str]
+    ] | None = None,
+    allowed_skill_script_authorities: list[
+        tuple[str, str, str, str, str, str]
+    ] | None = None,
+    allowed_skill_package_digests: list[tuple[str, str]] | None = None,
     allowed_skill_commands: list[
         tuple[str, str, str, tuple[str, ...]]
     ] | None = None,
@@ -9566,6 +10128,15 @@ async def run_stream(
         delegated_resource_boundary=delegated_resource_boundary,
         allowed_skill_resources=tuple(allowed_skill_resources or ()),
         allowed_skill_scripts=tuple(allowed_skill_scripts or ()),
+        process_only_skill_scripts=tuple(
+            process_only_skill_scripts or ()
+        ),
+        allowed_skill_script_authorities=tuple(
+            allowed_skill_script_authorities or ()
+        ),
+        allowed_skill_package_digests=tuple(
+            allowed_skill_package_digests or ()
+        ),
         allowed_skill_commands=tuple(allowed_skill_commands or ()),
         allowed_skill_http_prefixes=tuple(allowed_skill_http_prefixes or ()),
         allowed_skill_http_post_prefixes=tuple(
@@ -10194,21 +10765,10 @@ async def run_stream(
                 bootstrap_tools = _declared_child_tools(
                     run_state.available_tools,
                     declared_capabilities,
-                    runnable_capability_skills=(
-                        _runnable_capability_skill_names(
-                            required_capability_skills,
-                            user_id=run_state.user_id,
-                            session_id=run_state.session_id,
-                            enabled_user_skills=enabled_user_skills,
-                        )
-                    ),
-                    runnable_script_capability_skills=(
-                        _runnable_script_capability_skill_names(
-                            required_capability_skills,
-                            user_id=run_state.user_id,
-                            session_id=run_state.session_id,
-                            enabled_user_skills=enabled_user_skills,
-                        )
+                    **_profile_bound_child_runner_kwargs(
+                        tool_context,
+                        required_capability_skills,
+                        local_skill_name=selected_skill,
                     ),
                     command_capability_skills=(
                         _command_capability_skill_names(
@@ -10460,21 +11020,10 @@ async def run_stream(
                     worker_tools = _declared_child_tools(
                         run_state.available_tools,
                         declared_capabilities,
-                        runnable_capability_skills=(
-                            _runnable_capability_skill_names(
-                                required_capability_skills,
-                                user_id=run_state.user_id,
-                                session_id=run_state.session_id,
-                                enabled_user_skills=enabled_user_skills,
-                            )
-                        ),
-                        runnable_script_capability_skills=(
-                            _runnable_script_capability_skill_names(
-                                required_capability_skills,
-                                user_id=run_state.user_id,
-                                session_id=run_state.session_id,
-                                enabled_user_skills=enabled_user_skills,
-                            )
+                        **_profile_bound_child_runner_kwargs(
+                            tool_context,
+                            required_capability_skills,
+                            local_skill_name=selected_skill,
                         ),
                         command_capability_skills=(
                             _command_capability_skill_names(
@@ -10715,21 +11264,10 @@ async def run_stream(
                 aggregation_tools = _declared_child_tools(
                     run_state.available_tools,
                     declared_capabilities,
-                    runnable_capability_skills=(
-                        _runnable_capability_skill_names(
-                            required_capability_skills,
-                            user_id=run_state.user_id,
-                            session_id=run_state.session_id,
-                            enabled_user_skills=enabled_user_skills,
-                        )
-                    ),
-                    runnable_script_capability_skills=(
-                        _runnable_script_capability_skill_names(
-                            required_capability_skills,
-                            user_id=run_state.user_id,
-                            session_id=run_state.session_id,
-                            enabled_user_skills=enabled_user_skills,
-                        )
+                    **_profile_bound_child_runner_kwargs(
+                        tool_context,
+                        required_capability_skills,
+                        local_skill_name=selected_skill,
                     ),
                     command_capability_skills=(
                         _command_capability_skill_names(
@@ -11592,7 +12130,8 @@ async def run_stream(
         # every Skill discovery/execution bridge from this run.
         unselected_skill_tools = {
             "skills_list", "skill_view", "skill_copy_resource", "skill_manage",
-            "run_skill_python", "run_skill_script", "run_declared_command",
+            "run_skill_process", "run_skill_python", "run_skill_script",
+            "run_declared_command",
             "skill_http_get", "skill_http_post_json",
             CAPABILITY_PLAN_TOOL_NAME,
         }
@@ -11640,6 +12179,21 @@ async def run_stream(
             if bounded_skill_exposure is not None
             else tool_context.allowed_skill_scripts
         ),
+        process_only_skill_scripts=(
+            bounded_skill_exposure.process_only_skill_scripts
+            if bounded_skill_exposure is not None
+            else tool_context.process_only_skill_scripts
+        ),
+        allowed_skill_script_authorities=(
+            bounded_skill_exposure.allowed_skill_script_authorities
+            if bounded_skill_exposure is not None
+            else tool_context.allowed_skill_script_authorities
+        ),
+        allowed_skill_package_digests=(
+            bounded_skill_exposure.allowed_skill_package_digests
+            if bounded_skill_exposure is not None
+            else tool_context.allowed_skill_package_digests
+        ),
         allowed_skill_commands=(
             bounded_skill_exposure.allowed_skill_commands
             if bounded_skill_exposure is not None
@@ -11663,7 +12217,9 @@ async def run_stream(
     if not tool_context.allowed_skill_scripts:
         tools = [
             name for name in tools
-            if name not in {"run_skill_python", "run_skill_script"}
+            if name not in {
+                "run_skill_process", "run_skill_python", "run_skill_script",
+            }
         ]
     if not tool_context.allowed_skill_commands:
         tools = [name for name in tools if name != "run_declared_command"]
@@ -11719,6 +12275,19 @@ async def run_stream(
         provider,
         *(dict(item) for item in model_routing.fallback_providers),
     ]
+    # Resolve only the provider that will actually receive this request.
+    # Fallback catalogs may be slow, unavailable, or credential-scoped; eager
+    # fan-out delays healthy primary traffic and observes endpoints that the
+    # run never uses. Each fallback is resolved lazily at the switch boundary.
+    provider, primary_provider_metadata_audit = (
+        await resolve_provider_runtime_metadata(provider_chain[0])
+    )
+    provider_chain[0] = provider
+    provider_metadata_audits = [{
+        **primary_provider_metadata_audit,
+        "resolution_boundary": "initial_primary",
+        "provider_index": 0,
+    }]
     provider_cursor = 0
     base_url, api_model, api_key, protocol, headers = apply_provider(provider)
     tool_context = replace(
@@ -11811,6 +12380,12 @@ async def run_stream(
         model_routing_payload,
     ):
         yield debug_evt
+    for audit in provider_metadata_audits:
+        for debug_evt in await debug_stream_event(
+            "provider.metadata.resolved",
+            audit,
+        ):
+            yield debug_evt
     if session_skill_relevance_decision.semantic_status != "not_attempted":
         for debug_evt in await debug_stream_event(
             "session_skill.semantic_selection",
@@ -12929,6 +13504,9 @@ async def run_stream(
                 allowed_skill_resources=planning_resources,
                 selected_skill_browse_roots=(selected_name,),
                 allowed_skill_scripts=(),
+                process_only_skill_scripts=(),
+                allowed_skill_script_authorities=(),
+                allowed_skill_package_digests=(),
                 allowed_skill_commands=(),
                 allowed_skill_http_prefixes=(),
                 allowed_skill_http_post_prefixes=(),
@@ -13018,6 +13596,9 @@ async def run_stream(
                     allowed_skill_resources=planning_resources,
                     selected_skill_browse_roots=(standard_name,),
                     allowed_skill_scripts=(),
+                    process_only_skill_scripts=(),
+                    allowed_skill_script_authorities=(),
+                    allowed_skill_package_digests=(),
                     allowed_skill_commands=(),
                     allowed_skill_http_prefixes=(),
                     allowed_skill_http_post_prefixes=(),
@@ -13082,6 +13663,9 @@ async def run_stream(
                     allowed_skill_resources=planning_resources,
                     selected_skill_browse_roots=(standard_name,),
                     allowed_skill_scripts=(),
+                    process_only_skill_scripts=(),
+                    allowed_skill_script_authorities=(),
+                    allowed_skill_package_digests=(),
                     allowed_skill_commands=(),
                     allowed_skill_http_prefixes=(),
                     allowed_skill_http_post_prefixes=(),
@@ -13105,6 +13689,9 @@ async def run_stream(
                 allowed_skill_resources=planning_resources,
                 selected_skill_browse_roots=(standard_name,),
                 allowed_skill_scripts=(),
+                process_only_skill_scripts=(),
+                allowed_skill_script_authorities=(),
+                allowed_skill_package_digests=(),
                 allowed_skill_commands=(),
                 allowed_skill_http_prefixes=(),
                 allowed_skill_http_post_prefixes=(),
@@ -13160,6 +13747,15 @@ async def run_stream(
                 if (name, "SKILL.md") in set(exposure.allowed_skill_resources)
             )),
             allowed_skill_scripts=exposure.allowed_skill_scripts,
+            process_only_skill_scripts=(
+                exposure.process_only_skill_scripts
+            ),
+            allowed_skill_script_authorities=(
+                exposure.allowed_skill_script_authorities
+            ),
+            allowed_skill_package_digests=(
+                exposure.allowed_skill_package_digests
+            ),
             allowed_skill_commands=exposure.allowed_skill_commands,
             allowed_skill_http_prefixes=exposure.allowed_skill_http_prefixes,
             allowed_skill_http_post_prefixes=(
@@ -13327,6 +13923,7 @@ async def run_stream(
             required=result_data.get("required"),
             optional=result_data.get("optional"),
             unsupported=result_data.get("unsupported"),
+            catalog_sha256=result_data.get("catalog_sha256"),
         )
         if not validated.valid:
             return (
@@ -13334,6 +13931,33 @@ async def run_stream(
                 + str(validated.payload.get("error") or "invalid plan")
             )
         plan = validated.payload
+        runtime_preflight = _preflight_standard_skill_runtime_selection(
+            catalog,
+            [
+                *(
+                    str(item)
+                    for item in plan.get("required") or []
+                    if str(item)
+                ),
+                *(
+                    str(item)
+                    for item in plan.get("optional") or []
+                    if str(item)
+                ),
+            ],
+        )
+        if runtime_preflight.get("valid") is not True:
+            return (
+                "[Harness capability plan rejected after dispatch] "
+                "The selected exact Skill entrypoint is unavailable in its "
+                "profile-bound isolated runtime: "
+                + json.dumps(
+                    runtime_preflight.get("blockers") or [],
+                    ensure_ascii=False,
+                )
+            )
+        plan["runtime_preflight"] = runtime_preflight
+        previous_receipts = dict(standard_required_candidate_receipts)
         selected_tools = [
             str(name) for name in plan.get("selected_tools") or []
             if isinstance(name, str)
@@ -13363,6 +13987,24 @@ async def run_stream(
                 and all(isinstance(item, str) and item for item in row)
             ):
                 script_rows.append((row[0], row[1], row[2]))
+        process_only_rows: list[tuple[str, str, str]] = []
+        for row in plan.get("process_only_skill_scripts") or []:
+            if (
+                isinstance(row, list)
+                and len(row) == 3
+                and all(isinstance(item, str) and item for item in row)
+            ):
+                process_only_rows.append((row[0], row[1], row[2]))
+        script_authority_rows: list[
+            tuple[str, str, str, str, str, str]
+        ] = []
+        for row in plan.get("allowed_skill_script_authorities") or []:
+            if (
+                isinstance(row, list)
+                and len(row) == 6
+                and all(isinstance(item, str) and item for item in row)
+            ):
+                script_authority_rows.append(tuple(row))
         command_rows: list[tuple[str, str, str, tuple[str, ...]]] = []
         for row in plan.get("allowed_skill_commands") or []:
             if (
@@ -13378,6 +14020,12 @@ async def run_stream(
             (skill_name, "__manifest__"),
         ]))
         allowed_scripts = tuple(dict.fromkeys(script_rows))
+        allowed_script_authorities = tuple(dict.fromkeys(
+            script_authority_rows
+        ))
+        allowed_package_digests = pair_rows(
+            plan.get("allowed_skill_package_digests")
+        )
         allowed_commands = tuple(dict.fromkeys(command_rows))
         allowed_http = pair_rows(plan.get("allowed_skill_http_prefixes"))
         allowed_http_post = pair_rows(
@@ -13392,6 +14040,11 @@ async def run_stream(
             allowed_skill_resources=allowed_resources,
             selected_skill_browse_roots=(skill_name,),
             allowed_skill_scripts=allowed_scripts,
+            process_only_skill_scripts=tuple(dict.fromkeys(
+                process_only_rows
+            )),
+            allowed_skill_script_authorities=allowed_script_authorities,
+            allowed_skill_package_digests=allowed_package_digests,
             allowed_skill_commands=allowed_commands,
             allowed_skill_http_prefixes=allowed_http,
             allowed_skill_http_post_prefixes=allowed_http_post,
@@ -13404,12 +14057,31 @@ async def run_stream(
             for candidate in plan.get("required_candidates") or []
             if isinstance(candidate, dict) and str(candidate.get("id") or "")
         }
-        standard_completed_required_candidate_ids = set()
-        standard_required_candidate_receipts = {}
+        standard_required_candidate_receipts = {
+            candidate_id: receipt
+            for candidate_id, receipt in previous_receipts.items()
+            if candidate_id in standard_required_candidates
+        }
+        standard_completed_required_candidate_ids = set(
+            standard_required_candidate_receipts
+        )
         standard_plan_execution_window_pending = True
-        plan["completed_required_candidate_ids"] = []
-        plan["failed_required_candidate_ids"] = []
-        plan["required_candidate_receipts"] = []
+        plan["completed_required_candidate_ids"] = sorted(
+            candidate_id
+            for candidate_id, receipt
+            in standard_required_candidate_receipts.items()
+            if receipt.get("outcome") == "success"
+        )
+        plan["failed_required_candidate_ids"] = sorted(
+            candidate_id
+            for candidate_id, receipt
+            in standard_required_candidate_receipts.items()
+            if receipt.get("outcome") != "success"
+        )
+        plan["required_candidate_receipts"] = [
+            standard_required_candidate_receipts[candidate_id]
+            for candidate_id in sorted(standard_required_candidate_receipts)
+        ]
         # Exact candidates supersede the legacy bridge-name groups.  Keeping
         # both would let an earlier main read (skill_view) or optional call on
         # a shared runner incorrectly satisfy a required exact resource.
@@ -13454,6 +14126,153 @@ async def run_stream(
             + json.dumps(command_catalog, ensure_ascii=False)
             + " Unsupported: "
             + json.dumps(unsupported, ensure_ascii=False)
+        )
+
+    def amend_standard_capability_catalog_after_reference(
+        skill_name: str,
+    ) -> str | None:
+        """Reopen typed planning when a trusted reference adds exact grants."""
+
+        nonlocal tools, tool_context, forced_workflow_policy
+        nonlocal direct_required_tool_groups, direct_missing_requirements
+        nonlocal standard_plan_execution_window_pending
+
+        if (
+            agent_kind != "primary"
+            or skill_name not in run_state.skill_capability_plans
+            or CAPABILITY_PLAN_TOOL_NAME not in skill_compiler_tool_universe
+        ):
+            return None
+        allowed_resources = set(tool_context.allowed_skill_resources)
+        authority_documents = tuple(
+            record
+            for (record_skill, _normalized_path), record
+            in sorted(run_state.skill_disclosed_authority_documents.items())
+            if (
+                record_skill == skill_name
+                and isinstance(record, dict)
+                and (skill_name, str(record.get("resource_path") or ""))
+                in allowed_resources
+            )
+        )
+        if not authority_documents:
+            return None
+        record = session_skill_catalog.get(skill_name)
+        if not isinstance(record, dict):
+            return None
+        try:
+            from skills.loader import load_skill_content
+            from skills.path_safety import validate_skill_resource
+            from skills.scanner import skill_runnable_script_resources
+
+            loaded_package = load_skill_content(
+                Path(str(record.get("path") or "")),
+                skill_dir=str(record.get("skill_dir") or ""),
+                session_id=session_id,
+            )
+            package_root = Path(
+                str(
+                    loaded_package.get("skill_dir")
+                    or record.get("skill_dir")
+                    or Path(str(record.get("path") or "")).parent
+                )
+            ).resolve(strict=True)
+            current_authority_documents: list[dict[str, str]] = []
+            for document in authority_documents:
+                resource_path = str(document.get("resource_path") or "")
+                checked = validate_skill_resource(
+                    package_root,
+                    resource_path,
+                    expected_kind="file",
+                    require_relative=True,
+                )
+                if not checked.valid or checked.path is None:
+                    continue
+                current_digest = hashlib.sha256(
+                    checked.path.read_bytes()
+                ).hexdigest()
+                if current_digest != str(document.get("sha256") or ""):
+                    continue
+                current_authority_documents.append(dict(document))
+            if not current_authority_documents:
+                return None
+            runnable_scripts = skill_runnable_script_resources(
+                skill_name,
+                user_id,
+                session_id,
+                enabled_user_skills,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to compile standard Skill reference amendment "
+                "user=%s session=%s skill=%s",
+                user_id,
+                session_id,
+                skill_name,
+                exc_info=True,
+            )
+            return None
+
+        compiler_tools = list(dict.fromkeys([
+            *skill_compiler_tool_universe,
+            *tools,
+        ]))
+        amended = _build_standard_skill_capability_catalog(
+            skill_name,
+            loaded_package,
+            compiler_tools,
+            tuple(runnable_scripts or ()),
+            tuple(current_authority_documents),
+        )
+        previous = run_state.skill_capability_catalogs.get(skill_name) or {}
+        previous_ids = {
+            str(candidate.get("id") or "")
+            for candidate in previous.get("candidates") or []
+            if isinstance(candidate, dict)
+        }
+        amended_ids = {
+            str(candidate.get("id") or "")
+            for candidate in amended.get("candidates") or []
+            if isinstance(candidate, dict)
+        }
+        added_ids = sorted(amended_ids - previous_ids)
+        if (
+            not added_ids
+            and amended.get("catalog_sha256")
+            == previous.get("catalog_sha256")
+        ):
+            return None
+        amended["previous_catalog_sha256"] = str(
+            previous.get("catalog_sha256") or ""
+        )
+        amended["added_candidate_ids"] = added_ids[:64]
+        run_state.skill_capability_catalogs[skill_name] = amended
+
+        tools = list(dict.fromkeys([
+            *tools,
+            CAPABILITY_PLAN_TOOL_NAME,
+        ]))
+        tool_context = replace(
+            tool_context,
+            enabled_tools=tuple(tools),
+            skill_capability_catalog=amended,
+        )
+        run_state.available_tools = set(tools)
+        direct_required_tool_groups = [(CAPABILITY_PLAN_TOOL_NAME,)]
+        direct_missing_requirements = []
+        forced_workflow_policy = {
+            "tools": [CAPABILITY_PLAN_TOOL_NAME],
+            "max_calls": 1,
+            "reason": "content-addressed standard Skill catalog amendment",
+        }
+        standard_plan_execution_window_pending = False
+        return (
+            "[Harness standard Skill capability catalog amendment] A complete "
+            "previously selected reference disclosed new exact package "
+            "capabilities. Submit one replacement plan over the amended "
+            "catalog, retaining still-needed prior IDs and copying the exact "
+            "catalog_sha256. No new grant exists until that plan is accepted:\n"
+            + capability_catalog_json(amended)
         )
 
     async def recompile_selected_skill_boundary(
@@ -13613,6 +14432,15 @@ async def run_stream(
                 if (name, "SKILL.md") in set(exposure.allowed_skill_resources)
             )),
             allowed_skill_scripts=exposure.allowed_skill_scripts,
+            process_only_skill_scripts=(
+                exposure.process_only_skill_scripts
+            ),
+            allowed_skill_script_authorities=(
+                exposure.allowed_skill_script_authorities
+            ),
+            allowed_skill_package_digests=(
+                exposure.allowed_skill_package_digests
+            ),
             allowed_skill_commands=exposure.allowed_skill_commands,
             allowed_skill_http_prefixes=exposure.allowed_skill_http_prefixes,
             allowed_skill_http_post_prefixes=(
@@ -13677,6 +14505,15 @@ async def run_stream(
             ) == "intent"
             and str(task.get("skill_name") or "")
         ))
+
+    delegated_output_contract_base_fingerprints = frozenset(
+        fingerprint
+        for fingerprint in (
+            _history_message_fingerprint(message)
+            for message in conversation
+        )
+        if fingerprint
+    )
 
     while (
         budget.remaining > 0
@@ -13820,7 +14657,10 @@ async def run_stream(
                     auto_result = await dispatch(
                         auto_tool_name,
                         auto_preflight.args,
-                        context=tool_context,
+                        context=_tool_dispatch_context(
+                            tool_context,
+                            auto_call_id,
+                        ),
                     )
             auto_outcome, auto_detail = _tool_outcome_summary(str(auto_result))
             auto_result_data = _json_object(str(auto_result))
@@ -13896,6 +14736,16 @@ async def run_stream(
                     )
                     if initial_guidance:
                         auto_boundary_guidance.append(initial_guidance)
+                    if auto_skill_resource_complete:
+                        amendment_guidance = (
+                            amend_standard_capability_catalog_after_reference(
+                                str(auto_args.get("name") or "")
+                            )
+                        )
+                        if amendment_guidance:
+                            auto_boundary_guidance.append(
+                                amendment_guidance
+                            )
                     for intent_skill_name in sorted(
                         run_state.skill_completed_intent
                         - completed_intent_before
@@ -15019,6 +15869,17 @@ async def run_stream(
 
         caller_requested_max_tokens = int(max_tokens or DEFAULT_MAX_TOKENS)
         requested_max_tokens = caller_requested_max_tokens
+        try:
+            provider_output_limit = int(
+                provider.get("max_output_tokens") or 0
+            )
+        except (TypeError, ValueError, OverflowError):
+            provider_output_limit = 0
+        if provider_output_limit > 0:
+            requested_max_tokens = min(
+                requested_max_tokens,
+                provider_output_limit,
+            )
         primary_phase_output_token_cap: int | None = None
         if primary_bounded_argument_tool_frontier:
             # Context length is an admission ceiling, not a useful generation
@@ -16677,6 +17538,22 @@ async def run_stream(
                         tool_call_accumulator.fragment_count
                     ),
                 })
+                if raw_protocol_abort and iteration_output_contract_repair:
+                    msg = (
+                        "The single delegated output-contract correction emitted "
+                        "raw tool protocol. Its buffered value was discarded."
+                    )
+                    yield await emit_agent_event("run.failed", {
+                        "error": msg,
+                        "finish_reason": (
+                            "delegated_output_contract_repair_protocol_invalid"
+                        ),
+                        "failure_class": "agent_contract_noncompliance",
+                        "retryable": True,
+                        **abort_debug,
+                    })
+                    yield {"type": "error", "msg": msg}
+                    return
                 msg = (
                     "The delegated provider stream crossed a bounded "
                     "convergence boundary. Its uncommitted output was "
@@ -16834,7 +17711,42 @@ async def run_stream(
                 adjusted_max_tokens, overflow_budget = _retry_max_tokens_from_context_overflow(
                     e.body,
                     int(body.get("max_tokens") or 0),
+                    estimated_input_tokens,
                 )
+                discovered_context_length = int(
+                    overflow_budget.get("context_length") or 0
+                )
+                if discovered_context_length > 0:
+                    provider["context_length"] = discovered_context_length
+                    compressor.set_context_length(
+                        discovered_context_length
+                    )
+                    record_provider_context_limit(
+                        provider,
+                        discovered_context_length,
+                    )
+                    for debug_evt in await debug_stream_event(
+                        "provider.metadata.corrected",
+                        {
+                            "provider_key_sha256": hashlib.sha256(
+                                (
+                                    str(provider.get("id") or "")
+                                    + "\0"
+                                    + str(api_model)
+                                ).encode("utf-8")
+                            ).hexdigest()[:20],
+                            "api_model": str(api_model)[:200],
+                            "source": overflow_budget.get("source"),
+                            "context_length": discovered_context_length,
+                            "effective_max_tokens": adjusted_max_tokens,
+                            "recovery_action": (
+                                "reduce_output"
+                                if adjusted_max_tokens is not None
+                                else "force_compression"
+                            ),
+                        },
+                    ):
+                        yield debug_evt
                 if adjusted_max_tokens is not None:
                     body["max_tokens"] = adjusted_max_tokens
                     logger.warning(
@@ -17009,8 +17921,16 @@ async def run_stream(
                 ):
                     previous = provider_chain[provider_cursor]
                     provider_cursor += 1
-                    provider = provider_chain[provider_cursor]
+                    provider, fallback_metadata_audit = (
+                        await resolve_provider_runtime_metadata(
+                            provider_chain[provider_cursor]
+                        )
+                    )
+                    provider_chain[provider_cursor] = provider
                     base_url, api_model, api_key, protocol, headers = apply_provider(provider)
+                    compressor.set_context_length(
+                        provider.get("context_length")
+                    )
                     tool_context = replace(
                         tool_context,
                         model_id=str(provider.get("id") or api_model),
@@ -17018,6 +17938,15 @@ async def run_stream(
                         fallback_configs=tuple(provider_chain[provider_cursor + 1:]),
                         enabled_tools=tuple(tools),
                     )
+                    for debug_evt in await debug_stream_event(
+                        "provider.metadata.resolved",
+                        {
+                            **fallback_metadata_audit,
+                            "resolution_boundary": "provider_switch",
+                            "provider_index": provider_cursor,
+                        },
+                    ):
+                        yield debug_evt
                     yield await emit_agent_event("model.switch", {
                         "from_model": previous.get("id") or model_id,
                         "to_model": provider.get("id") or api_model,
@@ -17301,8 +18230,16 @@ async def run_stream(
                 ):
                     previous = provider_chain[provider_cursor]
                     provider_cursor += 1
-                    provider = provider_chain[provider_cursor]
+                    provider, fallback_metadata_audit = (
+                        await resolve_provider_runtime_metadata(
+                            provider_chain[provider_cursor]
+                        )
+                    )
+                    provider_chain[provider_cursor] = provider
                     base_url, api_model, api_key, protocol, headers = apply_provider(provider)
+                    compressor.set_context_length(
+                        provider.get("context_length")
+                    )
                     tool_context = replace(
                         tool_context,
                         model_id=str(provider.get("id") or api_model),
@@ -17310,6 +18247,15 @@ async def run_stream(
                         fallback_configs=tuple(provider_chain[provider_cursor + 1:]),
                         enabled_tools=tuple(tools),
                     )
+                    for debug_evt in await debug_stream_event(
+                        "provider.metadata.resolved",
+                        {
+                            **fallback_metadata_audit,
+                            "resolution_boundary": "provider_switch",
+                            "provider_index": provider_cursor,
+                        },
+                    ):
+                        yield debug_evt
                     yield await emit_agent_event("model.switch", {
                         "from_model": previous.get("id") or model_id,
                         "to_model": provider.get("id") or api_model,
@@ -18029,14 +18975,21 @@ async def run_stream(
                 **run_usage,
                 "model": provider.get("id") or api_model,
             }
-            yield await emit_agent_event("run.completed", {
-                "finish_reason": "stop",
-                "terminal_reason": (
+            msg = (
+                "The single delegated output-contract correction emitted an "
+                "invalid structured tool-call batch. Its buffered value was "
+                "discarded and no tool was dispatched."
+            )
+            yield await emit_agent_event("run.failed", {
+                "error": msg,
+                "finish_reason": (
                     "delegated_output_contract_repair_protocol_invalid"
                 ),
+                "failure_class": "agent_contract_noncompliance",
+                "retryable": True,
                 "usage": run_usage,
             })
-            yield {"type": "done", "finish_reason": "stop"}
+            yield {"type": "error", "msg": msg}
             return
 
         if (
@@ -18520,6 +19473,18 @@ async def run_stream(
                     repair_unavailable_reason = "iteration_budget_exhausted"
                 elif not tool_schemas or not iteration_exposed_tools:
                     repair_unavailable_reason = "no_closed_tool_schema"
+                elif (
+                    tool_stream_recovery_count
+                    >= _MAX_TOOL_STREAM_RUN_RECOVERIES
+                ):
+                    repair_unavailable_reason = "run_recovery_limit_exhausted"
+                elif (
+                    tool_stream_consecutive_no_progress_recoveries + 1
+                    > _MAX_TOOL_STREAM_CONSECUTIVE_NO_PROGRESS_RECOVERIES
+                ):
+                    repair_unavailable_reason = (
+                        "consecutive_no_progress_limit_exhausted"
+                    )
 
                 if not repair_unavailable_reason:
                     repair_schema_tool_names = {
@@ -18543,6 +19508,8 @@ async def run_stream(
                             repair_requested_max_tokens,
                             _DELEGATE_BOUNDED_CAPABILITY_CALL_MAX_TOKENS,
                         )
+                    tool_stream_recovery_count += 1
+                    tool_stream_consecutive_no_progress_recoveries += 1
                     tool_stream_continuation_repair_attempted = True
                     tool_stream_continuation_repair_episode_count += 1
                     pending_tool_stream_continuation_repair = {
@@ -18598,6 +19565,14 @@ async def run_stream(
                         "max_repairs": 1,
                         "repair_episode": (
                             tool_stream_continuation_repair_episode_count
+                        ),
+                        "run_recovery_count": tool_stream_recovery_count,
+                        "max_run_recoveries": _MAX_TOOL_STREAM_RUN_RECOVERIES,
+                        "consecutive_no_progress_recoveries": (
+                            tool_stream_consecutive_no_progress_recoveries
+                        ),
+                        "max_consecutive_no_progress_recoveries": (
+                            _MAX_TOOL_STREAM_CONSECUTIVE_NO_PROGRESS_RECOVERIES
                         ),
                         "remaining_iterations": budget.remaining,
                         "assistant_anchor_chars": len(full_content),
@@ -18882,6 +19857,7 @@ async def run_stream(
                     ),
                 )
             )
+            fallback_salvage_accepted = False
             if fallback_assembly is None or not fallback_assembly.ok:
                 failed_debug = {
                     "attempt": 1,
@@ -18915,6 +19891,7 @@ async def run_stream(
                     else None
                 )
                 if fallback_salvage is not None and fallback_salvage.calls:
+                    fallback_salvage_accepted = True
                     tool_stream_recovery_count += 1
                     for debug_evt in await debug_stream_event(
                         "tool.stream.salvage.reviewed",
@@ -19096,30 +20073,56 @@ async def run_stream(
                     yield {"type": "error", "msg": msg}
                     return
 
-            # Ignore fallback content completely; retain any content already
-            # emitted by the original stream and replace only its corrupt calls.
-            tool_call_assembly = fallback_assembly
-            finish_reason = "tool_calls"
-            fallback_argument_chars = int(
-                fallback_assembly.debug.get("argument_chars_total", 0) or 0
-            )
-            fallback_effective_usage = _update_compressor_usage(
-                compressor,
-                fallback_usage,
-                estimated_input_tokens=estimated_input_tokens,
-                estimated_output_tokens=max(1, fallback_argument_chars // 4),
-            )
-            run_usage["input_tokens"] += fallback_effective_usage["prompt_tokens"]
-            run_usage["output_tokens"] += fallback_effective_usage["completion_tokens"]
-            run_usage["total_tokens"] += fallback_effective_usage["total_tokens"]
-            for debug_evt in await debug_stream_event(
-                "tool.stream.fallback.completed",
-                {
-                    "attempt": 1,
-                    **fallback_debug,
-                },
-            ):
-                yield debug_evt
+            if fallback_assembly is not None:
+                fallback_argument_chars = int(
+                    fallback_assembly.debug.get(
+                        "argument_chars_total", 0
+                    ) or 0
+                )
+                fallback_effective_usage = _update_compressor_usage(
+                    compressor,
+                    fallback_usage,
+                    estimated_input_tokens=estimated_input_tokens,
+                    estimated_output_tokens=max(
+                        1, fallback_argument_chars // 4
+                    ),
+                )
+                run_usage["input_tokens"] += fallback_effective_usage[
+                    "prompt_tokens"
+                ]
+                run_usage["output_tokens"] += fallback_effective_usage[
+                    "completion_tokens"
+                ]
+                run_usage["total_tokens"] += fallback_effective_usage[
+                    "total_tokens"
+                ]
+
+            if fallback_assembly is not None and fallback_assembly.ok:
+                # Ignore fallback content completely; retain any content
+                # already emitted by the original stream and replace only its
+                # corrupt calls with the atomically valid fallback batch.
+                tool_call_assembly = fallback_assembly
+                finish_reason = "tool_calls"
+                for debug_evt in await debug_stream_event(
+                    "tool.stream.fallback.completed",
+                    {
+                        "attempt": 1,
+                        **fallback_debug,
+                    },
+                ):
+                    yield debug_evt
+            elif fallback_salvage_accepted:
+                # The invalid fallback assembly was deliberately replaced by
+                # the narrower, preflighted salvage assembly above.  Do not
+                # overwrite it with the original corrupt batch.
+                for debug_evt in await debug_stream_event(
+                    "tool.stream.fallback.salvaged",
+                    {
+                        "attempt": 1,
+                        **fallback_debug,
+                    },
+                ):
+                    yield debug_evt
 
         if tool_call_assembly is not None and tool_call_assembly.ok:
             deduped_calls, duplicate_read_only_call_count = (
@@ -19224,6 +20227,7 @@ async def run_stream(
                     exposed_tool_names=iteration_exposed_tools,
                     tool_context=tool_context,
                     workflow_policy=iteration_workflow_policy,
+                    max_safe_calls=1,
                 )
                 if repair_mismatch_salvage.calls:
                     tool_stream_recovery_count += 1
@@ -19755,6 +20759,8 @@ async def run_stream(
             yield await emit_agent_event("run.failed", {
                 "error": msg,
                 "finish_reason": "delegated_output_contract_repair_failed",
+                "failure_class": "agent_contract_noncompliance",
+                "retryable": True,
                 **failed_debug,
             })
             yield {"type": "error", "msg": msg}
@@ -20256,6 +21262,10 @@ async def run_stream(
                     if transactional_output_contract_recovery
                     else "delegated_visible_length_recovery_failed"
                 ),
+                **({
+                    "failure_class": "agent_contract_noncompliance",
+                    "retryable": True,
+                } if transactional_output_contract_recovery else {}),
                 **failed_debug,
             })
             yield {"type": "error", "msg": msg}
@@ -20763,13 +21773,14 @@ async def run_stream(
                 pending_delegate_output_contract_repair = True
                 previous_length_content = ""
                 forced_workflow_policy = None
-                conversation.append({
-                    "role": "assistant",
-                    "content": (
-                        "[The preceding delegated draft was rejected by the "
-                        "harness output-contract audit and was discarded.]"
-                    ),
-                })
+                clean_restart_debug = (
+                    _reset_delegated_output_contract_history(
+                        conversation,
+                        base_message_fingerprints=(
+                            delegated_output_contract_base_fingerprints
+                        ),
+                    )
+                )
                 footer_instruction = ""
                 if delegated_required_result_fields:
                     footer_instruction = (
@@ -20788,10 +21799,17 @@ async def run_stream(
                     "role": "user",
                     "content": (
                         "This is the single bounded delegated output-contract "
-                        "correction. All tools are closed. Regenerate the complete "
+                        "correction and a transactional clean restart. All tools "
+                        "are closed. Regenerate the complete "
                         "substantive result from the original task, preloaded "
                         "resources, and existing structured tool results already "
                         "in context. Do not copy or discuss the rejected draft. "
+                        "Be concise enough to finish in one provider response; "
+                        "target no more than 16,000 Unicode characters while "
+                        "retaining every exact required field, evidence identifier, "
+                        "provenance reference, conflict, and explicit gap. Prefer "
+                        "structured evidence references over repeating long source "
+                        "bodies. "
                         "Preserve concrete evidence and provenance; mark every "
                         "unavailable fact as an explicit WARN/degraded gap instead "
                         "of inventing it. Never emit XML, `<tool_call>`, function-"
@@ -20825,6 +21843,9 @@ async def run_stream(
                     "repair_count": 1,
                     "max_repairs": 1,
                     "tools_exposed_next_turn": 0,
+                    "transactional_clean_restart": True,
+                    "target_max_unicode_chars": 16_000,
+                    **clean_restart_debug,
                 }
                 for debug_evt in await debug_stream_event(
                     "gate.continuation",
@@ -20927,7 +21948,7 @@ async def run_stream(
                             "delegated_output_contract_repair_continuation_invalid"
                         ),
                         "failure_class": "agent_contract_noncompliance",
-                        "retryable": False,
+                        "retryable": True,
                         **transactional_failure_debug,
                     })
                     yield {"type": "error", "msg": msg}
@@ -22244,6 +23265,9 @@ async def run_stream(
                             allowed_skill_resources=(),
                             selected_skill_browse_roots=(),
                             allowed_skill_scripts=(),
+                            process_only_skill_scripts=(),
+                            allowed_skill_script_authorities=(),
+                            allowed_skill_package_digests=(),
                             allowed_skill_commands=(),
                             allowed_skill_http_prefixes=(),
                             allowed_skill_http_post_prefixes=(),
@@ -22507,7 +23531,10 @@ async def run_stream(
                             result = await dispatch(
                                 display_tool_name,
                                 native_preflight.args,
-                                context=tool_context,
+                                context=_tool_dispatch_context(
+                                    tool_context,
+                                    tool_call_id,
+                                ),
                             )
                     elif display_tool_name.startswith("mcp_"):
                         from tools.mcp_client import dispatch_mcp_tool
@@ -22550,7 +23577,10 @@ async def run_stream(
                             result = await dispatch(
                                 display_tool_name,
                                 native_preflight.args,
-                                context=tool_context,
+                                context=_tool_dispatch_context(
+                                    tool_context,
+                                    tool_call_id,
+                                ),
                             )
                 elif tc.name in ("mcp_server_list", "mcp_server_status"):
                     native_preflight = preflight_native_tool_call(
@@ -22573,7 +23603,10 @@ async def run_stream(
                         result = await dispatch(
                             tc.name,
                             native_preflight.args,
-                            context=tool_context,
+                            context=_tool_dispatch_context(
+                                tool_context,
+                                tool_call_id,
+                            ),
                         )
                 elif tc.name.startswith("mcp_"):
                     from tools.mcp_client import dispatch_mcp_tool
@@ -22616,7 +23649,10 @@ async def run_stream(
                         result = await dispatch(
                             tc.name,
                             native_preflight.args,
-                            context=tool_context,
+                            context=_tool_dispatch_context(
+                                tool_context,
+                                tool_call_id,
+                            ),
                         )
                 if (
                     actual_dispatch_attempted
@@ -23116,6 +24152,16 @@ async def run_stream(
                     )
                     if initial_guidance:
                         boundary_guidance_messages.append(initial_guidance)
+                    if skill_resource_complete:
+                        amendment_guidance = (
+                            amend_standard_capability_catalog_after_reference(
+                                str(executed_args.get("name") or "")
+                            )
+                        )
+                        if amendment_guidance:
+                            boundary_guidance_messages.append(
+                                amendment_guidance
+                            )
                     for intent_skill_name in sorted(
                         run_state.skill_completed_intent
                         - completed_intent_before
@@ -26014,7 +27060,8 @@ def _artifact_payloads_from_tool_result(tool_name: str, raw: str) -> list[dict[s
             payload["sha256"] = sha256
         return [payload]
     if tool_name not in {
-        "execute_code", "run_skill_python", "run_skill_script",
+        "execute_code", "run_skill_process", "run_skill_python",
+        "run_skill_script",
         "run_declared_command",
     }:
         return []
@@ -28688,12 +29735,184 @@ class SkillExecutionExposure:
     selected_skills: tuple[str, ...]
     allowed_skill_resources: tuple[tuple[str, str], ...]
     allowed_skill_scripts: tuple[tuple[str, str, str], ...]
+    # Exact browser-profile entrypoints are valid process capabilities but
+    # are never valid one-shot/base-executor capabilities.
+    process_only_skill_scripts: tuple[tuple[str, str, str], ...]
+    allowed_skill_script_authorities: tuple[
+        tuple[str, str, str, str, str, str], ...
+    ]
+    allowed_skill_package_digests: tuple[tuple[str, str], ...]
     allowed_skill_commands: tuple[
         tuple[str, str, str, tuple[str, ...]], ...
     ]
     allowed_skill_http_prefixes: tuple[tuple[str, str], ...] = ()
     allowed_skill_http_post_prefixes: tuple[tuple[str, str], ...] = ()
     mcp_exact_names: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _ProfiledSkillScriptGrants:
+    scripts: tuple[tuple[str, str, str], ...] = ()
+    process_only_scripts: tuple[tuple[str, str, str], ...] = ()
+    authorities: tuple[
+        tuple[str, str, str, str, str, str], ...
+    ] = ()
+    package_digests: tuple[tuple[str, str], ...] = ()
+    errors: tuple[str, ...] = ()
+
+
+def _profiled_skill_script_grants(
+    skill_name: str,
+    loaded_package: dict[str, Any],
+    runnable_scripts: tuple[tuple[str, str], ...],
+    *,
+    selected_paths: set[str] | None = None,
+) -> _ProfiledSkillScriptGrants:
+    """Compile exact snapshot/profile/package authority for runnable scripts."""
+
+    from tools.isolated_skill_executor import snapshot_skill_package
+    from tools.skill_runtime_profile import (
+        BROWSER_RUNTIME_PROFILE,
+        select_skill_runtime_profile,
+    )
+
+    workflow = loaded_package.get("workflow_contract")
+    if not isinstance(workflow, dict):
+        workflow = {}
+    authorized_paths = {
+        str(path)
+        for path in workflow.get("script_candidates") or []
+        if isinstance(path, str) and path
+    }
+    if selected_paths is not None:
+        authorized_paths.intersection_update(selected_paths)
+    candidates = [
+        (str(path), str(digest))
+        for path, digest in runnable_scripts
+        if str(path) in authorized_paths and str(digest)
+    ]
+    if not candidates:
+        return _ProfiledSkillScriptGrants()
+
+    skill_dir = str(loaded_package.get("skill_dir") or "")
+    try:
+        snapshot = snapshot_skill_package(Path(skill_dir))
+        root_digest = snapshot.file_sha256("SKILL.md")
+    except (OSError, RuntimeError, ValueError, KeyError) as exc:
+        return _ProfiledSkillScriptGrants(errors=(
+            "skill_snapshot_unavailable:"
+            + str(getattr(exc, "code", type(exc).__name__)),
+        ))
+    manifest = loaded_package.get("runtime_profile_manifest")
+    if not isinstance(manifest, dict):
+        manifest = workflow.get("_chatds_runtime_profile_manifest")
+    loaded_root_digest = str(
+        loaded_package.get("skill_md_sha256") or ""
+    )
+    if (
+        loaded_root_digest != root_digest
+        or not isinstance(manifest, dict)
+        or manifest.get("package_sha256") != snapshot.sha256
+    ):
+        return _ProfiledSkillScriptGrants(errors=(
+            "loaded_skill_snapshot_authority_mismatch",
+        ))
+    manifest_rows = {
+        str(row.get("entrypoint") or ""): row
+        for row in manifest.get("scripts") or []
+        if isinstance(row, dict) and str(row.get("entrypoint") or "")
+    }
+
+    authority = workflow.get("resource_authority")
+    reasons_by_path = (
+        authority.get("reasons")
+        if isinstance(authority, dict) else {}
+    )
+    if not isinstance(reasons_by_path, dict):
+        reasons_by_path = {}
+
+    scripts: list[tuple[str, str, str]] = []
+    process_only: list[tuple[str, str, str]] = []
+    authorities: list[tuple[str, str, str, str, str, str]] = []
+    errors: list[str] = []
+    for path, inventory_digest in candidates:
+        try:
+            selection = select_skill_runtime_profile(snapshot, path)
+            actual_digest = snapshot.file_sha256(path)
+        except (RuntimeError, ValueError, KeyError) as exc:
+            errors.append(
+                f"{path}:"
+                + str(getattr(exc, "code", type(exc).__name__))
+            )
+            continue
+        if (
+            selection.package_sha256 != snapshot.sha256
+            or selection.script_sha256 != actual_digest
+            or actual_digest != inventory_digest
+        ):
+            errors.append(f"{path}:skill_script_authority_mismatch")
+            continue
+        manifest_row = manifest_rows.get(path)
+        if (
+            not isinstance(manifest_row, dict)
+            or manifest_row.get("package_sha256") != snapshot.sha256
+            or manifest_row.get("script_sha256") != actual_digest
+            or manifest_row.get("runtime_profile")
+            != selection.runtime_profile
+            or manifest_row.get("required_cwd")
+            != selection.required_cwd
+        ):
+            errors.append(
+                f"{path}:skill_runtime_profile_authority_mismatch"
+            )
+            continue
+
+        declaring_resource = "SKILL.md"
+        path_reasons = reasons_by_path.get(path)
+        if isinstance(path_reasons, list):
+            declared_by = [
+                str(reason).split(":", 1)[1]
+                for reason in path_reasons
+                if str(reason).startswith("declared_by:")
+                and ":" in str(reason)
+            ]
+            if declared_by:
+                declaring_resource = declared_by[0]
+        try:
+            declaring_digest = snapshot.file_sha256(
+                declaring_resource
+            )
+        except KeyError:
+            errors.append(
+                f"{path}:skill_script_declaring_authority_unavailable"
+            )
+            continue
+
+        triple = (skill_name, path, actual_digest)
+        scripts.append(triple)
+        if (
+            selection.runtime_profile == BROWSER_RUNTIME_PROFILE
+            or selection.required_cwd is not None
+        ):
+            process_only.append(triple)
+        authorities.append((
+            skill_name,
+            root_digest,
+            declaring_resource,
+            declaring_digest,
+            path,
+            actual_digest,
+        ))
+    return _ProfiledSkillScriptGrants(
+        scripts=tuple(dict.fromkeys(scripts)),
+        process_only_scripts=tuple(dict.fromkeys(process_only)),
+        authorities=tuple(dict.fromkeys(authorities)),
+        package_digests=(
+            ((skill_name, snapshot.sha256),)
+            if scripts else ()
+        ),
+        errors=tuple(dict.fromkeys(errors)),
+    )
 
 
 @dataclass(frozen=True)
@@ -28735,6 +29954,19 @@ class SemanticSessionSkillSelection:
 
 _MAX_STANDARD_SKILL_CAPABILITY_BODY_CHARS = 128_000
 _MAX_STANDARD_SKILL_DIRECTIVE_LINES = 512
+_MAX_STANDARD_SKILL_NATIVE_CANDIDATES = 24
+# This small, backend-issued family is language neutral.  It is merely a
+# finite set of candidates the model may select; URL/DNS, workspace, and
+# dispatch policy still apply.  Natural-language browser regexes may rank or
+# explain these entries, but never create or remove their authority.
+_STANDARD_SKILL_STABLE_NATIVE_TOOLS = (
+    "read_file",
+    "search_files",
+    "web_search",
+    "web_extract",
+    "browser_navigate",
+    "browser_snapshot",
+)
 _STANDARD_SKILL_BODY_CAPABILITY_TOOLS = frozenset({
     "browser_back",
     "browser_click",
@@ -28774,8 +30006,25 @@ _STANDARD_SKILL_DIRECTIVE_PREFIX_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
-
-
+_STANDARD_SKILL_BROWSER_RUNTIME_RE = re.compile(
+    r"(?:"
+    r"\b(?:playwright|selenium|puppeteer|webdriver|chrome|chromium|"
+    r"chrome\s+devtools\s+protocol|cdp|browser(?:\s+(?:session|context|page))?)\b|"
+    r"(?:浏览器|浏览会话|浏览器会话|浏览器上下文|可见\s*chrome|"
+    r"无头\s*chrome|页面渲染|渲染后(?:的)?(?:网页|网站|页面))"
+    r")",
+    re.IGNORECASE,
+)
+_STANDARD_SKILL_BROWSER_EVIDENCE_RE = re.compile(
+    r"(?:\bdom\b|screenshots?|screen\s+captures?|viewport|"
+    r"页面截图|网页截图|屏幕截图|视口截图|页面\s*dom|网页\s*dom)",
+    re.IGNORECASE,
+)
+_STANDARD_SKILL_BROWSER_PAGE_RE = re.compile(
+    r"(?:\b(?:browser|web\s*page|website|rendered\s+page|page\s+state)\b|"
+    r"浏览器|网页|网站|渲染(?:后)?页面|页面状态)",
+    re.IGNORECASE,
+)
 def _standard_skill_directive_text(content: Any) -> str:
     """Return executable-looking directives from canonical SKILL.md only."""
     if not isinstance(content, str) or not content.strip():
@@ -28827,6 +30076,26 @@ def _standard_skill_directive_text(content: Any) -> str:
     return "\n".join(directives)
 
 
+def _standard_skill_has_browser_runtime_intent(directives: str) -> bool:
+    """Return a presentation hint for ordering the stable browser family.
+
+    This classifier never adds/removes candidates and is not consulted by
+    dispatch authorization.  It may therefore improve English/Chinese prompt
+    ordering without making those languages a security or compatibility
+    boundary.
+    """
+
+    normalized = re.sub(r"\s+", " ", str(directives or "")).strip()
+    if not normalized:
+        return False
+    if _STANDARD_SKILL_BROWSER_RUNTIME_RE.search(normalized):
+        return True
+    return bool(
+        _STANDARD_SKILL_BROWSER_EVIDENCE_RE.search(normalized)
+        and _STANDARD_SKILL_BROWSER_PAGE_RE.search(normalized)
+    )
+
+
 def _standard_skill_body_capability_plan(
     content: Any,
     available_tools: list[str] | tuple[str, ...] | set[str],
@@ -28842,7 +30111,10 @@ def _standard_skill_body_capability_plan(
     inferred = _direct_chat_tool_exposure(directives, available_order, set())
     requested = {
         name for name in inferred.tools
-        if name in _STANDARD_SKILL_BODY_CAPABILITY_TOOLS
+        if (
+            name in _STANDARD_SKILL_BODY_CAPABILITY_TOOLS
+            and not name.startswith("browser_")
+        )
     }
     required_groups = [
         tuple(name for name in group if name in requested)
@@ -28850,6 +30122,14 @@ def _standard_skill_body_capability_plan(
     ]
     required_groups = [group for group in required_groups if group]
     missing = list(inferred.missing_requirements)
+
+    browser_runtime_intent = _standard_skill_has_browser_runtime_intent(
+        directives
+    )
+    # Browser regexes are presentation hints only.  Standard free-form Skills
+    # receive the small stable browser family from the typed catalog, while a
+    # structured Skill must use its compiler-owned environment declaration.
+    # Neither path gains authority from English/Chinese vocabulary.
 
     # Skill procedures commonly say "verify with code execution", whereas
     # direct user-intent detection deliberately expects an action before the
@@ -28882,6 +30162,10 @@ def _standard_skill_body_capability_plan(
     if code_verification:
         reasons = tuple(dict.fromkeys(
             [*reasons, "standard_skill_body:code_verification"]
+        ))
+    if browser_runtime_intent:
+        reasons = tuple(dict.fromkeys(
+            [*reasons, "standard_skill_body:browser_runtime"]
         ))
     return DirectToolExposure(
         tools=ordered,
@@ -28930,7 +30214,12 @@ def _standard_skill_catalog_native_tools(
         loaded_package.get("content"),
         available_order,
     )
-    explicitly_supported = set(inferred.tools)
+    explicitly_supported = {
+        name
+        for name in inferred.tools
+        if not name.startswith("browser_")
+    }
+    exact_tool_mentions: set[str] = set()
     for name in available_order:
         if re.search(
             rf"(?<![\w-]){re.escape(name)}(?![\w-])",
@@ -28938,23 +30227,57 @@ def _standard_skill_catalog_native_tools(
             re.IGNORECASE,
         ):
             explicitly_supported.add(name)
+            exact_tool_mentions.add(name)
 
     selected: list[str] = []
     metadata_by_tool: dict[str, dict[str, Any]] = {}
+    stable = {
+        name for name in _STANDARD_SKILL_STABLE_NATIVE_TOOLS
+        if name in available_order
+    }
     for name in available_order:
         metadata = dict(get_metadata(name) or {})
         metadata_by_tool[name] = metadata
+        # Stateful browser actions require an exact backend tool declaration.
+        # "click this page" translations are useful model hints but do not
+        # grant an interaction surface.
+        if name.startswith("browser_") and name not in stable:
+            if name not in exact_tool_mentions:
+                continue
+        if name in stable:
+            selected.append(name)
+            continue
         requires_directive = bool(
             name == "execute_code"
             or metadata.get("destructive")
             or metadata.get("mutates_workspace")
             or metadata.get("mutates_global_state")
+            or metadata.get("external_interaction")
             or name in {"browser_click", "browser_type"}
         )
         if requires_directive and name not in explicitly_supported:
             continue
+        # Unknown/ambient tools are not swept into a standard Skill merely
+        # because their registry metadata omitted an impact bit.
+        if not metadata and name not in explicitly_supported:
+            continue
         selected.append(name)
-    return selected, metadata_by_tool
+    stable_order = [
+        name for name in _STANDARD_SKILL_STABLE_NATIVE_TOOLS
+        if name in selected
+    ]
+    non_stable = [name for name in selected if name not in stable]
+    # Browser language detection changes presentation order only.
+    if _standard_skill_has_browser_runtime_intent(directives):
+        stable_browser = [
+            name for name in stable_order if name.startswith("browser_")
+        ]
+        stable_order = [
+            *stable_browser,
+            *(name for name in stable_order if name not in stable_browser),
+        ]
+    selected = [*stable_order, *non_stable]
+    return selected[:_MAX_STANDARD_SKILL_NATIVE_CANDIDATES], metadata_by_tool
 
 
 def _standard_skill_directives_reference_path(directives: str, path: str) -> bool:
@@ -28982,24 +30305,68 @@ def _standard_skill_directives_reference_path(directives: str, path: str) -> boo
 def _standard_skill_runnable_scripts(
     loaded_package: dict[str, Any],
     runnable_scripts: tuple[tuple[str, str], ...],
+    authority_documents: tuple[dict[str, Any], ...] = (),
 ) -> tuple[tuple[str, str], ...]:
-    directives = _standard_skill_directive_text(loaded_package.get("content"))
-    if not directives:
+    directives = str(loaded_package.get("content") or "")
+    authority_contents = [
+        str(document.get("content") or "")
+        for document in authority_documents
+        if isinstance(document, dict)
+    ]
+    if not directives and not any(authority_contents):
         return ()
     result: list[tuple[str, str]] = []
-    remote_markers = re.compile(
-        r"(?:https?://|\b(?:browser|browse|website|web\s*page|remote|network|online)\b|"
-        r"浏览器|网页|网站|远程|联网|网络)",
-        re.IGNORECASE,
-    )
     for path, digest in runnable_scripts:
-        if not _standard_skill_directives_reference_path(directives, path):
-            continue
-        path_lines = [line for line in directives.splitlines() if path in line]
-        if any(remote_markers.search(line) for line in path_lines):
+        if not (
+            _standard_skill_directives_reference_path(directives, path)
+            or any(
+                _standard_skill_directives_reference_path(content, path)
+                for content in authority_contents
+            )
+        ):
             continue
         result.append((path, digest))
     return tuple(result)
+
+
+def _standard_skill_unavailable_script_capabilities(
+    loaded_package: dict[str, Any],
+    runnable_scripts: tuple[tuple[str, str], ...],
+    filtered_runnable_scripts: tuple[tuple[str, str], ...],
+    authority_documents: tuple[dict[str, Any], ...] = (),
+) -> list[dict[str, str]]:
+    """Explain exact referenced scripts without a registered runtime bridge."""
+
+    directives = str(loaded_package.get("content") or "")
+    authority_contents = [
+        str(document.get("content") or "")
+        for document in authority_documents
+        if isinstance(document, dict)
+    ]
+    retained = {path for path, _digest in filtered_runnable_scripts}
+    unavailable: list[dict[str, str]] = []
+    for path, _digest in runnable_scripts:
+        if (
+            path in retained
+            or not (
+                _standard_skill_directives_reference_path(directives, path)
+                or any(
+                    _standard_skill_directives_reference_path(content, path)
+                    for content in authority_contents
+                )
+            )
+        ):
+            continue
+        unavailable.append({
+            "kind": "skill_script",
+            "resource_path": path,
+            "reason": (
+                "The referenced script has no backend-issued compatible "
+                "runtime candidate in this run. Do not probe or install "
+                "runtimes with execute_code."
+            ),
+        })
+    return unavailable[:64]
 
 
 def _build_standard_skill_capability_catalog(
@@ -29007,6 +30374,7 @@ def _build_standard_skill_capability_catalog(
     loaded_package: dict[str, Any],
     available_tools: list[str] | tuple[str, ...] | set[str],
     runnable_scripts: tuple[tuple[str, str], ...],
+    authority_documents: tuple[dict[str, Any], ...] = (),
 ) -> dict[str, Any]:
     """Compile current exact candidates with runtime-owned policy metadata."""
 
@@ -29015,6 +30383,21 @@ def _build_standard_skill_capability_catalog(
         compile_loaded_skill_http_grants,
         compile_loaded_skill_http_post_grants,
     )
+    from tools.isolated_skill_executor import snapshot_skill_package
+    from tools.skill_runtime_profile import select_skill_runtime_profile
+
+    skill_package_sha256 = ""
+    skill_snapshot = None
+    package_root_value = loaded_package.get("skill_dir")
+    if isinstance(package_root_value, str) and package_root_value:
+        try:
+            skill_snapshot = snapshot_skill_package(Path(package_root_value))
+            skill_package_sha256 = skill_snapshot.sha256
+        except (OSError, RuntimeError, ValueError):
+            # A malformed, unsafe, oversized, or concurrently changing
+            # package simply cannot expose the persistent process runner.
+            # Other exact candidates remain independently eligible.
+            skill_package_sha256 = ""
 
     workflow = loaded_package.get("workflow_contract")
     if not isinstance(workflow, dict):
@@ -29038,26 +30421,151 @@ def _build_standard_skill_capability_catalog(
     filtered_runnable_scripts = _standard_skill_runnable_scripts(
         loaded_package,
         runnable_scripts,
+        authority_documents,
     )
+    script_runtime_profiles: dict[str, dict[str, Any]] = {}
+    profile_unavailable: list[dict[str, str]] = []
+    profiled_runnable_scripts: list[tuple[str, str]] = []
+    for path, digest in filtered_runnable_scripts:
+        if skill_snapshot is None:
+            profile_unavailable.append({
+                "kind": "skill_script",
+                "resource_path": path,
+                "reason": (
+                    "The exact immutable Skill package could not be captured "
+                    "for runtime-profile selection."
+                ),
+            })
+            continue
+        try:
+            selection = select_skill_runtime_profile(
+                skill_snapshot,
+                path,
+            )
+        except (RuntimeError, ValueError) as exc:
+            profile_unavailable.append({
+                "kind": "skill_script",
+                "resource_path": path,
+                "reason": (
+                    "The exact immutable entrypoint has no supported runtime "
+                    "profile: "
+                    + str(getattr(exc, "code", type(exc).__name__))
+                ),
+            })
+            continue
+        if (
+            selection.package_sha256 != skill_package_sha256
+            or selection.script_sha256 != digest
+        ):
+            profile_unavailable.append({
+                "kind": "skill_script",
+                "resource_path": path,
+                "reason": (
+                    "The runtime-profile snapshot does not match the current "
+                    "content-addressed script inventory."
+                ),
+            })
+            continue
+        script_runtime_profiles[path] = {
+            "runtime_profile": selection.runtime_profile,
+            "package_sha256": selection.package_sha256,
+            "script_sha256": selection.script_sha256,
+            "runtime_requirements": list(
+                selection.runtime_requirements
+            ),
+            "runtime_commands": list(selection.runtime_commands),
+            "runtime_node_packages": list(
+                selection.runtime_node_packages
+            ),
+            "reachable_sources": list(selection.reachable_sources),
+            "required_cwd": selection.required_cwd,
+        }
+        profiled_runnable_scripts.append((path, digest))
+    filtered_runnable_scripts = profiled_runnable_scripts
+    if filtered_runnable_scripts:
+        candidate_tools = list(dict.fromkeys([
+            *candidate_tools,
+            *(
+                name
+                for name in (
+                    "run_skill_process",
+                    "run_skill_script",
+                    "run_skill_python",
+                )
+                if name in set(available_tools)
+            ),
+        ]))
     if explicitly_empty:
         candidate_tools = [
             name for name in candidate_tools
             if name in {"skill_view", CAPABILITY_PLAN_TOOL_NAME}
         ]
+    runtime_runnable_scripts = tuple(
+        (path, digest)
+        for path, digest in filtered_runnable_scripts
+        if (
+            "run_skill_process" in candidate_tools
+            or "run_skill_script" in candidate_tools
+            or (
+                "run_skill_python" in candidate_tools
+                and PurePosixPath(path).suffix.casefold() == ".py"
+            )
+        )
+    )
+    unavailable_script_capabilities = (
+        _standard_skill_unavailable_script_capabilities(
+            loaded_package,
+            runnable_scripts,
+            runtime_runnable_scripts,
+            authority_documents,
+        )
+    )
+    # Profile selection has the most precise, stable diagnostic (for example,
+    # a non-literal CommonJS dependency).  The generic "no compatible
+    # runtime" pass sees the same rejected entrypoint, so de-duplicate by
+    # resource while preserving the profile-specific reason.
+    deduplicated_unavailable: list[dict[str, str]] = []
+    seen_unavailable_paths: set[str] = set()
+    for item in [
+        *profile_unavailable,
+        *unavailable_script_capabilities,
+    ]:
+        resource_path = str(item.get("resource_path") or "")
+        if not resource_path or resource_path in seen_unavailable_paths:
+            continue
+        seen_unavailable_paths.add(resource_path)
+        deduplicated_unavailable.append(item)
+    unavailable_script_capabilities = deduplicated_unavailable[:64]
     exact_mcp_names = [
         str(selector).split("(", 1)[0].strip()
         for selector in environment.get("allowed_tools") or []
         if str(selector).strip().casefold().startswith("mcp_")
     ]
     commands = all_compiled_command_grants(loaded_package)
+    if not explicitly_empty:
+        candidate_tools = list(dict.fromkeys([
+            *candidate_tools,
+            *(
+                name for name in exact_mcp_names
+                if name in set(available_tools)
+            ),
+            *(
+                ["run_declared_command"]
+                if commands and "run_declared_command" in set(available_tools)
+                else []
+            ),
+        ]))
     preliminary = build_capability_catalog(
         skill_name=skill_name,
         loaded_package=loaded_package,
         available_tools=candidate_tools,
+        skill_package_sha256=skill_package_sha256,
         runnable_scripts=filtered_runnable_scripts,
         command_grants=commands,
         exact_mcp_names=exact_mcp_names,
         native_tool_metadata=native_tool_metadata,
+        authority_documents=authority_documents,
+        script_runtime_profiles=script_runtime_profiles,
     )
     referenced_paths = [
         str(candidate.get("resource_path") or "")
@@ -29076,17 +30584,156 @@ def _build_standard_skill_capability_catalog(
         loaded_package,
         ["SKILL.md", *referenced_paths],
     )
-    return build_capability_catalog(
+    if not explicitly_empty:
+        candidate_tools = list(dict.fromkeys([
+            *candidate_tools,
+            *(
+                ["skill_http_get"]
+                if http_prefixes and "skill_http_get" in set(available_tools)
+                else []
+            ),
+            *(
+                ["skill_http_post_json"]
+                if (
+                    http_post_prefixes
+                    and "skill_http_post_json" in set(available_tools)
+                )
+                else []
+            ),
+        ]))
+    catalog = build_capability_catalog(
         skill_name=skill_name,
         loaded_package=loaded_package,
         available_tools=candidate_tools,
+        skill_package_sha256=skill_package_sha256,
         runnable_scripts=filtered_runnable_scripts,
         command_grants=commands,
         http_prefixes=http_prefixes,
         http_post_prefixes=http_post_prefixes,
         exact_mcp_names=exact_mcp_names,
         native_tool_metadata=native_tool_metadata,
+        authority_documents=authority_documents,
+        script_runtime_profiles=script_runtime_profiles,
     )
+    catalog["unavailable_capabilities"] = unavailable_script_capabilities
+    if isinstance(package_root_value, str) and package_root_value:
+        # Runtime-only activation input. catalog_prompt_payload deliberately
+        # omits this host path, and it is excluded from catalog_sha256.
+        catalog["_runtime_skill_dir"] = str(
+            Path(package_root_value).resolve()
+        )
+    return catalog
+
+
+def _preflight_standard_skill_runtime_selection(
+    catalog: dict[str, Any],
+    selected_candidate_ids: list[str] | tuple[str, ...],
+) -> dict[str, Any]:
+    """Bind selected exact scripts to their profile-specific executor UDS."""
+
+    selected_ids = {
+        str(item) for item in selected_candidate_ids if str(item)
+    }
+    scripts = [
+        candidate
+        for candidate in catalog.get("candidates") or []
+        if (
+            isinstance(candidate, dict)
+            and candidate.get("kind") == "skill_script"
+            and str(candidate.get("id") or "") in selected_ids
+            and "run_skill_process" in {
+                str(name)
+                for name in candidate.get("tool_names") or []
+            }
+        )
+    ]
+    if not scripts:
+        return {
+            "valid": True,
+            "checked": False,
+            "entrypoints": [],
+        }
+    skill_dir = str(catalog.get("_runtime_skill_dir") or "")
+    if not skill_dir:
+        return {
+            "valid": False,
+            "checked": True,
+            "blockers": [{
+                "code": "skill_runtime_profile_authority_unavailable",
+                "items": [
+                    str(item.get("resource_path") or "")
+                    for item in scripts
+                ],
+            }],
+            "entrypoints": [],
+        }
+
+    from runtime.python_env import preflight_skill_entrypoint_runtime
+
+    reports: list[dict[str, Any]] = []
+    blockers: list[dict[str, Any]] = []
+    for candidate in scripts:
+        entrypoint = str(candidate.get("resource_path") or "")
+        report = preflight_skill_entrypoint_runtime(
+            skill_dir,
+            entrypoint,
+            expected_package_sha256=str(
+                candidate.get("package_sha256") or ""
+            ),
+            expected_script_sha256=str(candidate.get("sha256") or ""),
+            requirements=[
+                str(item)
+                for item in candidate.get("runtime_requirements") or []
+                if str(item)
+            ],
+            commands=[
+                str(item)
+                for item in candidate.get("runtime_commands") or []
+                if str(item)
+            ],
+        )
+        actual_profile = (
+            (report.get("entrypoint_runtime") or {}).get(
+                "runtime_profile"
+            )
+            if isinstance(report.get("entrypoint_runtime"), dict)
+            else None
+        )
+        expected_profile = str(
+            candidate.get("runtime_profile") or ""
+        )
+        if (
+            report.get("valid") is True
+            and (
+                actual_profile != expected_profile
+                or (
+                    report.get("entrypoint_runtime") or {}
+                ).get("required_cwd")
+                != candidate.get("required_cwd")
+            )
+        ):
+            report = {
+                **report,
+                "valid": False,
+                "error_code": "runtime_profile_mismatch",
+                "blockers": [{
+                    "code": "isolated_executor_runtime_profile_mismatch",
+                    "items": [expected_profile],
+                }],
+            }
+        reports.append({
+            "candidate_id": str(candidate.get("id") or ""),
+            "resource_path": entrypoint,
+            "runtime_profile": expected_profile,
+            "preflight": report,
+        })
+        blockers.extend(report.get("blockers") or [])
+    return {
+        "valid": not blockers,
+        "checked": True,
+        "blockers": blockers,
+        "entrypoints": reports,
+    }
 
 
 def _standard_skill_planning_exposure(
@@ -29108,6 +30755,9 @@ def _standard_skill_planning_exposure(
             (skill_name, "__manifest__"),
         ),
         allowed_skill_scripts=(),
+        process_only_skill_scripts=(),
+        allowed_skill_script_authorities=(),
+        allowed_skill_package_digests=(),
         allowed_skill_commands=(),
     )
 
@@ -30044,6 +31694,9 @@ def _bounded_skill_execution_exposure(
             selected_skills=(),
             allowed_skill_resources=(),
             allowed_skill_scripts=(),
+            process_only_skill_scripts=(),
+            allowed_skill_script_authorities=(),
+            allowed_skill_package_digests=(),
             allowed_skill_commands=(),
         )
 
@@ -30055,6 +31708,11 @@ def _bounded_skill_execution_exposure(
     mcp_exact_names: set[str] = set()
     allowed_resources: set[tuple[str, str]] = set()
     allowed_scripts: set[tuple[str, str, str]] = set()
+    process_only_scripts: set[tuple[str, str, str]] = set()
+    allowed_script_authorities: set[
+        tuple[str, str, str, str, str, str]
+    ] = set()
+    allowed_package_digests: set[tuple[str, str]] = set()
     allowed_commands: set[tuple[str, str, str, tuple[str, ...]]] = set()
     allowed_http_prefixes: set[tuple[str, str]] = set()
     allowed_http_post_prefixes: set[tuple[str, str]] = set()
@@ -30202,13 +31860,40 @@ def _bounded_skill_execution_exposure(
                     available_order,
                 )
             )
-            for relative_path, digest in package_scripts:
-                allowed_scripts.add((skill_name, relative_path, digest))
-            if package_scripts and "run_skill_script" in available:
+            selected_script_paths = (
+                set(_selected_plan_script_resources(workflow, plan))
+                if execution else None
+            )
+            profiled = _profiled_skill_script_grants(
+                skill_name,
+                loaded,
+                package_scripts,
+                selected_paths=selected_script_paths,
+            )
+            allowed_scripts.update(profiled.scripts)
+            process_only_scripts.update(
+                profiled.process_only_scripts
+            )
+            allowed_script_authorities.update(profiled.authorities)
+            allowed_package_digests.update(profiled.package_digests)
+            missing.extend(
+                f"skill_runtime_profile_unavailable:{skill_name}:{item}"
+                for item in profiled.errors
+            )
+            one_shot_scripts = set(profiled.scripts).difference(
+                profiled.process_only_scripts
+            )
+            if profiled.scripts and "run_skill_process" in available:
+                requested.add("run_skill_process")
+                execution_capabilities.add("run_skill_process")
+            if one_shot_scripts and "run_skill_script" in available:
                 requested.add("run_skill_script")
                 execution_capabilities.add("run_skill_script")
             if (
-                any(PurePosixPath(path).suffix.casefold() == ".py" for path, _ in package_scripts)
+                any(
+                    PurePosixPath(path).suffix.casefold() == ".py"
+                    for _name, path, _digest in one_shot_scripts
+                )
                 and "run_skill_python" in available
             ):
                 requested.add("run_skill_python")
@@ -30364,16 +32049,42 @@ def _bounded_skill_execution_exposure(
     # A worker that explicitly declares a capability Skill may need its exact
     # package runner. Make the runner schema available to that child only when
     # at least one such package has a content-addressed executable resource.
-    capability_scripts = [
-        (skill_name, path, digest)
-        for skill_name in declared_capability_skills
-        for path, digest in runnable_scripts.get(skill_name) or ()
-    ]
+    capability_scripts: list[tuple[str, str, str]] = []
+    capability_process_only: set[tuple[str, str, str]] = set()
+    for capability_skill in sorted(declared_capability_skills):
+        capability_loaded = loaded_packages.get(capability_skill)
+        if not isinstance(capability_loaded, dict):
+            continue
+        profiled = _profiled_skill_script_grants(
+            capability_skill,
+            capability_loaded,
+            tuple(runnable_scripts.get(capability_skill) or ()),
+        )
+        capability_scripts.extend(profiled.scripts)
+        capability_process_only.update(
+            profiled.process_only_scripts
+        )
+        allowed_script_authorities.update(profiled.authorities)
+        allowed_package_digests.update(profiled.package_digests)
+        missing.extend(
+            "capability_skill_runtime_profile_unavailable:"
+            f"{capability_skill}:{item}"
+            for item in profiled.errors
+        )
     allowed_scripts.update(capability_scripts)
-    if capability_scripts and "run_skill_script" in available:
+    process_only_scripts.update(capability_process_only)
+    one_shot_capability_scripts = set(capability_scripts).difference(
+        capability_process_only
+    )
+    if capability_scripts and "run_skill_process" in available:
+        requested.add("run_skill_process")
+    if one_shot_capability_scripts and "run_skill_script" in available:
         requested.add("run_skill_script")
     if (
-        any(PurePosixPath(path).suffix.casefold() == ".py" for _, path, _ in capability_scripts)
+        any(
+            PurePosixPath(path).suffix.casefold() == ".py"
+            for _, path, _ in one_shot_capability_scripts
+        )
         and "run_skill_python" in available
     ):
         requested.add("run_skill_python")
@@ -30416,6 +32127,9 @@ def _bounded_skill_execution_exposure(
         # external side effects.
         requested.intersection_update({"skills_list", "skill_view"})
         allowed_scripts.clear()
+        process_only_scripts.clear()
+        allowed_script_authorities.clear()
+        allowed_package_digests.clear()
         allowed_commands.clear()
         allowed_http_prefixes.clear()
         allowed_http_post_prefixes.clear()
@@ -30432,7 +32146,9 @@ def _bounded_skill_execution_exposure(
             body_groups.extend(body_plan.required_groups)
         body_required_groups = tuple(dict.fromkeys(body_groups))
 
-    runner_names = {"run_skill_script", "run_skill_python"} & requested
+    runner_names = {
+        "run_skill_process", "run_skill_script", "run_skill_python",
+    } & requested
     if runner_names and not allowed_scripts and not capability_scripts:
         requested.difference_update(runner_names)
         execution_capabilities.difference_update(runner_names)
@@ -30455,7 +32171,7 @@ def _bounded_skill_execution_exposure(
             set(selected),
         )
         protected_bridges = {
-            "run_skill_script", "run_skill_python",
+            "run_skill_process", "run_skill_script", "run_skill_python",
             "run_declared_command", "skill_http_get",
             "skill_http_post_json",
         }
@@ -30548,6 +32264,13 @@ def _bounded_skill_execution_exposure(
         selected_skills=selected,
         allowed_skill_resources=tuple(sorted(allowed_resources)),
         allowed_skill_scripts=tuple(sorted(allowed_scripts)),
+        process_only_skill_scripts=tuple(sorted(process_only_scripts)),
+        allowed_skill_script_authorities=tuple(
+            sorted(allowed_script_authorities)
+        ),
+        allowed_skill_package_digests=tuple(
+            sorted(allowed_package_digests)
+        ),
         allowed_skill_commands=tuple(sorted(allowed_commands)),
         allowed_skill_http_prefixes=tuple(sorted(allowed_http_prefixes)),
         allowed_skill_http_post_prefixes=tuple(

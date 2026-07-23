@@ -16,6 +16,9 @@ from skills.dependencies import (
     scan_skill_dependencies,
 )
 from skills.loader import load_skill_content
+from tools.skill_runtime_profile import (
+    compile_skill_runtime_profile_manifest,
+)
 
 
 class SkillActivationPrerequisiteTests(unittest.TestCase):
@@ -23,6 +26,104 @@ class SkillActivationPrerequisiteTests(unittest.TestCase):
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(textwrap.dedent(content).lstrip(), encoding="utf-8")
+
+    def test_selected_route_preflight_uses_only_its_exact_runtime_profile(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write(
+                root,
+                "SKILL.md",
+                "---\nname: mixed-runtime\n---\n",
+            )
+            self._write(
+                root,
+                "scripts/base.cjs",
+                'const readline = require("readline");\n',
+            )
+            self._write(
+                root,
+                "scripts/browser.cjs",
+                'const { chromium } = require("playwright");\n',
+            )
+            manifest = compile_skill_runtime_profile_manifest(
+                root,
+                ("scripts/base.cjs", "scripts/browser.cjs"),
+            )
+            workflow = {
+                "_chatds_runtime_profile_manifest": manifest,
+                "execution_contract": {
+                    "schema_version": 1,
+                    "environment_contract": {},
+                },
+            }
+            workers = {
+                "base": {
+                    "id": "base",
+                    "local_resources": ["scripts/base.cjs"],
+                },
+                "browser": {
+                    "id": "browser",
+                    "local_resources": ["scripts/browser.cjs"],
+                },
+            }
+
+            def fake_preflight(**kwargs):
+                profile = kwargs.get("runtime_profile")
+                return {
+                    "valid": True,
+                    "checked": True,
+                    "runtime_identity": {
+                        "platform": "linux",
+                        "runtime_profile": profile,
+                    },
+                    "blockers": [],
+                    "packages": {
+                        "requirements": kwargs.get("requirements") or [],
+                        "status": "satisfied",
+                    },
+                }
+
+            with patch(
+                "runtime.python_env.preflight_isolated_skill_runtime",
+                side_effect=fake_preflight,
+            ) as runtime_preflight:
+                base = _skill_activation_preflight(
+                    workflow,
+                    {
+                        "workers": workers,
+                        "required_workers": ["base"],
+                        "bootstrap_sources": [],
+                        "aggregation_steps": [],
+                    },
+                    {"run_skill_process"},
+                )
+                browser = _skill_activation_preflight(
+                    workflow,
+                    {
+                        "workers": workers,
+                        "required_workers": ["browser"],
+                        "bootstrap_sources": [],
+                        "aggregation_steps": [],
+                    },
+                    {"run_skill_process"},
+                )
+
+        self.assertTrue(base["valid"], base)
+        self.assertTrue(browser["valid"], browser)
+        self.assertEqual(
+            "base-v1",
+            runtime_preflight.call_args_list[0].kwargs[
+                "runtime_profile"
+            ],
+        )
+        self.assertEqual(
+            "browser-automation-v1",
+            runtime_preflight.call_args_list[1].kwargs[
+                "runtime_profile"
+            ],
+        )
 
     def test_compiler_preserves_standard_activation_fields_and_sources(self):
         with tempfile.TemporaryDirectory() as temp_dir:

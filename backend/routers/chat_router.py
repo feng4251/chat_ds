@@ -275,12 +275,20 @@ def _agent_event_terminal_status(
         if run_id is not None and str(event.get("run_id") or "") != run_id:
             continue
         event_type = str(event.get("event_type") or "")
+        payload = _event_payload(event)
+        if (
+            event_type in {"run.completed", "run.failed", "run.cancelled"}
+            and payload.get("authoritative") is False
+        ):
+            # Nested/provisional convergence terminals are observability, not
+            # the root run's committed outcome.  Absence remains authoritative
+            # for backwards-compatible producers.
+            continue
         if event_type == "run.completed":
             terminal_type = event_type
             terminal_error = None
         elif event_type == "run.failed":
             terminal_type = event_type
-            payload = _event_payload(event)
             terminal_error = str(payload.get("error") or "Agent run failed.")[:4000]
         elif event_type == "run.cancelled":
             terminal_type = event_type
@@ -292,6 +300,59 @@ def _agent_event_terminal_status(
     if terminal_type == "run.cancelled":
         return "cancelled", None
     return None, None
+
+
+def _reconcile_root_stream_error(
+    agent_events: list[dict],
+    *,
+    run_id: str,
+    stream_error: str | None,
+) -> tuple[str | None, bool]:
+    """Return the durable chat error and whether it is an execution failure.
+
+    A committed root terminal is authoritative over incidental child failures
+    and over a late transport symptom.  Without a committed root terminal, an
+    HTTP/SSE error (or the missing-terminal condition itself) is a genuine
+    stream interruption.
+    """
+
+    terminal_status, terminal_error = _agent_event_terminal_status(
+        agent_events,
+        run_id=run_id,
+    )
+    if terminal_status == "failed":
+        return terminal_error or "Agent run failed.", True
+    if terminal_status in {"succeeded", "cancelled"}:
+        return None, False
+    return (
+        stream_error or "Harness stream ended without a terminal run event.",
+        False,
+    )
+
+
+def _chat_stream_failure_notice(
+    error_message: str,
+    *,
+    execution_failed: bool,
+    has_partial_content: bool,
+) -> str:
+    prefix = "\n\n---\n" if has_partial_content else ""
+    if execution_failed:
+        suffix = (
+            "\n已显示的是未完成草稿，请修复失败原因后重试。"
+            if has_partial_content
+            else ""
+        )
+        return f"{prefix}⚠️ 本次任务执行失败：{error_message}{suffix}"
+    suffix = (
+        "\n已显示的是不完整草稿，请重新发送或点击重试。"
+        if has_partial_content
+        else ""
+    )
+    return (
+        f"{prefix}⚠️ 本次响应在流式输出过程中中断："
+        f"{error_message}{suffix}"
+    )
 
 
 def _normalized_usage(value: object) -> dict[str, int]:
@@ -1057,17 +1118,17 @@ async def _persist_after_stream(
     """Durably project one completed stream after its live event writers drain."""
 
     complete_events = list(agent_events or [])
-    terminal_status, terminal_error = _agent_event_terminal_status(
+    terminal_status, _terminal_error = _agent_event_terminal_status(
         complete_events,
         run_id=run_id,
     )
-    if terminal_status == "failed" and not error_message:
-        error_message = terminal_error
-    elif terminal_status == "cancelled":
-        error_message = None
+    error_message, _execution_failed = _reconcile_root_stream_error(
+        complete_events,
+        run_id=run_id,
+        stream_error=error_message,
+    )
+    if terminal_status == "cancelled":
         finish_reason = "task_cancelled"
-    elif terminal_status is None and not error_message:
-        error_message = "Harness stream ended without a terminal run event."
 
     # Every live projection for this root run was registered before the stream
     # entered its finally block.  Await them first so the complete ordered
@@ -1186,15 +1247,15 @@ def _spawn_persist_then_emit(
             agent_events or [],
             run_id=run_id,
         )
-        terminal_status, terminal_error = _agent_event_terminal_status(
+        terminal_status, _terminal_error = _agent_event_terminal_status(
             agent_events or [],
             run_id=run_id,
         )
-        effective_error = error_message
-        if terminal_status == "failed" and not effective_error:
-            effective_error = terminal_error or "Agent run failed."
-        elif terminal_status == "cancelled":
-            effective_error = None
+        effective_error, _execution_failed = _reconcile_root_stream_error(
+            agent_events or [],
+            run_id=run_id,
+            stream_error=error_message,
+        )
         persisted = await _persist_after_stream(
             conv_id, model_id, content, reasoning, tool_progress, first_user_content,
             run_id, resolved_model_id, usage, finish_reason, effective_error, agent_events,
@@ -1252,6 +1313,7 @@ BUILTIN = {
         "provider": "builtin",
         "protocol": "openai",
         "context_length": 303872,
+        "discover_runtime_metadata": True,
     },
     # 10.10.132.128 Qwen3-5 (397B, multimodal) — 多模态识别
     "qwen3_5": {
@@ -1269,6 +1331,7 @@ BUILTIN = {
         "provider": "builtin",
         "protocol": "openai",
         "context_length": 262144,
+        "discover_runtime_metadata": True,
     },
 }
 
@@ -1309,6 +1372,9 @@ async def resolve_model_config(model_id: str, cur_user: User, db: AsyncSession) 
             "protocol": cfg.get("protocol", "openai"),
             "is_multimodal": cfg["is_multimodal"],
             "context_length": cfg.get("context_length", 262144),
+            "discover_runtime_metadata": bool(
+                cfg.get("discover_runtime_metadata", False)
+            ),
             "agentic_auxiliary_only": cfg.get(
                 "agentic_auxiliary_only", False
             ),
@@ -1340,6 +1406,7 @@ async def resolve_model_config(model_id: str, cur_user: User, db: AsyncSession) 
         "protocol": "anthropic" if custom.provider == "anthropic" else "openai",
         "is_multimodal": custom.is_multimodal,
         "context_length": 128000,
+        "discover_runtime_metadata": True,
         "extra_headers": extra_headers,
     }
 
@@ -1664,6 +1731,7 @@ async def _chat_stream_with_turn(
         full_reasoning = ""
         full_tool_progress = ""
         error_message: Optional[str] = None
+        stream_error_message: Optional[str] = None
         finish_reason = "stop"
         resolved_model_id = model_id
         usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
@@ -1711,7 +1779,9 @@ async def _chat_stream_with_turn(
 
             # Stream from harness — agent loop with full tool set
             try:
-                async with httpx.AsyncClient(timeout=1800) as client:
+                async with httpx.AsyncClient(
+                    timeout=settings.harness_stream_timeout_seconds
+                ) as client:
                     async with client.stream(
                         "POST",
                         f"{settings.harness_url}/v1/chat/completions",
@@ -1745,7 +1815,7 @@ async def _chat_stream_with_turn(
                     ) as response:
                         if response.status_code >= 400:
                             body = (await response.aread()).decode("utf-8", "ignore")[:300]
-                            error_message = f"Harness 返回 HTTP {response.status_code}:{body}"
+                            stream_error_message = f"Harness 返回 HTTP {response.status_code}:{body}"
                         else:
                             async for line in response.aiter_lines():
                                 if not line.startswith("data: "):
@@ -1767,9 +1837,6 @@ async def _chat_stream_with_turn(
                                             seen_agent_events.add(key)
                                             agent_events.append(agent_event)
                                             event_type = str(agent_event.get("event_type") or "")
-                                            if event_type == "run.failed":
-                                                payload = _event_payload(agent_event)
-                                                error_message = str(payload.get("error") or "Agent run failed.")[:4000]
                                             if _should_persist_agent_event_immediately(event_type):
                                                 _spawn_agent_event_immediate_persist(
                                                     conv_id=conv_id,
@@ -1805,9 +1872,9 @@ async def _chat_stream_with_turn(
                                         yield f"data: {json.dumps({'tool_progress': msg, 'model_switch': switch, 'conversation_id': conv_id})}\n\n"
                                     choice = data.get("choices", [{}])[0]
                                     if "error" in data:
-                                        error_message = str(data.get("error") or "Harness stream error")
+                                        stream_error_message = str(data.get("error") or "Harness stream error")
                                     elif isinstance(choice.get("delta"), dict) and choice["delta"].get("error"):
-                                        error_message = str(choice["delta"].get("error"))
+                                        stream_error_message = str(choice["delta"].get("error"))
                                     if choice.get("finish_reason"):
                                         finish_reason = choice["finish_reason"]
                                     if data.get("model"):
@@ -1821,33 +1888,30 @@ async def _chat_stream_with_turn(
                                 except (json.JSONDecodeError, KeyError, IndexError):
                                     pass
             except httpx.ConnectError:
-                error_message = f"无法连接到 Harness 服务 {settings.harness_url}。请检查 harness 容器是否在运行。"
+                stream_error_message = f"无法连接到 Harness 服务 {settings.harness_url}。请检查 harness 容器是否在运行。"
             except httpx.TimeoutException:
-                error_message = "Harness 服务响应超时。"
+                stream_error_message = "Harness 服务响应超时。"
             except Exception as e:
-                error_message = f"调用 Harness 时出错:{type(e).__name__}: {e}"
+                stream_error_message = f"调用 Harness 时出错:{type(e).__name__}: {e}"
 
-            terminal_status, terminal_error = _agent_event_terminal_status(
+            error_message, execution_failed = _reconcile_root_stream_error(
                 agent_events,
                 run_id=run.id,
+                stream_error=stream_error_message,
             )
-            if terminal_status == "failed" and not error_message:
-                error_message = terminal_error
-            elif terminal_status is None and not error_message:
-                error_message = "Harness stream ended without a terminal run event."
 
             if error_message:
+                warning = _chat_stream_failure_notice(
+                    error_message,
+                    execution_failed=execution_failed,
+                    has_partial_content=bool(full_content),
+                )
                 if full_content:
-                    warning = (
-                        "\n\n---\n"
-                        f"⚠️ 本次响应在流式输出过程中中断：{error_message}\n"
-                        "已显示的是不完整草稿，请重新发送或点击重试。"
-                    )
                     full_content += warning
                     yield f"data: {json.dumps({'delta': warning, 'conversation_id': conv_id})}\n\n"
                 else:
                     # Surface the error as the assistant's content so the user sees it
-                    full_content = f"⚠️ {error_message}"
+                    full_content = warning
                     yield f"data: {json.dumps({'delta': full_content, 'conversation_id': conv_id})}\n\n"
         except (asyncio.CancelledError, GeneratorExit):
             stream_aborted = True

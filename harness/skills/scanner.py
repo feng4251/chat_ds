@@ -40,7 +40,7 @@ OPTIONAL_SKILLS_DIR = Path(__file__).resolve().parent / "optional"
 USER_SKILLS_BASE = Path("data/skills")
 _SESSION_DIR_RE = re.compile(r"^[0-9a-f]{32}$", re.IGNORECASE)
 RUNNABLE_SKILL_SCRIPT_EXTENSIONS = frozenset({
-    ".py", ".sh", ".bash", ".js", ".mjs",
+    ".py", ".sh", ".bash", ".js", ".mjs", ".cjs",
 })
 MAX_RUNNABLE_SCRIPT_BYTES = 10_000_000
 # Collection roots may contain arbitrary category/grouping directories.  Keep

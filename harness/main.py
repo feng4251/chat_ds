@@ -8,6 +8,7 @@ import asyncio
 import hmac
 import json
 import logging
+import os
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -30,7 +31,43 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """MCP runtimes are lazy per-session; shutdown tears down active scopes."""
+    """Reclaim stale executor leases, then own all session runtime cleanup."""
+
+    # Process capabilities intentionally remain in Harness memory. A crash can
+    # therefore leave an executor-side lease alive. Before serving any request,
+    # the replacement Harness authenticates to every configured executor and
+    # proves the fixed worker slot empty.
+    from tools.isolated_skill_executor import reap_isolated_executor_leases
+    from tools.skill_runtime_profile import (
+        BASE_RUNTIME_PROFILE,
+        BROWSER_RUNTIME_PROFILE,
+        runtime_profile_socket_binding,
+    )
+
+    startup_profiles = [BASE_RUNTIME_PROFILE]
+    if os.environ.get("SKILL_BROWSER_EXECUTOR_SOCKET", "").strip():
+        startup_profiles.append(BROWSER_RUNTIME_PROFILE)
+    seen_sockets: set[str] = set()
+    for runtime_profile in startup_profiles:
+        binding = runtime_profile_socket_binding(runtime_profile)
+        if binding.socket_path in seen_sockets:
+            raise RuntimeError(
+                "Distinct executor profiles must not share one process socket."
+            )
+        seen_sockets.add(binding.socket_path)
+        receipt = await reap_isolated_executor_leases(
+            socket_path=binding.socket_path,
+        )
+        if receipt.get("runtime_profile") != runtime_profile:
+            raise RuntimeError(
+                "Executor startup reap returned the wrong runtime profile."
+            )
+        logger.info(
+            "Executor startup reap complete profile=%s leases=%s",
+            runtime_profile,
+            receipt.get("reaped_leases"),
+        )
+
     yield
 
     # ── Shutdown ─────────────────────────────────────────────────────────
@@ -56,6 +93,12 @@ async def lifespan(app: FastAPI):
         await close_all_browser_sessions()
     except Exception:
         logger.exception("Shutdown browser cleanup failed")
+
+    try:
+        from tools.skill_process import close_all_skill_processes
+        await close_all_skill_processes()
+    except Exception:
+        logger.exception("Shutdown persistent Skill process cleanup failed")
 
 
 app = FastAPI(title="Chat ACITS Harness", version="2.0.0", lifespan=lifespan)
@@ -176,9 +219,45 @@ async def internal_session_cleanup(
     user_id: str,
     session_id: str,
 ):
-    """Tear down session runtime state and remove session MCP config."""
+    """Tear down every session-owned runtime without masking either result."""
     from tools.mcp_client import cleanup_session_runtime
-    return await cleanup_session_runtime(user_id, session_id)
+    from tools.skill_process import cleanup_skill_process_session
+
+    try:
+        process_result = await cleanup_skill_process_session(
+            user_id,
+            session_id,
+        )
+    except Exception as exc:
+        logger.exception(
+            "Session persistent Skill process cleanup failed user=%s session=%s",
+            user_id,
+            session_id,
+        )
+        process_result = {
+            "success": False,
+            "error_code": type(exc).__name__,
+        }
+    try:
+        mcp_result = await cleanup_session_runtime(user_id, session_id)
+    except Exception as exc:
+        logger.exception(
+            "Session MCP cleanup failed user=%s session=%s",
+            user_id,
+            session_id,
+        )
+        mcp_result = {
+            "success": False,
+            "error_code": type(exc).__name__,
+        }
+    return {
+        **mcp_result,
+        "success": bool(
+            mcp_result.get("success") is True
+            and process_result.get("success") is True
+        ),
+        "skill_processes": process_result,
+    }
 
 
 @app.post("/internal/runtime/python/ensure")
@@ -216,6 +295,10 @@ async def list_models():
                 "is_multimodal": cfg.get("is_multimodal", False),
                 "is_default": cfg.get("is_default", False),
                 "capabilities": cfg.get("capabilities", ["text"]),
+                "context_length": cfg.get("context_length"),
+                "discover_runtime_metadata": bool(
+                    cfg.get("discover_runtime_metadata", False)
+                ),
             }
             for mid, cfg in PROVIDERS.items()
         ],

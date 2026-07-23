@@ -25,6 +25,10 @@ class Settings(BaseSettings):
 
     # Harness agent service
     harness_url: str = "http://harness:8020"
+    # Long-context reasoning runs can legitimately remain silent for more than
+    # the Harness's 2400-second provider deadline.  Keep the backend proxy
+    # comfortably above that boundary so it does not sever a healthy stream.
+    harness_stream_timeout_seconds: int = 3000
     internal_api_token: str = "chat-ds-internal-token"
     scheduler_poll_seconds: int = 15
     hook_timeout_seconds: int = 8

@@ -14,6 +14,11 @@ def _parent_context(
     *tools: str,
     allowed_skill_resources: tuple[tuple[str, str], ...] = (),
     allowed_skill_scripts: tuple[tuple[str, str, str], ...] = (),
+    process_only_skill_scripts: tuple[tuple[str, str, str], ...] = (),
+    allowed_skill_script_authorities: tuple[
+        tuple[str, str, str, str, str, str], ...
+    ] = (),
+    allowed_skill_package_digests: tuple[tuple[str, str], ...] = (),
 ) -> ToolContext:
     return ToolContext(
         user_id="u",
@@ -30,6 +35,11 @@ def _parent_context(
         skill_execution_resource_boundary=bool(allowed_skill_resources),
         allowed_skill_resources=allowed_skill_resources,
         allowed_skill_scripts=allowed_skill_scripts,
+        process_only_skill_scripts=process_only_skill_scripts,
+        allowed_skill_script_authorities=(
+            allowed_skill_script_authorities
+        ),
+        allowed_skill_package_digests=allowed_skill_package_digests,
     )
 
 
@@ -578,7 +588,7 @@ class DelegatedBoundaryPropagationTests(unittest.IsolatedAsyncioTestCase):
                 0,
             )
 
-        self.assertEqual("completed", result["status"])
+        self.assertEqual("completed", result["status"], result)
         self.assertEqual(
             [first_grant, second_grant],
             observed["allowed_skill_scripts"],
@@ -597,6 +607,143 @@ class DelegatedBoundaryPropagationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private_helper.py", prompt)
         self.assertNotIn("__manifest__", prompt)
         self.assertNotIn("scripts/query_drugs.py", prompt)
+
+    async def test_child_inherits_exact_process_only_and_authority_rows(self):
+        observed: dict[str, object] = {}
+        base_grant = (
+            "mixed-runtime", "scripts/base.cjs", "a" * 64,
+        )
+        browser_grant = (
+            "mixed-runtime", "scripts/browser.cjs", "b" * 64,
+        )
+        sibling_grant = (
+            "sibling-runtime", "scripts/browser.cjs", "c" * 64,
+        )
+        base_authority = (
+            "mixed-runtime", "1" * 64, "SKILL.md", "1" * 64,
+            base_grant[1], base_grant[2],
+        )
+        browser_authority = (
+            "mixed-runtime", "1" * 64, "orchestration/main.yaml",
+            "2" * 64, browser_grant[1], browser_grant[2],
+        )
+        sibling_authority = (
+            "sibling-runtime", "3" * 64, "SKILL.md", "3" * 64,
+            sibling_grant[1], sibling_grant[2],
+        )
+
+        async def fake_dispatch(name, args, *, context):
+            return json.dumps({
+                "success": True,
+                "content": "Exact mixed runtime capability.",
+            })
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            observed["tools"] = tools
+            observed["allowed_skill_scripts"] = kwargs[
+                "allowed_skill_scripts"
+            ]
+            observed["process_only_skill_scripts"] = kwargs[
+                "process_only_skill_scripts"
+            ]
+            observed["authorities"] = kwargs[
+                "allowed_skill_script_authorities"
+            ]
+            observed["packages"] = kwargs[
+                "allowed_skill_package_digests"
+            ]
+            yield {
+                "type": "delta",
+                "content": (
+                    "Substantive bounded result with explicit provenance and "
+                    "limitations. " * 20
+                ),
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        def script_inventory(name, *_args, **_kwargs):
+            if name == "mixed-runtime":
+                return (
+                    (base_grant[1], base_grant[2]),
+                    (browser_grant[1], browser_grant[2]),
+                )
+            if name == "sibling-runtime":
+                return ((sibling_grant[1], sibling_grant[2]),)
+            return ()
+
+        with (
+            patch("tools.delegation.registry_dispatch", fake_dispatch),
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "skills.scanner.skill_runnable_script_resources",
+                side_effect=script_inventory,
+            ),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                return_value="results/delegate_profile.txt",
+            ),
+        ):
+            result = await _run_child(
+                {
+                    "goal": "Use the exact mixed runtime capability.",
+                    "skill_name": "generic-workflow",
+                    "step_type": "worker",
+                    "step_id": "mixed",
+                    "workflow_stage": "worker",
+                    "tools": [
+                        "skill_view",
+                        "run_skill_process",
+                        "run_skill_script",
+                    ],
+                    "required_capability_skills": ["mixed-runtime"],
+                },
+                _parent_context(
+                    "skill_view",
+                    "run_skill_process",
+                    "run_skill_script",
+                    allowed_skill_resources=(
+                        ("mixed-runtime", "SKILL.md"),
+                        ("sibling-runtime", "SKILL.md"),
+                    ),
+                    allowed_skill_scripts=(
+                        base_grant,
+                        browser_grant,
+                        sibling_grant,
+                    ),
+                    process_only_skill_scripts=(
+                        browser_grant,
+                        sibling_grant,
+                    ),
+                    allowed_skill_script_authorities=(
+                        base_authority,
+                        browser_authority,
+                        sibling_authority,
+                    ),
+                    allowed_skill_package_digests=(
+                        ("mixed-runtime", "4" * 64),
+                        ("sibling-runtime", "5" * 64),
+                    ),
+                ),
+                0,
+            )
+
+        self.assertEqual("completed", result["status"], result)
+        self.assertEqual(
+            [base_grant, browser_grant],
+            observed["allowed_skill_scripts"],
+        )
+        self.assertEqual(
+            [browser_grant],
+            observed["process_only_skill_scripts"],
+        )
+        self.assertEqual(
+            [base_authority, browser_authority],
+            observed["authorities"],
+        )
+        self.assertEqual(
+            [("mixed-runtime", "4" * 64)],
+            observed["packages"],
+        )
 
     async def test_oversize_exact_entrypoint_disclosure_fails_before_model(self):
         first_grant = (
