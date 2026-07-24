@@ -533,6 +533,122 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(events[-1], {"type": "done", "finish_reason": "stop"})
 
+    async def test_required_http_followup_ignored_length_retries_exact_call_once(self):
+        root = "https://api.vendor.test/search?q=evidence&pageSize=50"
+        full = json.dumps({
+            "items": [{"text": "x" * 300}],
+            "nextPageToken": None,
+        })
+        visible = full[:100]
+        first_receipt = build_http_retrieval_receipt(
+            method="GET",
+            request_url=root,
+            request_body=None,
+            response_body=visible,
+            pagination_scan_body=full,
+            body_truncated=True,
+            wire_body_complete=True,
+            response_bytes_read=len(full.encode("utf-8")),
+            response_byte_limit=400_000,
+            response_chars_read=len(full),
+            response_chars_returned=len(visible),
+            response_char_limit=100,
+            response_char_hard_limit=100,
+            request_timeout=20,
+            request_number=1,
+            request_run_hop_limit=16,
+            request_elapsed_ms=5,
+        )
+        action = first_receipt["continuation_action"]
+        smaller_url = action["args"]["url"]
+        ignored = (
+            "This truncated prose must be discarded because the exact "
+            "machine-owned HTTP continuation was not dispatched."
+        )
+        responses = [
+            _tool_call_response(
+                "call-http-oversized-before-ignore",
+                tool_name="skill_http_get",
+                arguments={"url": root, "max_chars": 100},
+            ),
+            _visible_length_response(ignored),
+            _tool_call_response(
+                "call-http-repage-after-ignore",
+                tool_name="skill_http_get",
+                arguments=action["args"],
+            ),
+            _stop_response(
+                "Replacement page chain closed.\n"
+                + _result_fields_footer("evidence")
+            ),
+        ]
+        dispatch_results = [
+            json.dumps({
+                "status": "success",
+                "request_sent": True,
+                "request_number": 1,
+                "url": root,
+                "body": visible,
+                "body_chars": len(visible),
+                "body_truncated": True,
+                "retrieval": first_receipt,
+            }),
+            _http_success_result(
+                smaller_url,
+                '{"items":[1],"nextPageToken":null}',
+                request_number=2,
+                max_chars=100,
+            ),
+        ]
+
+        request_bodies, dispatch_mock, events, _persisted = await self._run(
+            responses,
+            max_iterations=6,
+            dispatch_result="",
+            dispatch_results=dispatch_results,
+            tools=["skill_http_get"],
+            schemas=self.http_schema,
+            required_result_fields=["evidence"],
+            required_capability_tools=["skill_http_get"],
+            allowed_skill_http_prefixes=[(
+                "evidence-api", "https://api.vendor.test/search"
+            )],
+        )
+
+        self.assertFalse(responses)
+        self.assertEqual(2, dispatch_mock.await_count)
+        self.assertEqual(4, len(request_bodies))
+        for body in request_bodies[1:3]:
+            self.assertEqual("required", body.get("tool_choice"))
+            self.assertEqual(2_048, body.get("max_tokens"))
+            self.assertEqual(
+                ["skill_http_get"],
+                [item["function"]["name"] for item in body["tools"]],
+            )
+        emitted = "".join(
+            str(event.get("content") or "")
+            for event in events
+            if event.get("type") == "delta"
+        )
+        self.assertNotIn(ignored, emitted)
+        requested = [
+            event["payload"]
+            for event in events
+            if event.get("event_type")
+            == "debug.delegate.required_capability_noncall_recovery.requested"
+        ]
+        self.assertEqual(1, len(requested))
+        self.assertEqual(
+            "required_http_retrieval_continuation",
+            requested[0]["required_call_kind"],
+        )
+        self.assertEqual("length", requested[0]["provider_finish_reason"])
+        self.assertFalse(any(
+            event.get("event_type") == "run.failed"
+            for event in events
+        ))
+        self.assertEqual(events[-1], {"type": "done", "finish_reason": "stop"})
+
     async def test_next_page_token_chain_must_reach_end_before_synthesis(self):
         root = "https://api.vendor.test/search?q=evidence"
         page2 = root + "&pageToken=A"

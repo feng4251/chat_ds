@@ -100,6 +100,82 @@ _DEGRADED_REPORT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+_EXPLICIT_DEGRADED_STATUS_PATTERN = re.compile(
+    r"""
+    (?:
+        ["'](?:status|completion[_\s-]*quality|quality)["']
+        \s*:\s*
+        ["'](?:degraded|warn(?:ing)?)["']
+    )
+    |
+    (?:
+        ^\s*\#{1,6}\s+
+        [^\r\n]{0,120}
+        (?:degraded[\s_-]*status|fallback\s*/\s*degraded|降级状态)
+        [^\r\n]{0,120}$
+    )
+    |
+    (?:
+        ^\s*(?:[-*]\s*)?(?:\#{1,6}\s*)?
+        (?:status|completion[\s_-]*quality|quality|result|状态|完成质量|结果)
+        \s*(?:[:：=]|[—-]\s+|\|\s*)
+        (?:\*\*)?(?:degraded|warn(?:ing)?|降级|警告)(?:\*\*)?
+        (?:\s|$|\|)
+    )
+    """,
+    re.IGNORECASE | re.MULTILINE | re.VERBOSE,
+)
+
+_EXPLICIT_DEGRADED_MARKER_PATTERN = re.compile(
+    r"""
+    (?:
+        (?<!NOT\ )(?<!NON-)\bDEGRADED\b
+    )
+    |
+    (?:
+        (?<!NO\ )(?<!NOT\ )\bWARN(?:ING)?\b
+    )
+    |
+    (?:
+        ^\s*(?:[-*]\s*)?(?:\#{1,6}\s*)?
+        (?:\*\*)?(?:DEGRADED(?:\s+GAP)?|WARN(?:ING)?)(?:\*\*)?
+        (?:\s*(?:[:：—-]|\||$))
+    )
+    |
+    (?:
+        (?:[:：—-]|\|)\s*
+        (?:\*\*)?(?:DEGRADED(?:\s+GAP)?|WARN(?:ING)?)(?:\*\*)?
+        (?:\s*(?:[:：—-]|\||$))
+    )
+    |
+    (?:
+        ^\s*(?:[-*]\s*)?(?:\#{1,6}\s*)?
+        (?:降级(?:状态|结果|完成|缺口)?|警告(?:状态|结果|缺口)?)
+        (?:\s*(?:[:：—-]|\||$))
+    )
+    """,
+    re.MULTILINE | re.VERBOSE,
+)
+
+
+def _content_declares_degraded_completion(content: str) -> bool:
+    """Return true only for an explicit, result-level degraded declaration.
+
+    A child may truthfully finish with evidence gaps.  The outer workflow must
+    preserve that quality state instead of upgrading it to ``complete`` merely
+    because the prose/output contract passed.  Conversely, an incidental
+    sentence such as "this result is not degraded" is not a machine quality
+    declaration, so the accepted forms are deliberately status-shaped,
+    uppercase markers, or Chinese status headings.
+    """
+
+    value = str(content or "")
+    return bool(
+        _EXPLICIT_DEGRADED_STATUS_PATTERN.search(value)
+        or _EXPLICIT_DEGRADED_MARKER_PATTERN.search(value)
+    )
+
+
 _DEGRADED_GAP_PATTERN = re.compile(
     r"\b(?:warn(?:ing)?|degraded|gap|unavailable|not available|missing|"
     r"not retrieved|not found|blocked)\b|警告|降级|缺口|不可用|缺失|未检索到|阻塞",
@@ -5639,6 +5715,11 @@ async def _run_child(
     contract_complete_despite_terminal = bool(
         runtime_error
         and validation_error is None
+        # An undeclared prose fragment cannot prove that it is complete when
+        # the provider explicitly stopped at its output limit.  Accept a
+        # terminal payload only when a typed/structured/output/artifact
+        # contract gives the wrapper a machine-checkable completion boundary.
+        and has_semantic_short_result_contract
         and _is_terminal_budget_or_length_error(runtime_error, terminal_reason)
     )
     if contract_complete_despite_terminal:
@@ -5655,6 +5736,11 @@ async def _run_child(
         error = validation_error
     else:
         error = None
+    if (
+        error is None
+        and _content_declares_degraded_completion(content)
+    ):
+        runtime_completion_quality = "degraded"
     persistence_failed = False
     if error is None:
         try:
@@ -5706,6 +5792,23 @@ async def _run_child(
                 )
             ),
             retryable=False,
+        )
+    elif (
+        runtime_error
+        and normalized_terminal_reason == "model_hit_max_output_tokens"
+    ):
+        # The runtime's output ceiling is the primary failure, even when an
+        # earlier read-only receipt caused a bounded result-recovery path to
+        # run.  The parent-owned ledger above has already ruled out every
+        # mutating handler boundary, so a clean whole-child sample is safe.
+        # Keep this ahead of derivative output-contract classification; a
+        # partial result is invalid because the model hit its limit, not
+        # because the child independently violated the declared schema.
+        failure_fields = _child_failure_fields(
+            runtime_error,
+            terminal_reason,
+            failure_class="model_output_limit",
+            retryable=True,
         )
     elif (
         dispatched_result_recovery_completed

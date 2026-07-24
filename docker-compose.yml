@@ -376,6 +376,9 @@ services:
       - seccomp:./executor/browser_runtime/seccomp_profile.json
     environment:
       BROWSER_CDP_SOCKET: /run/chat-ds-browser/cdp.sock
+      # Optional certificate-scoped exceptions for explicitly allowlisted
+      # internal HTTPS origins. Never replace this with a global TLS bypass.
+      BROWSER_TLS_SPKI_ALLOWLIST: ${BROWSER_TLS_SPKI_ALLOWLIST:-}
     tmpfs:
       - /tmp:size=1g,mode=1777
       - /dev/shm:size=512m,mode=1777

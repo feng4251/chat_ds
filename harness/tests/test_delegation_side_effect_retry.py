@@ -182,6 +182,54 @@ class DelegationSideEffectRetryTests(unittest.IsolatedAsyncioTestCase):
         )
         persist_result.assert_not_called()
 
+    async def test_read_only_dispatch_then_plain_output_limit_is_retryable(self):
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            call_id = "read-before-output-limit"
+            yield _started("read_file", call_id)
+            yield _dispatch_started("read_file", call_id)
+            yield _completed("read_file", call_id)
+            error = (
+                "Delegated model hit its output limit; returning the bounded "
+                "partial child payload for outer contract validation."
+            )
+            yield {"type": "delta", "content": "partial evidence"}
+            yield {
+                "type": "agent_event",
+                "event_type": "run.failed",
+                "payload": {
+                    "error": error,
+                    "finish_reason": "length",
+                    "terminal_reason": "model_hit_max_output_tokens",
+                },
+            }
+            yield {"type": "error", "msg": error}
+
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch("tools.delegation.persist_result_for_history") as persist_result,
+        ):
+            result = await _run_child(
+                {
+                    "goal": "inspect one source and return bounded evidence",
+                    "tools": ["read_file"],
+                },
+                _context("read_file"),
+                0,
+            )
+
+        self.assertEqual("error", result["status"])
+        self.assertTrue(result["retryable"])
+        self.assertEqual("model_output_limit", result["failure_class"])
+        self.assertEqual(
+            ["read_file"],
+            result["dispatch_receipt_audit"]["read_only_tool_names"],
+        )
+        self.assertEqual(
+            [],
+            result["dispatch_receipt_audit"]["mutating_tool_names"],
+        )
+        persist_result.assert_not_called()
+
     async def test_mutation_receipt_overrides_runtime_output_contract_retry(self):
         async def fake_run_stream(model_id, messages, tools, **kwargs):
             call_id = "write-before-contract-failure"

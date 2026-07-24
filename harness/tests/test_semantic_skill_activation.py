@@ -781,6 +781,68 @@ class SemanticSkillActivationTests(unittest.IsolatedAsyncioTestCase):
         }
         self.assertIn("skill_view", exposed)
 
+    async def test_generic_explicit_request_selects_one_skill_before_any_execution(self):
+        records = [
+            {
+                "name": "visual-browser-operator",
+                "description": (
+                    "Operate rendered web pages and authorized authenticated "
+                    "browser sessions."
+                ),
+            },
+            {
+                "name": "table-auditor",
+                "description": "Check numeric tables for duplicate rows and totals.",
+            },
+        ]
+
+        def selector(body):
+            exposed = {
+                (tool.get("function") or {}).get("name")
+                for tool in body.get("tools") or []
+            }
+            self.assertEqual({"select_session_skill"}, exposed)
+            return {
+                "decision": "candidate",
+                "candidate_names": ["visual-browser-operator"],
+                "reason": "The request requires an authenticated browser session.",
+            }
+
+        selector_requests, stream_requests, dispatches, events = await self._run(
+            "请使用合适的 skill 登录这个内部网页并总结页面内容。",
+            records,
+            selector,
+        )
+
+        # A one-page generic explicit request reuses the primary stream turn
+        # for the typed metadata-only selector.
+        self.assertEqual(0, len(selector_requests))
+        self.assertEqual(
+            [(
+                "skill_view",
+                {"name": "visual-browser-operator", "file_path": ""},
+            )],
+            dispatches,
+        )
+        first_surface = {
+            tool["function"]["name"]
+            for tool in stream_requests[0].get("tools") or []
+        }
+        self.assertEqual({"select_session_skill"}, first_surface)
+        started = next(
+            event for event in events if event.get("event_type") == "run.started"
+        )
+        self.assertEqual(
+            "explicit_skill_request",
+            started["payload"]["skill_workflow_activation"],
+        )
+        self.assertTrue(any(
+            event.get("event_type") == "debug.session_skill.semantic_selection"
+            and event.get("payload", {}).get("status") == "selected"
+            and event.get("payload", {}).get("inspection_authority_only") is True
+            for event in events
+        ))
+
     async def test_selector_cannot_choose_name_outside_disclosed_page(self):
         records = [{
             "name": "table-auditor",

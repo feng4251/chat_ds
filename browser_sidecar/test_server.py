@@ -81,6 +81,35 @@ class BrowserRuntimeDirectoryTests(unittest.TestCase):
             command,
         )
 
+    def test_chromium_uses_only_valid_certificate_spki_exceptions(self):
+        first = "A" * 43 + "="
+        second = "b" * 43
+        with patch.dict(
+            os.environ,
+            {"BROWSER_TLS_SPKI_ALLOWLIST": f"{first}, {second}, {first}"},
+        ):
+            command = server._chromium_command()
+
+        self.assertIn(
+            "--ignore-certificate-errors-spki-list="
+            + first
+            + ","
+            + second,
+            command,
+        )
+        self.assertNotIn("--ignore-certificate-errors", command)
+
+    def test_malformed_certificate_spki_exception_fails_closed(self):
+        with patch.dict(
+            os.environ,
+            {"BROWSER_TLS_SPKI_ALLOWLIST": "not-a-valid-spki-hash"},
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "BROWSER_TLS_SPKI_ALLOWLIST",
+            ):
+                server._chromium_command()
+
     def test_http_health_response_is_complete_without_connection_eof(self):
         body = b'{"webSocketDebuggerUrl":"ws://localhost/devtools/browser/id"}'
         response = (

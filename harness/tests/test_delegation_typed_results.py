@@ -14,6 +14,7 @@ from tools.context import ToolContext
 from tools.delegation import (
     DELEGATE_TASK_SCHEMA,
     _child_failure_fields,
+    _content_declares_degraded_completion,
     _result_field_audit,
     _run_child,
     _strict_result_field_schema,
@@ -79,6 +80,43 @@ def _legacy_envelope_schema() -> dict:
 
 
 class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
+    def test_only_explicit_status_shapes_declare_degraded_completion(self):
+        self.assertTrue(
+            _content_declares_degraded_completion(
+                "Status: DEGRADED\nVerified evidence remains reusable."
+            )
+        )
+        self.assertTrue(
+            _content_declares_degraded_completion(
+                "| source | WARN | endpoint unavailable |"
+            )
+        )
+        self.assertTrue(
+            _content_declares_degraded_completion(
+                '{"completion_quality":"degraded","evidence":"bounded"}'
+            )
+        )
+        self.assertTrue(
+            _content_declares_degraded_completion(
+                "完成质量：降级\n已明确隔离证据缺口。"
+            )
+        )
+        self.assertFalse(
+            _content_declares_degraded_completion(
+                "The completed result is not degraded and contains no warning."
+            )
+        )
+        self.assertFalse(
+            _content_declares_degraded_completion(
+                "STATUS: NOT DEGRADED\nThe evidence contract is complete."
+            )
+        )
+        self.assertFalse(
+            _content_declares_degraded_completion(
+                "NO WARNING\nAll declared evidence checks passed."
+            )
+        )
+
     def test_parenthesized_raw_tool_call_dialect_is_rejected(self):
         content = (
             "I will persist the result now.\n"
@@ -909,6 +947,7 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["completion_quality"], "degraded")
         self.assertEqual(result["result_path"], "results/delegate_typed.md")
         persist_result.assert_called_once()
         self.assertEqual(result["required_result_fields"], [

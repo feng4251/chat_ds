@@ -137,6 +137,53 @@ class StandardSkillCapabilityPlanTests(unittest.TestCase):
         )
         self.assertNotIn("write_file", by_tool)
 
+    def test_explicit_independent_agents_become_a_required_delegate_candidate(self):
+        _root, package = self._package(
+            "# Instructions\nFollow the user's requested collaboration workflow.\n"
+        )
+        catalog = _build_standard_skill_capability_catalog(
+            "portable-skill",
+            package,
+            ["skill_view", "delegate_task", "write_file"],
+            (),
+            request_text=(
+                "请让以下 Agent 分别独立输出首轮意见，再进行第二轮复核。"
+            ),
+        )
+        delegate = next(
+            item
+            for item in catalog["candidates"]
+            if item.get("tool_name") == "delegate_task"
+        )
+        self.assertIn(
+            [delegate["id"]],
+            catalog["required_candidate_groups"],
+        )
+
+        omitted = validate_capability_plan(
+            catalog,
+            skill_name="portable-skill",
+            body_sha256=catalog["body_sha256"],
+            required=[],
+            optional=[delegate["id"]],
+            unsupported=[],
+        )
+        self.assertFalse(omitted.valid)
+        self.assertEqual(
+            "capability_plan_required_group_omitted",
+            omitted.payload["error_code"],
+        )
+
+        accepted = validate_capability_plan(
+            catalog,
+            skill_name="portable-skill",
+            body_sha256=catalog["body_sha256"],
+            required=[delegate["id"]],
+            optional=[],
+            unsupported=[],
+        )
+        self.assertTrue(accepted.valid)
+
     def test_language_neutral_stable_browser_family_is_not_regex_authority(self):
         bodies = (
             "# 手順\n- ウェブページを開いて表示内容を確認してください。\n",

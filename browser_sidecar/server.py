@@ -37,6 +37,9 @@ LOG_DRAIN_TIMEOUT_SECONDS: Final[float] = 2.0
 _URL_IN_LOG_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)\b(?:https?|wss?|ftp)://[^\s<>\]\[\"']+"
 )
+_TLS_SPKI_SHA256_RE: Final[re.Pattern[str]] = re.compile(
+    r"[A-Za-z0-9+/]{43}=?"
+)
 
 
 def _read_active_port() -> tuple[int, str] | None:
@@ -176,9 +179,44 @@ def _prepare_runtime_dirs() -> None:
     SOCKET_PATH.unlink()
 
 
+def _tls_spki_allowlist_switch() -> str | None:
+    """Compile a deployment-owned, certificate-scoped Chromium exception.
+
+    Private origins may use certificates issued by an internal CA that is not
+    present in the immutable browser image.  A global
+    ``--ignore-certificate-errors`` would silently weaken every destination.
+    Chromium's SPKI allowlist keeps the exception bound to exact public-key
+    hashes while the Harness independently enforces the per-turn origin grant.
+    """
+
+    configured = str(
+        os.environ.get("BROWSER_TLS_SPKI_ALLOWLIST", "") or ""
+    ).strip()
+    if not configured:
+        return None
+    values = [
+        item
+        for item in re.split(r"[\s,]+", configured)
+        if item
+    ]
+    if not values or any(
+        _TLS_SPKI_SHA256_RE.fullmatch(item) is None
+        for item in values
+    ):
+        raise RuntimeError(
+            "BROWSER_TLS_SPKI_ALLOWLIST must contain only comma-separated "
+            "base64 SHA-256 SPKI hashes"
+        )
+    deduplicated = list(dict.fromkeys(values))
+    return (
+        "--ignore-certificate-errors-spki-list="
+        + ",".join(deduplicated)
+    )
+
+
 def _chromium_command() -> list[str]:
     executable = os.environ.get("CHROMIUM_EXECUTABLE", "/usr/bin/chromium")
-    return [
+    command = [
         executable,
         "--headless=new",
         # The sidecar runs non-root with no-new-privileges, so the setuid
@@ -205,8 +243,12 @@ def _chromium_command() -> list[str]:
         "--disable-sync",
         "--metrics-recording-only",
         "--password-store=basic",
-        "about:blank",
     ]
+    tls_spki_switch = _tls_spki_allowlist_switch()
+    if tls_spki_switch is not None:
+        command.append(tls_spki_switch)
+    command.append("about:blank")
+    return command
 
 
 async def _terminate_process_group(process: asyncio.subprocess.Process) -> None:
