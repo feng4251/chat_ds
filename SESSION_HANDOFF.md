@@ -1,4 +1,4 @@
-# ChatDS 当前会话交接（2026-07-23）
+# ChatDS 当前会话交接（2026-07-24）
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
@@ -6,10 +6,10 @@
 
 - 工作目录：`/nfs/yangbb/codes/chat_ds`。
 - 分支：`fix/generic-skill-harness-20260717`。
-- 本轮开始时 HEAD：`d224db33 feat: recover corrupt tool streams generically`。
-- 本轮功能提交：`b0744a33 feat: add generic profile-aware skill sandboxes`。
+- 2026-07-24 最新功能提交：`e90415a0 feat: close generic skill workflow recovery gaps`。
+- 前一轮 profile-aware sandbox 提交：`b0744a33 feat: add generic profile-aware skill sandboxes`。
 - 本轮通用 Skill Harness、process protocol v2、profile-aware preflight、base/browser executor 和 browser egress proxy 已完成实现、全量回归与真实容器验收。
-- 独立 reviewer 已给出代码/测试 `GO`；功能提交已按 canary 顺序部署到生产，并通过非模型 smoke。
+- `e90415a0` 已按 browser → Harness 顺序部署到生产，并通过真实私网浏览器和非模型 smoke。
 - 不自动执行模型重型 V2.3 E2E。V2.3 是用户手工业务验收用例，不是 Harness 特判目标。
 - Git 只做本地 commit，不向 remote push。
 
@@ -98,12 +98,41 @@
 - Chromium wrapper 拒绝代理覆盖、resolver 覆盖、公开 remote-debug、stealth/anti-evasion、QUIC 和非代理 WebRTC 路径。
 - internal/private 浏览继续走已有 legacy browser 的 per-turn policy，不给 Skill browser 全局放权。
 
+### 4.6 2026-07-24 两个 session 的系统性修复
+
+本轮按“持久化对话 + exact Skill + debug/tool/AgentRun”交叉核对：
+
+- `df842a5f2a464e1b924e2794827dd591`
+  - `lung-cancer-mdt` 生成了 1705 行报告，但实际没有任何 child Agent；11 个第一轮意见、11 个第二轮意见和投票均由主模型模拟。根因是 instruction-only Skill 没有结构化 workflow，且中文“分别”被 `别` 的否定词规则误判，导致 `delegate_task` 没进入必选能力。
+  - 随后的 `visual-browser-operator` 请求只说“使用 Skill”，在多 Skill session 中没有解析为唯一 Skill；因此没有编译 browser profile，模型退化到 broad tools、legacy browser 和无浏览器依赖的 `execute_code`。两个私网目标也未在部署 allowlist 中。
+  - 两个 root run 的 debug 终态均是 `task_cancelled`，没有证据证明是 provider timeout；取消来源仍不能从现有日志唯一确定。
+- `3bbd719a241d4a23aa65d1dd3ca9846c`
+  - `healthsim-trialsim` 的结构化 DAG、intent、7 个 bootstrap、8-worker 路由和第一波 fan-out 均正确编译并真实执行。
+  - `worker-safety-extraction` 在已成功完成两次只读 HTTP 后，被 Harness 强制执行下一页 GET；该轮只有一个 `skill_http_get` schema、`tool_choice=required`、2048 输出预算，但 provider 输出 2048 token prose 而没有 tool call，触发 `model_hit_max_output_tokens`。旧恢复逻辑只覆盖初始 required capability，没有覆盖强制 retrieval continuation。
+  - 7 个 bootstrap 结果中的显式 `DEGRADED/WARN` 未稳定传播到 authoritative `completion_quality`，造成上层错误升级为 complete。
+
+通用修复：
+
+- 泛化的“使用合适 Skill”请求先走 bounded name/description selector，再绑定唯一 immutable Skill，不再把整套 broad tools 交给主模型自行漫游。
+- 用户明确要求独立/分别/并行 Agent 时，runtime-owned required capability group 强制 capability plan 把 `delegate_task` 选为 required；修复“分别”被识别为否定词。
+- 强制只读 HTTP continuation 被 provider 忽略时，丢弃 prose 并做一次精确 bounded correction；若仍失败，外层依据副作用 receipt ledger 允许 clean child retry。发生任何 mutating dispatch 时仍 fail closed。
+- 未声明完成边界的自由 prose 在 `length` 终态不再被当作完整结果；明确的 `DEGRADED/WARN/降级状态` 会传播到 child、batch 和 DAG completion quality。
+- 私网浏览仍需“部署 allowlist ∩ 用户明确 URL”双重授权；当前只加入 `https://10.10.132.126:18443` 和 `https://172.30.100.126:18443`。自签/内部证书只通过 SHA-256 SPKI 精确豁免，未启用全局 TLS bypass。短的“继续/使用这个 Skill”可以引用最近一个用户原创 URL turn，不能引用 assistant/tool 或更早的 ambient URL。
+- 用户明确标注的 password/token 只保留为进程内 ephemeral taint：禁止进入文件、代码、memory、Skill state、process argv 或 delegated task；直接授权的 `browser_type` 仍可输入，且输入文本不会进入 debug 参数。
+
+仍需后续设计：
+
+- 对无结构化 workflow 的超复杂 prose Skill，目前可以强制“必须发生真实 delegation”，但还不能仅靠 Harness 机器证明 11 个角色 × 两轮 × Round 3 全覆盖。长期方案是通用 prose-to-typed workflow graph + 独立 instruction-coverage verifier；有结构化 YAML/JSON workflow 的 Skill 已具备完整 DAG 强制能力。
+- 历史视觉会话工作区曾生成可能包含用户口令的登录脚本；本轮未擅自删除用户 session artifact。应由用户授权后清理，并轮换该测试凭据。
+
 ## 5. 当前验证证据
 
-最终冻结源码已通过：
+2026-07-24 最终冻结源码已通过：
 
-- Harness 全量：`1331 passed, 1 skipped, 526 subtests passed`。
+- Harness 全量：`1341 tests OK`；首次只挂 Harness 目录时唯一失败是测试环境缺根目录 `executor`，补齐根目录和固定 Node 后完整通过。
+- 关键故障路径定向：`263 tests OK`；最后安全/浏览器增量定向：`135 tests OK`。
 - Backend：`47 passed`。
+- legacy browser sidecar：`8 tests OK`。
 - Executor/browser/profile/topology/proxy：`86 passed, 1 skipped, 43 subtests passed`。
 - 最终 Shell/profile 定向：`78 passed, 40 subtests passed`；独立 reviewer 的 23-case Bash 矩阵也通过。
 - `py_compile`、`git diff --check`、默认 Compose config、`local-search` profile config 均通过。
@@ -135,7 +164,7 @@
   - UID 65528/65529 当前无宿主进程冲突；
   - 根盘约 87 GiB 可用，内存约 26 GiB available；
   - Compose 2.32.4 支持当前声明。
-- 2026-07-23 17:47（Asia/Shanghai）完成生产切换。固定使用 project `chat_ds` 和原 bind/data 路径，没有重建 Frontend、DB 或 search。
+- 2026-07-24 13:04（Asia/Shanghai）完成最新生产切换。固定使用 project `chat_ds` 和原 bind/data 路径，只重建 legacy browser 与 Harness，没有重建 Frontend、Backend、DB、search 或两个 Skill executor。
 - `.env` 已原子生成独立 `EXECUTOR_V2_AUTH_TOKEN`，mode 为 0600；base/browser/Harness 三方值一致且长度合规，值未输出或写入 Git。
 - Harness stream ceiling 为 2400 秒，Backend proxy deadline 为 3000 秒。
 
@@ -146,8 +175,8 @@
 | `chat_acits_executor` | `sha256:a7afa67c6c2f0ffe08e27cd8b5b5101b08444e71e6008b85efacf9c6784ad14f` | healthy |
 | `chat_acits_skill_egress_proxy` | `sha256:c5ee4fdc2ee785868f15036706f01d327b05b358f2b7812fcca8bfb7454f9c05` | healthy |
 | `chat_acits_skill_browser_executor` | `sha256:76acea01fdf89f324fef6c48e44d6270841bbb8127887e8cf2e082cd76a84b90` | healthy |
-| `chat_acits_browser` | `sha256:dfe9e49d893e2618c9fec58c095a8254d5e91da4f4f06ce032e0090fe56d6fca` | healthy |
-| `chat_acits_harness` | `sha256:35ad1fbeaede8f0c3843c0375678645e07c4516db4f8e23da1790fe432c4d992` | healthy |
+| `chat_acits_browser` | `sha256:391260b06964c7cfbd2bb934501f35b47ed5d093ac6e1d51f769c41e3576087d` | healthy |
+| `chat_acits_harness` | `sha256:e7546f176135d32dd4b15a4d4a289fa495cc2da5f0f1dd4b2a3a2eca9eae152d` | healthy |
 | `chat_acits_backend` | `sha256:4da7df118bcd06f7b30e57191f0d0a275e238f27beb12ee10a0510e6d32134fb` | running / `/api/health` 200 |
 
 生产 smoke 证据：
@@ -158,6 +187,9 @@
 - legacy CDP browser 真实打开 `https://example.com/` 并得到 `Example Domain`。
 - Harness `/health` 和 `/v1/models` 正常；未鉴权 `/internal/*` 为 401，Backend 持有的正确 token 为 200。
 - Frontend `/` 与 `/api/health` 均为 200。
+- Harness `/health` 为 200；本轮启动日志中 browser/Harness 均无 traceback、fatal 或 unhealthy。
+- legacy browser 对两个精确私网 origin 均成功跟随 302 到 OpenEMR login 页面并取得 DOM snapshot；未列入 allowlist 的私网 origin 和 metadata 地址仍被拦截。
+- Chromium 进程含精确 SPKI exception flag，且不含全局 `--ignore-certificate-errors`。
 - SearXNG 真实查询返回 46 条结果，前十条 provenance 包括 360search、Baidu、Mojeek、Sogou。
 - worker UID 65528/65529 在 smoke 后宿主任务数均为 0；Harness 镜像内 baked runtime-data 文件数为 0。
 - 切换前 DB 中存在 7 月 20 日遗留的 stale `running` 投影，但最近 30 分钟 AgentRun/TaskItem/ScheduledRun 均为 0，Harness/Backend 也无 established provider/SSE 连接。
@@ -166,8 +198,9 @@
 回滚点：
 
 - 原 executor/browser/Harness/Backend 镜像保留 tag `rollback-20260723-pre-process-v2`。
+- 本轮切换前 browser/Harness 镜像另保留 tag `rollback-pre-e90415a0`；新镜像 tag 为 `deploy-e90415a0`。
 - 可重建的旧 Harness 代码镜像：`chat_ds-harness:rollback-d224db33`，image `sha256:e7d16ee538fc69e638f20bb93035df90d76008721116ebfedb7d07ccb986abef`。
-- 精确部署 bundle 和构建日志位于 `/nfs/temp/chat_ds_deploy_b0744a33/`，不属于 Git；确认稳定后可按运维保留策略清理。
+- 前轮 `b0744a33` 的部署 bundle 和构建日志位于 `/nfs/temp/chat_ds_deploy_b0744a33/`，不属于 Git；本轮直接从共享仓库的已提交 `e90415a0` 源码构建并保留 commit-tagged 镜像。
 
 ## 7. Git/worktree 边界
 
