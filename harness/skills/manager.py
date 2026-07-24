@@ -534,10 +534,15 @@ class SkillsManager:
         target = file_check.path
         assert target is not None
         size_bytes = target.stat().st_size
-        sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+        raw_bytes = target.read_bytes()
+        sha256 = hashlib.sha256(raw_bytes).hexdigest()
         media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
         try:
-            content = target.read_text(encoding="utf-8")
+            # Preserve exact newline bytes in text resources.  The returned
+            # content must re-encode to the same EOF SHA advertised alongside
+            # it so Workflow IR authority references remain content addressed
+            # on CRLF as well as LF packages.
+            content = raw_bytes.decode("utf-8")
         except UnicodeDecodeError:
             return {
                 "success": True,

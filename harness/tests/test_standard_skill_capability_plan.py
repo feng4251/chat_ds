@@ -9,8 +9,11 @@ from unittest.mock import AsyncMock, patch
 
 from agent_loop import (
     HarnessRunState,
+    SessionSkillRelevanceDecision,
     _build_standard_skill_capability_catalog,
     _preflight_standard_skill_runtime_selection,
+    _safe_build_standard_skill_capability_catalog,
+    _standard_skill_catalog_failure_terminal,
     run_stream,
 )
 from skill_capability_plan import (
@@ -100,6 +103,63 @@ class StandardSkillCapabilityPlanTests(unittest.TestCase):
             encoding="utf-8",
         )
         return root, load_skill_content(root / "SKILL.md", skill_dir=str(root))
+
+    def test_catalog_safe_build_returns_bounded_failure_without_exception_text(self):
+        _root, package = self._package("# Instructions\nDo the task.\n")
+        secret_exception_text = "private/path and package-controlled text"
+        with patch(
+            "agent_loop._build_standard_skill_capability_catalog",
+            side_effect=RuntimeError(secret_exception_text),
+        ):
+            catalog, failure = (
+                _safe_build_standard_skill_capability_catalog(
+                    "portable-skill",
+                    package,
+                    ["skill_view"],
+                    (),
+                    phase="amendment",
+                )
+            )
+
+        self.assertIsNone(catalog)
+        self.assertEqual({
+            "reason_code": "capability_catalog_compilation_failed",
+            "phase": "amendment",
+            "catalog_dispatch_attempted": False,
+        }, failure)
+        message, payload = _standard_skill_catalog_failure_terminal(
+            failure
+        )
+        persisted = json.dumps(
+            {"message": message, "payload": payload},
+            ensure_ascii=False,
+        )
+        self.assertNotIn(secret_exception_text, persisted)
+        self.assertEqual(
+            "capability_catalog_compilation_failed",
+            payload["finish_reason"],
+        )
+
+    def test_catalog_safe_build_does_not_catch_base_exception(self):
+        _root, package = self._package("# Instructions\nDo the task.\n")
+
+        class FatalCatalogCompilerSignal(BaseException):
+            pass
+
+        with (
+            patch(
+                "agent_loop._build_standard_skill_capability_catalog",
+                side_effect=FatalCatalogCompilerSignal(),
+            ),
+            self.assertRaises(FatalCatalogCompilerSignal),
+        ):
+            _safe_build_standard_skill_capability_catalog(
+                "portable-skill",
+                package,
+                ["skill_view"],
+                (),
+                phase="initial",
+            )
 
     def test_native_capability_metadata_distinguishes_browser_sidecar_and_compute(self):
         _root, package = self._package(
@@ -1026,7 +1086,11 @@ class StandardSkillCapabilityPlanTests(unittest.TestCase):
                 "name": "portable-skill",
                 "file_path": "references/required.md",
             },
-            result_data={"success": True, "has_more": False},
+            result_data={
+                "success": True,
+                "has_more": False,
+                "sha256": required["sha256"],
+            },
             skill_resource_complete=True,
         ))
 
@@ -1108,6 +1172,7 @@ class StandardSkillCapabilityPlanTests(unittest.TestCase):
             "kind": "skill_resource",
             "skill_name": "portable-skill",
             "resource_path": "references/large.md",
+            "sha256": "b" * 64,
         }
         args_last = {
             "name": "portable-skill",
@@ -1165,9 +1230,511 @@ class StandardSkillCapabilityPlanTests(unittest.TestCase):
             result_data=last,
             skill_resource_complete=complete,
         ))
+        changed = dict(last)
+        changed["sha256"] = "c" * 64
+        self.assertFalse(capability_call_satisfies_candidate(
+            candidate,
+            tool_name="skill_view",
+            args=args_last,
+            result_data=changed,
+            skill_resource_complete=True,
+        ))
 
 
 class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
+    async def test_initial_catalog_compiler_exception_fails_before_any_dispatch(self):
+        provider = {
+            "id": "mock-initial-catalog-failure",
+            "base_url": "http://model.invalid/v1",
+            "api_model": "mock-initial-catalog-failure",
+            "api_key": "EMPTY",
+            "protocol": "openai",
+            "provider": "mock",
+            "context_length": 64_000,
+            "is_multimodal": True,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "portable-skill"
+            root.mkdir()
+            main = root / "SKILL.md"
+            main.write_text(
+                "---\nname: portable-skill\n"
+                "description: A portable instruction Skill.\n---\n"
+                "# Instructions\nRead the requested workspace input.\n",
+                encoding="utf-8",
+            )
+            package = load_skill_content(main, skill_dir=str(root))
+            skill_record = {
+                "name": "portable-skill",
+                "description": package["description"],
+                "scope": "session",
+                "path": str(main),
+                "skill_dir": str(root),
+            }
+            dispatch_mock = AsyncMock()
+
+            class NoProviderClient:
+                def __init__(self, *args, **kwargs):
+                    raise AssertionError(
+                        "provider client constructed after initial compile failure"
+                    )
+
+            with (
+                patch(
+                    "workspace_context.WORKSPACE_ROOT",
+                    Path(temp_dir) / "ws",
+                ),
+                patch("agent_loop.httpx.AsyncClient", NoProviderClient),
+                patch("agent_loop.dispatch", dispatch_mock),
+                patch("agent_loop.build_system_prompt", return_value="system"),
+                patch("agent_loop.load_workspace_context", return_value=""),
+                patch("agent_loop._fetch_goal", AsyncMock(return_value=None)),
+                patch(
+                    "skills.scanner.find_all_skills",
+                    return_value=[skill_record],
+                ),
+                patch(
+                    "skills.scanner.skill_runnable_script_resources",
+                    return_value=(),
+                ),
+                patch(
+                    "agent_loop._build_standard_skill_capability_catalog",
+                    side_effect=RuntimeError(
+                        "must-not-escape private compiler detail"
+                    ),
+                ),
+            ):
+                events = [
+                    event async for event in run_stream(
+                        "mock-initial-catalog-failure",
+                        [{
+                            "role": "user",
+                            "content": "请运行 portable-skill 完成任务",
+                        }],
+                        [
+                            "skill_view",
+                            "submit_skill_capability_plan",
+                            "read_file",
+                        ],
+                        provider_override=provider,
+                        allow_session_mcp=False,
+                        user_id="u-initial-catalog-failure",
+                        session_id="s-initial-catalog-failure",
+                        max_iterations=4,
+                    )
+                ]
+
+        dispatch_mock.assert_not_awaited()
+        lifecycle = [
+            event
+            for event in events
+            if event.get("type") == "agent_event"
+            and str(event.get("event_type") or "").startswith("run.")
+        ]
+        failed = [
+            event for event in lifecycle
+            if event.get("event_type") == "run.failed"
+        ]
+        self.assertEqual(1, len(failed))
+        self.assertFalse(any(
+            event.get("event_type") == "run.started"
+            for event in lifecycle
+        ))
+        self.assertFalse(any(
+            event.get("event_type") in {
+                "tool.started",
+                "tool.dispatch_started",
+            }
+            for event in events
+        ))
+        payload = failed[0]["payload"]
+        self.assertEqual(
+            "capability_catalog_compilation_failed",
+            payload["finish_reason"],
+        )
+        self.assertEqual(
+            "initial",
+            payload["capability_catalog_failure"]["phase"],
+        )
+        self.assertNotIn(
+            "must-not-escape",
+            json.dumps(events, ensure_ascii=False),
+        )
+
+    async def test_dynamic_catalog_compiler_exception_stops_after_skill_view(self):
+        provider = {
+            "id": "mock-dynamic-catalog-failure",
+            "base_url": "http://model.invalid/v1",
+            "api_model": "mock-dynamic-catalog-failure",
+            "api_key": "EMPTY",
+            "protocol": "openai",
+            "provider": "mock",
+            "context_length": 64_000,
+            "is_multimodal": True,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "portable-skill"
+            root.mkdir()
+            main = root / "SKILL.md"
+            main.write_text(
+                "---\nname: portable-skill\n"
+                "description: Produce a complete evidence report.\n---\n"
+                "# Instructions\nRead the requested input and prepare the report.\n",
+                encoding="utf-8",
+            )
+            package = load_skill_content(main, skill_dir=str(root))
+            skill_record = {
+                "name": "portable-skill",
+                "description": package["description"],
+                "scope": "session",
+                "path": str(main),
+                "skill_dir": str(root),
+            }
+            dispatch_names: list[str] = []
+            provider_stream_calls = 0
+
+            async def fake_dispatch(name, args, *, context):
+                dispatch_names.append(name)
+                if name != "skill_view":
+                    raise AssertionError(f"unexpected dispatch: {name}")
+                return json.dumps({
+                    **package,
+                    "success": True,
+                    "skill_dir": str(root),
+                }, ensure_ascii=False)
+
+            class NoModelStreamClient:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, exc_type, exc, tb):
+                    return False
+
+                def stream(self, method, url, **kwargs):
+                    nonlocal provider_stream_calls
+                    provider_stream_calls += 1
+                    raise AssertionError(
+                        "provider stream opened after dynamic compile failure"
+                    )
+
+            relevance = SessionSkillRelevanceDecision(
+                ("portable-skill",),
+                (("portable-skill", 100),),
+                "description_match",
+            )
+            with (
+                patch(
+                    "workspace_context.WORKSPACE_ROOT",
+                    Path(temp_dir) / "ws",
+                ),
+                patch("agent_loop.httpx.AsyncClient", NoModelStreamClient),
+                patch("agent_loop.dispatch", fake_dispatch),
+                patch("agent_loop.build_system_prompt", return_value="system"),
+                patch("agent_loop.load_workspace_context", return_value=""),
+                patch("agent_loop._fetch_goal", AsyncMock(return_value=None)),
+                patch(
+                    "agent_loop.resolve_provider_runtime_metadata",
+                    AsyncMock(return_value=(
+                        provider,
+                        {"source": "test", "status": "resolved"},
+                    )),
+                ),
+                patch(
+                    "agent_loop._bounded_session_skill_relevance_selection",
+                    return_value=relevance,
+                ),
+                patch(
+                    "skills.scanner.find_all_skills",
+                    return_value=[skill_record],
+                ),
+                patch(
+                    "skills.scanner.skill_runnable_script_resources",
+                    return_value=(),
+                ),
+                patch(
+                    "agent_loop._build_standard_skill_capability_catalog",
+                    side_effect=RuntimeError(
+                        "dynamic private compiler detail"
+                    ),
+                ),
+            ):
+                events = [
+                    event async for event in run_stream(
+                        "mock-dynamic-catalog-failure",
+                        [{
+                            "role": "user",
+                            "content": (
+                                "请生成一份完整的深度证据分析报告并保存为 "
+                                "Markdown 文件"
+                            ),
+                        }],
+                        [
+                            "skill_view",
+                            "submit_skill_capability_plan",
+                            "read_file",
+                            "write_file",
+                        ],
+                        provider_override=provider,
+                        allow_session_mcp=False,
+                        user_id="u-dynamic-catalog-failure",
+                        session_id="s-dynamic-catalog-failure",
+                        max_iterations=4,
+                    )
+                ]
+
+        self.assertEqual(["skill_view"], dispatch_names)
+        self.assertEqual(0, provider_stream_calls)
+        dispatch_started = [
+            event
+            for event in events
+            if event.get("type") == "agent_event"
+            and event.get("event_type") == "tool.dispatch_started"
+        ]
+        self.assertEqual(
+            ["skill_view"],
+            [event["payload"]["tool_name"] for event in dispatch_started],
+        )
+        failed = [
+            event
+            for event in events
+            if event.get("type") == "agent_event"
+            and event.get("event_type") == "run.failed"
+        ]
+        self.assertEqual(1, len(failed))
+        self.assertEqual(
+            "dynamic",
+            failed[0]["payload"]["capability_catalog_failure"]["phase"],
+        )
+        self.assertNotIn(
+            "dynamic private compiler detail",
+            json.dumps(events, ensure_ascii=False),
+        )
+
+    async def test_amendment_catalog_failure_revokes_old_plan_and_terminates(self):
+        provider = {
+            "id": "mock-amendment-catalog-failure",
+            "base_url": "http://model.invalid/v1",
+            "api_model": "mock-amendment-catalog-failure",
+            "api_key": "EMPTY",
+            "protocol": "openai",
+            "provider": "mock",
+            "context_length": 64_000,
+            "is_multimodal": True,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "portable-skill"
+            (root / "references").mkdir(parents=True)
+            main = root / "SKILL.md"
+            main.write_text(
+                "---\nname: portable-skill\ndescription: portable\n---\n"
+                "Read `references/runtime.md` completely.\n",
+                encoding="utf-8",
+            )
+            reference = root / "references" / "runtime.md"
+            reference.write_text(
+                "Then inspect the workspace input.\n",
+                encoding="utf-8",
+            )
+            package = load_skill_content(main, skill_dir=str(root))
+            reference_content = reference.read_text(encoding="utf-8")
+            reference_digest = hashlib.sha256(
+                reference.read_bytes()
+            ).hexdigest()
+            enabled = [
+                "skill_view",
+                "submit_skill_capability_plan",
+                "read_file",
+            ]
+            initial = _build_standard_skill_capability_catalog(
+                "portable-skill",
+                package,
+                enabled,
+                (),
+            )
+            reference_id = next(
+                item["id"]
+                for item in initial["candidates"]
+                if item.get("resource_path") == "references/runtime.md"
+            )
+            responses = [
+                _tool_response(
+                    "main",
+                    "skill_view",
+                    {"name": "portable-skill"},
+                ),
+                _tool_response(
+                    "initial-plan",
+                    "submit_skill_capability_plan",
+                    {
+                        "skill_name": "portable-skill",
+                        "body_sha256": initial["body_sha256"],
+                        "catalog_sha256": initial["catalog_sha256"],
+                        "required": [reference_id],
+                        "optional": [],
+                        "unsupported": [],
+                    },
+                ),
+                _tool_response(
+                    "reference",
+                    "skill_view",
+                    {
+                        "name": "portable-skill",
+                        "file_path": "references/runtime.md",
+                    },
+                ),
+            ]
+            request_count = 0
+            dispatch_names: list[str] = []
+
+            class Client:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, exc_type, exc, tb):
+                    return False
+
+                def stream(self, method, url, **kwargs):
+                    nonlocal request_count
+                    request_count += 1
+                    if not responses:
+                        raise AssertionError(
+                            "provider called after amendment compile failure"
+                        )
+                    return _Response(responses.pop(0))
+
+            async def fake_dispatch(name, args, *, context):
+                dispatch_names.append(name)
+                if name == "submit_skill_capability_plan":
+                    return await submit_skill_capability_plan(
+                        **args,
+                        context=context,
+                    )
+                if name == "skill_view" and not args.get("file_path"):
+                    return json.dumps({
+                        **package,
+                        "success": True,
+                        "skill_dir": str(root),
+                    }, ensure_ascii=False)
+                if name == "skill_view":
+                    return json.dumps({
+                        "success": True,
+                        "name": "portable-skill",
+                        "file": "references/runtime.md",
+                        "content": reference_content,
+                        "sha256": reference_digest,
+                        "offset": 0,
+                        "returned_chars": len(reference_content),
+                        "total_chars": len(reference_content),
+                        "next_offset": None,
+                        "has_more": False,
+                        "pagination": {
+                            "offset": 0,
+                            "returned_chars": len(reference_content),
+                            "total_chars": len(reference_content),
+                            "has_more": False,
+                            "next_offset": None,
+                        },
+                    }, ensure_ascii=False)
+                raise AssertionError(f"unexpected dispatch: {name}")
+
+            real_builder = _build_standard_skill_capability_catalog
+
+            def injected_builder(
+                skill_name,
+                loaded_package,
+                available_tools,
+                runnable_scripts,
+                authority_documents=(),
+                *,
+                request_text="",
+            ):
+                if authority_documents:
+                    raise RuntimeError(
+                        "amendment private compiler detail"
+                    )
+                return real_builder(
+                    skill_name,
+                    loaded_package,
+                    available_tools,
+                    runnable_scripts,
+                    authority_documents,
+                    request_text=request_text,
+                )
+
+            skill_record = {
+                "name": "portable-skill",
+                "description": package["description"],
+                "scope": "session",
+                "path": str(main),
+                "skill_dir": str(root),
+            }
+            with (
+                patch(
+                    "workspace_context.WORKSPACE_ROOT",
+                    Path(temp_dir) / "ws",
+                ),
+                patch("agent_loop.httpx.AsyncClient", Client),
+                patch("agent_loop.dispatch", fake_dispatch),
+                patch("agent_loop.build_system_prompt", return_value="system"),
+                patch("agent_loop.load_workspace_context", return_value=""),
+                patch("agent_loop._fetch_goal", AsyncMock(return_value=None)),
+                patch(
+                    "skills.scanner.find_all_skills",
+                    return_value=[skill_record],
+                ),
+                patch(
+                    "skills.scanner.skill_runnable_script_resources",
+                    return_value=(),
+                ),
+                patch(
+                    "agent_loop._build_standard_skill_capability_catalog",
+                    side_effect=injected_builder,
+                ),
+            ):
+                events = [
+                    event async for event in run_stream(
+                        "mock-amendment-catalog-failure",
+                        [{
+                            "role": "user",
+                            "content": "请运行 portable-skill",
+                        }],
+                        enabled,
+                        provider_override=provider,
+                        allow_session_mcp=False,
+                        user_id="u-amendment-catalog-failure",
+                        session_id="s-amendment-catalog-failure",
+                        max_iterations=6,
+                    )
+                ]
+
+        self.assertFalse(responses)
+        self.assertEqual(3, request_count)
+        self.assertEqual(
+            ["skill_view", "submit_skill_capability_plan", "skill_view"],
+            dispatch_names,
+        )
+        failed = [
+            event
+            for event in events
+            if event.get("type") == "agent_event"
+            and event.get("event_type") == "run.failed"
+        ]
+        self.assertEqual(1, len(failed))
+        self.assertEqual(
+            "amendment",
+            failed[0]["payload"]["capability_catalog_failure"]["phase"],
+        )
+        self.assertNotIn(
+            "amendment private compiler detail",
+            json.dumps(events, ensure_ascii=False),
+        )
+
     async def test_submit_reloads_main_digest_before_accepting_plan(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "portable-skill"
@@ -2116,6 +2683,14 @@ class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
                     "name": "portable-skill",
                     "file": path,
                     "content": content,
+                    **(
+                        {
+                            "sha256": hashlib.sha256(
+                                content.encode("utf-8")
+                            ).hexdigest(),
+                        }
+                        if path == "references/required.md" else {}
+                    ),
                     "has_more": False,
                 }, ensure_ascii=False)
 
@@ -2133,6 +2708,10 @@ class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
                 patch("agent_loop.build_system_prompt", return_value="system"),
                 patch("agent_loop.load_workspace_context", return_value=""),
                 patch("agent_loop._fetch_goal", AsyncMock(return_value=None)),
+                patch(
+                    "agent_loop._safe_build_standard_skill_capability_catalog",
+                    return_value=(catalog, None),
+                ),
                 patch("skills.scanner.find_all_skills", return_value=[skill_record]),
             ):
                 events = [event async for event in run_stream(

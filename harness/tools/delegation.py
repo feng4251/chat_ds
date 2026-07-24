@@ -43,6 +43,7 @@ from result_fan_in_runtime import (
     load_exact_result_text,
     materialize_fan_in_plan,
 )
+from skill_capability_plan import capability_call_satisfies_candidate
 from tools.path_security import sandbox_dir
 from workspace_patterns import (
     WorkspacePatternError,
@@ -176,6 +177,68 @@ def _content_declares_degraded_completion(content: str) -> bool:
     )
 
 
+_CAPABILITY_GAPS_JSON_PATTERN = re.compile(
+    r"(?m)^\s*CAPABILITY_GAPS_JSON:\s*(\{[^\r\n]*\})\s*$"
+)
+
+
+def _exact_capability_gap_ledger_error(
+    content: str,
+    failed_candidate_ids: list[str],
+) -> str | None:
+    """Validate a machine-readable ledger for failed exact capabilities."""
+
+    expected = list(dict.fromkeys(
+        str(identifier)
+        for identifier in failed_candidate_ids
+        if str(identifier)
+    ))
+    matches = _CAPABILITY_GAPS_JSON_PATTERN.findall(str(content or ""))
+    if len(matches) != 1:
+        return (
+            "failed exact capability candidates require exactly one "
+            "single-line CAPABILITY_GAPS_JSON ledger"
+        )
+    raw = matches[0]
+    if len(raw.encode("utf-8")) > 32_768:
+        return "CAPABILITY_GAPS_JSON exceeds the bounded 32 KiB limit"
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return "CAPABILITY_GAPS_JSON must contain valid JSON"
+    if not isinstance(payload, dict) or set(payload) != {
+        "status",
+        "failed_candidate_ids",
+    }:
+        return (
+            "CAPABILITY_GAPS_JSON must contain only status and "
+            "failed_candidate_ids"
+        )
+    if payload.get("status") != "degraded":
+        return "CAPABILITY_GAPS_JSON status must be exactly degraded"
+    actual = payload.get("failed_candidate_ids")
+    if (
+        not isinstance(actual, list)
+        or any(
+            not isinstance(identifier, str)
+            or not identifier
+            or identifier != identifier.strip()
+            for identifier in actual
+        )
+        or len(set(actual)) != len(actual)
+    ):
+        return (
+            "CAPABILITY_GAPS_JSON failed_candidate_ids must be a "
+            "duplicate-free list of exact identifiers"
+        )
+    if set(actual) != set(expected) or len(actual) != len(expected):
+        return (
+            "CAPABILITY_GAPS_JSON failed_candidate_ids must exactly cover "
+            "every failed exact capability candidate"
+        )
+    return None
+
+
 _DEGRADED_GAP_PATTERN = re.compile(
     r"\b(?:warn(?:ing)?|degraded|gap|unavailable|not available|missing|"
     r"not retrieved|not found|blocked)\b|警告|降级|缺口|不可用|缺失|未检索到|阻塞",
@@ -287,11 +350,42 @@ _MAX_CHILD_SCRIPT_ENTRYPOINTS = 1024
 _MAX_CHILD_SCRIPT_ENTRYPOINT_GUIDANCE_BYTES = 256 * 1024
 _MAX_DECLARED_PATH_CHARS = 512
 _MAX_DECLARED_SKILL_NAME_CHARS = 128
+_MAX_EXACT_CAPABILITY_BINDINGS = 64
+_MAX_EXACT_CAPABILITY_BINDINGS_BYTES = 256 * 1024
+_MAX_EXACT_CAPABILITY_ID_CHARS = 160
 _PRELOADED_READER_TOOLS = {"skill_view", "read_file", "search_files"}
 _DECLARED_SKILL_NAME_RE = re.compile(
     r"^[a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)?$",
     re.IGNORECASE,
 )
+_EXACT_CAPABILITY_BINDING_KINDS = {
+    "native_tool",
+    "mcp_tool",
+    "skill_resource",
+    "skill_script",
+    "declared_command",
+    "skill_http_prefix",
+}
+_EXACT_CAPABILITY_BINDING_FIELDS = {
+    "candidate_id",
+    "kind",
+    "tool_name",
+    "tool_names",
+    "skill_name",
+    "resource_path",
+    "sha256",
+    "package_sha256",
+    "command_id",
+    "executable",
+    "fixed_argv",
+    "additional_argv",
+    "url_prefix",
+    "http_method",
+    "runtime_profile",
+    "required_cwd",
+    "schema_sha256",
+    "descriptor_sha256",
+}
 
 # A delegated child receives the normal harness system prompt and its complete
 # tool schemas in addition to the user prompt assembled in this module.  Keep a
@@ -1369,6 +1463,687 @@ def _strict_capability_skill_list(
                 "numbers, dots, underscores, and hyphens."
             )
     return values, None
+
+
+def _strict_instruction_source_bindings(
+    task: dict[str, Any],
+) -> tuple[list[dict[str, str]], str | None]:
+    """Parse the frozen Workflow IR instruction-source prerequisite ledger."""
+
+    field = "required_instruction_source_bindings"
+    if field not in task or task.get(field) is None:
+        return [], None
+    raw = task.get(field)
+    if not isinstance(raw, list) or not raw or len(raw) > 64:
+        return [], (
+            f"{field} must be a non-empty list with at most 64 exact sources."
+        )
+    bindings: list[dict[str, str]] = []
+    seen_paths: set[str] = set()
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict) or set(item) != {
+            "resource_path",
+            "sha256",
+        }:
+            return [], (
+                f"{field}[{index}] must contain only resource_path and sha256."
+            )
+        path, path_error = _normalize_declared_relative_path(
+            item.get("resource_path"),
+            f"{field}[{index}].resource_path",
+        )
+        digest = item.get("sha256")
+        if path_error or path != item.get("resource_path"):
+            return [], path_error or (
+                f"{field}[{index}].resource_path must already be canonical."
+            )
+        if (
+            not isinstance(digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        ):
+            return [], (
+                f"{field}[{index}].sha256 must be one lowercase full SHA-256."
+            )
+        if path in seen_paths:
+            return [], f"{field} repeats resource_path {path}."
+        seen_paths.add(path)
+        bindings.append({
+            "resource_path": path,
+            "sha256": digest,
+        })
+    return bindings, None
+
+
+def _instruction_source_boundary_error(
+    bindings: list[dict[str, str]],
+    *,
+    skill_name: str,
+    context: ToolContext,
+) -> str | None:
+    """Intersect instruction sources with frozen catalog and current bytes."""
+
+    if not bindings:
+        return None
+    if not (
+        skill_name
+        and context.skill_execution_resource_boundary
+        and isinstance(context.skill_capability_catalog, dict)
+    ):
+        return (
+            "Workflow IR instruction sources require a parent-frozen Skill "
+            "capability catalog and execution resource boundary."
+        )
+    catalog = context.skill_capability_catalog
+    if str(catalog.get("skill_name") or "") != skill_name:
+        return (
+            "Workflow IR instruction sources do not match the parent-frozen "
+            "Skill catalog identity."
+        )
+    authorized_digests = {
+        "SKILL.md": str(catalog.get("body_sha256") or ""),
+        **{
+            str(document.get("resource_path") or ""): str(
+                document.get("sha256") or ""
+            )
+            for document in catalog.get("authority_documents") or []
+            if isinstance(document, dict)
+        },
+    }
+    parent_resources = set(context.allowed_skill_resources)
+    try:
+        from skills.path_safety import validate_skill_resource
+        from skills.scanner import resolve_skill_path
+
+        main = resolve_skill_path(
+            skill_name,
+            context.user_id,
+            context.session_id,
+            enabled_user_skills=list(context.enabled_user_skills),
+        )
+        if main is None:
+            raise ValueError("canonical Skill is unavailable")
+        package_root = main.parent.resolve(strict=True)
+        for binding in bindings:
+            path = binding["resource_path"]
+            expected_digest = binding["sha256"]
+            if authorized_digests.get(path) != expected_digest:
+                return (
+                    "Workflow IR instruction source "
+                    f"{path} is outside the parent-frozen digest authority."
+                )
+            if (skill_name, path) not in parent_resources:
+                return (
+                    "Workflow IR instruction source "
+                    f"{path} is outside the parent resource grant."
+                )
+            if path == "SKILL.md":
+                checked_path = main.resolve(strict=True)
+            else:
+                checked = validate_skill_resource(
+                    package_root,
+                    path,
+                    expected_kind="file",
+                    require_relative=True,
+                )
+                if not checked.valid or checked.path is None:
+                    raise ValueError(f"instruction source is unavailable: {path}")
+                checked_path = checked.path
+            actual_digest = hashlib.sha256(checked_path.read_bytes()).hexdigest()
+            if actual_digest != expected_digest:
+                return (
+                    "Workflow IR instruction source "
+                    f"{path} changed after capability-plan compilation."
+                )
+    except (OSError, RuntimeError, ValueError) as exc:
+        return f"Workflow IR instruction source revalidation failed: {exc}"
+    return None
+
+
+def _strict_exact_capability_bindings(
+    task: dict[str, Any],
+) -> tuple[list[dict[str, Any]], str, str | None]:
+    """Validate one content-addressed Workflow IR node capability boundary.
+
+    The digest proves that the list survived model/tool transport unchanged; it
+    is not authority by itself.  The caller must additionally intersect every
+    exact coordinate with the parent-owned ToolContext grants.
+    """
+
+    has_bindings = "capability_bindings" in task
+    has_digest = "capability_bindings_sha256" in task
+    if not has_bindings and not has_digest:
+        return [], "", None
+    if not has_bindings or not has_digest:
+        return [], "", (
+            "capability_bindings and capability_bindings_sha256 must be supplied "
+            "together for an exact Workflow IR node boundary."
+        )
+    raw = task.get("capability_bindings")
+    supplied_digest = task.get("capability_bindings_sha256")
+    if not isinstance(raw, list) or not raw:
+        return [], "", (
+            "capability_bindings must be a non-empty explicit list for an exact "
+            "Workflow IR node boundary."
+        )
+    if len(raw) > _MAX_EXACT_CAPABILITY_BINDINGS:
+        return [], "", (
+            "capability_bindings exceeds the bounded per-node limit of "
+            f"{_MAX_EXACT_CAPABILITY_BINDINGS}."
+        )
+    if (
+        not isinstance(supplied_digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", supplied_digest)
+    ):
+        return [], "", (
+            "capability_bindings_sha256 must be one lowercase full SHA-256."
+        )
+    try:
+        encoded = json.dumps(
+            raw,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, RecursionError):
+        return [], "", (
+            "capability_bindings must contain only finite, acyclic JSON values."
+        )
+    if len(encoded) > _MAX_EXACT_CAPABILITY_BINDINGS_BYTES:
+        return [], "", (
+            "capability_bindings exceeds the bounded UTF-8 metadata limit of "
+            f"{_MAX_EXACT_CAPABILITY_BINDINGS_BYTES} bytes."
+        )
+    actual_digest = hashlib.sha256(encoded).hexdigest()
+    if actual_digest != supplied_digest:
+        return [], actual_digest, (
+            "capability_bindings_sha256 does not match the exact canonical "
+            "capability_bindings list."
+        )
+    bindings = json.loads(encoded.decode("utf-8"))
+    seen_ids: set[str] = set()
+    for index, binding in enumerate(bindings):
+        label = f"capability_bindings[{index}]"
+        if not isinstance(binding, dict):
+            return [], actual_digest, f"{label} must be an object."
+        unknown = sorted(set(binding) - _EXACT_CAPABILITY_BINDING_FIELDS)
+        if unknown:
+            return [], actual_digest, (
+                f"{label} contains undeclared fields: {', '.join(unknown)}."
+            )
+        candidate_id = binding.get("candidate_id")
+        kind = binding.get("kind")
+        if (
+            not isinstance(candidate_id, str)
+            or not candidate_id
+            or candidate_id != candidate_id.strip()
+            or len(candidate_id) > _MAX_EXACT_CAPABILITY_ID_CHARS
+            or any(char in candidate_id for char in "\r\n\x00")
+        ):
+            return [], actual_digest, (
+                f"{label}.candidate_id must be one bounded non-empty identifier."
+            )
+        if candidate_id in seen_ids:
+            return [], actual_digest, (
+                f"capability_bindings repeats candidate_id {candidate_id}."
+            )
+        seen_ids.add(candidate_id)
+        if kind not in _EXACT_CAPABILITY_BINDING_KINDS:
+            return [], actual_digest, (
+                f"{label}.kind is not a supported exact capability kind."
+            )
+
+        raw_tool_names = binding.get("tool_names")
+        if (
+            not isinstance(raw_tool_names, list)
+            or len(raw_tool_names) > 8
+            or any(
+                not isinstance(name, str)
+                or not name
+                or name != name.strip()
+                or len(name) > 256
+                or any(char in name for char in "\r\n\x00")
+                for name in raw_tool_names
+            )
+            or len(set(raw_tool_names)) != len(raw_tool_names)
+        ):
+            return [], actual_digest, (
+                f"{label}.tool_names must be a duplicate-free bounded list of "
+                "exact tool names."
+            )
+        tool_name = binding.get("tool_name")
+        if tool_name is not None and (
+            not isinstance(tool_name, str)
+            or not tool_name
+            or tool_name != tool_name.strip()
+            or len(tool_name) > 256
+            or any(char in tool_name for char in "\r\n\x00")
+        ):
+            return [], actual_digest, (
+                f"{label}.tool_name must be one bounded exact tool name."
+            )
+        if isinstance(tool_name, str) and tool_name not in raw_tool_names:
+            return [], actual_digest, (
+                f"{label}.tool_name must also appear exactly in tool_names."
+            )
+
+        skill_value = binding.get("skill_name")
+        if skill_value is not None and (
+            not isinstance(skill_value, str)
+            or len(skill_value) > _MAX_DECLARED_SKILL_NAME_CHARS
+            or not _DECLARED_SKILL_NAME_RE.fullmatch(skill_value)
+        ):
+            return [], actual_digest, (
+                f"{label}.skill_name must be one exact safe Skill name."
+            )
+        path_value = binding.get("resource_path")
+        if path_value is not None:
+            normalized_path, path_error = _normalize_declared_relative_path(
+                path_value,
+                f"{label}.resource_path",
+            )
+            if path_error or normalized_path != path_value:
+                return [], actual_digest, (
+                    path_error
+                    or f"{label}.resource_path must already be canonical."
+                )
+        for digest_field in (
+            "sha256",
+            "package_sha256",
+            "schema_sha256",
+            "descriptor_sha256",
+        ):
+            value = binding.get(digest_field)
+            if value is not None and (
+                not isinstance(value, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", value)
+            ):
+                return [], actual_digest, (
+                    f"{label}.{digest_field} must be one lowercase full SHA-256."
+                )
+        for string_field in (
+            "command_id",
+            "executable",
+            "url_prefix",
+            "http_method",
+            "runtime_profile",
+            "required_cwd",
+        ):
+            value = binding.get(string_field)
+            if value is not None and (
+                not isinstance(value, str)
+                or not value
+                or value != value.strip()
+                or len(value) > 4096
+                or any(char in value for char in "\r\n\x00")
+            ):
+                return [], actual_digest, (
+                    f"{label}.{string_field} must be one bounded exact string."
+                )
+        fixed_argv = binding.get("fixed_argv")
+        if fixed_argv is not None and (
+            not isinstance(fixed_argv, list)
+            or len(fixed_argv) > 128
+            or any(
+                not isinstance(value, str)
+                or len(value) > 4096
+                or any(char in value for char in "\r\n\x00")
+                for value in fixed_argv
+            )
+        ):
+            return [], actual_digest, (
+                f"{label}.fixed_argv must be a bounded exact string list."
+            )
+        if (
+            "additional_argv" in binding
+            and not isinstance(binding.get("additional_argv"), bool)
+        ):
+            return [], actual_digest, (
+                f"{label}.additional_argv must be a boolean."
+            )
+
+        if kind in {"native_tool", "mcp_tool"}:
+            if not isinstance(tool_name, str) or raw_tool_names != [tool_name]:
+                return [], actual_digest, (
+                    f"{label} must bind exactly one native/MCP tool name."
+                )
+        elif kind == "skill_resource":
+            if (
+                not isinstance(skill_value, str)
+                or not isinstance(path_value, str)
+                or not isinstance(binding.get("sha256"), str)
+                or raw_tool_names
+                or tool_name is not None
+            ):
+                return [], actual_digest, (
+                    f"{label} must bind only one exact Skill resource path "
+                    "and SHA-256."
+                )
+        elif kind == "skill_script":
+            if (
+                not isinstance(skill_value, str)
+                or not isinstance(path_value, str)
+                or not isinstance(binding.get("sha256"), str)
+                or not raw_tool_names
+                or not set(raw_tool_names).issubset({
+                    "run_skill_python",
+                    "run_skill_script",
+                    "run_skill_process",
+                })
+            ):
+                return [], actual_digest, (
+                    f"{label} must bind an exact Skill script path, SHA-256, "
+                    "and one or more managed runner names."
+                )
+            if (
+                "run_skill_process" in raw_tool_names
+                and not isinstance(binding.get("package_sha256"), str)
+            ):
+                return [], actual_digest, (
+                    f"{label} requires package_sha256 for persistent execution."
+                )
+            if binding.get("runtime_profile") not in {
+                None,
+                "base-v1",
+                "browser-automation-v1",
+            } or binding.get("required_cwd") not in {
+                None,
+                "script",
+                "skill",
+            }:
+                return [], actual_digest, (
+                    f"{label} carries an unsupported script runtime profile."
+                )
+        elif kind == "declared_command":
+            if (
+                skill_value is None
+                or tool_name != "run_declared_command"
+                or raw_tool_names != ["run_declared_command"]
+                or not isinstance(binding.get("command_id"), str)
+                or not isinstance(binding.get("executable"), str)
+                or not isinstance(fixed_argv, list)
+            ):
+                return [], actual_digest, (
+                    f"{label} must bind one exact declared command tuple."
+                )
+        elif kind == "skill_http_prefix":
+            from skills.http_grants import canonical_https_prefix
+
+            expected_method = {
+                "skill_http_get": "GET",
+                "skill_http_post_json": "POST JSON",
+            }.get(str(tool_name or ""))
+            prefix = binding.get("url_prefix")
+            if (
+                skill_value is None
+                or expected_method is None
+                or raw_tool_names != [tool_name]
+                or binding.get("http_method") != expected_method
+                or not isinstance(prefix, str)
+                or canonical_https_prefix(prefix) != prefix
+            ):
+                return [], actual_digest, (
+                    f"{label} must bind one canonical exact HTTPS prefix and "
+                    "its declared method-level bridge."
+                )
+    return bindings, actual_digest, None
+
+
+def _exact_node_capability_grants(
+    bindings: list[dict[str, Any]],
+    *,
+    required_capability_skills: list[str],
+    context: ToolContext,
+) -> tuple[dict[str, Any], str | None]:
+    """Intersect a node's exact bindings with parent-owned runtime authority."""
+
+    empty = {
+        "resource_grants": [],
+        "script_grants": [],
+        "package_grants": [],
+        "command_grants": [],
+        "http_get_grants": [],
+        "http_post_grants": [],
+        "bound_tool_names": [],
+        "receipt_bindings": [],
+    }
+    if not bindings:
+        return empty, None
+    if not context.skill_execution_resource_boundary:
+        return empty, (
+            "Exact Workflow IR capability bindings require a parent-owned "
+            "Skill execution resource boundary."
+        )
+
+    parent_tools = set(context.enabled_tools)
+    parent_resources = set(context.allowed_skill_resources)
+    parent_scripts = set(context.allowed_skill_scripts)
+    parent_packages = set(context.allowed_skill_package_digests)
+    parent_commands = set(context.allowed_skill_commands)
+    parent_http_get = set(context.allowed_skill_http_prefixes)
+    parent_http_post = set(context.allowed_skill_http_post_prefixes)
+    resources: list[tuple[str, str]] = []
+    scripts: list[tuple[str, str, str]] = []
+    packages: list[tuple[str, str]] = []
+    commands: list[tuple[str, str, str, tuple[str, ...]]] = []
+    http_get: list[tuple[str, str]] = []
+    http_post: list[tuple[str, str]] = []
+    bound_tools: list[str] = []
+    receipts: list[dict[str, Any]] = []
+    binding_capability_skills: list[str] = []
+    parent_catalog = (
+        context.skill_capability_catalog
+        if isinstance(context.skill_capability_catalog, dict)
+        else None
+    )
+    parent_catalog_candidates = {
+        str(candidate.get("id") or ""): candidate
+        for candidate in (
+            parent_catalog.get("candidates") or []
+            if parent_catalog is not None else []
+        )
+        if isinstance(candidate, dict) and str(candidate.get("id") or "")
+    }
+
+    for binding in bindings:
+        kind = str(binding.get("kind") or "")
+        candidate_id = str(binding.get("candidate_id") or "")
+        tool_names = [
+            str(name) for name in binding.get("tool_names") or []
+            if str(name) and str(name) != "delegate_task"
+        ]
+        bound_tools.extend(tool_names)
+        if (
+            kind == "native_tool"
+            and binding.get("tool_name") == "delegate_task"
+        ):
+            # The parent consumes the controller candidate; it is neither
+            # recursively granted nor a child receipt obligation.
+            continue
+        catalog_candidate = parent_catalog_candidates.get(candidate_id)
+        if catalog_candidate is None:
+            return empty, (
+                f"Exact capability candidate {candidate_id} is absent from the "
+                "parent-frozen capability catalog."
+            )
+        candidate_tool_names: list[str] = []
+        catalog_tool_name = catalog_candidate.get("tool_name")
+        if isinstance(catalog_tool_name, str) and catalog_tool_name:
+            candidate_tool_names.append(catalog_tool_name)
+        raw_catalog_tool_names = catalog_candidate.get("tool_names")
+        if isinstance(raw_catalog_tool_names, list):
+            candidate_tool_names.extend(
+                str(name)
+                for name in raw_catalog_tool_names
+                if isinstance(name, str) and name
+            )
+        catalog_projection: dict[str, Any] = {
+            "candidate_id": str(catalog_candidate.get("id") or ""),
+            "kind": str(catalog_candidate.get("kind") or ""),
+            "tool_names": list(dict.fromkeys(candidate_tool_names)),
+        }
+        for field in (
+            "skill_name",
+            "resource_path",
+            "sha256",
+            "package_sha256",
+            "tool_name",
+            "command_id",
+            "executable",
+            "url_prefix",
+            "http_method",
+            "runtime_profile",
+            "required_cwd",
+            "schema_sha256",
+            "descriptor_sha256",
+        ):
+            value = catalog_candidate.get(field)
+            if isinstance(value, str) and value:
+                catalog_projection[field] = value
+        fixed_argv = catalog_candidate.get("fixed_argv")
+        if isinstance(fixed_argv, list) and all(
+            isinstance(value, str) for value in fixed_argv
+        ):
+            catalog_projection["fixed_argv"] = list(fixed_argv)
+        if isinstance(catalog_candidate.get("additional_argv"), bool):
+            catalog_projection["additional_argv"] = (
+                catalog_candidate["additional_argv"]
+            )
+        if binding != catalog_projection:
+            return empty, (
+                f"Exact capability candidate {candidate_id} coordinates differ "
+                "from the parent-frozen capability catalog."
+            )
+        missing_tools = sorted(set(tool_names) - parent_tools)
+        if missing_tools:
+            return empty, (
+                f"Exact capability candidate {candidate_id} names tools outside "
+                "the parent grant: " + ", ".join(missing_tools)
+            )
+        receipts.append(binding)
+        skill = str(binding.get("skill_name") or "")
+        if kind == "skill_resource":
+            grant = (skill, str(binding.get("resource_path") or ""))
+            if grant not in parent_resources:
+                return empty, (
+                    f"Exact capability candidate {candidate_id} resource is "
+                    "outside the parent grant."
+                )
+            expected_digest = str(binding.get("sha256") or "")
+            if expected_digest:
+                try:
+                    from skills.path_safety import validate_skill_resource
+                    from skills.scanner import resolve_skill_path
+
+                    skill_md = resolve_skill_path(
+                        skill,
+                        context.user_id,
+                        context.session_id,
+                        enabled_user_skills=list(context.enabled_user_skills),
+                    )
+                    if skill_md is None:
+                        raise ValueError("canonical Skill is unavailable")
+                    checked = validate_skill_resource(
+                        skill_md.parent.resolve(strict=True),
+                        grant[1],
+                        expected_kind="file",
+                        require_relative=True,
+                    )
+                    if not checked.valid or checked.path is None:
+                        raise ValueError("resource is unavailable")
+                    actual_digest = hashlib.sha256(
+                        checked.path.read_bytes()
+                    ).hexdigest()
+                except (OSError, RuntimeError, ValueError) as exc:
+                    return empty, (
+                        f"Exact capability candidate {candidate_id} resource "
+                        f"cannot be revalidated: {exc}"
+                    )
+                if actual_digest != expected_digest:
+                    return empty, (
+                        f"Exact capability candidate {candidate_id} resource "
+                        "changed after Workflow IR compilation."
+                    )
+            resources.append(grant)
+        elif kind == "skill_script":
+            binding_capability_skills.append(skill)
+            grant = (
+                skill,
+                str(binding.get("resource_path") or ""),
+                str(binding.get("sha256") or ""),
+            )
+            if grant not in parent_scripts:
+                return empty, (
+                    f"Exact capability candidate {candidate_id} script tuple is "
+                    "outside the parent content-addressed grant."
+                )
+            scripts.append(grant)
+            package_digest = str(binding.get("package_sha256") or "")
+            if package_digest:
+                package_grant = (skill, package_digest)
+                if package_grant not in parent_packages:
+                    return empty, (
+                        f"Exact capability candidate {candidate_id} package "
+                        "digest is outside the parent grant."
+                    )
+                packages.append(package_grant)
+        elif kind == "declared_command":
+            binding_capability_skills.append(skill)
+            grant = (
+                skill,
+                str(binding.get("command_id") or ""),
+                str(binding.get("executable") or ""),
+                tuple(str(value) for value in binding.get("fixed_argv") or []),
+            )
+            if grant not in parent_commands:
+                return empty, (
+                    f"Exact capability candidate {candidate_id} command tuple is "
+                    "outside the parent grant."
+                )
+            commands.append(grant)
+        elif kind == "skill_http_prefix":
+            binding_capability_skills.append(skill)
+            grant = (skill, str(binding.get("url_prefix") or ""))
+            if binding.get("tool_name") == "skill_http_post_json":
+                if grant not in parent_http_post:
+                    return empty, (
+                        f"Exact capability candidate {candidate_id} POST prefix "
+                        "is outside the parent grant."
+                    )
+                http_post.append(grant)
+            else:
+                if grant not in parent_http_get:
+                    return empty, (
+                        f"Exact capability candidate {candidate_id} GET prefix "
+                        "is outside the parent grant."
+                    )
+                http_get.append(grant)
+
+    exact_skill_set = set(binding_capability_skills)
+    if set(required_capability_skills) != exact_skill_set:
+        return empty, (
+            "required_capability_skills must equal the exact Skill set carried "
+            "by this node's script/command/HTTP bindings."
+        )
+    for skill in required_capability_skills:
+        main = (skill, "SKILL.md")
+        if main not in parent_resources:
+            return empty, (
+                "Exact node capability Skill main is outside the parent resource "
+                f"grant: {skill}/SKILL.md"
+            )
+        resources.append(main)
+
+    return {
+        "resource_grants": list(dict.fromkeys(resources)),
+        "script_grants": list(dict.fromkeys(scripts)),
+        "package_grants": list(dict.fromkeys(packages)),
+        "command_grants": list(dict.fromkeys(commands)),
+        "http_get_grants": list(dict.fromkeys(http_get)),
+        "http_post_grants": list(dict.fromkeys(http_post)),
+        "bound_tool_names": list(dict.fromkeys(bound_tools)),
+        "receipt_bindings": receipts,
+    }, None
 
 
 def _strict_result_field_list(
@@ -2640,6 +3415,11 @@ async def _run_child(
     required_capability_skills, capability_skill_metadata_error = (
         _strict_capability_skill_list(task)
     )
+    (
+        capability_bindings,
+        capability_bindings_sha256,
+        capability_bindings_metadata_error,
+    ) = _strict_exact_capability_bindings(task)
     required_skill_files_to_inspect, skill_inspection_metadata_error = (
         _strict_task_string_list(
             task,
@@ -2647,6 +3427,50 @@ async def _run_child(
             normalize_path=True,
         )
     )
+    (
+        required_instruction_source_bindings,
+        instruction_source_metadata_error,
+    ) = _strict_instruction_source_bindings(task)
+    exact_workflow_controller_binding = bool(
+        capability_bindings
+        and capability_bindings_metadata_error is None
+        and context.skill_execution_resource_boundary
+        and skill_name
+        and step_id
+        and step_type.casefold() in {"worker", "aggregation"}
+        and any(
+            binding.get("kind") == "native_tool"
+            and binding.get("tool_name") == "delegate_task"
+            for binding in capability_bindings
+        )
+    )
+    exact_zero_tool_workflow_node = bool(
+        exact_workflow_controller_binding
+        and (
+            worker_file
+            or required_skill_files_to_inspect
+            or required_result_paths
+        )
+        and all(
+            binding.get("kind") == "native_tool"
+            and binding.get("tool_name") == "delegate_task"
+            for binding in capability_bindings
+        )
+    )
+    if (
+        exact_workflow_controller_binding
+        and instruction_source_metadata_error is None
+        and not required_instruction_source_bindings
+    ):
+        # An exact delegate controller binding is emitted only by the Workflow
+        # IR compiler.  Requiring its frozen source ledger here closes direct
+        # handler calls as well as the ordinary agent-loop gate: callers may
+        # not turn preloaded file names into self-asserted instruction
+        # authority by omitting the content-addressed binding.
+        instruction_source_metadata_error = (
+            "Exact Workflow IR nodes require a non-empty "
+            "required_instruction_source_bindings ledger."
+        )
     if not goal:
         return {
             "index": index,
@@ -2696,6 +3520,7 @@ async def _run_child(
         isinstance(requested_tools, list)
         and not requested_tools
         and not is_model_intent_classifier
+        and not exact_zero_tool_workflow_node
     ):
         return {
             "index": index,
@@ -2713,30 +3538,118 @@ async def _run_child(
             ),
             **_contract_failure_fields(),
         }
-    if isinstance(requested_tools, list):
-        # Session MCP tools deliberately do not live in the process-global
-        # registry, so registry metadata cannot authorize them here. Resolve
-        # their names from this exact tenant/session instead, and still require
-        # the parent to have granted and the task to have explicitly requested
-        # each one. The child run loop applies the same exact-name filter when
-        # it injects model-visible MCP schemas.
-        try:
-            from tools.mcp_client import get_session_tool_names
+    requested_tool_names = (
+        [str(name) for name in requested_tools]
+        if isinstance(requested_tools, list)
+        else [str(name) for name in context.enabled_tools]
+    )
+    requested_mcp_names = [
+        name for name in requested_tool_names if name.startswith("mcp_")
+    ]
+    child_frozen_mcp_catalog = None
+    mcp_contract_rejections: dict[str, str] = {}
+    missing_parent_mcp_authority = False
+    # Session MCP tools deliberately do not live in the process-global
+    # registry. Resolve a non-widening child catalog from the parent's frozen
+    # surface when available, then intersect it with current live state. The
+    # task-local inherited boundary also protects nested delegates whose
+    # ToolContext was created by an older compatibility entry point.
+    try:
+        from tools.mcp_client import (
+            freeze_child_session_mcp_catalog,
+            get_inherited_frozen_mcp_catalog,
+        )
+        from tools.mcp_contract import (
+            freeze_mcp_catalog,
+            intersect_mcp_catalogs,
+        )
 
-            session_mcp_names = set(
-                get_session_tool_names(context.user_id, context.session_id)
+        context_mcp_catalog = context.frozen_mcp_catalog
+        inherited_mcp_catalog = get_inherited_frozen_mcp_catalog(
+            context.user_id,
+            context.session_id,
+        )
+        if (
+            context_mcp_catalog is not None
+            and inherited_mcp_catalog is not None
+        ):
+            # Nested compatibility paths may carry an older/broader explicit
+            # context. The active task-local boundary is already parent-owned,
+            # so intersect both before consulting live state.
+            parent_mcp_catalog = intersect_mcp_catalogs(
+                inherited_mcp_catalog,
+                context_mcp_catalog,
+                allowed_tool_names=requested_mcp_names,
             )
-        except Exception:
-            session_mcp_names = set()
-        requested_tool_names = [str(name) for name in requested_tools]
+        else:
+            parent_mcp_catalog = (
+                context_mcp_catalog or inherited_mcp_catalog
+            )
+        if not requested_mcp_names:
+            child_frozen_mcp_catalog = freeze_mcp_catalog(
+                (),
+                parent_catalog_revision=(
+                    parent_mcp_catalog.catalog_revision
+                    if parent_mcp_catalog is not None else None
+                ),
+            )
+        elif parent_mcp_catalog is not None:
+            child_frozen_mcp_catalog = freeze_child_session_mcp_catalog(
+                parent_mcp_catalog,
+                context.user_id,
+                context.session_id,
+                allowed_tool_names=requested_mcp_names,
+            )
+        else:
+            # A legacy/compatibility caller without a sealed parent catalog has
+            # no MCP authority to delegate. Consulting live state here and
+            # intersecting it with itself would let a child acquire capabilities
+            # that were never frozen for its parent run.
+            missing_parent_mcp_authority = True
+            child_frozen_mcp_catalog = freeze_mcp_catalog(
+                (),
+                parent_catalog_revision=None,
+            )
+        session_mcp_descriptors = {
+            descriptor.public_name: descriptor
+            for descriptor in child_frozen_mcp_catalog.descriptors
+        }
+        session_mcp_names = set(session_mcp_descriptors)
+        mcp_contract_rejections = {
+            rejected.public_name: rejected.reason
+            for rejected in child_frozen_mcp_catalog.rejected_tools
+        }
+        if missing_parent_mcp_authority:
+            mcp_contract_rejections.update({
+                name: "parent_frozen_mcp_catalog_missing"
+                for name in requested_mcp_names
+            })
+    except Exception:
+        session_mcp_descriptors = {}
+        session_mcp_names = set()
+        child_frozen_mcp_catalog = None
+
+    if isinstance(requested_tools, list):
         tools = [
             str(name) for name in requested_tools
             if (
                 str(name) in context.enabled_tools
                 and (
-                    str(name) in session_mcp_names
-                    or _tool_allowed_in_child(
-                        str(name), parallel_child=parallel_child
+                    (
+                        str(name).startswith("mcp_")
+                        and str(name) in session_mcp_names
+                        and (
+                            not parallel_child
+                            or session_mcp_descriptors[
+                                str(name)
+                            ].policy.parallel_child_safe
+                        )
+                    )
+                    or (
+                        not str(name).startswith("mcp_")
+                        and _tool_allowed_in_child(
+                            str(name), parallel_child=parallel_child
+                        )
                     )
                 )
             )
@@ -2756,25 +3669,70 @@ async def _run_child(
                 "requested_tools": requested_tool_names,
                 "effective_tools": tools,
                 "rejected_tools": rejected_tools,
+                "mcp_contract_rejections": {
+                    name: mcp_contract_rejections[name]
+                    for name in rejected_tools
+                    if name in mcp_contract_rejections
+                },
                 "error": (
                     "Explicit child tool allowlist was rejected before model "
                     "execution. Every requested tool must be parent-granted, "
                     "available in this exact session, and safe for the child "
                     "execution mode; rejected: " + ", ".join(rejected_tools)
+                    + (
+                        "; frozen MCP contract: "
+                        + "; ".join(
+                            f"{name}: {mcp_contract_rejections[name]}"
+                            for name in rejected_tools
+                            if name in mcp_contract_rejections
+                        )
+                        if any(
+                            name in mcp_contract_rejections
+                            for name in rejected_tools
+                        )
+                        else ""
+                    )
                 ),
-                **_contract_failure_fields(),
+                **_contract_failure_fields(
+                    "mcp_capability_contract_violation"
+                    if any(
+                        name in mcp_contract_rejections
+                        for name in rejected_tools
+                    )
+                    else "delegation_contract_invalid"
+                ),
             }
     else:
         tools = [
             name for name in context.enabled_tools
-            if _tool_allowed_in_child(name, parallel_child=parallel_child)
+            if (
+                (
+                    name.startswith("mcp_")
+                    and name in session_mcp_names
+                    and (
+                        not parallel_child
+                        or session_mcp_descriptors[
+                            name
+                        ].policy.parallel_child_safe
+                    )
+                )
+                or (
+                    not name.startswith("mcp_")
+                    and _tool_allowed_in_child(
+                        name,
+                        parallel_child=parallel_child,
+                    )
+                )
+            )
         ]
     metadata_error = (
         result_path_metadata_error
         or worker_file_metadata_error
         or capability_metadata_error
         or capability_skill_metadata_error
+        or capability_bindings_metadata_error
         or skill_inspection_metadata_error
+        or instruction_source_metadata_error
         or result_field_metadata_error
         or result_schema_metadata_error
         or retrieval_policy_metadata_error
@@ -2790,6 +3748,68 @@ async def _run_child(
                 "effective explicit capability allowlist; missing: "
                 + ", ".join(missing_capability_grants)
             )
+    exact_node_capability_grants: dict[str, Any] | None = None
+    if metadata_error is None and capability_bindings:
+        (
+            exact_node_capability_grants,
+            exact_binding_boundary_error,
+        ) = _exact_node_capability_grants(
+            capability_bindings,
+            required_capability_skills=required_capability_skills,
+            context=context,
+        )
+        if exact_binding_boundary_error:
+            metadata_error = exact_binding_boundary_error
+        else:
+            exact_bound_tools = set(
+                exact_node_capability_grants.get("bound_tool_names") or []
+            )
+            unexpected_tools = sorted(
+                set(tools) - exact_bound_tools - _PRELOADED_READER_TOOLS
+            )
+            if unexpected_tools:
+                metadata_error = (
+                    "Exact Workflow IR node tools must be limited to its own "
+                    "capability bindings plus deterministic prerequisite readers; "
+                    "unexpected: " + ", ".join(unexpected_tools)
+                )
+            else:
+                for binding in (
+                    exact_node_capability_grants.get("receipt_bindings") or []
+                ):
+                    kind = str(binding.get("kind") or "")
+                    candidate_tools = set(binding.get("tool_names") or [])
+                    if kind == "skill_resource":
+                        available = "skill_view" in tools
+                    else:
+                        available = bool(candidate_tools.intersection(tools))
+                    if not available:
+                        metadata_error = (
+                            "Exact Workflow IR capability candidate "
+                            f"{binding.get('candidate_id')} has no usable tool in "
+                            "the child's explicit allowlist."
+                        )
+                        break
+    if metadata_error is None and required_instruction_source_bindings:
+        missing_instruction_preloads = sorted(
+            {
+                binding["resource_path"]
+                for binding in required_instruction_source_bindings
+            }
+            - set(required_skill_files_to_inspect)
+        )
+        if missing_instruction_preloads:
+            metadata_error = (
+                "Every frozen Workflow IR instruction source must be included "
+                "in required_skill_files_to_inspect; missing: "
+                + ", ".join(missing_instruction_preloads)
+            )
+        else:
+            metadata_error = _instruction_source_boundary_error(
+                required_instruction_source_bindings,
+                skill_name=skill_name,
+                context=context,
+            )
     if (
         metadata_error is None
         and required_skill_files_to_inspect
@@ -2800,12 +3820,22 @@ async def _run_child(
         )
     if metadata_error is None and worker_file and not skill_name:
         metadata_error = "skill_name is required when worker_file is declared."
-    if metadata_error is None and required_result_paths and "read_file" not in tools:
+    if (
+        metadata_error is None
+        and required_result_paths
+        and "read_file" not in tools
+        and not exact_zero_tool_workflow_node
+    ):
         metadata_error = (
             "required_result_paths requires read_file in the child's effective "
             "explicit capability allowlist."
         )
-    if metadata_error is None and worker_file and "skill_view" not in tools:
+    if (
+        metadata_error is None
+        and worker_file
+        and "skill_view" not in tools
+        and not exact_zero_tool_workflow_node
+    ):
         metadata_error = (
             "worker_file requires skill_view in the child's effective explicit "
             "capability allowlist."
@@ -2814,6 +3844,7 @@ async def _run_child(
         metadata_error is None
         and required_skill_files_to_inspect
         and "skill_view" not in tools
+        and not exact_zero_tool_workflow_node
     ):
         metadata_error = (
             "required_skill_files_to_inspect requires skill_view in the child's "
@@ -2870,7 +3901,17 @@ async def _run_child(
             ),
             "required_capability_tools": required_capability_tools,
             "required_capability_skills": required_capability_skills,
+            "capability_bindings_sha256": (
+                capability_bindings_sha256 or None
+            ),
+            "capability_binding_candidate_ids": [
+                str(binding.get("candidate_id") or "")
+                for binding in capability_bindings
+            ],
             "required_skill_files_to_inspect": required_skill_files_to_inspect,
+            "required_instruction_source_bindings": (
+                required_instruction_source_bindings
+            ),
             "error": metadata_error,
             **_contract_failure_fields(),
         }
@@ -2936,9 +3977,48 @@ async def _run_child(
             if required_result_fields else ""
         )
         + (
+            "Required exact capability candidates (each candidate requires one "
+            "distinct real handler dispatch receipt; calling another candidate "
+            "that shares the same public tool name does not satisfy it). If an "
+            "exact candidate dispatch fails, return a result-level degraded "
+            "status and exactly one single-line ledger "
+            '`CAPABILITY_GAPS_JSON: {"status":"degraded",'
+            '"failed_candidate_ids":["<exact candidate id>",...]}` whose IDs '
+            "exactly cover every failed candidate receipt. Candidates: "
+            + json.dumps(
+                [
+                    {
+                        key: binding.get(key)
+                        for key in (
+                            "candidate_id",
+                            "kind",
+                            "tool_name",
+                            "tool_names",
+                            "skill_name",
+                            "resource_path",
+                            "sha256",
+                            "command_id",
+                            "url_prefix",
+                            "http_method",
+                        )
+                        if binding.get(key) not in (None, "", [])
+                    }
+                    for binding in (
+                        (exact_node_capability_grants or {}).get(
+                            "receipt_bindings"
+                        ) or []
+                    )
+                ],
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n"
+            if capability_bindings else ""
+        )
+        + (
             "Required evidence capabilities (at least one must actually be "
             f"attempted): {', '.join(required_capability_tools)}\n"
-            if required_capability_tools else ""
+            if required_capability_tools and not capability_bindings else ""
         )
         + (
             "Required capability Skill mains already loaded by the harness "
@@ -2950,6 +4030,17 @@ async def _run_child(
             "before model execution: "
             f"{', '.join(required_skill_files_to_inspect)}\n"
             if required_skill_files_to_inspect else ""
+        )
+        + (
+            "Frozen Workflow IR instruction sources (the harness verifies each "
+            "whole-resource SHA-256 before model execution): "
+            + json.dumps(
+                required_instruction_source_bindings,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n"
+            if required_instruction_source_bindings else ""
         )
         + (
             "\nUse the exact worker contract preloaded by the harness before execution; "
@@ -3137,6 +4228,7 @@ async def _run_child(
     successful_tool_calls: list[
         tuple[str, dict[str, Any], list[dict[str, Any]]]
     ] = []
+    dispatched_tool_calls: list[dict[str, Any]] = []
     non_evidentiary_runner_calls: list[dict[str, Any]] = []
     successful_artifact_calls: list[
         tuple[str, str, dict[str, Any], list[dict[str, Any]]]
@@ -3314,6 +4406,10 @@ async def _run_child(
             "required_result_schema": required_result_schema,
             "required_capability_tools": required_capability_tools,
             "required_capability_skills": required_capability_skills,
+            "capability_bindings_sha256": (
+                capability_bindings_sha256 or None
+            ),
+            "capability_binding_count": len(capability_bindings),
             "required_skill_files_to_inspect": required_skill_files_to_inspect,
             "parallel_child": parallel_child,
             "requested_tools": requested_tools or [],
@@ -3818,7 +4914,11 @@ async def _run_child(
         )
     )
     capability_resource_grant_error = None
-    if delegated_resource_boundary and required_capability_skills:
+    if capability_bindings:
+        capability_resource_grants = list(
+            (exact_node_capability_grants or {}).get("resource_grants") or []
+        )
+    elif delegated_resource_boundary and required_capability_skills:
         capability_resource_grants, capability_resource_grant_error = (
             _exact_capability_skill_resource_grants(
                 required_capability_skills,
@@ -3838,13 +4938,19 @@ async def _run_child(
         [(skill_name, path) for path in skill_preload_paths]
         + capability_resource_grants
     ))
-    allowed_skill_scripts = _exact_declared_skill_script_grants(
-        skill_name=skill_name,
-        skill_preload_paths=skill_preload_paths,
-        required_capability_skills=required_capability_skills,
-        user_id=context.user_id,
-        session_id=context.session_id,
-        context=context,
+    allowed_skill_scripts = (
+        list(
+            (exact_node_capability_grants or {}).get("script_grants") or []
+        )
+        if capability_bindings
+        else _exact_declared_skill_script_grants(
+            skill_name=skill_name,
+            skill_preload_paths=skill_preload_paths,
+            required_capability_skills=required_capability_skills,
+            user_id=context.user_id,
+            session_id=context.session_id,
+            context=context,
+        )
     )
     allowed_script_keys = {
         (skill, path, digest)
@@ -3866,11 +4972,17 @@ async def _run_child(
     allowed_script_skills = {
         skill for skill, _path, _digest in allowed_skill_scripts
     }
-    allowed_skill_package_digests = [
-        row
-        for row in context.allowed_skill_package_digests
-        if len(row) == 2 and row[0] in allowed_script_skills
-    ]
+    allowed_skill_package_digests = (
+        list(
+            (exact_node_capability_grants or {}).get("package_grants") or []
+        )
+        if capability_bindings
+        else [
+            row
+            for row in context.allowed_skill_package_digests
+            if len(row) == 2 and row[0] in allowed_script_skills
+        ]
+    )
     try:
         exact_script_entrypoint_guidance = (
             _render_exact_child_script_entrypoints(allowed_skill_scripts)
@@ -3884,20 +4996,36 @@ async def _run_child(
             )
     if exact_script_entrypoint_guidance:
         prompt += "\n\n" + exact_script_entrypoint_guidance
-    allowed_skill_http_prefixes = _exact_capability_skill_http_grants(
-        required_capability_skills,
-        context=context,
-    )
-    allowed_skill_http_post_prefixes = (
-        _exact_capability_skill_http_post_grants(
+    allowed_skill_http_prefixes = (
+        list(
+            (exact_node_capability_grants or {}).get("http_get_grants") or []
+        )
+        if capability_bindings
+        else _exact_capability_skill_http_grants(
             required_capability_skills,
             context=context,
         )
     )
-    allowed_skill_commands = _exact_declared_skill_command_grants(
-        task=task,
-        required_capability_skills=required_capability_skills,
-        context=context,
+    allowed_skill_http_post_prefixes = (
+        list(
+            (exact_node_capability_grants or {}).get("http_post_grants") or []
+        )
+        if capability_bindings
+        else _exact_capability_skill_http_post_grants(
+            required_capability_skills,
+            context=context,
+        )
+    )
+    allowed_skill_commands = (
+        list(
+            (exact_node_capability_grants or {}).get("command_grants") or []
+        )
+        if capability_bindings
+        else _exact_declared_skill_command_grants(
+            task=task,
+            required_capability_skills=required_capability_skills,
+            context=context,
+        )
     )
     allowed_read_paths = list(dict.fromkeys(required_result_paths))
     has_on_demand_capability_resources = any(
@@ -4012,6 +5140,18 @@ async def _run_child(
     preloaded_result_bytes = 0
     prerequisite_fan_in: dict[str, Any] | None = None
     verified_preloaded_input_receipt: dict[str, Any] | None = None
+    exact_resource_binding_digests = {
+        (
+            str(binding.get("skill_name") or ""),
+            str(binding.get("resource_path") or ""),
+        ): str(binding.get("sha256") or "")
+        for binding in capability_bindings
+        if binding.get("kind") == "skill_resource"
+    }
+    exact_resource_binding_digests.update({
+        (skill_name, binding["resource_path"]): binding["sha256"]
+        for binding in required_instruction_source_bindings
+    })
     preload_error = capability_resource_grant_error
     if preload_started:
         if preload_error is None:
@@ -4184,6 +5324,31 @@ async def _run_child(
                 and tool_succeeded
                 and completeness_error is None
             ):
+                expected_resource_digest = (
+                    exact_resource_binding_digests.get((
+                        str(tool_args.get("name") or ""),
+                        str(tool_args.get("file_path") or ""),
+                    ))
+                )
+                if (
+                    expected_resource_digest
+                    and (
+                        not isinstance(preload_pagination, dict)
+                        or preload_pagination.get("complete") is not True
+                        or preload_pagination.get("sha256")
+                        != expected_resource_digest
+                    )
+                ):
+                    completeness_error = (
+                        "exact Skill resource changed after Workflow IR "
+                        "compilation or its EOF receipt omitted the compiled "
+                        "SHA-256"
+                    )
+            if (
+                tool_name == "skill_view"
+                and tool_succeeded
+                and completeness_error is None
+            ):
                 try:
                     _render_preloaded_prerequisites(
                         [
@@ -4215,6 +5380,27 @@ async def _run_child(
                         f"{MAX_TOTAL_EXACT_RESULT_BYTES} bytes"
                     )
             succeeded = tool_succeeded and completeness_error is None
+            dispatched_tool_calls.append({
+                "tool_name": tool_name,
+                "args": dict(tool_args),
+                "outcome": "success" if succeeded else "error",
+                "artifacts": [],
+                "result_data": (
+                    {
+                        "sha256": preload_pagination.get("sha256"),
+                    }
+                    if (
+                        tool_name == "skill_view"
+                        and isinstance(preload_pagination, dict)
+                    )
+                    else {}
+                ),
+                "skill_resource_complete": (
+                    True
+                    if tool_name == "skill_view" and succeeded
+                    else None
+                ),
+            })
             await forward_event({
                 "type": "agent_event",
                 "event_type": "tool.completed" if succeeded else "tool.failed",
@@ -5001,7 +6187,7 @@ async def _run_child(
 
     from agent_loop import run_stream
 
-    async for event in run_stream(
+    child_runtime_stream = run_stream(
         context.model_id,
         [{"role": "user", "content": prompt}],
         model_tools,
@@ -5062,6 +6248,15 @@ async def _run_child(
         declared_artifact_patterns=(
             artifact_output_patterns if is_artifact_synthesis else None
         ),
+    )
+    from tools.mcp_client import (
+        iterate_with_inherited_frozen_mcp_catalog,
+    )
+    async for event in iterate_with_inherited_frozen_mcp_catalog(
+        child_runtime_stream,
+        user_id=context.user_id,
+        session_id=context.session_id,
+        catalog=child_frozen_mcp_catalog,
     ):
         if event["type"] == "delta":
             value = str(event.get("content", "") or "")
@@ -5218,14 +6413,6 @@ async def _run_child(
                     # and cannot satisfy a required evidence-capability audit.
                     continue
                 attempted_tools.add(tool_name)
-                succeeded = (
-                    event_type == "tool.completed"
-                    and outcome.casefold() == "success"
-                )
-                if not succeeded:
-                    dispatch_audit_args.pop(tool_call_id, None)
-                    continue
-                successful_tools.add(tool_name)
                 canonical_args = dispatch_audit_args.pop(
                     tool_call_id,
                     None,
@@ -5234,6 +6421,10 @@ async def _run_child(
                     canonical_args = (
                         pending[1] if not pending[3] else {}
                     )
+                succeeded = (
+                    event_type == "tool.completed"
+                    and outcome.casefold() == "success"
+                )
                 emitted_artifacts = payload.get("artifacts")
                 if not isinstance(emitted_artifacts, list):
                     emitted_artifacts = []
@@ -5242,6 +6433,17 @@ async def _run_child(
                     for item in emitted_artifacts[:512]
                     if isinstance(item, dict)
                 ]
+                dispatched_tool_calls.append({
+                    "tool_name": tool_name,
+                    "args": canonical_args,
+                    "outcome": "success" if succeeded else "error",
+                    "artifacts": emitted_artifacts,
+                    "result_data": {},
+                    "skill_resource_complete": None,
+                })
+                if not succeeded:
+                    continue
+                successful_tools.add(tool_name)
                 successful_tool_calls.append((
                     tool_name,
                     canonical_args,
@@ -5632,7 +6834,134 @@ async def _run_child(
     successful_required_capabilities = sorted(
         required_capability_set & successful_tools
     )
-    for script_runner in ("run_skill_python", "run_skill_script"):
+    capability_receipt_audit: dict[str, Any] = {}
+    if capability_bindings:
+        required_exact_bindings = list(
+            (exact_node_capability_grants or {}).get("receipt_bindings") or []
+        )
+        unmatched_call_indexes = set(range(len(dispatched_tool_calls)))
+        exact_receipts: list[dict[str, Any]] = []
+        missing_exact_candidate_ids: list[str] = []
+        failed_exact_candidate_ids: list[str] = []
+        successful_exact_candidate_ids: list[str] = []
+        for binding in required_exact_bindings:
+            matched_index: int | None = None
+            for call_index in sorted(unmatched_call_indexes):
+                call = dispatched_tool_calls[call_index]
+                call_tool_name = str(call.get("tool_name") or "")
+                call_args = (
+                    call.get("args")
+                    if isinstance(call.get("args"), dict)
+                    else {}
+                )
+                artifacts = (
+                    call.get("artifacts")
+                    if isinstance(call.get("artifacts"), list)
+                    else []
+                )
+                if (
+                    binding.get("kind") == "skill_script"
+                    and not _script_call_has_semantic_task_binding(
+                        call_tool_name,
+                        call_args,
+                        artifacts,
+                    )
+                ):
+                    continue
+                if capability_call_satisfies_candidate(
+                    binding,
+                    tool_name=call_tool_name,
+                    args=call_args,
+                    result_data=(
+                        call.get("result_data")
+                        if isinstance(call.get("result_data"), dict)
+                        else {}
+                    ),
+                    outcome=str(call.get("outcome") or "error"),
+                    skill_resource_complete=call.get(
+                        "skill_resource_complete"
+                    ),
+                    allowed_skill_scripts=allowed_skill_scripts,
+                    allowed_skill_commands=allowed_skill_commands,
+                    allowed_skill_http_prefixes=(
+                        allowed_skill_http_prefixes
+                    ),
+                    allowed_skill_http_post_prefixes=(
+                        allowed_skill_http_post_prefixes
+                    ),
+                ):
+                    matched_index = call_index
+                    break
+            candidate_id = str(binding.get("candidate_id") or "")
+            if matched_index is None:
+                missing_exact_candidate_ids.append(candidate_id)
+                continue
+            unmatched_call_indexes.remove(matched_index)
+            matched_call = dispatched_tool_calls[matched_index]
+            matched_outcome = str(matched_call.get("outcome") or "error")
+            exact_receipts.append({
+                "candidate_id": candidate_id,
+                "kind": str(binding.get("kind") or ""),
+                "tool_name": str(matched_call.get("tool_name") or ""),
+                "outcome": matched_outcome,
+            })
+            if matched_outcome == "success":
+                successful_exact_candidate_ids.append(candidate_id)
+            else:
+                failed_exact_candidate_ids.append(candidate_id)
+        capability_receipt_audit = {
+            "mode": "exact_candidate",
+            "capability_bindings_sha256": capability_bindings_sha256,
+            "required_candidate_ids": [
+                str(binding.get("candidate_id") or "")
+                for binding in required_exact_bindings
+            ],
+            "satisfied_candidate_ids": [
+                str(receipt.get("candidate_id") or "")
+                for receipt in exact_receipts
+            ],
+            "successful_candidate_ids": successful_exact_candidate_ids,
+            "failed_candidate_ids": failed_exact_candidate_ids,
+            "missing_candidate_ids": missing_exact_candidate_ids,
+            "receipts": exact_receipts,
+        }
+        if validation_error is None and missing_exact_candidate_ids:
+            validation_error = (
+                "Delegated step did not produce one distinct exact dispatch "
+                "receipt for every required capability candidate; missing: "
+                + ", ".join(missing_exact_candidate_ids)
+            )
+        if validation_error is None and failed_exact_candidate_ids:
+            if not _content_declares_degraded_completion(content):
+                validation_error = (
+                    "One or more exact required capability candidates failed; "
+                    "completion requires an explicit result-level degraded "
+                    "status and a structured capability gap ledger: "
+                    + ", ".join(failed_exact_candidate_ids)
+                )
+            else:
+                gap_ledger_error = _exact_capability_gap_ledger_error(
+                    content,
+                    failed_exact_candidate_ids,
+                )
+                if gap_ledger_error:
+                    validation_error = (
+                        gap_ledger_error + "; failed candidates: "
+                        + ", ".join(failed_exact_candidate_ids)
+                    )
+    else:
+        capability_receipt_audit = {
+            "mode": "legacy_tool_alternative",
+            "required_tool_names": list(required_capability_tools),
+            "attempted_tool_names": attempted_required_capabilities,
+            "successful_tool_names": successful_required_capabilities,
+        }
+
+    for script_runner in (
+        ("run_skill_python", "run_skill_script")
+        if not capability_bindings
+        else ()
+    ):
         if not (
             required_capability_skills
             and script_runner in successful_required_capabilities
@@ -5682,6 +7011,7 @@ async def _run_child(
                 })
     if (
         validation_error is None
+        and not capability_bindings
         and required_capability_tools
         and not attempted_required_capabilities
     ):
@@ -5691,6 +7021,7 @@ async def _run_child(
         )
     if (
         validation_error is None
+        and not capability_bindings
         and attempted_required_capabilities
         and not successful_required_capabilities
         and not _DEGRADED_REPORT_PATTERN.search(content)
@@ -5698,6 +7029,10 @@ async def _run_child(
         validation_error = (
             "Every attempted required evidence capability failed; completion "
             "requires an explicit WARN/degraded report naming the evidence gap."
+        )
+    if not capability_bindings:
+        capability_receipt_audit["successful_tool_names"] = list(
+            successful_required_capabilities
         )
     # A provider may report length/budget exhaustion after already returning a
     # machine-complete child payload. Accept it only when every typed output,
@@ -5872,6 +7207,7 @@ async def _run_child(
     # authoritative child terminal here.  Content may span bounded transport
     # chunks, but the ordered chunks form one release transaction and contain
     # every accepted byte exactly once.  Hidden reasoning is never released.
+    content_sha256 = ""
     if error is None:
         content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
         chunk_count = max(
@@ -5961,7 +7297,14 @@ async def _run_child(
         "required_result_paths": required_result_paths,
         "required_capability_tools": required_capability_tools,
         "required_capability_skills": required_capability_skills,
+        "capability_bindings_sha256": (
+            capability_bindings_sha256 or None
+        ),
+        "capability_receipt_audit": capability_receipt_audit,
         "required_skill_files_to_inspect": required_skill_files_to_inspect,
+        "required_instruction_source_bindings": (
+            required_instruction_source_bindings
+        ),
         "child_run_id": child_run_id,
         "agent_name": agent_name,
         "agent_kind": "delegate",
@@ -5979,6 +7322,7 @@ async def _run_child(
         "result_excerpt": content[:1000] if content and error is None else "",
         "result_path": result_path,
         "result_chars": len(content),
+        "result_sha256": content_sha256 or None,
         "result_shape": {
             "semantic_short_result_valid": bool(
                 error is None
@@ -6061,7 +7405,12 @@ async def delegate_task(
     required_result_paths: list[str] | None = None,
     required_capability_tools: list[str] | None = None,
     required_capability_skills: list[str] | None = None,
+    capability_bindings: list[dict[str, Any]] | None = None,
+    capability_bindings_sha256: str | None = None,
     required_skill_files_to_inspect: list[str] | None = None,
+    required_instruction_source_bindings: (
+        list[dict[str, str]] | None
+    ) = None,
     deterministic_intent_selections: dict[str, str] | None = None,
     required_skill_files: list[str] | None = None,
     parallel_stage: bool = False,
@@ -6092,8 +7441,19 @@ async def delegate_task(
             "required_capability_tools": required_capability_tools,
             "required_capability_skills": required_capability_skills,
             "required_skill_files_to_inspect": required_skill_files_to_inspect,
+            "required_instruction_source_bindings": (
+                required_instruction_source_bindings
+            ),
             "parallel_stage": parallel_stage,
         }
+        if (
+            capability_bindings is not None
+            or capability_bindings_sha256 is not None
+        ):
+            single_task["capability_bindings"] = capability_bindings
+            single_task["capability_bindings_sha256"] = (
+                capability_bindings_sha256
+            )
         if (
             deterministic_intent_selections is not None
             or required_skill_files is not None
@@ -6267,6 +7627,14 @@ async def delegate_task(
                 ),
             }
         elif isinstance(raw_result, BaseException):
+            raw_exception_mutation_count = dispatch_receipt_audit.get(
+                "mutating_dispatch_count"
+            )
+            raw_exception_retry_safe = bool(
+                isinstance(raw_exception_mutation_count, int)
+                and not isinstance(raw_exception_mutation_count, bool)
+                and raw_exception_mutation_count == 0
+            )
             result: dict[str, Any] = {
                 "index": index,
                 "status": "error",
@@ -6282,16 +7650,16 @@ async def delegate_task(
                 **_child_failure_fields(
                     raw_result,
                     (
-                        "delegated_child_exception_after_mutating_dispatch"
-                        if mutating_dispatch_observed
-                        else "delegated_child_exception"
+                        "delegated_child_exception"
+                        if raw_exception_retry_safe
+                        else "delegated_child_exception_after_mutating_or_uncertain_dispatch"
                     ),
                     failure_class=(
-                        "side_effect_state_uncertain"
-                        if mutating_dispatch_observed
-                        else "child_internal_exception"
+                        "child_internal_exception"
+                        if raw_exception_retry_safe
+                        else "side_effect_state_uncertain"
                     ),
-                    retryable=False,
+                    retryable=raw_exception_retry_safe,
                 ),
             }
         elif not isinstance(raw_result, dict):
@@ -6412,6 +7780,65 @@ async def delegate_task(
     return json.dumps(payload, ensure_ascii=False)
 
 
+_EXACT_CAPABILITY_BINDINGS_PARAMETER_SCHEMA = {
+    "type": "array",
+    "minItems": 1,
+    "maxItems": _MAX_EXACT_CAPABILITY_BINDINGS,
+    "items": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "candidate_id": {"type": "string"},
+            "kind": {
+                "type": "string",
+                "enum": sorted(_EXACT_CAPABILITY_BINDING_KINDS),
+            },
+            "tool_name": {"type": "string"},
+            "tool_names": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "skill_name": {"type": "string"},
+            "resource_path": {"type": "string"},
+            "sha256": {"type": "string"},
+            "package_sha256": {"type": "string"},
+            "command_id": {"type": "string"},
+            "executable": {"type": "string"},
+            "fixed_argv": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "additional_argv": {"type": "boolean"},
+            "url_prefix": {"type": "string"},
+            "http_method": {"type": "string"},
+            "runtime_profile": {"type": "string"},
+            "required_cwd": {"type": "string"},
+            "schema_sha256": {"type": "string"},
+            "descriptor_sha256": {"type": "string"},
+        },
+        "required": ["candidate_id", "kind", "tool_names"],
+    },
+}
+
+_INSTRUCTION_SOURCE_BINDINGS_PARAMETER_SCHEMA = {
+    "type": "array",
+    "minItems": 1,
+    "maxItems": 64,
+    "items": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "resource_path": {"type": "string"},
+            "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+            },
+        },
+        "required": ["resource_path", "sha256"],
+    },
+}
+
+
 DELEGATE_TASK_SCHEMA = {
     "name": "delegate_task",
     "description": (
@@ -6432,8 +7859,8 @@ DELEGATE_TASK_SCHEMA = {
                 "items": {"type": "string"},
                 "description": (
                     "Explicit subset of parent-granted tools. Use [] only for "
-                    "intent_classification; declared workflow steps otherwise "
-                    "require a non-empty allowlist."
+                    "intent_classification or a harness-frozen controller-only "
+                    "Workflow IR node with deterministic prerequisites."
                 ),
             },
             "max_iterations": {"type": "integer", "minimum": 1, "maximum": 30},
@@ -6534,12 +7961,33 @@ DELEGATE_TASK_SCHEMA = {
                     "before the child's first model call."
                 ),
             },
+            "capability_bindings": {
+                **_EXACT_CAPABILITY_BINDINGS_PARAMETER_SCHEMA,
+                "description": (
+                    "Harness-compiled exact per-candidate authority boundary for "
+                    "one Workflow IR node. Copy unchanged."
+                ),
+            },
+            "capability_bindings_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": (
+                    "Canonical SHA-256 of capability_bindings. Copy unchanged."
+                ),
+            },
             "required_skill_files_to_inspect": {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
                     "Exact Skill-relative format/resources that must each have a "
                     "successful skill_view audit before completion."
+                ),
+            },
+            "required_instruction_source_bindings": {
+                **_INSTRUCTION_SOURCE_BINDINGS_PARAMETER_SCHEMA,
+                "description": (
+                    "Harness-frozen Workflow IR instruction source paths and "
+                    "whole-resource SHA-256 values. Copy unchanged."
                 ),
             },
             "deterministic_intent_selections": {
@@ -6616,10 +8064,20 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "array",
                             "items": {"type": "string"},
                         },
+                        "capability_bindings": (
+                            _EXACT_CAPABILITY_BINDINGS_PARAMETER_SCHEMA
+                        ),
+                        "capability_bindings_sha256": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{64}$",
+                        },
                         "required_skill_files_to_inspect": {
                             "type": "array",
                             "items": {"type": "string"},
                         },
+                        "required_instruction_source_bindings": (
+                            _INSTRUCTION_SOURCE_BINDINGS_PARAMETER_SCHEMA
+                        ),
                         "deterministic_intent_selections": {
                             "type": "object",
                             "additionalProperties": {"type": "string"},

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -25,6 +26,14 @@ def _event(event_type: str, seq: int, *, run_id: str = "child") -> dict:
         payload = {
             "model_id": "model",
             "enabled_tools": ["skill_view"],
+        }
+    elif event_type == "tool_surface.resolved":
+        payload = {
+            "mode": "skill_bounded",
+            "mcp_policy": "exact",
+            "effective_tools": ["skill_view", "mcp_catalog_lookup"],
+            "required_tool_groups": [["mcp_catalog_lookup"]],
+            "missing_tool_requirements": [],
         }
     elif event_type == "run.completed":
         payload = {
@@ -182,6 +191,264 @@ class AgentEventPersistenceTests(unittest.IsolatedAsyncioTestCase):
                 )
             )).scalar_one()
             self.assertEqual(duplicate_count, len(events))
+
+    async def test_final_tool_surface_and_terminal_projection_are_monotonic(self):
+        started = _event("run.started", 1, run_id="root")
+        surface = _event("tool_surface.resolved", 2, run_id="root")
+        provisional = _event("run.failed", 3, run_id="root")
+        provisional["payload"]["authoritative"] = False
+        completed = _event("run.completed", 4, run_id="root")
+        events = [completed, started, provisional, surface]
+        kwargs = {
+            "conv_id": "conversation",
+            "user_id": "user",
+            "root_run_id": "root",
+            "requested_model_id": "model",
+            "resolved_model_id": "model",
+        }
+
+        async with self.sessions() as session:
+            await chat_router._persist_agent_events(
+                session,
+                **kwargs,
+                events=events,
+            )
+            await session.commit()
+
+        # Replaying an old start in a later transaction must not reopen the
+        # already committed root lifecycle.
+        async with self.sessions() as session:
+            await chat_router._persist_agent_events(
+                session,
+                **kwargs,
+                events=[started],
+            )
+            await session.commit()
+
+        async with self.sessions() as session:
+            root = await session.get(AgentRun, "root")
+            self.assertEqual("succeeded", root.status)
+            self.assertEqual(
+                ["skill_view", "mcp_catalog_lookup"],
+                json.loads(root.effective_tools),
+            )
+            policy = json.loads(root.policy)
+            self.assertEqual("skill_bounded", policy["mode"])
+            self.assertEqual("exact", policy["mcp_policy"])
+            task = (await session.execute(
+                select(TaskItem).where(TaskItem.run_id == "root")
+            )).scalar_one()
+            self.assertEqual("succeeded", task.status)
+
+    async def test_top_level_terminal_authority_matches_harness_precedence(self):
+        provisional = _event("run.failed", 2, run_id="root")
+        provisional["authoritative"] = False
+        provisional["payload"]["authoritative"] = True
+        completed = _event("run.completed", 3, run_id="root")
+
+        top_level_authoritative = _event(
+            "run.completed",
+            2,
+            run_id="child-authority",
+        )
+        top_level_authoritative["authoritative"] = True
+        top_level_authoritative["payload"]["authoritative"] = False
+        ignored_later_failure = _event(
+            "run.failed",
+            3,
+            run_id="child-authority",
+        )
+
+        async with self.sessions() as session:
+            await chat_router._persist_agent_events(
+                session,
+                conv_id="conversation",
+                user_id="user",
+                root_run_id="root",
+                requested_model_id="model",
+                resolved_model_id="model",
+                events=[
+                    provisional,
+                    completed,
+                    top_level_authoritative,
+                    ignored_later_failure,
+                ],
+            )
+            await session.commit()
+
+        async with self.sessions() as session:
+            root = await session.get(AgentRun, "root")
+            child = await session.get(AgentRun, "child-authority")
+            self.assertEqual("succeeded", root.status)
+            self.assertEqual("succeeded", child.status)
+            provisional_row = (await session.execute(
+                select(AgentRunEvent).where(
+                    AgentRunEvent.run_id == "root",
+                    AgentRunEvent.event_type == "run.failed",
+                    AgentRunEvent.seq == 2,
+                )
+            )).scalar_one()
+            self.assertFalse(
+                json.loads(provisional_row.payload)["authoritative"]
+            )
+            authoritative_row = (await session.execute(
+                select(AgentRunEvent).where(
+                    AgentRunEvent.run_id == "child-authority",
+                    AgentRunEvent.event_type == "run.completed",
+                    AgentRunEvent.seq == 2,
+                )
+            )).scalar_one()
+            self.assertTrue(
+                json.loads(authoritative_row.payload)["authoritative"]
+            )
+
+    async def test_conflicting_terminal_at_same_sequence_cannot_replace_first(self):
+        completed = _event("run.completed", 4, run_id="root")
+        failed = _event("run.failed", 4, run_id="root")
+        failed["payload"]["error"] = "late conflicting terminal"
+        kwargs = {
+            "conv_id": "conversation",
+            "user_id": "user",
+            "root_run_id": "root",
+            "requested_model_id": "model",
+            "resolved_model_id": "model",
+        }
+
+        async with self.sessions() as session:
+            await chat_router._persist_agent_events(
+                session,
+                **kwargs,
+                events=[completed, failed],
+            )
+            await session.commit()
+
+        async with self.sessions() as session:
+            root = await session.get(AgentRun, "root")
+            self.assertEqual("succeeded", root.status)
+            task = (await session.execute(
+                select(TaskItem).where(TaskItem.run_id == "root")
+            )).scalar_one()
+            self.assertEqual("succeeded", task.status)
+
+    async def test_higher_sequence_terminal_cannot_replace_first_terminal(self):
+        completed = _event("run.completed", 4, run_id="root")
+        failed = _event("run.failed", 5, run_id="root")
+        failed["payload"]["error"] = "later contradictory terminal"
+        kwargs = {
+            "conv_id": "conversation",
+            "user_id": "user",
+            "root_run_id": "root",
+            "requested_model_id": "model",
+            "resolved_model_id": "model",
+        }
+
+        async with self.sessions() as session:
+            await chat_router._persist_agent_events(
+                session,
+                **kwargs,
+                events=[completed],
+            )
+            await session.commit()
+        async with self.sessions() as session:
+            await chat_router._persist_agent_events(
+                session,
+                **kwargs,
+                events=[failed],
+            )
+            await session.commit()
+
+        async with self.sessions() as session:
+            root = await session.get(AgentRun, "root")
+            self.assertEqual("succeeded", root.status)
+            task = (await session.execute(
+                select(TaskItem).where(TaskItem.run_id == "root")
+            )).scalar_one()
+            self.assertEqual("succeeded", task.status)
+
+    async def test_conflicting_same_key_replay_cannot_rewrite_tool_surface(self):
+        surface = _event("tool_surface.resolved", 2, run_id="root")
+        conflicting = _event("tool_surface.resolved", 2, run_id="root")
+        conflicting["payload"]["effective_tools"] = ["execute_code"]
+        conflicting["payload"]["mode"] = "conflicting"
+        kwargs = {
+            "conv_id": "conversation",
+            "user_id": "user",
+            "root_run_id": "root",
+            "requested_model_id": "model",
+            "resolved_model_id": "model",
+        }
+
+        async with self.sessions() as session:
+            await chat_router._persist_agent_events(
+                session,
+                **kwargs,
+                events=[surface],
+            )
+            await session.commit()
+        async with self.sessions() as session:
+            await chat_router._persist_agent_events(
+                session,
+                **kwargs,
+                events=[conflicting],
+            )
+            await session.commit()
+
+        async with self.sessions() as session:
+            root = await session.get(AgentRun, "root")
+            self.assertEqual(
+                ["skill_view", "mcp_catalog_lookup"],
+                json.loads(root.effective_tools),
+            )
+            self.assertEqual("skill_bounded", json.loads(root.policy)["mode"])
+            count = (await session.execute(
+                select(func.count(AgentRunEvent.id)).where(
+                    AgentRunEvent.run_id == "root",
+                    AgentRunEvent.event_type == "tool_surface.resolved",
+                    AgentRunEvent.seq == 2,
+                )
+            )).scalar_one()
+            self.assertEqual(1, count)
+
+    async def test_passed_verifier_cannot_be_reopened_by_late_request(self):
+        completed = _event("verifier.completed", 2, run_id="root")
+        completed["payload"] = {
+            "verifier_kind": "run_contract_terminal_preflight",
+            "verdict": "pass",
+            "reason": "machine receipts are complete",
+            "needs_more_work": False,
+            "harness_generated": True,
+        }
+        requested = _event("verifier.requested", 3, run_id="root")
+        requested["payload"] = {
+            "verifier_kind": "run_contract_terminal_preflight",
+            "needs_more_work": False,
+            "harness_generated": True,
+        }
+        kwargs = {
+            "conv_id": "conversation",
+            "user_id": "user",
+            "root_run_id": "root",
+            "requested_model_id": "model",
+            "resolved_model_id": "model",
+        }
+
+        async with self.sessions() as session:
+            await chat_router._persist_agent_events(
+                session,
+                **kwargs,
+                events=[completed, requested],
+            )
+            await session.commit()
+
+        async with self.sessions() as session:
+            task = (await session.execute(
+                select(TaskItem).where(
+                    TaskItem.task_key
+                    == "verifier:root:run_contract_terminal_preflight"
+                )
+            )).scalar_one()
+            self.assertEqual("succeeded", task.status)
+            self.assertEqual("machine receipts are complete", task.summary)
 
     async def test_sqlite_lock_retry_is_bounded_and_recovers(self):
         attempts = 0

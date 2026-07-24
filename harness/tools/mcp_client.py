@@ -33,11 +33,30 @@ import shutil
 import stat
 import sys
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator, Iterable, Mapping
 
 import httpx
+
+from tools.mcp_contract import (
+    FrozenMCPCatalog,
+    FrozenMCPToolDescriptor,
+    MCPContractError,
+    MCPDescriptorDriftResult,
+    MCP_MAX_CATALOG_TOOLS,
+    MCPRejectedTool,
+    MCPToolCallPreflightResult,
+    build_mcp_tool_descriptor,
+    check_mcp_descriptor_drift,
+    check_mcp_schema_drift,
+    freeze_mcp_catalog,
+    intersect_mcp_catalogs,
+    preflight_mcp_tool_call,
+    sealed_empty_mcp_catalog,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -162,6 +181,9 @@ _CREDENTIAL_PATTERN = re.compile(
 
 _mcp_states: dict[tuple[str, str], dict[str, "MCPServerState"]] = {}
 _mcp_connect_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
+_inherited_frozen_mcp_catalog: ContextVar[
+    tuple[str, str, FrozenMCPCatalog] | None
+] = ContextVar("inherited_frozen_mcp_catalog", default=None)
 
 
 class MCPServerState:
@@ -637,7 +659,7 @@ def _sanitize_mcp_name_component(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]", "_", name)
 
 
-def _normalize_tool_def(tool_def) -> tuple[str, dict, str]:
+def _normalize_tool_def(tool_def) -> tuple[str, Any, str]:
     """Return ``(tool_name, input_schema, description)`` for an MCP tool."""
     if hasattr(tool_def, "name"):
         tool_name = tool_def.name
@@ -651,7 +673,18 @@ def _normalize_tool_def(tool_def) -> tuple[str, dict, str]:
             "inputSchema", {"type": "object", "properties": {}}
         )
         description = tool_def.get("description", f"MCP tool: {tool_name}")
-    return tool_name, input_schema or {}, description or f"MCP tool: {tool_name}"
+    if input_schema is None:
+        input_schema = {}
+    return tool_name, input_schema, description or f"MCP tool: {tool_name}"
+
+
+def _tool_annotations(tool_def) -> Any:
+    """Return raw MCP annotations without assigning them any trust."""
+    if hasattr(tool_def, "annotations"):
+        return getattr(tool_def, "annotations", None)
+    if isinstance(tool_def, dict):
+        return tool_def.get("annotations")
+    return None
 
 
 def _public_tool_name(server_name: str, tool_name: str) -> str:
@@ -678,40 +711,241 @@ def _deregister_mcp_tools(server_name: str) -> None:
     return None
 
 
-def get_session_tool_definitions(
+def _freeze_live_session_mcp_catalog(
     user_id: str,
     session_id: str = "default",
-) -> list[dict]:
-    """Build the model-visible MCP catalog for exactly one session."""
+    *,
+    trusted_annotation_servers: Iterable[str] = (),
+    trusted_policy_overrides: Mapping[str, Mapping[str, Any]] | None = None,
+) -> FrozenMCPCatalog:
+    """Freeze unconstrained live MCP state for exactly one session.
+
+    Server annotations are ignored unless the caller explicitly identifies a
+    trusted server.  Likewise, policy overrides are accepted only through this
+    Python API; neither ``mcp_server_add`` nor Skill-owned ``.mcp.json`` exposes
+    those arguments to the model/package.
+    """
+
     states = _mcp_states.get((user_id, session_id), {})
-    definitions: list[dict] = []
+    trusted_servers = frozenset(
+        str(item) for item in trusted_annotation_servers if str(item)
+    )
+    policy_overrides = (
+        dict(trusted_policy_overrides)
+        if isinstance(trusted_policy_overrides, Mapping)
+        else {}
+    )
+    descriptors: list[FrozenMCPToolDescriptor] = []
+    rejected: list[MCPRejectedTool] = []
     seen: set[str] = set()
+
     for server_name, state in sorted(states.items()):
         if not state.connected:
             continue
         for tool_def in state.tools:
-            tool_name, input_schema, description = _normalize_tool_def(tool_def)
-            public_name = _public_tool_name(server_name, tool_name)
+            try:
+                tool_name, input_schema, description = _normalize_tool_def(tool_def)
+                if not isinstance(tool_name, str) or not tool_name:
+                    raise ValueError("MCP tool name must be a non-empty string")
+                public_name = _public_tool_name(server_name, tool_name)
+            except (KeyError, TypeError, ValueError) as exc:
+                rejected.append(MCPRejectedTool(
+                    server_name=str(server_name),
+                    tool_name="<invalid>",
+                    public_name="<invalid>",
+                    reason=f"invalid MCP tool definition: {_sanitize_error(str(exc))[:300]}",
+                ))
+                continue
             if public_name in seen:
-                logger.warning(
-                    "Duplicate session MCP tool name %s for user=%s session=%s",
-                    public_name, user_id, session_id,
-                )
+                rejected.append(MCPRejectedTool(
+                    server_name=str(server_name),
+                    tool_name=str(tool_name),
+                    public_name=public_name,
+                    reason="duplicate public MCP tool name",
+                ))
                 continue
             seen.add(public_name)
-            definitions.append({
-                "type": "function",
-                "function": {
-                    "name": public_name,
-                    "description": f"[MCP:{server_name}] {description}",
-                    "parameters": {
-                        "type": input_schema.get("type", "object"),
-                        "properties": input_schema.get("properties", {}),
-                        "required": input_schema.get("required", []),
-                    },
-                },
-            })
-    return definitions
+            if len(descriptors) >= MCP_MAX_CATALOG_TOOLS:
+                rejected.append(MCPRejectedTool(
+                    server_name=str(server_name),
+                    tool_name=str(tool_name),
+                    public_name=public_name,
+                    reason=(
+                        "MCP catalog tool was rejected after the bounded "
+                        f"{MCP_MAX_CATALOG_TOOLS}-tool limit"
+                    ),
+                ))
+                continue
+            override = policy_overrides.get(public_name)
+            try:
+                descriptors.append(build_mcp_tool_descriptor(
+                    server_name=server_name,
+                    tool_name=tool_name,
+                    public_name=public_name,
+                    description=description,
+                    input_schema=input_schema,
+                    tool_annotations=_tool_annotations(tool_def),
+                    trust_server_annotations=server_name in trusted_servers,
+                    trusted_control_plane_override=(
+                        override if isinstance(override, Mapping) else None
+                    ),
+                ))
+            except MCPContractError as exc:
+                rejected.append(MCPRejectedTool(
+                    server_name=str(server_name),
+                    tool_name=str(tool_name),
+                    public_name=public_name,
+                    reason=str(exc)[:500],
+                ))
+                logger.warning(
+                    "Rejected MCP tool contract %s/%s for user=%s session=%s: %s",
+                    server_name,
+                    tool_name,
+                    user_id,
+                    session_id,
+                    exc,
+                )
+
+    return freeze_mcp_catalog(descriptors, rejected_tools=rejected)
+
+
+def get_inherited_frozen_mcp_catalog(
+    user_id: str,
+    session_id: str = "default",
+) -> FrozenMCPCatalog | None:
+    """Return the task-local parent contract for this exact session, if any."""
+
+    inherited = _inherited_frozen_mcp_catalog.get()
+    if inherited is None:
+        return None
+    inherited_user, inherited_session, catalog = inherited
+    if inherited_user != user_id or inherited_session != session_id:
+        return None
+    return catalog
+
+
+@contextmanager
+def bind_inherited_frozen_mcp_catalog(
+    user_id: str,
+    session_id: str,
+    catalog: FrozenMCPCatalog | None,
+):
+    """Bind one child task to a parent-derived MCP catalog.
+
+    ``ContextVar`` isolation keeps parallel delegates from observing each
+    other's catalog. Nested delegates inherit the boundary automatically.
+    """
+
+    if catalog is None:
+        yield
+        return
+    token = _inherited_frozen_mcp_catalog.set((
+        str(user_id),
+        str(session_id),
+        catalog,
+    ))
+    try:
+        yield
+    finally:
+        _inherited_frozen_mcp_catalog.reset(token)
+
+
+async def iterate_with_inherited_frozen_mcp_catalog(
+    stream: Any,
+    *,
+    user_id: str,
+    session_id: str,
+    catalog: FrozenMCPCatalog | None,
+) -> AsyncIterator[Any]:
+    """Iterate one child runtime while its inherited MCP boundary is active."""
+
+    with bind_inherited_frozen_mcp_catalog(
+        user_id,
+        session_id,
+        catalog,
+    ):
+        async for item in stream:
+            yield item
+
+
+def freeze_child_session_mcp_catalog(
+    parent_catalog: FrozenMCPCatalog,
+    user_id: str,
+    session_id: str = "default",
+    *,
+    allowed_tool_names: Iterable[str] | None = None,
+) -> FrozenMCPCatalog:
+    """Intersect a parent snapshot with current live state for one child."""
+
+    # A parent's failed/not-enabled boundary is authoritative for every
+    # descendant.  Do not even consult a recovered live catalog: doing so would
+    # turn a run-scoped freeze failure into a later, ambient capability lookup.
+    if parent_catalog.sealed_closed:
+        return sealed_empty_mcp_catalog(
+            parent_catalog.resolution_status,
+            parent_catalog_revision=parent_catalog.catalog_revision,
+        )
+    live_catalog = _freeze_live_session_mcp_catalog(user_id, session_id)
+    return intersect_mcp_catalogs(
+        parent_catalog,
+        live_catalog,
+        allowed_tool_names=allowed_tool_names,
+    )
+
+
+def freeze_session_mcp_catalog(
+    user_id: str,
+    session_id: str = "default",
+    *,
+    trusted_annotation_servers: Iterable[str] = (),
+    trusted_policy_overrides: Mapping[str, Mapping[str, Any]] | None = None,
+) -> FrozenMCPCatalog:
+    """Freeze the effective MCP surface under any inherited child boundary."""
+
+    inherited = get_inherited_frozen_mcp_catalog(user_id, session_id)
+    if inherited is not None and inherited.sealed_closed:
+        # Preserve the run-owned terminal boundary without touching mutable
+        # live MCP state, even if that state has recovered since run start.
+        return inherited
+    live_catalog = _freeze_live_session_mcp_catalog(
+        user_id,
+        session_id,
+        trusted_annotation_servers=trusted_annotation_servers,
+        trusted_policy_overrides=trusted_policy_overrides,
+    )
+    if inherited is None:
+        return live_catalog
+    return intersect_mcp_catalogs(inherited, live_catalog)
+
+
+def get_session_mcp_tool_descriptor(
+    public_name: str,
+    user_id: str,
+    session_id: str = "default",
+    *,
+    trusted_annotation_servers: Iterable[str] = (),
+    trusted_policy_overrides: Mapping[str, Mapping[str, Any]] | None = None,
+) -> FrozenMCPToolDescriptor | None:
+    """Return one descriptor from a newly frozen session catalog."""
+
+    return freeze_session_mcp_catalog(
+        user_id,
+        session_id,
+        trusted_annotation_servers=trusted_annotation_servers,
+        trusted_policy_overrides=trusted_policy_overrides,
+    ).get(public_name)
+
+
+def get_session_tool_definitions(
+    user_id: str,
+    session_id: str = "default",
+) -> list[dict]:
+    """Build the model-visible, lossless MCP catalog for one session."""
+
+    return freeze_session_mcp_catalog(
+        user_id,
+        session_id,
+    ).model_definitions()
 
 
 def get_session_tool_names(
@@ -732,10 +966,185 @@ def _resolve_session_tool(
     states = _mcp_states.get((user_id, session_id), {})
     for server_name, state in states.items():
         for tool_def in state.tools:
-            tool_name, _, _ = _normalize_tool_def(tool_def)
+            try:
+                tool_name, _, _ = _normalize_tool_def(tool_def)
+                if not isinstance(tool_name, str) or not tool_name:
+                    continue
+            except (KeyError, TypeError, ValueError):
+                continue
             if _public_tool_name(server_name, tool_name) == public_name:
                 return server_name, tool_name, state
     return None
+
+
+def check_session_mcp_tool_schema_drift(
+    expected: FrozenMCPToolDescriptor,
+    user_id: str,
+    session_id: str = "default",
+) -> MCPDescriptorDriftResult:
+    """Compare one run-frozen descriptor with the current session tool."""
+
+    route = _resolve_session_tool(expected.public_name, user_id, session_id)
+    if route is None:
+        return check_mcp_descriptor_drift(expected, None)
+    server_name, tool_name, state = route
+    current_tool_def = None
+    for tool_def in state.tools:
+        try:
+            current_name, input_schema, _ = _normalize_tool_def(tool_def)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (
+            current_name == tool_name
+            and _public_tool_name(server_name, current_name)
+            == expected.public_name
+        ):
+            current_tool_def = input_schema
+            break
+    if current_tool_def is None:
+        return check_mcp_descriptor_drift(expected, None)
+    return check_mcp_schema_drift(
+        expected,
+        server_name=server_name,
+        tool_name=tool_name,
+        public_name=expected.public_name,
+        input_schema=current_tool_def,
+    )
+
+
+def preflight_session_mcp_tool_call(
+    public_name: str,
+    args: Any,
+    user_id: str,
+    session_id: str = "default",
+    *,
+    expected_descriptor: FrozenMCPToolDescriptor | None = None,
+) -> MCPToolCallPreflightResult:
+    """Validate one live session call against a current or frozen contract."""
+
+    if (
+        expected_descriptor is not None
+        and expected_descriptor.public_name != public_name
+    ):
+        return MCPToolCallPreflightResult(
+            descriptor=expected_descriptor,
+            args=args,
+            error_payload={
+                "error": (
+                    "The frozen MCP descriptor does not match the requested "
+                    "public tool name; the call was not dispatched."
+                ),
+                "reason": "mcp_capability_changed",
+                "tool_name": public_name,
+                "expected_tool_name": expected_descriptor.public_name,
+            },
+            reason="mcp_capability_changed",
+        )
+
+    descriptor = expected_descriptor
+    if descriptor is not None:
+        drift = check_session_mcp_tool_schema_drift(
+            descriptor,
+            user_id,
+            session_id,
+        )
+        if not drift.ok:
+            return MCPToolCallPreflightResult(
+                descriptor=descriptor,
+                args=args,
+                error_payload=drift.error_payload,
+                reason=drift.reason,
+            )
+    else:
+        catalog = freeze_session_mcp_catalog(user_id, session_id)
+        descriptor = catalog.get(public_name)
+        if descriptor is None:
+            rejected = next(
+                (
+                    item for item in catalog.rejected_tools
+                    if item.public_name == public_name
+                ),
+                None,
+            )
+            reason = (
+                "invalid_mcp_contract"
+                if rejected is not None
+                else "mcp_capability_unavailable"
+            )
+            detail = (
+                f": {rejected.reason}" if rejected is not None else ""
+            )
+            return MCPToolCallPreflightResult(
+                descriptor=None,
+                args=args,
+                error_payload={
+                    "error": (
+                        f"MCP tool '{public_name}' is unavailable in this "
+                        f"session{detail}; the call was not dispatched."
+                    ),
+                    "reason": reason,
+                    "tool_name": public_name,
+                    "session_id": session_id,
+                },
+                reason=reason,
+            )
+    return preflight_mcp_tool_call(descriptor, args)
+
+
+def preflight_frozen_session_mcp_tool_call(
+    public_name: str,
+    args: Any,
+    user_id: str,
+    session_id: str,
+    *,
+    frozen_catalog: FrozenMCPCatalog,
+) -> MCPToolCallPreflightResult:
+    """Validate against one run-frozen catalog without live rediscovery.
+
+    A missing descriptor is a run capability-boundary failure, not a signal to
+    call ``freeze_session_mcp_catalog`` again.  For a retained descriptor we
+    still compare its schema with the current route immediately before
+    transport; that drift check cannot add a capability to the run.
+    """
+
+    descriptor = frozen_catalog.get(public_name)
+    if descriptor is None:
+        if frozen_catalog.resolution_status == "freeze_failed":
+            reason = "mcp_catalog_freeze_failed"
+            error = (
+                "The run-scoped MCP catalog could not be frozen; no MCP tool "
+                "may be dispatched in this run."
+            )
+        elif frozen_catalog.resolution_status == "not_enabled":
+            reason = "mcp_not_enabled_for_run"
+            error = "MCP capabilities were not enabled for this run."
+        else:
+            reason = "mcp_tool_not_in_frozen_catalog"
+            error = (
+                f"MCP tool '{public_name}' is not authorized by the run-scoped "
+                "frozen catalog; the call was not dispatched."
+            )
+        return MCPToolCallPreflightResult(
+            descriptor=None,
+            args=args,
+            error_payload={
+                "error": error,
+                "reason": reason,
+                "tool_name": public_name,
+                "catalog_resolution_status": (
+                    frozen_catalog.resolution_status
+                ),
+                "catalog_revision": frozen_catalog.catalog_revision,
+            },
+            reason=reason,
+        )
+    return preflight_session_mcp_tool_call(
+        public_name,
+        args,
+        user_id,
+        session_id,
+        expected_descriptor=descriptor,
+    )
 
 
 async def _call_mcp_state_tool(
@@ -762,8 +1171,45 @@ async def dispatch_mcp_tool(
     user_id: str,
     session_id: str = "default",
     enabled_user_skills: list[str] | None = None,
+    *,
+    expected_descriptor: FrozenMCPToolDescriptor | None = None,
+    frozen_catalog: FrozenMCPCatalog | None = None,
 ) -> str:
-    """Dispatch one session-local MCP tool, reconnecting once on failure."""
+    """Dispatch one session-local MCP tool after deterministic preflight.
+
+    Run-scoped callers should pass ``frozen_catalog``; absence from that
+    catalog then fails before connect and can never trigger live rediscovery.
+    ``expected_descriptor`` retains schema-drift validation and supports older
+    callers. Calls without either value still validate against a freshly
+    frozen current descriptor for backward compatibility outside AgentLoop.
+    """
+    if frozen_catalog is not None:
+        frozen_preflight = preflight_frozen_session_mcp_tool_call(
+            public_name,
+            args,
+            user_id,
+            session_id,
+            frozen_catalog=frozen_catalog,
+        )
+        if not frozen_preflight.ok:
+            return frozen_preflight.error_json()
+        catalog_descriptor = frozen_preflight.descriptor
+        if (
+            expected_descriptor is not None
+            and expected_descriptor != catalog_descriptor
+        ):
+            return json.dumps({
+                "error": (
+                    "The supplied MCP descriptor does not match the run-frozen "
+                    "catalog; the call was not dispatched."
+                ),
+                "reason": "mcp_capability_changed",
+                "tool_name": public_name,
+                "catalog_revision": frozen_catalog.catalog_revision,
+            }, ensure_ascii=False)
+        expected_descriptor = catalog_descriptor
+        args = dict(frozen_preflight.args)
+
     await connect_all_for_user(
         user_id, session_id,
         enabled_user_skills=enabled_user_skills,
@@ -776,7 +1222,17 @@ async def dispatch_mcp_tool(
         }, ensure_ascii=False)
 
     server_name, tool_name, state = route
-    params = dict(args)
+    preflight = preflight_session_mcp_tool_call(
+        public_name,
+        args,
+        user_id,
+        session_id,
+        expected_descriptor=expected_descriptor,
+    )
+    if not preflight.ok:
+        return preflight.error_json()
+    dispatch_descriptor = preflight.descriptor
+    params = dict(preflight.args)
     for attempt in (1, 2):
         if not state.connected:
             state = await connect_server(user_id, server_name, session_id)
@@ -786,6 +1242,26 @@ async def dispatch_mcp_tool(
                 "error": f"MCP server '{server_name}' is not connected: {error}",
                 "session_id": session_id,
             }, ensure_ascii=False)
+        # Re-resolve after a reconnect and validate at the last synchronous
+        # boundary before entering the transport. Dynamic tools/list_changed
+        # must not silently alter the contract frozen above.
+        route = _resolve_session_tool(public_name, user_id, session_id)
+        if route is None:
+            return check_mcp_descriptor_drift(
+                dispatch_descriptor,
+                None,
+            ).error_json()
+        server_name, tool_name, state = route
+        preflight = preflight_session_mcp_tool_call(
+            public_name,
+            params,
+            user_id,
+            session_id,
+            expected_descriptor=dispatch_descriptor,
+        )
+        if not preflight.ok:
+            return preflight.error_json()
+        params = dict(preflight.args)
         try:
             result = await _call_mcp_state_tool(state, tool_name, params)
             _record_success(state)
@@ -799,6 +1275,15 @@ async def dispatch_mcp_tool(
                 server_name, tool_name, attempt, exc,
             )
             if attempt == 1:
+                if not dispatch_descriptor.policy.idempotent:
+                    await disconnect_server(user_id, server_name, session_id)
+                    return json.dumps({
+                        "error": state.last_error,
+                        "server": server_name,
+                        "session_id": session_id,
+                        "reason": "mcp_non_idempotent_retry_suppressed",
+                        "retry_suppressed": True,
+                    }, ensure_ascii=False)
                 await disconnect_server(user_id, server_name, session_id)
                 state = await connect_server(user_id, server_name, session_id)
                 continue

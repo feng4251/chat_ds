@@ -2,7 +2,17 @@ import uuid
 from datetime import datetime
 from typing import Optional, List
 
-from sqlalchemy import String, Text, Integer, DateTime, ForeignKey, Boolean, JSON, func
+from sqlalchemy import (
+    String,
+    Text,
+    Integer,
+    DateTime,
+    ForeignKey,
+    Boolean,
+    JSON,
+    Index,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from database import Base
 
@@ -172,6 +182,16 @@ class AgentRunEvent(Base):
     """Append-only normalized event stream for agent run trees."""
 
     __tablename__ = "agent_run_events"
+    __table_args__ = (
+        Index(
+            "ux_agent_run_events_conversation_run_type_seq",
+            "conversation_id",
+            "run_id",
+            "event_type",
+            "seq",
+            unique=True,
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=generate_uuid)
     run_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
@@ -185,7 +205,7 @@ class AgentRunEvent(Base):
     seq: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     event_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     payload: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    tool_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    tool_name: Mapped[Optional[str]] = mapped_column(String(512), nullable=True, index=True)
     tool_call_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
     event_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 

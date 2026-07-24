@@ -7,6 +7,7 @@ from typing import Any
 
 from skill_capability_plan import validate_capability_plan
 from tools.context import ToolContext
+from workflow_ir import InstructionDocument, workflow_ir_json_schema
 
 
 async def submit_skill_capability_plan(
@@ -16,6 +17,7 @@ async def submit_skill_capability_plan(
     optional: list[str],
     unsupported: list[dict[str, str]],
     catalog_sha256: str | None = None,
+    workflow_ir: dict[str, Any] | None = None,
     context: ToolContext | None = None,
 ) -> str:
     """Select only capabilities issued in the current runtime catalog."""
@@ -33,6 +35,7 @@ async def submit_skill_capability_plan(
             optional=optional,
             unsupported=unsupported,
             catalog_sha256=catalog_sha256,
+            workflow_ir=workflow_ir,
         )
         return json.dumps(result.payload, ensure_ascii=False)
     try:
@@ -103,6 +106,55 @@ async def submit_skill_capability_plan(
                     f"read it again before amending the plan: {exc}"
                 ),
             }, ensure_ascii=False)
+    instruction_documents = catalog.get("instruction_documents")
+    if instruction_documents is not None:
+        try:
+            from skills.path_safety import validate_skill_resource
+
+            if (
+                not isinstance(instruction_documents, (list, tuple))
+                or not instruction_documents
+            ):
+                raise ValueError("malformed runtime-owned instruction documents")
+            package_root = current_main.parent.resolve(strict=True)
+            for document in instruction_documents:
+                if not isinstance(document, InstructionDocument):
+                    raise ValueError("malformed runtime-owned instruction document")
+                if document.source_path == "SKILL.md":
+                    checked_path = current_main
+                else:
+                    checked = validate_skill_resource(
+                        package_root,
+                        document.source_path,
+                        expected_kind="file",
+                        require_relative=True,
+                    )
+                    if not checked.valid or checked.path is None:
+                        raise ValueError(
+                            "instruction resource is unavailable: "
+                            + document.source_path
+                        )
+                    checked_path = checked.path
+                actual_digest = (
+                    __import__("hashlib").sha256(checked_path.read_bytes()).hexdigest()
+                )
+                if actual_digest != document.source_sha256:
+                    raise ValueError(
+                        "instruction resource changed: " + document.source_path
+                    )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error_code": ("capability_plan_instruction_document_changed"),
+                    "error": (
+                        "A runtime-owned Workflow IR instruction document "
+                        "changed after disclosure; read it again before "
+                        f"submitting a plan: {exc}"
+                    ),
+                },
+                ensure_ascii=False,
+            )
     result = validate_capability_plan(
         catalog,
         skill_name=skill_name,
@@ -111,6 +163,7 @@ async def submit_skill_capability_plan(
         optional=optional,
         unsupported=unsupported,
         catalog_sha256=catalog_sha256,
+        workflow_ir=workflow_ir,
     )
     return json.dumps(result.payload, ensure_ascii=False)
 
@@ -123,7 +176,9 @@ SUBMIT_SKILL_CAPABILITY_PLAN_SCHEMA: dict[str, Any] = {
         "optional and record instructions unsupported by the finite catalog. "
         "If the Harness later exposes a content-addressed catalog amendment, "
         "submit one replacement plan with its exact catalog_sha256. This tool "
-        "cannot create grants."
+        "cannot create grants. When the catalog says workflow_ir_required, "
+        "also submit the complete typed graph against its exact instruction "
+        "catalog; optional simple catalogs remain backward compatible."
     ),
     "parameters": {
         "type": "object",
@@ -176,6 +231,7 @@ SUBMIT_SKILL_CAPABILITY_PLAN_SCHEMA: dict[str, Any] = {
                 },
                 "maxItems": 64,
             },
+            "workflow_ir": workflow_ir_json_schema(),
         },
         "required": [
             "skill_name",
