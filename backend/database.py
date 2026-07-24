@@ -61,7 +61,7 @@ _LIGHTWEIGHT_MIGRATIONS = [
     "seq INTEGER NOT NULL DEFAULT 0, "
     "event_type VARCHAR(64) NOT NULL, "
     "payload TEXT, "
-    "tool_name VARCHAR(128), "
+    "tool_name VARCHAR(512), "
     "tool_call_id VARCHAR(128), "
     "event_time DATETIME DEFAULT CURRENT_TIMESTAMP)",
     "CREATE INDEX IF NOT EXISTS ix_agent_run_events_run_id ON agent_run_events (run_id)",
@@ -126,6 +126,78 @@ _LIGHTWEIGHT_MIGRATIONS = [
     "UPDATE agent_runs SET root_run_id = id WHERE root_run_id IS NULL",
 ]
 
+_AGENT_RUN_EVENT_IDENTITY_INDEX = (
+    "ux_agent_run_events_conversation_run_type_seq"
+)
+_AGENT_RUN_EVENT_IDENTITY_COLUMNS = (
+    "conversation_id",
+    "run_id",
+    "event_type",
+    "seq",
+)
+
+
+async def _ensure_agent_run_event_identity(conn) -> None:
+    """Install the durable event identity contract on legacy SQLite databases.
+
+    Old databases predate the database-level uniqueness guarantee and may
+    contain replay duplicates. SQLite ``rowid`` reflects insertion order for
+    this ordinary (non-``WITHOUT ROWID``) table, so retaining the smallest
+    ``rowid`` implements the same stable first-wins rule as the projection
+    layer. The cleanup and index creation run in the caller's transaction.
+    """
+
+    if conn.dialect.name != "sqlite":
+        # New non-SQLite databases receive the index from SQLAlchemy metadata.
+        # The repository's lightweight legacy migrations are SQLite-specific.
+        return
+
+    index_rows = (
+        await conn.execute(text("PRAGMA index_list('agent_run_events')"))
+    ).mappings().all()
+    matching_index = next(
+        (
+            row
+            for row in index_rows
+            if str(row.get("name") or "") == _AGENT_RUN_EVENT_IDENTITY_INDEX
+        ),
+        None,
+    )
+    if matching_index is not None:
+        index_columns = tuple(
+            str(row.get("name") or "")
+            for row in (
+                await conn.execute(text(
+                    "PRAGMA index_info("
+                    f"'{_AGENT_RUN_EVENT_IDENTITY_INDEX}'"
+                    ")"
+                ))
+            ).mappings().all()
+        )
+        if (
+            int(matching_index.get("unique") or 0) != 1
+            or index_columns != _AGENT_RUN_EVENT_IDENTITY_COLUMNS
+        ):
+            raise RuntimeError(
+                "Existing agent-run event identity index has an "
+                "incompatible definition"
+            )
+        return
+
+    await conn.execute(text(
+        "DELETE FROM agent_run_events "
+        "WHERE rowid NOT IN ("
+        "SELECT MIN(rowid) FROM agent_run_events "
+        "GROUP BY conversation_id, run_id, event_type, seq"
+        ")"
+    ))
+    await conn.execute(text(
+        "CREATE UNIQUE INDEX "
+        f"{_AGENT_RUN_EVENT_IDENTITY_INDEX} "
+        "ON agent_run_events "
+        "(conversation_id, run_id, event_type, seq)"
+    ))
+
 
 async def init_db():
     from models import Base as ModelBase  # noqa: F811
@@ -136,3 +208,4 @@ async def init_db():
                 await conn.execute(text(sql))
             except Exception:
                 pass  # column already exists
+        await _ensure_agent_run_event_identity(conn)

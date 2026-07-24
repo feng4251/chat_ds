@@ -3,6 +3,7 @@ import hashlib
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import AsyncMock, call, patch
 
@@ -81,6 +82,44 @@ def _tool_finished(
             "tool_call_id": tool_call_id,
             "outcome": outcome,
         },
+    }
+
+
+def _binding_digest(bindings: list[dict]) -> str:
+    return hashlib.sha256(json.dumps(
+        bindings,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+def _complete_skill_preload(content: str) -> tuple[dict, dict]:
+    encoded = content.encode("utf-8")
+    return (
+        {"success": True, "content": content},
+        {
+            "page_count": 1,
+            "total_chars": len(content),
+            "total_bytes": len(encoded),
+            "complete": True,
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+        },
+    )
+
+
+def _catalog_for_bindings(
+    skill_name: str,
+    bindings: list[dict],
+) -> dict:
+    candidates: list[dict] = []
+    for binding in bindings:
+        candidate = dict(binding)
+        candidate["id"] = candidate.pop("candidate_id")
+        candidates.append(candidate)
+    return {
+        "skill_name": skill_name,
+        "candidates": candidates,
     }
 
 
@@ -249,7 +288,11 @@ class DelegationBatchModeTests(unittest.IsolatedAsyncioTestCase):
             payload["results"][0]["failure_class"],
             "child_internal_exception",
         )
-        self.assertFalse(payload["results"][0]["retryable"])
+        self.assertTrue(
+            payload["results"][0]["retryable"],
+            "an isolated child exception is safe to retry when the parent "
+            "receipt audit proves zero mutating dispatches",
+        )
         self.assertEqual(payload["results"][1]["status"], "completed")
 
     async def test_duplicate_step_identity_fails_envelope_protocol(self):
@@ -2217,6 +2260,774 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result["error"])
         self.assertEqual(result["tool_audit"]["attempted_tools"], ["web_search"])
         self.assertEqual(result["tool_audit"]["successful_tools"], [])
+
+    async def test_exact_http_candidates_each_require_a_distinct_dispatch(self):
+        skill = "evidence-skill"
+        first_prefix = "https://api.github.com/repos/"
+        second_prefix = "https://api.github.com/users/"
+        bindings = [
+            {
+                "candidate_id": "http-first",
+                "kind": "skill_http_prefix",
+                "tool_name": "skill_http_get",
+                "tool_names": ["skill_http_get"],
+                "skill_name": skill,
+                "url_prefix": first_prefix,
+                "http_method": "GET",
+            },
+            {
+                "candidate_id": "http-second",
+                "kind": "skill_http_prefix",
+                "tool_name": "skill_http_get",
+                "tool_names": ["skill_http_get"],
+                "skill_name": skill,
+                "url_prefix": second_prefix,
+                "http_method": "GET",
+            },
+        ]
+
+        async def fake_preload(*args, **kwargs):
+            return _complete_skill_preload("Use both evidence endpoints.")
+
+        async def fake_run_stream(*args, **kwargs):
+            yield _tool_started(
+                "skill_http_get",
+                "get-first",
+                url=first_prefix + "record",
+            )
+            yield _tool_finished("skill_http_get", "get-first")
+            yield {
+                "type": "delta",
+                "content": "substantive evidence report with provenance " * 20,
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        context = replace(
+            _context("skill_view", "skill_http_get"),
+            skill_execution_resource_boundary=True,
+            skill_capability_catalog=_catalog_for_bindings(skill, bindings),
+            allowed_skill_resources=((skill, "SKILL.md"),),
+            allowed_skill_http_prefixes=(
+                (skill, first_prefix),
+                (skill, second_prefix),
+            ),
+        )
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation._load_complete_skill_view_preload",
+                fake_preload,
+            ),
+            patch("tools.delegation.persist_result_for_history") as persist,
+        ):
+            result = await _run_child(
+                {
+                    "goal": "retrieve both exact evidence sources",
+                    "skill_name": skill,
+                    "step_type": "aggregation",
+                    "step_id": "evidence",
+                    "workflow_stage": "aggregation",
+                    "tools": ["skill_view", "skill_http_get"],
+                    "required_capability_tools": ["skill_http_get"],
+                    "required_capability_skills": [skill],
+                    "capability_bindings": bindings,
+                    "capability_bindings_sha256": _binding_digest(bindings),
+                },
+                context,
+                0,
+            )
+
+        self.assertEqual("error", result["status"])
+        self.assertIn("distinct exact dispatch receipt", result["error"])
+        self.assertEqual(
+            ["http-second"],
+            result["capability_receipt_audit"]["missing_candidate_ids"],
+        )
+        self.assertEqual(
+            ["http-first"],
+            result["capability_receipt_audit"]["satisfied_candidate_ids"],
+        )
+        persist.assert_not_called()
+
+    async def test_exact_node_cannot_inherit_sibling_http_prefix(self):
+        skill = "evidence-skill"
+        own_prefix = "https://api.github.com/repos/"
+        sibling_prefix = "https://api.github.com/users/"
+        bindings = [{
+            "candidate_id": "http-own",
+            "kind": "skill_http_prefix",
+            "tool_name": "skill_http_get",
+            "tool_names": ["skill_http_get"],
+            "skill_name": skill,
+            "url_prefix": own_prefix,
+            "http_method": "GET",
+        }]
+        observed: dict[str, object] = {}
+
+        async def fake_preload(*args, **kwargs):
+            return _complete_skill_preload("Use the node-owned endpoint.")
+
+        async def fake_run_stream(*args, **kwargs):
+            observed["http_prefixes"] = kwargs.get(
+                "allowed_skill_http_prefixes"
+            )
+            yield _tool_started(
+                "skill_http_get",
+                "get-own",
+                url=own_prefix + "record",
+            )
+            yield _tool_finished("skill_http_get", "get-own")
+            yield {
+                "type": "delta",
+                "content": "substantive node-scoped evidence " * 20,
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        context = replace(
+            _context("skill_view", "skill_http_get"),
+            skill_execution_resource_boundary=True,
+            skill_capability_catalog=_catalog_for_bindings(skill, bindings),
+            allowed_skill_resources=((skill, "SKILL.md"),),
+            allowed_skill_http_prefixes=(
+                (skill, own_prefix),
+                (skill, sibling_prefix),
+            ),
+        )
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation._load_complete_skill_view_preload",
+                fake_preload,
+            ),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                return_value="results/node.txt",
+            ),
+        ):
+            result = await _run_child(
+                {
+                    "goal": "retrieve only this node's source",
+                    "skill_name": skill,
+                    "step_type": "aggregation",
+                    "step_id": "own-source",
+                    "workflow_stage": "aggregation",
+                    "tools": ["skill_view", "skill_http_get"],
+                    "required_capability_tools": ["skill_http_get"],
+                    "required_capability_skills": [skill],
+                    "capability_bindings": bindings,
+                    "capability_bindings_sha256": _binding_digest(bindings),
+                },
+                context,
+                0,
+            )
+
+        self.assertEqual("completed", result["status"])
+        self.assertEqual([(skill, own_prefix)], observed["http_prefixes"])
+        self.assertNotIn((skill, sibling_prefix), observed["http_prefixes"])
+
+    async def test_rehashed_binding_cannot_forge_parent_candidate_identity_or_coordinates(self):
+        skill = "evidence-skill"
+        parent_prefix = "https://api.github.com/repos/"
+        forged_prefix = "https://api.github.com/users/"
+        parent_binding = {
+            "candidate_id": "http-parent",
+            "kind": "skill_http_prefix",
+            "tool_name": "skill_http_get",
+            "tool_names": ["skill_http_get"],
+            "skill_name": skill,
+            "url_prefix": parent_prefix,
+            "http_method": "GET",
+        }
+        forged_bindings = [
+            {
+                **parent_binding,
+                "candidate_id": "http-model-authored",
+            },
+            {
+                **parent_binding,
+                "url_prefix": forged_prefix,
+            },
+        ]
+        for forged in forged_bindings:
+            with self.subTest(binding=forged):
+                context = replace(
+                    _context("skill_view", "skill_http_get"),
+                    skill_execution_resource_boundary=True,
+                    skill_capability_catalog=_catalog_for_bindings(
+                        skill,
+                        [parent_binding],
+                    ),
+                    allowed_skill_resources=((skill, "SKILL.md"),),
+                    allowed_skill_http_prefixes=(
+                        (skill, parent_prefix),
+                        (skill, forged_prefix),
+                    ),
+                )
+                with (
+                    patch("agent_loop.run_stream") as run_stream,
+                    patch(
+                        "tools.delegation.persist_result_for_history"
+                    ) as persist,
+                ):
+                    result = await _run_child(
+                        {
+                            "goal": "retrieve exact evidence",
+                            "skill_name": skill,
+                            "step_type": "aggregation",
+                            "step_id": "forged-source",
+                            "workflow_stage": "aggregation",
+                            "tools": ["skill_view", "skill_http_get"],
+                            "required_capability_tools": ["skill_http_get"],
+                            "required_capability_skills": [skill],
+                            "capability_bindings": [forged],
+                            "capability_bindings_sha256": _binding_digest(
+                                [forged]
+                            ),
+                        },
+                        context,
+                        0,
+                    )
+
+                self.assertEqual("error", result["status"])
+                self.assertTrue(
+                    "absent from the parent-frozen" in result["error"]
+                    or "coordinates differ" in result["error"],
+                    result,
+                )
+                run_stream.assert_not_called()
+                persist.assert_not_called()
+
+    async def test_failed_exact_candidate_rejects_negated_degraded_prose(self):
+        skill = "evidence-skill"
+        prefix = "https://api.github.com/repos/"
+        bindings = [{
+            "candidate_id": "http-required",
+            "kind": "skill_http_prefix",
+            "tool_name": "skill_http_get",
+            "tool_names": ["skill_http_get"],
+            "skill_name": skill,
+            "url_prefix": prefix,
+            "http_method": "GET",
+        }]
+
+        async def fake_preload(*args, **kwargs):
+            return _complete_skill_preload("Use the evidence endpoint.")
+
+        async def fake_run_stream(*args, **kwargs):
+            yield _tool_started(
+                "skill_http_get", "get-failed", url=prefix + "record"
+            )
+            yield _tool_finished(
+                "skill_http_get",
+                "get-failed",
+                outcome="error",
+                event_type="tool.failed",
+            )
+            yield {
+                "type": "delta",
+                "content": (
+                    "This result is not degraded. Evidence is complete. " * 20
+                ),
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        context = replace(
+            _context("skill_view", "skill_http_get"),
+            skill_execution_resource_boundary=True,
+            skill_capability_catalog=_catalog_for_bindings(skill, bindings),
+            allowed_skill_resources=((skill, "SKILL.md"),),
+            allowed_skill_http_prefixes=((skill, prefix),),
+        )
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation._load_complete_skill_view_preload",
+                fake_preload,
+            ),
+            patch("tools.delegation.persist_result_for_history") as persist,
+        ):
+            result = await _run_child(
+                {
+                    "goal": "retrieve exact evidence",
+                    "skill_name": skill,
+                    "step_type": "aggregation",
+                    "step_id": "failed-source",
+                    "workflow_stage": "aggregation",
+                    "tools": ["skill_view", "skill_http_get"],
+                    "required_capability_tools": ["skill_http_get"],
+                    "required_capability_skills": [skill],
+                    "capability_bindings": bindings,
+                    "capability_bindings_sha256": _binding_digest(bindings),
+                },
+                context,
+                0,
+            )
+
+        self.assertEqual("error", result["status"])
+        self.assertIn("result-level degraded status", result["error"])
+        persist.assert_not_called()
+
+    async def test_failed_exact_candidate_needs_exact_structured_gap_ids(self):
+        skill = "evidence-skill"
+        prefix = "https://api.github.com/repos/"
+        bindings = [{
+            "candidate_id": "http-required",
+            "kind": "skill_http_prefix",
+            "tool_name": "skill_http_get",
+            "tool_names": ["skill_http_get"],
+            "skill_name": skill,
+            "url_prefix": prefix,
+            "http_method": "GET",
+        }]
+
+        async def fake_preload(*args, **kwargs):
+            return _complete_skill_preload("Use the evidence endpoint.")
+
+        async def fake_run_stream(*args, **kwargs):
+            yield _tool_started(
+                "skill_http_get", "get-failed", url=prefix + "record"
+            )
+            yield _tool_finished(
+                "skill_http_get",
+                "get-failed",
+                outcome="error",
+                event_type="tool.failed",
+            )
+            yield {
+                "type": "delta",
+                "content": (
+                    "STATUS: DEGRADED\n"
+                    "The exact endpoint was unavailable.\n"
+                    'CAPABILITY_GAPS_JSON: {"status":"degraded",'
+                    '"failed_candidate_ids":["some-other-candidate"]}'
+                ),
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        context = replace(
+            _context("skill_view", "skill_http_get"),
+            skill_execution_resource_boundary=True,
+            skill_capability_catalog=_catalog_for_bindings(skill, bindings),
+            allowed_skill_resources=((skill, "SKILL.md"),),
+            allowed_skill_http_prefixes=((skill, prefix),),
+        )
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation._load_complete_skill_view_preload",
+                fake_preload,
+            ),
+            patch("tools.delegation.persist_result_for_history") as persist,
+        ):
+            result = await _run_child(
+                {
+                    "goal": "retrieve exact evidence",
+                    "skill_name": skill,
+                    "step_type": "aggregation",
+                    "step_id": "failed-source",
+                    "workflow_stage": "aggregation",
+                    "tools": ["skill_view", "skill_http_get"],
+                    "required_capability_tools": ["skill_http_get"],
+                    "required_capability_skills": [skill],
+                    "capability_bindings": bindings,
+                    "capability_bindings_sha256": _binding_digest(bindings),
+                },
+                context,
+                0,
+            )
+
+        self.assertEqual("error", result["status"])
+        self.assertIn("must exactly cover", result["error"])
+        persist.assert_not_called()
+
+    async def test_exact_resource_missing_sha_is_rejected_before_model(self):
+        binding = {
+            "candidate_id": "resource-required",
+            "kind": "skill_resource",
+            "tool_names": [],
+            "skill_name": "resource-skill",
+            "resource_path": "references/data.md",
+        }
+        context = replace(
+            _context("skill_view"),
+            skill_execution_resource_boundary=True,
+            allowed_skill_resources=(
+                ("resource-skill", "references/data.md"),
+            ),
+        )
+        with (
+            patch("agent_loop.run_stream") as run_stream,
+            patch("tools.delegation.persist_result_for_history") as persist,
+        ):
+            result = await _run_child(
+                {
+                    "goal": "inspect the exact resource",
+                    "skill_name": "resource-skill",
+                    "step_type": "aggregation",
+                    "step_id": "resource-check",
+                    "tools": ["skill_view"],
+                    "required_skill_files_to_inspect": [
+                        "references/data.md",
+                    ],
+                    "capability_bindings": [binding],
+                    "capability_bindings_sha256": _binding_digest([binding]),
+                },
+                context,
+                0,
+            )
+
+        self.assertEqual("error", result["status"])
+        self.assertIn("exact Skill resource path and SHA-256", result["error"])
+        run_stream.assert_not_called()
+        persist.assert_not_called()
+
+    async def test_exact_resource_mutation_after_plan_fails_before_model(self):
+        skill = "resource-skill"
+        resource_path = "references/data.md"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / skill
+            (root / "references").mkdir(parents=True)
+            main = root / "SKILL.md"
+            resource = root / resource_path
+            main.write_text("# Resource Skill\n", encoding="utf-8")
+            resource.write_text("planned bytes", encoding="utf-8")
+            planned_digest = hashlib.sha256(resource.read_bytes()).hexdigest()
+            binding = {
+                "candidate_id": "resource-required",
+                "kind": "skill_resource",
+                "tool_names": [],
+                "skill_name": skill,
+                "resource_path": resource_path,
+                "sha256": planned_digest,
+            }
+            # Same canonical path, different bytes after Workflow IR planning.
+            resource.write_text("replacement bytes", encoding="utf-8")
+            context = replace(
+                _context("skill_view"),
+                skill_execution_resource_boundary=True,
+                skill_capability_catalog=_catalog_for_bindings(
+                    skill,
+                    [binding],
+                ),
+                allowed_skill_resources=((skill, resource_path),),
+            )
+            with (
+                patch("skills.scanner.resolve_skill_path", return_value=main),
+                patch("agent_loop.run_stream") as run_stream,
+                patch("tools.delegation.persist_result_for_history") as persist,
+            ):
+                result = await _run_child(
+                    {
+                        "goal": "inspect the exact planned resource",
+                        "skill_name": skill,
+                        "step_type": "aggregation",
+                        "step_id": "resource-check",
+                        "tools": ["skill_view"],
+                        "required_skill_files_to_inspect": [resource_path],
+                        "capability_bindings": [binding],
+                        "capability_bindings_sha256": _binding_digest([binding]),
+                    },
+                    context,
+                    0,
+                )
+
+        self.assertEqual("error", result["status"])
+        self.assertIn("changed after Workflow IR compilation", result["error"])
+        run_stream.assert_not_called()
+        persist.assert_not_called()
+
+    async def test_exact_resource_eof_sha_must_match_compiled_binding(self):
+        skill = "resource-skill"
+        resource_path = "references/data.md"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / skill
+            (root / "references").mkdir(parents=True)
+            main = root / "SKILL.md"
+            resource = root / resource_path
+            main.write_text("# Resource Skill\n", encoding="utf-8")
+            resource.write_text("planned bytes", encoding="utf-8")
+            planned_digest = hashlib.sha256(resource.read_bytes()).hexdigest()
+            binding = {
+                "candidate_id": "resource-required",
+                "kind": "skill_resource",
+                "tool_names": [],
+                "skill_name": skill,
+                "resource_path": resource_path,
+                "sha256": planned_digest,
+            }
+
+            async def stale_preload(*args, **kwargs):
+                result, pagination = _complete_skill_preload("different bytes")
+                self.assertNotEqual(planned_digest, pagination["sha256"])
+                return result, pagination
+
+            context = replace(
+                _context("skill_view"),
+                skill_execution_resource_boundary=True,
+                skill_capability_catalog=_catalog_for_bindings(
+                    skill,
+                    [binding],
+                ),
+                allowed_skill_resources=((skill, resource_path),),
+            )
+            with (
+                patch("skills.scanner.resolve_skill_path", return_value=main),
+                patch(
+                    "tools.delegation._load_complete_skill_view_preload",
+                    stale_preload,
+                ),
+                patch("agent_loop.run_stream") as run_stream,
+                patch("tools.delegation.persist_result_for_history") as persist,
+            ):
+                result = await _run_child(
+                    {
+                        "goal": "inspect the exact planned resource",
+                        "skill_name": skill,
+                        "step_type": "aggregation",
+                        "step_id": "resource-check",
+                        "tools": ["skill_view"],
+                        "required_skill_files_to_inspect": [resource_path],
+                        "capability_bindings": [binding],
+                        "capability_bindings_sha256": _binding_digest([binding]),
+                    },
+                    context,
+                    0,
+                )
+
+        self.assertEqual("error", result["status"])
+        self.assertIn("EOF receipt omitted the compiled SHA-256", result["error"])
+        run_stream.assert_not_called()
+        persist.assert_not_called()
+
+    async def test_controller_only_worker_can_run_with_zero_model_tools(self):
+        binding = {
+            "candidate_id": "delegate-controller",
+            "kind": "native_tool",
+            "tool_name": "delegate_task",
+            "tool_names": ["delegate_task"],
+        }
+        observed: dict[str, object] = {}
+        source_content = "Reason over the provided contract."
+        source_digest = hashlib.sha256(source_content.encode("utf-8")).hexdigest()
+        source_binding = {
+            "resource_path": "SKILL.md",
+            "sha256": source_digest,
+        }
+
+        async def fake_run_stream(*args, **kwargs):
+            observed["tools"] = list(args[2])
+            yield {
+                "type": "delta",
+                "content": "complete reasoning result with evidence " * 20,
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "reasoning-skill"
+            root.mkdir()
+            main = root / "SKILL.md"
+            main.write_text(source_content, encoding="utf-8")
+            context = replace(
+                _context(),
+                skill_execution_resource_boundary=True,
+                skill_capability_catalog={
+                    "skill_name": "reasoning-skill",
+                    "body_sha256": source_digest,
+                    "authority_documents": [],
+                    "candidates": [],
+                },
+                allowed_skill_resources=(
+                    ("reasoning-skill", "SKILL.md"),
+                ),
+            )
+            with (
+                patch(
+                    "skills.scanner.resolve_skill_path",
+                    return_value=main,
+                ),
+                patch("agent_loop.run_stream", fake_run_stream),
+                patch(
+                    "tools.delegation._load_complete_skill_view_preload",
+                    AsyncMock(
+                        return_value=_complete_skill_preload(source_content)
+                    ),
+                ),
+                patch(
+                    "tools.delegation.persist_result_for_history",
+                    return_value="results/reasoning.txt",
+                ),
+            ):
+                result = await _run_child(
+                    {
+                        "goal": "perform the declared reasoning node",
+                        "skill_name": "reasoning-skill",
+                        "worker_id": "reason",
+                        "worker_file": "SKILL.md",
+                        "step_type": "worker",
+                        "step_id": "reason",
+                        "workflow_stage": "reasoning",
+                        "tools": [],
+                        "required_skill_files_to_inspect": ["SKILL.md"],
+                        "required_instruction_source_bindings": [
+                            source_binding
+                        ],
+                        "capability_bindings": [binding],
+                        "capability_bindings_sha256": _binding_digest([binding]),
+                    },
+                    context,
+                    0,
+                )
+
+        self.assertEqual("completed", result["status"])
+        self.assertEqual([], observed["tools"])
+        self.assertEqual(
+            [],
+            result["capability_receipt_audit"]["required_candidate_ids"],
+        )
+
+    async def test_exact_workflow_node_cannot_omit_instruction_source_ledger(self):
+        bindings = [
+            {
+                "candidate_id": "delegate-controller",
+                "kind": "native_tool",
+                "tool_name": "delegate_task",
+                "tool_names": ["delegate_task"],
+            },
+            {
+                "candidate_id": "node-search",
+                "kind": "native_tool",
+                "tool_name": "web_search",
+                "tool_names": ["web_search"],
+            },
+        ]
+        context = replace(
+            _context("web_search"),
+            skill_execution_resource_boundary=True,
+        )
+        with (
+            patch("agent_loop.run_stream") as run_stream,
+            patch(
+                "tools.delegation.persist_result_for_history"
+            ) as persist,
+        ):
+            result = await _run_child(
+                {
+                    "goal": "execute the exact planned node",
+                    "skill_name": "reasoning-skill",
+                    "step_type": "aggregation",
+                    "step_id": "search-and-synthesize",
+                    "tools": ["web_search"],
+                    "required_skill_files_to_inspect": ["SKILL.md"],
+                    "capability_bindings": bindings,
+                    "capability_bindings_sha256": _binding_digest(bindings),
+                },
+                context,
+                0,
+            )
+
+        self.assertEqual("error", result["status"])
+        self.assertIn(
+            "require a non-empty required_instruction_source_bindings ledger",
+            result["error"],
+        )
+        run_stream.assert_not_called()
+        persist.assert_not_called()
+
+    async def test_controller_only_aggregation_can_use_preloaded_inputs_with_zero_tools(self):
+        binding = {
+            "candidate_id": "delegate-controller",
+            "kind": "native_tool",
+            "tool_name": "delegate_task",
+            "tool_names": ["delegate_task"],
+        }
+        observed: dict[str, object] = {}
+        source_content = "Synthesize the exact prerequisite."
+        source_digest = hashlib.sha256(source_content.encode("utf-8")).hexdigest()
+        source_binding = {
+            "resource_path": "SKILL.md",
+            "sha256": source_digest,
+        }
+
+        async def fake_run_stream(*args, **kwargs):
+            observed["tools"] = list(args[2])
+            yield {
+                "type": "delta",
+                "content": "complete synthesis retaining all evidence " * 20,
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "reasoning-skill"
+            root.mkdir()
+            main = root / "SKILL.md"
+            main.write_text(source_content, encoding="utf-8")
+            context = replace(
+                _context(),
+                skill_execution_resource_boundary=True,
+                skill_capability_catalog={
+                    "skill_name": "reasoning-skill",
+                    "body_sha256": source_digest,
+                    "authority_documents": [],
+                    "candidates": [],
+                },
+                allowed_skill_resources=(
+                    ("reasoning-skill", "SKILL.md"),
+                ),
+                allowed_read_paths=("results/worker.txt",),
+            )
+            with (
+                patch(
+                    "skills.scanner.resolve_skill_path",
+                    return_value=main,
+                ),
+                patch("agent_loop.run_stream", fake_run_stream),
+                patch(
+                    "tools.delegation._load_complete_skill_view_preload",
+                    AsyncMock(
+                        return_value=_complete_skill_preload(source_content)
+                    ),
+                ),
+                patch(
+                    "tools.delegation.registry_dispatch",
+                    AsyncMock(return_value=json.dumps(
+                        _complete_read_result("worker evidence")
+                    )),
+                ),
+                patch(
+                    "tools.delegation.load_exact_result_text",
+                    return_value="worker evidence",
+                ),
+                patch(
+                    "tools.delegation.persist_result_for_history",
+                    return_value="results/aggregation.txt",
+                ),
+            ):
+                result = await _run_child(
+                    {
+                        "goal": "synthesize the declared prerequisite",
+                        "skill_name": "reasoning-skill",
+                        "step_type": "aggregation",
+                        "step_id": "synthesize",
+                        "workflow_stage": "aggregation",
+                        "tools": [],
+                        "required_result_paths": ["results/worker.txt"],
+                        "required_skill_files_to_inspect": ["SKILL.md"],
+                        "required_instruction_source_bindings": [
+                            source_binding
+                        ],
+                        "capability_bindings": [binding],
+                        "capability_bindings_sha256": _binding_digest([binding]),
+                    },
+                    context,
+                    0,
+                )
+
+        self.assertEqual("completed", result["status"])
+        self.assertEqual([], observed["tools"])
+        self.assertEqual(
+            ["results/worker.txt"],
+            result["tool_audit"]["read_result_paths"],
+        )
 
     async def test_unrelated_skill_script_cannot_satisfy_capability_audit(self):
         async def fake_dispatch(name, args, *, context):

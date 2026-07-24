@@ -114,3 +114,9 @@ class ToolContext:
     # from model arguments or serialized into conversation history. Stateful
     # adapters use it to make a transport retry idempotent.
     tool_operation_id: str | None = field(default=None, repr=False)
+    # Optional run-frozen MCP authority. Primary orchestration installs the
+    # exact catalog shown to the parent model; delegation intersects it with
+    # current live state and propagates only unchanged parent descriptors.
+    # ``Any`` avoids coupling the generic tool context to the optional MCP SDK.
+    # Kept at the end so older positional compatibility callers do not shift.
+    frozen_mcp_catalog: Any | None = field(default=None, repr=False)

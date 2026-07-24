@@ -778,7 +778,13 @@ def load_skill_content(
         }
 
     try:
-        raw = main_check.path.read_text(encoding="utf-8")
+        # Decode the exact bytes without TextIO's universal-newline
+        # translation.  ``skill_md_sha256`` is a byte-identity authority used
+        # by Skill snapshots, skill_view EOF receipts, Workflow IR source
+        # bindings, and child TOCTOU checks; CRLF must therefore remain CRLF
+        # in the decoded source whose digest is recorded below.
+        raw_bytes = main_check.path.read_bytes()
+        raw = raw_bytes.decode("utf-8")
     except (UnicodeDecodeError, PermissionError) as e:
         return {"error": f"Cannot read skill file: {e}"}
     except Exception as e:
@@ -929,7 +935,7 @@ def load_skill_content(
         # including frontmatter fields such as allowed-tools/compatibility.
         # Hashing only the Markdown body would accept a stale plan after an
         # authority-bearing metadata edit.
-        "skill_md_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+        "skill_md_sha256": hashlib.sha256(raw_bytes).hexdigest(),
         "skill_md_chars": len(raw),
         "tags": tags,
         "related_skills": related_skills,

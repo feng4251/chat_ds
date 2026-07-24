@@ -100,6 +100,38 @@ def _generic_contract() -> dict:
 
 
 class SkillWorkflowRuntimeTests(unittest.TestCase):
+    @staticmethod
+    def _workflow_ir_state() -> HarnessRunState:
+        state = HarnessRunState(
+            available_tools={"delegate_task"},
+            original_user_text="Produce the required report",
+        )
+        state.skill_execution_plans["generic"] = {
+            "selection": "workflow_ir",
+            "required_workers": ["research"],
+            "workers": {
+                "research": {
+                    "id": "research",
+                    "name": "Research",
+                    "dependencies": [],
+                },
+            },
+            "waves": [{
+                "id": "ir-wave-001",
+                "mode": "sequential",
+                "workers": ["research"],
+                "dependencies": [],
+            }],
+            "bootstrap_sources": [],
+            "aggregation_steps": [{
+                "id": "synthesize",
+                "required": True,
+                "depends_on": [],
+                "input_worker_ids": ["research"],
+            }],
+        }
+        return state
+
     def _seven_source_state(self) -> HarnessRunState:
         contract = _generic_contract()
         contract["execution_contract"]["knowledge_bootstrap"]["sources"] = [
@@ -356,6 +388,261 @@ class SkillWorkflowRuntimeTests(unittest.TestCase):
         terminal = state.terminal_delegate_failure()
         self.assertEqual(terminal["step_id"], "source-1")
         self.assertEqual(terminal["attempts"], 2)
+
+    def test_workflow_ir_degraded_required_worker_retries_then_fails_closed(self):
+        state = self._workflow_ir_state()
+        args = {"tasks": [{
+            "skill_name": "generic",
+            "worker_id": "research",
+            "step_type": "worker",
+            "step_id": "research",
+            "workflow_stage": "ir-wave-001",
+        }]}
+        envelope = {
+            "status": "completed_degraded",
+            "results": [{
+                "status": "completed",
+                "completion_quality": "degraded",
+                "skill_name": "generic",
+                "worker_id": "research",
+                "step_type": "worker",
+                "step_id": "research",
+                "workflow_stage": "ir-wave-001",
+                "result_path": "results/research.md",
+                "result_chars": 500,
+                "dispatch_receipt_audit": {
+                    "mutating_dispatch_count": 0,
+                },
+            }],
+        }
+
+        first = state.record_delegate_task(args, envelope)
+
+        self.assertEqual([], first["completed_step_ids"])
+        self.assertEqual([], first["degraded_completed_step_ids"])
+        self.assertEqual(["research"], first["retryable_failed_step_ids"])
+        self.assertNotIn(
+            "research",
+            state.skill_completed_workers.get("generic", set()),
+        )
+        self.assertEqual(
+            ["research"],
+            state.ordered_delegate_candidates(
+                "generic",
+                "worker",
+                ["research"],
+            ),
+        )
+        self.assertIsNone(state.terminal_delegate_failure())
+
+        second = state.record_delegate_task(args, envelope)
+
+        self.assertEqual([], second["completed_step_ids"])
+        self.assertEqual([], second["retryable_failed_step_ids"])
+        self.assertEqual(["research"], second["terminal_failed_step_ids"])
+        self.assertEqual(
+            [],
+            state.ordered_delegate_candidates(
+                "generic",
+                "worker",
+                ["research"],
+            ),
+        )
+        terminal = state.terminal_delegate_failure()
+        self.assertIsNotNone(terminal)
+        self.assertEqual("research", terminal["step_id"])
+        self.assertEqual(2, terminal["attempts"])
+        self.assertTrue(terminal["retryable"])
+        self.assertEqual(
+            "workflow_ir_required_step_degraded",
+            terminal["terminal_reason"],
+        )
+        self.assertEqual("completion_quality", terminal["failure_class"])
+        self.assertEqual(
+            "required Workflow IR worker 'research' returned "
+            "completion_quality=degraded; a complete result is mandatory",
+            terminal["error"],
+        )
+
+    def test_workflow_ir_degraded_required_aggregation_is_retryable(self):
+        state = self._workflow_ir_state()
+        state.skill_completed_workers["generic"] = {"research"}
+        state.skill_worker_results["generic"] = {
+            "research": {
+                "status": "completed",
+                "completion_quality": "complete",
+                "result_path": "results/research.md",
+            },
+        }
+        args = {
+            "skill_name": "generic",
+            "step_type": "aggregation",
+            "step_id": "synthesize",
+            "workflow_stage": "aggregation",
+            "required_result_paths": ["results/research.md"],
+        }
+        envelope = {
+            "status": "completed_degraded",
+            "results": [{
+                "status": "completed",
+                "completion_quality": "degraded",
+                "skill_name": "generic",
+                "step_type": "aggregation",
+                "step_id": "synthesize",
+                "workflow_stage": "aggregation",
+                "result_path": "results/synthesize.md",
+                "result_chars": 500,
+                "required_result_paths": ["results/research.md"],
+                "tool_audit": {
+                    "read_result_paths": ["results/research.md"],
+                },
+                "dispatch_receipt_audit": {
+                    "mutating_dispatch_count": 0,
+                },
+            }],
+        }
+
+        update = state.record_delegate_task(args, envelope)
+
+        self.assertEqual([], update["completed_step_ids"])
+        self.assertEqual([], update["degraded_completed_step_ids"])
+        self.assertEqual(["synthesize"], update["retryable_failed_step_ids"])
+        self.assertNotIn(
+            "synthesize",
+            state.skill_completed_aggregation.get("generic", set()),
+        )
+        self.assertEqual(
+            ["synthesize"],
+            state.ordered_delegate_candidates(
+                "generic",
+                "aggregation",
+                ["synthesize"],
+            ),
+        )
+        self.assertIsNone(state.terminal_delegate_failure())
+        recorded = state.skill_aggregation_results["generic"]["synthesize"]
+        self.assertEqual("error", recorded["status"])
+        self.assertEqual("degraded", recorded["completion_quality"])
+        self.assertTrue(recorded["retryable"])
+
+    def test_workflow_ir_degraded_required_worker_with_mutating_dispatch_is_terminal(self):
+        state = self._workflow_ir_state()
+        args = {"tasks": [{
+            "skill_name": "generic",
+            "worker_id": "research",
+            "step_type": "worker",
+            "step_id": "research",
+            "workflow_stage": "ir-wave-001",
+        }]}
+        envelope = {
+            "status": "completed_degraded",
+            "results": [{
+                "status": "completed",
+                "completion_quality": "degraded",
+                "skill_name": "generic",
+                "worker_id": "research",
+                "step_type": "worker",
+                "step_id": "research",
+                "workflow_stage": "ir-wave-001",
+                "result_path": "results/research.md",
+                "result_chars": 500,
+                "dispatch_receipt_audit": {
+                    "mutating_dispatch_count": 1,
+                    "mutating_tool_names": ["write_file"],
+                },
+            }],
+        }
+
+        update = state.record_delegate_task(args, envelope)
+
+        self.assertEqual([], update["retryable_failed_step_ids"])
+        self.assertEqual(["research"], update["terminal_failed_step_ids"])
+        terminal = state.terminal_delegate_failure()
+        self.assertIsNotNone(terminal)
+        self.assertFalse(terminal["retryable"])
+        self.assertEqual(
+            "side_effect_state_uncertain",
+            terminal["failure_class"],
+        )
+        self.assertEqual(
+            "workflow_ir_required_step_degraded",
+            terminal["terminal_reason"],
+        )
+
+    def test_workflow_ir_degraded_required_worker_without_dispatch_audit_is_terminal(self):
+        state = self._workflow_ir_state()
+        args = {"tasks": [{
+            "skill_name": "generic",
+            "worker_id": "research",
+            "step_type": "worker",
+            "step_id": "research",
+            "workflow_stage": "ir-wave-001",
+        }]}
+        envelope = {
+            "status": "completed_degraded",
+            "results": [{
+                "status": "completed",
+                "completion_quality": "degraded",
+                "skill_name": "generic",
+                "worker_id": "research",
+                "step_type": "worker",
+                "step_id": "research",
+                "workflow_stage": "ir-wave-001",
+                "result_path": "results/research.md",
+                "result_chars": 500,
+            }],
+        }
+
+        update = state.record_delegate_task(args, envelope)
+
+        self.assertEqual([], update["retryable_failed_step_ids"])
+        self.assertEqual(["research"], update["terminal_failed_step_ids"])
+        terminal = state.terminal_delegate_failure()
+        self.assertIsNotNone(terminal)
+        self.assertFalse(terminal["retryable"])
+        self.assertEqual(
+            "side_effect_state_uncertain",
+            terminal["failure_class"],
+        )
+
+    def test_non_workflow_ir_degraded_worker_remains_completed(self):
+        state = self._workflow_ir_state()
+        state.skill_execution_plans["generic"]["selection"] = "full"
+
+        update = state.record_delegate_task(
+            {"tasks": [{
+                "skill_name": "generic",
+                "worker_id": "research",
+                "step_type": "worker",
+                "step_id": "research",
+                "workflow_stage": "ir-wave-001",
+            }]},
+            {
+                "status": "completed_degraded",
+                "results": [{
+                    "status": "completed",
+                    "completion_quality": "degraded",
+                    "skill_name": "generic",
+                    "worker_id": "research",
+                    "step_type": "worker",
+                    "step_id": "research",
+                    "workflow_stage": "ir-wave-001",
+                    "result_path": "results/research.md",
+                    "result_chars": 500,
+                }],
+            },
+        )
+
+        self.assertEqual(["research"], update["completed_step_ids"])
+        self.assertEqual(
+            ["research"],
+            update["degraded_completed_step_ids"],
+        )
+        self.assertIn(
+            "research",
+            state.skill_completed_workers.get("generic", set()),
+        )
+        self.assertIsNone(state.terminal_delegate_failure())
 
     def test_artifact_synthesis_is_recorded_as_terminal_phase_not_worker(self):
         contract = _generic_contract()

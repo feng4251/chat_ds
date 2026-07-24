@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, PropertyMock, patch
 
 from agent_loop import (
     DirectToolExposure,
@@ -1193,6 +1193,97 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
                     )
                 ]
         return requests, dispatch_mock, events
+
+    async def test_terminal_event_contains_reconciled_run_contract(self):
+        _, dispatch_mock, events = await self._run_stream_sequence(
+            [self._stop_lines("plain answer")],
+            max_iterations=1,
+            enabled_tool="",
+            task_text="say hello",
+        )
+
+        dispatch_mock.assert_not_awaited()
+        terminal = next(
+            event
+            for event in events
+            if event.get("event_type") == "run.completed"
+        )
+        contract = terminal["payload"]["run_contract"]
+        self.assertTrue(contract["terminal"])
+        self.assertTrue(contract["reconciliation_valid"])
+        self.assertRegex(
+            contract["reconciliation_sha256"],
+            r"^[0-9a-f]{64}$",
+        )
+        self.assertEqual("verified", terminal["payload"]["contract_quality"])
+        self.assertIn(
+            "verifier.completed",
+            [
+                item["event"]
+                for item in contract["lifecycle"]["recent_history"]
+            ],
+        )
+
+    async def test_completion_receipt_failure_never_publishes_pass_or_success(self):
+        with patch(
+            "agent_loop.RunContractLedger.preview_terminal",
+            return_value={
+                "completion_allowed": False,
+                "quality": "failed",
+            },
+        ):
+            _, _, events = await self._run_stream_sequence(
+                [self._stop_lines("plain answer")],
+                max_iterations=1,
+                enabled_tool="",
+                task_text="say hello",
+            )
+
+        self.assertFalse(any(
+            event.get("event_type") == "run.completed"
+            for event in events
+        ))
+        self.assertFalse(any(
+            event.get("event_type") == "verifier.completed"
+            and (event.get("payload") or {}).get("verdict") == "pass"
+            for event in events
+        ))
+        failed = next(
+            event
+            for event in events
+            if event.get("event_type") == "run.failed"
+        )
+        self.assertEqual(
+            "completion_contract_failed",
+            failed["payload"]["terminal_reason"],
+        )
+
+    async def test_invalid_lifecycle_integrity_cannot_publish_success(self):
+        with patch(
+            "agent_loop.RunLifecycleMachine.integrity_valid",
+            new_callable=PropertyMock,
+            return_value=False,
+        ):
+            _, _, events = await self._run_stream_sequence(
+                [self._stop_lines("plain answer")],
+                max_iterations=1,
+                enabled_tool="",
+                task_text="say hello",
+            )
+
+        self.assertFalse(any(
+            event.get("event_type") == "run.completed"
+            for event in events
+        ))
+        failed = next(
+            event
+            for event in events
+            if event.get("event_type") == "run.failed"
+        )
+        self.assertEqual(
+            "lifecycle_integrity_failed",
+            failed["payload"]["terminal_reason"],
+        )
 
     async def test_live_runtime_capacity_clamps_the_first_wire_request(self):
         async def resolve_runtime(provider):

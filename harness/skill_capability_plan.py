@@ -19,11 +19,19 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 from urllib.parse import urlsplit
 
 from skills.http_grants import canonical_https_prefix, canonical_https_request_url
+from workflow_ir import (
+    InstructionDocument,
+    WorkflowIRValidationError,
+    WorkflowPlanAdapterError,
+    compile_worker_wave_plan,
+    instruction_catalog_payload,
+    validate_workflow_ir,
+)
 
 
 CAPABILITY_PLAN_TOOL_NAME = "submit_skill_capability_plan"
@@ -36,6 +44,7 @@ MAX_NATIVE_CAPABILITY_CANDIDATES = 32
 MAX_AUTHORITY_DOCUMENTS = 16
 MAX_AUTHORITY_DOCUMENT_CHARS = 256_000
 MAX_UNSUPPORTED_ITEMS = 64
+MAX_WORKFLOW_INSTRUCTION_CATALOG_BYTES = 750_000
 
 # These public bridge schemas are never selectable without a more specific,
 # backend-issued candidate.  This keeps a model from turning the presence of a
@@ -77,6 +86,32 @@ def _safe_relative_path(value: Any) -> str | None:
     if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
         return None
     return str(path)
+
+
+def _current_loaded_resource_sha256(
+    loaded_package: dict[str, Any],
+    resource_path: str,
+) -> str | None:
+    """Hash one loader-owned package resource without following escapes."""
+
+    skill_dir = loaded_package.get("skill_dir")
+    if not isinstance(skill_dir, str) or not skill_dir:
+        return None
+    try:
+        from skills.path_safety import validate_skill_resource
+
+        root = Path(skill_dir).resolve(strict=True)
+        checked = validate_skill_resource(
+            root,
+            resource_path,
+            expected_kind="file",
+            require_relative=True,
+        )
+        if not checked.valid or checked.path is None:
+            return None
+        return hashlib.sha256(checked.path.read_bytes()).hexdigest()
+    except (OSError, RuntimeError, ValueError):
+        return None
 
 
 def _body_references_path(body: str, path: str) -> bool:
@@ -254,6 +289,69 @@ def _validated_authority_documents(
     return result
 
 
+def _validated_workflow_instruction_documents(
+    documents: Iterable[InstructionDocument],
+    *,
+    body_sha256: str,
+    authority_documents: Iterable[dict[str, str]],
+    workflow_ir_required: bool,
+) -> tuple[tuple[InstructionDocument, ...], dict[str, Any] | None]:
+    """Bind runtime-owned IR authority to the exact disclosed Skill closure."""
+
+    if not isinstance(workflow_ir_required, bool):
+        raise ValueError("workflow_ir_required must be a boolean")
+    if isinstance(documents, (str, bytes)):
+        raise ValueError(
+            "instruction_documents must contain InstructionDocument objects"
+        )
+    normalized = tuple(documents)
+    if workflow_ir_required and not normalized:
+        raise ValueError(
+            "workflow_ir_required needs runtime-owned instruction_documents"
+        )
+    if not normalized:
+        return (), None
+
+    try:
+        projection = instruction_catalog_payload(normalized)
+    except WorkflowIRValidationError as exc:
+        raise ValueError(
+            f"invalid workflow instruction documents ({exc.code}): {exc}"
+        ) from exc
+
+    authorized_digests = {
+        "SKILL.md": body_sha256,
+        **{
+            str(document.get("resource_path") or ""): str(document.get("sha256") or "")
+            for document in authority_documents
+            if isinstance(document, dict)
+        },
+    }
+    if not any(document.source_path == "SKILL.md" for document in normalized):
+        raise ValueError(
+            "workflow instruction authority must include canonical SKILL.md"
+        )
+    for document in normalized:
+        if authorized_digests.get(document.source_path) != (document.source_sha256):
+            raise ValueError(
+                "workflow instruction document is outside the exact "
+                f"content-addressed authority closure: {document.source_path}"
+            )
+
+    encoded = json.dumps(
+        projection,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(encoded) > MAX_WORKFLOW_INSTRUCTION_CATALOG_BYTES:
+        raise ValueError(
+            "workflow instruction catalog exceeds the bounded model-visible "
+            f"limit of {MAX_WORKFLOW_INSTRUCTION_CATALOG_BYTES} bytes"
+        )
+    return normalized, projection
+
+
 def build_capability_catalog(
     *,
     skill_name: str,
@@ -269,6 +367,8 @@ def build_capability_catalog(
     authority_documents: Iterable[dict[str, Any]] = (),
     script_runtime_profiles: dict[str, dict[str, Any]] | None = None,
     required_native_tool_groups: Iterable[Iterable[str]] = (),
+    instruction_documents: Iterable[InstructionDocument] = (),
+    workflow_ir_required: bool = False,
 ) -> dict[str, Any]:
     """Build a finite catalog from backend-authorized, current capabilities.
 
@@ -385,11 +485,24 @@ def build_capability_catalog(
             if _body_references_path(body, path)
             else authority_by_referenced_path.get(path)
         )
+        resource_sha256 = _current_loaded_resource_sha256(
+            loaded_package,
+            path,
+        )
+        # A path-only candidate is vulnerable to same-path replacement after
+        # planning. Runtime-loaded packages always provide skill_dir; if the
+        # exact current bytes cannot be hashed, do not issue the candidate.
+        if not _valid_sha256(resource_sha256):
+            continue
         candidates.append({
-            "id": _stable_id("resource", f"{skill_name}\0{path}"),
+            "id": _stable_id(
+                "resource",
+                f"{skill_name}\0{path}\0{resource_sha256}",
+            ),
             "kind": "skill_resource",
             "skill_name": skill_name,
             "resource_path": path,
+            "sha256": resource_sha256,
             "authority_chain": (
                 [
                     {"resource_path": "SKILL.md", "sha256": body_sha256},
@@ -623,6 +736,25 @@ def build_capability_catalog(
         }
         for document in root_linked_documents
     ]
+    runtime_instruction_documents, instruction_catalog = (
+        _validated_workflow_instruction_documents(
+            instruction_documents,
+            body_sha256=body_sha256,
+            authority_documents=authority_projection,
+            workflow_ir_required=workflow_ir_required,
+        )
+    )
+    workflow_projection = (
+        {
+            "workflow_ir_required": workflow_ir_required,
+            "instruction_catalog_sha256": instruction_catalog["catalog_sha256"],
+            "instruction_documents": [
+                document.binding_dict() for document in runtime_instruction_documents
+            ],
+        }
+        if instruction_catalog is not None
+        else None
+    )
     catalog_sha256 = hashlib.sha256(json.dumps(
         {
             "schema_version": CAPABILITY_PLAN_SCHEMA_VERSION,
@@ -631,17 +763,24 @@ def build_capability_catalog(
             "authority_documents": authority_projection,
             "candidates": candidates,
             "required_candidate_groups": required_candidate_groups,
+            **(
+                {"workflow_ir": workflow_projection}
+                if workflow_projection is not None else {}
+            ),
         },
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")).hexdigest()
-    return {
+    catalog = {
         "schema_version": CAPABILITY_PLAN_SCHEMA_VERSION,
         "skill_name": skill_name,
         "body_sha256": body_sha256,
         "catalog_sha256": catalog_sha256,
-        "catalog_revision": len(authority_projection),
+        "catalog_revision": (
+            len(authority_projection)
+            + (1 if instruction_catalog is not None else 0)
+        ),
         "authority_documents": authority_projection,
         "body_chars": int(loaded_package.get("skill_md_chars") or len(body)),
         "candidates": candidates,
@@ -669,32 +808,90 @@ def build_capability_catalog(
             "max_native_candidates": MAX_NATIVE_CAPABILITY_CANDIDATES,
         },
     }
+    if instruction_catalog is not None:
+        # Runtime-owned immutable objects are intentionally omitted by
+        # catalog_prompt_payload.  The exact bounded projection below is the
+        # only model-visible form.
+        catalog.update(
+            {
+                "instruction_documents": runtime_instruction_documents,
+                "instruction_catalog": instruction_catalog,
+                "workflow_ir_required": workflow_ir_required,
+            }
+        )
+        catalog["policy"].update(
+            {
+                "workflow_ir_content_addressed": True,
+                "workflow_ir_unknown_or_omitted_units_rejected": True,
+                "workflow_ir_selected_capabilities_only": True,
+                "max_instruction_catalog_bytes": (
+                    MAX_WORKFLOW_INSTRUCTION_CATALOG_BYTES
+                ),
+            }
+        )
+    return catalog
 
 
 def catalog_prompt_payload(catalog: dict[str, Any]) -> dict[str, Any]:
     """Return the bounded model-visible projection of one catalog."""
 
-    return {
+    instruction_catalog = catalog.get("instruction_catalog")
+    workflow_ir_available = isinstance(instruction_catalog, dict)
+    workflow_ir_required = (
+        workflow_ir_available and catalog.get("workflow_ir_required") is True
+    )
+    workflow_guidance = ""
+    if workflow_ir_available:
+        workflow_guidance = (
+            " The runtime also issued a content-addressed instruction catalog. "
+            "If you submit workflow_ir, copy every exact document binding and "
+            "provide exactly one coverage record for every instruction unit. "
+            "Every workflow node capability_ids entry must come from this "
+            "plan's required+optional selections; sharing one selected "
+            "delegate capability does not merge distinct workflow nodes. "
+            "Dependencies must form a finite acyclic graph, every required "
+            "instruction must map bidirectionally to required nodes, and the "
+            "IR complete/count fields must be exact."
+        )
+        if workflow_ir_required:
+            workflow_guidance += (
+                " workflow_ir is mandatory for this catalog; omitting it "
+                "fails closed and no capability plan is installed. Every "
+                "non-heading instruction unit is runtime-required: classify "
+                "it as required or conditional, map it bidirectionally to at "
+                "least one required child_agent node, and bind every required "
+                "node to the required delegate_task candidate. Headings alone "
+                "may be advisory/not_applicable. The parent consumes "
+                "delegate_task; other node-bound candidates form that exact "
+                "child's capability/resource boundary."
+            )
+        else:
+            workflow_guidance += (
+                " workflow_ir is optional for this simple catalog; omit it "
+                "unless the disclosed instructions require an explicit graph."
+            )
+
+    payload = {
         "schema_version": catalog.get("schema_version"),
         "skill_name": catalog.get("skill_name"),
         "body_sha256": catalog.get("body_sha256"),
         "catalog_sha256": catalog.get("catalog_sha256"),
         "catalog_revision": catalog.get("catalog_revision", 0),
-        "authority_documents": list(
-            catalog.get("authority_documents") or []
-        )[:MAX_AUTHORITY_DOCUMENTS],
+        "authority_documents": list(catalog.get("authority_documents") or [])[
+            :MAX_AUTHORITY_DOCUMENTS
+        ],
         "body_chars": catalog.get("body_chars"),
         "candidates": list(catalog.get("candidates") or [])[:MAX_CAPABILITY_CANDIDATES],
         "required_candidate_groups": [
             list(group)
-            for group in (
-                catalog.get("required_candidate_groups") or []
-            )[:MAX_CAPABILITY_CANDIDATES]
+            for group in (catalog.get("required_candidate_groups") or [])[
+                :MAX_CAPABILITY_CANDIDATES
+            ]
             if isinstance(group, list)
         ],
-        "unavailable_capabilities": list(
-            catalog.get("unavailable_capabilities") or []
-        )[:MAX_UNSUPPORTED_ITEMS],
+        "unavailable_capabilities": list(catalog.get("unavailable_capabilities") or [])[
+            :MAX_UNSUPPORTED_ITEMS
+        ],
         "instructions": (
             "After reading every SKILL.md page, call submit_skill_capability_plan "
             "once. Put capability IDs needed to satisfy mandatory instructions in "
@@ -721,8 +918,17 @@ def catalog_prompt_payload(catalog: dict[str, Any]) -> dict[str, Any]:
             "uses a network-disabled isolated executor and cannot replace a browser or "
             "remote-network capability; a listed persistent-process runner remains "
             "limited to its backend-owned runtime/egress profile and opaque lease."
+            + workflow_guidance
         ),
     }
+    if workflow_ir_available:
+        payload.update(
+            {
+                "workflow_ir_required": workflow_ir_required,
+                "instruction_catalog": instruction_catalog,
+            }
+        )
+    return payload
 
 
 def _error(code: str, message: str, **extra: Any) -> CapabilityPlanResult:
@@ -734,6 +940,133 @@ def _error(code: str, message: str, **extra: Any) -> CapabilityPlanResult:
     })
 
 
+def _candidate_tool_names(candidate: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    tool_name = candidate.get("tool_name")
+    if isinstance(tool_name, str) and tool_name:
+        names.append(tool_name)
+    raw_names = candidate.get("tool_names")
+    if isinstance(raw_names, list):
+        names.extend(
+            str(name)
+            for name in raw_names
+            if isinstance(name, str) and name
+        )
+    return list(dict.fromkeys(names))
+
+
+def _bind_worker_plan_capabilities(
+    worker_plan: dict[str, Any],
+    *,
+    candidates: dict[str, dict[str, Any]],
+    skill_name: str,
+) -> dict[str, Any]:
+    """Project exact candidate IDs into the existing child-task contract.
+
+    ``delegate_task`` is a parent controller bridge, not a recursive child
+    capability. Other candidates become an explicit required child tool or
+    an exact local resource preload. The child still receives only grants
+    already present in the accepted parent capability plan.
+    """
+
+    enriched = json.loads(json.dumps(worker_plan))
+
+    def enrich(step: dict[str, Any]) -> None:
+        candidate_ids = [
+            str(identifier)
+            for identifier in step.get("capability_candidate_ids") or []
+            if isinstance(identifier, str) and identifier
+        ]
+        child_tools: list[str] = []
+        local_resources = [
+            str(path)
+            for path in step.get("local_resources") or []
+            if isinstance(path, str) and path
+        ]
+        local_grant_needed = False
+        bindings: list[dict[str, Any]] = []
+        for identifier in candidate_ids:
+            candidate = candidates[identifier]
+            kind = str(candidate.get("kind") or "")
+            tool_names = _candidate_tool_names(candidate)
+            child_tools.extend(
+                name for name in tool_names if name != "delegate_task"
+            )
+            resource_path = candidate.get("resource_path")
+            if kind == "skill_resource" and isinstance(resource_path, str):
+                local_resources.append(resource_path)
+            if kind in {
+                "skill_script",
+                "declared_command",
+                "skill_http_prefix",
+            }:
+                local_grant_needed = True
+            binding: dict[str, Any] = {
+                "candidate_id": identifier,
+                "kind": kind,
+                "tool_names": tool_names,
+            }
+            # Retain the exact backend-issued authority coordinates needed to
+            # narrow one child.  Tool names alone are not sufficient: several
+            # scripts, commands, resources, or HTTP prefixes intentionally
+            # share one bridge name inside a selected Skill.
+            for field in (
+                "skill_name",
+                "resource_path",
+                "sha256",
+                "package_sha256",
+                "tool_name",
+                "command_id",
+                "executable",
+                "url_prefix",
+                "http_method",
+                "runtime_profile",
+                "required_cwd",
+                "schema_sha256",
+                "descriptor_sha256",
+            ):
+                value = candidate.get(field)
+                if isinstance(value, str) and value:
+                    binding[field] = value
+            fixed_argv = candidate.get("fixed_argv")
+            if isinstance(fixed_argv, list) and all(
+                isinstance(value, str) for value in fixed_argv
+            ):
+                binding["fixed_argv"] = list(fixed_argv)
+            if isinstance(candidate.get("additional_argv"), bool):
+                binding["additional_argv"] = candidate["additional_argv"]
+            bindings.append(binding)
+        step["tools"] = [
+            {"tool": name, "required": True}
+            for name in dict.fromkeys(child_tools)
+        ]
+        step["local_resources"] = list(dict.fromkeys(local_resources))
+        if local_grant_needed:
+            step["skills"] = [skill_name]
+        step["capability_bindings"] = bindings
+        step["capability_bindings_sha256"] = hashlib.sha256(
+            json.dumps(
+                bindings,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+    workers = enriched.get("workers")
+    if isinstance(workers, dict):
+        for step in workers.values():
+            if isinstance(step, dict):
+                enrich(step)
+    for step in enriched.get("aggregation_steps") or []:
+        if isinstance(step, dict):
+            enrich(step)
+    enriched["available_aggregation_steps"] = list(
+        enriched.get("aggregation_steps") or []
+    )
+    return enriched
+
+
 def validate_capability_plan(
     catalog: dict[str, Any] | None,
     *,
@@ -743,6 +1076,7 @@ def validate_capability_plan(
     optional: Any,
     unsupported: Any,
     catalog_sha256: Any = None,
+    workflow_ir: Any = None,
 ) -> CapabilityPlanResult:
     """Validate a model selection and derive its exact effective closure."""
 
@@ -876,10 +1210,218 @@ def validate_capability_plan(
             missing_required_candidate_groups=missing_required_groups[:32],
         )
 
+    workflow_flag = catalog.get("workflow_ir_required", False)
+    if not isinstance(workflow_flag, bool):
+        return _error(
+            "capability_catalog_workflow_ir_invalid",
+            "The runtime-owned workflow_ir_required flag is malformed.",
+        )
+    raw_instruction_documents = catalog.get("instruction_documents")
+    if raw_instruction_documents is None:
+        runtime_instruction_documents: tuple[InstructionDocument, ...] = ()
+    elif not isinstance(raw_instruction_documents, (list, tuple)) or not all(
+        isinstance(document, InstructionDocument)
+        for document in raw_instruction_documents
+    ):
+        return _error(
+            "capability_catalog_workflow_ir_invalid",
+            "The runtime-owned instruction documents are malformed.",
+        )
+    else:
+        runtime_instruction_documents = tuple(raw_instruction_documents)
+
+    if workflow_flag and not runtime_instruction_documents:
+        return _error(
+            "capability_catalog_workflow_ir_invalid",
+            "workflow_ir_required has no runtime-owned instruction documents.",
+        )
+    if runtime_instruction_documents:
+        try:
+            current_instruction_catalog = instruction_catalog_payload(
+                runtime_instruction_documents
+            )
+        except WorkflowIRValidationError as exc:
+            return _error(
+                "capability_catalog_workflow_ir_invalid",
+                "The runtime-owned instruction catalog is invalid.",
+                workflow_ir_error_code=exc.code,
+                workflow_ir_error_path=exc.path,
+            )
+        if len(json.dumps(
+            current_instruction_catalog,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")) > MAX_WORKFLOW_INSTRUCTION_CATALOG_BYTES:
+            return _error(
+                "capability_catalog_workflow_ir_invalid",
+                "The runtime-owned instruction catalog exceeds its bounded "
+                "model-visible size.",
+            )
+        if catalog.get("instruction_catalog") != current_instruction_catalog:
+            return _error(
+                "capability_catalog_workflow_ir_invalid",
+                "The model-visible instruction catalog no longer matches "
+                "runtime-owned instruction documents.",
+            )
+    elif workflow_ir is not None:
+        return _error(
+            "capability_plan_workflow_ir_not_authorized",
+            "This simple catalog did not issue instruction-document authority "
+            "for a model-authored Workflow IR.",
+        )
+
+    workflow_payload = workflow_ir
+    if workflow_flag and workflow_payload is None:
+        return _error(
+            "capability_plan_workflow_ir_required",
+            "This content-addressed instruction catalog requires workflow_ir.",
+            instruction_catalog_sha256=(
+                (catalog.get("instruction_catalog") or {}).get("catalog_sha256")
+            ),
+        )
+
+    validated_workflow_ir = None
+    worker_plan: dict[str, Any] | None = None
+    workflow_instruction_resource_bindings: list[dict[str, str]] = []
+    if workflow_payload is not None:
+        if not runtime_instruction_documents:
+            return _error(
+                "capability_plan_workflow_ir_not_authorized",
+                "No runtime-owned instruction documents authorize workflow_ir.",
+            )
+        if not isinstance(workflow_payload, dict):
+            return _error(
+                "capability_plan_workflow_ir_invalid",
+                "workflow_ir must be one complete JSON object.",
+            )
+        try:
+            validated_workflow_ir = validate_workflow_ir(
+                workflow_payload,
+                documents=runtime_instruction_documents,
+                skill_name=expected_skill,
+                capability_catalog_sha256=expected_catalog_digest,
+                # Passing only the exact current selections prevents the graph
+                # from widening the capability plan.
+                available_capability_ids=all_ids,
+                strict_instruction_execution=workflow_flag,
+            )
+        except WorkflowIRValidationError as exc:
+            error_code = (
+                "capability_plan_workflow_ir_unselected_capability"
+                if exc.code == "unknown_capability_id"
+                else "capability_plan_workflow_ir_invalid"
+            )
+            return _error(
+                error_code,
+                "The submitted Workflow IR failed deterministic validation.",
+                workflow_ir_error_code=exc.code,
+                workflow_ir_error_path=exc.path,
+                workflow_ir_error=str(exc)[:1_000],
+            )
+        delegate_candidate_ids = {
+            identifier
+            for identifier, candidate in candidates.items()
+            if (
+                candidate.get("kind") == "native_tool"
+                and candidate.get("tool_name") == "delegate_task"
+            )
+        }
+        if workflow_flag and not delegate_candidate_ids.intersection(required):
+            return _error(
+                "capability_plan_workflow_delegate_not_required",
+                "Mandatory Workflow IR requires the backend-issued "
+                "delegate_task candidate in the required selection.",
+            )
+        for node in validated_workflow_ir.nodes:
+            if (
+                node.required
+                and not delegate_candidate_ids.intersection(
+                    node.capability_ids
+                )
+            ):
+                return _error(
+                    "capability_plan_workflow_node_not_delegated",
+                    "Every required child-agent Workflow IR node must bind the "
+                    "backend-issued delegate_task candidate.",
+                    workflow_ir_node_id=node.id,
+                )
+        authorized_instruction_digests = {
+            "SKILL.md": expected_digest,
+            **{
+                str(document.get("resource_path") or ""): str(
+                    document.get("sha256") or ""
+                )
+                for document in catalog.get("authority_documents") or []
+                if isinstance(document, dict)
+            },
+        }
+        instruction_units_by_id = {
+            unit.id: unit
+            for unit in validated_workflow_ir.instruction_units
+        }
+        seen_instruction_sources: set[str] = set()
+        for node in validated_workflow_ir.nodes:
+            if not node.required:
+                continue
+            for instruction_id in node.instruction_ids:
+                unit = instruction_units_by_id[instruction_id]
+                if (
+                    authorized_instruction_digests.get(unit.source_path)
+                    != unit.source_sha256
+                ):
+                    return _error(
+                        "capability_plan_workflow_instruction_source_unauthorized",
+                        "A required Workflow IR node instruction source is "
+                        "outside the parent-frozen content-addressed authority "
+                        "closure.",
+                        workflow_ir_node_id=node.id,
+                        workflow_ir_instruction_id=instruction_id,
+                        workflow_ir_instruction_source=unit.source_path,
+                    )
+                if unit.source_path not in seen_instruction_sources:
+                    seen_instruction_sources.add(unit.source_path)
+                    workflow_instruction_resource_bindings.append({
+                        "resource_path": unit.source_path,
+                        "sha256": unit.source_sha256,
+                    })
+        try:
+            worker_plan = _bind_worker_plan_capabilities(
+                compile_worker_wave_plan(validated_workflow_ir),
+                candidates=candidates,
+                skill_name=expected_skill,
+            )
+        except WorkflowPlanAdapterError as exc:
+            return _error(
+                "capability_plan_workflow_ir_not_lowerable",
+                "The validated Workflow IR cannot be represented by the "
+                "bounded worker/wave runtime.",
+                workflow_ir_error_code=exc.code,
+                workflow_ir_node_id=exc.node_id,
+                workflow_ir_error=str(exc)[:1_000],
+            )
+        if workflow_flag and not (
+            worker_plan.get("required_workers")
+            or worker_plan.get("aggregation_steps")
+        ):
+            return _error(
+                "capability_plan_workflow_empty",
+                "Mandatory Workflow IR lowered to no required execution nodes.",
+            )
+
     selected = [candidates[identifier] for identifier in all_ids]
     required_candidates = [candidates[identifier] for identifier in required]
     tools: list[str] = ["skill_view"]
-    resources: list[tuple[str, str]] = [(expected_skill, "SKILL.md")]
+    resources: list[tuple[str, str]] = [
+        (expected_skill, "SKILL.md"),
+        *[
+            (
+                expected_skill,
+                str(binding.get("resource_path") or ""),
+            )
+            for binding in workflow_instruction_resource_bindings
+        ],
+    ]
     scripts: list[tuple[str, str, str]] = []
     process_only_scripts: list[tuple[str, str, str]] = []
     script_authorities: list[
@@ -1028,6 +1570,22 @@ def validate_capability_plan(
             if clean_unsupported else "all classified instructions use backend-issued candidates"
         ),
     }
+    if validated_workflow_ir is not None and worker_plan is not None:
+        canonical_workflow_ir = validated_workflow_ir.to_dict()
+        normalized.update(
+            {
+                "workflow_ir_required": workflow_flag,
+                "workflow_ir": canonical_workflow_ir,
+                "worker_plan": worker_plan,
+                "workflow_instruction_resource_bindings": [
+                    dict(binding)
+                    for binding in workflow_instruction_resource_bindings
+                ],
+                "instruction_coverage": [
+                    item.to_dict() for item in validated_workflow_ir.coverage
+                ],
+            }
+        )
     return CapabilityPlanResult(True, normalized)
 
 
@@ -1064,6 +1622,7 @@ def capability_call_satisfies_candidate(
         if tool_name != "skill_view":
             return False
         path = str(candidate.get("resource_path") or "")
+        expected_digest = str(candidate.get("sha256") or "")
         requested_path = args.get("file_path")
         if requested_path in {None, ""}:
             requested_path = "SKILL.md"
@@ -1072,8 +1631,19 @@ def capability_call_satisfies_candidate(
         # Merely asking for a later page whose response says has_more=false is
         # not a complete receipt. A terminal handler error remains a concrete
         # degraded attempt and is matched below by its exact arguments.
-        if outcome == "success" and skill_resource_complete is not True:
-            return False
+        if outcome == "success":
+            if skill_resource_complete is not True:
+                return False
+            # EOF alone does not bind the bytes to the capability plan.  The
+            # whole-resource digest returned by skill_view must still equal the
+            # compiler-issued candidate digest, closing same-path replacement
+            # between planning and direct/root execution.
+            if (
+                not expected_digest
+                or not isinstance(result_data, dict)
+                or result_data.get("sha256") != expected_digest
+            ):
+                return False
         return (
             args.get("name") == skill_name
             and requested_path == path

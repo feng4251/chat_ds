@@ -403,6 +403,154 @@ class WorkflowGateToolPolicyTests(unittest.TestCase):
             _workflow_gate_call_error(policy, "delegate_task", exact, prior_call_count=0),
         )
 
+    def test_exact_controller_only_worker_and_aggregation_allow_zero_model_tools(self):
+        binding = {
+            "candidate_id": "delegate-controller",
+            "kind": "native_tool",
+            "tool_name": "delegate_task",
+            "tool_names": ["delegate_task"],
+        }
+        digest = hashlib.sha256(json.dumps(
+            [binding],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        source_binding = {
+            "resource_path": "SKILL.md",
+            "sha256": "a" * 64,
+        }
+
+        worker_policy = _workflow_gate_tool_policy(
+            "delegate workflow stage 'reasoning' for session skill 'generic' "
+            "(parallel workers: reason)",
+            self.available,
+        )
+        worker_policy.update({
+            "expected_step_ids": ["reason"],
+            "expected_worker_files": {
+                "reason": "workers/reason.md",
+            },
+            "expected_capability_bindings": {
+                "reason": [binding],
+            },
+            "expected_capability_bindings_sha256": {
+                "reason": digest,
+            },
+            "expected_instruction_source_bindings": {
+                "reason": [source_binding],
+            },
+            "expected_required_result_paths": {
+                "reason": [],
+            },
+            "expected_skill_files_to_inspect": {
+                "reason": ["SKILL.md"],
+            },
+        })
+        worker = {
+            "goal": "reason from the exact instruction",
+            "skill_name": "generic",
+            "step_type": "worker",
+            "step_id": "reason",
+            "worker_id": "reason",
+            "worker_file": "workers/reason.md",
+            "tools": [],
+            "required_skill_files_to_inspect": ["SKILL.md"],
+            "required_instruction_source_bindings": [source_binding],
+            "capability_bindings": [binding],
+            "capability_bindings_sha256": digest,
+        }
+        self.assertEqual(
+            "",
+            _workflow_gate_call_error(
+                worker_policy,
+                "delegate_task",
+                worker,
+                prior_call_count=0,
+            ),
+        )
+
+        aggregation_policy = _workflow_gate_tool_policy(
+            "delegate aggregation step 'synthesize' for session skill 'generic'",
+            self.available,
+        )
+        aggregation_policy.update({
+            "expected_step_ids": ["synthesize"],
+            "expected_capability_bindings": {
+                "synthesize": [binding],
+            },
+            "expected_capability_bindings_sha256": {
+                "synthesize": digest,
+            },
+            "expected_instruction_source_bindings": {
+                "synthesize": [source_binding],
+            },
+            "expected_required_result_paths": {
+                "synthesize": ["results/reason.txt"],
+            },
+            "expected_skill_files_to_inspect": {
+                "synthesize": ["SKILL.md"],
+            },
+        })
+        aggregation = {
+            "goal": "synthesize the preloaded result",
+            "skill_name": "generic",
+            "step_type": "aggregation",
+            "step_id": "synthesize",
+            "tools": [],
+            "required_result_paths": ["results/reason.txt"],
+            "required_skill_files_to_inspect": ["SKILL.md"],
+            "required_instruction_source_bindings": [source_binding],
+            "capability_bindings": [binding],
+            "capability_bindings_sha256": digest,
+        }
+        self.assertEqual(
+            "",
+            _workflow_gate_call_error(
+                aggregation_policy,
+                "delegate_task",
+                aggregation,
+                prior_call_count=0,
+            ),
+        )
+
+        for invalid, expected_error in (
+            (
+                {**worker, "capability_bindings_sha256": "0" * 64},
+                "explicit empty tools allowlist",
+            ),
+            (
+                {
+                    key: value
+                    for key, value in worker.items()
+                    if key != "worker_file"
+                },
+                "exact contract file",
+            ),
+            (
+                {
+                    "goal": "ad hoc empty delegate",
+                    "skill_name": "generic",
+                    "step_type": "worker",
+                    "step_id": "reason",
+                    "worker_id": "reason",
+                    "worker_file": "workers/reason.md",
+                    "tools": [],
+                },
+                "explicit empty tools allowlist",
+            ),
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertIn(
+                    expected_error,
+                    _workflow_gate_call_error(
+                        worker_policy,
+                        "delegate_task",
+                        invalid,
+                        prior_call_count=0,
+                    ),
+                )
+
     def test_worker_gate_rejects_duplicate_or_missing_extra_step_ids(self):
         policy = _workflow_gate_tool_policy(
             "delegate workflow stage 'research' for session skill 'generic' (parallel workers: a, b)",

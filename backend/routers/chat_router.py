@@ -260,8 +260,109 @@ def _event_payload(event: dict) -> dict:
     return event.get("payload") if isinstance(event.get("payload"), dict) else {}
 
 
+def _event_is_authoritative(
+    event: dict,
+    payload: dict | None = None,
+) -> bool:
+    """Apply the Harness terminal-authority precedence exactly once.
+
+    The run-contract adapter gives an explicit top-level boolean precedence
+    over the payload field, then treats ``provisional_terminal`` as
+    non-authoritative.  Backend persistence must use the same rule or one
+    event can be provisional in the Harness and terminal in the projection.
+    """
+
+    top_level = event.get("authoritative")
+    if isinstance(top_level, bool):
+        return top_level
+    effective_payload = (
+        payload if isinstance(payload, dict) else _event_payload(event)
+    )
+    nested = effective_payload.get("authoritative")
+    if isinstance(nested, bool):
+        return nested
+    if effective_payload.get("provisional_terminal") is True:
+        return False
+    return True
+
+
+def _normalized_event_payload(
+    event: dict,
+    payload: dict | None = None,
+) -> dict:
+    """Return the durable payload with terminal authority canonicalized."""
+
+    normalized = dict(
+        payload if isinstance(payload, dict) else _event_payload(event)
+    )
+    if str(event.get("event_type") or "") in {
+        "run.completed",
+        "run.failed",
+        "run.cancelled",
+    }:
+        normalized["authoritative"] = _event_is_authoritative(
+            event,
+            normalized,
+        )
+    return normalized
+
+
 def _event_key(event: dict, run_id: str) -> str:
     return f"{run_id}:{event.get('event_type') or 'unknown'}:{int(event.get('seq') or 0)}"
+
+
+def _event_contract_fingerprint(
+    event: dict,
+    *,
+    payload: dict | None = None,
+) -> str:
+    """Hash the durable, projection-relevant identity of one event.
+
+    The hash is used only for replay/conflict decisions and never logs raw
+    payloads. Exact replay is idempotent; a different payload under the same
+    ``(run_id, event_type, seq)`` key is rejected before any projection.
+    """
+
+    effective_payload = _normalized_event_payload(event, payload)
+    projection = {
+        "run_id": str(event.get("run_id") or ""),
+        "event_type": str(event.get("event_type") or ""),
+        "seq": int(event.get("seq") or 0),
+        "parent_run_id": event.get("parent_run_id"),
+        "payload": effective_payload,
+        "tool_name": event.get("tool_name")
+        or effective_payload.get("tool_name"),
+        "tool_call_id": event.get("tool_call_id")
+        or effective_payload.get("tool_call_id"),
+    }
+    encoded = json.dumps(
+        projection,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _persisted_event_contract_fingerprint(row: object) -> str:
+    try:
+        payload = json.loads(getattr(row, "payload", None) or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    return _event_contract_fingerprint(
+        {
+            "run_id": getattr(row, "run_id", ""),
+            "event_type": getattr(row, "event_type", ""),
+            "seq": int(getattr(row, "seq", 0) or 0),
+            "parent_run_id": getattr(row, "parent_run_id", None),
+            "tool_name": getattr(row, "tool_name", None),
+            "tool_call_id": getattr(row, "tool_call_id", None),
+        },
+        payload=payload,
+    )
 
 
 def _agent_event_terminal_status(
@@ -275,10 +376,10 @@ def _agent_event_terminal_status(
         if run_id is not None and str(event.get("run_id") or "") != run_id:
             continue
         event_type = str(event.get("event_type") or "")
-        payload = _event_payload(event)
+        payload = _normalized_event_payload(event)
         if (
             event_type in {"run.completed", "run.failed", "run.cancelled"}
-            and payload.get("authoritative") is False
+            and not _event_is_authoritative(event, payload)
         ):
             # Nested/provisional convergence terminals are observability, not
             # the root run's committed outcome.  Absence remains authoritative
@@ -287,12 +388,15 @@ def _agent_event_terminal_status(
         if event_type == "run.completed":
             terminal_type = event_type
             terminal_error = None
+            break
         elif event_type == "run.failed":
             terminal_type = event_type
             terminal_error = str(payload.get("error") or "Agent run failed.")[:4000]
+            break
         elif event_type == "run.cancelled":
             terminal_type = event_type
             terminal_error = None
+            break
     if terminal_type == "run.failed":
         return "failed", terminal_error or "Agent run failed."
     if terminal_type == "run.completed":
@@ -526,9 +630,14 @@ def _project_task_event(
     run_id: str,
     event: dict,
     payload: dict,
+    project_lifecycle: bool = True,
 ) -> None:
     task_key = _task_key_for_event(event, payload, run_id)
     if not task_key:
+        return
+    # Replayed, provisional, stale, or conflicting lifecycle observations
+    # must not mutate even descriptive task projection fields.
+    if not project_lifecycle:
         return
     event_type = str(event.get("event_type") or "")
     now = datetime.utcnow()
@@ -540,6 +649,16 @@ def _project_task_event(
         kind = "delegate" if agent_kind == "delegate" else "primary"
         title = str(event.get("agent_name") or payload.get("goal") or agent_kind or "Run")[:256]
     task = task_items.get(task_key)
+    if (
+        task is not None
+        and task.status in {"succeeded", "failed", "cancelled", "blocked"}
+        and event_type in {
+            "agent.spawned",
+            "run.started",
+            "verifier.requested",
+        }
+    ):
+        return
     if task is None:
         task = TaskItem(
             id=uuid.uuid4().hex,
@@ -620,18 +739,50 @@ async def _persist_agent_events(
         for event in events
         if event.get("run_id")
     }
-    persisted_event_keys: set[tuple[str, str, int]] = set()
+    persisted_event_fingerprints: dict[
+        tuple[str, str, int], str
+    ] = {}
+    authoritative_terminal_seq: dict[str, int] = {}
     if event_run_ids:
         rows = (await s.execute(
-            select(AgentRunEvent.run_id, AgentRunEvent.event_type, AgentRunEvent.seq).where(
+            select(AgentRunEvent).where(
                 AgentRunEvent.conversation_id == conv_id,
                 AgentRunEvent.run_id.in_(event_run_ids),
             )
-        )).all()
-        persisted_event_keys = {
-            (str(row[0]), str(row[1]), int(row[2] or 0))
+        )).scalars().all()
+        persisted_event_fingerprints = {
+            (
+                str(row.run_id),
+                str(row.event_type),
+                int(row.seq or 0),
+            ): _persisted_event_contract_fingerprint(row)
             for row in rows
         }
+        for row in rows:
+            persisted_type = str(row.event_type or "")
+            if persisted_type not in {
+                "run.completed", "run.failed", "run.cancelled",
+            }:
+                continue
+            try:
+                persisted_payload = json.loads(row.payload or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                persisted_payload = {}
+            if not isinstance(persisted_payload, dict):
+                persisted_payload = {}
+            if not _event_is_authoritative(
+                {
+                    "event_type": persisted_type,
+                    "payload": persisted_payload,
+                },
+                persisted_payload,
+            ):
+                continue
+            persisted_run_id = str(row.run_id)
+            authoritative_terminal_seq.setdefault(
+                persisted_run_id,
+                int(row.seq or 0),
+            )
     task_items = {
         task.task_key: task
         for task in (await s.execute(
@@ -645,15 +796,49 @@ async def _persist_agent_events(
         run_id = str(event.get("run_id") or "")
         if not run_id:
             continue
-        payload = _event_payload(event)
+        payload = _normalized_event_payload(event)
         event_type = str(event.get("event_type") or "unknown")
         if event_type in {"agent.delta", "agent.reasoning_delta"}:
             continue
         seq = int(event.get("seq") or 0)
         event_key = (run_id, event_type, seq)
-        event_already_persisted = event_key in persisted_event_keys
-        if event_already_persisted and event_type.startswith("debug."):
+        incoming_fingerprint = _event_contract_fingerprint(
+            event,
+            payload=payload,
+        )
+        persisted_fingerprint = persisted_event_fingerprints.get(event_key)
+        event_already_persisted = persisted_fingerprint is not None
+        if event_already_persisted:
+            if persisted_fingerprint != incoming_fingerprint:
+                logger.warning(
+                    "Rejected conflicting agent event replay "
+                    "conv=%s run=%s type=%s seq=%s",
+                    conv_id,
+                    run_id,
+                    event_type,
+                    seq,
+                )
             continue
+        terminal_event = event_type in {
+            "run.completed", "run.failed", "run.cancelled",
+        }
+        authoritative_terminal = bool(
+            terminal_event and _event_is_authoritative(event, payload)
+        )
+        known_terminal_seq = authoritative_terminal_seq.get(run_id, -1)
+        project_lifecycle = not event_already_persisted
+        if (
+            event_type
+            in {"agent.spawned", "run.started", "verifier.requested"}
+            and known_terminal_seq >= 0
+        ):
+            # A delayed/replayed start cannot reopen a durably terminal run.
+            project_lifecycle = False
+        if terminal_event:
+            if not authoritative_terminal or known_terminal_seq >= 0:
+                project_lifecycle = False
+            elif project_lifecycle:
+                authoritative_terminal_seq[run_id] = seq
         if run_id not in existing_runs:
             child_run = AgentRun(
                 id=run_id,
@@ -679,27 +864,51 @@ async def _persist_agent_events(
         run.agent_name = event.get("agent_name") or run.agent_name
         run.depth = int(event.get("depth") if event.get("depth") is not None else run.depth or 0)
         run.workspace_scope = str(event.get("workspace_scope") or run.workspace_scope or "shared_session")
-        if event.get("event_type") == "agent.spawned":
+        if event_type == "agent.spawned" and project_lifecycle:
             run.effective_tools = json.dumps(payload.get("effective_tools") or [], ensure_ascii=False)
             run.requested_tools = json.dumps(payload.get("requested_tools") or [], ensure_ascii=False)
-        elif event.get("event_type") == "run.started":
+        elif event_type == "run.started" and project_lifecycle:
             run.status = "running"
             if payload.get("model_id"):
                 run.requested_model_id = str(payload.get("model_id"))
             if payload.get("enabled_tools") is not None:
                 run.effective_tools = json.dumps(payload.get("enabled_tools"), ensure_ascii=False)
-        elif event.get("event_type") == "usage.updated":
+        elif event_type == "tool_surface.resolved":
+            # Session MCP discovery and Skill narrowing happen after
+            # ``run.started``. This event is the final callable run surface.
+            if payload.get("effective_tools") is not None:
+                run.effective_tools = json.dumps(
+                    payload.get("effective_tools") or [],
+                    ensure_ascii=False,
+                )
+            run.policy = json.dumps(
+                {
+                    key: payload.get(key)
+                    for key in (
+                        "mode",
+                        "mcp_policy",
+                        "required_tool_groups",
+                        "missing_tool_requirements",
+                        "capability_registry_sha256",
+                        "capability_catalog_revision",
+                    )
+                    if payload.get(key) is not None
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        elif event_type == "usage.updated":
             _merge_monotonic_run_usage(run, payload)
             run.resolved_model_id = str(payload.get("model") or run.resolved_model_id or resolved_model_id)
-        elif event.get("event_type") == "model.switch":
+        elif event_type == "model.switch":
             run.resolved_model_id = str(payload.get("to_model") or run.resolved_model_id or resolved_model_id)
-        elif event.get("event_type") == "run.completed":
+        elif event_type == "run.completed" and project_lifecycle:
             run.status = "succeeded"
             run.finish_reason = str(payload.get("finish_reason") or "stop")
             usage_payload = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
             _merge_monotonic_run_usage(run, usage_payload)
             run.ended_at = datetime.utcnow()
-        elif event.get("event_type") == "run.failed":
+        elif event_type == "run.failed" and project_lifecycle:
             run.status = "failed"
             run.error = str(payload.get("error") or "Unknown error")
             usage_payload = (
@@ -709,7 +918,7 @@ async def _persist_agent_events(
             )
             _merge_monotonic_run_usage(run, usage_payload)
             run.ended_at = datetime.utcnow()
-        elif event.get("event_type") == "run.cancelled":
+        elif event_type == "run.cancelled" and project_lifecycle:
             run.status = "cancelled"
             run.finish_reason = str(
                 payload.get("finish_reason")
@@ -742,6 +951,7 @@ async def _persist_agent_events(
             run_id=run_id,
             event=event,
             payload=payload,
+            project_lifecycle=project_lifecycle,
         )
         if not event_already_persisted:
             s.add(AgentRunEvent(
@@ -756,7 +966,7 @@ async def _persist_agent_events(
                 tool_name=event.get("tool_name") or payload.get("tool_name"),
                 tool_call_id=event.get("tool_call_id") or payload.get("tool_call_id"),
             ))
-            persisted_event_keys.add(event_key)
+            persisted_event_fingerprints[event_key] = incoming_fingerprint
 
 
 def _should_persist_agent_event_immediately(event_type: str) -> bool:
@@ -773,6 +983,7 @@ def _should_persist_agent_event_immediately(event_type: str) -> bool:
         "usage.",
         "model.",
         "tool.",
+        "tool_surface.",
         "artifact.",
         "verifier.",
         "agent.spawned",
@@ -793,15 +1004,29 @@ async def _persist_agent_event_once(
             run_id = str(event.get("run_id") or "")
             event_type = str(event.get("event_type") or "")
             seq = int(event.get("seq"))
-            exists = (await s.execute(
-                select(AgentRunEvent.id).where(
+            existing = (await s.execute(
+                select(AgentRunEvent).where(
                     AgentRunEvent.conversation_id == conv_id,
                     AgentRunEvent.run_id == run_id,
                     AgentRunEvent.event_type == event_type,
                     AgentRunEvent.seq == seq,
                 )
             )).scalar_one_or_none()
-            if exists:
+            if existing is not None:
+                incoming_fingerprint = _event_contract_fingerprint(event)
+                persisted_fingerprint = (
+                    _persisted_event_contract_fingerprint(existing)
+                )
+                if incoming_fingerprint != persisted_fingerprint:
+                    logger.warning(
+                        "Rejected conflicting immediate agent event replay "
+                        "conv=%s run=%s type=%s seq=%s",
+                        conv_id,
+                        run_id,
+                        event_type,
+                        seq,
+                    )
+                    return False
                 return True
             await _persist_agent_events(
                 s,
