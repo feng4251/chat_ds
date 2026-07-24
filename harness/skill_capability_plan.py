@@ -268,6 +268,7 @@ def build_capability_catalog(
     native_tool_metadata: dict[str, dict[str, Any]] | None = None,
     authority_documents: Iterable[dict[str, Any]] = (),
     script_runtime_profiles: dict[str, dict[str, Any]] | None = None,
+    required_native_tool_groups: Iterable[Iterable[str]] = (),
 ) -> dict[str, Any]:
     """Build a finite catalog from backend-authorized, current capabilities.
 
@@ -594,6 +595,27 @@ def build_capability_catalog(
             })
 
     candidates = _dedupe_candidates(candidates)
+    native_candidate_ids_by_tool = {
+        str(candidate.get("tool_name") or ""): str(candidate.get("id") or "")
+        for candidate in candidates
+        if (
+            isinstance(candidate, dict)
+            and candidate.get("kind") == "native_tool"
+            and candidate.get("tool_name")
+            and candidate.get("id")
+        )
+    }
+    required_candidate_groups: list[list[str]] = []
+    for raw_group in required_native_tool_groups:
+        if not isinstance(raw_group, (list, tuple, set, frozenset)):
+            continue
+        group = list(dict.fromkeys(
+            native_candidate_ids_by_tool.get(str(tool_name), "")
+            for tool_name in raw_group
+            if native_candidate_ids_by_tool.get(str(tool_name), "")
+        ))
+        if group and group not in required_candidate_groups:
+            required_candidate_groups.append(group)
     authority_projection = [
         {
             "resource_path": document["resource_path"],
@@ -608,6 +630,7 @@ def build_capability_catalog(
             "body_sha256": body_sha256,
             "authority_documents": authority_projection,
             "candidates": candidates,
+            "required_candidate_groups": required_candidate_groups,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -623,6 +646,7 @@ def build_capability_catalog(
         "body_chars": int(loaded_package.get("skill_md_chars") or len(body)),
         "candidates": candidates,
         "candidate_count": len(candidates),
+        "required_candidate_groups": required_candidate_groups,
         "planning_tool": CAPABILITY_PLAN_TOOL_NAME,
         "policy": {
             "selection_only": True,
@@ -661,6 +685,13 @@ def catalog_prompt_payload(catalog: dict[str, Any]) -> dict[str, Any]:
         )[:MAX_AUTHORITY_DOCUMENTS],
         "body_chars": catalog.get("body_chars"),
         "candidates": list(catalog.get("candidates") or [])[:MAX_CAPABILITY_CANDIDATES],
+        "required_candidate_groups": [
+            list(group)
+            for group in (
+                catalog.get("required_candidate_groups") or []
+            )[:MAX_CAPABILITY_CANDIDATES]
+            if isinstance(group, list)
+        ],
         "unavailable_capabilities": list(
             catalog.get("unavailable_capabilities") or []
         )[:MAX_UNSUPPORTED_ITEMS],
@@ -672,7 +703,9 @@ def catalog_prompt_payload(catalog: dict[str, Any]) -> dict[str, Any]:
             "entries remain reusable during this bounded Skill run: required means "
             "at least one exact dispatch receipt is needed before finishing, not "
             "that the capability may be called only once; optional is authorized "
-            "without a minimum receipt. Reuse a selected capability when the task "
+            "without a minimum receipt. Every required_candidate_groups entry is a "
+            "runtime-owned user requirement: put at least one ID from each group in "
+            "required (optional does not satisfy it). Reuse a selected capability when the task "
             "needs multiple files, queries, pages, or other distinct operations, "
             "then stop and synthesize when the Skill is complete. Never invent "
             "an ID, executable, argv, script path, digest, URL prefix, or MCP name. "
@@ -812,6 +845,36 @@ def validate_capability_plan(
             "The plan contains capability IDs that were not issued by the backend.",
             unknown_ids=unknown[:32],
         )
+    required_candidate_groups: list[list[str]] = []
+    for raw_group in catalog.get("required_candidate_groups") or []:
+        if (
+            not isinstance(raw_group, list)
+            or not raw_group
+            or not all(
+                isinstance(identifier, str)
+                and identifier in candidates
+                for identifier in raw_group
+            )
+        ):
+            return _error(
+                "capability_catalog_required_group_invalid",
+                "The runtime-owned required capability groups are malformed.",
+            )
+        canonical_group = list(dict.fromkeys(raw_group))
+        if canonical_group not in required_candidate_groups:
+            required_candidate_groups.append(canonical_group)
+    missing_required_groups = [
+        group
+        for group in required_candidate_groups
+        if not set(group).intersection(required)
+    ]
+    if missing_required_groups:
+        return _error(
+            "capability_plan_required_group_omitted",
+            "At least one capability ID from every runtime-owned user "
+            "requirement group must be selected as required.",
+            missing_required_candidate_groups=missing_required_groups[:32],
+        )
 
     selected = [candidates[identifier] for identifier in all_ids]
     required_candidates = [candidates[identifier] for identifier in required]
@@ -928,6 +991,7 @@ def validate_capability_plan(
         # commands can intentionally share one bridge without being
         # interchangeable.
         "required_candidates": [dict(item) for item in required_candidates],
+        "required_candidate_groups": required_candidate_groups,
         "capability_semantics": {
             "selection_lifetime": "active_standard_skill_run",
             "selected_capabilities_reusable": True,

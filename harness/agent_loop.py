@@ -113,6 +113,7 @@ from tools.omission_guard import (
 )
 from tools.registry import (
     JSON_SCHEMA_LOSSLESS_KEYWORDS,
+    ToolPreflightResult,
     dispatch,
     get_metadata,
     get_schemas,
@@ -882,8 +883,25 @@ def _omitted_argument_summary(kind: str, chars: int) -> dict[str, Any]:
     }
 
 
-def _compact_tool_argument_value(value: Any, *, tool_name: str, key: str = "", filepath: str = "") -> Any:
+def _compact_tool_argument_value(
+    value: Any,
+    *,
+    tool_name: str,
+    key: str = "",
+    filepath: str = "",
+    credential_literals: frozenset[str] = frozenset(),
+) -> Any:
     if isinstance(value, str):
+        if any(secret in value for secret in credential_literals):
+            return _omitted_argument_summary(
+                "sensitive_user_credential",
+                len(value),
+            )
+        if tool_name == "browser_type" and key == "text":
+            return _omitted_argument_summary(
+                "browser_input_text",
+                len(value),
+            )
         if key == "url" and tool_name in {"web_extract", "browser_navigate"}:
             return {
                 "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
@@ -904,7 +922,13 @@ def _compact_tool_argument_value(value: Any, *, tool_name: str, key: str = "", f
         return value
     if isinstance(value, list):
         return [
-            _compact_tool_argument_value(item, tool_name=tool_name, key=key, filepath=filepath)
+            _compact_tool_argument_value(
+                item,
+                tool_name=tool_name,
+                key=key,
+                filepath=filepath,
+                credential_literals=credential_literals,
+            )
             for item in value
         ]
     if isinstance(value, dict):
@@ -912,13 +936,19 @@ def _compact_tool_argument_value(value: Any, *, tool_name: str, key: str = "", f
         return {
             str(k): _compact_tool_argument_value(
                 v, tool_name=tool_name, key=str(k), filepath=nested_filepath,
+                credential_literals=credential_literals,
             )
             for k, v in value.items()
         }
     return value
 
 
-def _compact_tool_call_arguments(tool_name: str, arguments: str) -> str:
+def _compact_tool_call_arguments(
+    tool_name: str,
+    arguments: str,
+    *,
+    credential_literals: frozenset[str] = frozenset(),
+) -> str:
     """Return an observability-only redaction of tool arguments.
 
     This representation is for events/debug traces. It must never be placed
@@ -931,7 +961,11 @@ def _compact_tool_call_arguments(tool_name: str, arguments: str) -> str:
             "chars": len(arguments or ""),
             "error": "malformed or non-object JSON arguments; raw input excluded",
         })
-    compacted = _compact_tool_argument_value(args, tool_name=tool_name)
+    compacted = _compact_tool_argument_value(
+        args,
+        tool_name=tool_name,
+        credential_literals=credential_literals,
+    )
     if tool_name == "write_file" and isinstance(compacted, dict) and isinstance(compacted.get("content"), dict):
         compacted = {k: v for k, v in compacted.items() if k != "content"} | {"content_omitted": args.get("filepath") and _omitted_argument_summary("large_file_content", len(str(args.get("content", ""))))}
     elif tool_name == "execute_code" and isinstance(compacted, dict) and isinstance(compacted.get("code"), dict):
@@ -1505,12 +1539,222 @@ _DEBUG_SECRET_ASSIGNMENT_RE = re.compile(
 )
 _DEBUG_BEARER_RE = re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}")
 _DEBUG_URL_RE = re.compile(r"https?://[^\s<>{}\[\]\"']+", re.IGNORECASE)
+_USER_CREDENTIAL_LITERAL_RE = re.compile(
+    r"""
+    (?:
+        (?i:\b(?:password|passwd|passcode|pwd|api[\s_-]*key|access[\s_-]*token|
+        refresh[\s_-]*token|secret|credential)\b)
+        \s*(?:(?i:is)\s+|[:=]\s*)
+    )
+    |
+    (?:
+        (?:密码|口令|密钥|令牌)
+        \s*(?:(?:是|为)\s*|[:：=]\s*|(?=[\x21-\x7e]))
+    )
+    ["'`]?
+    ([^\s,，;；"'`]{4,256})
+    """,
+    re.VERBOSE,
+)
+_CREDENTIAL_PERSISTENCE_SINK_TOOLS = frozenset({
+    "delegate_task",
+    "execute_code",
+    "memory",
+    "patch_file",
+    "run_declared_command",
+    "run_skill_process",
+    "run_skill_python",
+    "run_skill_script",
+    "skill_manage",
+    "todo",
+    "write_file",
+})
+_CREDENTIAL_PLACEHOLDER_VALUES = frozenset({
+    "[redacted]",
+    "<redacted>",
+    "changeme",
+    "example",
+    "password",
+    "replace-me",
+    "secret",
+    "your-password",
+    "your-secret",
+    "your-token",
+})
+_PRIVATE_ORIGIN_CONTEXT_REFERENCE_RE = re.compile(
+    r"""
+    (?:
+        (?:继续|接着|仍然|沿用|上述|上面|前述|该|这个)
+        [^\r\n]{0,32}
+        (?:网址|网站|页面|链接|地址|任务|skill|技能|浏览|登录|操作)
+    )
+    |
+    (?:
+        (?:使用|运行|执行|按)
+        [^\r\n]{0,24}
+        (?:skill|技能)
+    )
+    |
+    (?:
+        \b(?:continue|resume|same|previous|above)\b
+        [^\r\n]{0,40}
+        \b(?:url|site|page|link|task|skill|browser|login)\b
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+_HTTP_URL_IN_TEXT_RE = re.compile(
+    r"https?://[^\s<>\"']+",
+    re.IGNORECASE,
+)
 
 
 def _redacted_debug_url(match: re.Match[str]) -> str:
     raw_url = match.group(0)
     digest = hashlib.sha256(raw_url.encode("utf-8")).hexdigest()[:20]
     return f"[url sha256={digest}]"
+
+
+def _message_plain_text(message: Any) -> str:
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    text_parts: list[str] = []
+    for part in content:
+        if isinstance(part, str):
+            text_parts.append(part)
+        elif isinstance(part, dict) and part.get("type") == "text":
+            value = part.get("text")
+            if isinstance(value, str):
+                text_parts.append(value)
+    return "\n".join(text_parts)
+
+
+def _extract_user_credential_literals(
+    messages: list[dict],
+) -> frozenset[str]:
+    """Extract only explicitly labelled user credential values in memory.
+
+    Values are never logged, hashed into persistent traces, or returned to the
+    model.  The bounded set exists solely to stop a later tool call from
+    copying a credential into a durable or delegated sink.
+    """
+
+    values: set[str] = set()
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        for match in _USER_CREDENTIAL_LITERAL_RE.finditer(
+            _message_plain_text(message)
+        ):
+            value = str(match.group(1) or "").strip().rstrip(".。)")
+            if (
+                4 <= len(value) <= 256
+                and value.casefold() not in _CREDENTIAL_PLACEHOLDER_VALUES
+            ):
+                values.add(value)
+            if len(values) >= 32:
+                return frozenset(values)
+    return frozenset(values)
+
+
+def _private_origin_authorization_text(messages: list[dict]) -> str:
+    """Resolve a bounded user-authored URL reference for the current turn.
+
+    Exact URLs in the latest user turn remain the normal authority.  A short
+    "continue/use this Skill" turn may refer to the immediately preceding
+    user-authored URL; allowing only that nearest URL-bearing user turn avoids
+    granting an origin from assistant/tool content or ambient session history.
+    The deployment allowlist is still independently required.
+    """
+
+    user_texts: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        text = _message_plain_text(message)
+        if text.strip():
+            user_texts.append(text)
+    if not user_texts:
+        return ""
+    latest = user_texts[-1]
+    if _HTTP_URL_IN_TEXT_RE.search(latest):
+        return latest
+    if not _PRIVATE_ORIGIN_CONTEXT_REFERENCE_RE.search(latest):
+        return latest
+    for prior in reversed(user_texts[-4:-1]):
+        if _HTTP_URL_IN_TEXT_RE.search(prior):
+            return latest + "\n" + prior
+    return latest
+
+
+def _argument_contains_credential_literal(
+    value: Any,
+    credential_literals: frozenset[str],
+    *,
+    depth: int = 0,
+) -> bool:
+    if depth > 16 or not credential_literals:
+        return False
+    if isinstance(value, str):
+        return any(secret in value for secret in credential_literals)
+    if isinstance(value, list):
+        return any(
+            _argument_contains_credential_literal(
+                item,
+                credential_literals,
+                depth=depth + 1,
+            )
+            for item in value[:512]
+        )
+    if isinstance(value, dict):
+        return any(
+            _argument_contains_credential_literal(
+                item,
+                credential_literals,
+                depth=depth + 1,
+            )
+            for item in list(value.values())[:512]
+        )
+    return False
+
+
+def _credential_persistence_preflight(
+    tool_name: str,
+    args: Any,
+    credential_literals: frozenset[str],
+) -> ToolPreflightResult | None:
+    """Fail closed before a labelled user credential reaches a durable sink."""
+
+    normalized_name = str(tool_name or "").strip()
+    if (
+        normalized_name not in _CREDENTIAL_PERSISTENCE_SINK_TOOLS
+        or not _argument_contains_credential_literal(
+            args,
+            credential_literals,
+        )
+    ):
+        return None
+    return ToolPreflightResult(
+        name=normalized_name,
+        args=args,
+        semantic_args={},
+        error_payload={
+            "error": (
+                "User credential values are ephemeral and cannot be copied "
+                "into files, code, memories, Skill state, process arguments, "
+                "or delegated tasks. Use a direct authorized interactive "
+                "credential field instead."
+            ),
+            "reason": "sensitive_user_credential_persistence_blocked",
+            "actual_dispatch_attempted": False,
+        },
+        reason="sensitive_user_credential_persistence_blocked",
+    )
 
 
 def _redact_debug_text(value: str) -> str:
@@ -10096,7 +10340,7 @@ async def run_stream(
 
     allowed_browser_private_origins = (
         compile_user_private_origin_grants(
-            _latest_user_text(messages),
+            _private_origin_authorization_text(messages),
             str(
                 getattr(settings, "browser_private_origin_allowlist", "")
                 or ""
@@ -10266,6 +10510,7 @@ async def run_stream(
     goal_continuations = 0
     goal_parse_failures = 0
     original_user_text = _latest_user_text(messages)
+    user_credential_literals = _extract_user_credential_literals(messages)
     request_has_image_input = _latest_user_turn_has_image_input(messages)
     delegated_subtask = bool(agent_kind == "delegate" or source == "delegate")
     delegated_required_result_fields = tuple(
@@ -11812,15 +12057,25 @@ async def run_stream(
                 )
             )
             run_state.session_skill_names.update(explicit_selected_skill_names)
-        elif session_skill_catalog and (
-            run_state.skill_workflow_activation == "complex_deliverable"
-            # Simple image identification/OCR belongs on the direct multimodal
-            # path unless the user explicitly names a Skill or requests a
-            # complex deliverable.  Catalog metadata must not turn one image
-            # question into an agent loop merely because an image Skill is
-            # installed for the session.
-            or not request_has_image_input
+        if (
+            session_skill_catalog
+            and not explicit_selected_skill_names
+            and (
+                run_state.skill_workflow_activation == "complex_deliverable"
+                # Simple image identification/OCR belongs on the direct
+                # multimodal path unless the user explicitly names a Skill or
+                # requests a complex deliverable. Catalog metadata must not
+                # turn one image question into an agent loop merely because
+                # an image Skill is installed for the session.
+                or not request_has_image_input
+            )
         ):
+            # A generic explicit request such as "use the appropriate Skill"
+            # is not authority for the primary model to browse every installed
+            # package or pick one by issuing an executable call. Resolve it
+            # through the same bounded name+description control plane used for
+            # implicit relevance. Exact-name requests above still bypass this
+            # selector and retain their deterministic route.
             session_skill_relevance_decision = (
                 _bounded_session_skill_relevance_selection(
                     run_state.original_user_text,
@@ -11910,7 +12165,10 @@ async def run_stream(
                 # without implying artifact generation or multi-agent work.
                 run_state.skill_workflow_activation = "relevant_skill_request"
             elif (
-                run_state.skill_workflow_activation == "complex_deliverable"
+                run_state.skill_workflow_activation in {
+                    "complex_deliverable",
+                    "explicit_skill_request",
+                }
                 and not session_skill_relevance_decision.selected_skill_names
                 and not main_model_skill_selection_pending
             ):
@@ -12021,6 +12279,7 @@ async def run_stream(
                     standard_package,
                     skill_compiler_tool_universe,
                     tuple(runnable_scripts.get(standard_name) or ()),
+                    request_text=run_state.original_user_text,
                 )
                 run_state.skill_capability_catalogs[standard_name] = (
                     standard_catalog
@@ -12100,6 +12359,7 @@ async def run_stream(
         agent_kind == "primary"
         and run_state.skill_workflow_activation in {
             "complex_deliverable", "relevant_skill_request",
+            "explicit_skill_request",
         }
         and session_skill_catalog
         and session_skill_relevance_decision.selected_skill_names
@@ -13199,6 +13459,13 @@ async def run_stream(
         outer child audit observes it even if execution is cancelled or the
         handler never returns.
         """
+        credential_rejection = _credential_persistence_preflight(
+            tool_name,
+            tool_args,
+            user_credential_literals,
+        )
+        if credential_rejection is not None:
+            return credential_rejection
         return preflight_tool(
             tool_name,
             tool_args,
@@ -13571,6 +13838,7 @@ async def run_stream(
                     selected_package,
                     compiler_tools,
                     tuple(current_scripts.get(standard_name) or ()),
+                    request_text=run_state.original_user_text,
                 )
                 run_state.skill_capability_catalogs[standard_name] = catalog
             run_state.session_skill_names = {standard_name}
@@ -14223,6 +14491,7 @@ async def run_stream(
             compiler_tools,
             tuple(runnable_scripts or ()),
             tuple(current_authority_documents),
+            request_text=run_state.original_user_text,
         )
         previous = run_state.skill_capability_catalogs.get(skill_name) or {}
         previous_ids = {
@@ -14582,7 +14851,9 @@ async def run_stream(
                 "tool_call_id": auto_call_id,
                 "args_compacted": _debug_payload(
                     _compact_tool_call_arguments(
-                        auto_tool_name, auto_observability_json
+                        auto_tool_name,
+                        auto_observability_json,
+                        credential_literals=user_credential_literals,
                     )
                 ),
                 "args_representation": "observability_redaction",
@@ -14615,7 +14886,9 @@ async def run_stream(
                 "tool_call_id": auto_call_id,
                 "arguments_compacted": _debug_payload(
                     _compact_tool_call_arguments(
-                        auto_tool_name, auto_observability_json
+                        auto_tool_name,
+                        auto_observability_json,
+                        credential_literals=user_credential_literals,
                     )
                 ),
                 "arguments_representation": "observability_redaction",
@@ -20766,25 +21039,57 @@ async def run_stream(
             yield {"type": "error", "msg": msg}
             return
 
-        if (
-            delegated_subtask
-            and finish_reason in {"stop", "length"}
-            and delegate_required_capability_at_request
-            and not tool_call_accumulator.fragment_count
+        required_capability_noncall = bool(
+            delegate_required_capability_at_request
             and not (
                 set(delegated_required_capability_tools)
                 & delegate_attempted_tool_names
+            )
+        )
+        current_turn_dispatch_count = (
+            run_state.tool_call_count - iteration_dispatch_count_start
+        )
+        retrieval_continuation_noncall = bool(
+            delegate_retrieval_call_at_request
+            and current_turn_dispatch_count == 0
+        )
+        if (
+            delegated_subtask
+            and finish_reason in {"stop", "length"}
+            and not tool_call_accumulator.fragment_count
+            and (
+                required_capability_noncall
+                or retrieval_continuation_noncall
             )
         ):
             # A provider-side ``required`` hint is not a dispatch receipt.
             # Keep this whole turn transactional (``buffer_visible_output``
             # above), discard any output/reasoning, and allow exactly one new
             # assistant turn under the same already-authorized capability
-            # boundary.  The retry is a new turn rather than a replay of the
-            # HTTP request, and a second non-call response fails closed.
+            # boundary. This includes an exact machine-owned HTTP pagination
+            # continuation: a successful earlier page is not evidence that
+            # the current forced page was dispatched. The retry is a new turn
+            # rather than a replay of the HTTP request, and a second non-call
+            # response fails closed.
+            noncall_kind = (
+                "required_http_retrieval_continuation"
+                if retrieval_continuation_noncall
+                else "required_evidence_capability"
+            )
+            expected_noncall_tools = (
+                sorted(iteration_exposed_tools.intersection({
+                    "skill_http_get", "skill_http_post_json",
+                }))
+                if retrieval_continuation_noncall
+                else sorted(
+                    set(delegated_required_capability_tools)
+                    & iteration_exposed_tools
+                )
+            )
             ignored_debug = {
                 "gate": "delegate_required_capability_noncall_recovery",
                 "reason": "provider_ignored_required_tool_choice",
+                "required_call_kind": noncall_kind,
                 "iteration": budget.used,
                 "remaining_iterations": budget.remaining,
                 "provider_finish_reason": finish_reason,
@@ -20797,10 +21102,7 @@ async def run_stream(
                 "required_capability_tools": list(
                     delegated_required_capability_tools
                 ),
-                "exposed_required_capability_tools": sorted(
-                    set(delegated_required_capability_tools)
-                    & iteration_exposed_tools
-                ),
+                "exposed_required_capability_tools": expected_noncall_tools,
                 "recovery_count": int(
                     delegate_required_capability_noncall_recovery_attempted
                 ),
@@ -20824,12 +21126,11 @@ async def run_stream(
                     "role": "user",
                     "content": (
                         "The previous delegated turn ignored the required "
-                        "capability-call boundary and returned output without "
-                        "dispatching any allowed evidence capability. That "
-                        "turn was discarded. This is the single bounded "
-                        "correction turn. Immediately issue one allowed "
-                        "required evidence capability call; do not return "
-                        "prose on this turn."
+                        "tool-call boundary and returned output without "
+                        "dispatching the exact currently required action. "
+                        "That turn was discarded. This is the single bounded "
+                        "correction turn. Immediately issue one exposed "
+                        "required call; do not return prose on this turn."
                     ),
                 })
                 for debug_evt in await debug_stream_event(
@@ -20853,7 +21154,11 @@ async def run_stream(
 
             terminal_debug = {
                 **ignored_debug,
-                "reason": "required_capability_not_attempted",
+                "reason": (
+                    "required_retrieval_continuation_not_attempted"
+                    if retrieval_continuation_noncall
+                    else "required_capability_not_attempted"
+                ),
                 "recovery_count": 1,
             }
             for debug_evt in await debug_stream_event(
@@ -20862,8 +21167,13 @@ async def run_stream(
             ):
                 yield debug_evt
             msg = (
-                "Delegated provider did not attempt any required evidence "
-                "capability after the single bounded correction turn."
+                "Delegated provider did not attempt the required "
+                + (
+                    "HTTP retrieval continuation"
+                    if retrieval_continuation_noncall
+                    else "evidence capability"
+                )
+                + " after the single bounded correction turn."
             )
             yield await emit_agent_event("usage.updated", {
                 **run_usage,
@@ -20876,9 +21186,13 @@ async def run_stream(
             }
             yield await emit_agent_event("run.failed", {
                 "error": msg,
-                "finish_reason": "required_capability_not_attempted",
+                "finish_reason": terminal_debug["reason"],
                 "failure_class": "agent_contract_noncompliance",
-                "retryable": False,
+                # A parent may cleanly re-sample a child whose only observed
+                # handlers were read-only. The outer receipt ledger remains
+                # the final authority and overrides this hint after any
+                # mutating dispatch.
+                "retryable": retrieval_continuation_noncall,
                 "usage": run_usage,
                 **terminal_debug,
             })
@@ -23407,7 +23721,11 @@ async def run_stream(
                     "tool_name": tc.name,
                     "tool_call_id": tool_call_id,
                     "args_compacted": _debug_payload(
-                        _compact_tool_call_arguments(tc.name, tc.arguments)
+                        _compact_tool_call_arguments(
+                            tc.name,
+                            tc.arguments,
+                            credential_literals=user_credential_literals,
+                        )
                     ),
                     "args_representation": "observability_redaction",
                     "args_are_dispatch_payload": False,
@@ -23451,7 +23769,11 @@ async def run_stream(
                     "tool_name": tc.name,
                     "tool_call_id": tool_call_id,
                     "arguments_compacted": _debug_payload(
-                        _compact_tool_call_arguments(tc.name, tc.arguments)
+                        _compact_tool_call_arguments(
+                            tc.name,
+                            tc.arguments,
+                            credential_literals=user_credential_literals,
+                        )
                     ),
                     "arguments_representation": "observability_redaction",
                     "arguments_are_dispatch_payload": False,
@@ -29691,7 +30013,10 @@ _WORKSPACE_FILE_REFERENCE_RE = re.compile(
 )
 _DIRECT_NEGATION_RE = re.compile(
     r"(?:\b(?:do\s+not|don't|dont|without|never|skip|avoid)\b|"
-    r"(?:不要|无需|不用|别|禁止|跳过|避免))",
+    # ``别`` is an imperative negation, but the same character in ``分别``
+    # means "separately".  Treating that common multi-agent instruction as a
+    # negation silently removed delegation authority.
+    r"(?:不要|无需|不用|(?<!分)别|禁止|跳过|避免))",
     re.IGNORECASE,
 )
 _DIRECT_META_RE = re.compile(
@@ -30375,6 +30700,8 @@ def _build_standard_skill_capability_catalog(
     available_tools: list[str] | tuple[str, ...] | set[str],
     runnable_scripts: tuple[tuple[str, str], ...],
     authority_documents: tuple[dict[str, Any], ...] = (),
+    *,
+    request_text: str = "",
 ) -> dict[str, Any]:
     """Compile current exact candidates with runtime-owned policy metadata."""
 
@@ -30418,6 +30745,35 @@ def _build_standard_skill_capability_catalog(
             available_tools,
         )
     )
+    user_required_native_groups: tuple[tuple[str, ...], ...] = ()
+    if request_text:
+        user_intent = _direct_chat_tool_exposure(
+            request_text,
+            available_tools,
+            {skill_name},
+        )
+        user_required_native_groups = tuple(
+            tuple(dict.fromkeys(
+                name
+                for name in group
+                if (
+                    name in set(available_tools)
+                    and name in _STANDARD_SKILL_BODY_CAPABILITY_TOOLS
+                )
+            ))
+            for group in user_intent.required_groups
+        )
+        user_required_native_groups = tuple(
+            group for group in user_required_native_groups if group
+        )
+        candidate_tools = list(dict.fromkeys([
+            *candidate_tools,
+            *(
+                name
+                for group in user_required_native_groups
+                for name in group
+            ),
+        ]))
     filtered_runnable_scripts = _standard_skill_runnable_scripts(
         loaded_package,
         runnable_scripts,
@@ -30566,6 +30922,7 @@ def _build_standard_skill_capability_catalog(
         native_tool_metadata=native_tool_metadata,
         authority_documents=authority_documents,
         script_runtime_profiles=script_runtime_profiles,
+        required_native_tool_groups=user_required_native_groups,
     )
     referenced_paths = [
         str(candidate.get("resource_path") or "")
@@ -30614,6 +30971,7 @@ def _build_standard_skill_capability_catalog(
         native_tool_metadata=native_tool_metadata,
         authority_documents=authority_documents,
         script_runtime_profiles=script_runtime_profiles,
+        required_native_tool_groups=user_required_native_groups,
     )
     catalog["unavailable_capabilities"] = unavailable_script_capabilities
     if isinstance(package_root_value, str) and package_root_value:
@@ -32639,7 +32997,15 @@ def _direct_chat_tool_exposure(
     explicit_delegate = bool(_positive_direct_clauses(
         original,
         r"(?:\b(?:delegate|spawn|use)\b.{0,24}\b(?:agent|subagent|multi-agent)\b|"
-        r"(?:委派|派发|启动|使用).{0,16}(?:子代理|代理|agent|多智能体))",
+        r"\b(?:each|every|all|following|separate)\b.{0,32}"
+        r"\b(?:agents?|subagents?)\b.{0,32}"
+        r"\b(?:independently|separately|in\s+parallel)\b|"
+        r"\b(?:agents?|subagents?)\b.{0,32}"
+        r"\b(?:independently|separately|in\s+parallel)\b|"
+        r"(?:委派|派发|启动|使用).{0,16}(?:子代理|代理|agent|多智能体)|"
+        r"(?:各|每个|所有|以下).{0,24}(?:子代理|代理|agent|智能体)"
+        r".{0,24}(?:分别|独立|并行)|"
+        r"(?:子代理|代理|agent|智能体).{0,24}(?:分别|独立|并行))",
     ))
     if explicit_delegate:
         grant("explicit_delegation", {"delegate_task"}, required_any_of={"delegate_task"})
