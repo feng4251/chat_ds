@@ -1,4 +1,4 @@
-# ChatDS 当前会话交接（2026-07-24）
+# ChatDS 当前会话交接（2026-07-27）
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
@@ -6,10 +6,10 @@
 
 - 工作目录：`/nfs/yangbb/codes/chat_ds`。
 - 分支：`fix/generic-skill-harness-20260717`。
-- 2026-07-24 最新功能提交：`5a7f21d9 feat: enforce generic skill execution contracts`。
-- 前两轮关键提交：`e90415a0 feat: close generic skill workflow recovery gaps`、`b0744a33 feat: add generic profile-aware skill sandboxes`。
+- 2026-07-27 最新功能提交：`c21deca0 feat: harden generic skill routing and stream diagnostics`。
+- 前三轮关键提交：`5a7f21d9 feat: enforce generic skill execution contracts`、`e90415a0 feat: close generic skill workflow recovery gaps`、`b0744a33 feat: add generic profile-aware skill sandboxes`。
 - 本轮在既有 process protocol v2、profile-aware sandbox 和 browser egress 基础上，补齐了内容寻址 Workflow IR、exact capability binding、运行生命周期/receipt ledger、MCP frozen catalog、委派 TOCTOU 防护和 Backend 事件幂等落库。
-- `5a7f21d9` 已按 Backend → Harness 顺序部署到生产，并通过数据库迁移、容器健康和无模型调用 smoke。
+- `c21deca0` 已按 Backend → Harness → Frontend 顺序部署到生产，并通过数据库迁移、容器健康、跨层 request ID 和无模型调用 smoke。
 - 不自动执行模型重型 V2.3 E2E。V2.3 是用户手工业务验收用例，不是 Harness 特判目标。
 - Git 只做本地 commit，不向 remote push。
 
@@ -138,13 +138,40 @@
 - Skill loader/manager 以原始 bytes 计算 digest 后再解码，CRLF 文件也能保持 source content 与 authority SHA 一致。
 - Backend 的 `agent_run_events` 启动迁移先按最早 rowid 去重，再创建 `(conversation_id, run_id, event_type, seq)` 唯一索引；`tool_name` 扩至 512，顶层 authoritative 语义与 Harness adapter 一致。
 
+### 4.8 2026-07-27 Skill 路由、浏览器执行与流终止观测
+
+本轮按“对话上下文 + exact Skill 包 + Harness/Backend debug”交叉审计
+`17ac2a581e5d4b469ccabbbf9f4f4a55`：
+
+- 第一轮 V2.3 请求的词法相关度只有 6，semantic selector 又发生 `ReadTimeout`，所以历史 Harness 没有选中任何 Skill，而是按普通复杂任务运行；工作区只有一个 90,907-byte Development Plan，没有进入该 Skill 声明的模块 cohort、强终稿和 mandatory merge 合同。
+- 同一次 ZIP 上传在数据库中是 1 个根 Skill 加 18 个 supporting Skill；旧 API/UI 把平铺记录都当顶层 Skill，所以再导入 browser Skill 后显示为 19 个。现在新上传持久化 archive SHA-256 `bundle_id`、`primary/supporting` role、root 和 source path；历史数据只在同 scope、同精确创建时间且唯一 primary 时保守投影。Backend、Harness 和 Frontend 共用同一 bundle 身份链。
+- 历史 browser turn 已成功 `browser_navigate`，但旧 capability plan 随后只强制 `web_search`；provider 继续尝试另一个浏览器工具名并产生冲突/破损 JSON。现在“访问具体站点并在站内搜索”编译为独立的 `browser_navigate`、`browser_type`、`browser_click` required receipts，不再用 metasearch 替代页面内操作。
+
+通用修复如下：
+
+- 复杂或明确要求 Skill、但 name/description 路由未命中时，在 semantic selector 前增加最多 64 包的 loader-owned declared-route fallback。只有一个可见顶层包的非 default route 明确匹配才允许一次 `skill_view` 检查；它不授予执行、资源或工具 authority。
+- 完整包 inventory 仍参与依赖/Workflow 编译，supporting member 只从顶层 relevance/routing 视图隐藏；无 primary、跨 scope、无效 SHA、重复或孤儿 registry row 均 fail open 为独立 Skill，不能吞掉其他包。
+- 新增严格 `chatds-runtime.json` schema v1，并支持 `package.json/chatdsRuntime`。固定 runtime profile、依赖、命令、entrypoint、package/script/manifest SHA；未知字段、路径覆写、manifest drift 和未精确声明的动态依赖 fail closed。历史 visual 包没有该 manifest 时仍走已有 native browser action lane，不猜测执行动态 Node loader。
+- tool-call stream debug 新增 logical call 数、name fragment 长度以及 exact exposed/prefix/foreign/empty 分类；不保存原始未识别工具名、参数或模型正文。
+- Backend 每条 SSE bridge 现在记录 upstream/downstream 状态、chunks/bytes/parse errors、最后事件与根事件、root phase、provider typed failure、未满足合同摘要及终止来源。终止来源区分 Harness complete/failed/cancelled、provider failure、timeout/connect/HTTP error、`generator_closed`、`service_shutdown`、`downstream_send_failed`、有 ASGI `http.disconnect` 证据的 `client_disconnected` 和证据不足的 `asyncio_cancelled_unknown`。
+- 安全终止事件同时进入 `agent_run_events` 和 `workspace/debug/backend_streams/<run_id>.jsonl`；不记录请求头、URL、正文、工具参数或凭据。Nginx 生成的 `$request_id` 只作为安全 correlation label 传给 Backend，并在无终态的前端错误中显示。Nginx access log 只记录 `$uri`（不含 query）、status/upstream status/耗时/request ID。
+- Nginx SSE read/send timeout 从 1800 秒提高为 3600 秒，保持 `3600 > Backend→Harness 3000 > provider 2400`，避免代理成为第一条长流硬上限。
+- Frontend 不再把 `onChunk` 回调异常吞成 malformed SSE；缺少 durable `stream_terminal` 时保留部分草稿并明确失败。
+- 断连后的 terminal projection 先进入 conversation barrier。成功 task 可清理；失败、取消或非 durable task 必须由下一 turn 明确消费并拒绝，不能在 callback 中遗忘。只有真实 `http.disconnect` 才归因客户端断连，Starlette 包装的 send failure 保持为 `downstream_send_failed`。
+- package-controlled route ID 只允许安全标识字符原样进入 lifecycle/debug；其他内容仅保存 SHA-256 correlation，避免 URL 或敏感文本进入持久化事件。
+
+历史第一轮为何取消仍无法唯一追溯：旧证据只能证明 provider request 已开始、没有
+`debug.llm.finish`、admission 随后释放且根事件为 `run.cancelled/task_cancelled`。无法在事后区分浏览器/代理断连、Backend task cancellation 或服务 shutdown。新版能完整覆盖系统实际观测到的边界；进程被强杀、日志丢失或系统外网络故障仍必须保留 `unknown`，不能虚构原因。
+
 ## 5. 当前验证证据
 
-2026-07-24 当前最终冻结源码 `5a7f21d9` 已通过：
+2026-07-27 当前最终冻结功能源码 `c21deca0` 已通过：
 
-- Harness 全量（`cd harness && PYTHONPATH=..:.`）：`1463 tests OK, 1 skipped`。
+- Harness 全量（`cd harness && PYTHONPATH=..:.`）：`1484 tests OK, 1 skipped`。
+- Backend：`68 passed`。
+- Frontend：`3 passed`，production build 和本轮相关文件定向 ESLint 通过；全量 ESLint 仍有 2 个本轮未修改的既有 Hook 规则问题（`ModelSelector.jsx`、`SkillLibrary.jsx`）。
+- Nginx 配置 `nginx -t` 通过；Frontend SSE 3600 秒和 `X-Request-ID` 响应头已在生产验证。
 - Workflow IR、run contract、MCP、delegation、gate 和 catalog failure 聚焦组合：`276 tests OK`；instruction-source 模块 `24 tests OK`；terminal/run-contract 模块 `170 tests OK`。
-- Backend：`56 passed`。
 - legacy browser sidecar：`8 tests OK`。
 - Executor/browser/profile/topology/proxy：`86 passed, 1 skipped, 43 subtests passed`。
 - 最终 Shell/profile 定向：`78 passed, 40 subtests passed`；独立 reviewer 的 23-case Bash 矩阵也通过。
@@ -178,9 +205,9 @@
   - UID 65528/65529 当前无宿主进程冲突；
   - 根盘约 87 GiB 可用，内存约 26 GiB available；
   - Compose 2.32.4 支持当前声明。
-- 2026-07-24 16:24（Asia/Shanghai）完成 `5a7f21d9` 最新生产切换。固定使用 project `chat_ds` 和原 bind/data 路径，先切换 Backend 并验证真实数据库迁移，再切换 Harness；Frontend、DB volume、search、browser 和两个 Skill executor 均未重建。
+- 2026-07-27 12:54（Asia/Shanghai）完成 `c21deca0` 最新生产切换。固定使用 project `chat_ds` 和原 bind/data 路径，先切换 Backend 并验证真实数据库迁移，再切换 Harness，最后切换 Frontend；DB volume、search、browser 和两个 Skill executor 均未重建。
 - `.env` 已原子生成独立 `EXECUTOR_V2_AUTH_TOKEN`，mode 为 0600；base/browser/Harness 三方值一致且长度合规，值未输出或写入 Git。
-- Harness stream ceiling 为 2400 秒，Backend proxy deadline 为 3000 秒。
+- Harness stream ceiling 为 2400 秒，Backend proxy deadline 为 3000 秒，Frontend Nginx SSE deadline 为 3600 秒。
 
 当前生产镜像：
 
@@ -190,8 +217,9 @@
 | `chat_acits_skill_egress_proxy` | `sha256:c5ee4fdc2ee785868f15036706f01d327b05b358f2b7812fcca8bfb7454f9c05` | healthy |
 | `chat_acits_skill_browser_executor` | `sha256:76acea01fdf89f324fef6c48e44d6270841bbb8127887e8cf2e082cd76a84b90` | healthy |
 | `chat_acits_browser` | `sha256:391260b06964c7cfbd2bb934501f35b47ed5d093ac6e1d51f769c41e3576087d` | healthy |
-| `chat_acits_harness` | `sha256:a13c8fcd34e50687bfb24c8c9d6635dd33ebf8bacdb706b177baf60c5917a4fb` | healthy / restart 0 |
-| `chat_acits_backend` | `sha256:acad847a9e6c93eff143fffbb298ae469266b6160064182fa4d8e83a24aa16c0` | running / restart 0 / `/api/health` 200 |
+| `chat_acits_harness` | `sha256:00be5cec39dfb95f19003a42ae1efeed747a45de60822af38e9b8a88df6d99fe` | healthy / restart 0 |
+| `chat_acits_backend` | `sha256:3ac1669cf1834e8639d22da0b69cab0d146b9b61217037162245c05df8ad007f` | running / restart 0 / `/api/health` 200 |
+| `chat_acits_frontend` | `sha256:d58dda8c9f3442c436fe4e626c7ab2c087886bcf910547097dce9ada6e9f5c5b` | running / restart 0 / `/` 200 |
 
 生产 smoke 证据：
 
@@ -201,23 +229,26 @@
 - legacy CDP browser 真实打开 `https://example.com/` 并得到 `Example Domain`。
 - Harness `/health` 和 `/v1/models` 正常；未鉴权 `/internal/*` 为 401，Backend 持有的正确 token 为 200。
 - Frontend `/` 与 `/api/health` 均为 200。
+- Frontend Nginx `nginx -t` 通过，SSE location 为 3600 秒；`/api/chat/completions` 的无鉴权 HEAD smoke 返回 `X-Request-ID`，未触发模型。
 - Harness `/health` 为 200；`/v1/models` 无模型调用地报告 AgentModel context length `303872`、Qwen context length `262144`。
 - 真实生产 SQLite 已存在 `ux_agent_run_events_conversation_run_type_seq`，列顺序为 `conversation_id, run_id, event_type, seq`。
-- 本轮 Backend/Harness 启动后均为 restart 0，近期日志无 traceback、critical、fatal、unhandled 或 migration failure。
+- 真实生产 SQLite 的 `skill_packages` 已有 4 个 bundle identity 列和 `ix_skill_packages_bundle_id`。
+- 本轮 Backend/Harness/Frontend 启动后均为 restart 0，近期日志无 traceback、critical、fatal、unhandled 或 migration failure。
 - legacy browser 对两个精确私网 origin 均成功跟随 302 到 OpenEMR login 页面并取得 DOM snapshot；未列入 allowlist 的私网 origin 和 metadata 地址仍被拦截。
 - Chromium 进程含精确 SPKI exception flag，且不含全局 `--ignore-certificate-errors`。
 - SearXNG 真实查询返回 46 条结果，前十条 provenance 包括 360search、Baidu、Mojeek、Sogou。
 - worker UID 65528/65529 在 smoke 后宿主任务数均为 0；Harness 镜像内 baked runtime-data 文件数为 0。
-- 切换前 DB 中存在 7 月 20 日遗留的 stale `running` 投影，但最近 30 分钟 AgentRun/TaskItem/ScheduledRun 均为 0，Harness/Backend 也无 established provider/SSE 连接。
-- 本轮没有运行模型重型 V2.3 E2E。
+- 本轮切换前最近一小时真实 AgentRun `running` 数为 0。
+- 本轮没有运行模型重型 V2.3 E2E；下一项仍是用户手工业务验收。
 
 回滚点：
 
 - 原 executor/browser/Harness/Backend 镜像保留 tag `rollback-20260723-pre-process-v2`。
 - 本轮切换前 browser/Harness 镜像另保留 tag `rollback-pre-e90415a0`；新镜像 tag 为 `deploy-e90415a0`。
 - `5a7f21d9` 切换前 Backend/Harness 分别保留 `rollback-pre-5a7f21d9`；当前镜像分别标记为 `chat_ds-backend:deploy-5a7f21d9`、`chat_ds-harness:deploy-5a7f21d9`。
+- `c21deca0` 切换前 Backend/Harness/Frontend 均保留 `rollback-pre-c21deca0`；当前镜像分别标记为 `chat_ds-backend:deploy-c21deca0`、`chat_ds-harness:deploy-c21deca0`、`chat_ds-frontend:deploy-c21deca0`，三者 revision label 均为 `c21deca0`。
 - 可重建的旧 Harness 代码镜像：`chat_ds-harness:rollback-d224db33`，image `sha256:e7d16ee538fc69e638f20bb93035df90d76008721116ebfedb7d07ccb986abef`。
-- 前轮 `b0744a33` 的部署 bundle 和构建日志位于 `/nfs/temp/chat_ds_deploy_b0744a33/`，不属于 Git；`e90415a0` 和当前 `5a7f21d9` 均直接从共享仓库的已提交源码构建并保留 commit-tagged 镜像。
+- `c21deca0` 的 Backend/Harness 从只包含三项服务目录的 clean Git archive 构建。Docker Hub metadata 临时连接重置时，Frontend 使用已经本地验证的同一提交 `dist`，在 `rollback-pre-c21deca0` 的既有 Nginx runtime 上清空旧静态文件后封装；配置和资源 marker 均做了生产验证。部署上下文/日志位于生产主机 `/tmp/chat_ds_deploy_c21deca0/`，不属于 Git。
 
 ## 7. Git/worktree 边界
 
