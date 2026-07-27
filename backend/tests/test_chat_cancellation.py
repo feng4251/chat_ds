@@ -6,7 +6,15 @@ from unittest.mock import AsyncMock, patch
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from models import AgentRun, AgentRunEvent, Base, Conversation, TaskItem, User
+from models import (
+    AgentRun,
+    AgentRunEvent,
+    Base,
+    Conversation,
+    Message,
+    TaskItem,
+    User,
+)
 from routers import chat_router
 from routers.hook_router import ALLOWED_EVENTS
 from schemas import ChatRequest
@@ -102,6 +110,76 @@ class ChatStreamFailureClassificationTests(unittest.TestCase):
         self.assertIn("流式输出过程中中断", stream_notice)
         self.assertNotIn("本次任务执行失败", stream_notice)
 
+    def test_cancelled_root_is_never_reconciled_as_success(self):
+        cancelled = _terminal("run.cancelled", "root", 3)
+        cancelled["payload"].update({
+            "cancellation_source": "client_disconnected",
+            "exception_class": "CancelledError",
+        })
+        error, execution_failed = chat_router._reconcile_root_stream_error(
+            [cancelled],
+            run_id="root",
+            stream_error=None,
+        )
+        self.assertIn("cancelled before completion", error)
+        self.assertFalse(execution_failed)
+
+    def test_contract_and_provider_debug_summary_are_bounded(self):
+        failed = _terminal("run.failed", "root", 4)
+        failed["payload"].update({
+            "finish_reason": "provider_tool_stream_corrupt",
+            "failure_class": "provider_protocol",
+            "error": "must-not-be-copied secret-token",
+            "run_contract": {
+                "quality_ledger": {
+                    "entry_count_active": 9,
+                    "active_nonverified_count": 2,
+                    "required_failed_count": 1,
+                    "pending_dispatch_count": 1,
+                    "completion_blocker_count": 2,
+                    "completion_allowed": False,
+                    "entries": [{"receipt": {"args": "must-not-persist"}}],
+                },
+            },
+        })
+        contract = chat_router._unsatisfied_contract_summary(
+            [failed],
+            run_id="root",
+        )
+        provider = chat_router._provider_failure_summary(
+            [failed],
+            run_id="root",
+        )
+        self.assertEqual(contract["status"], "unsatisfied")
+        self.assertEqual(contract["completion_blocker_count"], 2)
+        self.assertNotIn("entries", contract)
+        self.assertTrue(provider["reported"])
+        rendered = json.dumps(
+            {"contract": contract, "provider": provider},
+            ensure_ascii=False,
+        )
+        self.assertNotIn("secret-token", rendered)
+        self.assertNotIn("must-not-persist", rendered)
+
+        debug_gap = {
+            "event_type": "debug.tool.stream.salvage.reviewed",
+            "run_id": "root",
+            "seq": 5,
+            "payload": {
+                "unresolved_call_count": 3,
+                "required_logical_call_count": 1,
+                "calls": [{"arguments": "must-not-persist"}],
+            },
+        }
+        fallback = chat_router._unsatisfied_contract_summary(
+            [debug_gap],
+            run_id="root",
+        )
+        self.assertEqual(fallback["status"], "unsatisfied")
+        self.assertEqual(fallback["unresolved_call_count"], 3)
+        self.assertFalse(fallback["sealed_contract_snapshot"])
+        self.assertNotIn("calls", fallback)
+
     def test_default_backend_timeout_exceeds_harness_provider_deadline(self):
         self.assertGreater(
             chat_router.settings.harness_stream_timeout_seconds,
@@ -162,7 +240,10 @@ class ChatCancellationProjectionTests(unittest.IsolatedAsyncioTestCase):
             (None, None),
         )
 
-        with patch.object(chat_router, "async_session", self.sessions):
+        with (
+            patch.object(chat_router, "async_session", self.sessions),
+            patch.object(chat_router, "emit_event", new=AsyncMock()),
+        ):
             await chat_router._persist_after_stream(
                 "conversation",
                 "model",
@@ -197,6 +278,14 @@ class ChatCancellationProjectionTests(unittest.IsolatedAsyncioTestCase):
             )).scalar_one()
             self.assertEqual(task.status, "cancelled")
             self.assertIsNotNone(task.ended_at)
+            assistant = (await session.execute(
+                select(Message).where(
+                    Message.conversation_id == "conversation",
+                    Message.role == "assistant",
+                )
+            )).scalar_one()
+            self.assertIn("流式输出过程中中断", assistant.content)
+            self.assertIn("cancelled before completion", assistant.content)
 
     async def test_explicit_sse_close_closes_harness_stream_and_marks_root_cancelled(self):
         harness_stream_closed = False
@@ -225,6 +314,12 @@ class ChatCancellationProjectionTests(unittest.IsolatedAsyncioTestCase):
                     }]
                 }
                 yield "data: " + json.dumps(chunk)
+                yield "data: " + json.dumps({
+                    "choices": [{
+                        "delta": {"content": "partial draft"},
+                        "index": 0,
+                    }],
+                })
                 await asyncio.Event().wait()
 
         class FakeStreamContext:
@@ -278,6 +373,10 @@ class ChatCancellationProjectionTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(chat_router.httpx, "AsyncClient", FakeClient),
                 patch.object(
                     chat_router,
+                    "_append_backend_stream_debug_file",
+                ),
+                patch.object(
+                    chat_router,
                     "_spawn_persist_then_emit",
                     side_effect=capture_persist,
                 ),
@@ -296,6 +395,8 @@ class ChatCancellationProjectionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("routed_model", str(routed))
                 forwarded = await anext(iterator)
                 self.assertIn("agent_event", str(forwarded))
+                partial = await anext(iterator)
+                self.assertIn("partial draft", str(partial))
                 await iterator.aclose()
 
         self.assertTrue(harness_stream_closed)
@@ -312,10 +413,103 @@ class ChatCancellationProjectionTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(
             [event["event_type"] for event in root_events],
-            ["run.started", "run.cancelled"],
+            [
+                "run.started",
+                "debug.backend_stream.terminated",
+                "run.cancelled",
+            ],
         )
         self.assertEqual(persisted["finish_reason"], "task_cancelled")
-        self.assertIsNone(persisted["error_message"])
+        self.assertIn("响应生成器", persisted["error_message"])
+        self.assertIn("partial draft", persisted["content"])
+        self.assertIn("不完整草稿", persisted["content"])
+        debug_payload = root_events[1]["payload"]
+        cancel_payload = root_events[2]["payload"]
+        self.assertEqual(
+            debug_payload["termination_source"],
+            "generator_closed",
+        )
+        self.assertEqual(
+            cancel_payload["cancellation_source"],
+            "generator_closed",
+        )
+        self.assertEqual(cancel_payload["exception_class"], "GeneratorExit")
+        self.assertEqual(cancel_payload["last_root_event_type"], "run.started")
+        self.assertEqual(cancel_payload["root_phase"], "executing")
+        self.assertGreaterEqual(
+            cancel_payload["stream_counts"]["downstream_chunks"],
+            3,
+        )
+        self.assertEqual(
+            cancel_payload["unsatisfied_contract"]["status"],
+            "not_reported_by_harness",
+        )
+        self.assertEqual(
+            cancel_payload["connection_state"]["downstream"],
+            "generator_closed",
+        )
+
+    async def test_abort_source_requires_observed_disconnect_or_shutdown(self):
+        observation = chat_router._StreamObservation(
+            run_id="root",
+            ingress_request_id="0123456789abcdef",
+        )
+        self.assertEqual(
+            observation.snapshot()["correlation"],
+            {
+                "backend_run_id": "root",
+                "ingress_request_id": "0123456789abcdef",
+            },
+        )
+        self.assertEqual(
+            chat_router._local_abort_source(
+                asyncio.CancelledError(),
+                observation,
+            ),
+            "asyncio_cancelled_unknown",
+        )
+
+        observed_disconnect = chat_router._StreamObservation(run_id="root")
+        observed_disconnect.observe_http_disconnect()
+        self.assertEqual(
+            chat_router._local_abort_source(
+                asyncio.CancelledError(),
+                observed_disconnect,
+            ),
+            "client_disconnected",
+        )
+        self.assertTrue(
+            observed_disconnect.snapshot()["connection_state"][
+                "http_disconnect_observed"
+            ]
+        )
+
+        wrapped_send_failure = chat_router._StreamObservation(run_id="root")
+        wrapped_send_failure.observe_client_disconnect_exception(
+            exception_class="ClientDisconnect",
+        )
+        self.assertEqual(
+            wrapped_send_failure.snapshot()["connection_state"]["downstream"],
+            "downstream_send_failed",
+        )
+        self.assertFalse(
+            wrapped_send_failure.snapshot()["connection_state"][
+                "http_disconnect_observed"
+            ]
+        )
+
+        shutdown = chat_router._StreamObservation(run_id="root")
+        chat_router.set_service_shutdown_started(True)
+        try:
+            self.assertEqual(
+                chat_router._local_abort_source(
+                    asyncio.CancelledError(),
+                    shutdown,
+                ),
+                "service_shutdown",
+            )
+        finally:
+            chat_router.set_service_shutdown_started(False)
 
 
 if __name__ == "__main__":

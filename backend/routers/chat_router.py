@@ -7,8 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Awaitable, Callable, Optional, TypeVar
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select, func
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,6 +24,7 @@ from models import (
     AgentRun,
     AgentRunEvent,
     TaskItem,
+    SkillPackage,
 )
 from schemas import ChatRequest
 from workspace import ensure_workspace, safe_workspace_path, serialize_json_list, workspace_file_metadata
@@ -35,11 +35,29 @@ from model_routing import (
     filter_agentic_fallback_model_ids,
 )
 from auth import get_current_user
+from skill_bundles import skill_bundle_registry_rows
+from stream_observability import (
+    _ObservedStreamingResponse,
+    _StreamObservation,
+    _append_backend_stream_debug_file,
+    _append_backend_stream_termination_event,
+    _cancellation_diagnostic_fields,
+    _cancellation_interruption_message,
+    _local_abort_source,
+    _provider_failure_summary,
+    _safe_diagnostic_label,
+    _unsatisfied_contract_summary,
+    set_service_shutdown_started,
+)
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 # Background tasks (keep references so they don't get GC'd before completion).
 _background_tasks: set[asyncio.Task] = set()
+_INCOMPLETE_RESPONSE_MARKERS = (
+    "⚠️ 本次任务执行失败：",
+    "⚠️ 本次响应在流式输出过程中中断：",
+)
 
 
 class _ConversationTurnState:
@@ -90,16 +108,21 @@ async def _drain_conversation_projection_tasks(
     """Wait for terminal projections left running by a disconnected client."""
 
     while True:
-        pending = [task for task in state.projection_tasks if not task.done()]
-        if not pending:
+        # Failed completed tasks deliberately remain tracked until this
+        # barrier consumes them.  Looking only at pending tasks would forget a
+        # projection that failed between the disconnect and the next turn.
+        tracked = list(state.projection_tasks)
+        if not tracked:
             return
         # The projection belongs to the conversation, not to the next request.
         # Shielding it ensures cancellation of that waiter cannot cancel the
         # durable write it is waiting for.
         results = await asyncio.gather(
-            *(asyncio.shield(task) for task in pending),
+            *(asyncio.shield(task) for task in tracked),
             return_exceptions=True,
         )
+        for task in tracked:
+            state.projection_tasks.discard(task)
         for result in results:
             if isinstance(result, BaseException):
                 raise _ConversationProjectionBarrierError(
@@ -164,16 +187,34 @@ def _track_conversation_projection(
 
     def finish(completed: asyncio.Task) -> None:
         _background_tasks.discard(completed)
-        state.projection_tasks.discard(completed)
         try:
             error = completed.exception()
-        except asyncio.CancelledError:
-            error = None
+        except asyncio.CancelledError as exc:
+            error = exc
+        durable = False
+        if error is None:
+            try:
+                durable = completed.result() is True
+            except asyncio.CancelledError as exc:
+                error = exc
+            except Exception as exc:
+                error = exc
+        # A successful projection no longer needs a future barrier.  Failed,
+        # cancelled, and non-durable results remain in the state until the
+        # next acquire observes and rejects them.
+        if durable:
+            state.projection_tasks.discard(completed)
         if error is not None:
             logger.error(
                 "Uncaught terminal conversation projection failure conv=%s",
                 conv_id,
                 exc_info=(type(error), error, error.__traceback__),
+            )
+        elif not durable:
+            logger.error(
+                "Terminal conversation projection returned a non-durable "
+                "result conv=%s",
+                conv_id,
             )
         _cleanup_conversation_turn_state(conv_id, state)
 
@@ -426,8 +467,10 @@ def _reconcile_root_stream_error(
     )
     if terminal_status == "failed":
         return terminal_error or "Agent run failed.", True
-    if terminal_status in {"succeeded", "cancelled"}:
+    if terminal_status == "succeeded":
         return None, False
+    if terminal_status == "cancelled":
+        return "Harness reported that the root run was cancelled before completion.", False
     return (
         stream_error or "Harness stream ended without a terminal run event.",
         False,
@@ -1354,6 +1397,15 @@ async def _persist_after_stream(
     )
     if terminal_status == "cancelled":
         finish_reason = "task_cancelled"
+    if (
+        error_message
+        and not any(marker in content for marker in _INCOMPLETE_RESPONSE_MARKERS)
+    ):
+        content += _chat_stream_failure_notice(
+            error_message,
+            execution_failed=_execution_failed,
+            has_partial_content=bool(content),
+        )
 
     # Every live projection for this root run was registered before the stream
     # entered its finally block.  Await them first so the complete ordered
@@ -1768,7 +1820,13 @@ async def _generate_title(
         logger.info("title saved for %s: %r", conv_id, title)
 
 
-async def _chat_stream(req: ChatRequest, cur_user: User, db: AsyncSession):
+async def _chat_stream(
+    req: ChatRequest,
+    cur_user: User,
+    db: AsyncSession,
+    *,
+    ingress_request_id: str | None = None,
+):
     # Serialize a conversation before verifying it or loading history.  A
     # different conversation receives a distinct lock and is unaffected.
     conv_id = req.conversation_id
@@ -1822,6 +1880,7 @@ async def _chat_stream(req: ChatRequest, cur_user: User, db: AsyncSession):
             conv_id=conv_id,
             model_id=model_id,
             turn_lease=turn_lease,
+            ingress_request_id=ingress_request_id,
         )
     except _ConversationProjectionBarrierError as exc:
         if turn_lease is not None:
@@ -1848,6 +1907,7 @@ async def _chat_stream_with_turn(
     conv_id: str,
     model_id: str,
     turn_lease: _ConversationTurnLease,
+    ingress_request_id: str | None = None,
 ):
     await _assert_no_unprojected_primary_turn(db, conv_id)
 
@@ -1858,6 +1918,22 @@ async def _chat_stream_with_turn(
     ) or DEFAULT_CUSTOM_MAX_TOKENS
     enabled_tools = serialize_json_list(conv.enabled_tools, DEFAULT_NATIVE_TOOLS)
     enabled_user_skills = serialize_json_list(conv.enabled_user_skills, [])
+    skill_registry_query = select(SkillPackage).where(
+        SkillPackage.user_id == cur_user.id,
+        (
+            (SkillPackage.session_id == conv_id)
+            | (
+                SkillPackage.session_id.is_(None)
+                & SkillPackage.name.in_(enabled_user_skills)
+            )
+        ),
+    ).order_by(SkillPackage.created_at.desc()).limit(513)
+    skill_registry_rows = (
+        await db.execute(skill_registry_query)
+    ).scalars().all()
+    session_skill_registry = skill_bundle_registry_rows(
+        skill_registry_rows
+    )
     fallback_ids, removed_fallback_ids = filter_agentic_fallback_model_ids(
         serialize_json_list(conv.fallback_model_ids, []),
         requested_model_id=model_id,
@@ -1950,6 +2026,10 @@ async def _chat_stream_with_turn(
         {"conversation_id": conv_id, "run_id": run.id, "model_id": model_id},
         conv_id,
     )
+    stream_observation = _StreamObservation(
+        run_id=run.id,
+        ingress_request_id=ingress_request_id,
+    )
 
     async def generate():
         full_content = ""
@@ -1964,11 +2044,23 @@ async def _chat_stream_with_turn(
         seen_agent_events: set[tuple[str, str, int]] = set()
         cancelled = False
         stream_aborted = False
+        termination_event_appended = False
+        upstream_failure_kind: str | None = None
+        upstream_exception_class: str | None = None
+        terminal_envelope_payload: dict | None = None
+
+        def encode_sse(payload: dict) -> str:
+            chunk = f"data: {json.dumps(payload)}\n\n"
+            return stream_observation.observe_downstream_chunk(chunk)
 
         try:
             # Establish cleanup before the first yield: a client may disconnect
             # immediately after receiving routing metadata.
-            yield f"data: {json.dumps({'routed_model': model_id, 'conversation_id': conv_id})}\n\n"
+            yield encode_sse({
+                "routed_model": model_id,
+                "conversation_id": conv_id,
+                "run_id": run.id,
+            })
 
             # Build messages: system prompt + history + user message.
             # Images are passed as proper image_url content parts. The harness
@@ -2004,6 +2096,7 @@ async def _chat_stream_with_turn(
 
             # Stream from harness — agent loop with full tool set
             try:
+                stream_observation.upstream_state = "connecting"
                 async with httpx.AsyncClient(
                     timeout=settings.harness_stream_timeout_seconds
                 ) as client:
@@ -2027,6 +2120,9 @@ async def _chat_stream_with_turn(
                             "fallback_configs": fallback_configs,
                             "source": "chat",
                             "enabled_user_skills": enabled_user_skills,
+                            "session_skill_registry": (
+                                session_skill_registry
+                            ),
                             "event_schema": "chatds.agent.v2",
                             "run_metadata": {
                                 "run_id": run.id,
@@ -2038,18 +2134,24 @@ async def _chat_stream_with_turn(
                             },
                         },
                     ) as response:
+                        stream_observation.upstream_state = "connected"
                         if response.status_code >= 400:
                             body = (await response.aread()).decode("utf-8", "ignore")[:300]
                             stream_error_message = f"Harness 返回 HTTP {response.status_code}:{body}"
+                            upstream_failure_kind = "upstream_harness_http_error"
+                            stream_observation.upstream_state = "http_error"
                         else:
                             async for line in response.aiter_lines():
+                                stream_observation.observe_upstream_line(line)
                                 if not line.startswith("data: "):
                                     continue
                                 chunk = line[6:]
                                 if chunk == "[DONE]":
+                                    stream_observation.upstream_state = "done_received"
                                     break
                                 try:
                                     data = json.loads(chunk)
+                                    stream_observation.observe_upstream_data()
                                     delta = data["choices"][0].get("delta", {})
                                     agent_event = delta.get("agent_event")
                                     if isinstance(agent_event, dict):
@@ -2060,6 +2162,9 @@ async def _chat_stream_with_turn(
                                         )
                                         if key not in seen_agent_events:
                                             seen_agent_events.add(key)
+                                            stream_observation.observe_agent_event(
+                                                agent_event
+                                            )
                                             agent_events.append(agent_event)
                                             event_type = str(agent_event.get("event_type") or "")
                                             if _should_persist_agent_event_immediately(event_type):
@@ -2071,12 +2176,18 @@ async def _chat_stream_with_turn(
                                                     resolved_model_id=resolved_model_id,
                                                     event=agent_event,
                                                 )
-                                            yield f"data: {json.dumps({'agent_event': agent_event, 'conversation_id': conv_id})}\n\n"
+                                            yield encode_sse({
+                                                "agent_event": agent_event,
+                                                "conversation_id": conv_id,
+                                            })
                                     # Harness tool_progress
                                     tp = delta.get("tool_progress")
                                     if tp:
                                         full_tool_progress += (full_tool_progress and "\n" or "") + tp
-                                        yield f"data: {json.dumps({'tool_progress': tp, 'conversation_id': conv_id})}\n\n"
+                                        yield encode_sse({
+                                            "tool_progress": tp,
+                                            "conversation_id": conv_id,
+                                        })
                                     reasoning_piece = delta.get("reasoning") or ""
                                     content_piece = delta.get("content") or ""
                                     usage_piece = delta.get("usage")
@@ -2094,7 +2205,11 @@ async def _chat_stream_with_turn(
                                             f"{switch.get('to_model')} ({switch.get('reason')})"
                                         )
                                         full_tool_progress += (full_tool_progress and "\n" or "") + msg
-                                        yield f"data: {json.dumps({'tool_progress': msg, 'model_switch': switch, 'conversation_id': conv_id})}\n\n"
+                                        yield encode_sse({
+                                            "tool_progress": msg,
+                                            "model_switch": switch,
+                                            "conversation_id": conv_id,
+                                        })
                                     choice = data.get("choices", [{}])[0]
                                     if "error" in data:
                                         stream_error_message = str(data.get("error") or "Harness stream error")
@@ -2106,17 +2221,34 @@ async def _chat_stream_with_turn(
                                         resolved_model_id = data["model"]
                                     if reasoning_piece:
                                         full_reasoning += reasoning_piece
-                                        yield f"data: {json.dumps({'reasoning_delta': reasoning_piece, 'conversation_id': conv_id})}\n\n"
+                                        yield encode_sse({
+                                            "reasoning_delta": reasoning_piece,
+                                            "conversation_id": conv_id,
+                                        })
                                     if content_piece:
                                         full_content += content_piece
-                                        yield f"data: {json.dumps({'delta': content_piece, 'conversation_id': conv_id})}\n\n"
+                                        yield encode_sse({
+                                            "delta": content_piece,
+                                            "conversation_id": conv_id,
+                                        })
                                 except (json.JSONDecodeError, KeyError, IndexError):
-                                    pass
-            except httpx.ConnectError:
+                                    stream_observation.observe_parse_error()
+                            if stream_observation.upstream_state == "connected":
+                                stream_observation.upstream_state = "eof"
+            except httpx.ConnectError as exc:
+                upstream_failure_kind = "upstream_harness_connect_error"
+                upstream_exception_class = type(exc).__name__
+                stream_observation.upstream_state = "connect_error"
                 stream_error_message = f"无法连接到 Harness 服务 {settings.harness_url}。请检查 harness 容器是否在运行。"
-            except httpx.TimeoutException:
+            except httpx.TimeoutException as exc:
+                upstream_failure_kind = "upstream_harness_timeout"
+                upstream_exception_class = type(exc).__name__
+                stream_observation.upstream_state = "timeout"
                 stream_error_message = "Harness 服务响应超时。"
             except Exception as e:
+                upstream_failure_kind = "upstream_harness_exception"
+                upstream_exception_class = type(e).__name__
+                stream_observation.upstream_state = "exception"
                 stream_error_message = f"调用 Harness 时出错:{type(e).__name__}: {e}"
 
             error_message, execution_failed = _reconcile_root_stream_error(
@@ -2133,19 +2265,100 @@ async def _chat_stream_with_turn(
                 )
                 if full_content:
                     full_content += warning
-                    yield f"data: {json.dumps({'delta': warning, 'conversation_id': conv_id})}\n\n"
+                    yield encode_sse({
+                        "delta": warning,
+                        "conversation_id": conv_id,
+                    })
                 else:
                     # Surface the error as the assistant's content so the user sees it
                     full_content = warning
-                    yield f"data: {json.dumps({'delta': full_content, 'conversation_id': conv_id})}\n\n"
-        except (asyncio.CancelledError, GeneratorExit):
+                    yield encode_sse({
+                        "delta": full_content,
+                        "conversation_id": conv_id,
+                    })
+
+            root_terminal_status, _root_terminal_error = (
+                _agent_event_terminal_status(agent_events, run_id=run.id)
+            )
+            provider_failure = _provider_failure_summary(
+                agent_events,
+                run_id=run.id,
+            )
+            if root_terminal_status == "succeeded":
+                termination_source = "upstream_harness_completed"
+            elif root_terminal_status == "failed":
+                termination_source = (
+                    "provider_failure_reported_by_harness"
+                    if provider_failure.get("reported") is True
+                    else "upstream_harness_failed"
+                )
+            elif root_terminal_status == "cancelled":
+                termination_source = "upstream_harness_cancelled"
+            else:
+                termination_source = (
+                    upstream_failure_kind
+                    or "upstream_stream_eof_without_terminal"
+                )
+            stream_observation.terminal_envelope_planned = True
+            _append_backend_stream_termination_event(
+                agent_events,
+                run_id=run.id,
+                observation=stream_observation,
+                termination_source=termination_source,
+                exception_class=upstream_exception_class,
+                root_terminal_status=root_terminal_status,
+            )
+            termination_event_appended = True
+            terminal_envelope_payload = {
+                "stream_terminal": {
+                    "status": root_terminal_status or "interrupted",
+                    "complete": root_terminal_status == "succeeded",
+                    "finish_reason": finish_reason,
+                    "termination_source": termination_source,
+                },
+                "conversation_id": conv_id,
+                "run_id": run.id,
+            }
+        except (asyncio.CancelledError, GeneratorExit) as exc:
             stream_aborted = True
             root_terminal_status, _root_terminal_error = (
                 _agent_event_terminal_status(agent_events, run_id=run.id)
             )
+            abort_source = _local_abort_source(exc, stream_observation)
+            if not termination_event_appended:
+                termination_event = _append_backend_stream_termination_event(
+                    agent_events,
+                    run_id=run.id,
+                    observation=stream_observation,
+                    termination_source=abort_source,
+                    exception_class=type(exc).__name__,
+                    root_terminal_status=root_terminal_status,
+                )
+                termination_event_appended = True
+            else:
+                termination_event = next(
+                    (
+                        event for event in reversed(agent_events)
+                        if event.get("event_type")
+                        == "debug.backend_stream.terminated"
+                    ),
+                    None,
+                )
             if root_terminal_status is None:
                 cancelled = True
                 finish_reason = "task_cancelled"
+                error_message = _cancellation_interruption_message(
+                    abort_source
+                )
+                if not any(
+                    marker in full_content
+                    for marker in _INCOMPLETE_RESPONSE_MARKERS
+                ):
+                    full_content += _chat_stream_failure_notice(
+                        error_message,
+                        execution_failed=False,
+                        has_partial_content=bool(full_content),
+                    )
                 root_seq = max(
                     (
                         int(event.get("seq") or 0)
@@ -2153,6 +2366,12 @@ async def _chat_stream_with_turn(
                         if str(event.get("run_id") or "") == run.id
                     ),
                     default=0,
+                )
+                diagnostic_payload = (
+                    termination_event.get("payload")
+                    if isinstance(termination_event, dict)
+                    and isinstance(termination_event.get("payload"), dict)
+                    else {}
                 )
                 cancellation_event = {
                     "type": "agent_event",
@@ -2168,6 +2387,13 @@ async def _chat_stream_with_turn(
                     "payload": {
                         "finish_reason": "task_cancelled",
                         "terminal_reason": "task_cancelled",
+                        "cancellation_source": abort_source,
+                        "exception_class": _safe_diagnostic_label(
+                            type(exc).__name__
+                        ),
+                        **_cancellation_diagnostic_fields(
+                            diagnostic_payload
+                        ),
                         "usage": dict(usage),
                     },
                 }
@@ -2175,12 +2401,75 @@ async def _chat_stream_with_turn(
                 seen_agent_events.add(
                     (run.id, "run.cancelled", root_seq + 1)
                 )
-            # Client disconnect is control flow.  Starlette normally cancels
-            # the streaming task, while explicit async-generator cleanup can
-            # arrive as GeneratorExit; both must close the harness stream and
-            # persist the same root cancellation boundary.
+            # Cancellation is control flow, but its source is not inferred
+            # from the exception class alone. Only an observed ASGI disconnect
+            # is labelled client_disconnected; otherwise the debug boundary
+            # retains the weaker generator/cancellation/shutdown fact.
             raise
+        except Exception as exc:
+            upstream_exception_class = type(exc).__name__
+            stream_observation.upstream_state = "backend_exception"
+            if not termination_event_appended:
+                root_terminal_status, _root_terminal_error = (
+                    _agent_event_terminal_status(
+                        agent_events,
+                        run_id=run.id,
+                    )
+                )
+                stream_observation.terminal_envelope_planned = True
+                _append_backend_stream_termination_event(
+                    agent_events,
+                    run_id=run.id,
+                    observation=stream_observation,
+                    termination_source="backend_stream_exception",
+                    exception_class=upstream_exception_class,
+                    root_terminal_status=root_terminal_status,
+                )
+                termination_event_appended = True
+            error_message = (
+                "Backend stream processing failed before a durable root "
+                "terminal event."
+            )
+            warning = _chat_stream_failure_notice(
+                error_message,
+                execution_failed=False,
+                has_partial_content=bool(full_content),
+            )
+            if not any(
+                marker in full_content
+                for marker in _INCOMPLETE_RESPONSE_MARKERS
+            ):
+                full_content += warning
+                yield encode_sse({
+                    "delta": warning if full_content != warning else full_content,
+                    "conversation_id": conv_id,
+                })
+            terminal_envelope_payload = {
+                "stream_terminal": {
+                    "status": "interrupted",
+                    "complete": False,
+                    "finish_reason": "backend_stream_exception",
+                    "termination_source": "backend_stream_exception",
+                },
+                "conversation_id": conv_id,
+                "run_id": run.id,
+            }
         finally:
+            termination_debug_event = next(
+                (
+                    event for event in reversed(agent_events)
+                    if event.get("event_type")
+                    == "debug.backend_stream.terminated"
+                ),
+                None,
+            )
+            if isinstance(termination_debug_event, dict):
+                _append_backend_stream_debug_file(
+                    user_id=str(cur_user.id),
+                    session_id=conv_id,
+                    run_id=run.id,
+                    event=termination_debug_event,
+                )
             root_terminal_status, _root_terminal_error = (
                 _agent_event_terminal_status(agent_events, run_id=run.id)
             )
@@ -2219,11 +2508,29 @@ async def _chat_stream_with_turn(
                 # On disconnect the shielded task remains registered.  The
                 # next turn acquires this lock and drains it before history.
                 _release_conversation_turn(conv_id, turn_lease)
+        if terminal_envelope_payload is not None:
+            # This is emitted only after the terminal assistant/run projection
+            # above is durable. EOF without it is therefore an interruption,
+            # not a successful response.
+            yield encode_sse(terminal_envelope_payload)
 
-    return StreamingResponse(generate(), media_type="text/event-stream")
+    return _ObservedStreamingResponse(
+        generate(),
+        observation=stream_observation,
+        media_type="text/event-stream",
+    )
 
 
 @router.post("/completions")
-async def chat_completion(req: ChatRequest,
-    cur_user=Depends(get_current_user), db=Depends(get_db)):
-    return await _chat_stream(req, cur_user, db)
+async def chat_completion(
+    req: ChatRequest,
+    request: Request,
+    cur_user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    return await _chat_stream(
+        req,
+        cur_user,
+        db,
+        ingress_request_id=request.headers.get("x-request-id"),
+    )

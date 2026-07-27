@@ -300,6 +300,14 @@ _WORKSPACE_LIFECYCLE_EVENT_TYPES = {
     "run.failed",
     "run.cancelled",
 }
+_HARNESS_SERVICE_SHUTDOWN_STARTED = False
+
+
+def set_harness_service_shutdown_started(value: bool) -> None:
+    """Expose the locally observed Harness lifespan state to active runs."""
+
+    global _HARNESS_SERVICE_SHUTDOWN_STARTED
+    _HARNESS_SERVICE_SHUTDOWN_STARTED = bool(value)
 
 # Complex session-skill deliverables should cover the explicit workflow files
 # declared by the skill, not just sample a few worker resources.
@@ -398,6 +406,22 @@ _SESSION_SKILL_SEMANTIC_REASON_CHARS = 500
 _SESSION_SKILL_SEMANTIC_MAX_PAGE_BYTES = 64 * 1024
 _SESSION_SKILL_SEMANTIC_MAX_SHORTLIST = 16
 _SESSION_SKILL_SELECTOR_TOOL_NAME = "select_session_skill"
+# Bundle identity is supplied by the Backend's persisted upload registry.  It
+# affects only which packages participate in top-level relevance/routing; all
+# filesystem-visible members remain in the inventory so a selected root can
+# still compile exact supporting Skill dependencies.
+_MAX_SESSION_SKILL_BUNDLE_REGISTRY_ROWS = 512
+_SESSION_SKILL_BUNDLE_ID_RE = re.compile(r"^[a-f0-9]{64}$")
+_SAFE_DECLARED_ROUTE_DIAGNOSTIC_ID_RE = re.compile(
+    r"^[A-Za-z0-9_.-]{1,128}$"
+)
+# Declarative routes are loader-validated, package-owned metadata.  A unique
+# exact route match is a stronger deterministic inspection hint than
+# name/description similarity and remains incapable of granting execution
+# authority.  Keep the fallback bounded across the complete visible catalog;
+# larger catalogs continue through the semantic selector without eagerly
+# compiling an attacker-sized package set.
+_MAX_SESSION_SKILL_DECLARED_ROUTE_PACKAGES = 64
 
 
 _LARGE_TOOL_ARGUMENT_STRING_CAP = 2_000
@@ -10750,8 +10774,17 @@ def _emit_run_cancelled_on_cancellation(func):
                     elif event.get("type") == "usage":
                         observe_usage(event, cumulative=True)
                 yield event
-        except (asyncio.CancelledError, GeneratorExit):
+        except (asyncio.CancelledError, GeneratorExit) as exc:
             if run_id and not terminal_seen:
+                cancellation_source = (
+                    "service_shutdown"
+                    if _HARNESS_SERVICE_SHUTDOWN_STARTED
+                    else (
+                        "generator_closed"
+                        if isinstance(exc, GeneratorExit)
+                        else "asyncio_cancelled_unknown"
+                    )
+                )
                 cancellation_event = {
                     "type": "agent_event",
                     "event_type": "run.cancelled",
@@ -10766,6 +10799,8 @@ def _emit_run_cancelled_on_cancellation(func):
                     "payload": {
                         "finish_reason": "task_cancelled",
                         "terminal_reason": "task_cancelled",
+                        "cancellation_source": cancellation_source,
+                        "exception_class": type(exc).__name__,
                         "usage": dict(observed_usage),
                     },
                 }
@@ -10902,6 +10937,7 @@ async def run_stream(
     declared_artifact_patterns: list[str] | None = None,
     thinking_policy: str = "provider_default",
     temperature_override: float | None = None,
+    session_skill_registry: list[dict[str, Any]] | None = None,
     _browser_run_scope_id: str | None = None,
 ) -> AsyncIterator[dict]:
     """Async generator yielding SSE-style dicts for a full agent conversation turn.
@@ -13164,6 +13200,12 @@ async def run_stream(
     session_skill_relevance_decision = SessionSkillRelevanceDecision(
         (), (), "not_evaluated"
     )
+    declared_route_skill_selection = DeclaredRouteSessionSkillSelection(
+        (), "not_attempted", 0,
+    )
+    session_skill_bundle_catalog = SessionSkillBundleCatalog(
+        (), (), "not_scanned",
+    )
     if enforce_session_skill_workflow and "skill_view" in tools:
         try:
             from skills.scanner import find_all_skills
@@ -13171,6 +13213,13 @@ async def run_stream(
                 user_id,
                 session_id,
                 enabled_user_skills=enabled_user_skills,
+            )
+            session_skill_bundle_catalog = _session_skill_bundle_catalog(
+                available_records,
+                session_skill_registry,
+            )
+            available_records = list(
+                session_skill_bundle_catalog.inventory_records
             )
             explicit_skill_catalog = {
                 str(skill["name"]): skill
@@ -13183,7 +13232,9 @@ async def run_stream(
             # not grant authority to a disabled private package or an ambient
             # directory tree.
             session_records = [
-                skill for skill in available_records if skill.get("name")
+                skill
+                for skill in session_skill_bundle_catalog.routing_records
+                if skill.get("name")
             ]
             session_skill_catalog = {
                 str(skill["name"]): skill for skill in session_records
@@ -13242,6 +13293,35 @@ async def run_stream(
                     session_skill_catalog,
                 )
             )
+            if (
+                not session_skill_relevance_decision.selected_skill_names
+                and run_state.skill_workflow_activation in {
+                    "complex_deliverable",
+                    "explicit_skill_request",
+                }
+                and session_skill_relevance_decision.reason
+                not in {"empty_catalog", "empty_request", "user_opted_out"}
+            ):
+                declared_route_skill_selection = (
+                    _bounded_declared_route_skill_selection(
+                        run_state.original_user_text,
+                        session_skill_catalog,
+                    )
+                )
+                if (
+                    declared_route_skill_selection.status == "selected"
+                    and len(
+                        declared_route_skill_selection.selected_skill_names
+                    ) == 1
+                ):
+                    session_skill_relevance_decision = (
+                        SessionSkillRelevanceDecision(
+                            declared_route_skill_selection.selected_skill_names,
+                            session_skill_relevance_decision.ranked_scores,
+                            "declared_route_selected",
+                            "declared_route",
+                        )
+                    )
             if (
                 not session_skill_relevance_decision.selected_skill_names
                 and session_skill_relevance_decision.reason
@@ -13484,9 +13564,9 @@ async def run_stream(
             # Capability Skills are resolved later from the selected package's
             # declarations. Inventory only the already-visible canonical
             # packages and their content-addressed entrypoints.
-            for skill_name in session_skill_catalog:
+            for skill_name in explicit_skill_catalog:
                 if skill_name not in loaded_packages:
-                    record = session_skill_catalog.get(skill_name)
+                    record = explicit_skill_catalog.get(skill_name)
                     if isinstance(record, dict):
                         loaded_package = load_skill_content(
                             Path(str(record.get("path") or "")),
@@ -13859,6 +13939,30 @@ async def run_stream(
         "effective_model_id": model_routing.effective_provider_id,
         "model_routing": model_routing_payload,
         "session_skill_relevance": {
+            "bundle_registry": {
+                "status": session_skill_bundle_catalog.status,
+                "registry_rows": (
+                    session_skill_bundle_catalog.registry_rows
+                ),
+                "inventory_count": len(
+                    session_skill_bundle_catalog.inventory_records
+                ),
+                "routing_count": len(
+                    session_skill_bundle_catalog.routing_records
+                ),
+                "applied_rows": (
+                    session_skill_bundle_catalog.applied_rows
+                ),
+                "supporting_rows": (
+                    session_skill_bundle_catalog.supporting_rows
+                ),
+                "unmatched_rows": (
+                    session_skill_bundle_catalog.unmatched_rows
+                ),
+                "failure_codes": list(
+                    session_skill_bundle_catalog.failure_codes
+                ),
+            },
             "selected_skills": list(
                 session_skill_relevance_decision.selected_skill_names
             ),
@@ -13882,6 +13986,23 @@ async def run_stream(
                 {"skill_name": name, "score": score}
                 for name, score in session_skill_relevance_decision.ranked_scores[:12]
             ],
+            "declared_route": {
+                "status": declared_route_skill_selection.status,
+                "packages_evaluated": (
+                    declared_route_skill_selection.packages_evaluated
+                ),
+                "selected_skills": list(
+                    declared_route_skill_selection.selected_skill_names
+                ),
+                "matched_routes": [
+                    {"skill_name": skill_name, "route_id": route_id}
+                    for skill_name, route_id
+                    in declared_route_skill_selection.matched_routes[:16]
+                ],
+                "failure_codes": list(
+                    declared_route_skill_selection.failure_codes[:16]
+                ),
+            },
         },
     })
     if model_routing.normalized:
@@ -13914,6 +14035,38 @@ async def run_stream(
             audit,
         ):
             yield debug_evt
+    if session_skill_registry is not None:
+        for debug_evt in await debug_stream_event(
+            "session_skill.bundle_registry",
+            {
+                "status": session_skill_bundle_catalog.status,
+                "registry_rows": (
+                    session_skill_bundle_catalog.registry_rows
+                ),
+                "inventory_count": len(
+                    session_skill_bundle_catalog.inventory_records
+                ),
+                "routing_count": len(
+                    session_skill_bundle_catalog.routing_records
+                ),
+                "applied_rows": (
+                    session_skill_bundle_catalog.applied_rows
+                ),
+                "supporting_rows": (
+                    session_skill_bundle_catalog.supporting_rows
+                ),
+                "unmatched_rows": (
+                    session_skill_bundle_catalog.unmatched_rows
+                ),
+                "failure_codes": list(
+                    session_skill_bundle_catalog.failure_codes
+                ),
+                "authority_effect": (
+                    "routing_projection_only"
+                ),
+            },
+        ):
+            yield debug_evt
     if session_skill_relevance_decision.semantic_status != "not_attempted":
         for debug_evt in await debug_stream_event(
             "session_skill.semantic_selection",
@@ -13937,6 +14090,29 @@ async def run_stream(
                 ),
                 "catalog_count": len(session_skill_catalog),
                 "metadata_fields": ["name", "description"],
+                "inspection_authority_only": True,
+            },
+        ):
+            yield debug_evt
+    if declared_route_skill_selection.status != "not_attempted":
+        for debug_evt in await debug_stream_event(
+            "session_skill.declared_route_selection",
+            {
+                "status": declared_route_skill_selection.status,
+                "packages_evaluated": (
+                    declared_route_skill_selection.packages_evaluated
+                ),
+                "selected_skills": list(
+                    declared_route_skill_selection.selected_skill_names
+                ),
+                "matched_routes": [
+                    {"skill_name": skill_name, "route_id": route_id}
+                    for skill_name, route_id
+                    in declared_route_skill_selection.matched_routes[:16]
+                ],
+                "failure_codes": list(
+                    declared_route_skill_selection.failure_codes[:16]
+                ),
                 "inspection_authority_only": True,
             },
         ):
@@ -15093,7 +15269,7 @@ async def run_stream(
 
             current_packages: dict[str, dict[str, Any]] = {}
             current_scripts: dict[str, tuple[tuple[str, str], ...]] = {}
-            for skill_name, record in session_skill_catalog.items():
+            for skill_name, record in explicit_skill_catalog.items():
                 if not isinstance(record, dict):
                     continue
                 loaded = load_skill_content(
@@ -15940,7 +16116,7 @@ async def run_stream(
         )
         if not authority_documents:
             return None
-        record = session_skill_catalog.get(skill_name)
+        record = explicit_skill_catalog.get(skill_name)
         if not isinstance(record, dict):
             return None
         try:
@@ -16103,7 +16279,7 @@ async def run_stream(
 
             current_packages: dict[str, dict[str, Any]] = {}
             current_scripts: dict[str, tuple[tuple[str, str], ...]] = {}
-            for current_name, record in session_skill_catalog.items():
+            for current_name, record in explicit_skill_catalog.items():
                 if not isinstance(record, dict):
                     continue
                 loaded = load_skill_content(
@@ -31993,6 +32169,200 @@ class SemanticSessionSkillSelection:
     usage: tuple[tuple[str, int], ...] = ()
 
 
+@dataclass(frozen=True)
+class DeclaredRouteSessionSkillSelection:
+    """Bounded loader-owned route match used only to select one inspection.
+
+    Route regexes have already passed the package compiler's structural and
+    complexity checks.  This result intentionally carries no host path,
+    resource body, script, tool, or execution grant.
+    """
+
+    selected_skill_names: tuple[str, ...]
+    status: str
+    packages_evaluated: int
+    matched_routes: tuple[tuple[str, str], ...] = ()
+    failure_codes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SessionSkillBundleCatalog:
+    """Validated inventory and top-level routing views for one Skill catalog.
+
+    Bundle metadata never grants package access: rows are intersected with the
+    canonical filesystem scanner, and supporting members are hidden from the
+    routing view only when one exact primary in the same scope and bundle is
+    also present.  The complete inventory remains available to the existing
+    content-addressed Skill compiler.
+    """
+
+    inventory_records: tuple[dict[str, Any], ...]
+    routing_records: tuple[dict[str, Any], ...]
+    status: str
+    registry_rows: int = 0
+    applied_rows: int = 0
+    supporting_rows: int = 0
+    unmatched_rows: int = 0
+    failure_codes: tuple[str, ...] = ()
+
+
+def _safe_declared_route_diagnostic_id(value: Any) -> str:
+    """Keep ordinary IDs readable and hash arbitrary package-controlled text."""
+
+    route_id = str(value or "route").strip()
+    if _SAFE_DECLARED_ROUTE_DIAGNOSTIC_ID_RE.fullmatch(route_id):
+        return route_id
+    return "sha256:" + hashlib.sha256(
+        route_id.encode("utf-8", "replace")
+    ).hexdigest()[:24]
+
+
+def _session_skill_bundle_catalog(
+    available_records: list[dict[str, Any]],
+    raw_registry: Any,
+) -> SessionSkillBundleCatalog:
+    """Apply a bounded Backend bundle registry without widening authority."""
+
+    inventory = tuple(
+        dict(record)
+        for record in available_records
+        if isinstance(record, dict)
+    )
+    if raw_registry is None:
+        return SessionSkillBundleCatalog(
+            inventory,
+            inventory,
+            "not_provided",
+        )
+    if not isinstance(raw_registry, list):
+        return SessionSkillBundleCatalog(
+            inventory,
+            inventory,
+            "invalid",
+            failure_codes=("registry_not_list",),
+        )
+    if len(raw_registry) > _MAX_SESSION_SKILL_BUNDLE_REGISTRY_ROWS:
+        return SessionSkillBundleCatalog(
+            inventory,
+            inventory,
+            "invalid",
+            registry_rows=len(raw_registry),
+            failure_codes=("registry_row_limit_exceeded",),
+        )
+
+    failures: list[str] = []
+    parsed: dict[tuple[str, str], dict[str, str]] = {}
+    duplicate_keys: set[tuple[str, str]] = set()
+    for raw_row in raw_registry:
+        if not isinstance(raw_row, dict):
+            failures.append("registry_row_not_object")
+            continue
+        name = str(raw_row.get("name") or "").strip()
+        scope = str(raw_row.get("scope") or "").strip()
+        bundle_id = str(raw_row.get("bundle_id") or "").strip().lower()
+        role = str(raw_row.get("bundle_role") or "").strip().lower()
+        root_name = str(raw_row.get("bundle_root_name") or "").strip()
+        if (
+            not name
+            or len(name) > 256
+            or scope not in {"session", "user"}
+            or not _SESSION_SKILL_BUNDLE_ID_RE.fullmatch(bundle_id)
+            or role not in {"primary", "supporting"}
+            or not root_name
+            or len(root_name) > 256
+        ):
+            failures.append("registry_row_invalid")
+            continue
+        key = (scope, name)
+        if key in parsed:
+            duplicate_keys.add(key)
+            failures.append("registry_key_duplicate")
+            continue
+        parsed[key] = {
+            "bundle_id": bundle_id,
+            "bundle_role": role,
+            "bundle_root_name": root_name,
+        }
+    for key in duplicate_keys:
+        parsed.pop(key, None)
+
+    available_keys = {
+        (str(record.get("scope") or ""), str(record.get("name") or ""))
+        for record in inventory
+    }
+    unmatched_rows = sum(1 for key in parsed if key not in available_keys)
+
+    groups: dict[tuple[str, str], list[tuple[tuple[str, str], dict[str, str]]]] = {}
+    for key, metadata in parsed.items():
+        if key not in available_keys:
+            continue
+        groups.setdefault(
+            (key[0], metadata["bundle_id"]),
+            [],
+        ).append((key, metadata))
+
+    validated: dict[tuple[str, str], dict[str, str]] = {}
+    for (_scope, _bundle_id), members in groups.items():
+        primaries = [
+            (key, metadata)
+            for key, metadata in members
+            if metadata["bundle_role"] == "primary"
+        ]
+        if len(primaries) != 1:
+            failures.append("bundle_primary_ambiguous")
+            continue
+        primary_key, primary_metadata = primaries[0]
+        primary_name = primary_key[1]
+        if primary_metadata["bundle_root_name"] != primary_name:
+            failures.append("bundle_primary_root_mismatch")
+            continue
+        if any(
+            metadata["bundle_root_name"] != primary_name
+            for _key, metadata in members
+        ):
+            failures.append("bundle_member_root_mismatch")
+            continue
+        validated.update(members)
+
+    enriched: list[dict[str, Any]] = []
+    routing: list[dict[str, Any]] = []
+    supporting_rows = 0
+    for original in inventory:
+        record = dict(original)
+        key = (
+            str(record.get("scope") or ""),
+            str(record.get("name") or ""),
+        )
+        metadata = validated.get(key)
+        if metadata is not None:
+            record.update(metadata)
+        enriched.append(record)
+        if (
+            metadata is not None
+            and metadata["bundle_role"] == "supporting"
+        ):
+            supporting_rows += 1
+            continue
+        routing.append(record)
+
+    if failures and validated:
+        status = "partial"
+    elif failures:
+        status = "invalid"
+    else:
+        status = "applied"
+    return SessionSkillBundleCatalog(
+        tuple(enriched),
+        tuple(routing),
+        status,
+        registry_rows=len(raw_registry),
+        applied_rows=len(validated),
+        supporting_rows=supporting_rows,
+        unmatched_rows=unmatched_rows,
+        failure_codes=tuple(dict.fromkeys(failures))[:16],
+    )
+
+
 _MAX_STANDARD_SKILL_CAPABILITY_BODY_CHARS = 128_000
 _MAX_STANDARD_SKILL_DIRECTIVE_LINES = 512
 _MAX_STANDARD_SKILL_NATIVE_CANDIDATES = 24
@@ -32703,6 +33073,19 @@ def _build_standard_skill_capability_catalog(
             available_tools,
             {skill_name},
         )
+        site_scoped_browser_search = {
+            "explicit_site_search_input",
+            "explicit_site_search_submit",
+        }.issubset(set(user_intent.reasons))
+        if site_scoped_browser_search:
+            # A request to search *inside* an explicitly named site is not
+            # authority for ambient metasearch.  Keep the candidate catalog
+            # aligned with the required navigate/fill/submit frontier so the
+            # optional set cannot encourage a contradictory shortcut.
+            candidate_tools = [
+                name for name in candidate_tools
+                if name != "web_search"
+            ]
         user_required_native_groups = tuple(
             tuple(dict.fromkeys(
                 name
@@ -33304,6 +33687,113 @@ def _bounded_session_skill_relevance_selection(
             (), ranked_scores, "insufficient_top_margin"
         )
     return SessionSkillRelevanceDecision((top_name,), ranked_scores, "selected")
+
+
+def _bounded_declared_route_skill_selection(
+    text: str,
+    session_skill_catalog: dict[str, dict[str, Any]],
+) -> DeclaredRouteSessionSkillSelection:
+    """Select one package when exactly one compiled route matches the request.
+
+    This is a deterministic fallback for complex or explicitly Skill-driven
+    turns whose catalog metadata is too weak and whose semantic selector may
+    be slow or unavailable.  Loading a package only validates immutable
+    declarations; the selected package still receives exactly one
+    ``skill_view`` inspection before any capability can be planned or run.
+    Defaults never select a package at this cross-package boundary.
+    """
+
+    if not isinstance(session_skill_catalog, dict) or not session_skill_catalog:
+        return DeclaredRouteSessionSkillSelection((), "empty_catalog", 0)
+    if (
+        len(session_skill_catalog)
+        > _MAX_SESSION_SKILL_DECLARED_ROUTE_PACKAGES
+    ):
+        return DeclaredRouteSessionSkillSelection(
+            (), "catalog_limit", 0,
+            failure_codes=("declared_route_catalog_limit",),
+        )
+    request_text = str(text or "")
+    if not request_text.strip():
+        return DeclaredRouteSessionSkillSelection((), "empty_request", 0)
+
+    from skills.loader import load_skill_content
+
+    matches: list[tuple[str, str]] = []
+    failures: list[str] = []
+    evaluated = 0
+    for skill_name in sorted(session_skill_catalog, key=str.casefold):
+        record = session_skill_catalog.get(skill_name)
+        if not isinstance(record, dict):
+            failures.append("invalid_catalog_record")
+            continue
+        path_value = record.get("path")
+        skill_dir_value = record.get("skill_dir")
+        if not isinstance(path_value, str) or not path_value:
+            failures.append("missing_skill_path")
+            continue
+        try:
+            loaded = load_skill_content(
+                Path(path_value),
+                skill_dir=(
+                    str(skill_dir_value)
+                    if isinstance(skill_dir_value, str)
+                    and skill_dir_value
+                    else str(Path(path_value).parent)
+                ),
+            )
+        except Exception:
+            # Package-controlled validation errors can contain paths or
+            # instruction fragments.  Persist only a stable category.
+            failures.append("package_load_exception")
+            continue
+        evaluated += 1
+        if not isinstance(loaded, dict) or loaded.get("error"):
+            failures.append("package_load_failed")
+            continue
+        execution_contract = loaded.get("execution_contract")
+        if not isinstance(execution_contract, dict):
+            workflow_contract = loaded.get("workflow_contract")
+            execution_contract = (
+                _execution_contract_from_workflow(workflow_contract)
+                if isinstance(workflow_contract, dict)
+                else {}
+            )
+        routes = execution_contract.get("routes")
+        if not isinstance(routes, list) or not routes:
+            continue
+        route, route_status, _ambiguous = _select_execution_route(
+            execution_contract,
+            request_text,
+        )
+        if route_status == "matched" and isinstance(route, dict):
+            route_id = _safe_declared_route_diagnostic_id(
+                route.get("id") or "route"
+            )
+            matches.append((str(skill_name), route_id))
+        elif route_status == "ambiguous":
+            failures.append("package_route_ambiguous")
+        elif route_status == "invalid_contract":
+            failures.append("package_route_contract_invalid")
+
+    matched_skill_names = tuple(dict.fromkeys(
+        skill_name for skill_name, _route_id in matches
+    ))
+    if len(matched_skill_names) == 1:
+        return DeclaredRouteSessionSkillSelection(
+            matched_skill_names,
+            "selected",
+            evaluated,
+            tuple(matches[:32]),
+            tuple(dict.fromkeys(failures))[:16],
+        )
+    return DeclaredRouteSessionSkillSelection(
+        (),
+        "ambiguous" if len(matched_skill_names) > 1 else "none",
+        evaluated,
+        tuple(matches[:32]),
+        tuple(dict.fromkeys(failures))[:16],
+    )
 
 
 def _semantic_skill_selection_is_useful(text: str) -> bool:
@@ -34713,6 +35203,61 @@ def _unique_direct_http_url(text: str) -> tuple[str, str] | None:
     return literal, canonical
 
 
+_BARE_WEB_TARGET_RE = re.compile(
+    r"(?<![@A-Za-z0-9_.-])"
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"[a-z]{2,63}"
+    r"(?::[0-9]{1,5})?"
+    r"(?:/[^\s<>\"']*)?",
+    re.IGNORECASE,
+)
+_LOCAL_FILE_LIKE_WEB_SUFFIXES = frozenset({
+    "bash", "cfg", "csv", "css", "docx", "html", "ini", "ipynb", "js",
+    "json", "jsx", "md", "mjs", "pdf", "py", "rst", "sh", "sql", "svg",
+    "toml", "ts", "tsx", "txt", "xlsx", "xml", "yaml", "yml", "zip",
+})
+
+
+def _site_navigation_target_windows(text: str) -> list[str]:
+    """Return bounded positive action windows around concrete web targets.
+
+    Direct-request clause splitting treats ``.`` as sentence punctuation, so
+    it cannot preserve a bare hostname such as ``search.example.com``.  Scan
+    target spans first, then evaluate only the nearby action phrase.
+    """
+
+    value = str(text or "")
+    target_spans: list[tuple[int, int]] = [
+        match.span()
+        for match in re.finditer(
+            r"https?://[^\s<>\"']+",
+            value,
+            re.IGNORECASE,
+        )
+    ]
+    for match in _BARE_WEB_TARGET_RE.finditer(value):
+        token = match.group(0).split("/", 1)[0].split(":", 1)[0]
+        suffix = token.rsplit(".", 1)[-1].casefold()
+        if suffix not in _LOCAL_FILE_LIKE_WEB_SUFFIXES:
+            target_spans.append(match.span())
+    action = re.compile(
+        r"(?:\b(?:visit|navigate|open|browse)\b|(?:访问|打开|浏览))",
+        re.IGNORECASE,
+    )
+    windows: list[str] = []
+    for start, end in sorted(set(target_spans)):
+        window_start = max(0, start - 64)
+        window_end = min(len(value), end + 24)
+        window = value[window_start:window_end]
+        action_match = action.search(window)
+        if action_match is None:
+            continue
+        if _skill_request_match_is_blocked(window, action_match.start()):
+            continue
+        windows.append(window)
+    return list(dict.fromkeys(windows))
+
+
 def _direct_chat_tool_exposure(
     text: str,
     available_tools: list[str] | tuple[str, ...] | set[str],
@@ -34790,7 +35335,12 @@ def _direct_chat_tool_exposure(
         r"(?:天气|价格|新闻).{0,16}(?:如何|怎样|多少|是什么|怎么样))",
         exclude_pattern=local_search_object,
     )
-    if explicit_search or freshness_lookup:
+    site_navigation_clauses = _site_navigation_target_windows(original)
+    site_scoped_search = bool(
+        site_navigation_clauses
+        and (explicit_search or freshness_lookup)
+    )
+    if (explicit_search or freshness_lookup) and not site_scoped_search:
         grant(
             "explicit_web_search",
             {"web_search"},
@@ -34816,11 +35366,15 @@ def _direct_chat_tool_exposure(
         )
     browser_clauses = _positive_direct_clauses(
         original,
-        r"(?:\b(?:navigate|click|scroll|fill|type|log\s*in|sign\s*in)\b|"
+        r"(?:\b(?:visit|navigate|click|scroll|fill|type|log\s*in|sign\s*in)\b|"
         r"(?:浏览器|网页|网站|页面|按钮|表单|登录).{0,24}"
         r"(?:打开|点击|滚动|填写|输入|返回|登录)|"
         r"(?:打开|点击|滚动|填写|输入|登录).{0,24}(?:网页|网站|页面|按钮|表单|https?://))",
     )
+    browser_clauses = list(dict.fromkeys([
+        *browser_clauses,
+        *site_navigation_clauses,
+    ]))
     if browser_clauses:
         browser_names = {"browser_navigate", "browser_snapshot"}
         joined_browser = " ".join(browser_clauses).casefold()
@@ -34832,12 +35386,28 @@ def _direct_chat_tool_exposure(
             browser_names.add("browser_scroll")
         if re.search(r"(?:back|返回)", joined_browser):
             browser_names.add("browser_back")
-        required_browser = browser_names - {"browser_snapshot"}
+        if site_scoped_search:
+            # Searching *inside* a named site is a stateful browser workflow,
+            # not an interchangeable metasearch request.  The user action
+            # itself authorizes the minimum fill+submit family; exact element
+            # references still come only from the live page snapshot.
+            browser_names.update({"browser_type", "browser_click"})
         grant(
             "explicit_browser",
             browser_names,
-            required_any_of=required_browser or {"browser_navigate"},
+            required_any_of={"browser_navigate"},
         )
+        if site_scoped_search:
+            grant(
+                "explicit_site_search_input",
+                {"browser_type"},
+                required_any_of={"browser_type"},
+            )
+            grant(
+                "explicit_site_search_submit",
+                {"browser_click"},
+                required_any_of={"browser_click"},
+            )
 
     file_reference = bool(_WORKSPACE_FILE_REFERENCE_RE.search(original))
     file_read = _positive_direct_clauses(

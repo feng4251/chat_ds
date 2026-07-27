@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ from tools.isolated_skill_executor import (
     snapshot_skill_package,
 )
 from tools.skill_runtime_profile import (
+    compile_skill_runtime_profile_manifest,
     select_skill_runtime_profile,
 )
 
@@ -268,6 +270,283 @@ class SkillRuntimeProfileTests(unittest.TestCase):
             selection.runtime_node_packages,
         )
 
+    def test_dynamic_node_exact_manifest_proves_fixed_dependency(self) -> None:
+        self.write(
+            "scripts/dynamic.cjs",
+            'const name = "playwright";\nrequire(name);\n',
+        )
+        manifest_path = self.write(
+            "chatds-runtime.json",
+            json.dumps({
+                "schema_version": 1,
+                "entrypoints": {
+                    "scripts/dynamic.cjs": {
+                        "runtime_profile": "browser-automation-v1",
+                        "dependencies": {
+                            "node": {"playwright": "1.61.0"},
+                        },
+                    },
+                },
+            }),
+        )
+        snapshot = snapshot_skill_package(self.root)
+
+        selection = select_skill_runtime_profile(
+            snapshot, "scripts/dynamic.cjs"
+        )
+        compiled = compile_skill_runtime_profile_manifest(
+            self.root, ()
+        )
+
+        self.assertEqual(
+            "browser-automation-v1",
+            selection.runtime_profile,
+        )
+        self.assertEqual(
+            ("playwright",),
+            selection.runtime_node_packages,
+        )
+        self.assertEqual(
+            "chatds-runtime.json",
+            selection.runtime_manifest_path,
+        )
+        self.assertEqual(
+            snapshot.file_sha256("chatds-runtime.json"),
+            selection.runtime_manifest_sha256,
+        )
+        self.assertTrue(compiled["valid"], compiled)
+        self.assertEqual(snapshot.sha256, compiled["package_sha256"])
+        self.assertEqual(
+            hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+            compiled["entrypoint_manifest"]["sha256"],
+        )
+        self.assertEqual(
+            ["scripts/dynamic.cjs"],
+            [row["entrypoint"] for row in compiled["scripts"]],
+        )
+        self.assertTrue(compiled["scripts"][0]["manifest_declared"])
+
+    def test_runtime_manifest_does_not_authorize_undeclared_dynamic_peer(
+        self,
+    ) -> None:
+        self.write(
+            "scripts/declared.cjs",
+            'const name = "playwright";\nrequire(name);\n',
+        )
+        self.write(
+            "scripts/undeclared.cjs",
+            'const name = "playwright";\nrequire(name);\n',
+        )
+        self.write(
+            "chatds-runtime.json",
+            json.dumps({
+                "schema_version": 1,
+                "entrypoints": [{
+                    "path": "scripts/declared.cjs",
+                    "runtime_profile": "browser-automation-v1",
+                    "node_packages": ["playwright"],
+                }],
+            }),
+        )
+        snapshot = snapshot_skill_package(self.root)
+
+        with self.assertRaises(IsolatedSkillExecutorError) as raised:
+            select_skill_runtime_profile(
+                snapshot, "scripts/undeclared.cjs"
+            )
+
+        self.assertEqual(
+            "skill_runtime_dynamic_dependency_unsupported",
+            raised.exception.code,
+        )
+
+    def test_dynamic_node_manifest_requires_exact_node_dependency(
+        self,
+    ) -> None:
+        self.write(
+            "scripts/dynamic.cjs",
+            'const name = "playwright";\nrequire(name);\n',
+        )
+        self.write(
+            "chatds-runtime.json",
+            json.dumps({
+                "schema_version": 1,
+                "entrypoints": [{
+                    "path": "scripts/dynamic.cjs",
+                    "runtime_profile": "browser-automation-v1",
+                    "commands": ["curl"],
+                }],
+            }),
+        )
+        snapshot = snapshot_skill_package(self.root)
+
+        with self.assertRaises(IsolatedSkillExecutorError) as raised:
+            select_skill_runtime_profile(
+                snapshot, "scripts/dynamic.cjs"
+            )
+
+        self.assertEqual(
+            "skill_runtime_dynamic_dependency_unsupported",
+            raised.exception.code,
+        )
+
+    def test_runtime_manifest_rejects_unknown_entrypoint_fields(
+        self,
+    ) -> None:
+        self.write(
+            "scripts/dynamic.cjs",
+            'const name = "playwright";\nrequire(name);\n',
+        )
+        self.write(
+            "chatds-runtime.json",
+            json.dumps({
+                "schema_version": 1,
+                "entrypoints": [{
+                    "path": "scripts/dynamic.cjs",
+                    "runtime_profile": "browser-automation-v1",
+                    "node_packages": ["playwright"],
+                    "unbounded_install": True,
+                }],
+            }),
+        )
+        snapshot = snapshot_skill_package(self.root)
+
+        with self.assertRaises(IsolatedSkillExecutorError) as raised:
+            select_skill_runtime_profile(
+                snapshot, "scripts/dynamic.cjs"
+            )
+
+        self.assertEqual(
+            "skill_runtime_manifest_invalid",
+            raised.exception.code,
+        )
+
+    def test_package_json_namespaced_entrypoint_manifest_is_compatible(
+        self,
+    ) -> None:
+        self.write(
+            "scripts/dynamic.cjs",
+            'const name = "playwright";\nrequire(name);\n',
+        )
+        package_json = self.write(
+            "package.json",
+            json.dumps({
+                "name": "portable-runtime-fixture",
+                "private": True,
+                "chatdsRuntime": {
+                    "schema_version": 1,
+                    "entrypoints": [{
+                        "path": "scripts/dynamic.cjs",
+                        "runtime_profile": "browser-automation-v1",
+                        "node_packages": ["playwright"],
+                    }],
+                },
+            }),
+        )
+        snapshot = snapshot_skill_package(self.root)
+
+        selection = select_skill_runtime_profile(
+            snapshot, "scripts/dynamic.cjs"
+        )
+        compiled = compile_skill_runtime_profile_manifest(
+            self.root, ("scripts/dynamic.cjs",)
+        )
+
+        self.assertEqual(
+            "browser-automation-v1",
+            selection.runtime_profile,
+        )
+        self.assertEqual(
+            "package.json",
+            selection.runtime_manifest_path,
+        )
+        self.assertEqual(
+            hashlib.sha256(package_json.read_bytes()).hexdigest(),
+            selection.runtime_manifest_sha256,
+        )
+        self.assertEqual(
+            "package.json",
+            compiled["entrypoint_manifest"]["path"],
+        )
+
+    def test_runtime_manifest_fixed_dependency_version_must_match_profile(
+        self,
+    ) -> None:
+        self.write(
+            "scripts/dynamic.cjs",
+            'const name = "playwright";\nrequire(name);\n',
+        )
+        self.write(
+            "chatds-runtime.json",
+            json.dumps({
+                "schema_version": 1,
+                "entrypoints": [{
+                    "path": "scripts/dynamic.cjs",
+                    "runtime_profile": "browser-automation-v1",
+                    "node_packages": {"playwright": "1.60.0"},
+                }],
+            }),
+        )
+        snapshot = snapshot_skill_package(self.root)
+
+        with self.assertRaises(IsolatedSkillExecutorError) as raised:
+            select_skill_runtime_profile(
+                snapshot, "scripts/dynamic.cjs"
+            )
+
+        self.assertEqual(
+            "skill_runtime_dependency_declaration_unsupported",
+            raised.exception.code,
+        )
+
+    def test_runtime_manifest_identity_changes_with_manifest_not_script(
+        self,
+    ) -> None:
+        self.write(
+            "scripts/dynamic.cjs",
+            'const name = "playwright";\nrequire(name);\n',
+        )
+        manifest = self.write(
+            "chatds-runtime.json",
+            json.dumps({
+                "schema_version": 1,
+                "entrypoints": [{
+                    "path": "scripts/dynamic.cjs",
+                    "runtime_profile": "browser-automation-v1",
+                    "node_packages": ["playwright"],
+                }],
+            }),
+        )
+        first_snapshot = snapshot_skill_package(self.root)
+        first = select_skill_runtime_profile(
+            first_snapshot, "scripts/dynamic.cjs"
+        )
+        manifest.write_text(
+            json.dumps({
+                "schema_version": 1,
+                "entrypoints": [{
+                    "path": "scripts/dynamic.cjs",
+                    "runtime_profile": "browser-automation-v1",
+                    "node_packages": ["playwright"],
+                    "commands": ["curl"],
+                }],
+            }),
+            encoding="utf-8",
+        )
+        second_snapshot = snapshot_skill_package(self.root)
+        second = select_skill_runtime_profile(
+            second_snapshot, "scripts/dynamic.cjs"
+        )
+
+        self.assertEqual(first.script_sha256, second.script_sha256)
+        self.assertNotEqual(first.package_sha256, second.package_sha256)
+        self.assertNotEqual(
+            first.runtime_manifest_sha256,
+            second.runtime_manifest_sha256,
+        )
+        self.assertNotIn("curl", first.runtime_commands)
+        self.assertIn("curl", second.runtime_commands)
+
     def test_dynamic_python_import_requires_exact_entrypoint_marker(self) -> None:
         self.write(
             "scripts/dynamic.py",
@@ -311,6 +590,43 @@ class SkillRuntimeProfileTests(unittest.TestCase):
         )
         self.assertEqual(
             ("selenium[websocket]==4.40.0",),
+            selection.runtime_requirements,
+        )
+
+    def test_dynamic_python_exact_manifest_uses_fixed_profile_package(
+        self,
+    ) -> None:
+        self.write(
+            "scripts/dynamic.py",
+            "from importlib import import_module\n"
+            'module_name = "selenium"\n'
+            "import_module(module_name)\n",
+        )
+        self.write(
+            "chatds-runtime.json",
+            json.dumps({
+                "schemaVersion": 1,
+                "entrypoints": [{
+                    "entrypoint": "scripts/dynamic.py",
+                    "runtimeProfile": "browser-automation-v1",
+                    "dependencies": {
+                        "python": {"selenium": "4.46.0"},
+                    },
+                }],
+            }),
+        )
+        snapshot = snapshot_skill_package(self.root)
+
+        selection = select_skill_runtime_profile(
+            snapshot, "scripts/dynamic.py"
+        )
+
+        self.assertEqual(
+            "browser-automation-v1",
+            selection.runtime_profile,
+        )
+        self.assertEqual(
+            ("selenium==4.46.0",),
             selection.runtime_requirements,
         )
 

@@ -42,6 +42,9 @@ MAX_PROFILE_SOURCE_FILES = 1_024
 MAX_PROFILE_SOURCE_BYTES = 24 * 1024 * 1024
 MAX_PROFILE_SOURCE_FILE_BYTES = 1_000_000
 MAX_PACKAGE_JSON_BYTES = 256_000
+SKILL_RUNTIME_MANIFEST_NAME = "chatds-runtime.json"
+MAX_SKILL_RUNTIME_MANIFEST_BYTES = 256_000
+MAX_SKILL_RUNTIME_MANIFEST_ENTRYPOINTS = 40
 MAX_SHELL_HEREDOCS = 128
 MAX_SHELL_HEREDOC_BODY_BYTES = MAX_PROFILE_SOURCE_FILE_BYTES
 
@@ -91,6 +94,12 @@ _FIXED_NODE_PACKAGE_VERSIONS = {
     BROWSER_RUNTIME_PROFILE: {
         "playwright": "1.61.0",
         "playwright-core": "1.61.0",
+    },
+}
+_FIXED_PYTHON_PACKAGE_VERSIONS = {
+    BROWSER_RUNTIME_PROFILE: {
+        "playwright": "1.61.0",
+        "selenium": "4.46.0",
     },
 }
 _SHELL_SKILL_PREFIXES = (
@@ -205,6 +214,8 @@ class SkillRuntimeSelection:
     runtime_commands: tuple[str, ...]
     runtime_node_packages: tuple[str, ...]
     required_cwd: str | None
+    runtime_manifest_path: str | None
+    runtime_manifest_sha256: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +238,18 @@ class _DynamicSourceAnalysis:
     runtime_commands: frozenset[str] = frozenset()
     required_cwds: frozenset[str] = frozenset()
     cwd_mutated: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _EntrypointRuntimeDeclaration:
+    """One strict package-root manifest declaration for an exact script."""
+
+    runtime_profile: str
+    python_requirements: tuple[str, ...]
+    node_packages: tuple[tuple[str, str], ...]
+    runtime_commands: tuple[str, ...]
+    manifest_path: str
+    manifest_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,6 +289,21 @@ def _unsupported_dependency_declaration(
         "skill_runtime_dependency_declaration_unsupported",
         f"Dependency {name!r} cannot be proven against the fixed isolated "
         f"runtime: {detail}",
+    )
+
+
+def _invalid_runtime_manifest(detail: str) -> None:
+    raise IsolatedSkillExecutorError(
+        "skill_runtime_manifest_invalid",
+        "The exact Skill runtime manifest is invalid: " + detail,
+    )
+
+
+def _runtime_profile_conflict(detail: str) -> None:
+    raise IsolatedSkillExecutorError(
+        "skill_runtime_profile_conflict",
+        "The exact Skill has conflicting runtime profile authority: "
+        + detail,
     )
 
 
@@ -2735,6 +2773,394 @@ def _validate_node_dependency_closure(
     return checked
 
 
+def _manifest_alias_value(
+    value: dict[str, Any],
+    *names: str,
+) -> Any:
+    """Read one aliased manifest field without accepting contradictions."""
+
+    present = [(name, value[name]) for name in names if name in value]
+    if not present:
+        return None
+    first = present[0][1]
+    if any(candidate != first for _name, candidate in present[1:]):
+        _invalid_runtime_manifest(
+            "conflicting aliases were supplied for " + "/".join(names)
+        )
+    return first
+
+
+def _manifest_entrypoint_path(
+    snapshot: SkillPackageSnapshot,
+    value: Any,
+) -> str:
+    raw = str(value or "").strip()
+    path = PurePosixPath(raw)
+    if (
+        not raw
+        or len(raw) > 512
+        or path.is_absolute()
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or path.as_posix() != raw
+        or path.suffix.casefold() not in _SOURCE_SUFFIXES
+        or raw not in snapshot.paths
+    ):
+        _invalid_runtime_manifest(
+            f"entrypoint {raw!r} is not an exact supported source in the "
+            "package snapshot"
+        )
+    return raw
+
+
+def _manifest_node_packages(
+    runtime_profile: str,
+    value: Any,
+) -> tuple[tuple[str, str], ...]:
+    if value in (None, {}, []):
+        return ()
+    fixed_versions = dict(
+        _FIXED_NODE_PACKAGE_VERSIONS.get(runtime_profile) or {}
+    )
+    if isinstance(value, list):
+        pairs: list[tuple[str, str]] = []
+        for raw_name in value:
+            if not isinstance(raw_name, str):
+                _invalid_runtime_manifest(
+                    "entrypoint Node dependency names must be strings"
+                )
+            name = str(raw_name or "").strip().casefold()
+            version = fixed_versions.get(name)
+            if not name or version is None:
+                _unsupported_dependency_declaration(
+                    name or "<empty>",
+                    f"it is not fixed in runtime profile {runtime_profile!r}",
+                )
+            pairs.append((name, version))
+    elif isinstance(value, dict):
+        pairs = []
+        for raw_name, raw_constraint in value.items():
+            name = str(raw_name or "").strip().casefold()
+            constraint = str(raw_constraint or "").strip()
+            if (
+                not name
+                or _canonical_node_package(name) != name
+                or _numeric_semver(constraint) is None
+            ):
+                _unsupported_dependency_declaration(
+                    name or "<empty>",
+                    "entrypoint manifests require an exact numeric Node "
+                    "package version",
+                )
+            fixed = fixed_versions.get(name)
+            if fixed is None:
+                _unsupported_dependency_declaration(
+                    name,
+                    f"it is not fixed in runtime profile {runtime_profile!r}",
+                )
+            if fixed != constraint:
+                _unsupported_dependency_declaration(
+                    name,
+                    f"manifest version {constraint!r} does not equal the "
+                    f"fixed profile version {fixed!r}",
+                )
+            pairs.append((name, constraint))
+    else:
+        _invalid_runtime_manifest(
+            "entrypoint Node dependencies must be an object or string list"
+        )
+    return tuple(sorted(dict(pairs).items()))
+
+
+def _manifest_python_requirements(
+    runtime_profile: str,
+    value: Any,
+) -> tuple[str, ...]:
+    if value in (None, {}, []):
+        return ()
+    fixed_versions = {
+        canonicalize_name(name): version
+        for name, version in (
+            _FIXED_PYTHON_PACKAGE_VERSIONS.get(runtime_profile) or {}
+        ).items()
+    }
+    raw_requirements: list[str] = []
+    if isinstance(value, dict):
+        for raw_name, raw_version in value.items():
+            if not isinstance(raw_version, str):
+                _invalid_runtime_manifest(
+                    "entrypoint Python dependency versions must be strings"
+                )
+            name = canonicalize_name(str(raw_name or "").strip())
+            version = str(raw_version or "").strip()
+            if not name or _numeric_semver(version) is None:
+                _unsupported_dependency_declaration(
+                    name or "<empty>",
+                    "entrypoint manifests require an exact numeric Python "
+                    "package version",
+                )
+            raw_requirements.append(f"{name}=={version}")
+    elif isinstance(value, list):
+        for raw_requirement in value:
+            if not isinstance(raw_requirement, str):
+                _invalid_runtime_manifest(
+                    "entrypoint Python requirements must be strings"
+                )
+            requirement = str(raw_requirement or "").strip()
+            normalized = canonicalize_name(requirement)
+            if normalized in fixed_versions and requirement == normalized:
+                requirement = (
+                    f"{normalized}=={fixed_versions[normalized]}"
+                )
+            raw_requirements.append(requirement)
+    else:
+        _invalid_runtime_manifest(
+            "entrypoint Python dependencies must be an object or string list"
+        )
+
+    result: list[str] = []
+    for raw in raw_requirements:
+        try:
+            requirement = Requirement(raw)
+        except InvalidRequirement:
+            _unsupported_dependency_declaration(
+                raw or "<empty>",
+                "entrypoint manifests require valid exact PEP 508 "
+                "requirements",
+            )
+        name = canonicalize_name(requirement.name)
+        fixed = fixed_versions.get(name)
+        specifiers = list(requirement.specifier)
+        if (
+            fixed is None
+            or requirement.url is not None
+            or requirement.marker is not None
+            or len(specifiers) != 1
+            or specifiers[0].operator not in {"==", "==="}
+            or "*" in specifiers[0].version
+            or specifiers[0].version != fixed
+        ):
+            _unsupported_dependency_declaration(
+                name,
+                f"the declaration must equal the package fixed in runtime "
+                f"profile {runtime_profile!r}",
+            )
+        result.append(raw)
+    return tuple(dict.fromkeys(result))
+
+
+def _manifest_runtime_commands(value: Any) -> tuple[str, ...]:
+    if value in (None, []):
+        return ()
+    if not isinstance(value, list):
+        _invalid_runtime_manifest(
+            "entrypoint commands must be a string list"
+        )
+    commands: list[str] = []
+    for raw_command in value:
+        if not isinstance(raw_command, str):
+            _invalid_runtime_manifest(
+                "entrypoint commands must be strings"
+            )
+        raw = str(raw_command or "").strip()
+        command = _literal_command_name(raw)
+        if command is None or command != raw:
+            _invalid_runtime_manifest(
+                f"entrypoint command {raw!r} is not an exact executable name"
+            )
+        commands.append(command)
+    return tuple(sorted(dict.fromkeys(commands)))
+
+
+def _declared_entrypoint_runtime_profiles(
+    snapshot: SkillPackageSnapshot,
+) -> dict[str, _EntrypointRuntimeDeclaration]:
+    """Parse the strict, package-root, snapshot-bound entrypoint manifest."""
+
+    embedded_value: Any = None
+    if "package.json" in snapshot.paths:
+        package_raw = snapshot.read_bytes("package.json")
+        if len(package_raw) <= MAX_PACKAGE_JSON_BYTES:
+            try:
+                package_value = json.loads(package_raw.decode("utf-8"))
+            except (UnicodeError, json.JSONDecodeError):
+                package_value = None
+            if isinstance(package_value, dict):
+                embedded_value = package_value.get("chatdsRuntime")
+    if (
+        SKILL_RUNTIME_MANIFEST_NAME in snapshot.paths
+        and embedded_value is not None
+    ):
+        _invalid_runtime_manifest(
+            "declare either chatds-runtime.json or package.json "
+            "chatdsRuntime, not both"
+        )
+    if SKILL_RUNTIME_MANIFEST_NAME in snapshot.paths:
+        manifest_path = SKILL_RUNTIME_MANIFEST_NAME
+        raw = snapshot.read_bytes(manifest_path)
+        if len(raw) > MAX_SKILL_RUNTIME_MANIFEST_BYTES:
+            _invalid_runtime_manifest("the manifest exceeds its byte limit")
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError):
+            _invalid_runtime_manifest(
+                "the manifest is not valid UTF-8 JSON"
+            )
+    elif embedded_value is not None:
+        manifest_path = "package.json"
+        raw = snapshot.read_bytes(manifest_path)
+        value = embedded_value
+    else:
+        return {}
+    if len(raw) > MAX_SKILL_RUNTIME_MANIFEST_BYTES:
+        _invalid_runtime_manifest("the manifest exceeds its byte limit")
+    if not isinstance(value, dict):
+        _invalid_runtime_manifest("the top-level value must be an object")
+    unknown_fields = set(value).difference({
+        "schema_version", "schemaVersion", "entrypoints",
+    })
+    if unknown_fields:
+        _invalid_runtime_manifest(
+            "the top-level object has unsupported fields"
+        )
+    schema_version = _manifest_alias_value(
+        value, "schema_version", "schemaVersion"
+    )
+    if type(schema_version) is not int or schema_version != 1:
+        _invalid_runtime_manifest("schema_version must be integer 1")
+    entries = value.get("entrypoints")
+    if not isinstance(entries, (dict, list)):
+        _invalid_runtime_manifest(
+            "entrypoints must be an object or an ordered object list"
+        )
+    normalized_entries: list[dict[str, Any]] = []
+    if isinstance(entries, dict):
+        for path, record in entries.items():
+            if not isinstance(record, dict):
+                _invalid_runtime_manifest(
+                    f"entrypoint {path!r} must map to an object"
+                )
+            if "path" in record or "entrypoint" in record:
+                _invalid_runtime_manifest(
+                    "object-form entrypoints must declare their path only "
+                    "as the map key"
+                )
+            normalized_entries.append({"path": path, **record})
+    else:
+        for record in entries:
+            if not isinstance(record, dict):
+                _invalid_runtime_manifest(
+                    "each entrypoint declaration must be an object"
+                )
+            normalized_entries.append(record)
+    if (
+        not normalized_entries
+        or len(normalized_entries)
+        > MAX_SKILL_RUNTIME_MANIFEST_ENTRYPOINTS
+    ):
+        _invalid_runtime_manifest(
+            "entrypoints must contain between 1 and "
+            f"{MAX_SKILL_RUNTIME_MANIFEST_ENTRYPOINTS} declarations"
+        )
+
+    manifest_sha256 = snapshot.file_sha256(
+        manifest_path
+    )
+    result: dict[str, _EntrypointRuntimeDeclaration] = {}
+    for record in normalized_entries:
+        unknown_entrypoint_fields = set(record).difference({
+            "path", "entrypoint",
+            "runtime_profile", "runtimeProfile",
+            "dependencies",
+            "python_requirements", "pythonRequirements",
+            "node_packages", "nodePackages",
+            "runtime_commands", "runtimeCommands", "commands",
+        })
+        if unknown_entrypoint_fields:
+            _invalid_runtime_manifest(
+                "an entrypoint declaration has unsupported fields"
+            )
+        path = _manifest_entrypoint_path(
+            snapshot,
+            _manifest_alias_value(record, "path", "entrypoint"),
+        )
+        if path in result:
+            _invalid_runtime_manifest(
+                f"entrypoint {path!r} is declared more than once"
+            )
+        runtime_profile = _manifest_alias_value(
+            record, "runtime_profile", "runtimeProfile"
+        )
+        if runtime_profile not in SUPPORTED_RUNTIME_PROFILES:
+            _unsupported_runtime_profile(runtime_profile)
+        dependencies = record.get("dependencies")
+        if dependencies is None:
+            dependencies = {}
+        if not isinstance(dependencies, dict):
+            _invalid_runtime_manifest(
+                f"entrypoint {path!r} dependencies must be an object"
+            )
+        unknown_dependency_fields = set(dependencies).difference({
+            "python", "node", "commands",
+        })
+        if unknown_dependency_fields:
+            _invalid_runtime_manifest(
+                f"entrypoint {path!r} has unsupported dependency fields"
+            )
+        python_value = _manifest_alias_value(
+            record, "python_requirements", "pythonRequirements"
+        )
+        node_value = _manifest_alias_value(
+            record, "node_packages", "nodePackages"
+        )
+        command_value = _manifest_alias_value(
+            record,
+            "runtime_commands",
+            "runtimeCommands",
+            "commands",
+        )
+        if python_value is not None and "python" in dependencies:
+            _invalid_runtime_manifest(
+                f"entrypoint {path!r} declares Python dependencies twice"
+            )
+        if node_value is not None and "node" in dependencies:
+            _invalid_runtime_manifest(
+                f"entrypoint {path!r} declares Node dependencies twice"
+            )
+        if command_value is not None and "commands" in dependencies:
+            _invalid_runtime_manifest(
+                f"entrypoint {path!r} declares commands twice"
+            )
+        result[path] = _EntrypointRuntimeDeclaration(
+            runtime_profile=str(runtime_profile),
+            python_requirements=_manifest_python_requirements(
+                str(runtime_profile),
+                (
+                    python_value
+                    if python_value is not None
+                    else dependencies.get("python")
+                ),
+            ),
+            node_packages=_manifest_node_packages(
+                str(runtime_profile),
+                (
+                    node_value
+                    if node_value is not None
+                    else dependencies.get("node")
+                ),
+            ),
+            runtime_commands=_manifest_runtime_commands(
+                (
+                    command_value
+                    if command_value is not None
+                    else dependencies.get("commands")
+                )
+            ),
+            manifest_path=manifest_path,
+            manifest_sha256=manifest_sha256,
+        )
+    return result
+
+
 def _declared_package_profile(
     snapshot: SkillPackageSnapshot,
 ) -> tuple[
@@ -2862,6 +3288,40 @@ def select_skill_runtime_profile(
         package_requirements,
         declared_node_constraints,
     ) = _declared_package_profile(snapshot)
+    entrypoint_declarations = _declared_entrypoint_runtime_profiles(
+        snapshot
+    )
+    entrypoint_declaration = entrypoint_declarations.get(entrypoint)
+    effective_package_requirements = {
+        name: list(values)
+        for name, values in package_requirements.items()
+    }
+    effective_node_constraints = dict(declared_node_constraints)
+    if entrypoint_declaration is not None:
+        for raw_requirement in (
+            entrypoint_declaration.python_requirements
+        ):
+            parsed = Requirement(raw_requirement)
+            name = canonicalize_name(parsed.name)
+            effective_package_requirements.setdefault(name, []).append(
+                raw_requirement
+            )
+        for name, constraint in entrypoint_declaration.node_packages:
+            package_constraint = effective_node_constraints.get(name)
+            if (
+                package_constraint is not None
+                and not _node_version_satisfies(
+                    name,
+                    constraint,
+                    package_constraint,
+                )
+            ):
+                _unsupported_dependency_declaration(
+                    name,
+                    f"package range {package_constraint!r} conflicts with "
+                    f"entrypoint manifest version {constraint!r}",
+                )
+            effective_node_constraints[name] = constraint
     queue = [entrypoint]
     seen: set[str] = set()
     browser_requirements: set[str] = set()
@@ -2997,6 +3457,27 @@ def select_skill_runtime_profile(
     entrypoint_marker = _source_runtime_profile_marker(
         _decode_source(entrypoint, sources)
     )
+    manifest_profile = (
+        entrypoint_declaration.runtime_profile
+        if entrypoint_declaration is not None else None
+    )
+    if (
+        entrypoint_marker is not None
+        and manifest_profile is not None
+        and entrypoint_marker != manifest_profile
+    ):
+        _runtime_profile_conflict(
+            "the entrypoint source marker and package manifest disagree"
+        )
+    if (
+        package_profile is not None
+        and manifest_profile is not None
+        and package_profile != manifest_profile
+    ):
+        _runtime_profile_conflict(
+            "the package-wide profile and exact entrypoint manifest disagree"
+        )
+    exact_entrypoint_profile = manifest_profile or entrypoint_marker
     if len(required_cwds) > 1:
         raise IsolatedSkillExecutorError(
             "skill_runtime_cwd_ambiguous",
@@ -3014,33 +3495,81 @@ def select_skill_runtime_profile(
     required_cwd = (
         next(iter(required_cwds)) if required_cwds else None
     )
-    if dynamic_dependency_sources and entrypoint_marker is None:
+    if (
+        dynamic_dependency_sources
+        and exact_entrypoint_profile is None
+    ):
         raise IsolatedSkillExecutorError(
             "skill_runtime_dynamic_dependency_unsupported",
             "A reachable source uses non-literal dependency or code dispatch. "
-            "Add an exact CHATDS_RUNTIME_PROFILE marker to the entrypoint and "
-            "declare external Python/Node dependencies in the package's "
-            "machine-readable manifests.",
+            "Add an exact CHATDS_RUNTIME_PROFILE marker or a strict "
+            f"{SKILL_RUNTIME_MANIFEST_NAME} entrypoint declaration, and "
+            "declare fixed external dependencies in machine-readable "
+            "manifests.",
+        )
+    if (
+        dynamic_dependency_sources
+        and entrypoint_declaration is not None
+        and not (
+            entrypoint_declaration.python_requirements
+            or entrypoint_declaration.node_packages
+            or entrypoint_declaration.runtime_commands
+        )
+    ):
+        raise IsolatedSkillExecutorError(
+            "skill_runtime_dynamic_dependency_unsupported",
+            "A dynamic entrypoint manifest must declare at least one exact "
+            "fixed dependency or runtime command.",
+        )
+    if (
+        dynamic_node_imports
+        and entrypoint_declaration is not None
+        and not entrypoint_declaration.node_packages
+    ):
+        raise IsolatedSkillExecutorError(
+            "skill_runtime_dynamic_dependency_unsupported",
+            "A dynamic Node import requires at least one exact fixed Node "
+            "dependency in its entrypoint manifest.",
         )
     if dynamic_node_imports or dynamic_python_or_shell:
         # The explicit entrypoint marker selects the profile. In the absence
         # of a statically knowable specifier, every declared root dependency
         # becomes part of the exact dependency proof.
-        source_node_packages.update(declared_node_constraints)
-    runtime_profile = (
-        BROWSER_RUNTIME_PROFILE
-        if (
-            package_profile == BROWSER_RUNTIME_PROFILE
-            or browser_requirements
+        source_node_packages.update(effective_node_constraints)
+    if entrypoint_declaration is not None:
+        source_node_packages.update(
+            name for name, _constraint
+            in entrypoint_declaration.node_packages
         )
-        else BASE_RUNTIME_PROFILE
+        source_runtime_commands.update(
+            entrypoint_declaration.runtime_commands
+        )
+    inferred_profile = (
+        BROWSER_RUNTIME_PROFILE
+        if browser_requirements else BASE_RUNTIME_PROFILE
+    )
+    if (
+        exact_entrypoint_profile == BASE_RUNTIME_PROFILE
+        and inferred_profile == BROWSER_RUNTIME_PROFILE
+    ):
+        _runtime_profile_conflict(
+            "the exact entrypoint declares base-v1 but its reachable "
+            "dependency closure requires browser-automation-v1"
+        )
+    runtime_profile = (
+        exact_entrypoint_profile
+        or (
+            BROWSER_RUNTIME_PROFILE
+            if package_profile == BROWSER_RUNTIME_PROFILE
+            else inferred_profile
+        )
     )
     runtime_node_packages = (
         _validate_node_dependency_closure(
             snapshot,
             runtime_profile,
             source_node_packages,
-            declared_node_constraints,
+            effective_node_constraints,
         )
         if has_node_source or source_node_packages else set()
     )
@@ -3068,18 +3597,27 @@ def select_skill_runtime_profile(
             normalized_root,
             normalized_root,
         )
-        if requirement_name in package_requirements:
+        if requirement_name in effective_package_requirements:
             reachable_requirement_names.add(requirement_name)
     if dynamic_python_or_shell:
-        reachable_requirement_names.update(package_requirements)
+        reachable_requirement_names.update(
+            effective_package_requirements
+        )
+    if entrypoint_declaration is not None:
+        reachable_requirement_names.update(
+            canonicalize_name(Requirement(raw).name)
+            for raw in entrypoint_declaration.python_requirements
+        )
     for requirement_name in sorted(reachable_requirement_names):
         if requirement_name in _UNSUPPORTED_BROWSER_REQUIREMENT_NAMES:
             _unsupported_browser_dependency(requirement_name)
-        declared = package_requirements.get(requirement_name) or ()
+        declared = (
+            effective_package_requirements.get(requirement_name) or ()
+        )
         if declared:
             runtime_requirements_set.update(declared)
     for requirement_name in sorted(python_browser_imports):
-        if not package_requirements.get(requirement_name):
+        if not effective_package_requirements.get(requirement_name):
             runtime_requirements_set.add(requirement_name)
     runtime_requirements = tuple(sorted(runtime_requirements_set))
     return SkillRuntimeSelection(
@@ -3092,6 +3630,14 @@ def select_skill_runtime_profile(
         runtime_commands=commands,
         runtime_node_packages=tuple(sorted(runtime_node_packages)),
         required_cwd=required_cwd,
+        runtime_manifest_path=(
+            entrypoint_declaration.manifest_path
+            if entrypoint_declaration is not None else None
+        ),
+        runtime_manifest_sha256=(
+            entrypoint_declaration.manifest_sha256
+            if entrypoint_declaration is not None else None
+        ),
     )
 
 
@@ -3116,10 +3662,35 @@ def compile_skill_runtime_profile_manifest(
             ),
             "scripts": [],
         }
+    try:
+        declared_entrypoints = _declared_entrypoint_runtime_profiles(
+            snapshot
+        )
+    except (RuntimeError, ValueError) as exc:
+        return {
+            "schema_version": 1,
+            "valid": False,
+            "package_sha256": snapshot.sha256,
+            "error_code": str(
+                getattr(exc, "code", None)
+                or "skill_runtime_manifest_invalid"
+            ),
+            "scripts": [],
+            "errors": [{
+                "entrypoint": "__manifest__",
+                "error_code": str(
+                    getattr(exc, "code", None)
+                    or "skill_runtime_manifest_invalid"
+                ),
+            }],
+        }
     scripts: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     for entrypoint in dict.fromkeys(
-        str(item) for item in entrypoints if str(item)
+        [
+            *(str(item) for item in entrypoints if str(item)),
+            *declared_entrypoints,
+        ]
     ):
         try:
             selection = select_skill_runtime_profile(
@@ -3149,11 +3720,28 @@ def compile_skill_runtime_profile_manifest(
                 selection.runtime_node_packages
             ),
             "required_cwd": selection.required_cwd,
+            "manifest_declared": (
+                entrypoint in declared_entrypoints
+            ),
+            "runtime_manifest_path": (
+                selection.runtime_manifest_path
+            ),
+            "runtime_manifest_sha256": (
+                selection.runtime_manifest_sha256
+            ),
         })
-    return {
+    result = {
         "schema_version": 1,
         "valid": not errors,
         "package_sha256": snapshot.sha256,
         "scripts": scripts,
         "errors": errors,
     }
+    if declared_entrypoints:
+        declaration = next(iter(declared_entrypoints.values()))
+        result["entrypoint_manifest"] = {
+            "path": declaration.manifest_path,
+            "sha256": declaration.manifest_sha256,
+            "schema_version": 1,
+        }
+    return result

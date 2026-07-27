@@ -2,6 +2,7 @@ import asyncio
 import io
 import stat
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -10,6 +11,7 @@ import pytest
 from fastapi import HTTPException
 
 import skill_frontmatter
+from models import SkillPackage
 from routers import skill_router
 
 
@@ -177,6 +179,144 @@ def test_nested_reference_skill_with_frontmatter_is_not_split_from_parent(tmp_pa
     assert [skill["name"] for skill in result["skills"]] == ["parent-skill"]
     assert (installed / "references/example/SKILL.md").read_bytes() == nested_example
     assert not (tmp_path / "user-1" / "nested-example").exists()
+
+
+def test_multi_skill_zip_persists_stable_primary_and_supporting_identity(
+    tmp_path: Path,
+):
+    contents = _zip_bytes({
+        "main/SKILL.md": (
+            b"---\nname: main-skill\ndescription: Main workflow.\n---\n"
+            b"Run the workflow.\n"
+        ),
+        "skills-bundle/helper/SKILL.md": (
+            b"---\nname: helper-skill\ndescription: Supporting capability.\n---\n"
+            b"Support the main workflow.\n"
+        ),
+    })
+    db = _FakeDb()
+
+    with (
+        patch.object(skill_router, "SKILLS_DATA_DIR", tmp_path),
+        patch.object(skill_router, "_invalidate_skills_cache"),
+        patch.object(
+            skill_router,
+            "_auto_register_mcp",
+            new=AsyncMock(return_value={
+                "registered": [], "skipped": [], "errors": [], "runtime": None,
+            }),
+        ),
+    ):
+        result = asyncio.run(
+            skill_router._process_skill_zip(
+                contents,
+                "workflow.zip",
+                None,
+                None,
+                SimpleNamespace(id="user-1"),
+                db,
+            )
+        )
+
+    by_name = {skill["name"]: skill for skill in result["skills"]}
+    assert by_name["main-skill"]["bundle_role"] == "primary"
+    assert by_name["helper-skill"]["bundle_role"] == "supporting"
+    assert (
+        by_name["main-skill"]["bundle_id"]
+        == by_name["helper-skill"]["bundle_id"]
+    )
+    assert by_name["helper-skill"]["bundle_root_name"] == "main-skill"
+    assert (
+        by_name["helper-skill"]["bundle_source_path"]
+        == "skills-bundle/helper/SKILL.md"
+    )
+
+    rows = {skill.name: skill for skill in db.added}
+    assert rows["main-skill"].bundle_role == "primary"
+    assert rows["helper-skill"].bundle_role == "supporting"
+    assert rows["helper-skill"].bundle_id == rows["main-skill"].bundle_id
+
+
+def test_equal_depth_multi_skill_zip_does_not_invent_a_primary():
+    contents = _zip_bytes({
+        "one/SKILL.md": (
+            b"---\nname: skill-one\ndescription: First independent Skill.\n---\n"
+        ),
+        "two/SKILL.md": (
+            b"---\nname: skill-two\ndescription: Second independent Skill.\n---\n"
+        ),
+    })
+    with zipfile.ZipFile(io.BytesIO(contents)) as archive:
+        manifests = skill_router._discover_skill_manifests(
+            archive,
+            skill_router._zip_file_entries(archive),
+        )
+
+    metadata = skill_router._bundle_manifest_metadata(contents, manifests)
+    assert metadata["skill-one"]["bundle_role"] == "primary"
+    assert metadata["skill-two"]["bundle_role"] == "primary"
+    assert (
+        metadata["skill-one"]["bundle_id"]
+        != metadata["skill-two"]["bundle_id"]
+    )
+
+
+def test_legacy_bundle_projection_requires_one_root_in_exact_upload_cohort():
+    created_at = datetime(2026, 7, 24, 8, 36, 49)
+    primary = SimpleNamespace(
+        id="main",
+        user_id="user",
+        session_id="conversation",
+        name="main-skill",
+        category=None,
+        bundle_id=None,
+        created_at=created_at,
+    )
+    child = SimpleNamespace(
+        id="child",
+        user_id="user",
+        session_id="conversation",
+        name="helper-skill",
+        category="skills-bundle",
+        bundle_id=None,
+        created_at=created_at,
+    )
+    independent = SimpleNamespace(
+        id="independent",
+        user_id="user",
+        session_id="conversation",
+        name="browser-skill",
+        category=None,
+        bundle_id=None,
+        created_at=datetime(2026, 7, 27, 0, 52, 50),
+    )
+
+    projected = skill_router.legacy_bundle_projection(
+        [primary, child, independent]
+    )
+    assert projected["main"]["bundle_role"] == "primary"
+    assert projected["child"]["bundle_role"] == "supporting"
+    assert projected["main"]["bundle_id"] == projected["child"]["bundle_id"]
+    assert "independent" not in projected
+
+    second_root = SimpleNamespace(
+        **{
+            **primary.__dict__,
+            "id": "second-root",
+            "name": "second-root",
+        }
+    )
+    assert skill_router.legacy_bundle_projection(
+        [primary, second_root, child]
+    ) == {}
+
+
+def test_skill_package_schema_exposes_bundle_identity_columns():
+    columns = SkillPackage.__table__.c
+    assert columns.bundle_id.type.length == 64
+    assert columns.bundle_role.type.length == 16
+    assert columns.bundle_root_name.type.length == 128
+    assert columns.bundle_source_path.type.length == 512
 
 
 def test_zip_resource_bounds_fail_closed():

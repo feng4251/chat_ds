@@ -7,10 +7,14 @@ import main as harness_main
 
 
 class SSEDisconnectCancellationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        agent_loop.set_harness_service_shutdown_started(False)
+
     async def test_asgi_disconnect_cancels_run_producer_and_records_terminal(self):
         entered = asyncio.Event()
         producer_closed = asyncio.Event()
         trace: list[dict] = []
+        observed_skill_registry = None
 
         @agent_loop._emit_run_cancelled_on_cancellation
         async def blocked_run_stream(
@@ -27,8 +31,11 @@ class SSEDisconnectCancellationTests(unittest.IsolatedAsyncioTestCase):
             depth=0,
             workspace_scope="shared_session",
             event_sink=None,
+            session_skill_registry=None,
             **_kwargs,
         ):
+            nonlocal observed_skill_registry
+            observed_skill_registry = session_skill_registry
             try:
                 entered.set()
                 await asyncio.Event().wait()
@@ -46,6 +53,13 @@ class SSEDisconnectCancellationTests(unittest.IsolatedAsyncioTestCase):
             {"base_url": "http://provider", "api_model": "model"},
             [],
             "chat",
+            session_skill_registry=[{
+                "name": "root",
+                "scope": "session",
+                "bundle_id": "a" * 64,
+                "bundle_role": "primary",
+                "bundle_root_name": "root",
+            }],
             run_metadata={
                 "run_id": "root-run",
                 "root_run_id": "root-run",
@@ -95,6 +109,7 @@ class SSEDisconnectCancellationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertGreaterEqual(receive_count, 1)
         self.assertTrue(producer_closed.is_set())
+        self.assertEqual("root", observed_skill_registry[0]["name"])
         cancelled = [
             event for event in trace
             if event.get("event_type") == "run.cancelled"

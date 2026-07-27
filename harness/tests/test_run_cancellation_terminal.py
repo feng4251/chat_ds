@@ -25,6 +25,9 @@ def _event(event_type: str, run_id: str, seq: int, payload=None) -> dict:
 
 
 class RunCancellationTerminalTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        agent_loop.set_harness_service_shutdown_started(False)
+
     async def test_cancel_writes_terminal_before_sink_and_reraises(self):
         entered = asyncio.Event()
         release = asyncio.Event()
@@ -110,12 +113,62 @@ class RunCancellationTerminalTests(unittest.IsolatedAsyncioTestCase):
             {
                 "finish_reason": "task_cancelled",
                 "terminal_reason": "task_cancelled",
+                "cancellation_source": "asyncio_cancelled_unknown",
+                "exception_class": "CancelledError",
                 "usage": {
                     "input_tokens": 11,
                     "output_tokens": 7,
                     "total_tokens": 18,
                 },
             },
+        )
+
+    async def test_service_shutdown_is_preserved_as_cancellation_source(self):
+        entered = asyncio.Event()
+        trace: list[dict] = []
+
+        @agent_loop._emit_run_cancelled_on_cancellation
+        async def blocked_stream(
+            model_id,
+            messages,
+            run_id=None,
+            user_id="default",
+            session_id="default",
+        ):
+            entered.set()
+            await asyncio.Event().wait()
+            if False:  # pragma: no cover - retain async-generator shape
+                yield {}
+
+        async def consume():
+            async for _event_value in blocked_stream(
+                "model",
+                [],
+                run_id="root-run",
+                user_id="user",
+                session_id="session",
+            ):
+                pass
+
+        with (
+            patch.object(agent_loop.settings, "agent_debug_trace", True),
+            patch.object(
+                agent_loop,
+                "_append_workspace_debug_event",
+                side_effect=lambda _u, _s, event: trace.append(event),
+            ),
+        ):
+            task = asyncio.create_task(consume())
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            agent_loop.set_harness_service_shutdown_started(True)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        agent_loop.set_harness_service_shutdown_started(False)
+
+        self.assertEqual(
+            "service_shutdown",
+            trace[0]["payload"]["cancellation_source"],
         )
 
     async def test_terminal_vs_cancel_race_does_not_add_second_terminal(self):

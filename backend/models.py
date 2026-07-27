@@ -116,6 +116,16 @@ class SkillPackage(Base):
     description: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     category: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     version: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    bundle_id: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    bundle_role: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    bundle_root_name: Mapped[Optional[str]] = mapped_column(
+        String(128), nullable=True
+    )
+    bundle_source_path: Mapped[Optional[str]] = mapped_column(
+        String(512), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()

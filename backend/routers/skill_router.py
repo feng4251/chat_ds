@@ -10,6 +10,7 @@ Endpoints:
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -29,6 +30,10 @@ from auth import get_current_user
 from config import settings
 from database import get_db
 from models import Conversation, SkillPackage, User
+from skill_bundles import (
+    legacy_bundle_projection,
+    resolved_bundle_metadata,
+)
 from skill_frontmatter import SkillFrontmatterError, parse_skill_frontmatter
 
 logger = logging.getLogger(__name__)
@@ -436,6 +441,63 @@ def _discover_skill_manifests(
     return manifests
 
 
+def _bundle_manifest_metadata(
+    contents: bytes,
+    manifests: list[dict],
+) -> dict[str, dict[str, str]]:
+    """Return stable, non-guessing bundle identity for discovered manifests.
+
+    A ZIP with one Skill is a one-member bundle.  For a multi-Skill archive,
+    a unique shallowest manifest is an unambiguous primary and all deeper
+    manifests are supporting members.  Equal-depth roots do not establish a
+    primary, so they remain independent top-level Skills with distinct IDs
+    rather than being grouped under an invented owner.
+    """
+
+    archive_digest = hashlib.sha256(contents).hexdigest()
+    if not manifests:
+        return {}
+
+    primary: dict | None = None
+    if len(manifests) == 1:
+        primary = manifests[0]
+    else:
+        minimum_depth = min(str(item["root"]).count("/") for item in manifests)
+        shallowest = [
+            item
+            for item in manifests
+            if str(item["root"]).count("/") == minimum_depth
+        ]
+        if len(shallowest) == 1:
+            primary = shallowest[0]
+
+    result: dict[str, dict[str, str]] = {}
+    if primary is not None:
+        root_name = str(primary["name"])
+        for manifest in manifests:
+            name = str(manifest["name"])
+            result[name] = {
+                "bundle_id": archive_digest,
+                "bundle_role": "primary" if manifest is primary else "supporting",
+                "bundle_root_name": root_name,
+                "bundle_source_path": str(manifest["skill_md"]),
+            }
+        return result
+
+    for manifest in manifests:
+        name = str(manifest["name"])
+        member_id = hashlib.sha256(
+            f"{archive_digest}\0{manifest['root']}\0{name}".encode("utf-8")
+        ).hexdigest()
+        result[name] = {
+            "bundle_id": member_id,
+            "bundle_role": "primary",
+            "bundle_root_name": name,
+            "bundle_source_path": str(manifest["skill_md"]),
+        }
+    return result
+
+
 def _entry_is_under_skill_root(entry_path: str, root: str) -> bool:
     return (entry_path == root or entry_path.startswith(f"{root}/")) if root else True
 
@@ -484,6 +546,7 @@ async def _process_skill_zip(
     try:
         entries = _zip_file_entries(zf)
         manifests = _discover_skill_manifests(zf, entries)
+        bundle_metadata = _bundle_manifest_metadata(contents, manifests)
 
         if session_id:
             user_skills_dir = SKILLS_DATA_DIR / user.id / session_id
@@ -560,12 +623,14 @@ async def _process_skill_zip(
                 skill_category = str(manifest["category"])[:64]
 
             description = str(manifest.get("description") or "")
+            member_metadata = bundle_metadata[skill_name]
             installed_skill = {
                 "name": skill_name,
                 "description": description,
                 "category": skill_category,
                 "version": str(manifest.get("version") or ""),
                 "session_id": session_id,
+                **member_metadata,
             }
             installed_skills.append(installed_skill)
             db.add(SkillPackage(
@@ -575,6 +640,10 @@ async def _process_skill_zip(
                 description=description[:1024] if description else None,
                 category=skill_category,
                 version=str(manifest.get("version") or ""),
+                bundle_id=member_metadata["bundle_id"],
+                bundle_role=member_metadata["bundle_role"],
+                bundle_root_name=member_metadata["bundle_root_name"],
+                bundle_source_path=member_metadata["bundle_source_path"],
             ))
 
         await db.commit()
@@ -720,12 +789,18 @@ async def list_skills(
     # one effective row per scope/name while preserving the newest metadata.
     seen: set[tuple[str | None, str]] = set()
     output = []
+    legacy_bundle_metadata = legacy_bundle_projection(skills)
     for skill in skills:
         key = (skill.session_id, skill.name)
         if key in seen:
             continue
         seen.add(key)
         exists = _skill_dir_exists(user.id, skill.name, skill.session_id)
+        bundle = resolved_bundle_metadata(skill, legacy_bundle_metadata)
+        bundle_id = bundle["bundle_id"]
+        bundle_role = bundle["bundle_role"]
+        bundle_root_name = bundle["bundle_root_name"]
+        bundle_source_path = bundle["bundle_source_path"]
         output.append({
             "id": skill.id,
             "name": skill.name,
@@ -734,6 +809,11 @@ async def list_skills(
             "version": skill.version,
             "session_id": skill.session_id,
             "scope": "session" if skill.session_id else "user",
+            "bundle_id": bundle_id,
+            "bundle_role": bundle_role,
+            "bundle_root_name": bundle_root_name,
+            "bundle_source_path": bundle_source_path,
+            "is_bundle_child": bundle_role == "supporting",
             "available": exists,
             "warning": None if exists else "Skill files are missing; reinstall this skill.",
             "created_at": skill.created_at.isoformat() if skill.created_at else None,
@@ -862,6 +942,10 @@ async def promote_skill(
         description=session_skill.description,
         category=session_skill.category,
         version=session_skill.version,
+        bundle_id=session_skill.bundle_id,
+        bundle_role=session_skill.bundle_role,
+        bundle_root_name=session_skill.bundle_root_name,
+        bundle_source_path=session_skill.bundle_source_path,
     )
     db.add(new_skill)
 
