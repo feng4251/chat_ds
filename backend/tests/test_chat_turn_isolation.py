@@ -75,6 +75,13 @@ class ChatTurnIsolationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_adjacent_turn_waits_for_durable_assistant_before_history(self):
         requests: list[dict] = []
+        expected_skill_registry = [{
+            "name": "root-skill",
+            "scope": "session",
+            "bundle_id": "a" * 64,
+            "bundle_role": "primary",
+            "bundle_root_name": "root-skill",
+        }]
         projection_started = asyncio.Event()
         release_projection = asyncio.Event()
         original_persist = chat_router._persist_after_stream
@@ -148,8 +155,17 @@ class ChatTurnIsolationTests(unittest.IsolatedAsyncioTestCase):
                 }),
             ),
             patch.object(chat_router, "ensure_workspace"),
+            patch.object(
+                chat_router,
+                "_append_backend_stream_debug_file",
+            ),
             patch.object(chat_router, "emit_event", new=AsyncMock()),
             patch.object(chat_router, "_generate_title", new=AsyncMock()),
+            patch.object(
+                chat_router,
+                "skill_bundle_registry_rows",
+                return_value=expected_skill_registry,
+            ),
             patch.object(chat_router.httpx, "AsyncClient", FakeClient),
             patch.object(
                 chat_router.settings,
@@ -165,7 +181,8 @@ class ChatTurnIsolationTests(unittest.IsolatedAsyncioTestCase):
 
         with common_patches[0], common_patches[1], common_patches[2], \
                 common_patches[3], common_patches[4], common_patches[5], \
-                common_patches[6], common_patches[7]:
+                common_patches[6], common_patches[7], common_patches[8], \
+                common_patches[9]:
             async with self.sessions() as first_session:
                 user = await first_session.get(User, "user")
                 first_response = await chat_router._chat_stream(
@@ -196,11 +213,21 @@ class ChatTurnIsolationTests(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(second_builder.done())
 
                     release_projection.set()
-                    await first_consumer
+                    first_chunks = await first_consumer
+                    self.assertIn("stream_terminal", str(first_chunks[-1]))
                     second_response = await second_builder
-                    await consume(second_response)
+                    second_chunks = await consume(second_response)
+                    self.assertIn("stream_terminal", str(second_chunks[-1]))
 
         self.assertEqual(len(requests), 2)
+        self.assertEqual(
+            expected_skill_registry,
+            requests[0]["session_skill_registry"],
+        )
+        self.assertEqual(
+            expected_skill_registry,
+            requests[1]["session_skill_registry"],
+        )
         second_messages = requests[1]["messages"]
         self.assertEqual(
             [(item["role"], item["content"]) for item in second_messages],
@@ -293,6 +320,31 @@ class ChatTurnIsolationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await projection_task
         await asyncio.sleep(0)
+        self.assertNotIn("conversation", chat_router._conversation_turn_states)
+
+    async def test_completed_projection_failure_is_retained_for_next_turn(self):
+        async def projection():
+            raise RuntimeError("database projection failed")
+
+        first_lease = await chat_router._acquire_conversation_turn(
+            "conversation"
+        )
+        projection_task = chat_router._track_conversation_projection(
+            "conversation",
+            projection(),
+        )
+        chat_router._release_conversation_turn("conversation", first_lease)
+        with self.assertRaises(RuntimeError):
+            await projection_task
+        # Let the task callback run before the next acquire.  The failed task
+        # must remain as a barrier even though it is no longer pending.
+        await asyncio.sleep(0)
+        state = chat_router._conversation_turn_states["conversation"]
+        self.assertIn(projection_task, state.projection_tasks)
+        with self.assertRaises(
+            chat_router._ConversationProjectionBarrierError
+        ):
+            await chat_router._acquire_conversation_turn("conversation")
         self.assertNotIn("conversation", chat_router._conversation_turn_states)
 
     async def test_durable_orphan_marker_blocks_later_turn_after_registry_cleanup(self):

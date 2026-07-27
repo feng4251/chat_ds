@@ -463,6 +463,26 @@ def build_capability_catalog(
         script_runtime_profiles
         if isinstance(script_runtime_profiles, dict) else {}
     )
+    workflow = loaded_package.get("workflow_contract")
+    if not isinstance(workflow, dict):
+        workflow = {}
+    runtime_manifest = loaded_package.get("runtime_profile_manifest")
+    if not isinstance(runtime_manifest, dict):
+        runtime_manifest = workflow.get(
+            "_chatds_runtime_profile_manifest"
+        )
+    runtime_manifest_rows = {
+        str(row.get("entrypoint") or ""): row
+        for row in (
+            runtime_manifest.get("scripts") or []
+            if isinstance(runtime_manifest, dict) else []
+        )
+        if (
+            isinstance(row, dict)
+            and row.get("manifest_declared") is True
+            and str(row.get("entrypoint") or "")
+        )
+    }
     # A bundled reference becomes instruction authority only after the root
     # names that exact path and a complete read supplies its current digest.
     root_linked_documents = [
@@ -548,6 +568,36 @@ def build_capability_catalog(
             or profile_record.get("script_sha256") != digest
         ):
             continue
+        manifest_row = runtime_manifest_rows.get(path)
+        manifest_authority: dict[str, str] | None = None
+        if manifest_row is not None:
+            manifest_path = _safe_relative_path(
+                manifest_row.get("runtime_manifest_path")
+            )
+            manifest_digest = str(
+                manifest_row.get("runtime_manifest_sha256") or ""
+            )
+            if (
+                manifest_path is None
+                or PurePosixPath(manifest_path).parent
+                != PurePosixPath(".")
+                or not _valid_sha256(manifest_digest)
+                or manifest_row.get("package_sha256")
+                != package_sha256
+                or manifest_row.get("script_sha256") != digest
+                or manifest_row.get("runtime_profile")
+                != runtime_profile
+                or _current_loaded_resource_sha256(
+                    loaded_package,
+                    manifest_path,
+                )
+                != manifest_digest
+            ):
+                continue
+            manifest_authority = {
+                "resource_path": manifest_path,
+                "sha256": manifest_digest,
+            }
         required_cwd = (
             profile_record.get("required_cwd")
             if isinstance(profile_record, dict)
@@ -585,6 +635,27 @@ def build_capability_catalog(
             # derived runtime grant so adding or mutating a helper file
             # invalidates the old plan.
             script_identity += f"\0{package_sha256}"
+        if manifest_authority is not None:
+            script_identity += (
+                f"\0{manifest_authority['resource_path']}"
+                f"\0{manifest_authority['sha256']}"
+            )
+        authority_chain = (
+            [
+                {"resource_path": "SKILL.md", "sha256": body_sha256},
+                {
+                    "resource_path": declaring_document["resource_path"],
+                    "sha256": declaring_document["sha256"],
+                },
+            ]
+            if declaring_document is not None
+            else [{"resource_path": "SKILL.md", "sha256": body_sha256}]
+        )
+        if (
+            manifest_authority is not None
+            and manifest_authority not in authority_chain
+        ):
+            authority_chain.append(manifest_authority)
         candidates.append({
             "id": _stable_id("script", script_identity),
             "kind": "skill_script",
@@ -595,6 +666,11 @@ def build_capability_catalog(
             **(
                 {"package_sha256": package_sha256}
                 if package_sha256
+                else {}
+            ),
+            **(
+                {"runtime_manifest": manifest_authority}
+                if manifest_authority is not None
                 else {}
             ),
             "runtime_profile": (
@@ -621,17 +697,7 @@ def build_capability_catalog(
                 }
                 if isinstance(profile_record, dict) else {}
             ),
-            "authority_chain": (
-                [
-                    {"resource_path": "SKILL.md", "sha256": body_sha256},
-                    {
-                        "resource_path": declaring_document["resource_path"],
-                        "sha256": declaring_document["sha256"],
-                    },
-                ]
-                if declaring_document is not None
-                else [{"resource_path": "SKILL.md", "sha256": body_sha256}]
-            ),
+            "authority_chain": authority_chain,
             "description": (
                 "Content-addressed script explicitly referenced by an exact "
                 "authorized instruction document; choose one listed runner at "

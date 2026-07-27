@@ -486,6 +486,10 @@ def preflight_skill_entrypoint_runtime(
         "script_sha256": selection.script_sha256,
         "reachable_sources": list(selection.reachable_sources),
         "required_cwd": selection.required_cwd,
+        "runtime_manifest_path": selection.runtime_manifest_path,
+        "runtime_manifest_sha256": (
+            selection.runtime_manifest_sha256
+        ),
     }
     return result
 

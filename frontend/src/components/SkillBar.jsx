@@ -6,6 +6,7 @@ import {
   getSkills, promoteSkill,
   getConversationSettings, updateConversationSettings,
 } from '../api'
+import { groupSkillsForDisplay } from '../utils/skillGrouping'
 
 function formatDate(iso) {
   if (!iso) return ''
@@ -51,6 +52,7 @@ function SkillGroupChip({ group, expanded, onToggle, onOpen }) {
   const main = group.main
   const children = group.children
   const childCount = children.length
+  const isSession = main.scope === 'session' || main.session_id
   return (
     <div className="relative">
       <button
@@ -58,17 +60,36 @@ function SkillGroupChip({ group, expanded, onToggle, onOpen }) {
         onClick={childCount ? onToggle : () => onOpen(main)}
         title={main.description || main.name}
         aria-label={`Skill bundle: ${main.name}`}
-        className="group flex items-center gap-1.5 pl-2.5 pr-2 py-1.5 rounded-lg text-xs border shadow-sm transition hover:shadow bg-purple-50 border-purple-200 text-purple-700 hover:bg-purple-100"
+        className={
+          'group flex items-center gap-1.5 pl-2.5 pr-2 py-1.5 rounded-lg text-xs border shadow-sm transition hover:shadow ' +
+          (isSession
+            ? 'bg-purple-50 border-purple-200 text-purple-700 hover:bg-purple-100'
+            : 'bg-blue-50 border-blue-200 text-blue-700 hover:bg-blue-100')
+        }
       >
         <FiPackage size={12} className="shrink-0" />
         <span className="font-medium truncate max-w-[170px]">{main.name}</span>
         {childCount > 0 && (
-          <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-purple-200/70 text-purple-800 font-semibold">
+          <span
+            className={
+              'text-[10px] px-1.5 py-0.5 rounded-full font-semibold ' +
+              (isSession
+                ? 'bg-purple-200/70 text-purple-800'
+                : 'bg-blue-200/70 text-blue-800')
+            }
+          >
             +{childCount}
           </span>
         )}
-        <span className="text-[9px] uppercase tracking-wide px-1 py-0.5 rounded font-medium bg-purple-200/60 text-purple-800">
-          session
+        <span
+          className={
+            'text-[9px] uppercase tracking-wide px-1 py-0.5 rounded font-medium ' +
+            (isSession
+              ? 'bg-purple-200/60 text-purple-800'
+              : 'bg-blue-200/60 text-blue-800')
+          }
+        >
+          {isSession ? 'session' : 'user'}
         </span>
         <FiInfo
           size={11}
@@ -395,34 +416,10 @@ export default function SkillBar({ skills = [], convId, onRefresh, onDelete, onU
   const [expandedGroup, setExpandedGroup] = useState('')
   const [promoting, setPromoting] = useState(false)
 
-  // session skills first, then user-level
-  const sorted = [...skills].sort((a, b) => {
-    const aS = a.scope === 'session' || a.session_id ? 0 : 1
-    const bS = b.scope === 'session' || b.session_id ? 0 : 1
-    return aS - bS
-  })
-
-  const sessionSkills = sorted.filter((s) => s.scope === 'session' || s.session_id)
-  const userSkills = sorted.filter((s) => !(s.scope === 'session' || s.session_id))
-  const bundleChildren = sessionSkills.filter((s) =>
-    s.is_bundle_child || s.bundle_parent || s.bundle_root || s.source_root || s.category === 'skills-bundle'
-  )
-  const childNames = new Set(bundleChildren.map((s) => s.name))
-  const explicitMainName = bundleChildren.find((s) => s.bundle_root)?.bundle_root
-    || bundleChildren.find((s) => s.source_root)?.source_root
-    || bundleChildren.find((s) => s.bundle_parent)?.bundle_parent
-  const explicitMain = explicitMainName
-    ? sessionSkills.find((s) => s.name === explicitMainName)
-    : null
-  const candidateMains = sessionSkills.filter((s) => !childNames.has(s.name) && s.category !== 'skills-bundle')
-  const bundleMain = explicitMain || (bundleChildren.length > 0 && candidateMains.length === 1 ? candidateMains[0] : null)
-  const groupedItems = bundleMain
-    ? [
-        { type: 'group', key: `bundle-${bundleMain.session_id || 'session'}-${bundleMain.name}`, main: bundleMain, children: bundleChildren.filter((s) => s.name !== bundleMain.name) },
-        ...sessionSkills.filter((s) => s.name !== bundleMain.name && !childNames.has(s.name)).map((skill) => ({ type: 'skill', key: `${skill.session_id || 'session'}-${skill.name}`, skill })),
-        ...userSkills.map((skill) => ({ type: 'skill', key: `${skill.session_id || 'user'}-${skill.name}`, skill })),
-      ]
-    : sorted.map((skill) => ({ type: 'skill', key: `${skill.session_id || 'user'}-${skill.name}`, skill }))
+  const {
+    items: groupedItems,
+    topLevelCount,
+  } = groupSkillsForDisplay(skills)
 
   async function handlePromote(skill) {
     if (!confirm(`确认将 Skill "${skill.name}" 升级为 user-level?`)) return
@@ -445,7 +442,7 @@ export default function SkillBar({ skills = [], convId, onRefresh, onDelete, onU
           <FiPackage size={11} className="mr-1" />
           可用 Skills
           <span className="ml-1 px-1.5 py-0.5 rounded-full bg-stone-100 text-stone-600 font-medium">
-            {skills.length}
+            {topLevelCount}
           </span>
         </div>
         {groupedItems.map((item) => (

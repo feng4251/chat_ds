@@ -3047,6 +3047,8 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
             "delegate_task", "image_generate", "mcp_server_list",
             "mcp_server_status", "session_search", "sessions_history",
             "sessions_send", "create_goal", "memory",
+            "browser_navigate", "browser_snapshot", "browser_click",
+            "browser_type", "browser_scroll", "browser_back",
         ]
         cases = (
             ("天空为什么通常是蓝色？", set(), "none"),
@@ -3082,6 +3084,14 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
             ("帮我查询为什么天空是蓝色的", {"web_search"}, "none"),
             ("web_search 帮我确认版本", {"web_search"}, "none"),
             (
+                "访问search.example.com，搜索今天排名前10的新闻并总结",
+                {
+                    "browser_navigate", "browser_snapshot",
+                    "browser_type", "browser_click",
+                },
+                "none",
+            ),
+            (
                 "请用 Python 运行代码计算这组数据",
                 {"execute_code"},
                 "none",
@@ -3104,6 +3114,34 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
                 exposure = _direct_chat_tool_exposure(text, available)
                 self.assertEqual(expected, set(exposure.tools))
                 self.assertEqual(expected_mcp_policy, exposure.mcp_policy)
+
+    def test_site_scoped_search_requires_a_complete_browser_action_frontier(self):
+        available = [
+            "web_search", "browser_navigate", "browser_snapshot",
+            "browser_type", "browser_click", "browser_scroll",
+        ]
+        exposure = _direct_chat_tool_exposure(
+            "使用合适的 skill 访问search.example.com，"
+            "搜索今天排名前10的新闻并总结",
+            available,
+            {"visual-browser-operator"},
+        )
+        self.assertNotIn("web_search", exposure.tools)
+        self.assertEqual(
+            {
+                ("browser_navigate",),
+                ("browser_type",),
+                ("browser_click",),
+            },
+            set(exposure.required_groups),
+        )
+        self.assertEqual(
+            {
+                "browser_navigate", "browser_snapshot",
+                "browser_type", "browser_click",
+            },
+            set(exposure.tools),
+        )
 
     def test_direct_chat_read_actions_never_gain_mutation_tools(self):
         available = [

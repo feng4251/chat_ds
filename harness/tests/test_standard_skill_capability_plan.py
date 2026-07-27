@@ -244,6 +244,66 @@ class StandardSkillCapabilityPlanTests(unittest.TestCase):
         )
         self.assertTrue(accepted.valid)
 
+    def test_site_scoped_search_requires_browser_navigate_fill_and_submit(self):
+        _root, package = self._package(
+            "# Instructions\nUse the selected browser workflow to operate the site.\n"
+        )
+        catalog = _build_standard_skill_capability_catalog(
+            "portable-skill",
+            package,
+            [
+                "skill_view", "web_search", "browser_navigate",
+                "browser_snapshot", "browser_type", "browser_click",
+            ],
+            (),
+            request_text=(
+                "使用合适的 skill 访问search.example.com，"
+                "搜索今天排名前10的新闻并总结"
+            ),
+        )
+        by_tool = {
+            item["tool_name"]: item["id"]
+            for item in catalog["candidates"]
+            if item.get("kind") == "native_tool"
+        }
+        self.assertTrue({
+            "browser_navigate", "browser_snapshot",
+            "browser_type", "browser_click",
+        }.issubset(by_tool))
+        self.assertNotIn("web_search", by_tool)
+
+        incomplete = validate_capability_plan(
+            catalog,
+            skill_name="portable-skill",
+            body_sha256=catalog["body_sha256"],
+            required=[by_tool["browser_navigate"]],
+            optional=[
+                by_tool["browser_snapshot"],
+                by_tool["browser_type"],
+                by_tool["browser_click"],
+            ],
+            unsupported=[],
+        )
+        self.assertFalse(incomplete.valid)
+        self.assertEqual(
+            "capability_plan_required_group_omitted",
+            incomplete.payload["error_code"],
+        )
+
+        accepted = validate_capability_plan(
+            catalog,
+            skill_name="portable-skill",
+            body_sha256=catalog["body_sha256"],
+            required=[
+                by_tool["browser_navigate"],
+                by_tool["browser_type"],
+                by_tool["browser_click"],
+            ],
+            optional=[by_tool["browser_snapshot"]],
+            unsupported=[],
+        )
+        self.assertTrue(accepted.valid)
+
     def test_language_neutral_stable_browser_family_is_not_regex_authority(self):
         bodies = (
             "# 手順\n- ウェブページを開いて表示内容を確認してください。\n",
@@ -748,6 +808,130 @@ class StandardSkillCapabilityPlanTests(unittest.TestCase):
             ["run_skill_process"],
             candidates["scripts/browser_operator.py"]["tool_names"],
         )
+
+    def test_exact_runtime_manifest_makes_dynamic_entrypoint_candidate(
+        self,
+    ):
+        root, _package = self._package(
+            "# Browser workflow\nRun `scripts/browser_session.cjs`.\n"
+        )
+        (root / "scripts").mkdir()
+        script = root / "scripts" / "browser_session.cjs"
+        script.write_text(
+            'const packageName = "playwright";\n'
+            "module.exports = require(packageName);\n",
+            encoding="utf-8",
+        )
+        manifest = root / "chatds-runtime.json"
+        manifest.write_text(
+            json.dumps({
+                "schema_version": 1,
+                "entrypoints": {
+                    "scripts/browser_session.cjs": {
+                        "runtime_profile": "browser-automation-v1",
+                        "dependencies": {
+                            "node": {"playwright": "1.61.0"},
+                        },
+                    },
+                },
+            }),
+            encoding="utf-8",
+        )
+        package = load_skill_content(
+            root / "SKILL.md",
+            skill_dir=str(root),
+        )
+        script_digest = hashlib.sha256(script.read_bytes()).hexdigest()
+        manifest_digest = hashlib.sha256(
+            manifest.read_bytes()
+        ).hexdigest()
+
+        catalog = _build_standard_skill_capability_catalog(
+            "portable-skill",
+            package,
+            ["skill_view", "run_skill_process"],
+            (("scripts/browser_session.cjs", script_digest),),
+        )
+        candidate = next(
+            item
+            for item in catalog.get("candidates") or []
+            if item.get("kind") == "skill_script"
+        )
+
+        self.assertEqual(
+            "browser-automation-v1",
+            candidate["runtime_profile"],
+        )
+        self.assertEqual(
+            ["run_skill_process"],
+            candidate["tool_names"],
+        )
+        self.assertEqual(
+            {
+                "resource_path": "chatds-runtime.json",
+                "sha256": manifest_digest,
+            },
+            candidate["runtime_manifest"],
+        )
+        self.assertEqual(
+            "chatds-runtime.json",
+            candidate["authority_chain"][-1]["resource_path"],
+        )
+        self.assertEqual(
+            manifest_digest,
+            candidate["authority_chain"][-1]["sha256"],
+        )
+        self.assertEqual(
+            compute_skill_package_digest(root),
+            candidate["package_sha256"],
+        )
+
+    def test_stale_loaded_runtime_manifest_cannot_mint_candidate(self):
+        root, _package = self._package(
+            "Run `scripts/browser_session.cjs`.\n"
+        )
+        (root / "scripts").mkdir()
+        script = root / "scripts" / "browser_session.cjs"
+        script.write_text(
+            'const packageName = "playwright";\n'
+            "module.exports = require(packageName);\n",
+            encoding="utf-8",
+        )
+        manifest = root / "chatds-runtime.json"
+        manifest_record = {
+            "schema_version": 1,
+            "entrypoints": [{
+                "path": "scripts/browser_session.cjs",
+                "runtime_profile": "browser-automation-v1",
+                "node_packages": ["playwright"],
+            }],
+        }
+        manifest.write_text(
+            json.dumps(manifest_record),
+            encoding="utf-8",
+        )
+        stale_package = load_skill_content(
+            root / "SKILL.md",
+            skill_dir=str(root),
+        )
+        manifest_record["entrypoints"][0]["commands"] = ["curl"]
+        manifest.write_text(
+            json.dumps(manifest_record),
+            encoding="utf-8",
+        )
+        script_digest = hashlib.sha256(script.read_bytes()).hexdigest()
+
+        catalog = _build_standard_skill_capability_catalog(
+            "portable-skill",
+            stale_package,
+            ["skill_view", "run_skill_process"],
+            (("scripts/browser_session.cjs", script_digest),),
+        )
+
+        self.assertFalse(any(
+            item.get("kind") == "skill_script"
+            for item in catalog.get("candidates") or []
+        ))
 
     def test_relative_dispatch_candidate_is_process_only_with_required_cwd(
         self,

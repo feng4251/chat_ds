@@ -151,6 +151,57 @@ class ToolCallStreamAccumulatorTests(unittest.TestCase):
         self.assertEqual((), assembly.calls)
         self.assertIn("tool_name_conflict", assembly.errors)
 
+    def test_rejected_name_debug_records_shape_without_name_value(self):
+        accumulator = ToolCallStreamAccumulator(
+            {"read_file", "web_search"}
+        )
+        accumulator.add_fragment(_fragment(
+            call_id="foreign",
+            index=0,
+            name="invented_browser_action",
+            arguments="{}",
+        ))
+
+        assembly = accumulator.finalize(iteration=8)
+
+        self.assertFalse(assembly.ok)
+        call_debug = assembly.debug["calls"][0]
+        self.assertEqual(
+            "foreign_or_conflict",
+            call_debug["name_resolution"],
+        )
+        self.assertEqual(
+            1,
+            call_debug["name_relation_counts"]["foreign"],
+        )
+        self.assertEqual(
+            len("invented_browser_action"),
+            call_debug["name_fragment_chars_total"],
+        )
+        rendered = json.dumps(assembly.debug, ensure_ascii=False)
+        self.assertNotIn("invented_browser_action", rendered)
+
+    def test_split_exposed_name_debug_resolves_exactly(self):
+        accumulator = ToolCallStreamAccumulator({"read_file"})
+        accumulator.add_fragment(_fragment(
+            call_id="split",
+            index=0,
+            name="read_",
+            arguments="{}",
+        ))
+        accumulator.add_fragment(_fragment(
+            call_id="split",
+            index=0,
+            name="file",
+        ))
+
+        assembly = accumulator.finalize(iteration=8)
+
+        self.assertTrue(assembly.ok)
+        call_debug = assembly.debug["calls"][0]
+        self.assertEqual("exact_exposed", call_debug["name_resolution"])
+        self.assertEqual(2, call_debug["name_fragment_count"])
+
     def test_complete_call_is_retained_for_review_when_peer_is_malformed(self):
         accumulator = ToolCallStreamAccumulator({"read_file"})
         accumulator.add_fragment(_fragment(
@@ -348,6 +399,42 @@ class ToolCallStreamAccumulatorTests(unittest.TestCase):
         encoded = json.dumps(assembly.debug, ensure_ascii=False)
         self.assertNotIn("evidence.md", encoded)
         self.assertNotIn("complete-fallback", encoded)
+
+    def test_nonstream_foreign_name_debug_is_payload_free(self):
+        foreign_name = "invented_browser_action"
+        payload = {
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "foreign-call",
+                        "type": "function",
+                        "function": {
+                            "name": foreign_name,
+                            "arguments": "{}",
+                        },
+                    }],
+                },
+            }],
+        }
+
+        assembly = validate_nonstream_tool_call_batch(
+            payload,
+            {"browser_navigate"},
+        )
+
+        self.assertFalse(assembly.ok)
+        self.assertEqual(
+            "foreign",
+            assembly.debug["calls"][0]["name_relation"],
+        )
+        self.assertEqual(
+            len(foreign_name),
+            assembly.debug["calls"][0]["name_chars"],
+        )
+        self.assertNotIn(
+            foreign_name,
+            json.dumps(assembly.debug, ensure_ascii=False),
+        )
 
     def test_cumulative_argument_snapshot_replaces_instead_of_duplicates(self):
         accumulator = ToolCallStreamAccumulator({"read_file"})

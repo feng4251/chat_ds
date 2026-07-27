@@ -113,6 +113,12 @@ class _LogicalCall:
     argument_diagnostics: dict[str, Any] = field(default_factory=dict)
     fragment_count: int = 0
     name_fragment_count: int = 0
+    name_fragment_chars_total: int = 0
+    name_fragment_chars_max: int = 0
+    name_exact_fragment_count: int = 0
+    name_prefix_fragment_count: int = 0
+    name_foreign_fragment_count: int = 0
+    name_empty_fragment_count: int = 0
     argument_fragment_count: int = 0
     cumulative_argument_snapshots: int = 0
     error_codes: set[str] = field(default_factory=set)
@@ -339,6 +345,23 @@ class ToolCallStreamAccumulator:
 
     def _merge_name(self, call: _LogicalCall, incoming: str) -> None:
         call.name_fragment_count += 1
+        incoming_chars = len(incoming)
+        call.name_fragment_chars_total += incoming_chars
+        call.name_fragment_chars_max = max(
+            call.name_fragment_chars_max,
+            incoming_chars,
+        )
+        if not incoming:
+            call.name_empty_fragment_count += 1
+        elif incoming in self._exposed_names:
+            call.name_exact_fragment_count += 1
+        elif any(
+            exposed.startswith(incoming)
+            for exposed in self._exposed_names
+        ):
+            call.name_prefix_fragment_count += 1
+        else:
+            call.name_foreign_fragment_count += 1
         if call.locked_name is not None:
             if incoming != call.locked_name:
                 call.error_codes.add("tool_name_conflict")
@@ -645,6 +668,23 @@ class ToolCallStreamAccumulator:
                     "provider_index_count": len(call.provider_indexes),
                     "fragment_count": call.fragment_count,
                     "name_fragment_count": call.name_fragment_count,
+                    "name_fragment_chars_total": (
+                        call.name_fragment_chars_total
+                    ),
+                    "name_fragment_chars_max": (
+                        call.name_fragment_chars_max
+                    ),
+                    "name_relation_counts": {
+                        "exact_exposed": (
+                            call.name_exact_fragment_count
+                        ),
+                        "exposed_prefix": (
+                            call.name_prefix_fragment_count
+                        ),
+                        "foreign": call.name_foreign_fragment_count,
+                        "empty": call.name_empty_fragment_count,
+                    },
+                    "name_resolution": self._debug_name_resolution(call),
                     "argument_fragment_count": call.argument_fragment_count,
                     "argument_chars": self._argument_chars(call),
                     "argument_candidate_count": (
@@ -686,6 +726,26 @@ class ToolCallStreamAccumulator:
                 for call in self._calls
             ],
         }
+
+    def _debug_name_resolution(self, call: _LogicalCall) -> str:
+        """Return a payload-free relation between observed and exposed names."""
+
+        if call.locked_name in self._exposed_names:
+            return "exact_exposed"
+        if any(
+            candidate in self._exposed_names
+            for candidate in call.name_candidates
+        ):
+            return "exact_exposed"
+        if call.name_fragment_count == 0:
+            return "missing"
+        if any(candidate for candidate in call.name_candidates):
+            return "exposed_prefix"
+        if call.name_foreign_fragment_count:
+            return "foreign_or_conflict"
+        if "tool_name_conflict" in call.error_codes:
+            return "conflict"
+        return "unresolved"
 
     @staticmethod
     def _argument_chars(call: _LogicalCall) -> int:
@@ -1100,9 +1160,12 @@ def validate_nonstream_tool_call_batch(
             call_id = ""
             name = ""
             raw_arguments = ""
+            name_chars = 0
+            name_relation = "missing"
 
             if not isinstance(raw_call, Mapping):
                 call_errors.add("fallback_tool_call_not_object")
+                name_relation = "call_not_object"
             else:
                 raw_id = raw_call.get("id")
                 if not isinstance(raw_id, str) or not raw_id.strip():
@@ -1121,14 +1184,32 @@ def validate_nonstream_tool_call_batch(
                 function = raw_call.get("function")
                 if not isinstance(function, Mapping):
                     call_errors.add("fallback_function_not_object")
+                    name_relation = "function_not_object"
                 else:
                     raw_name = function.get("name")
                     if not isinstance(raw_name, str) or not raw_name:
                         call_errors.add("fallback_tool_name_missing")
+                        name_relation = (
+                            "not_string"
+                            if raw_name is not None
+                            and not isinstance(raw_name, str)
+                            else "missing"
+                        )
                     else:
                         name = raw_name
+                        name_chars = len(raw_name)
                         if name not in exposed_names:
                             call_errors.add("fallback_tool_name_not_exposed")
+                            name_relation = (
+                                "exposed_prefix"
+                                if any(
+                                    exposed.startswith(name)
+                                    for exposed in exposed_names
+                                )
+                                else "foreign"
+                            )
+                        else:
+                            name_relation = "exact_exposed"
 
                     arguments = function.get("arguments")
                     if not isinstance(arguments, str):
@@ -1156,6 +1237,8 @@ def validate_nonstream_tool_call_batch(
             call_debug.append({
                 "ordinal": ordinal,
                 "has_provider_id": bool(call_id),
+                "name_chars": name_chars,
+                "name_relation": name_relation,
                 "argument_chars": len(raw_arguments),
                 "corrupt": bool(call_errors),
                 "error_codes": sorted(call_errors),

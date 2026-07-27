@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -201,6 +202,58 @@ class SkillLoaderBoundsTests(unittest.TestCase):
             self._error_codes(loaded),
         )
         self.assertIn("scripts/example.py", workflow.get("script_candidates") or [])
+
+    def test_exact_runtime_manifest_declares_content_addressed_entrypoint(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._base_skill(root)
+            self._write(
+                root,
+                "scripts/dynamic.cjs",
+                'const name = "playwright";\nrequire(name);\n',
+            )
+            self._write(
+                root,
+                "chatds-runtime.json",
+                json.dumps({
+                    "schema_version": 1,
+                    "entrypoints": [{
+                        "path": "scripts/dynamic.cjs",
+                        "runtime_profile": "browser-automation-v1",
+                        "node_packages": ["playwright"],
+                    }],
+                }),
+            )
+
+            loaded = load_skill_content(
+                root / "SKILL.md",
+                skill_dir=str(root),
+            )
+
+        workflow = loaded.get("workflow_contract") or {}
+        manifest = loaded.get("runtime_profile_manifest") or {}
+        self.assertTrue(manifest.get("valid"), manifest)
+        self.assertEqual(
+            ["scripts/dynamic.cjs"],
+            workflow.get("script_candidates"),
+        )
+        self.assertEqual(
+            "chatds-runtime.json",
+            manifest["entrypoint_manifest"]["path"],
+        )
+        authority = workflow.get("resource_authority") or {}
+        self.assertIn(
+            "chatds-runtime.json",
+            authority.get("blocking_resources") or [],
+        )
+        self.assertIn(
+            "declared_by:chatds-runtime.json",
+            (authority.get("reasons") or {}).get(
+                "scripts/dynamic.cjs"
+            ) or [],
+        )
 
     def test_recursive_yaml_alias_fails_closed_without_recursion(self):
         with tempfile.TemporaryDirectory() as temp_dir:

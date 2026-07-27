@@ -22,6 +22,33 @@ const SAMPLE_PROMPTS = [
 ]
 
 const CAPABILITIES = ['GLM-5.2 主模型', 'Qwen3-5 多模态', '可接入自定义模型']
+const STREAM_INCOMPLETE_MARKERS = [
+  '⚠️ 本次任务执行失败：',
+  '⚠️ 本次响应在流式输出过程中中断：',
+]
+
+function withClientStreamError(message, error) {
+  const current = message?.content || ''
+  if (STREAM_INCOMPLETE_MARKERS.some((marker) => current.includes(marker))) {
+    return { ...message, streaming: false }
+  }
+  if (!current) {
+    return {
+      ...message,
+      content: '错误:' + error.message,
+      streaming: false,
+    }
+  }
+  return {
+    ...message,
+    content:
+      current +
+      '\n\n---\n⚠️ 本次响应在服务端终态确认前中断：' +
+      error.message +
+      '\n已显示的是不完整草稿，请重新发送或点击重试。',
+    streaming: false,
+  }
+}
 
 function updateAgentRuns(runs, event) {
   if (!event?.run_id) return runs || []
@@ -92,6 +119,10 @@ function updateAgentRuns(runs, event) {
   if (event.event_type === 'run.failed') {
     run.status = 'failed'
     run.error = payload.error || 'Unknown error'
+  }
+  if (event.event_type === 'run.cancelled') {
+    run.status = 'cancelled'
+    run.error = null
   }
   next[idx] = run
   return next
@@ -465,7 +496,7 @@ export default function ChatArea({
         const u = [...p]
         const last = u[u.length - 1]
         if (last && last.streaming) {
-          u[u.length - 1] = { ...last, content: '错误:' + err.message, streaming: false }
+          u[u.length - 1] = withClientStreamError(last, err)
         }
         return u
       })
@@ -558,7 +589,7 @@ export default function ChatArea({
         const u = [...p]
         const last = u[u.length - 1]
         if (last && last.streaming) {
-          u[u.length - 1] = { ...last, content: '错误:' + err.message, streaming: false }
+          u[u.length - 1] = withClientStreamError(last, err)
         }
         return u
       })

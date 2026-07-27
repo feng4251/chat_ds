@@ -4,7 +4,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from agent_loop import _semantic_skill_selector_arguments, run_stream
+from agent_loop import (
+    _semantic_skill_selector_arguments,
+    _session_skill_bundle_catalog,
+    run_stream,
+)
 
 
 class SemanticSkillActivationTests(unittest.IsolatedAsyncioTestCase):
@@ -30,6 +34,69 @@ class SemanticSkillActivationTests(unittest.IsolatedAsyncioTestCase):
         "execute_code",
     ]
 
+    def test_bundle_registry_keeps_supporting_members_out_of_routing_only(self):
+        bundle_id = "a" * 64
+        records = [
+            {"name": "root-skill", "scope": "session"},
+            {"name": "supporting-db", "scope": "session"},
+            {"name": "independent", "scope": "session"},
+        ]
+        registry = [
+            {
+                "name": "root-skill",
+                "scope": "session",
+                "bundle_id": bundle_id,
+                "bundle_role": "primary",
+                "bundle_root_name": "root-skill",
+            },
+            {
+                "name": "supporting-db",
+                "scope": "session",
+                "bundle_id": bundle_id,
+                "bundle_role": "supporting",
+                "bundle_root_name": "root-skill",
+            },
+        ]
+
+        catalog = _session_skill_bundle_catalog(records, registry)
+
+        self.assertEqual("applied", catalog.status)
+        self.assertEqual(3, len(catalog.inventory_records))
+        self.assertEqual(
+            {"root-skill", "independent"},
+            {record["name"] for record in catalog.routing_records},
+        )
+        supporting = next(
+            record
+            for record in catalog.inventory_records
+            if record["name"] == "supporting-db"
+        )
+        self.assertEqual("supporting", supporting["bundle_role"])
+        self.assertEqual(1, catalog.supporting_rows)
+
+    def test_invalid_bundle_registry_cannot_hide_an_orphan_member(self):
+        records = [
+            {"name": "orphan", "scope": "session"},
+            {"name": "independent", "scope": "session"},
+        ]
+        registry = [{
+            "name": "orphan",
+            "scope": "session",
+            "bundle_id": "b" * 64,
+            "bundle_role": "supporting",
+            "bundle_root_name": "missing-root",
+        }]
+
+        catalog = _session_skill_bundle_catalog(records, registry)
+
+        self.assertEqual("invalid", catalog.status)
+        self.assertEqual(2, len(catalog.routing_records))
+        self.assertEqual(0, catalog.supporting_rows)
+        self.assertIn(
+            "bundle_primary_ambiguous",
+            catalog.failure_codes,
+        )
+
     async def _run(
         self,
         request: str,
@@ -37,6 +104,7 @@ class SemanticSkillActivationTests(unittest.IsolatedAsyncioTestCase):
         selector,
         *,
         extra_selector_tool_calls: list[dict] | None = None,
+        session_skill_registry: list[dict] | None = None,
     ):
         selector_requests: list[dict] = []
         stream_requests: list[dict] = []
@@ -172,7 +240,12 @@ class SemanticSkillActivationTests(unittest.IsolatedAsyncioTestCase):
                     "# Instructions\n\nAnswer using the selected writing guidance.",
                 ),
                 "linked_files": {},
-                "workflow_contract": None,
+                "workflow_contract": (
+                    {"execution_contract": record["execution_contract"]}
+                    if isinstance(record.get("execution_contract"), dict)
+                    else None
+                ),
+                "execution_contract": record.get("execution_contract"),
                 "package_diagnostics": {
                     "valid": True,
                     "errors": [],
@@ -191,7 +264,12 @@ class SemanticSkillActivationTests(unittest.IsolatedAsyncioTestCase):
                     "# Instructions\n\nAnswer using the selected writing guidance.",
                 ),
                 "linked_files": {},
-                "workflow_contract": None,
+                "workflow_contract": (
+                    {"execution_contract": record["execution_contract"]}
+                    if isinstance(record.get("execution_contract"), dict)
+                    else None
+                ),
+                "execution_contract": record.get("execution_contract"),
                 "package_diagnostics": {
                     "valid": True,
                     "errors": [],
@@ -258,6 +336,7 @@ class SemanticSkillActivationTests(unittest.IsolatedAsyncioTestCase):
                         allow_session_mcp=False,
                         user_id="u-semantic-skill",
                         session_id="s-semantic-skill",
+                        session_skill_registry=session_skill_registry,
                         max_iterations=1,
                     )
                 ]
@@ -750,6 +829,144 @@ class SemanticSkillActivationTests(unittest.IsolatedAsyncioTestCase):
             and event.get("payload", {}).get("status") == "selected"
             for event in events
         ))
+
+    async def test_unique_declared_route_precedes_unavailable_semantic_selector(self):
+        records = [
+            {
+                "name": "domain-workflow",
+                "description": "A bounded multi-stage domain workflow.",
+                "execution_contract": {
+                    "routes": [{
+                        "id": (
+                            "https://private.invalid/route?"
+                            "opaque=fixture-value"
+                        ),
+                        "patterns": [
+                            r"(?:临床试验|clinical trial).{0,80}"
+                            r"(?:综合开发计划|development plan)",
+                        ],
+                        "priority": 10,
+                        "workers": ["planner"],
+                    }],
+                },
+            },
+            {
+                "name": "generic-writer",
+                "description": "A bounded multi-stage domain workflow.",
+                "execution_contract": {"routes": []},
+            },
+        ]
+
+        def selector(_body):
+            self.fail(
+                "a unique loader-validated route must avoid the semantic "
+                "control-plane request"
+            )
+
+        selector_requests, _stream_requests, _dispatches, events = (
+            await self._run(
+                "请完成一个完整临床试验设计和综合开发计划。",
+                records,
+                selector,
+            )
+        )
+
+        self.assertEqual([], selector_requests)
+        started = next(
+            event for event in events if event.get("event_type") == "run.started"
+        )
+        relevance = started["payload"]["session_skill_relevance"]
+        self.assertEqual(
+            ["domain-workflow"], relevance["selected_skills"]
+        )
+        self.assertEqual("declared_route", relevance["selection_method"])
+        self.assertEqual("selected", relevance["declared_route"]["status"])
+        safe_route_id = (
+            relevance["declared_route"]["matched_routes"][0]["route_id"]
+        )
+        self.assertRegex(safe_route_id, r"^sha256:[a-f0-9]{24}$")
+        self.assertNotIn(
+            "private.invalid",
+            json.dumps(relevance, ensure_ascii=False),
+        )
+        self.assertTrue(any(
+            event.get("event_type")
+            == "debug.session_skill.declared_route_selection"
+            and event.get("payload", {}).get("selected_skills")
+            == ["domain-workflow"]
+            and event.get("payload", {}).get("inspection_authority_only")
+            is True
+            for event in events
+        ))
+
+    async def test_supporting_bundle_route_does_not_compete_with_primary(self):
+        route = {
+            "id": "complete-study-design",
+            "patterns": [
+                r"(?:临床试验|clinical trial).{0,80}"
+                r"(?:综合开发计划|development plan)",
+            ],
+            "priority": 10,
+            "workers": ["planner"],
+        }
+        records = [
+            {
+                "name": "workflow-root",
+                "description": "A bounded multi-stage domain workflow.",
+                "execution_contract": {"routes": [route]},
+            },
+            {
+                "name": "workflow-support",
+                "description": "A bounded multi-stage domain workflow.",
+                "execution_contract": {"routes": [route]},
+            },
+        ]
+        bundle_id = "c" * 64
+        registry = [
+            {
+                "name": "workflow-root",
+                "scope": "session",
+                "bundle_id": bundle_id,
+                "bundle_role": "primary",
+                "bundle_root_name": "workflow-root",
+            },
+            {
+                "name": "workflow-support",
+                "scope": "session",
+                "bundle_id": bundle_id,
+                "bundle_role": "supporting",
+                "bundle_root_name": "workflow-root",
+            },
+        ]
+
+        def selector(_body):
+            self.fail("the primary declared route should be deterministic")
+
+        selector_requests, _stream_requests, _dispatches, events = (
+            await self._run(
+                "请完成一个完整临床试验设计和综合开发计划。",
+                records,
+                selector,
+                session_skill_registry=registry,
+            )
+        )
+
+        self.assertEqual([], selector_requests)
+        started = next(
+            event
+            for event in events
+            if event.get("event_type") == "run.started"
+        )
+        relevance = started["payload"]["session_skill_relevance"]
+        self.assertEqual(["workflow-root"], relevance["selected_skills"])
+        self.assertEqual(
+            1,
+            relevance["declared_route"]["packages_evaluated"],
+        )
+        bundle = relevance["bundle_registry"]
+        self.assertEqual(2, bundle["inventory_count"])
+        self.assertEqual(1, bundle["routing_count"])
+        self.assertEqual(1, bundle["supporting_rows"])
 
     async def test_explicit_exact_name_bypasses_semantic_model(self):
         records = [{

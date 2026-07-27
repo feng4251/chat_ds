@@ -16,14 +16,17 @@ from routers.hook_router import router as hook_router
 from routers.schedule_router import router as schedule_router, internal_router
 from routers.internal_session_router import router as internal_session_router
 from scheduler import scheduler_loop
+from stream_observability import set_service_shutdown_started
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    set_service_shutdown_started(False)
     await init_db()
     scheduler_task = asyncio.create_task(scheduler_loop())
     try:
         yield
     finally:
+        set_service_shutdown_started(True)
         scheduler_task.cancel()
         try:
             await scheduler_task

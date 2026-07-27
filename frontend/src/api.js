@@ -424,10 +424,15 @@ export async function chatCompletion(content, conversationId, modelId, imageUrls
       const text = await res.text().catch(() => '')
       throw new Error(text || `HTTP ${res.status}`)
     }
+    const requestIdHeader = res.headers.get('x-request-id') || ''
+    const requestId = /^[A-Za-z0-9_.:/-]{1,128}$/.test(requestIdHeader)
+      ? requestIdHeader
+      : ''
     const reader = res.body.getReader()
     const decoder = new TextDecoder()
     let convId = null
     let buf = ''
+    let terminalEnvelope = null
     while (true) {
       const { done, value } = await reader.read()
       if (done) break
@@ -436,25 +441,42 @@ export async function chatCompletion(content, conversationId, modelId, imageUrls
       buf = lines.pop()
       for (const line of lines) {
         if (line.startsWith('data: ')) {
+          let data
           try {
-            const data = JSON.parse(line.slice(6))
-            if (data.conversation_id) convId = data.conversation_id
-            onChunk(data)
+            data = JSON.parse(line.slice(6))
           } catch {
             // Ignore partial/non-JSON SSE lines.
+            continue
           }
+          if (data.conversation_id) convId = data.conversation_id
+          if (data.stream_terminal) terminalEnvelope = data.stream_terminal
+          // Keep consumer failures distinct from malformed upstream SSE.
+          onChunk(data)
         }
       }
     }
     // Flush remaining buffer
     if (buf.startsWith('data: ')) {
+      let data
       try {
-        const data = JSON.parse(buf.slice(6))
-        if (data.conversation_id) convId = data.conversation_id
-        onChunk(data)
+        data = JSON.parse(buf.slice(6))
       } catch {
         // Ignore a trailing partial/non-JSON SSE line.
       }
+      if (data) {
+        if (data.conversation_id) convId = data.conversation_id
+        if (data.stream_terminal) terminalEnvelope = data.stream_terminal
+        onChunk(data)
+      }
+    }
+    if (!terminalEnvelope) {
+      const err = new Error(
+        '响应连接在服务端终态确认前结束；当前内容是不完整草稿。' +
+        (requestId ? ` 请求追踪 ID：${requestId}` : '')
+      )
+      err.code = 'stream_terminal_missing'
+      if (requestId) err.requestId = requestId
+      throw err
     }
     return convId
   })

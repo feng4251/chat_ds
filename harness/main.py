@@ -23,7 +23,10 @@ from config import (
     canonical_provider_id,
     settings,
 )
-from agent_loop import run_stream
+from agent_loop import (
+    run_stream,
+    set_harness_service_shutdown_started,
+)
 import tools  # noqa: F401 — triggers tool registration
 
 logger = logging.getLogger(__name__)
@@ -33,6 +36,7 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Reclaim stale executor leases, then own all session runtime cleanup."""
 
+    set_harness_service_shutdown_started(False)
     # Process capabilities intentionally remain in Harness memory. A crash can
     # therefore leave an executor-side lease alive. Before serving any request,
     # the replacement Harness authenticates to every configured executor and
@@ -71,6 +75,7 @@ async def lifespan(app: FastAPI):
     yield
 
     # ── Shutdown ─────────────────────────────────────────────────────────
+    set_harness_service_shutdown_started(True)
     try:
         from tools.mcp_client import disconnect_all_for_user, get_active_mcp_sessions
         for user_id, session_id in get_active_mcp_sessions():
@@ -323,12 +328,14 @@ async def chat_completions(req: Request):
     user_id: str = body.get("user", "default")
     session_id: str = body.get("session_id", str(uuid.uuid4()))
     enabled_user_skills: list[str] = body.get("enabled_user_skills") or []
+    session_skill_registry = body.get("session_skill_registry")
 
     if stream:
         return _streaming_response(
             model_id, messages, tools, user_id, session_id,
             provider_config, fallback_configs, source,
             enabled_user_skills,
+            session_skill_registry,
             max_tokens,
             run_metadata,
             event_schema,
@@ -349,6 +356,7 @@ async def chat_completions(req: Request):
         fallback_overrides=fallback_configs,
         source=source,
         enabled_user_skills=enabled_user_skills,
+        session_skill_registry=session_skill_registry,
         max_tokens=max_tokens,
         run_id=run_metadata.get("run_id"),
         root_run_id=run_metadata.get("root_run_id"),
@@ -418,6 +426,7 @@ def _streaming_response(
     fallback_configs: list[dict],
     source: str,
     enabled_user_skills: list[str] | None = None,
+    session_skill_registry: list[dict] | None = None,
     max_tokens: int | None = None,
     run_metadata: dict | None = None,
     event_schema: str = "flat",
@@ -437,6 +446,7 @@ def _streaming_response(
                 fallback_overrides=fallback_configs,
                 source=source,
                 enabled_user_skills=enabled_user_skills,
+                session_skill_registry=session_skill_registry,
                 max_tokens=max_tokens,
                 run_id=run_metadata.get("run_id"),
                 root_run_id=run_metadata.get("root_run_id"),
@@ -471,6 +481,7 @@ def _streaming_response(
                     fallback_overrides=fallback_configs,
                     source=source,
                     enabled_user_skills=enabled_user_skills,
+                    session_skill_registry=session_skill_registry,
                     max_tokens=max_tokens,
                     run_id=run_metadata.get("run_id"),
                     root_run_id=run_metadata.get("root_run_id"),

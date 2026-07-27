@@ -870,7 +870,15 @@ def load_skill_content(
         workflow_contract.get("script_candidates")
         if isinstance(workflow_contract, dict) else None
     )
-    if isinstance(script_candidates, list) and script_candidates:
+    runtime_entrypoint_manifest_present = validate_skill_resource(
+        skill_dir_path,
+        skill_dir_path / "chatds-runtime.json",
+        expected_kind="file",
+    ).valid
+    if (
+        (isinstance(script_candidates, list) and script_candidates)
+        or runtime_entrypoint_manifest_present
+    ):
         # This runtime-owned manifest is derived from one immutable package
         # snapshot. Route activation later selects only exact entrypoints from
         # the chosen plan, so an unrelated browser helper cannot change a
@@ -885,7 +893,7 @@ def load_skill_content(
                     skill_dir_path,
                     tuple(
                         str(path)
-                        for path in script_candidates
+                        for path in (script_candidates or [])
                         if isinstance(path, str) and path
                     ),
                 )
@@ -901,6 +909,83 @@ def load_skill_content(
                 "scripts": [],
             }
         workflow_contract = dict(workflow_contract)
+        declared_manifest_scripts = [
+            str(row.get("entrypoint") or "")
+            for row in runtime_profile_manifest.get("scripts") or []
+            if (
+                isinstance(row, dict)
+                and row.get("manifest_declared") is True
+                and str(row.get("entrypoint") or "")
+            )
+        ]
+        if declared_manifest_scripts:
+            workflow_contract["script_candidates"] = list(dict.fromkeys([
+                *(
+                    str(path)
+                    for path in (script_candidates or [])
+                    if isinstance(path, str) and path
+                ),
+                *declared_manifest_scripts,
+            ]))[:40]
+            resource_authority = workflow_contract.get(
+                "resource_authority"
+            )
+            if not isinstance(resource_authority, dict):
+                resource_authority = {
+                    "blocking_resources": [],
+                    "advisory_resources": [],
+                    "reasons": {},
+                }
+            else:
+                resource_authority = dict(resource_authority)
+            blocking = [
+                str(path)
+                for path in (
+                    resource_authority.get("blocking_resources") or []
+                )
+                if str(path)
+            ]
+            reasons = resource_authority.get("reasons")
+            if not isinstance(reasons, dict):
+                reasons = {}
+            else:
+                reasons = {
+                    str(path): list(values)
+                    for path, values in reasons.items()
+                    if isinstance(values, list)
+                }
+            entrypoint_manifest = runtime_profile_manifest.get(
+                "entrypoint_manifest"
+            )
+            manifest_path = (
+                str(entrypoint_manifest.get("path") or "")
+                if isinstance(entrypoint_manifest, dict)
+                else ""
+            )
+            if not manifest_path:
+                manifest_path = "chatds-runtime.json"
+            blocking = list(dict.fromkeys([
+                *blocking,
+                manifest_path,
+                *declared_manifest_scripts,
+            ]))
+            reasons.setdefault(manifest_path, []).append(
+                "explicit_runtime_entrypoint_manifest"
+            )
+            for path in declared_manifest_scripts:
+                reasons.setdefault(path, []).append(
+                    f"declared_by:{manifest_path}"
+                )
+            resource_authority["blocking_resources"] = blocking
+            resource_authority["advisory_resources"] = [
+                str(path)
+                for path in (
+                    resource_authority.get("advisory_resources") or []
+                )
+                if str(path) not in set(blocking)
+            ]
+            resource_authority["reasons"] = reasons
+            workflow_contract["resource_authority"] = resource_authority
         workflow_contract["_chatds_runtime_profile_manifest"] = (
             runtime_profile_manifest
         )
