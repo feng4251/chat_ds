@@ -6,11 +6,14 @@
 
 - 工作目录：`/nfs/yangbb/codes/chat_ds`。
 - 分支：`fix/generic-skill-harness-20260717`。
-- 2026-07-27 已部署功能提交：`c21deca0 feat: harden generic skill routing and stream diagnostics`。
-- 2026-07-28 release candidate 已补齐断线后后台续跑、权威终态/刷新投影、语义化子 Agent、委派硬期限与撤权 fence，以及 Skill 安装/管理事务；全量回归通过，等待本地提交和生产切换。
+- 2026-07-28 最新功能提交：
+  `da70dc51 feat: make skill runs durable and transactional`。
+- `da70dc51` 已补齐断线后后台续跑、权威终态/刷新投影、语义化子 Agent、委派硬期限与撤权 fence，以及 Skill 安装/管理事务；全量回归通过并已部署生产。
+- 上一版已部署功能提交：
+  `c21deca0 feat: harden generic skill routing and stream diagnostics`。
 - 前三轮关键提交：`5a7f21d9 feat: enforce generic skill execution contracts`、`e90415a0 feat: close generic skill workflow recovery gaps`、`b0744a33 feat: add generic profile-aware skill sandboxes`。
 - 本轮在既有 process protocol v2、profile-aware sandbox 和 browser egress 基础上，补齐了内容寻址 Workflow IR、exact capability binding、运行生命周期/receipt ledger、MCP frozen catalog、委派 TOCTOU 防护和 Backend 事件幂等落库。
-- `c21deca0` 已按 Backend → Harness → Frontend 顺序部署到生产，并通过数据库迁移、容器健康、跨层 request ID 和无模型调用 smoke。
+- `da70dc51` 已按 Backend → Harness → Frontend 顺序部署到生产，并通过数据库迁移、orphan repair、容器健康和无模型调用 smoke。
 - 不自动执行模型重型 V2.3 E2E。V2.3 是用户手工业务验收用例，不是 Harness 特判目标。
 - Git 只做本地 commit，不向 remote push。
 
@@ -220,7 +223,7 @@
 
 ## 5. 当前验证证据
 
-2026-07-28 当前 release candidate 已通过：
+2026-07-28 当前功能提交 `da70dc51` 已通过：
 
 - Harness 全量（`cd harness && PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=..:.`）：
   `1511 tests OK, 1 skipped`，0 failures/errors。
@@ -271,7 +274,7 @@
   - UID 65528/65529 当前无宿主进程冲突；
   - 根盘约 87 GiB 可用，内存约 26 GiB available；
   - Compose 2.32.4 支持当前声明。
-- 2026-07-27 12:54（Asia/Shanghai）完成 `c21deca0` 最新生产切换。固定使用 project `chat_ds` 和原 bind/data 路径，先切换 Backend 并验证真实数据库迁移，再切换 Harness，最后切换 Frontend；DB volume、search、browser 和两个 Skill executor 均未重建。
+- 2026-07-28 14:13（Asia/Shanghai）完成 `da70dc51` 最新生产切换。固定使用 project `chat_ds` 和原 bind/data 路径，先切换 Backend 并验证真实数据库迁移，再切换 Harness，最后切换 Frontend；DB volume、search、browser 和两个 Skill executor 均未重建。
 - `.env` 已原子生成独立 `EXECUTOR_V2_AUTH_TOKEN`，mode 为 0600；base/browser/Harness 三方值一致且长度合规，值未输出或写入 Git。
 - Harness stream ceiling 为 2400 秒，Backend proxy deadline 为 3000 秒，Frontend Nginx SSE deadline 为 3600 秒。
 
@@ -283,9 +286,9 @@
 | `chat_acits_skill_egress_proxy` | `sha256:c5ee4fdc2ee785868f15036706f01d327b05b358f2b7812fcca8bfb7454f9c05` | healthy |
 | `chat_acits_skill_browser_executor` | `sha256:76acea01fdf89f324fef6c48e44d6270841bbb8127887e8cf2e082cd76a84b90` | healthy |
 | `chat_acits_browser` | `sha256:391260b06964c7cfbd2bb934501f35b47ed5d093ac6e1d51f769c41e3576087d` | healthy |
-| `chat_acits_harness` | `sha256:00be5cec39dfb95f19003a42ae1efeed747a45de60822af38e9b8a88df6d99fe` | healthy / restart 0 |
-| `chat_acits_backend` | `sha256:3ac1669cf1834e8639d22da0b69cab0d146b9b61217037162245c05df8ad007f` | running / restart 0 / `/api/health` 200 |
-| `chat_acits_frontend` | `sha256:d58dda8c9f3442c436fe4e626c7ab2c087886bcf910547097dce9ada6e9f5c5b` | running / restart 0 / `/` 200 |
+| `chat_acits_harness` | `sha256:f8094355bf57c44aa412db003aaf8c27d3337886e00f6ce9078702b8407ca451` | healthy / restart 0 |
+| `chat_acits_backend` | `sha256:1c1e86fae6aa43271d1f4edc8e7cbd7ec300dbcd246f5b35e10f30fe41286e59` | running / restart 0 / `/api/health` 200 |
+| `chat_acits_frontend` | `sha256:e3de411f03c037ac4307a78141e80f42c53645a625d09b830676c3b2dae979fd` | running / restart 0 / `/` 200 |
 
 生产 smoke 证据：
 
@@ -295,6 +298,14 @@
 - legacy CDP browser 真实打开 `https://example.com/` 并得到 `Example Domain`。
 - Harness `/health` 和 `/v1/models` 正常；未鉴权 `/internal/*` 为 401，Backend 持有的正确 token 为 200。
 - Frontend `/` 与 `/api/health` 均为 200。
+- `da70dc51` 切换后 Backend/Harness/Frontend revision label 均正确，restart 均为 0；
+  最近日志没有 traceback、critical、fatal、unhandled 或 migration failure。
+- 启动 orphan repair 将历史 19 条 stale `running` AgentRun 全部闭合，生产
+  `active_count=0`。`79c170...` 最后 3 个 child 以
+  `parent_run_terminal_reconciliation` 取消，未覆盖已有 root authoritative
+  `task_cancelled`。
+- 真实生产 SQLite 已有 conversation fork provenance 两列，以及
+  `ux_skill_packages_user_session_name`、`ux_skill_packages_user_name` 两个唯一索引。
 - Frontend Nginx `nginx -t` 通过，SSE location 为 3600 秒；`/api/chat/completions` 的无鉴权 HEAD smoke 返回 `X-Request-ID`，未触发模型。
 - Harness `/health` 为 200；`/v1/models` 无模型调用地报告 AgentModel context length `303872`、Qwen context length `262144`。
 - 真实生产 SQLite 已存在 `ux_agent_run_events_conversation_run_type_seq`，列顺序为 `conversation_id, run_id, event_type, seq`。
@@ -311,10 +322,20 @@
 
 - 原 executor/browser/Harness/Backend 镜像保留 tag `rollback-20260723-pre-process-v2`。
 - 本轮切换前 browser/Harness 镜像另保留 tag `rollback-pre-e90415a0`；新镜像 tag 为 `deploy-e90415a0`。
-- `5a7f21d9` 切换前 Backend/Harness 分别保留 `rollback-pre-5a7f21d9`；当前镜像分别标记为 `chat_ds-backend:deploy-5a7f21d9`、`chat_ds-harness:deploy-5a7f21d9`。
-- `c21deca0` 切换前 Backend/Harness/Frontend 均保留 `rollback-pre-c21deca0`；当前镜像分别标记为 `chat_ds-backend:deploy-c21deca0`、`chat_ds-harness:deploy-c21deca0`、`chat_ds-frontend:deploy-c21deca0`，三者 revision label 均为 `c21deca0`。
+- `5a7f21d9` 切换前 Backend/Harness 分别保留 `rollback-pre-5a7f21d9`；当时新镜像分别标记为 `chat_ds-backend:deploy-5a7f21d9`、`chat_ds-harness:deploy-5a7f21d9`。
+- `c21deca0` 切换前 Backend/Harness/Frontend 均保留 `rollback-pre-c21deca0`；当时新镜像分别标记为 `chat_ds-backend:deploy-c21deca0`、`chat_ds-harness:deploy-c21deca0`、`chat_ds-frontend:deploy-c21deca0`，三者 revision label 均为 `c21deca0`。
+- `da70dc51` 切换前 Backend/Harness/Frontend 均保留
+  `rollback-pre-da70dc51`；当前镜像分别标记为
+  `chat_ds-backend:deploy-da70dc51`、
+  `chat_ds-harness:deploy-da70dc51`、
+  `chat_ds-frontend:deploy-da70dc51`，三者 revision label 均为 `da70dc51`。
 - 可重建的旧 Harness 代码镜像：`chat_ds-harness:rollback-d224db33`，image `sha256:e7d16ee538fc69e638f20bb93035df90d76008721116ebfedb7d07ccb986abef`。
 - `c21deca0` 的 Backend/Harness 从只包含三项服务目录的 clean Git archive 构建。Docker Hub metadata 临时连接重置时，Frontend 使用已经本地验证的同一提交 `dist`，在 `rollback-pre-c21deca0` 的既有 Nginx runtime 上清空旧静态文件后封装；配置和资源 marker 均做了生产验证。部署上下文/日志位于生产主机 `/tmp/chat_ds_deploy_c21deca0/`，不属于 Git。
+- `da70dc51` 的 Backend/Harness/Frontend 源码均来自 clean Git archive
+  `/tmp/chat_ds_deploy_da70dc51.4O3a8d/`。Frontend 遇到 Docker Hub Nginx metadata
+  timeout 后，在该归档中用固定 Node 镜像重新构建 `dist`，再基于
+  `rollback-pre-da70dc51` 的既有 Nginx runtime 封装；候选镜像先通过同网络
+  `nginx -t`、`/` 和 `/api/health`，再切换生产。
 
 ## 7. Git/worktree 边界
 
