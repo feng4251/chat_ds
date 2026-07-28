@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 from pathlib import Path
@@ -193,9 +194,17 @@ class SkillHttpGrantTests(unittest.TestCase):
 
     def test_skill_execution_and_child_surfaces_require_compiled_http_grant(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
+            pipeline_root = Path(tmp) / "pipeline"
+            pipeline_root.mkdir()
+            pipeline_skill_md = pipeline_root / "SKILL.md"
+            pipeline_skill_md.write_text(
+                "Execute the declared pipeline.",
+                encoding="utf-8",
+            )
             rest_root = Path(tmp) / "rest-helper"
             rest_root.mkdir()
-            (rest_root / "SKILL.md").write_text(
+            rest_skill_md = rest_root / "SKILL.md"
+            rest_skill_md.write_text(
                 "Use GET https://api.vendor.test/v1/ for searches.",
                 encoding="utf-8",
             )
@@ -224,6 +233,10 @@ class SkillHttpGrantTests(unittest.TestCase):
                         "name": "pipeline",
                         "_chatds_scope": "session",
                         "workflow_contract": workflow,
+                        "skill_dir": str(pipeline_root),
+                        "skill_md_sha256": hashlib.sha256(
+                            pipeline_skill_md.read_bytes()
+                        ).hexdigest(),
                     },
                     "rest-helper": {
                         "name": "rest-helper",
@@ -231,6 +244,10 @@ class SkillHttpGrantTests(unittest.TestCase):
                         "content": "Use GET https://api.vendor.test/v1/ for searches.",
                         "resource_graph": {"skill_root": str(rest_root)},
                         "workflow_contract": None,
+                        "skill_dir": str(rest_root),
+                        "skill_md_sha256": hashlib.sha256(
+                            rest_skill_md.read_bytes()
+                        ).hexdigest(),
                     },
                 },
                 {},
@@ -452,6 +469,12 @@ class SkillHttpToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["request_sent"])
         self.assertEqual("rest-helper", result["matched_skill"])
         self.assertEqual("https://api.vendor.test/v1/", result["matched_prefix"])
+        self.assertEqual(
+            hashlib.sha256(
+                b"https://api.vendor.test/v1/"
+            ).hexdigest(),
+            result["matched_prefix_sha256"],
+        )
         self.assertEqual('{"ok":true}', result["body"])
         self.assertEqual(1, result["request_number"])
         self.assertEqual(1, result["root_request_number"])
@@ -663,6 +686,13 @@ class SkillHttpToolTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("skill_http_timeout", result["error_code"])
         self.assertFalse(result["request_sent"])
+        self.assertEqual("rest-helper", result["matched_skill"])
+        self.assertEqual(
+            hashlib.sha256(
+                b"https://api.vendor.test/v1/"
+            ).hexdigest(),
+            result["matched_prefix_sha256"],
+        )
         self.assertLess(elapsed, 1.5)
 
     async def test_redirects_do_not_reset_the_total_deadline(self) -> None:
@@ -692,6 +722,13 @@ class SkillHttpToolTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("skill_http_timeout", result["error_code"])
         self.assertTrue(result["request_sent"])
+        self.assertEqual("rest-helper", result["matched_skill"])
+        self.assertEqual(
+            hashlib.sha256(
+                b"https://api.vendor.test/v1/"
+            ).hexdigest(),
+            result["matched_prefix_sha256"],
+        )
         self.assertEqual(1, result["redirects_followed"])
         self.assertEqual(2, result["request_number"])
         self.assertLess(elapsed, 1.5)

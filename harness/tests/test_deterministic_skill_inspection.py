@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import unittest
@@ -14,7 +15,16 @@ from agent_loop import (
 )
 
 
-_SKILL_MD_SHA256 = "a" * 64
+_SKILL_MD_CONTENT = (
+    "---\n"
+    "name: deterministic-skill-fixture\n"
+    "description: Portable test fixture for compiled Skill inspection.\n"
+    "---\n"
+    "# Deterministic Skill Fixture\n"
+)
+_SKILL_MD_SHA256 = hashlib.sha256(
+    _SKILL_MD_CONTENT.encode("utf-8")
+).hexdigest()
 
 
 def _tool_call_response(call_id: str, name: str, arguments: dict) -> list[str]:
@@ -58,6 +68,7 @@ def _stop_response(content: str = "completed") -> list[str]:
 
 def _precompiled_package(
     *,
+    skill_dir: Path,
     linked_files: dict | None = None,
     workflow_contract: dict | None = None,
 ) -> dict:
@@ -69,8 +80,23 @@ def _precompiled_package(
     at that boundary instead of relying on an impossible pathless scanner
     record.
     """
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        _SKILL_MD_CONTENT,
+        encoding="utf-8",
+    )
+    for paths in (linked_files or {}).values():
+        for relative_path in paths:
+            target = skill_dir / relative_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                f"compiled fixture resource: {relative_path}\n",
+                encoding="utf-8",
+            )
     return {
+        "skill_dir": str(skill_dir),
         "skill_md_sha256": _SKILL_MD_SHA256,
+        "content": _SKILL_MD_CONTENT,
         "linked_files": linked_files or {},
         "workflow_contract": workflow_contract or {},
         "package_diagnostics": {
@@ -416,7 +442,9 @@ class DeterministicSkillInspectionRunTests(unittest.IsolatedAsyncioTestCase):
                 patch("agent_loop._fetch_goal", AsyncMock(return_value=None)),
                 patch(
                     "skills.loader.load_skill_content",
-                    return_value=_precompiled_package(),
+                    return_value=_precompiled_package(
+                        skill_dir=Path(temp_dir) / "skill-package",
+                    ),
                 ),
                 patch(
                     "skills.scanner.find_all_skills",
@@ -517,6 +545,7 @@ class DeterministicSkillInspectionRunTests(unittest.IsolatedAsyncioTestCase):
                 patch(
                     "skills.loader.load_skill_content",
                     return_value=_precompiled_package(
+                        skill_dir=Path(temp_dir) / "skill-package",
                         linked_files={"workers": worker_paths},
                         workflow_contract={
                             "worker_files": worker_paths,
@@ -659,6 +688,7 @@ class DeterministicSkillInspectionRunTests(unittest.IsolatedAsyncioTestCase):
                 patch(
                     "skills.loader.load_skill_content",
                     return_value=_precompiled_package(
+                        skill_dir=Path(temp_dir) / "skill-package",
                         linked_files={"workers": [worker_path]},
                         workflow_contract={
                             "worker_files": [worker_path],
@@ -826,6 +856,7 @@ class DeterministicSkillInspectionRunTests(unittest.IsolatedAsyncioTestCase):
                 patch(
                     "skills.loader.load_skill_content",
                     return_value=_precompiled_package(
+                        skill_dir=Path(temp_dir) / "skill-package",
                         linked_files={"workers": [worker_path]},
                         workflow_contract=contract,
                     ),
@@ -973,6 +1004,7 @@ class DeterministicSkillInspectionRunTests(unittest.IsolatedAsyncioTestCase):
                 patch(
                     "skills.loader.load_skill_content",
                     return_value=_precompiled_package(
+                        skill_dir=Path(temp_dir) / "skill-package",
                         linked_files=linked_files,
                         workflow_contract=contract,
                     ),
@@ -1281,6 +1313,7 @@ class DeterministicSkillInspectionRunTests(unittest.IsolatedAsyncioTestCase):
                 patch(
                     "skills.loader.load_skill_content",
                     return_value=_precompiled_package(
+                        skill_dir=Path(temp_dir) / "skill-package",
                         linked_files={
                             "orchestration": [orchestrator],
                             "intent": intent_paths,
@@ -1459,6 +1492,7 @@ class DeterministicSkillInspectionRunTests(unittest.IsolatedAsyncioTestCase):
                 patch(
                     "skills.loader.load_skill_content",
                     return_value=_precompiled_package(
+                        skill_dir=Path(temp_dir) / "skill-package",
                         linked_files={
                             "orchestration": [orchestrator],
                             "references": selected_paths,

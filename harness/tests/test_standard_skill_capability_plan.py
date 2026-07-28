@@ -2276,6 +2276,7 @@ class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
                     "script_path": (
                         "skills/portable-skill/scripts/session.cjs"
                     ),
+                    "args": ["execute-current-task"],
                 }),
                 _stop_response("complete"),
             ]

@@ -24,6 +24,10 @@ from tools.skill_capability_plan import (
     submit_skill_capability_plan,
     SUBMIT_SKILL_CAPABILITY_PLAN_SCHEMA,
 )
+from tools.knowledge_gate import (
+    submit_knowledge_gate_decisions,
+    SUBMIT_KNOWLEDGE_GATE_DECISIONS_SCHEMA,
+)
 from tools.file_tools import read_file, write_file, patch_file, merge_files, search_files
 from tools.file_tools import (
     READ_FILE_SCHEMA, WRITE_FILE_SCHEMA, PATCH_FILE_SCHEMA, MERGE_FILES_SCHEMA,
@@ -214,6 +218,16 @@ register(
     parallel_safe=False,
     allow_in_child=False,
     emoji="🧭",
+)
+
+register(
+    "submit_knowledge_gate_decisions",
+    SUBMIT_KNOWLEDGE_GATE_DECISIONS_SCHEMA,
+    submit_knowledge_gate_decisions,
+    is_read_only=True,
+    parallel_safe=False,
+    allow_in_child=True,
+    emoji="🚦",
 )
 
 register(

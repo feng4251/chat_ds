@@ -866,6 +866,25 @@ def _public_class_inventory(script: Path, *, strict: bool = False) -> list[dict[
     return classes
 
 
+def inspect_public_python_callables(script: Path) -> dict[str, list[dict[str, Any]]]:
+    """Return strict, bounded callable metadata without importing the script.
+
+    Callers must resolve and authorize ``script`` before using this helper. It
+    only performs the same bounded AST inspection used by
+    ``run_skill_python`` preflight; Skill code is never imported or executed.
+    Parse, encoding, size, and filesystem failures are reported as
+    ``ValueError`` so a guidance-only caller can replace the inventory with a
+    stable unavailable marker without exposing host details.
+    """
+
+    if not isinstance(script, Path) or script.suffix.casefold() != ".py":
+        raise ValueError("Public callable inventory requires an exact .py file.")
+    return {
+        "functions": _public_function_inventory(script, strict=True),
+        "classes": _public_class_inventory(script, strict=True),
+    }
+
+
 def _validated_cli_args(args: list[str] | None) -> list[str]:
     if args is None:
         return []

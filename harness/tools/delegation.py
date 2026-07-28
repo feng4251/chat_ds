@@ -51,7 +51,18 @@ from result_fan_in_runtime import (
     load_exact_result_text,
     materialize_fan_in_plan,
 )
-from skill_capability_plan import capability_call_satisfies_candidate
+from skill_capability_plan import (
+    capability_call_satisfies_candidate,
+    script_call_has_semantic_task_binding,
+)
+from knowledge_gate import (
+    MAX_GATE_IDENTIFIER_CHARS as _MAX_KNOWLEDGE_GATE_IDENTIFIER_CHARS,
+    is_canonical_knowledge_gate_identifier,
+)
+from knowledge_gate_runtime import (
+    MAX_GATE_TEXT_CHARS as _MAX_KNOWLEDGE_GATE_TEXT_CHARS,
+    MAX_KNOWLEDGE_GATE_PLAN_BYTES as _MAX_KNOWLEDGE_GATE_PLAN_BYTES,
+)
 from tools.path_security import sandbox_dir
 from workspace_patterns import (
     WorkspacePatternError,
@@ -273,6 +284,9 @@ def _content_declares_degraded_completion(content: str) -> bool:
 _CAPABILITY_GAPS_JSON_PATTERN = re.compile(
     r"(?m)^\s*CAPABILITY_GAPS_JSON:\s*(\{[^\r\n]*\})\s*$"
 )
+_KNOWLEDGE_GATE_GAPS_JSON_PATTERN = re.compile(
+    r"(?m)^\s*KNOWLEDGE_GATE_GAPS_JSON:\s*(\{[^\r\n]*\})\s*$"
+)
 
 
 def _exact_capability_gap_ledger_error(
@@ -328,6 +342,69 @@ def _exact_capability_gap_ledger_error(
         return (
             "CAPABILITY_GAPS_JSON failed_candidate_ids must exactly cover "
             "every failed exact capability candidate"
+        )
+    return None
+
+
+def _exact_knowledge_gate_gap_ledger_error(
+    content: str,
+    expected_gap_ids: list[str],
+) -> str | None:
+    """Validate the child-owned degraded ledger for one frozen gate plan."""
+
+    expected = list(dict.fromkeys(
+        str(identifier)
+        for identifier in expected_gap_ids
+        if str(identifier)
+    ))
+    matches = _KNOWLEDGE_GATE_GAPS_JSON_PATTERN.findall(str(content or ""))
+    if not expected:
+        if matches:
+            return (
+                "KNOWLEDGE_GATE_GAPS_JSON is present although the exact "
+                "knowledge-gate receipt audit found no gaps"
+            )
+        return None
+    if len(matches) != 1:
+        return (
+            "knowledge-gate gaps require exactly one single-line "
+            "KNOWLEDGE_GATE_GAPS_JSON ledger"
+        )
+    raw = matches[0]
+    if len(raw.encode("utf-8")) > _MAX_KNOWLEDGE_GATE_GAP_LEDGER_BYTES:
+        return "KNOWLEDGE_GATE_GAPS_JSON exceeds the bounded 32 KiB limit"
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return "KNOWLEDGE_GATE_GAPS_JSON must contain valid JSON"
+    if not isinstance(payload, dict) or set(payload) != {
+        "status",
+        "gap_ids",
+    }:
+        return (
+            "KNOWLEDGE_GATE_GAPS_JSON must contain only status and gap_ids"
+        )
+    if payload.get("status") != "degraded":
+        return "KNOWLEDGE_GATE_GAPS_JSON status must be exactly degraded"
+    actual = payload.get("gap_ids")
+    if (
+        not isinstance(actual, list)
+        or any(
+            not isinstance(identifier, str)
+            or not identifier
+            or identifier != identifier.strip()
+            for identifier in actual
+        )
+        or len(set(actual)) != len(actual)
+    ):
+        return (
+            "KNOWLEDGE_GATE_GAPS_JSON gap_ids must be a duplicate-free list "
+            "of exact identifiers"
+        )
+    if set(actual) != set(expected) or len(actual) != len(expected):
+        return (
+            "KNOWLEDGE_GATE_GAPS_JSON gap_ids must exactly cover every "
+            "knowledge-gate audit gap"
         )
     return None
 
@@ -441,11 +518,22 @@ _MAX_SKILL_PRELOAD_BYTES = 2 * 1024 * 1024
 # its complete exact grant set or fails before model/handler execution.
 _MAX_CHILD_SCRIPT_ENTRYPOINTS = 1024
 _MAX_CHILD_SCRIPT_ENTRYPOINT_GUIDANCE_BYTES = 256 * 1024
+# Callable discovery is guidance-only and must stay substantially smaller than
+# the complete exact entrypoint grant list.  Counts include functions, classes,
+# and directly callable instance methods across every authorized Python script.
+_MAX_CHILD_PYTHON_CALLABLE_INVENTORY_ENTRIES = 512
+_MAX_CHILD_PYTHON_CALLABLE_GUIDANCE_BYTES = 96 * 1024
+_PYTHON_CALLABLE_INVENTORY_UNAVAILABLE = '{"status":"unavailable"}'
 _MAX_DECLARED_PATH_CHARS = 512
 _MAX_DECLARED_SKILL_NAME_CHARS = 128
 _MAX_EXACT_CAPABILITY_BINDINGS = 64
 _MAX_EXACT_CAPABILITY_BINDINGS_BYTES = 256 * 1024
-_MAX_EXACT_CAPABILITY_ID_CHARS = 160
+_MAX_KNOWLEDGE_GATE_GAP_LEDGER_BYTES = 32 * 1024
+_MAX_KNOWLEDGE_GATE_CHECKS = 128
+_MAX_KNOWLEDGE_GATE_GROUPS = 256
+_MAX_KNOWLEDGE_GATE_CANDIDATES = 512
+_MAX_KNOWLEDGE_GATE_SELECTORS = 64
+_KNOWLEDGE_GATE_DECISION_TOOL = "submit_knowledge_gate_decisions"
 _PRELOADED_READER_TOOLS = {"skill_view", "read_file", "search_files"}
 _DECLARED_SKILL_NAME_RE = re.compile(
     r"^[a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)?$",
@@ -467,6 +555,7 @@ _EXACT_CAPABILITY_BINDING_FIELDS = {
     "skill_name",
     "resource_path",
     "sha256",
+    "skill_md_sha256",
     "package_sha256",
     "command_id",
     "executable",
@@ -1388,6 +1477,10 @@ def _exact_declared_skill_script_grants(
 
 def _render_exact_child_script_entrypoints(
     grants: list[tuple[str, str, str]],
+    *,
+    user_id: str | None = None,
+    session_id: str | None = None,
+    enabled_user_skills: list[str] | tuple[str, ...] = (),
 ) -> str:
     """Render only the executable grants already narrowed for one child.
 
@@ -1417,6 +1510,72 @@ def _render_exact_child_script_entrypoints(
         f"- skills/{skill_name}/{relative_path} sha256={digest}"
         for skill_name, relative_path, digest in exact
     )
+
+    python_grants = [
+        grant
+        for grant in exact
+        if PurePosixPath(grant[1]).suffix.casefold() == ".py"
+    ]
+    if python_grants:
+        inventory_rows: list[str] = []
+        inventory_entry_count = 0
+        inventory_overflow = False
+        for skill_name, relative_path, digest in python_grants:
+            inventory = _resolved_exact_python_callable_inventory(
+                skill_name=skill_name,
+                relative_path=relative_path,
+                digest=digest,
+                user_id=user_id,
+                session_id=session_id,
+                enabled_user_skills=enabled_user_skills,
+            )
+            display_path = f"skills/{skill_name}/{relative_path}"
+            if inventory is None:
+                inventory_rows.append(
+                    f"- {display_path}: "
+                    f"{_PYTHON_CALLABLE_INVENTORY_UNAVAILABLE}"
+                )
+                continue
+            entry_count = _python_callable_inventory_entry_count(inventory)
+            if (
+                entry_count < 0
+                or inventory_entry_count + entry_count
+                > _MAX_CHILD_PYTHON_CALLABLE_INVENTORY_ENTRIES
+            ):
+                inventory_overflow = True
+                break
+            inventory_entry_count += entry_count
+            inventory_rows.append(
+                f"- {display_path}: "
+                + json.dumps(
+                    {
+                        "status": "available",
+                        **inventory,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+
+        inventory_lines = [
+            "[Safe public Python callable inventory]",
+            "This bounded AST inventory is non-executing guidance for the "
+            "exact .py grants above. It does not add paths, tools, callable "
+            "authority, imports, inherited methods, or package browsing.",
+            *inventory_rows,
+        ]
+        inventory_rendered = "\n".join(inventory_lines)
+        if (
+            inventory_overflow
+            or len(inventory_rendered.encode("utf-8"))
+            > _MAX_CHILD_PYTHON_CALLABLE_GUIDANCE_BYTES
+        ):
+            inventory_rendered = "\n".join([
+                "[Safe public Python callable inventory]",
+                f"- {_PYTHON_CALLABLE_INVENTORY_UNAVAILABLE}",
+            ])
+        lines.extend(["", inventory_rendered])
     rendered = "\n".join(lines)
     rendered_bytes = len(rendered.encode("utf-8"))
     if rendered_bytes > _MAX_CHILD_SCRIPT_ENTRYPOINT_GUIDANCE_BYTES:
@@ -1426,6 +1585,145 @@ def _render_exact_child_script_entrypoints(
             f"{_MAX_CHILD_SCRIPT_ENTRYPOINT_GUIDANCE_BYTES}: {rendered_bytes}"
         )
     return rendered
+
+
+def _sha256_regular_file(path: Any) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _project_public_python_callable_inventory(
+    inventory: dict[str, Any],
+) -> dict[str, list[dict[str, Any]]] | None:
+    """Keep only bounded invocation metadata emitted by the trusted inspector."""
+
+    raw_functions = inventory.get("functions")
+    raw_classes = inventory.get("classes")
+    if not isinstance(raw_functions, list) or not isinstance(raw_classes, list):
+        return None
+    functions: list[dict[str, Any]] = []
+    for item in raw_functions:
+        if not isinstance(item, dict):
+            return None
+        name = item.get("name")
+        signature = item.get("signature")
+        async_value = item.get("async")
+        if (
+            not isinstance(name, str)
+            or not isinstance(signature, str)
+            or not isinstance(async_value, bool)
+        ):
+            return None
+        functions.append({
+            "name": name,
+            "signature": signature,
+            "async": async_value,
+        })
+    classes: list[dict[str, Any]] = []
+    for item in raw_classes:
+        if not isinstance(item, dict):
+            return None
+        name = item.get("name")
+        constructor_signature = item.get("constructor_signature")
+        methods_value = item.get("methods")
+        if (
+            not isinstance(name, str)
+            or not isinstance(constructor_signature, str)
+            or not isinstance(methods_value, list)
+        ):
+            return None
+        methods: list[dict[str, Any]] = []
+        for method in methods_value:
+            if not isinstance(method, dict):
+                return None
+            method_name = method.get("name")
+            signature = method.get("signature")
+            async_value = method.get("async")
+            if (
+                not isinstance(method_name, str)
+                or not isinstance(signature, str)
+                or not isinstance(async_value, bool)
+            ):
+                return None
+            methods.append({
+                "name": method_name,
+                "signature": signature,
+                "async": async_value,
+            })
+        classes.append({
+            "name": name,
+            "constructor_signature": constructor_signature,
+            "methods": methods,
+        })
+    return {
+        "functions": functions,
+        "classes": classes,
+    }
+
+
+def _resolved_exact_python_callable_inventory(
+    *,
+    skill_name: str,
+    relative_path: str,
+    digest: str,
+    user_id: str | None,
+    session_id: str | None,
+    enabled_user_skills: list[str] | tuple[str, ...],
+) -> dict[str, list[dict[str, Any]]] | None:
+    """Inspect one exact grant after canonical resolution and digest checks."""
+
+    if not isinstance(user_id, str) or not isinstance(session_id, str):
+        return None
+    try:
+        from tools.skill_python import inspect_public_python_callables
+        from tools.skill_script import _resolve_session_skill_script
+
+        script, skill_root, resolved_skill_name = (
+            _resolve_session_skill_script(
+                f"skills/{skill_name}/{relative_path}",
+                user_id,
+                session_id,
+                list(enabled_user_skills),
+            )
+        )
+        resolved_relative = script.resolve(strict=True).relative_to(
+            skill_root.resolve(strict=True)
+        ).as_posix()
+        if (
+            resolved_skill_name != skill_name
+            or resolved_relative != relative_path
+            or _sha256_regular_file(script) != digest
+        ):
+            return None
+        inventory = inspect_public_python_callables(script)
+        # Re-hash after AST inspection so a concurrently replaced package
+        # cannot lend stale callable guidance to the still-pinned grant.
+        if _sha256_regular_file(script) != digest:
+            return None
+        return _project_public_python_callable_inventory(inventory)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _python_callable_inventory_entry_count(
+    inventory: dict[str, list[dict[str, Any]]],
+) -> int:
+    functions = inventory.get("functions")
+    classes = inventory.get("classes")
+    if not isinstance(functions, list) or not isinstance(classes, list):
+        return -1
+    count = len(functions) + len(classes)
+    for item in classes:
+        if not isinstance(item, dict) or not isinstance(item.get("methods"), list):
+            return -1
+        count += len(item["methods"])
+    return count
 
 
 def _exact_capability_skill_resource_grants(
@@ -1862,15 +2160,10 @@ def _strict_exact_capability_bindings(
             )
         candidate_id = binding.get("candidate_id")
         kind = binding.get("kind")
-        if (
-            not isinstance(candidate_id, str)
-            or not candidate_id
-            or candidate_id != candidate_id.strip()
-            or len(candidate_id) > _MAX_EXACT_CAPABILITY_ID_CHARS
-            or any(char in candidate_id for char in "\r\n\x00")
-        ):
+        if not is_canonical_knowledge_gate_identifier(candidate_id):
             return [], actual_digest, (
-                f"{label}.candidate_id must be one bounded non-empty identifier."
+                f"{label}.candidate_id must be one canonical bounded "
+                "knowledge-gate identifier."
             )
         if candidate_id in seen_ids:
             return [], actual_digest, (
@@ -1938,6 +2231,7 @@ def _strict_exact_capability_bindings(
                 )
         for digest_field in (
             "sha256",
+            "skill_md_sha256",
             "package_sha256",
             "schema_sha256",
             "descriptor_sha256",
@@ -2076,6 +2370,492 @@ def _strict_exact_capability_bindings(
                     "its declared method-level bridge."
                 )
     return bindings, actual_digest, None
+
+
+def _bounded_knowledge_gate_identifier(
+    value: Any,
+    *,
+    label: str,
+) -> tuple[str, str | None]:
+    if not is_canonical_knowledge_gate_identifier(value):
+        return "", (
+            f"{label} must be one canonical bounded Unicode identifier of at "
+            f"most {_MAX_KNOWLEDGE_GATE_IDENTIFIER_CHARS} characters."
+        )
+    return value, None
+
+
+def _strict_knowledge_gate_string_list(
+    value: Any,
+    *,
+    label: str,
+    max_items: int,
+    identifiers: bool = False,
+) -> tuple[list[str], str | None]:
+    if not isinstance(value, list) or len(value) > max_items:
+        return [], f"{label} must be a bounded list."
+    normalized: list[str] = []
+    for index, item in enumerate(value):
+        if identifiers:
+            text, error = _bounded_knowledge_gate_identifier(
+                item,
+                label=f"{label}[{index}]",
+            )
+        else:
+            text = item if isinstance(item, str) else ""
+            error = None
+            if (
+                not text
+                or text != text.strip()
+                or len(text) > 4_096
+                or any(char in text for char in "\r\n\x00")
+            ):
+                error = (
+                    f"{label}[{index}] must be one bounded single-line string."
+                )
+        if error:
+            return [], error
+        normalized.append(text)
+    if len(set(normalized)) != len(normalized):
+        return [], f"{label} must not contain duplicates."
+    return normalized, None
+
+
+def _knowledge_gate_candidate_tool_names(
+    candidate: dict[str, Any],
+) -> tuple[str, ...]:
+    """Map one exact candidate coordinate to its actual registry bridges."""
+
+    if candidate.get("kind") == "skill_resource":
+        return ("skill_view",)
+    return tuple(dict.fromkeys(
+        str(name)
+        for name in candidate.get("tool_names") or []
+        if isinstance(name, str) and name
+    ))
+
+
+def _strict_knowledge_gate_plan(
+    task: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str, str | None]:
+    """Validate a compiler-owned conditional candidate plan and its digest."""
+
+    has_plan = "knowledge_gate_plan" in task
+    has_digest = "knowledge_gate_plan_sha256" in task
+    if not has_plan and not has_digest:
+        return None, "", None
+    if not has_plan or not has_digest:
+        return None, "", (
+            "knowledge_gate_plan and knowledge_gate_plan_sha256 must be "
+            "supplied together."
+        )
+    raw = task.get("knowledge_gate_plan")
+    supplied_digest = task.get("knowledge_gate_plan_sha256")
+    if not isinstance(raw, dict):
+        return None, "", "knowledge_gate_plan must be one explicit object."
+    if (
+        not isinstance(supplied_digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", supplied_digest)
+    ):
+        return None, "", (
+            "knowledge_gate_plan_sha256 must be one lowercase full SHA-256."
+        )
+    try:
+        encoded = json.dumps(
+            raw,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, RecursionError):
+        return None, "", (
+            "knowledge_gate_plan must contain only finite, acyclic JSON values."
+        )
+    if len(encoded) > _MAX_KNOWLEDGE_GATE_PLAN_BYTES:
+        return None, "", (
+            "knowledge_gate_plan exceeds the bounded UTF-8 metadata limit of "
+            f"{_MAX_KNOWLEDGE_GATE_PLAN_BYTES} bytes."
+        )
+    actual_digest = hashlib.sha256(encoded).hexdigest()
+    if actual_digest != supplied_digest:
+        return None, actual_digest, (
+            "knowledge_gate_plan_sha256 does not match the exact canonical "
+            "knowledge_gate_plan object."
+        )
+    plan = json.loads(encoded.decode("utf-8"))
+    expected_top_fields = {
+        "schema_version",
+        "worker_id",
+        "owner_skill",
+        "checks",
+        "groups",
+        "candidates",
+    }
+    if set(plan) != expected_top_fields:
+        return None, actual_digest, (
+            "knowledge_gate_plan must contain exactly schema_version, "
+            "worker_id, owner_skill, checks, groups, and candidates."
+        )
+    if plan.get("schema_version") != 1:
+        return None, actual_digest, (
+            "knowledge_gate_plan.schema_version must be exactly 1."
+        )
+    plan_worker, error = _bounded_knowledge_gate_identifier(
+        plan.get("worker_id"),
+        label="knowledge_gate_plan.worker_id",
+    )
+    if error:
+        return None, actual_digest, error
+    plan_skill = plan.get("owner_skill")
+    if (
+        not isinstance(plan_skill, str)
+        or len(plan_skill) > _MAX_DECLARED_SKILL_NAME_CHARS
+        or not _DECLARED_SKILL_NAME_RE.fullmatch(plan_skill)
+    ):
+        return None, actual_digest, (
+            "knowledge_gate_plan.owner_skill must be one exact safe Skill name."
+        )
+    if plan_worker != str(task.get("worker_id") or "").strip():
+        return None, actual_digest, (
+            "knowledge_gate_plan.worker_id does not match the delegated worker."
+        )
+    if plan_skill != str(task.get("skill_name") or "").strip():
+        return None, actual_digest, (
+            "knowledge_gate_plan.owner_skill does not match the delegated Skill."
+        )
+
+    checks = plan.get("checks")
+    groups = plan.get("groups")
+    candidates = plan.get("candidates")
+    if (
+        not isinstance(checks, list)
+        or not checks
+        or len(checks) > _MAX_KNOWLEDGE_GATE_CHECKS
+    ):
+        return None, actual_digest, (
+            "knowledge_gate_plan.checks must be a non-empty bounded list."
+        )
+    if (
+        not isinstance(groups, list)
+        or len(groups) > _MAX_KNOWLEDGE_GATE_GROUPS
+    ):
+        return None, actual_digest, (
+            "knowledge_gate_plan.groups must be a bounded list."
+        )
+    if (
+        not isinstance(candidates, list)
+        or len(candidates) > _MAX_KNOWLEDGE_GATE_CANDIDATES
+    ):
+        return None, actual_digest, (
+            "knowledge_gate_plan.candidates must be a bounded list."
+        )
+
+    normalized_candidates: list[dict[str, Any]] = []
+    for offset in range(0, len(candidates), _MAX_EXACT_CAPABILITY_BINDINGS):
+        chunk = candidates[offset:offset + _MAX_EXACT_CAPABILITY_BINDINGS]
+        chunk_encoded = json.dumps(
+            chunk,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        chunk_digest = hashlib.sha256(chunk_encoded).hexdigest()
+        validated, _digest, candidate_error = (
+            _strict_exact_capability_bindings({
+                "capability_bindings": chunk,
+                "capability_bindings_sha256": chunk_digest,
+            })
+        )
+        if candidate_error:
+            return None, actual_digest, (
+                "knowledge_gate_plan.candidates is invalid: "
+                + candidate_error
+            )
+        normalized_candidates.extend(validated)
+    candidate_ids = [
+        str(candidate.get("candidate_id") or "")
+        for candidate in normalized_candidates
+    ]
+    if len(set(candidate_ids)) != len(candidate_ids):
+        return None, actual_digest, (
+            "knowledge_gate_plan.candidates repeats a candidate_id."
+        )
+    if any(
+        _KNOWLEDGE_GATE_DECISION_TOOL
+        in set(candidate.get("tool_names") or [])
+        for candidate in normalized_candidates
+    ):
+        return None, actual_digest, (
+            "The knowledge-gate decision control tool cannot be an evidence "
+            "candidate."
+        )
+    for index, candidate in enumerate(normalized_candidates):
+        skill_identity = str(candidate.get("skill_name") or "")
+        has_skill_identity_digest = any(
+            candidate.get(field) is not None
+            for field in ("skill_md_sha256", "package_sha256")
+        )
+        if skill_identity and (
+            not isinstance(candidate.get("skill_md_sha256"), str)
+            or not isinstance(candidate.get("package_sha256"), str)
+        ):
+            return None, actual_digest, (
+                "knowledge_gate_plan.candidates["
+                f"{index}] derives from Skill {skill_identity!r} and must bind "
+                "both skill_md_sha256 and package_sha256."
+            )
+        if not skill_identity and has_skill_identity_digest:
+            return None, actual_digest, (
+                "knowledge_gate_plan.candidates["
+                f"{index}] cannot carry Skill identity digests without an "
+                "exact skill_name."
+            )
+
+    check_by_id: dict[str, dict[str, Any]] = {}
+    branch_keys: set[tuple[str, str]] = set()
+    branch_group_references: list[str] = []
+    for check_index, check in enumerate(checks):
+        label = f"knowledge_gate_plan.checks[{check_index}]"
+        if not isinstance(check, dict) or set(check) != {
+            "id",
+            "question",
+            "branches",
+            "legacy_ambiguous",
+        }:
+            return None, actual_digest, (
+                f"{label} must contain exactly id, question, branches, and "
+                "legacy_ambiguous."
+            )
+        check_id, error = _bounded_knowledge_gate_identifier(
+            check.get("id"),
+            label=f"{label}.id",
+        )
+        if error:
+            return None, actual_digest, error
+        if check_id in check_by_id:
+            return None, actual_digest, (
+                f"knowledge_gate_plan.checks repeats ID {check_id}."
+            )
+        question = check.get("question")
+        if (
+            not isinstance(question, str)
+            or len(question) > _MAX_KNOWLEDGE_GATE_TEXT_CHARS
+            or any(char in question for char in "\x00")
+        ):
+            return None, actual_digest, (
+                f"{label}.question must be one bounded string."
+            )
+        if not isinstance(check.get("legacy_ambiguous"), bool):
+            return None, actual_digest, (
+                f"{label}.legacy_ambiguous must be a boolean."
+            )
+        branches = check.get("branches")
+        if not isinstance(branches, list) or len(branches) > 3:
+            return None, actual_digest, (
+                f"{label}.branches must be a bounded list."
+            )
+        seen_outcomes: set[str] = set()
+        for branch_index, branch in enumerate(branches):
+            branch_label = f"{label}.branches[{branch_index}]"
+            if not isinstance(branch, dict) or set(branch) != {
+                "outcome",
+                "action",
+                "group_ids",
+            }:
+                return None, actual_digest, (
+                    f"{branch_label} must contain exactly outcome, action, "
+                    "and group_ids."
+                )
+            outcome = branch.get("outcome")
+            if (
+                outcome not in {"yes", "no", "unknown"}
+                or outcome in seen_outcomes
+            ):
+                return None, actual_digest, (
+                    f"{branch_label}.outcome must be one unique declared "
+                    "yes/no/unknown branch."
+                )
+            seen_outcomes.add(str(outcome))
+            action = branch.get("action")
+            if (
+                not isinstance(action, str)
+                or len(action) > _MAX_KNOWLEDGE_GATE_TEXT_CHARS
+                or any(char in action for char in "\x00")
+            ):
+                return None, actual_digest, (
+                    f"{branch_label}.action must be one bounded string."
+                )
+            group_ids, error = _strict_knowledge_gate_string_list(
+                branch.get("group_ids"),
+                label=f"{branch_label}.group_ids",
+                max_items=_MAX_KNOWLEDGE_GATE_GROUPS,
+                identifiers=True,
+            )
+            if error:
+                return None, actual_digest, error
+            branch_keys.add((check_id, str(outcome)))
+            branch_group_references.extend(group_ids)
+        check_by_id[check_id] = check
+
+    group_by_id: dict[str, dict[str, Any]] = {}
+    referenced_candidate_ids: set[str] = set()
+    for group_index, group in enumerate(groups):
+        label = f"knowledge_gate_plan.groups[{group_index}]"
+        if not isinstance(group, dict) or set(group) != {
+            "id",
+            "check_id",
+            "outcome",
+            "mode",
+            "candidate_ids",
+            "selectors",
+            "unresolved_selectors",
+        }:
+            return None, actual_digest, (
+                f"{label} contains an invalid field set."
+            )
+        group_id, error = _bounded_knowledge_gate_identifier(
+            group.get("id"),
+            label=f"{label}.id",
+        )
+        if error:
+            return None, actual_digest, error
+        if group_id in group_by_id:
+            return None, actual_digest, (
+                f"knowledge_gate_plan.groups repeats ID {group_id}."
+            )
+        check_id, error = _bounded_knowledge_gate_identifier(
+            group.get("check_id"),
+            label=f"{label}.check_id",
+        )
+        if error:
+            return None, actual_digest, error
+        outcome = group.get("outcome")
+        if (check_id, str(outcome)) not in branch_keys:
+            return None, actual_digest, (
+                f"{label} does not belong to one declared check branch."
+            )
+        if group.get("mode") != "one_of":
+            return None, actual_digest, (
+                f"{label}.mode must be exactly one_of."
+            )
+        group_candidate_ids, error = _strict_knowledge_gate_string_list(
+            group.get("candidate_ids"),
+            label=f"{label}.candidate_ids",
+            max_items=_MAX_KNOWLEDGE_GATE_CANDIDATES,
+            identifiers=True,
+        )
+        if error:
+            return None, actual_digest, error
+        selectors, error = _strict_knowledge_gate_string_list(
+            group.get("selectors"),
+            label=f"{label}.selectors",
+            max_items=_MAX_KNOWLEDGE_GATE_SELECTORS,
+        )
+        if error or not selectors:
+            return None, actual_digest, (
+                error or f"{label}.selectors must not be empty."
+            )
+        unresolved, error = _strict_knowledge_gate_string_list(
+            group.get("unresolved_selectors"),
+            label=f"{label}.unresolved_selectors",
+            max_items=_MAX_KNOWLEDGE_GATE_SELECTORS,
+        )
+        if error:
+            return None, actual_digest, error
+        if not set(unresolved).issubset(selectors):
+            return None, actual_digest, (
+                f"{label}.unresolved_selectors must be a subset of selectors."
+            )
+        missing_candidates = sorted(
+            set(group_candidate_ids) - set(candidate_ids)
+        )
+        if missing_candidates:
+            return None, actual_digest, (
+                f"{label} references unknown candidate IDs: "
+                + ", ".join(missing_candidates)
+            )
+        referenced_candidate_ids.update(group_candidate_ids)
+        group_by_id[group_id] = group
+
+    if len(set(branch_group_references)) != len(branch_group_references):
+        return None, actual_digest, (
+            "Every knowledge-gate group must be referenced by exactly one "
+            "check branch."
+        )
+    if set(branch_group_references) != set(group_by_id):
+        return None, actual_digest, (
+            "knowledge_gate_plan branch group_ids must exactly cover groups."
+        )
+    for check in checks:
+        check_id = str(check.get("id") or "")
+        for branch in check.get("branches") or []:
+            outcome = str(branch.get("outcome") or "")
+            for group_id in branch.get("group_ids") or []:
+                group = group_by_id.get(str(group_id))
+                if (
+                    group is None
+                    or group.get("check_id") != check_id
+                    or group.get("outcome") != outcome
+                ):
+                    return None, actual_digest, (
+                        "knowledge_gate_plan branch/group ownership differs."
+                    )
+    if referenced_candidate_ids != set(candidate_ids):
+        return None, actual_digest, (
+            "knowledge_gate_plan.candidates must be referenced by at least "
+            "one declared group, with no unused authority."
+        )
+    maximum_gap_ids: list[str] = []
+    for check in checks:
+        check_id = str(check.get("id") or "")
+        branch_by_outcome = {
+            str(branch.get("outcome") or ""): branch
+            for branch in check.get("branches") or []
+            if isinstance(branch, dict)
+        }
+        outcome_gap_choices: list[list[str]] = []
+        for outcome in ("yes", "no", "unknown"):
+            choice = (
+                [f"check:{check_id}:unknown"]
+                if outcome == "unknown"
+                else []
+            )
+            branch = branch_by_outcome.get(outcome)
+            if isinstance(branch, dict):
+                for group_id in branch.get("group_ids") or []:
+                    group = group_by_id[str(group_id)]
+                    choice.append(
+                        f"group:{group_id}:failed"
+                        if group.get("candidate_ids")
+                        else f"group:{group_id}:unresolved"
+                    )
+            outcome_gap_choices.append(choice)
+        maximum_gap_ids.extend(max(
+            outcome_gap_choices,
+            key=lambda choice: len(json.dumps(
+                choice,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")),
+        ))
+    maximum_gap_ledger = json.dumps(
+        {
+            "status": "degraded",
+            "gap_ids": maximum_gap_ids,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(maximum_gap_ledger) > _MAX_KNOWLEDGE_GATE_GAP_LEDGER_BYTES:
+        return None, actual_digest, (
+            "knowledge_gate_plan can produce a required exact gap ledger "
+            "larger than the bounded 32 KiB terminal contract."
+        )
+    plan["candidates"] = normalized_candidates
+    return plan, actual_digest, None
 
 
 def _exact_node_capability_grants(
@@ -2331,6 +3111,341 @@ def _exact_node_capability_grants(
         "http_get_grants": list(dict.fromkeys(http_get)),
         "http_post_grants": list(dict.fromkeys(http_post)),
         "bound_tool_names": list(dict.fromkeys(bound_tools)),
+        "receipt_bindings": receipts,
+    }, None
+
+
+def _exact_knowledge_gate_candidate_grants(
+    plan: dict[str, Any] | None,
+    *,
+    context: ToolContext,
+) -> tuple[dict[str, Any], str | None]:
+    """Prove every conditional coordinate against parent-owned authority.
+
+    The plan digest protects transport integrity, but never grants a tool,
+    resource, script, command, HTTP prefix, package, or MCP descriptor.  This
+    independent boundary deliberately does not reuse the standard capability
+    catalog's candidate IDs: the run-owned gate compiler has its own stable
+    identities, while authority remains the exact intersection below.
+    """
+
+    empty = {
+        "resource_grants": [],
+        "script_grants": [],
+        "process_only_script_grants": [],
+        "script_authority_grants": [],
+        "package_grants": [],
+        "command_grants": [],
+        "http_get_grants": [],
+        "http_post_grants": [],
+        "tool_names": [],
+        "receipt_bindings": [],
+    }
+    if plan is None:
+        return empty, None
+    if not context.skill_execution_resource_boundary:
+        return empty, (
+            "A knowledge_gate_plan requires a parent-owned Skill execution "
+            "resource boundary."
+        )
+
+    parent_tools = set(context.enabled_tools)
+    parent_resources = set(context.allowed_skill_resources)
+    parent_scripts = set(context.allowed_skill_scripts)
+    parent_process_only_scripts = set(context.process_only_skill_scripts)
+    parent_packages = set(context.allowed_skill_package_digests)
+    parent_commands = set(context.allowed_skill_commands)
+    parent_http_get = set(context.allowed_skill_http_prefixes)
+    parent_http_post = set(context.allowed_skill_http_post_prefixes)
+    resources: list[tuple[str, str]] = []
+    scripts: list[tuple[str, str, str]] = []
+    packages: list[tuple[str, str]] = []
+    commands: list[tuple[str, str, str, tuple[str, ...]]] = []
+    http_get: list[tuple[str, str]] = []
+    http_post: list[tuple[str, str]] = []
+    bound_tools: list[str] = []
+    receipts: list[dict[str, Any]] = []
+    resolved_roots: dict[str, Any] = {}
+    package_digests: dict[str, str] = {}
+
+    def resolve_skill_root(skill: str) -> tuple[Any | None, str | None]:
+        if skill in resolved_roots:
+            return resolved_roots[skill], None
+        try:
+            from skills.scanner import resolve_skill_path
+
+            skill_md = resolve_skill_path(
+                skill,
+                context.user_id,
+                context.session_id,
+                enabled_user_skills=list(context.enabled_user_skills),
+            )
+            if skill_md is None:
+                raise ValueError("canonical Skill is unavailable")
+            root = skill_md.parent.resolve(strict=True)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            return None, f"Skill package cannot be resolved: {exc}"
+        resolved_roots[skill] = root
+        return root, None
+
+    def revalidate_skill_identity(
+        candidate: dict[str, Any],
+    ) -> str | None:
+        skill = str(candidate.get("skill_name") or "")
+        if not skill:
+            return None
+        main_grant = (skill, "SKILL.md")
+        expected_main = str(candidate.get("skill_md_sha256") or "")
+        expected_package = str(candidate.get("package_sha256") or "")
+        if main_grant not in parent_resources:
+            return "supporting Skill main is outside the parent grant"
+        package_grant = (skill, expected_package)
+        if package_grant not in parent_packages:
+            return "supporting Skill package digest is outside the parent grant"
+        root, root_error = resolve_skill_root(skill)
+        if root_error or root is None:
+            return root_error or "supporting Skill package is unavailable"
+        try:
+            actual_main = hashlib.sha256(
+                (root / "SKILL.md").read_bytes()
+            ).hexdigest()
+            if skill not in package_digests:
+                from tools.isolated_skill_executor import (
+                    compute_skill_package_digest,
+                )
+
+                package_digests[skill] = compute_skill_package_digest(root)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            return f"supporting Skill identity cannot be revalidated: {exc}"
+        if actual_main != expected_main:
+            return "supporting SKILL.md changed after knowledge-gate compilation"
+        if package_digests[skill] != expected_package:
+            return (
+                "supporting Skill package changed after knowledge-gate "
+                "compilation"
+            )
+        packages.append(package_grant)
+        return None
+
+    def revalidate_skill_file(
+        candidate: dict[str, Any],
+    ) -> tuple[Any | None, Any | None, str | None]:
+        skill = str(candidate.get("skill_name") or "")
+        path = str(candidate.get("resource_path") or "")
+        expected_digest = str(candidate.get("sha256") or "")
+        try:
+            from skills.path_safety import validate_skill_resource
+
+            root, root_error = resolve_skill_root(skill)
+            if root_error or root is None:
+                raise ValueError(
+                    root_error or "canonical Skill is unavailable"
+                )
+            checked = validate_skill_resource(
+                root,
+                path,
+                expected_kind="file",
+                require_relative=True,
+            )
+            if not checked.valid or checked.path is None:
+                raise ValueError("declared file is unavailable")
+            actual_digest = hashlib.sha256(
+                checked.path.read_bytes()
+            ).hexdigest()
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            return None, None, (
+                f"candidate file cannot be revalidated: {exc}"
+            )
+        if actual_digest != expected_digest:
+            return None, None, (
+                "candidate file changed after knowledge-gate compilation"
+            )
+        return root, checked.path, None
+
+    for candidate in plan.get("candidates") or []:
+        candidate_id = str(candidate.get("candidate_id") or "")
+        kind = str(candidate.get("kind") or "")
+        tool_names = list(_knowledge_gate_candidate_tool_names(candidate))
+        missing_tools = sorted(set(tool_names) - parent_tools)
+        if missing_tools:
+            return empty, (
+                f"Knowledge-gate candidate {candidate_id} names tools outside "
+                "the parent grant: " + ", ".join(missing_tools)
+            )
+        bound_tools.extend(tool_names)
+        skill = str(candidate.get("skill_name") or "")
+        identity_error = revalidate_skill_identity(candidate)
+        if identity_error:
+            return empty, (
+                f"Knowledge-gate candidate {candidate_id} {identity_error}."
+            )
+
+        if kind == "native_tool":
+            tool_name = str(candidate.get("tool_name") or "")
+            if tool_name not in parent_tools:
+                return empty, (
+                    f"Knowledge-gate candidate {candidate_id} native tool is "
+                    "outside the parent grant."
+                )
+        elif kind == "mcp_tool":
+            tool_name = str(candidate.get("tool_name") or "")
+            parent_catalog = context.frozen_mcp_catalog
+            descriptor = (
+                parent_catalog.get(tool_name)
+                if parent_catalog is not None
+                and hasattr(parent_catalog, "get")
+                else None
+            )
+            if (
+                descriptor is None
+                or tool_name not in parent_tools
+                or str(getattr(descriptor, "schema_sha256", ""))
+                != candidate.get("schema_sha256")
+                or str(getattr(descriptor, "descriptor_sha256", ""))
+                != candidate.get("descriptor_sha256")
+            ):
+                return empty, (
+                    f"Knowledge-gate candidate {candidate_id} differs from the "
+                    "parent-frozen MCP descriptor."
+                )
+        elif kind == "skill_resource":
+            grant = (skill, str(candidate.get("resource_path") or ""))
+            if grant not in parent_resources:
+                return empty, (
+                    f"Knowledge-gate candidate {candidate_id} resource is "
+                    "outside the parent grant."
+                )
+            _root, _path, file_error = revalidate_skill_file(candidate)
+            if file_error:
+                return empty, (
+                    f"Knowledge-gate candidate {candidate_id} {file_error}."
+                )
+            resources.append(grant)
+        elif kind == "skill_script":
+            grant = (
+                skill,
+                str(candidate.get("resource_path") or ""),
+                str(candidate.get("sha256") or ""),
+            )
+            if grant not in parent_scripts:
+                return empty, (
+                    f"Knowledge-gate candidate {candidate_id} script tuple is "
+                    "outside the parent content-addressed grant."
+                )
+            uses_process_bridge = "run_skill_process" in tool_names
+            if uses_process_bridge and grant not in parent_process_only_scripts:
+                return empty, (
+                    f"Knowledge-gate candidate {candidate_id} persistent "
+                    "process bridge is outside the parent process-only grant."
+                )
+            if (
+                not uses_process_bridge
+                and grant in parent_process_only_scripts
+            ):
+                return empty, (
+                    f"Knowledge-gate candidate {candidate_id} cannot move a "
+                    "parent process-only script to a one-shot runner."
+                )
+            root, _path, file_error = revalidate_skill_file(candidate)
+            if file_error:
+                return empty, (
+                    f"Knowledge-gate candidate {candidate_id} {file_error}."
+                )
+            scripts.append(grant)
+            package_digest = str(candidate.get("package_sha256") or "")
+            if package_digest:
+                package_grant = (skill, package_digest)
+                if package_grant not in parent_packages:
+                    return empty, (
+                        f"Knowledge-gate candidate {candidate_id} package "
+                        "digest is outside the parent grant."
+                    )
+                try:
+                    if skill not in package_digests:
+                        from tools.isolated_skill_executor import (
+                            compute_skill_package_digest,
+                        )
+
+                        package_digests[skill] = (
+                            compute_skill_package_digest(root)
+                        )
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    return empty, (
+                        f"Knowledge-gate candidate {candidate_id} package "
+                        f"cannot be revalidated: {exc}"
+                    )
+                if package_digests[skill] != package_digest:
+                    return empty, (
+                        f"Knowledge-gate candidate {candidate_id} package "
+                        "changed after knowledge-gate compilation."
+                    )
+                packages.append(package_grant)
+        elif kind == "declared_command":
+            grant = (
+                skill,
+                str(candidate.get("command_id") or ""),
+                str(candidate.get("executable") or ""),
+                tuple(
+                    str(value)
+                    for value in candidate.get("fixed_argv") or []
+                ),
+            )
+            if grant not in parent_commands:
+                return empty, (
+                    f"Knowledge-gate candidate {candidate_id} command tuple is "
+                    "outside the parent grant."
+                )
+            commands.append(grant)
+        elif kind == "skill_http_prefix":
+            grant = (skill, str(candidate.get("url_prefix") or ""))
+            if candidate.get("tool_name") == "skill_http_post_json":
+                if grant not in parent_http_post:
+                    return empty, (
+                        f"Knowledge-gate candidate {candidate_id} POST prefix "
+                        "is outside the parent grant."
+                    )
+                http_post.append(grant)
+            else:
+                if grant not in parent_http_get:
+                    return empty, (
+                        f"Knowledge-gate candidate {candidate_id} GET prefix "
+                        "is outside the parent grant."
+                    )
+                http_get.append(grant)
+        else:
+            return empty, (
+                f"Knowledge-gate candidate {candidate_id} has an unsupported "
+                "capability kind."
+            )
+        receipts.append(candidate)
+
+    script_keys = set(scripts)
+    process_only_scripts = [
+        row for row in scripts
+        if row in parent_process_only_scripts
+    ]
+    script_authorities = [
+        row
+        for row in context.allowed_skill_script_authorities
+        if (
+            len(row) == 6
+            and (row[0], row[4], row[5]) in script_keys
+        )
+    ]
+    return {
+        "resource_grants": list(dict.fromkeys(resources)),
+        "script_grants": list(dict.fromkeys(scripts)),
+        "process_only_script_grants": list(dict.fromkeys(
+            process_only_scripts
+        )),
+        "script_authority_grants": list(dict.fromkeys(
+            script_authorities
+        )),
+        "package_grants": list(dict.fromkeys(packages)),
+        "command_grants": list(dict.fromkeys(commands)),
+        "http_get_grants": list(dict.fromkeys(http_get)),
+        "http_post_grants": list(dict.fromkeys(http_post)),
+        "tool_names": list(dict.fromkeys(bound_tools)),
         "receipt_bindings": receipts,
     }, None
 
@@ -3364,40 +4479,351 @@ def _script_call_has_semantic_task_binding(
     args: dict[str, Any],
     artifacts: list[dict[str, Any]] | None = None,
 ) -> bool:
-    """Reject argument-free demo execution as cross-Skill evidence.
+    """Compatibility wrapper around the shared exact-receipt matcher."""
 
-    Execution success proves only that code ran.  A cross-Skill evidence audit
-    additionally needs a task-bound invocation: declared function/method
-    identity, non-empty data/CLI arguments, or a verified artifact receipt.
-    A bare ``main()``/empty CLI is commonly a package demonstration and cannot
-    prove that the delegated query was executed.
-    """
-
-    if artifacts:
-        return True
-    count_fields = (
-        "cli_arg_count", "function_arg_count", "function_kwarg_count",
-        "constructor_arg_count", "constructor_kwarg_count",
-        "method_arg_count", "method_kwarg_count",
+    return script_call_has_semantic_task_binding(
+        tool_name,
+        args,
+        artifacts or (),
     )
-    has_arguments = any(int(args.get(field) or 0) > 0 for field in count_fields)
-    has_arguments = has_arguments or any(
-        isinstance(args.get(field), (list, dict)) and bool(args.get(field))
-        for field in (
-            "args", "function_args", "function_kwargs", "constructor_args",
-            "constructor_kwargs", "method_args", "method_kwargs",
+
+
+def _maximum_distinct_group_dispatch_matching(
+    group_ids: list[str],
+    edges: dict[str, list[int]],
+) -> dict[str, int]:
+    """Return a deterministic maximum-cardinality group→dispatch matching."""
+
+    call_to_group: dict[int, str] = {}
+
+    def assign(group_id: str, seen_calls: set[int]) -> bool:
+        for call_index in edges.get(group_id, []):
+            if call_index in seen_calls:
+                continue
+            seen_calls.add(call_index)
+            previous_group = call_to_group.get(call_index)
+            if (
+                previous_group is None
+                or assign(previous_group, seen_calls)
+            ):
+                call_to_group[call_index] = group_id
+                return True
+        return False
+
+    for group_id in group_ids:
+        assign(group_id, set())
+    return {
+        group_id: call_index
+        for call_index, group_id in call_to_group.items()
+    }
+
+
+def _knowledge_gate_receipt_audit(
+    plan: dict[str, Any] | None,
+    plan_sha256: str,
+    dispatched_tool_calls: list[dict[str, Any]],
+    *,
+    allowed_skill_scripts: list[tuple[str, str, str]],
+    allowed_skill_commands: list[
+        tuple[str, str, str, tuple[str, ...]]
+    ],
+    allowed_skill_http_prefixes: list[tuple[str, str]],
+    allowed_skill_http_post_prefixes: list[tuple[str, str]],
+) -> tuple[dict[str, Any], str | None]:
+    """Parse typed decisions and audit each activated conditional OR-group."""
+
+    if plan is None:
+        return {}, None
+    indexed_decision_calls = [
+        (index, call)
+        for index, call in enumerate(dispatched_tool_calls)
+        if (
+            call.get("tool_name") == _KNOWLEDGE_GATE_DECISION_TOOL
+            and call.get("outcome") == "success"
         )
+    ]
+    decision_calls = [call for _index, call in indexed_decision_calls]
+    audit: dict[str, Any] = {
+        "mode": "exact_conditional_candidate_groups",
+        "knowledge_gate_plan_sha256": plan_sha256,
+        "decision_call_count": len(decision_calls),
+        "decisions": [],
+        "activated_group_ids": [],
+        "unactivated_group_ids": [],
+        "successful_group_ids": [],
+        "failed_group_ids": [],
+        "unresolved_group_ids": [],
+        "missing_receipt_group_ids": [],
+        "unknown_check_ids": [],
+        "gap_ids": [],
+        "receipts": [],
+    }
+    if len(decision_calls) != 1:
+        return audit, (
+            "Delegated knowledge-gate execution requires exactly one "
+            "successful submit_knowledge_gate_decisions dispatch."
+        )
+    decision_call_index = indexed_decision_calls[0][0]
+    decision_args = (
+        decision_calls[0].get("args")
+        if isinstance(decision_calls[0].get("args"), dict)
+        else {}
     )
-    if tool_name == "run_skill_script":
-        return has_arguments
-    method_name = str(args.get("method_name") or "").strip()
-    class_name = str(args.get("class_name") or "").strip()
-    if method_name and class_name:
-        return method_name.casefold() != "main" or has_arguments
-    function_name = str(args.get("function_name") or "").strip()
-    if function_name:
-        return function_name.casefold() != "main" or has_arguments
-    return has_arguments
+    try:
+        from knowledge_gate_runtime import validate_knowledge_gate_decisions
+
+        decision_result = validate_knowledge_gate_decisions(
+            plan,
+            expected_sha256=plan_sha256,
+            supplied_sha256=str(
+                decision_args.get("plan_sha256") or ""
+            ),
+            decisions=decision_args.get("decisions"),
+        )
+    except (RuntimeError, TypeError, ValueError):
+        decision_result = {
+            "status": "error",
+            "error": "knowledge-gate decision validation failed closed",
+        }
+    if (
+        not isinstance(decision_result, dict)
+        or decision_result.get("status") != "accepted"
+    ):
+        return audit, (
+            "The successful knowledge-gate decision dispatch did not carry "
+            "one complete decision set for the exact frozen plan: "
+            + str(
+                (
+                    decision_result.get("error")
+                    if isinstance(decision_result, dict)
+                    else ""
+                )
+                or "invalid decision receipt"
+            )
+        )
+
+    decisions = [
+        dict(decision)
+        for decision in decision_result.get("decisions") or []
+        if isinstance(decision, dict)
+    ]
+    audit["decisions"] = decisions
+    check_by_id = {
+        str(check.get("id") or ""): check
+        for check in plan.get("checks") or []
+        if isinstance(check, dict)
+    }
+    group_by_id = {
+        str(group.get("id") or ""): group
+        for group in plan.get("groups") or []
+        if isinstance(group, dict)
+    }
+    candidate_by_id = {
+        str(candidate.get("candidate_id") or ""): candidate
+        for candidate in plan.get("candidates") or []
+        if isinstance(candidate, dict)
+    }
+    activated_group_ids: list[str] = []
+    unknown_check_ids: list[str] = []
+    for decision in decisions:
+        check_id = str(decision.get("check_id") or "")
+        outcome = str(decision.get("outcome") or "")
+        if outcome not in {"yes", "no", "unknown"}:
+            return audit, (
+                "Knowledge-gate decisions support only yes, no, or unknown; "
+                "an unowned applicability outcome cannot bypass a branch."
+            )
+        if outcome == "unknown":
+            unknown_check_ids.append(check_id)
+        check = check_by_id.get(check_id) or {}
+        branch = next(
+            (
+                item
+                for item in check.get("branches") or []
+                if (
+                    isinstance(item, dict)
+                    and item.get("outcome") == outcome
+                )
+            ),
+            None,
+        )
+        if isinstance(branch, dict):
+            activated_group_ids.extend(
+                str(group_id)
+                for group_id in branch.get("group_ids") or []
+                if str(group_id) in group_by_id
+            )
+    activated_group_ids = list(dict.fromkeys(activated_group_ids))
+    audit["activated_group_ids"] = activated_group_ids
+    audit["unactivated_group_ids"] = [
+        group_id
+        for group_id in group_by_id
+        if group_id not in set(activated_group_ids)
+    ]
+    audit["unknown_check_ids"] = unknown_check_ids
+
+    unresolved_group_ids = [
+        group_id
+        for group_id in activated_group_ids
+        if not group_by_id[group_id].get("candidate_ids")
+    ]
+    executable_group_ids = [
+        group_id
+        for group_id in activated_group_ids
+        if group_by_id[group_id].get("candidate_ids")
+    ]
+    candidate_dispatch_calls = [
+        (index, call)
+        for index, call in enumerate(dispatched_tool_calls)
+        if (
+            index > decision_call_index
+            and call.get("tool_name") != _KNOWLEDGE_GATE_DECISION_TOOL
+            and call.get("deterministic_prerequisite_preload") is not True
+        )
+    ]
+
+    def call_matches_group(
+        group_id: str,
+        call: dict[str, Any],
+    ) -> tuple[bool, str]:
+        tool_name = str(call.get("tool_name") or "")
+        args = call.get("args") if isinstance(call.get("args"), dict) else {}
+        artifacts = (
+            call.get("artifacts")
+            if isinstance(call.get("artifacts"), list)
+            else []
+        )
+        for candidate_id in group_by_id[group_id].get("candidate_ids") or []:
+            candidate = candidate_by_id.get(str(candidate_id))
+            if not isinstance(candidate, dict):
+                continue
+            if capability_call_satisfies_candidate(
+                candidate,
+                tool_name=tool_name,
+                args=args,
+                result_data=(
+                    call.get("result_data")
+                    if isinstance(call.get("result_data"), dict)
+                    else {}
+                ),
+                outcome=str(call.get("outcome") or "error"),
+                skill_resource_complete=call.get(
+                    "skill_resource_complete"
+                ),
+                artifacts=artifacts,
+                allowed_skill_scripts=allowed_skill_scripts,
+                allowed_skill_commands=allowed_skill_commands,
+                allowed_skill_http_prefixes=(
+                    allowed_skill_http_prefixes
+                ),
+                allowed_skill_http_post_prefixes=(
+                    allowed_skill_http_post_prefixes
+                ),
+            ):
+                return True, str(candidate_id)
+        return False, ""
+
+    edge_candidate_ids: dict[tuple[str, int], str] = {}
+    success_edges: dict[str, list[int]] = {}
+    failed_edges: dict[str, list[int]] = {}
+    call_by_index = dict(candidate_dispatch_calls)
+    for group_id in executable_group_ids:
+        success_edges[group_id] = []
+        failed_edges[group_id] = []
+        for call_index, call in candidate_dispatch_calls:
+            matches, candidate_id = call_matches_group(group_id, call)
+            if not matches:
+                continue
+            edge_candidate_ids[(group_id, call_index)] = candidate_id
+            target = (
+                success_edges
+                if call.get("outcome") == "success"
+                else failed_edges
+            )
+            target[group_id].append(call_index)
+
+    success_matches = _maximum_distinct_group_dispatch_matching(
+        executable_group_ids,
+        success_edges,
+    )
+    used_call_indexes = set(success_matches.values())
+    remaining_group_ids = [
+        group_id
+        for group_id in executable_group_ids
+        if group_id not in success_matches
+    ]
+    remaining_failed_edges = {
+        group_id: [
+            call_index
+            for call_index in failed_edges.get(group_id, [])
+            if call_index not in used_call_indexes
+        ]
+        for group_id in remaining_group_ids
+    }
+    failed_matches = _maximum_distinct_group_dispatch_matching(
+        remaining_group_ids,
+        remaining_failed_edges,
+    )
+    successful_group_ids = [
+        group_id
+        for group_id in executable_group_ids
+        if group_id in success_matches
+    ]
+    failed_group_ids = [
+        group_id
+        for group_id in executable_group_ids
+        if group_id in failed_matches
+    ]
+    missing_group_ids = [
+        group_id
+        for group_id in executable_group_ids
+        if (
+            group_id not in success_matches
+            and group_id not in failed_matches
+        )
+    ]
+    receipts: list[dict[str, Any]] = []
+    for group_id in executable_group_ids:
+        call_index = success_matches.get(group_id)
+        if call_index is None:
+            call_index = failed_matches.get(group_id)
+        if call_index is None:
+            continue
+        call = call_by_index[call_index]
+        receipts.append({
+            "group_id": group_id,
+            "candidate_id": edge_candidate_ids.get(
+                (group_id, call_index),
+            ),
+            "tool_name": str(call.get("tool_name") or ""),
+            "outcome": str(call.get("outcome") or "error"),
+        })
+    gap_ids = (
+        [f"check:{check_id}:unknown" for check_id in unknown_check_ids]
+        + [
+            f"group:{group_id}:unresolved"
+            for group_id in unresolved_group_ids
+        ]
+        + [
+            f"group:{group_id}:failed"
+            for group_id in failed_group_ids
+        ]
+    )
+    audit.update({
+        "successful_group_ids": successful_group_ids,
+        "failed_group_ids": failed_group_ids,
+        "unresolved_group_ids": unresolved_group_ids,
+        "missing_receipt_group_ids": missing_group_ids,
+        "gap_ids": gap_ids,
+        "receipts": receipts,
+    })
+    if missing_group_ids:
+        return audit, (
+            "Delegated knowledge-gate execution did not produce one distinct "
+            "actual dispatch receipt for every activated executable group; "
+            "missing: " + ", ".join(missing_group_ids)
+        )
+    return audit, None
 
 
 def _extract_intent_selections(content: str) -> dict[str, Any] | None:
@@ -3609,6 +5035,11 @@ async def _run_child(
         capability_bindings_sha256,
         capability_bindings_metadata_error,
     ) = _strict_exact_capability_bindings(task)
+    (
+        knowledge_gate_plan,
+        knowledge_gate_plan_sha256,
+        knowledge_gate_plan_metadata_error,
+    ) = _strict_knowledge_gate_plan(task)
     required_skill_files_to_inspect, skill_inspection_metadata_error = (
         _strict_task_string_list(
             task,
@@ -3732,6 +5163,10 @@ async def _run_child(
         if isinstance(requested_tools, list)
         else [str(name) for name in context.enabled_tools]
     )
+    validated_knowledge_gate_control = bool(
+        knowledge_gate_plan is not None
+        and knowledge_gate_plan_metadata_error is None
+    )
     requested_mcp_names = [
         name for name in requested_tool_names if name.startswith("mcp_")
     ]
@@ -3822,7 +5257,16 @@ async def _run_child(
         tools = [
             str(name) for name in requested_tools
             if (
-                str(name) in context.enabled_tools
+                (
+                    (
+                        str(name) == _KNOWLEDGE_GATE_DECISION_TOOL
+                        and validated_knowledge_gate_control
+                    )
+                    or (
+                        str(name) != _KNOWLEDGE_GATE_DECISION_TOOL
+                        and str(name) in context.enabled_tools
+                    )
+                )
                 and (
                     (
                         str(name).startswith("mcp_")
@@ -3847,7 +5291,14 @@ async def _run_child(
         rejected_tools = list(dict.fromkeys(
             name for name in requested_tool_names if name not in tools
         ))
-        if rejected_tools:
+        if (
+            rejected_tools
+            and not (
+                knowledge_gate_plan_metadata_error is not None
+                and set(rejected_tools)
+                == {_KNOWLEDGE_GATE_DECISION_TOOL}
+            )
+        ):
             return {
                 "index": index,
                 "status": "error",
@@ -3895,31 +5346,44 @@ async def _run_child(
         tools = [
             name for name in context.enabled_tools
             if (
-                (
-                    name.startswith("mcp_")
-                    and name in session_mcp_names
-                    and (
-                        not parallel_child
-                        or session_mcp_descriptors[
-                            name
-                        ].policy.parallel_child_safe
+                name != _KNOWLEDGE_GATE_DECISION_TOOL
+                and (
+                    (
+                        name.startswith("mcp_")
+                        and name in session_mcp_names
+                        and (
+                            not parallel_child
+                            or session_mcp_descriptors[
+                                name
+                            ].policy.parallel_child_safe
+                        )
                     )
-                )
-                or (
-                    not name.startswith("mcp_")
-                    and _tool_allowed_in_child(
-                        name,
-                        parallel_child=parallel_child,
+                    or (
+                        not name.startswith("mcp_")
+                        and _tool_allowed_in_child(
+                            name,
+                            parallel_child=parallel_child,
+                        )
                     )
                 )
             )
         ]
+        if (
+            validated_knowledge_gate_control
+            and _tool_allowed_in_child(
+                _KNOWLEDGE_GATE_DECISION_TOOL,
+                parallel_child=parallel_child,
+            )
+        ):
+            tools.append(_KNOWLEDGE_GATE_DECISION_TOOL)
+        tools = list(dict.fromkeys(tools))
     metadata_error = (
         result_path_metadata_error
         or worker_file_metadata_error
         or capability_metadata_error
         or capability_skill_metadata_error
         or capability_bindings_metadata_error
+        or knowledge_gate_plan_metadata_error
         or skill_inspection_metadata_error
         or instruction_source_metadata_error
         or result_field_metadata_error
@@ -3938,47 +5402,137 @@ async def _run_child(
                 + ", ".join(missing_capability_grants)
             )
     exact_node_capability_grants: dict[str, Any] | None = None
+    knowledge_gate_candidate_grants: dict[str, Any] | None = None
     if metadata_error is None and capability_bindings:
+        binding_capability_skills = list(dict.fromkeys(
+            str(binding.get("skill_name") or "")
+            for binding in capability_bindings
+            if (
+                binding.get("kind")
+                in {"skill_script", "declared_command", "skill_http_prefix"}
+                and str(binding.get("skill_name") or "")
+            )
+        ))
         (
             exact_node_capability_grants,
             exact_binding_boundary_error,
         ) = _exact_node_capability_grants(
             capability_bindings,
-            required_capability_skills=required_capability_skills,
+            required_capability_skills=(
+                binding_capability_skills
+                if knowledge_gate_plan is not None
+                else required_capability_skills
+            ),
             context=context,
         )
         if exact_binding_boundary_error:
             metadata_error = exact_binding_boundary_error
+    if metadata_error is None and knowledge_gate_plan is not None:
+        (
+            knowledge_gate_candidate_grants,
+            gate_boundary_error,
+        ) = _exact_knowledge_gate_candidate_grants(
+            knowledge_gate_plan,
+            context=context,
+        )
+        if gate_boundary_error:
+            metadata_error = gate_boundary_error
         else:
-            exact_bound_tools = set(
-                exact_node_capability_grants.get("bound_tool_names") or []
-            )
-            unexpected_tools = sorted(
-                set(tools) - exact_bound_tools - _PRELOADED_READER_TOOLS
-            )
-            if unexpected_tools:
-                metadata_error = (
-                    "Exact Workflow IR node tools must be limited to its own "
-                    "capability bindings plus deterministic prerequisite readers; "
-                    "unexpected: " + ", ".join(unexpected_tools)
+            gate_capability_skills = {
+                str(candidate.get("skill_name") or "")
+                for candidate in knowledge_gate_plan.get("candidates") or []
+                if (
+                    str(candidate.get("skill_name") or "")
                 )
-            else:
-                for binding in (
-                    exact_node_capability_grants.get("receipt_bindings") or []
-                ):
-                    kind = str(binding.get("kind") or "")
-                    candidate_tools = set(binding.get("tool_names") or [])
-                    if kind == "skill_resource":
-                        available = "skill_view" in tools
-                    else:
-                        available = bool(candidate_tools.intersection(tools))
-                    if not available:
-                        metadata_error = (
-                            "Exact Workflow IR capability candidate "
-                            f"{binding.get('candidate_id')} has no usable tool in "
-                            "the child's explicit allowlist."
-                        )
-                        break
+            }
+            missing_gate_skill_preloads = sorted(
+                gate_capability_skills
+                - set(required_capability_skills)
+            )
+            if missing_gate_skill_preloads:
+                metadata_error = (
+                    "knowledge_gate_plan capability Skills must be declared in "
+                    "required_capability_skills for exact main-file preloading; "
+                    "missing: " + ", ".join(missing_gate_skill_preloads)
+                )
+            missing_parent_gate_mains = sorted(
+                f"{capability_skill}/SKILL.md"
+                for capability_skill in required_capability_skills
+                if (
+                    capability_skill,
+                    "SKILL.md",
+                ) not in set(context.allowed_skill_resources)
+            )
+            if metadata_error is None and missing_parent_gate_mains:
+                metadata_error = (
+                    "knowledge_gate_plan capability Skill mains are outside "
+                    "the parent resource grant: "
+                    + ", ".join(missing_parent_gate_mains)
+                )
+    exact_authority_active = bool(
+        capability_bindings or knowledge_gate_plan is not None
+    )
+    if metadata_error is None and exact_authority_active:
+        exact_bound_tools = set(
+            (exact_node_capability_grants or {}).get("bound_tool_names") or []
+        ) | set(
+            (knowledge_gate_candidate_grants or {}).get(
+                "tool_names"
+            ) or []
+        )
+        allowed_control_tools = (
+            {_KNOWLEDGE_GATE_DECISION_TOOL}
+            if knowledge_gate_plan is not None
+            else set()
+        )
+        if (
+            knowledge_gate_plan is not None
+            and _KNOWLEDGE_GATE_DECISION_TOOL not in tools
+        ):
+            metadata_error = (
+                "knowledge_gate_plan requires "
+                "submit_knowledge_gate_decisions in the child's exact "
+                "explicit tool allowlist."
+            )
+        unexpected_tools = sorted(
+            set(tools)
+            - exact_bound_tools
+            - _PRELOADED_READER_TOOLS
+            - allowed_control_tools
+        )
+        if metadata_error is None and unexpected_tools:
+            metadata_error = (
+                "Exact Workflow IR node tools must be limited to its own "
+                "mandatory/conditional capability bindings, the knowledge-gate "
+                "decision control, and deterministic prerequisite readers; "
+                "unexpected: " + ", ".join(unexpected_tools)
+            )
+        for binding in (
+            list(
+                (exact_node_capability_grants or {}).get(
+                    "receipt_bindings"
+                ) or []
+            )
+            + list(
+                (knowledge_gate_candidate_grants or {}).get(
+                    "receipt_bindings"
+                ) or []
+            )
+        ):
+            if metadata_error is not None:
+                break
+            kind = str(binding.get("kind") or "")
+            candidate_tools = set(
+                _knowledge_gate_candidate_tool_names(binding)
+            )
+            available = bool(candidate_tools.intersection(tools))
+            if not available:
+                metadata_error = (
+                    "Exact Workflow IR capability candidate "
+                    f"{binding.get('candidate_id')} has no usable tool in "
+                    "the child's explicit allowlist."
+                )
+                break
     if metadata_error is None and required_instruction_source_bindings:
         missing_instruction_preloads = sorted(
             {
@@ -4072,6 +5626,18 @@ async def _run_child(
             "required_result_fields is not valid on the deterministic "
             "intent-only delegation path."
         )
+    if (
+        metadata_error is None
+        and knowledge_gate_plan is not None
+        and (
+            "deterministic_intent_selections" in task
+            or "required_skill_files" in task
+        )
+    ):
+        metadata_error = (
+            "knowledge_gate_plan is not valid on the deterministic intent-only "
+            "delegation path."
+        )
     if metadata_error:
         return {
             "index": index,
@@ -4096,6 +5662,15 @@ async def _run_child(
             "capability_binding_candidate_ids": [
                 str(binding.get("candidate_id") or "")
                 for binding in capability_bindings
+            ],
+            "knowledge_gate_plan_sha256": (
+                knowledge_gate_plan_sha256 or None
+            ),
+            "knowledge_gate_candidate_ids": [
+                str(candidate.get("candidate_id") or "")
+                for candidate in (
+                    (knowledge_gate_plan or {}).get("candidates") or []
+                )
             ],
             "required_skill_files_to_inspect": required_skill_files_to_inspect,
             "required_instruction_source_bindings": (
@@ -4211,9 +5786,38 @@ async def _run_child(
             if capability_bindings else ""
         )
         + (
+            "Frozen conditional knowledge-gate plan (copy its digest unchanged "
+            "into exactly one submit_knowledge_gate_decisions call before "
+            "ordinary evidence dispatch). Every yes/no/unknown decision "
+            "activates only its matching declared branch. Branch groups are "
+            "AND obligations and "
+            "candidate IDs inside one one_of group are alternatives. Every "
+            "activated group with candidates requires its own distinct actual "
+            "dispatch; another group's receipt cannot be reused. An unknown "
+            "decision, an activated group with no resolved candidates, or a "
+            "group whose matching dispatches all fail requires a result-level "
+            "degraded status and exactly one single-line ledger "
+            '`KNOWLEDGE_GATE_GAPS_JSON: {"status":"degraded",'
+            '"gap_ids":["<exact Harness gap id>",...]}`. Use only these '
+            "deterministic IDs: `check:<check_id>:unknown`, "
+            "`group:<group_id>:unresolved`, and "
+            "`group:<group_id>:failed`. Do not report "
+            "unselected branches or unused alternatives as gaps. Plan: "
+            + json.dumps(
+                {
+                    **(knowledge_gate_plan or {}),
+                    "plan_sha256": knowledge_gate_plan_sha256,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n"
+            if knowledge_gate_plan is not None else ""
+        )
+        + (
             "Required evidence capabilities (at least one must actually be "
             f"attempted): {', '.join(required_capability_tools)}\n"
-            if required_capability_tools and not capability_bindings else ""
+            if required_capability_tools and not exact_authority_active else ""
         )
         + (
             "Required capability Skill mains already loaded by the harness "
@@ -4614,6 +6218,15 @@ async def _run_child(
                 capability_bindings_sha256 or None
             ),
             "capability_binding_count": len(capability_bindings),
+            "knowledge_gate_plan_sha256": (
+                knowledge_gate_plan_sha256 or None
+            ),
+            "knowledge_gate_check_count": len(
+                (knowledge_gate_plan or {}).get("checks") or []
+            ),
+            "knowledge_gate_group_count": len(
+                (knowledge_gate_plan or {}).get("groups") or []
+            ),
             "required_skill_files_to_inspect": required_skill_files_to_inspect,
             "parallel_child": parallel_child,
             "requested_tools": requested_tools or [],
@@ -5122,10 +6735,42 @@ async def _run_child(
         )
     )
     capability_resource_grant_error = None
-    if capability_bindings:
-        capability_resource_grants = list(
-            (exact_node_capability_grants or {}).get("resource_grants") or []
-        )
+    exact_grants_active = bool(
+        capability_bindings or knowledge_gate_plan is not None
+    )
+
+    def exact_grants(field: str) -> list[Any]:
+        # Conditional gate coordinates are deliberately absent from the
+        # child's initial ToolContext.  They travel in the separately sealed
+        # runtime authority bundle and are installed only after the typed
+        # decision control activates their exact groups.
+        return list(dict.fromkeys(
+            (exact_node_capability_grants or {}).get(field) or []
+        ))
+
+    if exact_grants_active:
+        capability_resource_grants = exact_grants("resource_grants")
+        required_capability_mains = [
+            (capability_skill, "SKILL.md")
+            for capability_skill in required_capability_skills
+        ]
+        missing_capability_mains = [
+            f"{capability_skill}/SKILL.md"
+            for capability_skill, main_path in required_capability_mains
+            if (
+                capability_skill,
+                main_path,
+            ) not in set(context.allowed_skill_resources)
+        ]
+        if missing_capability_mains:
+            capability_resource_grant_error = (
+                "Delegated exact capability Skill mains are outside the "
+                "parent resource grant: "
+                + ", ".join(missing_capability_mains)
+            )
+        capability_resource_grants = list(dict.fromkeys(
+            capability_resource_grants + required_capability_mains
+        ))
     elif delegated_resource_boundary and required_capability_skills:
         capability_resource_grants, capability_resource_grant_error = (
             _exact_capability_skill_resource_grants(
@@ -5147,10 +6792,8 @@ async def _run_child(
         + capability_resource_grants
     ))
     allowed_skill_scripts = (
-        list(
-            (exact_node_capability_grants or {}).get("script_grants") or []
-        )
-        if capability_bindings
+        exact_grants("script_grants")
+        if exact_grants_active
         else _exact_declared_skill_script_grants(
             skill_name=skill_name,
             skill_preload_paths=skill_preload_paths,
@@ -5181,10 +6824,8 @@ async def _run_child(
         skill for skill, _path, _digest in allowed_skill_scripts
     }
     allowed_skill_package_digests = (
-        list(
-            (exact_node_capability_grants or {}).get("package_grants") or []
-        )
-        if capability_bindings
+        exact_grants("package_grants")
+        if exact_grants_active
         else [
             row
             for row in context.allowed_skill_package_digests
@@ -5193,7 +6834,12 @@ async def _run_child(
     )
     try:
         exact_script_entrypoint_guidance = (
-            _render_exact_child_script_entrypoints(allowed_skill_scripts)
+            _render_exact_child_script_entrypoints(
+                allowed_skill_scripts,
+                user_id=context.user_id,
+                session_id=context.session_id,
+                enabled_user_skills=list(context.enabled_user_skills),
+            )
         )
     except ValueError as exc:
         exact_script_entrypoint_guidance = ""
@@ -5205,30 +6851,24 @@ async def _run_child(
     if exact_script_entrypoint_guidance:
         prompt += "\n\n" + exact_script_entrypoint_guidance
     allowed_skill_http_prefixes = (
-        list(
-            (exact_node_capability_grants or {}).get("http_get_grants") or []
-        )
-        if capability_bindings
+        exact_grants("http_get_grants")
+        if exact_grants_active
         else _exact_capability_skill_http_grants(
             required_capability_skills,
             context=context,
         )
     )
     allowed_skill_http_post_prefixes = (
-        list(
-            (exact_node_capability_grants or {}).get("http_post_grants") or []
-        )
-        if capability_bindings
+        exact_grants("http_post_grants")
+        if exact_grants_active
         else _exact_capability_skill_http_post_grants(
             required_capability_skills,
             context=context,
         )
     )
     allowed_skill_commands = (
-        list(
-            (exact_node_capability_grants or {}).get("command_grants") or []
-        )
-        if capability_bindings
+        exact_grants("command_grants")
+        if exact_grants_active
         else _exact_declared_skill_command_grants(
             task=task,
             required_capability_skills=required_capability_skills,
@@ -5239,18 +6879,35 @@ async def _run_child(
     has_on_demand_capability_resources = any(
         path != "SKILL.md"
         for skill, path in capability_resource_grants
-        if skill in set(required_capability_skills)
+    )
+    mandatory_exact_tool_names = set(
+        (exact_node_capability_grants or {}).get("bound_tool_names") or []
+    )
+    runtime_base_tools = (
+        [
+            name
+            for name in tools
+            if (
+                name in mandatory_exact_tool_names
+                or name in _PRELOADED_READER_TOOLS
+                or name == _KNOWLEDGE_GATE_DECISION_TOOL
+            )
+        ]
+        if knowledge_gate_plan is not None
+        else list(tools)
     )
     model_tools = (
         [
-            name for name in tools
+            name for name in runtime_base_tools
             if name not in _PRELOADED_READER_TOOLS
             or (name == "skill_view" and has_on_demand_capability_resources)
         ]
         if delegated_resource_boundary
-        else list(tools)
+        else list(runtime_base_tools)
     )
-    preloaded_reader_tools = sorted(set(tools) - set(model_tools))
+    preloaded_reader_tools = sorted(
+        set(runtime_base_tools) - set(model_tools)
+    )
     if len(preload_specs) > _MAX_PRELOADED_PREREQUISITES:
         preload_error = (
             "Delegated prerequisite preload failed closed: the orchestrator "
@@ -5356,6 +7013,29 @@ async def _run_child(
         for binding in capability_bindings
         if binding.get("kind") == "skill_resource"
     }
+    exact_resource_binding_digests.update({
+        (
+            str(binding.get("skill_name") or ""),
+            str(binding.get("resource_path") or ""),
+        ): str(binding.get("sha256") or "")
+        for binding in (
+            (knowledge_gate_plan or {}).get("candidates") or []
+        )
+        if binding.get("kind") == "skill_resource"
+    })
+    exact_resource_binding_digests.update({
+        (
+            str(binding.get("skill_name") or ""),
+            "SKILL.md",
+        ): str(binding.get("skill_md_sha256") or "")
+        for binding in (
+            (knowledge_gate_plan or {}).get("candidates") or []
+        )
+        if (
+            str(binding.get("skill_name") or "")
+            and str(binding.get("skill_md_sha256") or "")
+        )
+    })
     exact_resource_binding_digests.update({
         (skill_name, binding["resource_path"]): binding["sha256"]
         for binding in required_instruction_source_bindings
@@ -5608,6 +7288,7 @@ async def _run_child(
                     if tool_name == "skill_view" and succeeded
                     else None
                 ),
+                "deterministic_prerequisite_preload": True,
             })
             await forward_event({
                 "type": "agent_event",
@@ -6463,6 +8144,15 @@ async def _run_child(
         required_result_schema=required_result_schema,
         retrieval_completeness_policy=retrieval_completeness_policy,
         required_capability_tools=required_capability_tools,
+        knowledge_gate_plan=knowledge_gate_plan,
+        knowledge_gate_plan_sha256=(
+            knowledge_gate_plan_sha256 or None
+        ),
+        knowledge_gate_candidate_authority=(
+            knowledge_gate_candidate_grants
+            if knowledge_gate_plan is not None
+            else None
+        ),
         verified_preloaded_input_receipt=(
             verified_preloaded_input_receipt
         ),
@@ -6665,13 +8355,49 @@ async def _run_child(
                     for item in emitted_artifacts[:512]
                     if isinstance(item, dict)
                 ]
+                exact_capability_receipt = payload.get(
+                    "exact_capability_receipt"
+                )
+                if not isinstance(exact_capability_receipt, dict):
+                    exact_capability_receipt = {}
+                receipt_result_data = exact_capability_receipt.get(
+                    "result_data"
+                )
+                if not isinstance(receipt_result_data, dict):
+                    receipt_result_data = {}
                 dispatched_tool_calls.append({
                     "tool_name": tool_name,
                     "args": canonical_args,
                     "outcome": "success" if succeeded else "error",
                     "artifacts": emitted_artifacts,
-                    "result_data": {},
-                    "skill_resource_complete": None,
+                    "result_data": {
+                        key: value
+                        for key, value in receipt_result_data.items()
+                        if key in {
+                            "sha256",
+                            "error_code",
+                            "request_sent",
+                            "status",
+                            "plan_sha256",
+                            "activated_group_ids",
+                            "unresolved_group_ids",
+                            "unknown_check_ids",
+                            "matched_skill",
+                            "matched_prefix_sha256",
+                        }
+                    },
+                    "skill_resource_complete": (
+                        exact_capability_receipt.get(
+                            "skill_resource_complete"
+                        )
+                        if isinstance(
+                            exact_capability_receipt.get(
+                                "skill_resource_complete"
+                            ),
+                            bool,
+                        )
+                        else None
+                    ),
                 })
                 if not succeeded:
                     continue
@@ -7091,15 +8817,6 @@ async def _run_child(
                     if isinstance(call.get("artifacts"), list)
                     else []
                 )
-                if (
-                    binding.get("kind") == "skill_script"
-                    and not _script_call_has_semantic_task_binding(
-                        call_tool_name,
-                        call_args,
-                        artifacts,
-                    )
-                ):
-                    continue
                 if capability_call_satisfies_candidate(
                     binding,
                     tool_name=call_tool_name,
@@ -7113,6 +8830,7 @@ async def _run_child(
                     skill_resource_complete=call.get(
                         "skill_resource_complete"
                     ),
+                    artifacts=artifacts,
                     allowed_skill_scripts=allowed_skill_scripts,
                     allowed_skill_commands=allowed_skill_commands,
                     allowed_skill_http_prefixes=(
@@ -7181,6 +8899,13 @@ async def _run_child(
                         gap_ledger_error + "; failed candidates: "
                         + ", ".join(failed_exact_candidate_ids)
                     )
+    elif knowledge_gate_plan is not None:
+        capability_receipt_audit = {
+            "mode": "conditional_knowledge_gate_plan",
+            "required_tool_names": [],
+            "attempted_tool_names": [],
+            "successful_tool_names": [],
+        }
     else:
         capability_receipt_audit = {
             "mode": "legacy_tool_alternative",
@@ -7189,9 +8914,143 @@ async def _run_child(
             "successful_tool_names": successful_required_capabilities,
         }
 
+    (
+        knowledge_gate_receipt_audit,
+        knowledge_gate_receipt_error,
+    ) = _knowledge_gate_receipt_audit(
+        knowledge_gate_plan,
+        knowledge_gate_plan_sha256,
+        dispatched_tool_calls,
+        allowed_skill_scripts=list(dict.fromkeys(
+            allowed_skill_scripts
+            + list(
+                (knowledge_gate_candidate_grants or {}).get(
+                    "script_grants"
+                ) or []
+            )
+        )),
+        allowed_skill_commands=list(dict.fromkeys(
+            allowed_skill_commands
+            + list(
+                (knowledge_gate_candidate_grants or {}).get(
+                    "command_grants"
+                ) or []
+            )
+        )),
+        allowed_skill_http_prefixes=list(dict.fromkeys(
+            allowed_skill_http_prefixes
+            + list(
+                (knowledge_gate_candidate_grants or {}).get(
+                    "http_get_grants"
+                ) or []
+            )
+        )),
+        allowed_skill_http_post_prefixes=(
+            list(dict.fromkeys(
+                allowed_skill_http_post_prefixes
+                + list(
+                    (knowledge_gate_candidate_grants or {}).get(
+                        "http_post_grants"
+                    ) or []
+                )
+            ))
+        ),
+    )
+    if knowledge_gate_plan is not None:
+        await forward_event(child_event(
+            "debug.knowledge_gate.final_audit",
+            {
+                "knowledge_gate_plan_sha256": (
+                    knowledge_gate_plan_sha256
+                ),
+                "decision_call_count": (
+                    knowledge_gate_receipt_audit.get(
+                        "decision_call_count"
+                    )
+                ),
+                "activated_group_ids": list(
+                    knowledge_gate_receipt_audit.get(
+                        "activated_group_ids"
+                    ) or []
+                ),
+                "successful_group_ids": list(
+                    knowledge_gate_receipt_audit.get(
+                        "successful_group_ids"
+                    ) or []
+                ),
+                "failed_group_ids": list(
+                    knowledge_gate_receipt_audit.get(
+                        "failed_group_ids"
+                    ) or []
+                ),
+                "unresolved_group_ids": list(
+                    knowledge_gate_receipt_audit.get(
+                        "unresolved_group_ids"
+                    ) or []
+                ),
+                "missing_receipt_group_ids": list(
+                    knowledge_gate_receipt_audit.get(
+                        "missing_receipt_group_ids"
+                    ) or []
+                ),
+                "unknown_check_ids": list(
+                    knowledge_gate_receipt_audit.get(
+                        "unknown_check_ids"
+                    ) or []
+                ),
+                "gap_ids": list(
+                    knowledge_gate_receipt_audit.get("gap_ids")
+                    or []
+                ),
+                "receipt_count": len(
+                    knowledge_gate_receipt_audit.get("receipts")
+                    or []
+                ),
+                "audit_valid": knowledge_gate_receipt_error is None,
+                "audit_error_code": (
+                    "knowledge_gate_receipt_audit_failed"
+                    if knowledge_gate_receipt_error
+                    else None
+                ),
+            },
+        ))
+    if validation_error is None and knowledge_gate_receipt_error:
+        validation_error = knowledge_gate_receipt_error
+    knowledge_gate_gap_ids = list(
+        knowledge_gate_receipt_audit.get("gap_ids") or []
+    )
+    if (
+        validation_error is None
+        and knowledge_gate_plan is not None
+        and knowledge_gate_gap_ids
+    ):
+        if not _content_declares_degraded_completion(content):
+            validation_error = (
+                "Knowledge-gate unknown, unresolved, or failed branches require "
+                "an explicit result-level degraded status and an exact "
+                "KNOWLEDGE_GATE_GAPS_JSON ledger."
+            )
+        else:
+            gate_gap_error = _exact_knowledge_gate_gap_ledger_error(
+                content,
+                knowledge_gate_gap_ids,
+            )
+            if gate_gap_error:
+                validation_error = gate_gap_error
+    elif (
+        validation_error is None
+        and knowledge_gate_plan is not None
+    ):
+        gate_gap_error = _exact_knowledge_gate_gap_ledger_error(
+            content,
+            [],
+        )
+        if gate_gap_error:
+            validation_error = gate_gap_error
+
     for script_runner in (
         ("run_skill_python", "run_skill_script")
-        if not capability_bindings
+        if not exact_grants_active
         else ()
     ):
         if not (
@@ -7243,7 +9102,7 @@ async def _run_child(
                 })
     if (
         validation_error is None
-        and not capability_bindings
+        and not exact_grants_active
         and required_capability_tools
         and not attempted_required_capabilities
     ):
@@ -7253,7 +9112,7 @@ async def _run_child(
         )
     if (
         validation_error is None
-        and not capability_bindings
+        and not exact_grants_active
         and attempted_required_capabilities
         and not successful_required_capabilities
         and not _DEGRADED_REPORT_PATTERN.search(content)
@@ -7262,7 +9121,7 @@ async def _run_child(
             "Every attempted required evidence capability failed; completion "
             "requires an explicit WARN/degraded report naming the evidence gap."
         )
-    if not capability_bindings:
+    if not exact_grants_active:
         capability_receipt_audit["successful_tool_names"] = list(
             successful_required_capabilities
         )
@@ -7537,6 +9396,12 @@ async def _run_child(
             capability_bindings_sha256 or None
         ),
         "capability_receipt_audit": capability_receipt_audit,
+        "knowledge_gate_plan_sha256": (
+            knowledge_gate_plan_sha256 or None
+        ),
+        "knowledge_gate_receipt_audit": (
+            knowledge_gate_receipt_audit
+        ),
         "required_skill_files_to_inspect": required_skill_files_to_inspect,
         "required_instruction_source_bindings": (
             required_instruction_source_bindings
@@ -7643,6 +9508,8 @@ async def delegate_task(
     required_capability_skills: list[str] | None = None,
     capability_bindings: list[dict[str, Any]] | None = None,
     capability_bindings_sha256: str | None = None,
+    knowledge_gate_plan: dict[str, Any] | None = None,
+    knowledge_gate_plan_sha256: str | None = None,
     required_skill_files_to_inspect: list[str] | None = None,
     required_instruction_source_bindings: (
         list[dict[str, str]] | None
@@ -7689,6 +9556,14 @@ async def delegate_task(
             single_task["capability_bindings"] = capability_bindings
             single_task["capability_bindings_sha256"] = (
                 capability_bindings_sha256
+            )
+        if (
+            knowledge_gate_plan is not None
+            or knowledge_gate_plan_sha256 is not None
+        ):
+            single_task["knowledge_gate_plan"] = knowledge_gate_plan
+            single_task["knowledge_gate_plan_sha256"] = (
+                knowledge_gate_plan_sha256
             )
         if (
             deterministic_intent_selections is not None
@@ -8419,6 +10294,7 @@ _EXACT_CAPABILITY_BINDINGS_PARAMETER_SCHEMA = {
             "skill_name": {"type": "string"},
             "resource_path": {"type": "string"},
             "sha256": {"type": "string"},
+            "skill_md_sha256": {"type": "string"},
             "package_sha256": {"type": "string"},
             "command_id": {"type": "string"},
             "executable": {"type": "string"},
@@ -8436,6 +10312,111 @@ _EXACT_CAPABILITY_BINDINGS_PARAMETER_SCHEMA = {
         },
         "required": ["candidate_id", "kind", "tool_names"],
     },
+}
+
+_KNOWLEDGE_GATE_PLAN_PARAMETER_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "schema_version": {"type": "integer", "enum": [1]},
+        "worker_id": {"type": "string"},
+        "owner_skill": {"type": "string"},
+        "checks": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": _MAX_KNOWLEDGE_GATE_CHECKS,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "id": {"type": "string"},
+                    "question": {"type": "string"},
+                    "legacy_ambiguous": {"type": "boolean"},
+                    "branches": {
+                        "type": "array",
+                        "maxItems": 3,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "outcome": {
+                                    "type": "string",
+                                    "enum": ["yes", "no", "unknown"],
+                                },
+                                "action": {"type": "string"},
+                                "group_ids": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                            },
+                            "required": [
+                                "outcome",
+                                "action",
+                                "group_ids",
+                            ],
+                        },
+                    },
+                },
+                "required": [
+                    "id",
+                    "question",
+                    "branches",
+                    "legacy_ambiguous",
+                ],
+            },
+        },
+        "groups": {
+            "type": "array",
+            "maxItems": _MAX_KNOWLEDGE_GATE_GROUPS,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "id": {"type": "string"},
+                    "check_id": {"type": "string"},
+                    "outcome": {
+                        "type": "string",
+                        "enum": ["yes", "no", "unknown"],
+                    },
+                    "mode": {"type": "string", "enum": ["one_of"]},
+                    "candidate_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "selectors": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "unresolved_selectors": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": [
+                    "id",
+                    "check_id",
+                    "outcome",
+                    "mode",
+                    "candidate_ids",
+                    "selectors",
+                    "unresolved_selectors",
+                ],
+            },
+        },
+        "candidates": {
+            "type": "array",
+            "maxItems": _MAX_KNOWLEDGE_GATE_CANDIDATES,
+            "items": _EXACT_CAPABILITY_BINDINGS_PARAMETER_SCHEMA["items"],
+        },
+    },
+    "required": [
+        "schema_version",
+        "worker_id",
+        "owner_skill",
+        "checks",
+        "groups",
+        "candidates",
+    ],
 }
 
 _INSTRUCTION_SOURCE_BINDINGS_PARAMETER_SCHEMA = {
@@ -8593,6 +10574,20 @@ DELEGATE_TASK_SCHEMA = {
                     "Canonical SHA-256 of capability_bindings. Copy unchanged."
                 ),
             },
+            "knowledge_gate_plan": {
+                **_KNOWLEDGE_GATE_PLAN_PARAMETER_SCHEMA,
+                "description": (
+                    "Harness-compiled conditional knowledge-gate plan. It is "
+                    "transport metadata, not authority; copy unchanged."
+                ),
+            },
+            "knowledge_gate_plan_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": (
+                    "Canonical SHA-256 of knowledge_gate_plan. Copy unchanged."
+                ),
+            },
             "required_skill_files_to_inspect": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -8700,6 +10695,13 @@ DELEGATE_TASK_SCHEMA = {
                             _EXACT_CAPABILITY_BINDINGS_PARAMETER_SCHEMA
                         ),
                         "capability_bindings_sha256": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{64}$",
+                        },
+                        "knowledge_gate_plan": (
+                            _KNOWLEDGE_GATE_PLAN_PARAMETER_SCHEMA
+                        ),
+                        "knowledge_gate_plan_sha256": {
                             "type": "string",
                             "pattern": "^[0-9a-f]{64}$",
                         },

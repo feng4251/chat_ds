@@ -37,6 +37,7 @@ from skills.command_grants import (
     compile_environment_command_grants,
     parse_allowed_tool_selectors,
 )
+from knowledge_gate import MAX_GATE_CHECKS, compile_symbolic_knowledge_gate
 
 logger = logging.getLogger(__name__)
 
@@ -2746,18 +2747,25 @@ def _normalize_worker_config(
         or config.get("requires_workers")
     )
     knowledge_gate = config.get("knowledge_gate")
-    gate_checks = knowledge_gate.get("checks") if isinstance(knowledge_gate, dict) else []
-    if isinstance(gate_checks, dict):
-        gate_checks = [
-            dict(value, id=key) if isinstance(value, dict) else {"id": key, "description": value}
-            for key, value in gate_checks.items()
-        ]
-    if not isinstance(gate_checks, list):
-        gate_checks = []
+    gate_compilation = compile_symbolic_knowledge_gate(
+        knowledge_gate,
+        skill_dir=skill_dir,
+        source_file=source_file,
+        worker_id=str(config.get("worker_id") or config.get("id") or worker_id),
+    )
+    for gate_diagnostic in gate_compilation.diagnostics:
+        _diagnostic(
+            diagnostics,
+            gate_diagnostic.level,
+            gate_diagnostic.code,
+            gate_diagnostic.message,
+            **gate_diagnostic.context,
+        )
+    gate_checks = gate_compilation.ir.get("checks") or []
     required_gate_ids = [
-        str(check.get("id") or check.get("name")).strip()
+        str(check.get("id")).strip()
         for check in gate_checks
-        if isinstance(check, dict) and (check.get("id") or check.get("name"))
+        if isinstance(check, dict) and check.get("id")
     ]
     dependencies = [str(value) for value in _bounded_sequence(
         dependencies,
@@ -2768,7 +2776,7 @@ def _normalize_worker_config(
     )]
     required_gate_ids = [str(value) for value in _bounded_sequence(
         required_gate_ids,
-        limit=80,
+        limit=MAX_GATE_CHECKS,
         diagnostics=diagnostics,
         field=f"workers[{worker_id}].required_gate_ids",
         source_file=source_file,
@@ -2798,6 +2806,52 @@ def _normalize_worker_config(
         field=f"workers[{worker_id}]",
         source_file=source_file,
     )
+    local_resources = [
+        str(value)
+        for value in _bounded_sequence(
+            _dedupe([
+                *local_resources,
+                *gate_compilation.local_resources,
+            ]),
+            limit=MAX_DECLARED_LOCAL_RESOURCES,
+            diagnostics=diagnostics,
+            field=f"workers[{worker_id}].local_resources",
+            source_file=source_file,
+        )
+    ]
+    declared_skills = config.get("skills")
+    if gate_compilation.skill_refs:
+        existing_gate_skill_names: set[str] = set()
+        declared_skill_items = (
+            sorted(declared_skills, key=str)
+            if isinstance(declared_skills, set)
+            else list(declared_skills)
+            if isinstance(declared_skills, (list, tuple))
+            else [declared_skills]
+            if declared_skills is not None
+            else []
+        )
+        for declared_skill in declared_skill_items:
+            if not isinstance(declared_skill, str):
+                continue
+            declared_name = declared_skill.strip()
+            if declared_name.casefold().startswith("skill:"):
+                declared_name = declared_name.split(":", 1)[1].strip()
+            if declared_name:
+                existing_gate_skill_names.add(declared_name.casefold())
+        gate_skill_selectors = [
+            f"skill:{skill_name}"
+            for skill_name in gate_compilation.skill_refs
+            if skill_name.casefold() not in existing_gate_skill_names
+        ]
+        if not gate_skill_selectors:
+            pass
+        elif declared_skills is None:
+            declared_skills = gate_skill_selectors
+        elif isinstance(declared_skills, (list, tuple, set)):
+            declared_skills = [*declared_skill_items, *gate_skill_selectors]
+        else:
+            declared_skills = [declared_skills, *gate_skill_selectors]
     environment_contract = _compile_nested_environment_contract(
         config,
         source_file=source_file,
@@ -2831,12 +2885,14 @@ def _normalize_worker_config(
         "required_gate_ids": required_gate_ids,
         "knowledge_gate": _compact_mapping(
             knowledge_gate,
-            max_items=80,
+            max_items=MAX_GATE_CHECKS,
             max_text=2_000,
             diagnostics=diagnostics,
             field=f"workers[{worker_id}].knowledge_gate",
             source_file=source_file,
         ),
+        "knowledge_gate_ir": gate_compilation.ir,
+        "knowledge_gate_skill_refs": list(gate_compilation.skill_refs),
         "tools": _compact_mapping(
             config.get("tools"),
             max_items=80,
@@ -2854,7 +2910,7 @@ def _normalize_worker_config(
             source_file=source_file,
         ),
         "skills": _compact_mapping(
-            config.get("skills"),
+            declared_skills,
             max_items=80,
             max_text=1_000,
             diagnostics=diagnostics,

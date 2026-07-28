@@ -59,6 +59,7 @@ _EXACT_GRANT_BRIDGES = frozenset({
 })
 _PLANNING_CONTROL_TOOLS = frozenset({
     CAPABILITY_PLAN_TOOL_NAME,
+    "submit_knowledge_gate_decisions",
     "skills_list",
     "skill_view",
 })
@@ -1655,6 +1656,50 @@ def validate_capability_plan(
     return CapabilityPlanResult(True, normalized)
 
 
+def script_call_has_semantic_task_binding(
+    tool_name: str,
+    args: dict[str, Any],
+    artifacts: Iterable[dict[str, Any]] = (),
+) -> bool:
+    """Prove that a managed script invocation is bound to the actual task.
+
+    Merely running a package demo or an argument-free ``main`` function does
+    not establish an evidence receipt. A declared callable/method, non-empty
+    data/CLI arguments, or a verified artifact does.
+    """
+
+    if any(isinstance(item, dict) for item in artifacts):
+        return True
+    count_fields = (
+        "cli_arg_count", "function_arg_count", "function_kwarg_count",
+        "constructor_arg_count", "constructor_kwarg_count",
+        "method_arg_count", "method_kwarg_count",
+    )
+    has_arguments = any(
+        isinstance(args.get(field), int)
+        and not isinstance(args.get(field), bool)
+        and args[field] > 0
+        for field in count_fields
+    )
+    has_arguments = has_arguments or any(
+        isinstance(args.get(field), (list, dict)) and bool(args.get(field))
+        for field in (
+            "args", "function_args", "function_kwargs", "constructor_args",
+            "constructor_kwargs", "method_args", "method_kwargs",
+        )
+    )
+    if tool_name == "run_skill_script":
+        return has_arguments
+    method_name = str(args.get("method_name") or "").strip()
+    class_name = str(args.get("class_name") or "").strip()
+    if method_name and class_name:
+        return method_name.casefold() != "main" or has_arguments
+    function_name = str(args.get("function_name") or "").strip()
+    if function_name:
+        return function_name.casefold() != "main" or has_arguments
+    return has_arguments
+
+
 def capability_call_satisfies_candidate(
     candidate: dict[str, Any],
     *,
@@ -1663,6 +1708,7 @@ def capability_call_satisfies_candidate(
     result_data: dict[str, Any] | None = None,
     outcome: str = "success",
     skill_resource_complete: bool | None = None,
+    artifacts: Iterable[dict[str, Any]] = (),
     allowed_skill_scripts: Iterable[tuple[str, str, str]] = (),
     allowed_skill_commands: Iterable[tuple[str, str, str, tuple[str, ...]]] = (),
     allowed_skill_http_prefixes: Iterable[tuple[str, str]] = (),
@@ -1720,6 +1766,12 @@ def capability_call_satisfies_candidate(
             str(item) for item in candidate.get("tool_names") or [] if str(item)
         }:
             return False
+        if not script_call_has_semantic_task_binding(
+            tool_name,
+            args,
+            artifacts,
+        ):
+            return False
         path = str(candidate.get("resource_path") or "")
         digest = str(candidate.get("sha256") or "")
         exact_grant = (skill_name, path, digest)
@@ -1766,29 +1818,52 @@ def capability_call_satisfies_candidate(
         )
         if (skill_name, prefix) not in set(allowed_prefixes):
             return False
-        request_url = canonical_https_request_url(args.get("url"))
         canonical_prefix = canonical_https_prefix(prefix)
-        if request_url is None or canonical_prefix is None:
+        if canonical_prefix is None:
             return False
-        request = urlsplit(request_url)
-        granted = urlsplit(canonical_prefix)
-        prefix_path = granted.path or "/"
-        request_path = request.path or "/"
-        path_matches = (
-            request_path.startswith(prefix_path)
-            if prefix_path.endswith("/") else request_path == prefix_path
+        receipt = result_data or {}
+        matched_skill = receipt.get("matched_skill")
+        matched_prefix_sha256 = receipt.get("matched_prefix_sha256")
+        safe_identity_present = (
+            matched_skill is not None
+            or matched_prefix_sha256 is not None
         )
-        if not (
-            (request.hostname or "").casefold()
-            == (granted.hostname or "").casefold()
-            and path_matches
-        ):
+        if safe_identity_present:
+            expected_prefix_sha256 = hashlib.sha256(
+                canonical_prefix.encode("utf-8")
+            ).hexdigest()
+            if (
+                matched_skill != skill_name
+                or matched_prefix_sha256 != expected_prefix_sha256
+            ):
+                return False
+        else:
+            # Compatibility for in-process callers that still retain the raw
+            # canonical args. Delegation deliberately redacts HTTP args, so
+            # its outer audit can use only the handler-owned safe identity
+            # above and can never persist a URL or query string.
+            request_url = canonical_https_request_url(args.get("url"))
+            if request_url is None:
+                return False
+            request = urlsplit(request_url)
+            granted = urlsplit(canonical_prefix)
+            prefix_path = granted.path or "/"
+            request_path = request.path or "/"
+            path_matches = (
+                request_path.startswith(prefix_path)
+                if prefix_path.endswith("/") else request_path == prefix_path
+            )
+            if not (
+                (request.hostname or "").casefold()
+                == (granted.hostname or "").casefold()
+                and path_matches
+            ):
+                return False
+        if receipt.get("request_sent") is not True:
             return False
         # A handler-level invalid/boundary error means no exact granted HTTP
         # attempt occurred even though its public handler was entered.
-        error_code = str((result_data or {}).get("error_code") or "")
-        if (result_data or {}).get("request_sent") is False:
-            return False
+        error_code = str(receipt.get("error_code") or "")
         if error_code in {
             "invalid_url", "missing_skill_http_grant",
             "skill_http_boundary_violation", "invalid_json_body",
