@@ -7,13 +7,20 @@
 - 工作目录：`/nfs/yangbb/codes/chat_ds`。
 - 分支：`fix/generic-skill-harness-20260717`。
 - 2026-07-28 最新功能提交：
-  `da70dc51 feat: make skill runs durable and transactional`。
-- `da70dc51` 已补齐断线后后台续跑、权威终态/刷新投影、语义化子 Agent、委派硬期限与撤权 fence，以及 Skill 安装/管理事务；全量回归通过并已部署生产。
+  `6785e443 feat: compile exact conditional skill knowledge gates`。
+- `6785e443` 已把 `knowledge_gate.checks[].tools` 通用编译为签名的条件候选组，
+  补齐 plan/digest、两阶段最小权限、TOCTOU、精确 receipt 和 gap ledger；全量回归
+  通过并已部署生产。
 - 上一版已部署功能提交：
-  `c21deca0 feat: harden generic skill routing and stream diagnostics`。
+  `da70dc51 feat: make skill runs durable and transactional`；该版补齐断线后后台续跑、
+  权威终态/刷新投影、语义化子 Agent、委派硬期限与撤权 fence，以及 Skill
+  安装/管理事务。
 - 前三轮关键提交：`5a7f21d9 feat: enforce generic skill execution contracts`、`e90415a0 feat: close generic skill workflow recovery gaps`、`b0744a33 feat: add generic profile-aware skill sandboxes`。
-- 本轮在既有 process protocol v2、profile-aware sandbox 和 browser egress 基础上，补齐了内容寻址 Workflow IR、exact capability binding、运行生命周期/receipt ledger、MCP frozen catalog、委派 TOCTOU 防护和 Backend 事件幂等落库。
-- `da70dc51` 已按 Backend → Harness → Frontend 顺序部署到生产，并通过数据库迁移、orphan repair、容器健康和无模型调用 smoke。
+- 本轮在既有内容寻址 Workflow IR、exact capability binding、运行生命周期/receipt
+  ledger、MCP frozen catalog 和委派 TOCTOU 防护基础上，补齐了 Knowledge Gate 的
+  compile → bind → decide → activate → dispatch → audit 闭环。
+- `6785e443` 已从 clean Git archive 构建并按 Harness → Backend 的兼容顺序部署；
+  Frontend 无代码变化，保持 `da70dc51`。
 - 不自动执行模型重型 V2.3 E2E。V2.3 是用户手工业务验收用例，不是 Harness 特判目标。
 - Git 只做本地 commit，不向 remote push。
 
@@ -221,20 +228,47 @@
   delete 使用 quarantine+journal，promote/fork 使用双锁、文件/DB/MCP 同边界恢复；fork
   保留 source snapshot digest、workspace、Skill、runtime、消息和 bundle metadata。
 
+### 4.10 Knowledge Gate 条件能力编译闭环
+
+- Loader 对每个 worker 的 `knowledge_gate` 做有界符号编译并签名；最多 128 个
+  checks。旧式平铺 `tools: [...]` 明确解释为一个 `one_of`，显式
+  `tool_groups`/`tools: {all_of: ...}` 表示 AND-of-OR，不从自然语言猜布尔语义。
+- 第二阶段只从当前 run 的 native registry、frozen MCP descriptor、Skill
+  package/resource/script/command/HTTP grant 中解析 exact candidates。计划和候选权限
+  分离，plan 本身不是 authority。
+- 决策前模型只看到动态 schema 的 `submit_knowledge_gate_decisions`；check ID 枚举、
+  数量和 `yes/no/unknown` 均由签名 plan 精确约束，禁止同 batch 混入候选调用。
+- 接受决策后才按选中分支原子激活候选权限；Skill package/main/resource、MCP
+  descriptor 和命令/HTTP 坐标在派发前再次校验。未选分支始终不可见。
+- 多个 AND 组必须由 distinct dispatch receipts 满足；HTTP receipt 使用
+  handler-owned `matched_skill` 与 canonical-prefix SHA，不把原始 URL/query 写入 debug。
+  失败组进入结构化 gap ledger，不能靠模型声称完成。
+- direct/primary chat 会无条件剥离内部决策工具；只有 delegated run 且 plan digest 与
+  exact conditional authority 验证成功后才恢复。
+- compiler、runtime 和 delegation 共用 NFC/Unicode/160 字符 canonical ID 合约；
+  支持中文和下划线开头，非法、非 NFC 或超长 ID 在编译期 fail-closed。
+- Debug 增加 `knowledge_gate.plan.bound/compiled`、`decision.accepted`、
+  `group.receipt`、`activation.failed` 和 delegated `final_audit`，只记录安全 ID、
+  数量、摘要和终态。
+
 ## 5. 当前验证证据
 
-2026-07-28 当前功能提交 `da70dc51` 已通过：
+2026-07-28 当前功能提交 `6785e443` 已通过：
 
 - Harness 全量（`cd harness && PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=..:.`）：
-  `1511 tests OK, 1 skipped`，0 failures/errors。
+  `1565 tests OK, 1 skipped`，0 failures/errors。
 - Backend compileall 通过；pytest 为 `121 passed`，只有既有 `crypt`/
   `datetime.utcnow()` deprecation warnings。
-- Frontend：`18 passed`；production build 和本轮相关文件定向 ESLint 通过。
-- Skill archive/workspace/bundle/install/fork/schema/registry 聚焦组合：
-  `58 passed`。
-- delegation leases、cancellation terminal、provider deadline/fence 聚焦组合：
-  `27 passed`；独立审查无 P0/P1。
-- `git diff --check` 通过。
+- Frontend 无本轮代码变化：`18 passed`，production build 通过；全目录 ESLint 仍只有
+  既有 `ModelSelector.jsx`、`SkillLibrary.jsx` 两处
+  `react-hooks/set-state-in-effect`，不属于本轮差异。
+- Knowledge Gate compiler/runtime/delegation/AgentLoop/能力隔离聚焦组合
+  `155 tests OK`；生产容器内 compiler/runtime/delegation/AgentLoop smoke
+  `49 tests OK`。
+- V2.3 ZIP 的零模型静态编译覆盖 9 个 workers、59 个 checks、58 个条件 OR 组、
+  101 个 selector occurrences；0 个空组，0 个 Knowledge Gate error/warning。
+- `py_compile`、`git diff --check`、staged secret scan 和生产代码 genericity scan 通过；
+  两轮独立 release review 最终无 P0/P1 blocker。
 - 本轮未执行模型重型 V2.3 E2E。
 
 2026-07-27 已冻结并部署的 `c21deca0` 此前还通过：
@@ -274,7 +308,10 @@
   - UID 65528/65529 当前无宿主进程冲突；
   - 根盘约 87 GiB 可用，内存约 26 GiB available；
   - Compose 2.32.4 支持当前声明。
-- 2026-07-28 14:13（Asia/Shanghai）完成 `da70dc51` 最新生产切换。固定使用 project `chat_ds` 和原 bind/data 路径，先切换 Backend 并验证真实数据库迁移，再切换 Harness，最后切换 Frontend；DB volume、search、browser 和两个 Skill executor 均未重建。
+- 2026-07-28 19:10（Asia/Shanghai）完成 `6785e443` 最新生产切换。固定使用
+  project `chat_ds` 和原 bind/data 路径；因旧 Backend 尚不发送内部 gate control、
+  而新 Harness 向后兼容，先切换 Harness 并验证健康，再切换 Backend。Frontend、
+  DB volume、search、browser 和两个 Skill executor 均未重建。
 - `.env` 已原子生成独立 `EXECUTOR_V2_AUTH_TOKEN`，mode 为 0600；base/browser/Harness 三方值一致且长度合规，值未输出或写入 Git。
 - Harness stream ceiling 为 2400 秒，Backend proxy deadline 为 3000 秒，Frontend Nginx SSE deadline 为 3600 秒。
 
@@ -286,8 +323,8 @@
 | `chat_acits_skill_egress_proxy` | `sha256:c5ee4fdc2ee785868f15036706f01d327b05b358f2b7812fcca8bfb7454f9c05` | healthy |
 | `chat_acits_skill_browser_executor` | `sha256:76acea01fdf89f324fef6c48e44d6270841bbb8127887e8cf2e082cd76a84b90` | healthy |
 | `chat_acits_browser` | `sha256:391260b06964c7cfbd2bb934501f35b47ed5d093ac6e1d51f769c41e3576087d` | healthy |
-| `chat_acits_harness` | `sha256:f8094355bf57c44aa412db003aaf8c27d3337886e00f6ce9078702b8407ca451` | healthy / restart 0 |
-| `chat_acits_backend` | `sha256:1c1e86fae6aa43271d1f4edc8e7cbd7ec300dbcd246f5b35e10f30fe41286e59` | running / restart 0 / `/api/health` 200 |
+| `chat_acits_harness` | `sha256:b726d2aafd64a22b08867fe25912b934207c39aa0a95f5e5ebdbc97ca0873b1a` | healthy / restart 0 / revision `6785e443` |
+| `chat_acits_backend` | `sha256:3b450245d9a26f57e8d8029d82b58f50c4bb1d80cfedb98abe38b822fbbaf668` | running / restart 0 / revision `6785e443` / `/api/health` 200 |
 | `chat_acits_frontend` | `sha256:e3de411f03c037ac4307a78141e80f42c53645a625d09b830676c3b2dae979fd` | running / restart 0 / `/` 200 |
 
 生产 smoke 证据：
@@ -298,8 +335,11 @@
 - legacy CDP browser 真实打开 `https://example.com/` 并得到 `Example Domain`。
 - Harness `/health` 和 `/v1/models` 正常；未鉴权 `/internal/*` 为 401，Backend 持有的正确 token 为 200。
 - Frontend `/` 与 `/api/health` 均为 200。
-- `da70dc51` 切换后 Backend/Harness/Frontend revision label 均正确，restart 均为 0；
-  最近日志没有 traceback、critical、fatal、unhandled 或 migration failure。
+- `6785e443` 切换后 Backend/Harness revision label 正确、restart 均为 0；Frontend
+  保持 `da70dc51`。最近日志没有 traceback、critical、fatal、unhandled 或
+  migration failure。
+- 生产容器内 Knowledge Gate 49 项 smoke 全通过；Harness `/health`、`/v1/models`、
+  Frontend `/` 和 `/api/health` 均为 200，`active_agent_runs=0`。
 - 启动 orphan repair 将历史 19 条 stale `running` AgentRun 全部闭合，生产
   `active_count=0`。`79c170...` 最后 3 个 child 以
   `parent_run_terminal_reconciliation` 取消，未覆盖已有 root authoritative
@@ -325,10 +365,14 @@
 - `5a7f21d9` 切换前 Backend/Harness 分别保留 `rollback-pre-5a7f21d9`；当时新镜像分别标记为 `chat_ds-backend:deploy-5a7f21d9`、`chat_ds-harness:deploy-5a7f21d9`。
 - `c21deca0` 切换前 Backend/Harness/Frontend 均保留 `rollback-pre-c21deca0`；当时新镜像分别标记为 `chat_ds-backend:deploy-c21deca0`、`chat_ds-harness:deploy-c21deca0`、`chat_ds-frontend:deploy-c21deca0`，三者 revision label 均为 `c21deca0`。
 - `da70dc51` 切换前 Backend/Harness/Frontend 均保留
-  `rollback-pre-da70dc51`；当前镜像分别标记为
+  `rollback-pre-da70dc51`；当时候选镜像分别标记为
   `chat_ds-backend:deploy-da70dc51`、
   `chat_ds-harness:deploy-da70dc51`、
   `chat_ds-frontend:deploy-da70dc51`，三者 revision label 均为 `da70dc51`。
+- `6785e443` 切换前 Backend/Harness 分别保留
+  `chat_ds-backend:rollback-pre-6785e443` 和
+  `chat_ds-harness:rollback-pre-6785e443`；候选镜像分别标记为
+  `chat_ds-backend:deploy-6785e443`、`chat_ds-harness:deploy-6785e443`。
 - 可重建的旧 Harness 代码镜像：`chat_ds-harness:rollback-d224db33`，image `sha256:e7d16ee538fc69e638f20bb93035df90d76008721116ebfedb7d07ccb986abef`。
 - `c21deca0` 的 Backend/Harness 从只包含三项服务目录的 clean Git archive 构建。Docker Hub metadata 临时连接重置时，Frontend 使用已经本地验证的同一提交 `dist`，在 `rollback-pre-c21deca0` 的既有 Nginx runtime 上清空旧静态文件后封装；配置和资源 marker 均做了生产验证。部署上下文/日志位于生产主机 `/tmp/chat_ds_deploy_c21deca0/`，不属于 Git。
 - `da70dc51` 的 Backend/Harness/Frontend 源码均来自 clean Git archive
@@ -336,6 +380,9 @@
   timeout 后，在该归档中用固定 Node 镜像重新构建 `dist`，再基于
   `rollback-pre-da70dc51` 的既有 Nginx runtime 封装；候选镜像先通过同网络
   `nginx -t`、`/` 和 `/api/health`，再切换生产。
+- `6785e443` 的 Backend/Harness 源码来自 clean Git archive
+  `/tmp/chat_ds_deploy_6785e443.sLSaCZ/`；候选镜像先通过无模型 registry/import
+  smoke，切换后再通过容器内 49 项回归和 HTTP/log/restart 检查。
 
 ## 7. Git/worktree 边界
 
@@ -387,9 +434,12 @@
 ## 10. 已知非 blocker 边界
 
 - V2.3 与 ground truth 的业务级一致性仍需用户手工真实模型 E2E；基础回归不能替代这项验收。
-- 当前 `knowledge_gate.checks[].tools` 还没有完整编译为 exact required/conditional/available
-  candidate OR-groups；旧 alternative 路径会让模型尝试错误 callable。不能把约 134 个候选
-  全标为 required，后续需做通用的候选组 IR 和 schema-grounded dispatch。
+- Legacy `knowledge_gate.checks[].tools` 只能安全解释为单个 OR 组；需要多个独立
+  必须条件的 Skill 应显式使用 `tool_groups` 或 `tools: {all_of: ...}`。Harness 不从
+  自然语言 action 猜 AND/OR。
+- 某个 supporting Skill 若没有可证明的 exact script/command/HTTP/native/MCP route，
+  该候选会保持 unresolved；同一 OR 组的其他精确候选仍可执行并形成降级证据，Harness
+  不会把说明文字升级为执行权限。
 - 同一事件循环里的任意同步阻塞无法被 asyncio hard deadline 抢占；内置长操作已使用
   async/sandbox，真正要强杀任意同步 Python 仍需进程级隔离/watchdog。deadline 后返回还
   可能包含两段有界 resource-close/child-cancel grace。
