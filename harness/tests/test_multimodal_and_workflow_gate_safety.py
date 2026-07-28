@@ -56,6 +56,7 @@ from config import (
     canonical_provider_id,
 )
 from prompt.builder import IMAGE_SKILL_MCP_GUIDANCE, SESSION_SKILL_USAGE_GUIDANCE
+from skills.loader import load_skill_content
 from tools.web_extract import web_extract
 
 
@@ -2405,6 +2406,127 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
         self.assertIn("run_skill_script", web_augmented.tools)
         self.assertIn("web_search", web_augmented.tools)
         self.assertIn(("web_search",), web_augmented.required_groups)
+
+    def test_structured_supporting_skill_hides_network_isolated_script(self):
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        root = Path(tempdir.name)
+        workflow_root = root / "workflow"
+        database_root = root / "vendor-database"
+        workflow_root.mkdir()
+        (database_root / "scripts").mkdir(parents=True)
+        (workflow_root / "SKILL.md").write_text(
+            "---\nname: portable-workflow\n"
+            "description: A structured workflow.\n---\n"
+            "# Workflow\nExecute the compiled worker.\n",
+            encoding="utf-8",
+        )
+        (database_root / "SKILL.md").write_text(
+            "---\nname: vendor-database\n"
+            "description: Query a remote database.\n---\n"
+            "# Query\nRun `scripts/query.py` or use "
+            "https://api.vendor.test/v1/search.\n",
+            encoding="utf-8",
+        )
+        script = database_root / "scripts/query.py"
+        script.write_text(
+            "import requests\n"
+            "def query(term):\n"
+            "    return requests.get("
+            "'https://api.vendor.test/v1/search', "
+            "params={'q': term}).json()\n",
+            encoding="utf-8",
+        )
+        (database_root / "chatds-runtime.json").write_text(
+            json.dumps({
+                "schema_version": 1,
+                "entrypoints": {
+                    "scripts/query.py": {
+                        "runtime_profile": "base-v1",
+                        "egress_only": True,
+                    },
+                },
+            }),
+            encoding="utf-8",
+        )
+        database = load_skill_content(
+            database_root / "SKILL.md",
+            skill_dir=str(database_root),
+        )
+        database = dict(database)
+        database["_chatds_scope"] = "session"
+        script_digest = hashlib.sha256(script.read_bytes()).hexdigest()
+        workflow = {
+            "name": "portable-workflow",
+            "skill_dir": str(workflow_root),
+            "skill_md_sha256": hashlib.sha256(
+                (workflow_root / "SKILL.md").read_bytes()
+            ).hexdigest(),
+            "workflow_contract": {
+                "execution_contract": {
+                    "schema_version": 1,
+                    "workers": {},
+                },
+            },
+        }
+        plan = {
+            "selection": "matched",
+            "route_id": "remote-worker",
+            "workers": {
+                "remote-worker": {
+                    "id": "remote-worker",
+                    "tools": [{
+                        "name": "vendor_query",
+                        "source": "skill:vendor-database",
+                    }],
+                },
+            },
+            "required_workers": ["remote-worker"],
+            "bootstrap_sources": [],
+            "aggregation_steps": [],
+        }
+
+        exposure = _bounded_skill_execution_exposure(
+            "Use portable-workflow",
+            [
+                "skill_view",
+                "delegate_task",
+                "run_skill_process",
+                "run_skill_script",
+                "run_skill_python",
+                "skill_http_get",
+            ],
+            {"portable-workflow", "vendor-database"},
+            {
+                "portable-workflow": workflow,
+                "vendor-database": database,
+            },
+            {
+                "portable-workflow": (),
+                "vendor-database": ((
+                    "scripts/query.py",
+                    script_digest,
+                ),),
+            },
+            selected_skill_names=("portable-workflow",),
+            compiled_plans={"portable-workflow": plan},
+        )
+
+        self.assertIn("skill_http_get", exposure.tools)
+        self.assertNotIn("run_skill_process", exposure.tools)
+        self.assertNotIn("run_skill_script", exposure.tools)
+        self.assertNotIn("run_skill_python", exposure.tools)
+        self.assertEqual((), exposure.allowed_skill_scripts)
+        self.assertEqual(
+            (("vendor-database", "https://api.vendor.test/v1/search"),),
+            exposure.allowed_skill_http_prefixes,
+        )
+        self.assertIn(
+            "capability_skill_runtime_profile_unavailable:"
+            "vendor-database:scripts/query.py:"
+            "skill_runtime_entrypoint_egress_only",
+            exposure.missing_requirements,
+        )
 
     def test_pure_function_skill_exposes_exact_python_entrypoint(self):
         tempdir = tempfile.TemporaryDirectory()

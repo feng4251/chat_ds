@@ -200,6 +200,100 @@ _RUNTIME_PROFILE_MARKER_RE = re.compile(
     r"([A-Za-z0-9_.-]{1,80})\s*(?:\*/)?\s*$",
 )
 
+# A base-profile Skill process is intentionally network-isolated.  These
+# identifiers are diagnostic signals only; merely importing a client or
+# defining a helper that could use it does not prove that an exact entrypoint
+# must perform external I/O.  Suppression uses the narrower entrypoint
+# assessment below.  No classification here grants egress: remote work must
+# still cross a separately compiled HTTP/browser/MCP capability.
+_PYTHON_NETWORK_CALL_PREFIXES = (
+    "aiohttp.ClientSession",
+    "Bio.Entrez.",
+    "bioservices.",
+    "chembl_webresource_client.",
+    "ftplib.FTP",
+    "http.client.HTTPConnection",
+    "http.client.HTTPSConnection",
+    "httpx.Client",
+    "httpx.AsyncClient",
+    "httpx.get",
+    "httpx.post",
+    "httpx.put",
+    "httpx.patch",
+    "httpx.delete",
+    "httpx.head",
+    "httpx.options",
+    "httpx.request",
+    "requests.Session",
+    "requests.get",
+    "requests.post",
+    "requests.put",
+    "requests.patch",
+    "requests.delete",
+    "requests.head",
+    "requests.options",
+    "requests.request",
+    "smtplib.SMTP",
+    "socket.create_connection",
+    "telnetlib.Telnet",
+    "urllib.request.urlopen",
+    "urllib.request.urlretrieve",
+    "urllib3.PoolManager",
+    "urllib3.ProxyManager",
+    "urllib3.request",
+    "websocket.create_connection",
+    "websockets.connect",
+)
+_PYTHON_REMOTE_CLIENT_IMPORT_ROOTS = frozenset({
+    "bioservices",
+    "chembl_webresource_client",
+})
+_NODE_NETWORK_MODULES = frozenset({
+    "axios", "dns", "got", "http", "http2", "https", "net",
+    "node-fetch", "tls", "undici",
+})
+_NODE_NETWORK_CALL_RE = re.compile(
+    r"\b(?:fetch|axios\s*\.\s*(?:get|post|put|patch|delete|request)|"
+    r"(?:http|https)\s*\.\s*(?:get|request)|"
+    r"(?:net|tls)\s*\.\s*connect)\s*\(",
+)
+_SHELL_NETWORK_COMMAND_RE = re.compile(
+    r"(?m)(?:^|[;&|(){}]\s*|\n\s*)"
+    r"(?:command\s+|exec\s+|env\s+)?"
+    r"(?:curl|wget|nc|ncat|netcat|telnet|ftp|sftp|scp|ssh)"
+    r"(?:\s|$)",
+)
+_PYTHON_LITERAL_URL_EGRESS_CALLS = frozenset({
+    "httpx.get",
+    "httpx.post",
+    "httpx.put",
+    "httpx.patch",
+    "httpx.delete",
+    "httpx.head",
+    "httpx.options",
+    "httpx.request",
+    "requests.get",
+    "requests.post",
+    "requests.put",
+    "requests.patch",
+    "requests.delete",
+    "requests.head",
+    "requests.options",
+    "requests.request",
+    "urllib.request.urlopen",
+    "urllib.request.urlretrieve",
+    "urllib3.request",
+    "websocket.create_connection",
+    "websockets.connect",
+})
+_EXTERNAL_NETWORK_URL_PREFIXES = (
+    "ftp://",
+    "http://",
+    "https://",
+    "ws://",
+    "wss://",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class SkillRuntimeSelection:
@@ -216,6 +310,356 @@ class SkillRuntimeSelection:
     required_cwd: str | None
     runtime_manifest_path: str | None
     runtime_manifest_sha256: str | None
+    egress_only: bool
+
+
+@dataclass(frozen=True, slots=True)
+class SkillRuntimeNetworkAssessment:
+    """Bounded entrypoint-level proof used for base-runtime exposure.
+
+    ``external_clients`` contains stable implementation labels only.  An
+    empty ``reason_code`` means analysis completed and the entrypoint remains
+    callable.  A non-empty reason without ``suppresses_entrypoint`` denotes a
+    stable analysis/runtime unavailability diagnostic, never a network guess.
+    """
+
+    suppresses_entrypoint: bool
+    external_clients: tuple[str, ...] = ()
+    reason_code: str | None = None
+    evidence_kind: str | None = None
+
+
+def _python_network_client_calls(source: str) -> set[str]:
+    """Return stable client identifiers for definite Python network calls."""
+
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return set()
+
+    aliases: dict[str, str] = {}
+    clients: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for item in node.names:
+                bound_name = item.asname or item.name.split(".", 1)[0]
+                aliases[bound_name] = (
+                    item.name if item.asname else bound_name
+                )
+                import_root = item.name.split(".", 1)[0]
+                if import_root in _PYTHON_REMOTE_CLIENT_IMPORT_ROOTS:
+                    clients.add(f"python:{import_root}")
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            import_root = node.module.split(".", 1)[0]
+            if import_root in _PYTHON_REMOTE_CLIENT_IMPORT_ROOTS:
+                clients.add(f"python:{import_root}")
+            for item in node.names:
+                if item.name == "*":
+                    continue
+                aliases[item.asname or item.name] = (
+                    f"{node.module}.{item.name}"
+                )
+
+    def dotted_name(node: ast.AST) -> str:
+        parts: list[str] = []
+        current = node
+        while isinstance(current, ast.Attribute):
+            parts.append(current.attr)
+            current = current.value
+        if not isinstance(current, ast.Name):
+            return ""
+        root = aliases.get(current.id, current.id)
+        return ".".join([root, *reversed(parts)])
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        called = dotted_name(node.func)
+        if not called:
+            continue
+        for prefix in _PYTHON_NETWORK_CALL_PREFIXES:
+            if called == prefix or called.startswith(prefix):
+                import_root = prefix.split(".", 1)[0]
+                if import_root in _PYTHON_REMOTE_CLIENT_IMPORT_ROOTS:
+                    clients.add(f"python:{import_root}")
+                else:
+                    clients.add(prefix)
+                break
+    return clients
+
+
+def _python_module_aliases(tree: ast.Module) -> dict[str, str]:
+    """Resolve imports executed directly by one exact Python entrypoint."""
+
+    aliases: dict[str, str] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for item in node.names:
+                bound_name = item.asname or item.name.split(".", 1)[0]
+                aliases[bound_name] = (
+                    item.name if item.asname else bound_name
+                )
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for item in node.names:
+                if item.name == "*":
+                    continue
+                aliases[item.asname or item.name] = (
+                    f"{node.module}.{item.name}"
+                )
+    return aliases
+
+
+def _python_dotted_name(
+    node: ast.AST,
+    aliases: dict[str, str],
+) -> str:
+    parts: list[str] = []
+    current = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if not isinstance(current, ast.Name):
+        return ""
+    root = aliases.get(current.id, current.id)
+    return ".".join([root, *reversed(parts)])
+
+
+def _python_direct_module_expressions(
+    tree: ast.Module,
+) -> tuple[ast.AST, ...]:
+    """Return expressions evaluated by the module itself, not helper bodies.
+
+    This deliberately excludes function/method/lambda bodies and conditional
+    branches.  A dead branch or an unused remote helper therefore cannot hide
+    unrelated local callables in the same exact script.
+    """
+
+    expressions: list[ast.AST] = []
+    for statement in tree.body:
+        if isinstance(statement, ast.Expr):
+            expressions.append(statement.value)
+        elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            value = getattr(statement, "value", None)
+            if isinstance(value, ast.AST):
+                expressions.append(value)
+        elif isinstance(statement, ast.AugAssign):
+            expressions.append(statement.value)
+        elif isinstance(
+            statement,
+            (ast.FunctionDef, ast.AsyncFunctionDef),
+        ):
+            expressions.extend(statement.decorator_list)
+            expressions.extend(statement.args.defaults)
+            expressions.extend(
+                item
+                for item in statement.args.kw_defaults
+                if isinstance(item, ast.AST)
+            )
+        elif isinstance(statement, ast.ClassDef):
+            expressions.extend(statement.decorator_list)
+            expressions.extend(statement.bases)
+            expressions.extend(
+                keyword.value for keyword in statement.keywords
+            )
+        elif isinstance(statement, ast.If):
+            # The condition itself is always evaluated.  Neither branch is
+            # assumed reachable; even ``if False`` must stay inert.
+            expressions.append(statement.test)
+        elif isinstance(statement, (ast.For, ast.AsyncFor)):
+            expressions.append(statement.iter)
+        elif isinstance(statement, (ast.With, ast.AsyncWith)):
+            expressions.extend(
+                item.context_expr for item in statement.items
+            )
+    return tuple(expressions)
+
+
+def _python_top_level_external_network_calls(
+    source: str,
+) -> set[str]:
+    """Return network calls evaluated directly by the exact module entry."""
+
+    tree = ast.parse(source)
+    aliases = _python_module_aliases(tree)
+    clients: set[str] = set()
+
+    def literal_external_url(call: ast.Call) -> bool:
+        candidates: list[ast.AST] = []
+        if call.args:
+            # ``requests.request(method, url)`` and ``httpx.request`` place
+            # the URL second; ordinary request helpers place it first.
+            position = (
+                1
+                if _python_dotted_name(call.func, aliases)
+                in {"requests.request", "httpx.request"}
+                and len(call.args) > 1
+                else 0
+            )
+            candidates.append(call.args[position])
+        candidates.extend(
+            keyword.value
+            for keyword in call.keywords
+            if keyword.arg == "url"
+        )
+        return any(
+            isinstance(value, ast.Constant)
+            and isinstance(value.value, str)
+            and value.value.strip().casefold().startswith(
+                _EXTERNAL_NETWORK_URL_PREFIXES
+            )
+            for value in candidates
+        )
+
+    class _DirectCallVisitor(ast.NodeVisitor):
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            # A lambda body is not evaluated merely because the lambda object
+            # is created.
+            return None
+
+        def visit_Call(self, node: ast.Call) -> None:
+            called = _python_dotted_name(node.func, aliases)
+            if (
+                called in _PYTHON_LITERAL_URL_EGRESS_CALLS
+                and literal_external_url(node)
+            ):
+                clients.add(called)
+            self.generic_visit(node)
+
+    visitor = _DirectCallVisitor()
+    for expression in _python_direct_module_expressions(tree):
+        visitor.visit(expression)
+    return clients
+
+
+def assess_skill_runtime_network(
+    snapshot: SkillPackageSnapshot,
+    selection: SkillRuntimeSelection,
+) -> SkillRuntimeNetworkAssessment:
+    """Conservatively decide whether one exact base entrypoint is callable.
+
+    Potential network use in reachable helpers is not suppression evidence.
+    Only an exact manifest declaration or a direct, unconditional module-level
+    network call suppresses the entrypoint.  Invalid source bytes receive a
+    stable unavailable result rather than escaping into catalog compilation.
+    """
+
+    try:
+        actual_script_sha256 = snapshot.file_sha256(selection.entrypoint)
+    except KeyError:
+        return SkillRuntimeNetworkAssessment(
+            False,
+            reason_code="skill_runtime_network_entrypoint_absent",
+            evidence_kind="analysis_unavailable",
+        )
+    if (
+        selection.package_sha256 != snapshot.sha256
+        or selection.script_sha256 != actual_script_sha256
+    ):
+        return SkillRuntimeNetworkAssessment(
+            False,
+            reason_code="skill_runtime_network_authority_mismatch",
+            evidence_kind="analysis_unavailable",
+        )
+
+    for relative_path in selection.reachable_sources:
+        try:
+            snapshot.read_bytes(relative_path).decode("utf-8")
+        except KeyError:
+            return SkillRuntimeNetworkAssessment(
+                False,
+                reason_code="skill_runtime_network_source_absent",
+                evidence_kind="analysis_unavailable",
+            )
+        except UnicodeDecodeError:
+            return SkillRuntimeNetworkAssessment(
+                False,
+                reason_code="skill_runtime_network_source_invalid_utf8",
+                evidence_kind="analysis_unavailable",
+            )
+
+    if selection.egress_only:
+        return SkillRuntimeNetworkAssessment(
+            True,
+            external_clients=("manifest:egress-only",),
+            reason_code="skill_runtime_entrypoint_egress_only",
+            evidence_kind="manifest",
+        )
+
+    suffix = PurePosixPath(selection.entrypoint).suffix.casefold()
+    if suffix != ".py":
+        # Regexes cannot prove whether Node/Shell matches are in a dead branch
+        # or unused helper.  Their fixed executor remains network-disabled;
+        # package authors can make an egress-only CLI explicit in the strict
+        # entrypoint manifest.
+        return SkillRuntimeNetworkAssessment(False)
+    try:
+        source = snapshot.read_bytes(selection.entrypoint).decode("utf-8")
+        clients = _python_top_level_external_network_calls(source)
+    except (SyntaxError, ValueError):
+        return SkillRuntimeNetworkAssessment(
+            False,
+            reason_code="skill_runtime_network_source_invalid_syntax",
+            evidence_kind="analysis_unavailable",
+        )
+    if not clients:
+        return SkillRuntimeNetworkAssessment(False)
+    return SkillRuntimeNetworkAssessment(
+        True,
+        external_clients=tuple(sorted(clients)),
+        reason_code="skill_runtime_entrypoint_requires_external_network",
+        evidence_kind="python_module_top_level",
+    )
+
+
+def skill_runtime_external_network_clients(
+    snapshot: SkillPackageSnapshot,
+    selection: SkillRuntimeSelection,
+) -> tuple[str, ...]:
+    """Classify definite external-network use in one immutable source closure.
+
+    The result is a diagnostic/capability-routing signal, not network
+    authority.  It intentionally reports only runtime-owned client labels,
+    never source text, URLs, arguments, or credentials.
+    """
+
+    if (
+        selection.package_sha256 != snapshot.sha256
+        or selection.script_sha256
+        != snapshot.file_sha256(selection.entrypoint)
+    ):
+        raise IsolatedSkillExecutorError(
+            "skill_runtime_profile_authority_mismatch",
+            "Network-use analysis requires the exact selected Skill snapshot.",
+        )
+
+    clients: set[str] = set()
+    for relative_path in selection.reachable_sources:
+        try:
+            source = snapshot.read_bytes(relative_path).decode("utf-8")
+        except (KeyError, UnicodeDecodeError):
+            # This helper is diagnostic-only and has no result channel for a
+            # typed unavailable reason.  The authoritative entrypoint
+            # assessment returns that stable reason; never let diagnostics
+            # abort capability compilation.
+            return ()
+        suffix = PurePosixPath(relative_path).suffix.casefold()
+        if suffix == ".py":
+            clients.update(_python_network_client_calls(source))
+        elif suffix in {".js", ".mjs", ".cjs"}:
+            modules = {
+                match.group(1).split("/", 1)[0]
+                for match in _JS_MODULE_RE.finditer(source)
+                if match.group(1)
+            }
+            for module in sorted(modules.intersection(_NODE_NETWORK_MODULES)):
+                clients.add(f"node:{module}")
+            if _NODE_NETWORK_CALL_RE.search(source):
+                clients.add("node:network-call")
+        elif suffix in {".sh", ".bash"} and _SHELL_NETWORK_COMMAND_RE.search(
+            source
+        ):
+            clients.add("shell:network-command")
+    return tuple(sorted(clients))
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,6 +692,7 @@ class _EntrypointRuntimeDeclaration:
     python_requirements: tuple[str, ...]
     node_packages: tuple[tuple[str, str], ...]
     runtime_commands: tuple[str, ...]
+    egress_only: bool
     manifest_path: str
     manifest_sha256: str
 
@@ -3070,6 +3515,7 @@ def _declared_entrypoint_runtime_profiles(
         unknown_entrypoint_fields = set(record).difference({
             "path", "entrypoint",
             "runtime_profile", "runtimeProfile",
+            "egress_only", "egressOnly",
             "dependencies",
             "python_requirements", "pythonRequirements",
             "node_packages", "nodePackages",
@@ -3092,6 +3538,15 @@ def _declared_entrypoint_runtime_profiles(
         )
         if runtime_profile not in SUPPORTED_RUNTIME_PROFILES:
             _unsupported_runtime_profile(runtime_profile)
+        egress_only = _manifest_alias_value(
+            record, "egress_only", "egressOnly"
+        )
+        if egress_only is None:
+            egress_only = False
+        if type(egress_only) is not bool:
+            _invalid_runtime_manifest(
+                f"entrypoint {path!r} egress_only must be a boolean"
+            )
         dependencies = record.get("dependencies")
         if dependencies is None:
             dependencies = {}
@@ -3155,6 +3610,7 @@ def _declared_entrypoint_runtime_profiles(
                     else dependencies.get("commands")
                 )
             ),
+            egress_only=egress_only,
             manifest_path=manifest_path,
             manifest_sha256=manifest_sha256,
         )
@@ -3638,6 +4094,10 @@ def select_skill_runtime_profile(
             entrypoint_declaration.manifest_sha256
             if entrypoint_declaration is not None else None
         ),
+        egress_only=bool(
+            entrypoint_declaration is not None
+            and entrypoint_declaration.egress_only
+        ),
     )
 
 
@@ -3723,6 +4183,7 @@ def compile_skill_runtime_profile_manifest(
             "manifest_declared": (
                 entrypoint in declared_entrypoints
             ),
+            "egress_only": selection.egress_only,
             "runtime_manifest_path": (
                 selection.runtime_manifest_path
             ),

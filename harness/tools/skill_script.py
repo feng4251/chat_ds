@@ -21,6 +21,7 @@ from runtime.python_env import preflight_declared_skill_dependencies
 from skills.path_safety import validate_skill_resource, validate_skill_root
 from skills import scanner as skill_scanner
 from tools.context import ToolContext
+from tools.execution_fence import require_execution_authority
 from tools.omission_guard import (
     compacted_history_omission_error,
     find_compacted_history_omission_path,
@@ -196,6 +197,21 @@ async def run_skill_script(
             **(
                 {"expected_skill_sha256": expected_skill_sha256}
                 if expected_skill_sha256 is not None
+                else {}
+            ),
+            **(
+                {
+                    "execution_authority_check": lambda: (
+                        require_execution_authority(
+                            context,
+                            boundary="skill_script.executor_commit",
+                        )
+                    )
+                }
+                if (
+                    context is not None
+                    and context.execution_fence is not None
+                )
                 else {}
             ),
         )

@@ -114,6 +114,14 @@ class ToolContext:
     # from model arguments or serialized into conversation history. Stateful
     # adapters use it to make a transport retry idempotent.
     tool_operation_id: str | None = field(default=None, repr=False)
+    # Delegated execution authority is independent from asyncio task
+    # cancellation.  The runtime binds a mutable fence plus its immutable
+    # generation to every child context; dataclasses.replace preserves both
+    # while narrowing tool/resource grants.  A revoked or generation-mismatched
+    # child cannot cross another dispatch or commit boundary even if it catches
+    # CancelledError.
+    execution_fence: Any | None = field(default=None, repr=False)
+    execution_fence_generation: int | None = field(default=None, repr=False)
     # Optional run-frozen MCP authority. Primary orchestration installs the
     # exact catalog shown to the parent model; delegation intersects it with
     # current live state and propagates only unchanged parent descriptors.

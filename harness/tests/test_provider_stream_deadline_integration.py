@@ -10,6 +10,11 @@ from provider_stream_deadline import (
     ProviderStreamDeadlineExceeded,
     build_provider_stream_deadline_plan,
 )
+from tools.context import ToolContext
+from tools.execution_fence import (
+    ChildExecutionFence,
+    ExecutionAuthorityRevoked,
+)
 
 
 def _short_plan(
@@ -122,6 +127,45 @@ class ProviderStreamDeadlineIntegrationTests(unittest.IsolatedAsyncioTestCase):
             raised.exception.metrics["deadline_kind"],
         )
         self.assertGreater(raised.exception.metrics["material_progress_chars"], 0)
+
+    async def test_revoked_child_cannot_keep_publishing_provider_items(self):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        provider_closed = asyncio.Event()
+        fence = ChildExecutionFence()
+        context = ToolContext(
+            user_id="u",
+            session_id="s",
+            model_id="m",
+            provider_config={},
+            execution_fence=fence,
+            execution_fence_generation=fence.generation,
+        )
+
+        async def provider():
+            try:
+                entered.set()
+                await release.wait()
+                for index in range(10_000):
+                    yield {"index": index}
+            finally:
+                provider_closed.set()
+
+        async def consume():
+            async for _ in _aiter_with_timeout(
+                provider(),
+                timeout_seconds=1,
+                execution_context=context,
+            ):
+                pass
+
+        task = asyncio.create_task(consume())
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        fence.revoke("fixture_deadline")
+        release.set()
+        with self.assertRaises(ExecutionAuthorityRevoked):
+            await asyncio.wait_for(task, timeout=0.5)
+        self.assertTrue(provider_closed.is_set())
 
     def test_only_text_reasoning_and_native_tool_strings_are_material(self):
         self.assertEqual(

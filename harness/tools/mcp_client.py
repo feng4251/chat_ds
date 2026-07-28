@@ -41,6 +41,11 @@ from typing import Any, AsyncIterator, Iterable, Mapping
 
 import httpx
 
+from tools.context import ToolContext
+from tools.execution_fence import (
+    ExecutionAuthorityRevoked,
+    require_execution_authority,
+)
 from tools.mcp_contract import (
     FrozenMCPCatalog,
     FrozenMCPToolDescriptor,
@@ -1174,6 +1179,7 @@ async def dispatch_mcp_tool(
     *,
     expected_descriptor: FrozenMCPToolDescriptor | None = None,
     frozen_catalog: FrozenMCPCatalog | None = None,
+    context: ToolContext | None = None,
 ) -> str:
     """Dispatch one session-local MCP tool after deterministic preflight.
 
@@ -1183,6 +1189,22 @@ async def dispatch_mcp_tool(
     callers. Calls without either value still validate against a freshly
     frozen current descriptor for backward compatibility outside AgentLoop.
     """
+    try:
+        require_execution_authority(
+            context,
+            boundary=f"mcp.preflight:{public_name}",
+        )
+    except ExecutionAuthorityRevoked:
+        return json.dumps({
+            "error": (
+                "Delegated execution authority was revoked; the MCP tool was "
+                "not dispatched."
+            ),
+            "reason": "execution_authority_revoked",
+            "tool_name": public_name,
+            "actual_dispatch_attempted": False,
+        }, ensure_ascii=False)
+
     if frozen_catalog is not None:
         frozen_preflight = preflight_frozen_session_mcp_tool_call(
             public_name,
@@ -1263,9 +1285,23 @@ async def dispatch_mcp_tool(
             return preflight.error_json()
         params = dict(preflight.args)
         try:
+            require_execution_authority(
+                context,
+                boundary=f"mcp.transport_submit:{public_name}",
+            )
             result = await _call_mcp_state_tool(state, tool_name, params)
             _record_success(state)
             return result
+        except ExecutionAuthorityRevoked:
+            return json.dumps({
+                "error": (
+                    "Delegated execution authority was revoked; the MCP tool "
+                    "was not dispatched."
+                ),
+                "reason": "execution_authority_revoked",
+                "tool_name": public_name,
+                "actual_dispatch_attempted": False,
+            }, ensure_ascii=False)
         except Exception as exc:
             state.last_error = _sanitize_error(_exc_str(exc))
             state.connected = False

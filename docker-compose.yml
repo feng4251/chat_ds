@@ -422,9 +422,13 @@ services:
       PROVIDER_ADMISSION_ESTIMATE_SAFETY_FACTOR: ${PROVIDER_ADMISSION_ESTIMATE_SAFETY_FACTOR:-1.10}
       # Zero means wait until ordinary run/batch cancellation.
       PROVIDER_ADMISSION_WAIT_TIMEOUT_SECONDS: ${PROVIDER_ADMISSION_WAIT_TIMEOUT_SECONDS:-0}
-      # Allows multiple admission cohorts in one complex delegated batch;
-      # each child/model/tool path retains its own tighter bounded controls.
+      # Per-child no-material-progress lease. Runtime-owned provider-admission
+      # waiting is exempt and healthy lifecycle/model/tool progress renews it.
       DELEGATION_BATCH_TIMEOUT_SECONDS: ${DELEGATION_BATCH_TIMEOUT_SECONDS:-3600}
+      # Independent async batch hard deadline; neither progress nor admission
+      # waiting may extend it. Long operations run in async/sandbox lanes so
+      # they do not synchronously block the Harness event loop.
+      DELEGATION_BATCH_HARD_TIMEOUT_SECONDS: ${DELEGATION_BATCH_HARD_TIMEOUT_SECONDS:-21600}
       # Absolute ceiling for a stream that continues making real progress.
       # Initial-response and read-stall leases remain independently shorter.
       LLM_STREAM_TOTAL_TIMEOUT_SECONDS: ${LLM_STREAM_TOTAL_TIMEOUT_SECONDS:-2400}
@@ -470,6 +474,11 @@ services:
       context: ./backend
     container_name: chat_acits_backend
     restart: unless-stopped
+    # Let detached chat producers record service-shutdown cancellation and
+    # finish their durable terminal projection before SIGKILL.
+    # Uvicorn stops waiting on live SSE requests after 3s; Backend then has a
+    # bounded 3s producer-cancel window plus 8s for terminal projection.
+    stop_grace_period: 30s
     depends_on:
       harness:
         condition: service_healthy

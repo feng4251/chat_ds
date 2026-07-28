@@ -10,6 +10,7 @@ import re
 import time
 import uuid
 from contextvars import ContextVar
+from dataclasses import replace
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -25,6 +26,13 @@ from delegated_result_contract import (
     strip_result_fields_candidate_tail,
 )
 from tools.context import ToolContext
+from tools.execution_fence import (
+    ChildExecutionFence,
+    FenceTeardownReport,
+    bounded_cancel_tasks,
+    require_execution_authority,
+    supervise_residual_task,
+)
 from tools.omission_guard import contains_compacted_history_omission
 from tools.registry import dispatch as registry_dispatch, get_metadata
 from tools.tool_result_storage import persist_result_for_history
@@ -126,6 +134,91 @@ _EXPLICIT_DEGRADED_STATUS_PATTERN = re.compile(
     """,
     re.IGNORECASE | re.MULTILINE | re.VERBOSE,
 )
+
+_WEAK_DELEGATE_NAME_PATTERN = re.compile(
+    r"^(?:delegate|agent|worker)[-_ ]?\d+$",
+    re.IGNORECASE,
+)
+_MAX_AGENT_DISPLAY_NAME_CHARS = 160
+_DELEGATION_BATCH_SOFT_LEASE_HARD_MAX_SECONDS = 14_400.0
+_DELEGATION_BATCH_HARD_CAP_HARD_MAX_SECONDS = 86_400.0
+
+
+def _bounded_display_label(value: Any) -> str:
+    """Normalize one bounded, single-line lifecycle display label."""
+
+    text = " ".join(str(value or "").split()).strip()
+    if not text:
+        return ""
+    return text[:_MAX_AGENT_DISPLAY_NAME_CHARS]
+
+
+def _semantic_agent_name(task: dict[str, Any], index: int) -> str:
+    """Derive a stable child identity from declared workflow semantics.
+
+    The scheduler slot remains separate metadata. A generated ``delegate-N``
+    label says only where a task happened to be scheduled, so it is never used
+    as the primary fallback identity.
+    """
+
+    explicit = _bounded_display_label(task.get("agent_name"))
+    if explicit and not _WEAK_DELEGATE_NAME_PATTERN.fullmatch(explicit):
+        return explicit
+
+    for key in ("role", "role_hint", "title", "worker_id", "step_id"):
+        candidate = _bounded_display_label(task.get(key))
+        if candidate:
+            return candidate
+
+    step_type = _bounded_display_label(task.get("step_type"))
+    if step_type:
+        return f"{step_type.replace('_', ' ').replace('-', ' ').title()} agent"
+    # Slot is intentionally not embedded in the identity; callers and UIs can
+    # disambiguate identical generic tasks with delegation_slot.
+    return "Delegated task"
+
+
+def _bounded_batch_timeout(
+    value: Any,
+    *,
+    default: float,
+    hard_maximum: float,
+) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        parsed = default
+    if not math.isfinite(parsed) or parsed <= 0:
+        parsed = default
+    return max(0.001, min(parsed, hard_maximum))
+
+
+def _cancellation_attribution_payload(
+    attribution: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Project runtime-owned batch cancellation metadata into lifecycle data."""
+
+    if not isinstance(attribution, dict):
+        return {}
+    projected: dict[str, Any] = {}
+    for key in (
+        "cancellation_source",
+        "terminal_reason",
+        "failure_class",
+        "delegation_batch_id",
+        "deadline_kind",
+    ):
+        value = _bounded_display_label(attribution.get(key))
+        if value:
+            projected[key] = value
+    for key in ("delegation_slot", "delegation_batch_size"):
+        value = attribution.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            projected[key] = value
+    retryable = attribution.get("retryable")
+    if isinstance(retryable, bool):
+        projected["retryable"] = retryable
+    return projected
 
 _EXPLICIT_DEGRADED_MARKER_PATTERN = re.compile(
     r"""
@@ -557,7 +650,10 @@ class _ChildDispatchReceiptTracker:
     must cancel the child at the batch deadline before ``_run_child`` returns.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        progress_notifier: asyncio.Event | None = None,
+    ) -> None:
         self._next_generation = 0
         self._active_calls: dict[str, tuple[str, int, bool]] = {}
         self._recorded_boundaries: set[tuple[str, int, str]] = set()
@@ -570,6 +666,46 @@ class _ChildDispatchReceiptTracker:
         self._read_only_tool_names: set[str] = set()
         self._terminal_events_by_run: dict[str, str] = {}
         self._maximum_event_seq_by_run: dict[str, int] = {}
+        self._last_progress_monotonic = time.monotonic()
+        self._provider_admission_waiting = False
+        self._progress_notifier = progress_notifier
+
+    def record_runtime_progress(
+        self,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        """Renew the child lease without retaining model/tool payload content."""
+
+        normalized_type = str(event_type or "").strip().casefold()
+        if not normalized_type:
+            return
+        admission_waiting_before = self._provider_admission_waiting
+        if normalized_type in {
+            "provider.admission.queued",
+            "provider_admission.queued",
+        }:
+            self._provider_admission_waiting = True
+        elif normalized_type in {
+            "provider.admission.acquired",
+            "provider.admission.timed_out",
+            "provider.admission.cancelled",
+            "provider_admission.acquired",
+            "provider_admission.timed_out",
+            "provider_admission.cancelled",
+        }:
+            self._provider_admission_waiting = False
+        self._last_progress_monotonic = time.monotonic()
+        # Ordinary progress need not wake the monitor for every streamed token:
+        # it will re-read this timestamp at the previous lease boundary. Queue
+        # state changes do need an immediate wake because they add/remove the
+        # soft-deadline exemption.
+        if (
+            self._progress_notifier is not None
+            and admission_waiting_before
+            != self._provider_admission_waiting
+        ):
+            self._progress_notifier.set()
 
     @staticmethod
     def _event_tool_name(event: dict[str, Any]) -> str:
@@ -625,6 +761,7 @@ class _ChildDispatchReceiptTracker:
         boundary_key = (normalized_call_id, generation, normalized_name)
         if boundary_key in self._recorded_boundaries:
             return
+        self.record_runtime_progress("tool.dispatch_started")
         self._recorded_boundaries.add(boundary_key)
         self._dispatch_count += 1
         self._tool_names.add(normalized_name)
@@ -640,6 +777,19 @@ class _ChildDispatchReceiptTracker:
         if event.get("type") != "agent_event":
             return
         event_type = str(event.get("event_type") or "")
+        if event_type.startswith("debug.provider.admission."):
+            self.record_runtime_progress(
+                event_type.removeprefix("debug.").replace(".", "_", 1),
+            )
+        elif event_type not in {
+            "run.completed",
+            "run.failed",
+            "run.cancelled",
+        }:
+            # Lifecycle, model delta, and tool boundary events all prove the
+            # child coroutine is making observable progress. Payloads are never
+            # retained by this tracker.
+            self.record_runtime_progress(event_type)
         event_run_id = str(event.get("run_id") or "")
         if event_run_id:
             try:
@@ -744,6 +894,14 @@ class _ChildDispatchReceiptTracker:
     def maximum_event_seq(self, run_id: str) -> int:
         return self._maximum_event_seq_by_run.get(str(run_id or ""), 0)
 
+    @property
+    def last_progress_monotonic(self) -> float:
+        return self._last_progress_monotonic
+
+    @property
+    def provider_admission_waiting(self) -> bool:
+        return self._provider_admission_waiting
+
     def snapshot(self) -> dict[str, Any]:
         """Return bounded, secret-free receipt metadata for result envelopes."""
         return {
@@ -763,6 +921,9 @@ _ACTIVE_CHILD_RUN_ID: ContextVar[str | None] = ContextVar(
     "delegation_child_run_id",
     default=None,
 )
+_ACTIVE_CHILD_CANCELLATION_ATTRIBUTION: ContextVar[
+    dict[str, Any] | None
+] = ContextVar("delegation_child_cancellation_attribution", default=None)
 
 
 async def _run_child_with_dispatch_receipts(
@@ -772,40 +933,67 @@ async def _run_child_with_dispatch_receipts(
     receipt_tracker: _ChildDispatchReceiptTracker,
     *,
     parallel_child: bool = False,
+    cancellation_attribution: dict[str, Any] | None = None,
+    execution_fence: ChildExecutionFence | None = None,
+    execution_fence_generation: int | None = None,
 ) -> dict[str, Any]:
     """Bind a parent-owned receipt tracker around one cancellable child."""
+    child_fence = execution_fence or ChildExecutionFence()
+    child_generation = (
+        execution_fence_generation
+        if execution_fence_generation is not None
+        else child_fence.generation
+    )
+    child_context = replace(
+        context,
+        execution_fence=child_fence,
+        execution_fence_generation=child_generation,
+    )
     token = _ACTIVE_CHILD_DISPATCH_RECEIPTS.set(receipt_tracker)
     child_run_id = uuid.uuid4().hex
     run_id_token = _ACTIVE_CHILD_RUN_ID.set(child_run_id)
+    cancellation_token = _ACTIVE_CHILD_CANCELLATION_ATTRIBUTION.set(
+        cancellation_attribution,
+    )
     try:
         return await _run_child(
             task,
-            context,
+            child_context,
             index,
             parallel_child=parallel_child,
         )
     except asyncio.CancelledError:
         if receipt_tracker.terminal_event(child_run_id) is None:
+            attribution_payload = _cancellation_attribution_payload(
+                cancellation_attribution,
+            )
             cancellation_event = {
                 "type": "agent_event",
                 "event_type": "run.cancelled",
                 "run_id": child_run_id,
                 "root_run_id": (
-                    context.root_run_id or context.run_id or child_run_id
+                    child_context.root_run_id
+                    or child_context.run_id
+                    or child_run_id
                 ),
-                "parent_run_id": context.run_id,
+                "parent_run_id": child_context.run_id,
                 "agent_kind": "delegate",
-                "agent_name": str(
-                    task.get("agent_name") or f"delegate-{index + 1}"
-                ).strip(),
+                "agent_name": _semantic_agent_name(task, index),
                 "depth": int(context.depth or 0) + 1,
                 "workspace_scope": str(
                     task.get("workspace_scope") or "shared_session"
                 ),
                 "seq": receipt_tracker.maximum_event_seq(child_run_id) + 1,
                 "payload": {
-                    "finish_reason": "task_cancelled",
-                    "terminal_reason": "task_cancelled",
+                    "finish_reason": str(
+                        attribution_payload.get("terminal_reason")
+                        or "task_cancelled"
+                    ),
+                    "terminal_reason": str(
+                        attribution_payload.get("terminal_reason")
+                        or "task_cancelled"
+                    ),
+                    **attribution_payload,
                     "usage": {
                         "input_tokens": 0,
                         "output_tokens": 0,
@@ -820,20 +1008,21 @@ async def _run_child_with_dispatch_receipts(
                 from agent_loop import _append_workspace_debug_event
 
                 _append_workspace_debug_event(
-                    context.user_id,
-                    context.session_id,
+                    child_context.user_id,
+                    child_context.session_id,
                     cancellation_event,
                 )
             receipt_tracker.observe_event(cancellation_event)
-            if context.event_sink is not None:
+            if child_context.event_sink is not None:
                 try:
-                    maybe = context.event_sink(cancellation_event)
+                    maybe = child_context.event_sink(cancellation_event)
                     if hasattr(maybe, "__await__"):
                         await asyncio.wait_for(maybe, timeout=0.25)
                 except BaseException:
                     pass
         raise
     finally:
+        _ACTIVE_CHILD_CANCELLATION_ATTRIBUTION.reset(cancellation_token)
         _ACTIVE_CHILD_RUN_ID.reset(run_id_token)
         _ACTIVE_CHILD_DISPATCH_RECEIPTS.reset(token)
 
@@ -3916,10 +4105,16 @@ async def _run_child(
             **_contract_failure_fields(),
         }
     child_run_id = _ACTIVE_CHILD_RUN_ID.get() or uuid.uuid4().hex
+    cancellation_attribution = (
+        _ACTIVE_CHILD_CANCELLATION_ATTRIBUTION.get()
+    )
+    batch_attribution = _cancellation_attribution_payload(
+        cancellation_attribution,
+    )
     parent_run_id = context.run_id
     root_run_id = context.root_run_id or context.run_id or child_run_id
     child_depth = int(context.depth or 0) + 1
-    agent_name = str(task.get("agent_name") or f"delegate-{index + 1}").strip()
+    agent_name = _semantic_agent_name(task, index)
     workspace_scope = str(task.get("workspace_scope") or "shared_session")
     if is_model_intent_classifier:
         prompt = (
@@ -4394,6 +4589,15 @@ async def _run_child(
         "seq": 0,
         "payload": {
             "index": index,
+            "delegation_slot": int(
+                batch_attribution.get("delegation_slot") or index + 1
+            ),
+            "delegation_batch_id": (
+                batch_attribution.get("delegation_batch_id")
+            ),
+            "delegation_batch_size": (
+                batch_attribution.get("delegation_batch_size")
+            ),
             "goal": goal,
             "skill_name": skill_name,
             "worker_id": worker_id,
@@ -4739,6 +4943,10 @@ async def _run_child(
             ])
             deterministic_content = "\n".join(lines)
             try:
+                require_execution_authority(
+                    context,
+                    boundary="delegation.intent_result.commit",
+                )
                 result_path = persist_result_for_history(
                     deterministic_content,
                     "delegate_" + (
@@ -5680,9 +5888,18 @@ async def _run_child(
                         scheduled_wave_cohorts = (
                             reducer_schedule.critical_call_cohorts
                         )
-                        configured_batch_timeout = max(
-                            0.001,
-                            float(settings.delegation_batch_timeout_seconds),
+                        configured_batch_hard_cap = (
+                            _bounded_batch_timeout(
+                                getattr(
+                                    settings,
+                                    "delegation_batch_hard_timeout_seconds",
+                                    21600.0,
+                                ),
+                                default=21600.0,
+                                hard_maximum=(
+                                    _DELEGATION_BATCH_HARD_CAP_HARD_MAX_SECONDS
+                                ),
+                            )
                         )
                         configured_stream_timeout = max(
                             0.001,
@@ -5699,10 +5916,10 @@ async def _run_child(
                         # by critical-path depth rather than raw step count.
                         worker_reserve = min(
                             600.0,
-                            max(60.0, configured_batch_timeout / 3.0),
+                            max(60.0, configured_batch_hard_cap / 3.0),
                         )
                         outer_remaining = (
-                            configured_batch_timeout
+                            configured_batch_hard_cap
                             - (time.monotonic() - child_started_monotonic)
                             - worker_reserve
                         )
@@ -5711,7 +5928,7 @@ async def _run_child(
                             + fan_in_step_timeout * scheduled_wave_cohorts
                         )
                         fan_in_plan_timeout = min(
-                            configured_batch_timeout * (2.0 / 3.0),
+                            configured_batch_hard_cap * (2.0 / 3.0),
                             desired_plan_timeout,
                             outer_remaining,
                         )
@@ -5834,6 +6051,10 @@ async def _run_child(
                                 include_session_context=False,
                                 thinking_policy="off_if_supported",
                                 temperature_override=0.0,
+                                _execution_fence=context.execution_fence,
+                                _execution_fence_generation=(
+                                    context.execution_fence_generation
+                                ),
                             ):
                                 if reduction_event.get("type") == "delta":
                                     reduction_content += str(
@@ -6248,6 +6469,12 @@ async def _run_child(
         declared_artifact_patterns=(
             artifact_output_patterns if is_artifact_synthesis else None
         ),
+        _cancellation_attribution=cancellation_attribution,
+        _runtime_progress_sink=dispatch_receipts.record_runtime_progress,
+        _execution_fence=context.execution_fence,
+        _execution_fence_generation=(
+            context.execution_fence_generation
+        ),
     )
     from tools.mcp_client import (
         iterate_with_inherited_frozen_mcp_catalog,
@@ -6259,6 +6486,7 @@ async def _run_child(
         catalog=child_frozen_mcp_catalog,
     ):
         if event["type"] == "delta":
+            dispatch_receipts.record_runtime_progress("agent.delta")
             value = str(event.get("content", "") or "")
             if tracked_turn_active:
                 current_turn_content += value
@@ -6267,12 +6495,16 @@ async def _run_child(
                 # not emit debug iteration boundaries.
                 content += value
         elif event["type"] == "reasoning_delta":
+            dispatch_receipts.record_runtime_progress(
+                "agent.reasoning_delta"
+            )
             value = str(event.get("content", "") or "")
             if tracked_turn_active:
                 current_turn_reasoning += value
             else:
                 reasoning += value
         elif event["type"] == "tool_progress":
+            dispatch_receipts.record_runtime_progress("tool.progress")
             tool_events.append(event.get("msg", ""))
         elif event["type"] == "agent_event":
             # Mocked/legacy run_stream producers may yield lifecycle events
@@ -7079,6 +7311,10 @@ async def _run_child(
     persistence_failed = False
     if error is None:
         try:
+            require_execution_authority(
+                context,
+                boundary="delegation.result.commit",
+            )
             result_path = persist_result_for_history(
                 content,
                 "delegate_" + (
@@ -7513,8 +7749,33 @@ async def delegate_task(
             "failure_class": "contract_validation",
             "retryable": False,
         }, ensure_ascii=False)
+    batch = [
+        {
+            **task,
+            "agent_name": _semantic_agent_name(task, index),
+        }
+        for index, task in enumerate(batch)
+    ]
+    progress_notifier = asyncio.Event()
+    delegation_batch_id = _bounded_display_label(
+        context.tool_operation_id or uuid.uuid4().hex
+    )
+    cancellation_attributions = [
+        {
+            "delegation_batch_id": delegation_batch_id,
+            "delegation_slot": index + 1,
+            "delegation_batch_size": len(batch),
+        }
+        for index in range(len(batch))
+    ]
     dispatch_receipt_trackers = [
-        _ChildDispatchReceiptTracker() for _task in batch
+        _ChildDispatchReceiptTracker(progress_notifier) for _task in batch
+    ]
+    child_execution_fences = [
+        ChildExecutionFence() for _task in batch
+    ]
+    child_execution_generations = [
+        fence.generation for fence in child_execution_fences
     ]
     child_tasks = [
         asyncio.create_task(
@@ -7532,43 +7793,331 @@ async def delegate_task(
                         "aggregation", "aggregate", "validation",
                     }
                 ),
+                cancellation_attribution=cancellation_attributions[index],
+                execution_fence=child_execution_fences[index],
+                execution_fence_generation=(
+                    child_execution_generations[index]
+                ),
             )
         )
         for index, task in enumerate(batch)
     ]
-    batch_timeout = max(
-        0.001,
-        float(settings.delegation_batch_timeout_seconds),
+    soft_lease_seconds = _bounded_batch_timeout(
+        settings.delegation_batch_timeout_seconds,
+        default=3600.0,
+        hard_maximum=_DELEGATION_BATCH_SOFT_LEASE_HARD_MAX_SECONDS,
     )
-    try:
-        _done, pending = await asyncio.wait(
-            child_tasks,
-            timeout=batch_timeout,
+    hard_cap_seconds = _bounded_batch_timeout(
+        getattr(
+            settings,
+            "delegation_batch_hard_timeout_seconds",
+            21600.0,
+        ),
+        default=21600.0,
+        hard_maximum=_DELEGATION_BATCH_HARD_CAP_HARD_MAX_SECONDS,
+    )
+    batch_started_monotonic = time.monotonic()
+    hard_deadline = batch_started_monotonic + hard_cap_seconds
+    cancellation_grace_seconds = _bounded_batch_timeout(
+        getattr(
+            settings,
+            "delegation_cancellation_grace_seconds",
+            5.0,
+        ),
+        default=5.0,
+        hard_maximum=30.0,
+    )
+    timeout_metadata_by_task: dict[
+        asyncio.Task[dict[str, Any]], dict[str, Any]
+    ] = {}
+    pending: set[asyncio.Task[dict[str, Any]]] = set(child_tasks)
+
+    async def cancel_children(
+        targets: set[asyncio.Task[dict[str, Any]]],
+        *,
+        deadline_kind: str,
+        cancellation_source: str,
+    ) -> None:
+        if not targets:
+            return
+        ordered_targets = [
+            child_task
+            for child_task in child_tasks
+            if child_task in targets
+        ]
+        for child_task in targets:
+            if child_task.done():
+                continue
+            index = child_tasks.index(child_task)
+            tracker = dispatch_receipt_trackers[index]
+            parent_cancelled = deadline_kind == "parent_cancelled"
+            terminal_reason = (
+                "task_cancelled"
+                if parent_cancelled
+                else (
+                    "delegated_child_timeout_after_mutating_dispatch"
+                    if tracker.mutating_dispatch_observed
+                    else "delegated_child_timeout"
+                )
+            )
+            failure_class = (
+                "parent_cancelled"
+                if parent_cancelled
+                else (
+                    "side_effect_state_uncertain"
+                    if tracker.mutating_dispatch_observed
+                    else "transient_external"
+                )
+            )
+            timeout_metadata = {
+                "deadline_kind": deadline_kind,
+                "cancellation_source": cancellation_source,
+                "terminal_reason": terminal_reason,
+                "failure_class": failure_class,
+                "retryable": (
+                    False
+                    if parent_cancelled
+                    else not tracker.mutating_dispatch_observed
+                ),
+            }
+            cancellation_attributions[index].update(timeout_metadata)
+            timeout_metadata_by_task[child_task] = timeout_metadata
+
+        # Cancellation is not an authority boundary. Revoke every child fence
+        # first, then close child-owned resources, and only then inject
+        # CancelledError into the coroutine. A child which catches cancellation
+        # still cannot dispatch or commit through the stale generation.
+        for child_task in ordered_targets:
+            index = child_tasks.index(child_task)
+            child_execution_fences[index].revoke(cancellation_source)
+
+        close_tasks: dict[
+            asyncio.Task[FenceTeardownReport],
+            asyncio.Task[dict[str, Any]],
+        ] = {}
+        for child_task in ordered_targets:
+            index = child_tasks.index(child_task)
+            close_task = asyncio.create_task(
+                child_execution_fences[index].close_registered_resources(
+                    grace_seconds=cancellation_grace_seconds,
+                )
+            )
+            close_tasks[close_task] = child_task
+        close_reports: dict[
+            asyncio.Task[dict[str, Any]],
+            FenceTeardownReport,
+        ] = {}
+        if close_tasks:
+            done_close, pending_close = await asyncio.wait(
+                set(close_tasks),
+                timeout=cancellation_grace_seconds + 0.05,
+                return_when=asyncio.ALL_COMPLETED,
+            )
+            for close_task in done_close:
+                child_task = close_tasks[close_task]
+                try:
+                    close_reports[child_task] = close_task.result()
+                except BaseException:
+                    # A failed closer leaves external state unproven.
+                    index = child_tasks.index(child_task)
+                    close_reports[child_task] = FenceTeardownReport(
+                        fence_id=child_execution_fences[index].fence_id,
+                        revoked=True,
+                        generation=child_execution_fences[index].generation,
+                        resource_count=1,
+                        acknowledged_resource_count=0,
+                        unacknowledged_resource_count=1,
+                        cancellation_unacknowledged=True,
+                        fence_coverage_proven=True,
+                    )
+            for close_task in pending_close:
+                child_task = close_tasks[close_task]
+                close_task.cancel()
+                supervise_residual_task(close_task)
+                index = child_tasks.index(child_task)
+                close_reports[child_task] = FenceTeardownReport(
+                    fence_id=child_execution_fences[index].fence_id,
+                    revoked=True,
+                    generation=child_execution_fences[index].generation,
+                    resource_count=1,
+                    acknowledged_resource_count=0,
+                    unacknowledged_resource_count=1,
+                    cancellation_unacknowledged=True,
+                    fence_coverage_proven=True,
+                )
+
+        residual_children = await bounded_cancel_tasks(
+            set(ordered_targets),
+            grace_seconds=cancellation_grace_seconds,
         )
-    except BaseException:
+        for child_task in ordered_targets:
+            index = child_tasks.index(child_task)
+            report = close_reports.get(child_task)
+            fence_covered = bool(
+                report is not None
+                and report.fence_coverage_proven
+                and child_execution_fences[index].revoked
+            )
+            cancellation_unacknowledged = bool(
+                child_task in residual_children
+                or report is None
+                or report.cancellation_unacknowledged
+                or not fence_covered
+            )
+            metadata = timeout_metadata_by_task.get(child_task)
+            if metadata is None:
+                metadata = {
+                    "deadline_kind": deadline_kind,
+                    "cancellation_source": cancellation_source,
+                }
+                timeout_metadata_by_task[child_task] = metadata
+            metadata.update({
+                "cancellation_acknowledged": (
+                    not cancellation_unacknowledged
+                ),
+                "cancellation_unacknowledged": (
+                    cancellation_unacknowledged
+                ),
+                "fence_coverage_proven": fence_covered,
+                "execution_fence_generation": (
+                    child_execution_generations[index]
+                ),
+                "execution_fence_revoked_generation": (
+                    child_execution_fences[index].generation
+                ),
+                "resource_teardown": (
+                    report.as_dict() if report is not None else None
+                ),
+            })
+            if cancellation_unacknowledged:
+                metadata.update({
+                    "terminal_reason": "cancellation_unacknowledged",
+                    "failure_class": "side_effect_state_uncertain",
+                    "retryable": False,
+                    "side_effect_state_uncertain": True,
+                })
+            cancellation_attributions[index].update(metadata)
+
+    try:
+        while pending:
+            now = time.monotonic()
+            if now >= hard_deadline:
+                await cancel_children(
+                    set(pending),
+                    deadline_kind="hard_cap",
+                    cancellation_source="parent_delegate_batch_hard_cap",
+                )
+                pending.clear()
+                break
+
+            soft_expired = {
+                child_task
+                for child_task in pending
+                if not child_task.done()
+                and not dispatch_receipt_trackers[
+                    child_tasks.index(child_task)
+                ].provider_admission_waiting
+                and (
+                    now
+                    - dispatch_receipt_trackers[
+                        child_tasks.index(child_task)
+                    ].last_progress_monotonic
+                    >= soft_lease_seconds
+                )
+            }
+            if soft_expired:
+                await cancel_children(
+                    soft_expired,
+                    deadline_kind="soft_no_progress",
+                    cancellation_source=(
+                        "parent_delegate_batch_soft_no_progress"
+                    ),
+                )
+                pending.difference_update(soft_expired)
+                continue
+
+            next_deadline = hard_deadline
+            for child_task in pending:
+                if child_task.done():
+                    next_deadline = now
+                    break
+                tracker = dispatch_receipt_trackers[
+                    child_tasks.index(child_task)
+                ]
+                if not tracker.provider_admission_waiting:
+                    next_deadline = min(
+                        next_deadline,
+                        tracker.last_progress_monotonic
+                        + soft_lease_seconds,
+                    )
+
+            progress_notifier.clear()
+            progress_waiter = asyncio.create_task(
+                progress_notifier.wait()
+            )
+            try:
+                done, _still_pending = await asyncio.wait(
+                    [*pending, progress_waiter],
+                    timeout=max(
+                        0.001,
+                        next_deadline - time.monotonic(),
+                    ),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                if not progress_waiter.done():
+                    progress_waiter.cancel()
+                    await asyncio.gather(
+                        progress_waiter,
+                        return_exceptions=True,
+                    )
+            pending.difference_update(
+                child_task
+                for child_task in done
+                if child_task is not progress_waiter
+            )
+    except BaseException as exc:
         # Do not leave child agents running if the parent request is cancelled.
-        for child_task in child_tasks:
-            if not child_task.done():
-                child_task.cancel()
-        await asyncio.gather(*child_tasks, return_exceptions=True)
+        unfinished = {
+            child_task for child_task in child_tasks
+            if not child_task.done()
+        }
+        cancellation_source = (
+            "parent_delegate_task_cancelled"
+            if isinstance(exc, asyncio.CancelledError)
+            else "parent_delegate_batch_aborted"
+        )
+        for child_task in unfinished:
+            index = child_tasks.index(child_task)
+            cancellation_attributions[index].update({
+                "cancellation_source": cancellation_source,
+                "terminal_reason": "task_cancelled",
+                "failure_class": "parent_cancelled",
+                "retryable": False,
+            })
+        await cancel_children(
+            unfinished,
+            deadline_kind="parent_cancelled",
+            cancellation_source=cancellation_source,
+        )
         raise
 
-    timed_out = set(pending)
-    if timed_out:
-        for child_task in timed_out:
-            child_task.cancel()
-        # Consume cancellation results before returning so timed-out children
-        # cannot continue mutating shared session state after their envelope is
-        # reported as failed.
-        await asyncio.gather(*timed_out, return_exceptions=True)
+    timed_out = set(timeout_metadata_by_task)
 
     raw_results: list[Any] = []
     for index, child_task in enumerate(child_tasks):
         if child_task in timed_out:
+            timeout_metadata = timeout_metadata_by_task[child_task]
+            timeout_kind = str(timeout_metadata["deadline_kind"])
+            deadline_seconds = (
+                soft_lease_seconds
+                if timeout_kind == "soft_no_progress"
+                else hard_cap_seconds
+            )
             raw_results.append(asyncio.TimeoutError(
                 "Delegated child "
-                f"{index} exceeded the delegate_task batch deadline of "
-                f"{batch_timeout:g} seconds."
+                f"{index} exceeded the delegate_task batch deadline "
+                f"({timeout_kind}) of {deadline_seconds:g} seconds."
             ))
             continue
         try:
@@ -7600,11 +8149,25 @@ async def delegate_task(
                 )
             submitted_keys.add(expected_key)
 
-        if isinstance(raw_result, asyncio.TimeoutError):
-            timeout_terminal_reason = (
-                "delegated_child_timeout_after_mutating_dispatch"
-                if mutating_dispatch_observed
-                else "delegated_child_timeout"
+        # A timeout is a parent-owned batch deadline only when the scheduler
+        # recorded deadline metadata before cancelling this exact task.
+        # ``asyncio.TimeoutError`` raised inside a child is otherwise an
+        # isolated child exception and must not acquire fabricated batch
+        # timeout attribution.
+        if child_tasks[index] in timeout_metadata_by_task:
+            timeout_audit = dict(
+                timeout_metadata_by_task.get(child_tasks[index]) or {}
+            )
+            timeout_terminal_reason = str(
+                timeout_audit.get("terminal_reason")
+                or (
+                    "delegated_child_timeout_after_mutating_dispatch"
+                    if mutating_dispatch_observed
+                    else "delegated_child_timeout"
+                )
+            )
+            cancellation_unacknowledged = (
+                timeout_audit.get("cancellation_unacknowledged") is True
             )
             result = {
                 "index": index,
@@ -7613,17 +8176,58 @@ async def delegate_task(
                 "worker_id": expected_worker or None,
                 "step_type": expected_type or None,
                 "step_id": expected_id or None,
+                "agent_name": _semantic_agent_name(task, index),
                 "error": str(raw_result),
                 "dispatch_receipt_audit": dispatch_receipt_audit,
+                "delegation_timeout": {
+                    "deadline_kind": timeout_audit.get(
+                        "deadline_kind"
+                    ),
+                    "soft_lease_seconds": soft_lease_seconds,
+                    "hard_cap_seconds": hard_cap_seconds,
+                    "cancellation_source": timeout_audit.get(
+                        "cancellation_source"
+                    ),
+                    "cancellation_acknowledged": timeout_audit.get(
+                        "cancellation_acknowledged"
+                    ),
+                    "cancellation_unacknowledged": (
+                        cancellation_unacknowledged
+                    ),
+                    "fence_coverage_proven": timeout_audit.get(
+                        "fence_coverage_proven"
+                    ),
+                    "resource_teardown": timeout_audit.get(
+                        "resource_teardown"
+                    ),
+                },
+                "cancellation_unacknowledged": (
+                    cancellation_unacknowledged
+                ),
+                "side_effect_state_uncertain": bool(
+                    timeout_audit.get("side_effect_state_uncertain")
+                ),
                 **_child_failure_fields(
                     raw_result,
                     timeout_terminal_reason,
                     failure_class=(
-                        "side_effect_state_uncertain"
-                        if mutating_dispatch_observed
-                        else "transient_external"
+                        str(timeout_audit.get("failure_class") or "")
+                        or (
+                            "side_effect_state_uncertain"
+                            if mutating_dispatch_observed
+                            else "transient_external"
+                        )
                     ),
-                    retryable=not mutating_dispatch_observed,
+                    retryable=(
+                        False
+                        if cancellation_unacknowledged
+                        else bool(
+                            timeout_audit.get(
+                                "retryable",
+                                not mutating_dispatch_observed,
+                            )
+                        )
+                    ),
                 ),
             }
         elif isinstance(raw_result, BaseException):
@@ -7642,6 +8246,7 @@ async def delegate_task(
                 "worker_id": expected_worker or None,
                 "step_type": expected_type or None,
                 "step_id": expected_id or None,
+                "agent_name": _semantic_agent_name(task, index),
                 "error": (
                     "Delegated child raised an isolated internal exception: "
                     f"{type(raw_result).__name__}: {raw_result}"
@@ -7670,6 +8275,7 @@ async def delegate_task(
                 "worker_id": expected_worker or None,
                 "step_type": expected_type or None,
                 "step_id": expected_id or None,
+                "agent_name": _semantic_agent_name(task, index),
                 "error": "Delegated child returned a non-object result.",
                 "dispatch_receipt_audit": dispatch_receipt_audit,
                 **_contract_failure_fields("delegation_result_invalid"),
@@ -7699,6 +8305,10 @@ async def delegate_task(
             result.setdefault("step_type", expected_type or None)
             result.setdefault("step_id", expected_id or None)
             result.setdefault(
+                "agent_name",
+                _semantic_agent_name(task, index),
+            )
+            result.setdefault(
                 "dispatch_receipt_audit",
                 dispatch_receipt_audit,
             )
@@ -7721,6 +8331,9 @@ async def delegate_task(
                         result["failure_class"] = (
                             "side_effect_state_uncertain"
                         )
+        result.setdefault("delegation_slot", index + 1)
+        result.setdefault("delegation_batch_id", delegation_batch_id)
+        result.setdefault("delegation_batch_size", len(batch))
         results.append(result)
 
     completed = sum(1 for result in results if result.get("status") == "completed")
@@ -7747,6 +8360,11 @@ async def delegate_task(
         "completed_count": completed,
         "degraded_completed_count": degraded_completed,
         "task_count": len(results),
+        "delegation_batch_id": delegation_batch_id,
+        "batch_deadline_policy": {
+            "soft_no_progress_seconds": soft_lease_seconds,
+            "hard_cap_seconds": hard_cap_seconds,
+        },
         "results": results,
     }
     retryable_failed = [
@@ -8024,6 +8642,20 @@ DELEGATE_TASK_SCHEMA = {
                         },
                         "tools": {"type": "array", "items": {"type": "string"}},
                         "agent_name": {"type": "string"},
+                        "title": {
+                            "type": "string",
+                            "description": (
+                                "Optional declared task title used as a semantic "
+                                "child display identity."
+                            ),
+                        },
+                        "role": {
+                            "type": "string",
+                            "description": (
+                                "Optional declared task role used as a semantic "
+                                "child display identity."
+                            ),
+                        },
                         "workspace_scope": {"type": "string", "enum": ["shared_session"]},
                         "max_iterations": {"type": "integer", "minimum": 1, "maximum": 30},
                         "skill_name": {"type": "string"},

@@ -11,8 +11,20 @@ import SkillBar from './SkillBar'
 import {
   getMessages, chatCompletion, uploadSessionFile, createConversation, uploadSkill,
   getConversationSettings, updateConversationSettings,
-  getSkills, deleteSkill,
+  getSkills, deleteSkill, getRunCards,
 } from '../api'
+import {
+  bindConversationRequestScope,
+  conversationRequestOwnsRoute,
+  conversationRequestWasAccepted,
+  createConversationRequestScope,
+  hydrateAgentRunCards,
+  observeConversationRequestRoute,
+  recordAcceptedRunReceipt,
+  runStatusPresentation,
+  toolStatusPresentation,
+  updateAgentRuns,
+} from '../utils/agentRunHydration'
 
 const SAMPLE_PROMPTS = [
   { icon: FiCode,      text: '帮我写一个红黑树的 Python 实现' },
@@ -26,11 +38,47 @@ const STREAM_INCOMPLETE_MARKERS = [
   '⚠️ 本次任务执行失败：',
   '⚠️ 本次响应在流式输出过程中中断：',
 ]
+const RUN_DTO_FIELD_LABELS = {
+  error: '错误详情',
+  requested_tools: '请求工具',
+  effective_tools: '有效工具',
+  policy: '运行策略',
+  tool_events: '工具事件',
+}
 
-function withClientStreamError(message, error) {
+function withClientStreamError(
+  message,
+  error,
+  backgroundRunExpected = false,
+  acceptancePending = false,
+) {
   const current = message?.content || ''
   if (STREAM_INCOMPLETE_MARKERS.some((marker) => current.includes(marker))) {
     return { ...message, streaming: false }
+  }
+  if (backgroundRunExpected) {
+    const notice = (
+      '⚠️ 实时输出连接已中断，但服务端已接受的任务仍在后台执行。'
+      + '页面会从持久化运行记录自动恢复状态；确认任务终态前请勿重复提交。'
+      + (error?.message ? `\n连接信息：${error.message}` : '')
+    )
+    return {
+      ...message,
+      content: current ? `${current}\n\n---\n${notice}` : notice,
+      streaming: false,
+    }
+  }
+  if (acceptancePending) {
+    const notice = (
+      '⚠️ 实时输出连接在任务受理回执到达前中断，服务端是否已受理尚待确认。'
+      + '页面正在核对该会话的持久化运行状态；确认前请勿重复提交。'
+      + (error?.message ? `\n连接信息：${error.message}` : '')
+    )
+    return {
+      ...message,
+      content: current ? `${current}\n\n---\n${notice}` : notice,
+      streaming: false,
+    }
   }
   if (!current) {
     return {
@@ -50,84 +98,6 @@ function withClientStreamError(message, error) {
   }
 }
 
-function updateAgentRuns(runs, event) {
-  if (!event?.run_id) return runs || []
-  const payload = event.payload || {}
-  const id = event.run_id
-  const next = [...(runs || [])]
-  let idx = next.findIndex((run) => run.id === id)
-  if (idx < 0) {
-    next.push({
-      id,
-      parent_run_id: event.parent_run_id || null,
-      root_run_id: event.root_run_id || id,
-      agent_kind: event.agent_kind || 'agent',
-      agent_name: event.agent_name || event.agent_kind || 'agent',
-      depth: event.depth || 0,
-      workspace_scope: event.workspace_scope || 'shared_session',
-      status: 'running',
-      preview: '',
-      tools: [],
-      artifacts: [],
-      verifier: null,
-      usage: null,
-      events: [],
-    })
-    idx = next.length - 1
-  }
-  const run = { ...next[idx], events: [...(next[idx].events || []), event] }
-  run.parent_run_id = event.parent_run_id || run.parent_run_id
-  run.root_run_id = event.root_run_id || run.root_run_id
-  run.agent_kind = event.agent_kind || run.agent_kind
-  run.agent_name = event.agent_name || run.agent_name
-  run.depth = event.depth ?? run.depth
-  run.workspace_scope = event.workspace_scope || run.workspace_scope
-  if (event.event_type === 'agent.spawned' || event.event_type === 'run.started') run.status = 'running'
-  if (event.event_type === 'agent.delta') run.preview = (run.preview || '') + (payload.content || '')
-  if (event.event_type === 'tool.started') run.tools = [...run.tools, { name: payload.tool_name, status: 'running' }]
-  if (event.event_type === 'tool.completed' || event.event_type === 'tool.failed') {
-    const tools = [...run.tools]
-    const toolIdx = [...tools].reverse().findIndex((tool) => tool.name === payload.tool_name && tool.status === 'running')
-    if (toolIdx >= 0) {
-      const realIdx = tools.length - 1 - toolIdx
-      tools[realIdx] = { ...tools[realIdx], status: event.event_type === 'tool.completed' ? 'success' : 'failed', detail: payload.detail }
-    } else {
-      tools.push({ name: payload.tool_name, status: event.event_type === 'tool.completed' ? 'success' : 'failed', detail: payload.detail })
-    }
-    run.tools = tools
-  }
-  if (event.event_type === 'usage.updated') run.usage = payload
-  if (event.event_type === 'artifact.created') {
-    const artifact = {
-      title: payload.title || payload.path || 'artifact',
-      path: payload.path || '',
-      kind: payload.kind || 'file',
-      size_bytes: payload.size_bytes || payload.size || 0,
-    }
-    run.artifacts = [...(run.artifacts || []), artifact]
-  }
-  if (event.event_type === 'verifier.completed' || event.event_type === 'verifier.failed') {
-    run.verifier = {
-      status: event.event_type === 'verifier.failed' ? 'failed' : (payload.verdict || 'inconclusive'),
-      reason: payload.reason || payload.error || '',
-    }
-  }
-  if (event.event_type === 'run.completed') {
-    run.status = 'succeeded'
-    run.usage = payload.usage || run.usage
-  }
-  if (event.event_type === 'run.failed') {
-    run.status = 'failed'
-    run.error = payload.error || 'Unknown error'
-  }
-  if (event.event_type === 'run.cancelled') {
-    run.status = 'cancelled'
-    run.error = null
-  }
-  next[idx] = run
-  return next
-}
-
 function AgentRunCards({ runs }) {
   const visibleRuns = (runs || []).filter((run) => (
     run.agent_kind !== 'primary' && (
@@ -140,31 +110,114 @@ function AgentRunCards({ runs }) {
   if (visibleRuns.length === 0) return null
   return (
     <div className="ml-10 -mt-3 mb-5 space-y-2">
-      {visibleRuns.map((run) => (
-        <details key={run.id} className="rounded-xl border border-indigo-100 bg-indigo-50/40 px-3 py-2 text-xs" open={run.status === 'running'}>
-          <summary className="cursor-pointer flex items-center gap-2 text-slate-700">
-            <FiCpu className="text-indigo-500" size={13} />
-            <span className="font-medium">{run.agent_name || run.agent_kind}</span>
-            <span className={run.status === 'failed' ? 'text-red-600' : run.status === 'succeeded' ? 'text-green-600' : 'text-amber-600'}>{run.status}</span>
-            <span className="text-slate-400">{run.workspace_scope}</span>
-          </summary>
+      {visibleRuns.map((run) => {
+        const status = runStatusPresentation(run)
+        const stepLabel = [run.workflow_stage, run.step_type, run.step_id]
+          .filter(Boolean)
+          .join(' · ')
+        const batchLabel = (
+          run.delegation_slot && run.delegation_batch_size
+            ? `批次槽位 ${run.delegation_slot}/${run.delegation_batch_size}`
+            : ''
+        )
+        return (
+          <details key={run.id} className="rounded-xl border border-indigo-100 bg-indigo-50/40 px-3 py-2 text-xs" open={(run.lifecycle_status || run.status) === 'running'}>
+            <summary className="cursor-pointer flex flex-wrap items-center gap-2 text-slate-700">
+              <FiCpu className="text-indigo-500" size={13} />
+              <span className="font-medium">{run.display_name || run.agent_name || run.agent_kind}</span>
+              <span className={status.tone}>{status.label}</span>
+              {run.recovered && (run.lifecycle_status || run.status) === 'degraded' && (
+                <span className="text-sky-600">已自动恢复，仍有数据缺口</span>
+              )}
+              {stepLabel && <span className="text-slate-400">{stepLabel}</span>}
+              {batchLabel && <span className="text-slate-400">{batchLabel}</span>}
+              <span className="text-slate-400">{run.workspace_scope}</span>
+            </summary>
           {run.tools?.length > 0 && (
-            <div className="mt-2 flex flex-wrap gap-1.5">
-              {run.tools.slice(-8).map((tool, idx) => (
-                <span key={`${tool.name}-${idx}`} className="px-2 py-0.5 rounded-full bg-white border border-indigo-100 text-slate-600">
-                  {tool.name}: {tool.status}
-                </span>
-              ))}
+            <>
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                {run.tools.slice(-24).map((tool, idx) => (
+                  <span
+                    key={`${tool.name}-${idx}`}
+                    title={tool.detail || ''}
+                    className={
+                      'px-2 py-0.5 rounded-full bg-white border text-slate-600 ' +
+                      (tool.status === 'failed'
+                        ? 'border-red-200'
+                        : tool.status === 'recovered'
+                          ? 'border-sky-200'
+                          : tool.status === 'rejected'
+                            ? 'border-amber-200'
+                            : 'border-indigo-100')
+                    }
+                  >
+                    {tool.name}
+                    {tool.attempt_index ? ` #${tool.attempt_index}` : ''}: {' '}
+                    {toolStatusPresentation(tool.status)}
+                    {tool.later_success_same_tool ? '；后续同工具调用成功' : ''}
+                  </span>
+                ))}
+              </div>
+              {run.tool_attempts_truncated && (
+                <div className="mt-1 text-slate-400">
+                  仅显示最近 {run.tools.length} / 共 {run.tool_attempt_count || run.tools.length} 次工具尝试。
+                </div>
+              )}
+              {run.tools.some((tool) => (
+                tool.detail
+                && ['failed', 'rejected', 'recovered'].includes(tool.status)
+              )) && (
+                <div className="mt-2 space-y-1 rounded-lg border border-slate-200 bg-white/70 p-2 text-slate-600">
+                  {run.tools
+                    .filter((tool) => (
+                      tool.detail
+                      && ['failed', 'rejected', 'recovered'].includes(tool.status)
+                    ))
+                    .slice(-24)
+                    .map((tool) => (
+                      <div key={`${run.id}-${tool.tool_call_id || tool.name}-${tool.attempt_index || ''}-detail`}>
+                        <span className="font-medium">
+                          {tool.name}
+                          {tool.attempt_index ? ` #${tool.attempt_index}` : ''}
+                        </span>
+                        {' · '}
+                        {toolStatusPresentation(tool.status)}
+                        {tool.later_success_same_tool
+                          ? '（后续同工具调用成功，不代表本次调用已恢复）'
+                          : ''}
+                        ：{tool.detail}
+                      </div>
+                    ))}
+                </div>
+              )}
+            </>
+          )}
+          {run.dto_truncated && (
+            <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50/80 p-2 text-amber-700">
+              该运行详情超过安全展示上限，已显示有界摘要
+              {run.dto_truncated_fields?.length
+                ? `（${run.dto_truncated_fields
+                  .map((field) => RUN_DTO_FIELD_LABELS[field] || field)
+                  .join('、')}）`
+                : ''}
+              。
             </div>
           )}
           {run.artifacts?.length > 0 && (
-            <div className="mt-2 flex flex-wrap gap-1.5">
-              {run.artifacts.slice(-4).map((artifact, idx) => (
-                <span key={`${artifact.path || artifact.title}-${idx}`} className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-100 text-emerald-700">
-                  {artifact.title || artifact.path} · {(artifact.size_bytes || 0).toLocaleString()}b
-                </span>
-              ))}
-            </div>
+            <>
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                {run.artifacts.slice(-4).map((artifact, idx) => (
+                  <span key={`${artifact.path || artifact.title}-${idx}`} className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-100 text-emerald-700">
+                    {artifact.title || artifact.path} · {(artifact.size_bytes || 0).toLocaleString()}b
+                  </span>
+                ))}
+              </div>
+              {(run.artifacts_truncated || run.artifacts.length > 4) && (
+                <div className="mt-1 text-slate-400">
+                  仅显示最近 {Math.min(4, run.artifacts.length)} / 共 {run.artifact_count || run.artifacts.length} 个产物。
+                </div>
+              )}
+            </>
           )}
           {run.verifier && (
             <div className={run.verifier.status === 'pass' ? 'mt-2 text-emerald-600' : run.verifier.status === 'failed' || run.verifier.status === 'fail' ? 'mt-2 text-red-600' : 'mt-2 text-amber-600'}>
@@ -172,10 +225,13 @@ function AgentRunCards({ runs }) {
             </div>
           )}
           {run.preview && <div className="mt-2 max-h-28 overflow-y-auto whitespace-pre-wrap text-slate-600 bg-white/70 rounded-lg p-2">{run.preview.slice(-800)}</div>}
+          {run.recovery_reason && <div className="mt-2 text-sky-700">恢复依据：{run.recovery_reason}</div>}
+          {run.status_reason && !run.error && <div className="mt-2 text-slate-500">终态：{run.status_reason}</div>}
           {run.error && <div className="mt-2 text-red-600">{run.error}</div>}
           {run.usage?.total_tokens ? <div className="mt-2 text-slate-400">{run.usage.total_tokens.toLocaleString()} tokens</div> : null}
-        </details>
-      ))}
+          </details>
+        )
+      })}
     </div>
   )
 }
@@ -192,6 +248,9 @@ export default function ChatArea({
   const [uploads, setUploads] = useState([])
   const [sessionSkills, setSessionSkills] = useState([])
   const [busy, setBusy] = useState(false)
+  const [durableRunActive, setDurableRunActive] = useState(false)
+  const [durableRunUnknown, setDurableRunUnknown] = useState(false)
+  const [durableRunConversation, setDurableRunConversation] = useState(null)
   const [routedModel, setRoutedModel] = useState('')
   const [selectedModel, setSelectedModel] = useState('')
   const [workspaceOpen, setWorkspaceOpen] = useState(false)
@@ -202,20 +261,88 @@ export default function ChatArea({
   const inpRef = useRef(null)
   const fileRef = useRef(null)
   const dragCounter = useRef(0)
+  const activeConvRef = useRef(activeConv)
+  const liveRequestRef = useRef(null)
+  activeConvRef.current = activeConv
+  const effectiveDurableRunUnknown = Boolean(
+    activeConv
+    && (
+      durableRunConversation !== activeConv
+      || durableRunUnknown
+    )
+  )
+
+  function requestOwnsCurrentView(scope) {
+    return (
+      liveRequestRef.current === scope
+      && conversationRequestOwnsRoute(scope, activeConvRef.current)
+    )
+  }
 
   useEffect(() => {
+    const liveRequest = liveRequestRef.current
+    if (liveRequest) {
+      observeConversationRequestRoute(liveRequest, activeConv)
+      if (!conversationRequestOwnsRoute(liveRequest, activeConv)) {
+        liveRequest.cancelled = true
+        liveRequest.controller?.abort()
+        liveRequestRef.current = null
+        setBusy(false)
+      }
+    }
+
     if (!activeConv) {
-      setMsgs((p) => (p.some((m) => m.streaming) ? p : []))
+      setMsgs((previous) => (
+        liveRequestRef.current
+        && conversationRequestOwnsRoute(liveRequestRef.current, null)
+        && previous.some((message) => message.streaming)
+          ? previous
+          : []
+      ))
       setSessionSkills([])
+      setDurableRunActive(false)
+      setDurableRunUnknown(false)
+      setDurableRunConversation(null)
       const defaultModel = models.find((m) => m.is_default)?.id || models[0]?.id || ''
       setSelectedModel(defaultModel)
       return
     }
+    setDurableRunActive(false)
+    setDurableRunUnknown(true)
+    setDurableRunConversation(activeConv)
     let aborted = false
-    Promise.all([getMessages(activeConv), getConversationSettings(activeConv)])
-      .then(([server, settings]) => {
+    Promise.all([
+      getMessages(activeConv),
+      getConversationSettings(activeConv),
+      getRunCards(activeConv).then(
+        (payload) => ({ available: true, payload }),
+        () => ({ available: false, payload: null }),
+      ),
+    ])
+      .then(([server, settings, runCardResult]) => {
         if (aborted) return
-        setMsgs((prev) => (prev.some((m) => m.streaming) ? prev : server))
+        const runCards = runCardResult.payload || {
+          roots: [],
+          has_active_runs: false,
+        }
+        setMsgs((prev) => (
+          liveRequestRef.current
+          && conversationRequestOwnsRoute(liveRequestRef.current, activeConv)
+          && prev.some((m) => m.streaming)
+            ? prev
+            : hydrateAgentRunCards(server, runCards)
+        ))
+        if (runCardResult.available) {
+          setDurableRunActive(Boolean(runCards?.has_active_runs))
+          setDurableRunUnknown(false)
+          setDurableRunConversation(activeConv)
+        } else {
+          // A failed status lookup is not evidence that no run exists. Keep
+          // interaction blocked and let the durable poller retry.
+          setDurableRunActive(false)
+          setDurableRunUnknown(true)
+          setDurableRunConversation(activeConv)
+        }
         setSelectedModel(settings.model_id || '')
         getSkills(activeConv, settings.enabled_user_skills || [])
           .then((list) => {
@@ -229,13 +356,112 @@ export default function ChatArea({
       })
       .catch(() => {
         if (aborted) return
-        setMsgs((prev) => (prev.some((m) => m.streaming) ? prev : []))
+        setMsgs((prev) => (
+          liveRequestRef.current
+          && conversationRequestOwnsRoute(liveRequestRef.current, activeConv)
+          && prev.some((m) => m.streaming)
+            ? prev
+            : []
+        ))
+        setDurableRunActive(false)
+        setDurableRunUnknown(true)
+        setDurableRunConversation(activeConv)
       })
     return () => {
       aborted = true
-      setBusy(false)
     }
   }, [activeConv, models])
+
+  // A refreshed tab has no live SSE subscription. Rehydrate from durable
+  // AgentRun projections and poll only while Backend reports an active run.
+  useEffect(() => {
+    if (
+      !activeConv
+      || busy
+      || (!durableRunActive && !effectiveDurableRunUnknown)
+    ) return
+    let cancelled = false
+    let timer = null
+
+    const poll = async () => {
+      try {
+        const runCards = await getRunCards(activeConv)
+        if (cancelled) return
+        const stillActive = Boolean(runCards?.has_active_runs)
+        if (stillActive) {
+          setMsgs((prev) => (
+            prev.some((message) => message.streaming)
+              ? prev
+              : hydrateAgentRunCards(prev, runCards)
+          ))
+        } else {
+          const server = await getMessages(activeConv)
+          if (cancelled) return
+          setMsgs((prev) => (
+            prev.some((message) => message.streaming)
+              ? prev
+              : hydrateAgentRunCards(server, runCards)
+          ))
+        }
+        setDurableRunActive(stillActive)
+        setDurableRunUnknown(false)
+        setDurableRunConversation(activeConv)
+        if (stillActive) {
+          timer = setTimeout(poll, runCards.poll_after_ms || 2500)
+        }
+      } catch {
+        if (!cancelled) {
+          setDurableRunUnknown(true)
+          setDurableRunConversation(activeConv)
+          timer = setTimeout(poll, 5000)
+        }
+      }
+    }
+
+    timer = setTimeout(poll, 1000)
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+    }
+  }, [activeConv, durableRunActive, effectiveDurableRunUnknown, busy])
+
+  async function reconcileDurableRuns(convId, requestScope) {
+    if (!convId) return
+    const runCards = await getRunCards(convId)
+    if (
+      requestScope
+        ? !requestOwnsCurrentView(requestScope)
+        : activeConvRef.current !== convId
+    ) return
+    const stillActive = Boolean(runCards?.has_active_runs)
+    if (stillActive) {
+      setMsgs((prev) => hydrateAgentRunCards(prev, runCards))
+    } else {
+      const server = await getMessages(convId)
+      if (
+        requestScope
+          ? !requestOwnsCurrentView(requestScope)
+          : activeConvRef.current !== convId
+      ) return
+      setMsgs((prev) => (
+        prev.some((message) => message.streaming)
+          ? prev
+          : hydrateAgentRunCards(server, runCards)
+      ))
+    }
+    setDurableRunActive(stillActive)
+    setDurableRunUnknown(false)
+    setDurableRunConversation(convId)
+  }
+
+  useEffect(() => () => {
+    const liveRequest = liveRequestRef.current
+    if (liveRequest) {
+      liveRequest.cancelled = true
+      liveRequest.controller?.abort()
+      liveRequestRef.current = null
+    }
+  }, [])
 
   const hasNoMessages = msgs.length === 0
 
@@ -431,11 +657,19 @@ export default function ChatArea({
 
   async function doSend(textOverride) {
     const text = (textOverride ?? inp).trim()
-    if ((!text && images.length === 0) || busy) return
+    if (
+      (!text && images.length === 0)
+      || busy
+      || durableRunActive
+      || effectiveDurableRunUnknown
+    ) return
     const sentImages = images
     setInp('')
     setImages([])
     setBusy(true)
+    const requestScope = createConversationRequestScope(activeConv)
+    requestScope.controller = new AbortController()
+    liveRequestRef.current = requestScope
 
     const uMsg = {
       role: 'user',
@@ -454,6 +688,7 @@ export default function ChatArea({
     setMsgs((p) => [...p, uMsg, aMsg])
 
     let convAnnounced = !!activeConv
+    let streamConvId = activeConv
     try {
       await chatCompletion(
         text,
@@ -461,6 +696,14 @@ export default function ChatArea({
         selectedModel || undefined,
         sentImages.length ? sentImages : null,
         (evt) => {
+          if (evt.run_id) {
+            recordAcceptedRunReceipt(requestScope, evt.run_id)
+          }
+          if (evt.conversation_id) {
+            streamConvId = evt.conversation_id
+            bindConversationRequestScope(requestScope, streamConvId)
+          }
+          if (!requestOwnsCurrentView(requestScope)) return
           if (evt.routed_model) setRoutedModel(evt.routed_model)
           if (evt.conversation_id && !convAnnounced) {
             convAnnounced = true
@@ -471,12 +714,18 @@ export default function ChatArea({
             const last = u[u.length - 1]
             if (!last || !last.streaming) return u
             const updated = { ...last }
+            if (evt.run_id) updated.rootRunId = evt.run_id
             if (evt.tool_progress) {
               updated.tool_progress =
                 (updated.tool_progress ? updated.tool_progress + '\n' : '') + evt.tool_progress
             }
             if (evt.agent_event) {
               updated.agentRuns = updateAgentRuns(updated.agentRuns || [], evt.agent_event)
+              updated.rootRunId = (
+                evt.agent_event.root_run_id
+                || evt.agent_event.run_id
+                || updated.rootRunId
+              )
             }
             if (evt.reasoning_delta) {
               updated.reasoning = (updated.reasoning || '') + evt.reasoning_delta
@@ -488,22 +737,59 @@ export default function ChatArea({
             u[u.length - 1] = updated
             return u
           })
-        }
+        },
+        { signal: requestScope.controller.signal },
       )
-      setMsgs((p) => p.map((m) => (m.streaming ? { ...m, streaming: false } : m)))
+      if (requestOwnsCurrentView(requestScope)) {
+        setMsgs((p) => p.map((m) => (
+          m.streaming ? { ...m, streaming: false } : m
+        )))
+      }
     } catch (err) {
+      if (!requestOwnsCurrentView(requestScope)) return
+      const accepted = conversationRequestWasAccepted(requestScope)
+      if (streamConvId) {
+        setDurableRunActive(accepted)
+        setDurableRunUnknown(!accepted)
+        setDurableRunConversation(streamConvId)
+      }
       setMsgs((p) => {
         const u = [...p]
         const last = u[u.length - 1]
         if (last && last.streaming) {
-          u[u.length - 1] = withClientStreamError(last, err)
+          u[u.length - 1] = withClientStreamError(
+            last,
+            err,
+            accepted,
+            !accepted,
+          )
         }
         return u
       })
     } finally {
-      setBusy(false)
-      onConvRefresh()
-      setTimeout(() => onConvRefresh(), 1500)
+      if (requestOwnsCurrentView(requestScope)) {
+        try {
+          await reconcileDurableRuns(streamConvId, requestScope)
+        } catch {
+          // The persisted projection is progressive enhancement for a live
+          // turn; keep the known/possible run blocked and let polling retry.
+          if (streamConvId && requestOwnsCurrentView(requestScope)) {
+            setDurableRunActive(
+              conversationRequestWasAccepted(requestScope),
+            )
+            setDurableRunUnknown(true)
+            setDurableRunConversation(streamConvId)
+          }
+        }
+      }
+      if (requestOwnsCurrentView(requestScope)) {
+        setBusy(false)
+        onConvRefresh()
+        setTimeout(() => onConvRefresh(), 1500)
+      }
+      if (liveRequestRef.current === requestScope) {
+        liveRequestRef.current = null
+      }
     }
   }
 
@@ -516,9 +802,11 @@ export default function ChatArea({
 
   // Regenerate the last assistant message — drops it and re-asks the last user msg
   async function regenerateLast() {
-    if (busy) return
+    if (busy || durableRunActive || effectiveDurableRunUnknown) return
     const lastAssistantIdx = msgs.reduce(
-      (acc, m, i) => (m.role === 'assistant' ? i : acc),
+      (acc, m, i) => (
+        m.role === 'assistant' && !m.durableRunPlaceholder ? i : acc
+      ),
       -1
     )
     if (lastAssistantIdx < 0) return
@@ -546,7 +834,11 @@ export default function ChatArea({
     })
 
     setBusy(true)
+    const requestScope = createConversationRequestScope(activeConv)
+    requestScope.controller = new AbortController()
+    liveRequestRef.current = requestScope
     let convAnnounced = !!activeConv
+    let streamConvId = activeConv
     try {
       await chatCompletion(
         userMsg.content,
@@ -554,6 +846,14 @@ export default function ChatArea({
         selectedModel || undefined,
         userMsg.image_urls,
         (evt) => {
+          if (evt.run_id) {
+            recordAcceptedRunReceipt(requestScope, evt.run_id)
+          }
+          if (evt.conversation_id) {
+            streamConvId = evt.conversation_id
+            bindConversationRequestScope(requestScope, streamConvId)
+          }
+          if (!requestOwnsCurrentView(requestScope)) return
           if (evt.routed_model) setRoutedModel(evt.routed_model)
           if (evt.conversation_id && !convAnnounced) {
             convAnnounced = true
@@ -564,12 +864,18 @@ export default function ChatArea({
             const last = u[u.length - 1]
             if (!last || !last.streaming) return u
             const updated = { ...last }
+            if (evt.run_id) updated.rootRunId = evt.run_id
             if (evt.tool_progress) {
               updated.tool_progress =
                 (updated.tool_progress ? updated.tool_progress + '\n' : '') + evt.tool_progress
             }
             if (evt.agent_event) {
               updated.agentRuns = updateAgentRuns(updated.agentRuns || [], evt.agent_event)
+              updated.rootRunId = (
+                evt.agent_event.root_run_id
+                || evt.agent_event.run_id
+                || updated.rootRunId
+              )
             }
             if (evt.reasoning_delta) {
               updated.reasoning = (updated.reasoning || '') + evt.reasoning_delta
@@ -581,26 +887,66 @@ export default function ChatArea({
             u[u.length - 1] = updated
             return u
           })
-        }
+        },
+        { signal: requestScope.controller.signal },
       )
-      setMsgs((p) => p.map((m) => (m.streaming ? { ...m, streaming: false } : m)))
+      if (requestOwnsCurrentView(requestScope)) {
+        setMsgs((p) => p.map((m) => (
+          m.streaming ? { ...m, streaming: false } : m
+        )))
+      }
     } catch (err) {
+      if (!requestOwnsCurrentView(requestScope)) return
+      const accepted = conversationRequestWasAccepted(requestScope)
+      if (streamConvId) {
+        setDurableRunActive(accepted)
+        setDurableRunUnknown(!accepted)
+        setDurableRunConversation(streamConvId)
+      }
       setMsgs((p) => {
         const u = [...p]
         const last = u[u.length - 1]
         if (last && last.streaming) {
-          u[u.length - 1] = withClientStreamError(last, err)
+          u[u.length - 1] = withClientStreamError(
+            last,
+            err,
+            accepted,
+            !accepted,
+          )
         }
         return u
       })
     } finally {
-      setBusy(false)
-      onConvRefresh()
-      setTimeout(() => onConvRefresh(), 1500)
+      if (requestOwnsCurrentView(requestScope)) {
+        try {
+          await reconcileDurableRuns(streamConvId, requestScope)
+        } catch {
+          if (streamConvId && requestOwnsCurrentView(requestScope)) {
+            setDurableRunActive(
+              conversationRequestWasAccepted(requestScope),
+            )
+            setDurableRunUnknown(true)
+            setDurableRunConversation(streamConvId)
+          }
+        }
+      }
+      if (requestOwnsCurrentView(requestScope)) {
+        setBusy(false)
+        onConvRefresh()
+        setTimeout(() => onConvRefresh(), 1500)
+      }
+      if (liveRequestRef.current === requestScope) {
+        liveRequestRef.current = null
+      }
     }
   }
 
-  const canSend = (inp.trim().length > 0 || images.length > 0) && !busy
+  const interactionBusy = (
+    busy
+    || durableRunActive
+    || effectiveDurableRunUnknown
+  )
+  const canSend = (inp.trim().length > 0 || images.length > 0) && !interactionBusy
 
   function scrollToBottom() {
     endRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -701,7 +1047,11 @@ export default function ChatArea({
           <div className="max-w-3xl mx-auto">
             {msgs.map((m, i) => {
               const isLastAssistant =
-                m.role === 'assistant' && i === msgs.length - 1 && !m.streaming
+                m.role === 'assistant'
+                && i === msgs.length - 1
+                && !m.streaming
+                && !m.durableRunPlaceholder
+                && !interactionBusy
               return (
                 <div key={m.id}>
                   <MessageBubble
@@ -810,6 +1160,17 @@ export default function ChatArea({
             />
           )}
 
+          {!busy && effectiveDurableRunUnknown && (
+            <div className="mb-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
+              正在重新连接并确认后台任务状态；确认完成前暂不接受重复提交。
+            </div>
+          )}
+          {!busy && durableRunActive && !effectiveDurableRunUnknown && (
+            <div className="mb-2 rounded-xl border border-indigo-200 bg-indigo-50 px-3 py-2 text-xs text-indigo-700">
+              任务仍在后台执行，页面会自动同步持久化进度；完成后即可继续发送。
+            </div>
+          )}
+
           <div className="flex items-end gap-1 bg-white rounded-3xl pl-2 pr-2 py-2 border border-stone-200 shadow-sm focus-within:border-indigo-300 focus-within:shadow-md transition">
             <button
               onClick={() => fileRef.current?.click()}
@@ -851,7 +1212,7 @@ export default function ChatArea({
               models={models}
               selectedModel={selectedModel}
               routedModel={routedModel}
-              busy={busy}
+              busy={interactionBusy}
               onChange={changeModel}
             />
 

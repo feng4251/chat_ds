@@ -11,6 +11,7 @@ from runtime.python_env import (
 )
 from skills.command_grants import grant_tuple, load_current_skill_command_grants
 from tools.context import ToolContext
+from tools.execution_fence import require_execution_authority
 from tools.isolated_skill_executor import (
     IsolatedSkillExecutorError,
     MAX_ARG_BYTES,
@@ -143,6 +144,18 @@ async def run_declared_command(
             argv=combined_argv,
             cwd=cwd,
             timeout=DEFAULT_TIMEOUT,
+            **(
+                {
+                    "execution_authority_check": lambda: (
+                        require_execution_authority(
+                            context,
+                            boundary="declared_command.executor_commit",
+                        )
+                    )
+                }
+                if context.execution_fence is not None
+                else {}
+            ),
         )
     except IsolatedSkillExecutorError as exc:
         return _error(exc.code, str(exc), skill_name=skill_name, command_id=command_id)

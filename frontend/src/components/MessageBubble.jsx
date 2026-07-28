@@ -8,6 +8,15 @@ import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 import 'highlight.js/styles/github-dark.css'
 
+const PROJECTION_LABELS = {
+  active_runs: '活动任务',
+  runs: '子代理',
+  events: '生命周期事件',
+  tasks: '任务',
+  artifacts: '产物',
+  run_dtos: '运行详情',
+}
+
 function CodeBlock({ children }) {
   const [copied, setCopied] = useState(false)
   const [collapsed, setCollapsed] = useState(false)
@@ -315,6 +324,28 @@ export function MessageBubble({ msg, onRegenerate }) {
                   {msg.reasoning}
                 </div>
               )}
+            </div>
+          )}
+
+          {msg.lifecycleNotice && (
+            <div className={
+              'mb-2 rounded-xl border px-3 py-2 text-xs ' +
+              (msg.runActive
+                ? 'border-indigo-200 bg-indigo-50 text-indigo-700'
+                : 'border-slate-200 bg-slate-50 text-slate-600')
+            }>
+              {msg.lifecycleNotice}
+              {msg.runActive && <span className="ml-1 animate-pulse">…</span>}
+            </div>
+          )}
+
+          {msg.projectionTruncated?.length > 0 && (
+            <div className="mb-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
+              执行记录较大，当前仅显示有界摘要：
+              {msg.projectionTruncated
+                .map((key) => PROJECTION_LABELS[key] || key)
+                .join('、')}
+              。后台活动状态仍按会话全局持久化记录判定。
             </div>
           )}
 

@@ -12,6 +12,7 @@ from sqlalchemy import (
     JSON,
     Index,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from database import Base
@@ -54,6 +55,15 @@ class Conversation(Base):
     enabled_tools: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     fallback_model_ids: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     enabled_user_skills: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    forked_from_conversation_id: Mapped[Optional[str]] = mapped_column(
+        String(32),
+        nullable=True,
+        index=True,
+    )
+    fork_snapshot_sha256: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        nullable=True,
+    )
     workspace_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     goal_objective: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     goal_status: Mapped[Optional[str]] = mapped_column(String(24), nullable=True)
@@ -103,6 +113,25 @@ class Message(Base):
 
 class SkillPackage(Base):
     __tablename__ = "skill_packages"
+    __table_args__ = (
+        Index(
+            "ux_skill_packages_user_session_name",
+            "user_id",
+            "session_id",
+            "name",
+            unique=True,
+            sqlite_where=text("session_id IS NOT NULL"),
+            postgresql_where=text("session_id IS NOT NULL"),
+        ),
+        Index(
+            "ux_skill_packages_user_name",
+            "user_id",
+            "name",
+            unique=True,
+            sqlite_where=text("session_id IS NULL"),
+            postgresql_where=text("session_id IS NULL"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=generate_uuid)
     user_id: Mapped[str] = mapped_column(

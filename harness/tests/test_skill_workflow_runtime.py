@@ -245,6 +245,7 @@ class SkillWorkflowRuntimeTests(unittest.TestCase):
         self.assertEqual(original_error, recorded["error"])
         self.assertEqual("delegation_contract_error", recorded["terminal_reason"])
         self.assertIsNone(recorded["child_run_id"])
+        self.assertEqual("failed", recorded["completion_quality"])
 
     @staticmethod
     def _failed_bootstrap_result(

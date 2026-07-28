@@ -22,6 +22,7 @@ from runtime.python_env import (
 )
 from skills.scanner import USER_SKILLS_BASE
 from tools.context import ToolContext
+from tools.execution_fence import require_execution_authority
 from tools.isolated_skill_executor import (
     IsolatedSkillExecutorError,
     execute_isolated_session_code,
@@ -80,6 +81,7 @@ def preflight_run_skill_python_args(
         # Direct legacy dispatch without a runtime-owned identity retains the
         # handler's existing validation. Agent-loop calls always carry context.
         return None
+    script: Path | None = None
     invocation_mode = _requested_invocation_mode(
         function_name=args.get("function_name"),
         class_name=args.get("class_name"),
@@ -154,12 +156,24 @@ def preflight_run_skill_python_args(
                 skill_root=skill_root,
             )
     except (SkillScriptError, FileNotFoundError, OSError, ValueError) as exc:
-        return {
+        result: dict[str, Any] = {
             "error": str(exc),
             "error_code": "skill_python_invocation_preflight_failed",
             "reason": "skill_python_invocation_preflight_failed",
             "invocation_mode": invocation_mode,
         }
+        # A guessed callable name is a deterministic, non-dispatched
+        # preflight error.  Return the bounded public inventory from the
+        # already-authorized exact script so the next turn can correct it
+        # without another guess or executor call.
+        if script is not None:
+            if invocation_mode == "function":
+                result["available_functions"] = _public_function_inventory(
+                    script
+                )
+            elif invocation_mode == "instance_method":
+                result["available_classes"] = _public_class_inventory(script)
+        return result
     return None
 
 
@@ -434,6 +448,21 @@ async def run_skill_python(
             **(
                 {"expected_skill_sha256": expected_skill_sha256}
                 if expected_skill_sha256 is not None
+                else {}
+            ),
+            **(
+                {
+                    "execution_authority_check": lambda: (
+                        require_execution_authority(
+                            context,
+                            boundary="skill_python.executor_commit",
+                        )
+                    )
+                }
+                if (
+                    context is not None
+                    and context.execution_fence is not None
+                )
                 else {}
             ),
         )

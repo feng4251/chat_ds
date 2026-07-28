@@ -11,6 +11,8 @@ import re
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from tools.approval import check_code_danger, check_code_warnings
+from tools.context import ToolContext
+from tools.execution_fence import require_execution_authority
 from tools.omission_guard import compacted_history_omission_error, contains_compacted_history_omission
 from tools.path_security import SANDBOX_ROOT, sandbox_dir
 
@@ -503,6 +505,7 @@ async def execute_code(
     timeout: int = DEFAULT_TIMEOUT,
     user_id: str = "default",
     session_id: str = "default",
+    context: ToolContext | None = None,
 ) -> str:
     """Run Python only in a dedicated container with no network namespace."""
     if not code or not code.strip():
@@ -541,6 +544,21 @@ async def execute_code(
                 code=isolated_code,
                 timeout=timeout,
                 skills_root=skills_root,
+                **(
+                    {
+                        "execution_authority_check": lambda: (
+                            require_execution_authority(
+                                context,
+                                boundary="execute_code.executor_commit",
+                            )
+                        )
+                    }
+                    if (
+                        context is not None
+                        and context.execution_fence is not None
+                    )
+                    else {}
+                ),
             )
         except IsolatedSkillExecutorError as exc:
             logger.warning("Isolated session-code request failed safely: %s", exc.code)

@@ -54,10 +54,302 @@ router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 # Background tasks (keep references so they don't get GC'd before completion).
 _background_tasks: set[asyncio.Task] = set()
+_detached_chat_producers: set[asyncio.Task] = set()
+_best_effort_tasks: set[asyncio.Task] = set()
 _INCOMPLETE_RESPONSE_MARKERS = (
     "⚠️ 本次任务执行失败：",
     "⚠️ 本次响应在流式输出过程中中断：",
 )
+_DETACHED_STREAM_DONE = object()
+_DETACHED_STREAM_MAX_CHUNKS = 256
+_DETACHED_STREAM_MAX_BYTES = 4 * 1024 * 1024
+_DETACHED_STREAM_PUBLISH_WAIT_SECONDS = 5.0
+_AGENT_RUN_ERROR_STORAGE_LIMIT = 4000
+
+
+def _bounded_agent_run_error(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    if len(text) <= _AGENT_RUN_ERROR_STORAGE_LIMIT:
+        return text
+    return text[:_AGENT_RUN_ERROR_STORAGE_LIMIT - 1] + "…"
+
+
+class _DetachedStreamRelay:
+    """Relay one accepted chat turn without coupling it to one HTTP client.
+
+    The upstream Harness request belongs to the durable AgentRun, not to the
+    browser connection that happened to start it.  Starlette cancels a
+    ``StreamingResponse`` body iterator when the browser refreshes or a proxy
+    drops the socket.  Keeping the producer in a separately tracked task lets
+    it continue projecting events and the final assistant message while this
+    small relay simply stops forwarding bytes to the departed subscriber.
+
+    The queue is bounded and applies backpressure while a subscriber is
+    attached. Detach clears it and wakes a blocked publisher; future publishes
+    become no-ops, so neither a slow nor a departed client can cause unbounded
+    memory growth.
+    """
+
+    __slots__ = (
+        "_queue",
+        "_attached",
+        "_finished",
+        "_error",
+        "_queued_bytes",
+        "_detach_reason",
+    )
+
+    def __init__(self) -> None:
+        self._queue: asyncio.Queue[object] = asyncio.Queue(
+            maxsize=_DETACHED_STREAM_MAX_CHUNKS
+        )
+        self._attached = True
+        self._finished = False
+        self._error: BaseException | None = None
+        self._queued_bytes = 0
+        self._detach_reason: str | None = None
+
+    async def publish(self, chunk: str) -> None:
+        if not self._attached or self._finished:
+            return
+        chunk_bytes = len(chunk.encode("utf-8", "replace"))
+        if (
+            chunk_bytes > _DETACHED_STREAM_MAX_BYTES
+            or self._queued_bytes + chunk_bytes
+            > _DETACHED_STREAM_MAX_BYTES
+        ):
+            self.detach("subscriber_backpressure")
+            return
+        try:
+            await asyncio.wait_for(
+                self._queue.put((chunk, chunk_bytes)),
+                timeout=_DETACHED_STREAM_PUBLISH_WAIT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            # A half-open or stalled browser must not stop the durable
+            # Backend→Harness producer. Drop this subscriber and continue the
+            # accepted run in the background.
+            self.detach("subscriber_backpressure")
+            return
+        self._queued_bytes += chunk_bytes
+        if not self._attached:
+            # Detach may have woken this publisher by draining a full queue.
+            # Drop the one item it raced to publish; no consumer remains.
+            self._drain_queue()
+            self._queued_bytes = 0
+
+    def finish(self, error: BaseException | None = None) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        self._error = error
+        # If buffered content remains, the consumer observes it first and then
+        # notices _finished at the top of its next loop. An empty queue needs a
+        # sentinel to wake a consumer already blocked in get().
+        if self._attached and self._queue.empty():
+            self._queue.put_nowait(_DETACHED_STREAM_DONE)
+
+    def _drain_queue(self) -> None:
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if (
+                isinstance(item, tuple)
+                and len(item) == 2
+                and isinstance(item[1], int)
+            ):
+                self._queued_bytes = max(
+                    0,
+                    self._queued_bytes - item[1],
+                )
+
+    def detach(self, reason: str = "consumer_closed") -> None:
+        if not self._attached:
+            return
+        self._attached = False
+        self._detach_reason = reason
+        self._drain_queue()
+        self._queued_bytes = 0
+        # Wake a consumer blocked in get(). The sentinel is not buffered model
+        # content and therefore does not count against the byte budget.
+        self._queue.put_nowait(_DETACHED_STREAM_DONE)
+
+    async def stream(self):
+        try:
+            while True:
+                if self._finished and self._queue.empty():
+                    if self._error is not None:
+                        raise self._error
+                    return
+                item = await self._queue.get()
+                if item is _DETACHED_STREAM_DONE:
+                    if self._error is not None:
+                        raise self._error
+                    return
+                chunk, chunk_bytes = item
+                self._queued_bytes = max(
+                    0,
+                    self._queued_bytes - int(chunk_bytes),
+                )
+                yield str(chunk)
+        finally:
+            self.detach()
+
+    @property
+    def detach_reason(self) -> str | None:
+        return self._detach_reason
+
+
+def _track_best_effort_task(
+    operation: Awaitable[None],
+    *,
+    description: str,
+) -> asyncio.Task:
+    """Retain a non-critical task without making it part of a durable barrier."""
+
+    task = asyncio.create_task(operation)
+    _best_effort_tasks.add(task)
+
+    def finish(completed: asyncio.Task) -> None:
+        _best_effort_tasks.discard(completed)
+        try:
+            error = completed.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            logger.warning(
+                "Best-effort background task failed: %s",
+                description,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    task.add_done_callback(finish)
+    return task
+
+
+def _track_detached_chat_producer(
+    *,
+    conv_id: str,
+    run_id: str,
+    relay: _DetachedStreamRelay,
+    operation: Awaitable[None],
+    producer_started: Callable[[], bool] | None = None,
+    on_prestart_exit: Callable[[BaseException | None], None] | None = None,
+) -> asyncio.Task:
+    """Run the accepted turn independently and retain/log its lifecycle."""
+
+    task = asyncio.create_task(operation)
+    _background_tasks.add(task)
+    _detached_chat_producers.add(task)
+
+    def finish(completed: asyncio.Task) -> None:
+        _background_tasks.discard(completed)
+        _detached_chat_producers.discard(completed)
+        error: BaseException | None = None
+        try:
+            error = completed.exception()
+        except asyncio.CancelledError as exc:
+            error = exc
+        relay.finish(error)
+        if (
+            on_prestart_exit is not None
+            and producer_started is not None
+            and not producer_started()
+        ):
+            try:
+                on_prestart_exit(error)
+            except Exception:
+                logger.exception(
+                    "Detached chat pre-start recovery failed conv=%s run=%s",
+                    conv_id,
+                    run_id,
+                )
+        if error is not None and not isinstance(error, asyncio.CancelledError):
+            logger.error(
+                "Detached chat producer failed conv=%s run=%s",
+                conv_id,
+                run_id,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    task.add_done_callback(finish)
+    return task
+
+
+async def shutdown_chat_background_tasks(
+    *,
+    producer_cancel_seconds: float = 3.0,
+    projection_grace_seconds: float = 8.0,
+    best_effort_cancel_seconds: float = 1.0,
+) -> None:
+    """Cancel accepted producers, then give their terminal projections grace.
+
+    Browser disconnects do not call this function.  It is reserved for an
+    actual Backend lifespan shutdown, where cancellation is unavoidable but
+    must still be attributed and projected before the process exits.
+    """
+
+    best_effort = [
+        task for task in _best_effort_tasks
+        if not task.done()
+    ]
+    for task in best_effort:
+        task.cancel()
+
+    producers = [
+        task for task in _detached_chat_producers
+        if not task.done()
+    ]
+    for task in producers:
+        task.cancel()
+    if producers:
+        _done, pending_producers = await asyncio.wait(
+            producers,
+            timeout=max(0.1, float(producer_cancel_seconds)),
+        )
+        if pending_producers:
+            logger.error(
+                "Backend producer cancellation deadline expired with %s "
+                "producer(s)",
+                len(pending_producers),
+            )
+
+    projections = [
+        task for task in _background_tasks
+        if not task.done()
+    ]
+    if not projections:
+        return
+    _done, pending = await asyncio.wait(
+        projections,
+        timeout=max(0.1, float(projection_grace_seconds)),
+    )
+    if pending:
+        logger.error(
+            "Backend shutdown projection grace expired with %s task(s)",
+            len(pending),
+        )
+    late_best_effort = [
+        task for task in _best_effort_tasks
+        if not task.done()
+    ]
+    for task in late_best_effort:
+        task.cancel()
+    if late_best_effort:
+        _done, pending_best_effort = await asyncio.wait(
+            late_best_effort,
+            timeout=max(0.1, float(best_effort_cancel_seconds)),
+        )
+        if pending_best_effort:
+            logger.warning(
+                "Backend best-effort cancellation deadline expired with %s "
+                "task(s)",
+                len(pending_best_effort),
+            )
 
 
 class _ConversationTurnState:
@@ -466,7 +758,22 @@ def _reconcile_root_stream_error(
         run_id=run_id,
     )
     if terminal_status == "failed":
-        return terminal_error or "Agent run failed.", True
+        transport_interruption = any(
+            str(event.get("run_id") or "") == run_id
+            and str(event.get("event_type") or "") == "run.failed"
+            and _event_is_authoritative(
+                event,
+                _normalized_event_payload(event),
+            )
+            and str(
+                _normalized_event_payload(event).get("failure_class") or ""
+            ) == "stream_transport"
+            for event in sorted(
+                agent_events or [],
+                key=lambda item: int(item.get("seq") or 0),
+            )
+        )
+        return terminal_error or "Agent run failed.", not transport_interruption
     if terminal_status == "succeeded":
         return None, False
     if terminal_status == "cancelled":
@@ -556,6 +863,169 @@ def _reconciled_root_run_usage(
         reconciled["input_tokens"] + reconciled["output_tokens"],
     )
     return reconciled
+
+
+def _seal_missing_root_terminal_for_projection(
+    agent_events: list[dict],
+    *,
+    run_id: str,
+    usage: object,
+    finish_reason: str,
+    error_message: str | None,
+    persisted_terminal: dict | None = None,
+    persisted_max_seq: int = 0,
+) -> tuple[list[dict], str, str | None]:
+    """Give every durable root projection one authoritative terminal event.
+
+    A Harness HTTP error, timeout, abrupt EOF, or Backend stream exception can
+    end before a root terminal crosses the bridge. Persisting only a failed
+    ``AgentRun`` row leaves its root task and descendants nonterminal because
+    lifecycle projection is event-driven. Synthesize one explicitly
+    attributed transport failure so the root run, root task, descendants, and
+    refresh cards cross the same atomic terminal boundary.
+    """
+
+    events = list(agent_events or [])
+    if isinstance(persisted_terminal, dict):
+        persisted_fingerprint = _event_contract_fingerprint(
+            persisted_terminal
+        )
+        retained: list[dict] = []
+        retained_persisted = False
+        for event in events:
+            is_root_terminal = (
+                str(event.get("run_id") or "") == run_id
+                and str(event.get("event_type") or "") in {
+                    "run.completed",
+                    "run.failed",
+                    "run.cancelled",
+                }
+                and _event_is_authoritative(
+                    event,
+                    _normalized_event_payload(event),
+                )
+            )
+            if not is_root_terminal:
+                retained.append(event)
+                continue
+            if (
+                not retained_persisted
+                and _event_contract_fingerprint(event)
+                == persisted_fingerprint
+            ):
+                retained.append(persisted_terminal)
+                retained_persisted = True
+        if not retained_persisted:
+            retained.append(persisted_terminal)
+        events = retained
+    terminal_status, _terminal_error = _agent_event_terminal_status(
+        events,
+        run_id=run_id,
+    )
+    if terminal_status is not None:
+        return events, finish_reason, error_message
+
+    terminal_reason = "missing_authoritative_root_terminal"
+    durable_error = (
+        str(error_message).strip()
+        if isinstance(error_message, str) and error_message.strip()
+        else "Harness stream ended without an authoritative root terminal event."
+    )
+    root_seq = max(
+        [max(0, int(persisted_max_seq or 0)), *(
+            int(event.get("seq") or 0)
+            for event in events
+            if str(event.get("run_id") or "") == run_id
+        )],
+    )
+    termination_source = "upstream_stream_missing_terminal"
+    for event in reversed(events):
+        if (
+            str(event.get("run_id") or "") == run_id
+            and event.get("event_type") == "debug.backend_stream.terminated"
+        ):
+            payload = _normalized_event_payload(event)
+            termination_source = (
+                _safe_diagnostic_label(payload.get("termination_source"))
+                or termination_source
+            )
+            break
+    events.append({
+        "type": "agent_event",
+        "event_type": "run.failed",
+        "run_id": run_id,
+        "root_run_id": run_id,
+        "parent_run_id": None,
+        "agent_kind": "primary",
+        "agent_name": "primary",
+        "depth": 0,
+        "workspace_scope": "shared_session",
+        "seq": root_seq + 1,
+        "authoritative": True,
+        "payload": {
+            "authoritative": True,
+            "error": durable_error[:4000],
+            "finish_reason": terminal_reason,
+            "terminal_reason": terminal_reason,
+            "failure_class": "stream_transport",
+            "termination_source": termination_source,
+            "retryable": True,
+            "usage": _normalized_usage(usage),
+        },
+    })
+    return events, terminal_reason, durable_error
+
+
+async def _persisted_authoritative_root_terminal(
+    *,
+    conv_id: str,
+    run_id: str,
+) -> tuple[dict | None, int]:
+    """Load the first already-durable root terminal for projection replay."""
+
+    async with async_session() as s:
+        rows = (await s.execute(
+            select(AgentRunEvent).where(
+                AgentRunEvent.conversation_id == conv_id,
+                AgentRunEvent.run_id == run_id,
+                AgentRunEvent.event_type.in_(
+                    ("run.completed", "run.failed", "run.cancelled")
+                ),
+            ).order_by(
+                AgentRunEvent.seq,
+                AgentRunEvent.event_time,
+                AgentRunEvent.id,
+            )
+        )).scalars().all()
+        max_seq = (await s.execute(
+            select(func.max(AgentRunEvent.seq)).where(
+                AgentRunEvent.conversation_id == conv_id,
+                AgentRunEvent.run_id == run_id,
+            )
+        )).scalar_one_or_none()
+    for row in rows:
+        try:
+            payload = json.loads(row.payload or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        event = {
+            "type": "agent_event",
+            "event_type": str(row.event_type or ""),
+            "run_id": str(row.run_id or ""),
+            "root_run_id": run_id,
+            "parent_run_id": row.parent_run_id,
+            "agent_kind": "primary",
+            "agent_name": "primary",
+            "depth": 0,
+            "workspace_scope": "shared_session",
+            "seq": int(row.seq or 0),
+            "payload": payload,
+        }
+        if _event_is_authoritative(event, payload):
+            return event, max(0, int(max_seq or 0))
+    return None, max(0, int(max_seq or 0))
 
 
 def _merge_monotonic_run_usage(run: AgentRun, value: object) -> None:
@@ -768,6 +1238,7 @@ async def _persist_agent_events(
     requested_model_id: str,
     resolved_model_id: str,
     events: list[dict],
+    defer_root_terminal: bool = False,
 ) -> None:
     if not user_id or not events:
         return
@@ -843,6 +1314,9 @@ async def _persist_agent_events(
         event_type = str(event.get("event_type") or "unknown")
         if event_type in {"agent.delta", "agent.reasoning_delta"}:
             continue
+        terminal_event = event_type in {
+            "run.completed", "run.failed", "run.cancelled",
+        }
         seq = int(event.get("seq") or 0)
         event_key = (run_id, event_type, seq)
         incoming_fingerprint = _event_contract_fingerprint(
@@ -851,6 +1325,15 @@ async def _persist_agent_events(
         )
         persisted_fingerprint = persisted_event_fingerprints.get(event_key)
         event_already_persisted = persisted_fingerprint is not None
+        replay_deferred_root_terminal = bool(
+            event_already_persisted
+            and persisted_fingerprint == incoming_fingerprint
+            and terminal_event
+            and run_id == root_run_id
+            and not defer_root_terminal
+            and existing_runs.get(run_id) is not None
+            and existing_runs[run_id].status == "committing"
+        )
         if event_already_persisted:
             if persisted_fingerprint != incoming_fingerprint:
                 logger.warning(
@@ -861,15 +1344,16 @@ async def _persist_agent_events(
                     event_type,
                     seq,
                 )
-            continue
-        terminal_event = event_type in {
-            "run.completed", "run.failed", "run.cancelled",
-        }
+            if not replay_deferred_root_terminal:
+                continue
         authoritative_terminal = bool(
             terminal_event and _event_is_authoritative(event, payload)
         )
         known_terminal_seq = authoritative_terminal_seq.get(run_id, -1)
-        project_lifecycle = not event_already_persisted
+        project_lifecycle = (
+            not event_already_persisted
+            or replay_deferred_root_terminal
+        )
         if (
             event_type
             in {"agent.spawned", "run.started", "verifier.requested"}
@@ -878,10 +1362,21 @@ async def _persist_agent_events(
             # A delayed/replayed start cannot reopen a durably terminal run.
             project_lifecycle = False
         if terminal_event:
-            if not authoritative_terminal or known_terminal_seq >= 0:
+            if replay_deferred_root_terminal:
+                project_lifecycle = authoritative_terminal
+            elif not authoritative_terminal or known_terminal_seq >= 0:
                 project_lifecycle = False
             elif project_lifecycle:
                 authoritative_terminal_seq[run_id] = seq
+        defer_this_root_terminal = bool(
+            defer_root_terminal
+            and run_id == root_run_id
+            and terminal_event
+            and authoritative_terminal
+            and project_lifecycle
+        )
+        if defer_this_root_terminal:
+            project_lifecycle = False
         if run_id not in existing_runs:
             child_run = AgentRun(
                 id=run_id,
@@ -889,6 +1384,10 @@ async def _persist_agent_events(
                 conversation_id=conv_id,
                 parent_run_id=event.get("parent_run_id"),
                 root_run_id=event.get("root_run_id") or root_run_id,
+                delegation_tool_call_id=(
+                    payload.get("delegation_batch_id")
+                    or payload.get("delegation_tool_call_id")
+                ),
                 agent_kind=str(event.get("agent_kind") or "delegate"),
                 agent_name=event.get("agent_name"),
                 depth=int(event.get("depth") or 0),
@@ -903,10 +1402,49 @@ async def _persist_agent_events(
         run = existing_runs[run_id]
         run.parent_run_id = event.get("parent_run_id") or run.parent_run_id
         run.root_run_id = event.get("root_run_id") or run.root_run_id or root_run_id
+        run.delegation_tool_call_id = (
+            payload.get("delegation_batch_id")
+            or payload.get("delegation_tool_call_id")
+            or run.delegation_tool_call_id
+        )
         run.agent_kind = str(event.get("agent_kind") or run.agent_kind or "delegate")
         run.agent_name = event.get("agent_name") or run.agent_name
         run.depth = int(event.get("depth") if event.get("depth") is not None else run.depth or 0)
         run.workspace_scope = str(event.get("workspace_scope") or run.workspace_scope or "shared_session")
+        if defer_this_root_terminal:
+            # The terminal event is durable, but the assistant message and
+            # root status must cross one final transaction together. Until
+            # then refresh/polling must continue and a new turn must not start.
+            run.status = "committing"
+            run.finish_reason = "terminal_projection_pending"
+            run.error = None
+            run.ended_at = None
+            task_key = f"run:{run_id}"
+            task = task_items.get(task_key)
+            if task is None:
+                task = TaskItem(
+                    id=uuid.uuid4().hex,
+                    user_id=user_id,
+                    conversation_id=conv_id,
+                    run_id=run_id,
+                    root_run_id=root_run_id,
+                    parent_run_id=event.get("parent_run_id"),
+                    task_key=task_key,
+                    kind="primary",
+                    title=str(
+                        event.get("agent_name") or "primary"
+                    )[:256],
+                    status="committing",
+                    agent_name=event.get("agent_name") or "primary",
+                )
+                s.add(task)
+                task_items[task_key] = task
+            task.status = "committing"
+            task.summary = "terminal_projection_pending"
+            task.error = None
+            task.ended_at = None
+            task.updated_at = datetime.utcnow()
+            task.metadata_json = json.dumps(payload, ensure_ascii=False)
         if event_type == "agent.spawned" and project_lifecycle:
             run.effective_tools = json.dumps(payload.get("effective_tools") or [], ensure_ascii=False)
             run.requested_tools = json.dumps(payload.get("requested_tools") or [], ensure_ascii=False)
@@ -953,7 +1491,9 @@ async def _persist_agent_events(
             run.ended_at = datetime.utcnow()
         elif event_type == "run.failed" and project_lifecycle:
             run.status = "failed"
-            run.error = str(payload.get("error") or "Unknown error")
+            run.error = _bounded_agent_run_error(
+                payload.get("error") or "Unknown error"
+            )
             usage_payload = (
                 payload.get("usage")
                 if isinstance(payload.get("usage"), dict)
@@ -1015,13 +1555,12 @@ async def _persist_agent_events(
 def _should_persist_agent_event_immediately(event_type: str) -> bool:
     if not settings.agent_event_immediate_persist:
         return False
-    if event_type.startswith("debug."):
-        return True
-    if not settings.agent_debug_trace:
-        return False
     if event_type in {"agent.delta", "agent.reasoning_delta"}:
         return False
-    return event_type.startswith((
+    # Run/task/artifact recovery is a product guarantee, not a debug feature.
+    # A page refresh may happen hours before terminal backfill, so lifecycle
+    # events must be durable even when verbose debug tracing is disabled.
+    if event_type.startswith((
         "run.",
         "usage.",
         "model.",
@@ -1030,7 +1569,12 @@ def _should_persist_agent_event_immediately(event_type: str) -> bool:
         "artifact.",
         "verifier.",
         "agent.spawned",
-    ))
+    )):
+        return True
+    return bool(
+        settings.agent_debug_trace
+        and event_type.startswith("debug.")
+    )
 
 
 async def _persist_agent_event_once(
@@ -1079,6 +1623,7 @@ async def _persist_agent_event_once(
                 requested_model_id=requested_model_id,
                 resolved_model_id=resolved_model_id,
                 events=[event],
+                defer_root_terminal=True,
             )
             await s.commit()
             return True
@@ -1246,7 +1791,8 @@ async def _assert_no_unprojected_primary_turn(
     unprojected = bool(
         latest_run is not None
         and (
-            latest_run.status == "running"
+            latest_run.status
+            in {"pending", "planned", "queued", "running", "committing"}
             or (
                 latest_message_role == "user"
                 and latest_run.status != "cancelled"
@@ -1262,6 +1808,92 @@ async def _assert_no_unprojected_primary_turn(
                 "projection; this turn was not started."
             ),
         )
+
+
+async def _reconcile_nonterminal_descendants(
+    s: AsyncSession,
+    *,
+    conv_id: str,
+    user_id: str | None,
+    root_run_id: str,
+    root_terminal_status: str | None,
+) -> int:
+    """Close any descendant left nonterminal when its root is terminal.
+
+    A transport can fail after the Harness has cancelled children but before
+    their terminal events cross the Backend SSE bridge.  Leaving those rows as
+    ``running`` makes refresh recovery lie forever.  Root terminality is the
+    ownership boundary: descendants cannot remain live once that root has
+    committed, so synthesize a clearly attributed cancellation projection.
+    """
+
+    if (
+        not user_id
+        or root_terminal_status
+        not in {"succeeded", "failed", "cancelled"}
+    ):
+        return 0
+    descendants = (await s.execute(
+        select(AgentRun).where(
+            AgentRun.conversation_id == conv_id,
+            AgentRun.root_run_id == root_run_id,
+            AgentRun.id != root_run_id,
+            AgentRun.status.in_(
+                ("pending", "planned", "queued", "running", "committing")
+            ),
+        )
+    )).scalars().all()
+    if not descendants:
+        return 0
+
+    now = datetime.utcnow()
+    task_items: dict[str, list[TaskItem]] = {}
+    for task in (await s.execute(
+        select(TaskItem).where(
+            TaskItem.conversation_id == conv_id,
+            TaskItem.root_run_id == root_run_id,
+            TaskItem.status.in_(
+                ("pending", "planned", "queued", "running", "committing")
+            ),
+        )
+    )).scalars().all():
+        task_items.setdefault(str(task.run_id), []).append(task)
+    for child in descendants:
+        max_seq = (await s.execute(
+            select(func.max(AgentRunEvent.seq)).where(
+                AgentRunEvent.conversation_id == conv_id,
+                AgentRunEvent.run_id == child.id,
+            )
+        )).scalar_one_or_none()
+        seq = max(0, int(max_seq or 0)) + 1
+        payload = {
+            "finish_reason": "parent_run_terminal",
+            "terminal_reason": "parent_run_terminal_reconciliation",
+            "cancellation_source": "root_run_terminal",
+            "parent_terminal_status": root_terminal_status,
+            "authoritative": True,
+        }
+        s.add(AgentRunEvent(
+            id=uuid.uuid4().hex,
+            run_id=child.id,
+            conversation_id=conv_id,
+            user_id=user_id,
+            parent_run_id=child.parent_run_id,
+            seq=seq,
+            event_type="run.cancelled",
+            payload=json.dumps(payload, ensure_ascii=False),
+        ))
+        child.status = "cancelled"
+        child.finish_reason = "parent_run_terminal"
+        child.error = None
+        child.ended_at = now
+        for task in task_items.get(child.id, []):
+            task.status = "cancelled"
+            task.error = None
+            task.summary = "parent_run_terminal_reconciliation"
+            task.ended_at = now
+            task.updated_at = now
+    return len(descendants)
 
 
 async def _persist_stream_projection_once(
@@ -1292,20 +1924,24 @@ async def _persist_stream_projection_once(
             input_tokens = reconciled_usage["input_tokens"]
             output_tokens = reconciled_usage["output_tokens"]
             total_tokens = reconciled_usage["total_tokens"]
-            if content or reasoning:
-                assistant_message = Message(
-                    conversation_id=conv_id,
-                    role="assistant",
-                    content=content,
-                    reasoning=reasoning or None,
-                    tool_progress=tool_progress or None,
-                    model_id=resolved_model_id or model_id,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    total_tokens=total_tokens,
-                    created_at=await _next_message_created_at(s, conv_id),
-                )
-                s.add(assistant_message)
+            # Every accepted chat root owns exactly one assistant turn at the
+            # durable projection boundary. A valid tool/artifact-only success
+            # may have no visible model text; omitting the row would leave the
+            # preceding user message last and falsely block every later turn
+            # as "unprojected".
+            assistant_message = Message(
+                conversation_id=conv_id,
+                role="assistant",
+                content=content or "",
+                reasoning=reasoning or None,
+                tool_progress=tool_progress or None,
+                model_id=resolved_model_id or model_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+                created_at=await _next_message_created_at(s, conv_id),
+            )
+            s.add(assistant_message)
             conv = (await s.execute(
                 select(Conversation).where(Conversation.id == conv_id)
             )).scalar_one_or_none()
@@ -1333,6 +1969,22 @@ async def _persist_stream_projection_once(
                 resolved_model_id=resolved_model_id or model_id,
                 events=agent_events,
             )
+            reconciled_descendants = await _reconcile_nonterminal_descendants(
+                s,
+                conv_id=conv_id,
+                user_id=str(event_user_id) if event_user_id else None,
+                root_run_id=run_id,
+                root_terminal_status=terminal_status,
+            )
+            if reconciled_descendants:
+                logger.warning(
+                    "Reconciled %s nonterminal descendant run(s) after root "
+                    "terminal conv=%s root_run=%s status=%s",
+                    reconciled_descendants,
+                    conv_id,
+                    run_id,
+                    terminal_status,
+                )
             run = (await s.execute(
                 select(AgentRun).where(AgentRun.id == run_id)
             )).scalar_one_or_none()
@@ -1350,7 +2002,7 @@ async def _persist_stream_projection_once(
                 else:
                     run.status = "failed" if error_message else "succeeded"
                     run.finish_reason = finish_reason
-                    run.error = error_message
+                    run.error = _bounded_agent_run_error(error_message)
                 run.tool_events = json.dumps(
                     tool_progress.splitlines() if tool_progress else [],
                     ensure_ascii=False,
@@ -1385,28 +2037,6 @@ async def _persist_after_stream(
 ) -> bool:
     """Durably project one completed stream after its live event writers drain."""
 
-    complete_events = list(agent_events or [])
-    terminal_status, _terminal_error = _agent_event_terminal_status(
-        complete_events,
-        run_id=run_id,
-    )
-    error_message, _execution_failed = _reconcile_root_stream_error(
-        complete_events,
-        run_id=run_id,
-        stream_error=error_message,
-    )
-    if terminal_status == "cancelled":
-        finish_reason = "task_cancelled"
-    if (
-        error_message
-        and not any(marker in content for marker in _INCOMPLETE_RESPONSE_MARKERS)
-    ):
-        content += _chat_stream_failure_notice(
-            error_message,
-            execution_failed=_execution_failed,
-            has_partial_content=bool(content),
-        )
-
     # Every live projection for this root run was registered before the stream
     # entered its finally block.  Await them first so the complete ordered
     # event list below is a true terminal backfill rather than another racing
@@ -1415,6 +2045,50 @@ async def _persist_after_stream(
     lock = _agent_event_persist_lock(conv_id)
     try:
         async with lock:
+            persisted_terminal, persisted_max_seq = (
+                await _persisted_authoritative_root_terminal(
+                    conv_id=conv_id,
+                    run_id=run_id,
+                )
+            )
+            complete_events, finish_reason, error_message = (
+                _seal_missing_root_terminal_for_projection(
+                    agent_events or [],
+                    run_id=run_id,
+                    usage=usage,
+                    finish_reason=finish_reason,
+                    error_message=error_message,
+                    persisted_terminal=persisted_terminal,
+                    persisted_max_seq=persisted_max_seq,
+                )
+            )
+            terminal_status, _terminal_error = (
+                _agent_event_terminal_status(
+                    complete_events,
+                    run_id=run_id,
+                )
+            )
+            error_message, _execution_failed = (
+                _reconcile_root_stream_error(
+                    complete_events,
+                    run_id=run_id,
+                    stream_error=error_message,
+                )
+            )
+            if terminal_status == "cancelled":
+                finish_reason = "task_cancelled"
+            if (
+                error_message
+                and not any(
+                    marker in content
+                    for marker in _INCOMPLETE_RESPONSE_MARKERS
+                )
+            ):
+                content += _chat_stream_failure_notice(
+                    error_message,
+                    execution_failed=_execution_failed,
+                    has_partial_content=bool(content),
+                )
             assistant_message_id, event_user_id = (
                 await _run_sqlite_persist_with_retry(
                     lambda: _persist_stream_projection_once(
@@ -1467,16 +2141,32 @@ async def _persist_after_stream(
                 conv_id,
                 run_id,
             )
-    async with async_session() as s:
-        try:
+    async def generate_title_best_effort() -> None:
+        async with async_session() as s:
             cnt = (await s.execute(
-                select(func.count(Message.id)).where(Message.conversation_id == conv_id)
+                select(func.count(Message.id)).where(
+                    Message.conversation_id == conv_id
+                )
             )).scalar() or 0
-            logger.info("title check: conv=%s cnt=%s has_first=%s", conv_id, cnt, bool(first_user_content))
+            logger.info(
+                "title check: conv=%s cnt=%s has_first=%s",
+                conv_id,
+                cnt,
+                bool(first_user_content),
+            )
             if cnt <= 2 and first_user_content:
-                await _generate_title(conv_id, first_user_content, content, s)
-        except Exception as e:
-            logger.exception("title generation failed: %s", e)
+                await _generate_title(
+                    conv_id,
+                    first_user_content,
+                    content,
+                    s,
+                )
+
+    if first_user_content:
+        _track_best_effort_task(
+            generate_title_best_effort(),
+            description=f"title generation conv={conv_id}",
+        )
     return True
 
 
@@ -1519,44 +2209,54 @@ def _spawn_persist_then_emit(
     agent_events: list[dict] | None = None,
 ) -> asyncio.Task:
     async def persist_then_emit() -> bool:
-        reconciled_usage = _reconciled_root_run_usage(
-            usage,
-            agent_events or [],
-            run_id=run_id,
-        )
-        terminal_status, _terminal_error = _agent_event_terminal_status(
-            agent_events or [],
-            run_id=run_id,
-        )
-        effective_error, _execution_failed = _reconcile_root_stream_error(
-            agent_events or [],
-            run_id=run_id,
-            stream_error=error_message,
-        )
         persisted = await _persist_after_stream(
             conv_id, model_id, content, reasoning, tool_progress, first_user_content,
-            run_id, resolved_model_id, usage, finish_reason, effective_error, agent_events,
+            run_id, resolved_model_id, usage, finish_reason,
+            error_message, agent_events,
         )
         if not persisted:
             raise RuntimeError(
                 f"Terminal stream projection was not durable conv={conv_id} run={run_id}"
             )
         try:
+            async with async_session() as s:
+                persisted_run = await s.get(AgentRun, run_id)
+            persisted_status = (
+                str(persisted_run.status or "")
+                if persisted_run is not None
+                else "failed"
+            )
+            persisted_error = (
+                persisted_run.error
+                if persisted_run is not None
+                else "Terminal projection row was not found."
+            )
+            persisted_usage = _normalized_usage({
+                "input_tokens": getattr(
+                    persisted_run, "input_tokens", 0
+                ),
+                "output_tokens": getattr(
+                    persisted_run, "output_tokens", 0
+                ),
+                "total_tokens": getattr(
+                    persisted_run, "total_tokens", 0
+                ),
+            })
             await emit_event(
                 user_id,
                 (
                     "run.cancelled"
-                    if terminal_status == "cancelled"
+                    if persisted_status == "cancelled"
                     else "run.failed"
-                    if terminal_status == "failed" or effective_error
+                    if persisted_status == "failed"
                     else "run.completed"
                 ),
                 {
                     "conversation_id": conv_id,
                     "run_id": run_id,
                     "model_id": resolved_model_id,
-                    "usage": reconciled_usage,
-                    "error": effective_error,
+                    "usage": persisted_usage,
+                    "error": persisted_error,
                 },
                 conv_id,
             )
@@ -1989,9 +2689,12 @@ async def _chat_stream_with_turn(
         created_at=user_created_at,
     )
     db.add(user_msg)
+    run_id = uuid.uuid4().hex
     run = AgentRun(
+        id=run_id,
         user_id=cur_user.id,
         conversation_id=conv_id,
+        root_run_id=run_id,
         source="chat",
         requested_model_id=model_id,
         resolved_model_id=model_id,
@@ -2006,26 +2709,6 @@ async def _chat_stream_with_turn(
     )
     db.add(run)
     await db.commit()
-    await db.refresh(run)
-    run.root_run_id = run.id
-    await db.commit()
-    await emit_event(
-        cur_user.id,
-        "message.created",
-        {
-            "conversation_id": conv_id,
-            "message_id": user_msg.id,
-            "role": "user",
-            "model_id": model_id,
-            "source": "chat",
-        },
-        conv_id,
-    )
-    await emit_event(
-        cur_user.id, "run.started",
-        {"conversation_id": conv_id, "run_id": run.id, "model_id": model_id},
-        conv_id,
-    )
     stream_observation = _StreamObservation(
         run_id=run.id,
         ingress_request_id=ingress_request_id,
@@ -2051,7 +2734,7 @@ async def _chat_stream_with_turn(
 
         def encode_sse(payload: dict) -> str:
             chunk = f"data: {json.dumps(payload)}\n\n"
-            return stream_observation.observe_downstream_chunk(chunk)
+            return stream_observation.observe_produced_chunk(chunk)
 
         try:
             # Establish cleanup before the first yield: a client may disconnect
@@ -2514,9 +3197,151 @@ async def _chat_stream_with_turn(
             # not a successful response.
             yield encode_sse(terminal_envelope_payload)
 
+    relay = _DetachedStreamRelay()
+    producer_state = {"started": False}
+
+    async def produce_detached() -> None:
+        producer_state["started"] = True
+        try:
+            async for chunk in generate():
+                await relay.publish(chunk)
+        except BaseException as exc:
+            relay.finish(exc)
+            raise
+        else:
+            relay.finish()
+
+    def recover_prestart_exit(error: BaseException | None) -> None:
+        cancellation_event = {
+            "type": "agent_event",
+            "event_type": "run.cancelled",
+            "run_id": run.id,
+            "root_run_id": run.id,
+            "parent_run_id": None,
+            "agent_kind": "primary",
+            "agent_name": "primary",
+            "depth": 0,
+            "workspace_scope": "shared_session",
+            "seq": 1,
+            "payload": {
+                "finish_reason": "producer_not_started",
+                "terminal_reason": "producer_not_started",
+                "cancellation_source": "backend_producer_prestart_exit",
+                "exception_class": (
+                    _safe_diagnostic_label(type(error).__name__)
+                    if error is not None
+                    else None
+                ),
+                "authoritative": True,
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+            },
+        }
+        _spawn_persist_then_emit(
+            user_id=cur_user.id,
+            conv_id=conv_id,
+            model_id=model_id,
+            content="",
+            reasoning="",
+            tool_progress="",
+            first_user_content=req.content,
+            run_id=run.id,
+            resolved_model_id=model_id,
+            usage={
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+            finish_reason="producer_not_started",
+            error_message=None,
+            agent_events=[cancellation_event],
+        )
+        _release_conversation_turn(conv_id, turn_lease)
+
+    _track_detached_chat_producer(
+        conv_id=conv_id,
+        run_id=run.id,
+        relay=relay,
+        operation=produce_detached(),
+        producer_started=lambda: producer_state["started"],
+        on_prestart_exit=recover_prestart_exit,
+    )
+
+    async def announce_chat_start() -> None:
+        await emit_event(
+            cur_user.id,
+            "message.created",
+            {
+                "conversation_id": conv_id,
+                "message_id": user_msg.id,
+                "role": "user",
+                "model_id": model_id,
+                "source": "chat",
+            },
+            conv_id,
+        )
+        await emit_event(
+            cur_user.id,
+            "run.started",
+            {
+                "conversation_id": conv_id,
+                "run_id": run.id,
+                "model_id": model_id,
+            },
+            conv_id,
+        )
+
+    _track_best_effort_task(
+        announce_chat_start(),
+        description=f"chat start hooks conv={conv_id} run={run.id}",
+    )
+
+    def persist_downstream_final(
+        observation: _StreamObservation,
+    ) -> None:
+        if relay.detach_reason == "subscriber_backpressure":
+            observation.mark_downstream(
+                "subscriber_backpressure_detached"
+            )
+        event = {
+            "type": "agent_event",
+            "event_type": "debug.backend_stream.downstream_final",
+            "run_id": run.id,
+            "root_run_id": run.id,
+            "parent_run_id": None,
+            "agent_kind": "primary",
+            "agent_name": "primary",
+            "depth": 0,
+            "workspace_scope": "shared_session",
+            "seq": 0,
+            "payload": {
+                **observation.snapshot(),
+                "observation_kind": "downstream_final",
+            },
+        }
+        _append_backend_stream_debug_file(
+            user_id=str(cur_user.id),
+            session_id=conv_id,
+            run_id=run.id,
+            event=event,
+        )
+        if _should_persist_agent_event_immediately(event["event_type"]):
+            _spawn_agent_event_immediate_persist(
+                conv_id=conv_id,
+                user_id=str(cur_user.id),
+                root_run_id=run.id,
+                requested_model_id=model_id,
+                resolved_model_id=model_id,
+                event=event,
+            )
+
     return _ObservedStreamingResponse(
-        generate(),
+        relay.stream(),
         observation=stream_observation,
+        on_downstream_final=persist_downstream_final,
         media_type="text/event-stream",
     )
 

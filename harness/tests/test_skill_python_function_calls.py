@@ -124,6 +124,13 @@ class SkillPythonFunctionCallTests(unittest.IsolatedAsyncioTestCase):
             "skill_python_invocation_preflight_failed",
         )
         self.assertIn("not declared", denied["error"])
+        self.assertEqual(
+            ["search"],
+            [
+                item["name"]
+                for item in denied["available_functions"]
+            ],
+        )
         self.assertIsNone(allowed)
         self.isolated.assert_not_awaited()
 

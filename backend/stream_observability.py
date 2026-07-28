@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -100,6 +101,10 @@ class _StreamObservation:
         self.upstream_data_chunks = 0
         self.upstream_bytes = 0
         self.upstream_parse_errors = 0
+        self.produced_chunks = 0
+        self.produced_bytes = 0
+        self.relayed_chunks = 0
+        self.relayed_bytes = 0
         self.downstream_chunks = 0
         self.downstream_bytes = 0
         self.last_event_seq: int | None = None
@@ -122,10 +127,30 @@ class _StreamObservation:
     def observe_parse_error(self) -> None:
         self.upstream_parse_errors += 1
 
-    def observe_downstream_chunk(self, chunk: str) -> str:
-        self.downstream_chunks += 1
-        self.downstream_bytes += len(chunk.encode("utf-8", "replace"))
+    @staticmethod
+    def _chunk_size(chunk: str | bytes | bytearray | memoryview) -> int:
+        if isinstance(chunk, str):
+            return len(chunk.encode("utf-8", "replace"))
+        return len(bytes(chunk))
+
+    def observe_produced_chunk(self, chunk: str) -> str:
+        self.produced_chunks += 1
+        self.produced_bytes += self._chunk_size(chunk)
         return chunk
+
+    def observe_relayed_chunk(
+        self,
+        chunk: str | bytes | bytearray | memoryview,
+    ) -> None:
+        self.relayed_chunks += 1
+        self.relayed_bytes += self._chunk_size(chunk)
+
+    def observe_downstream_chunk(
+        self,
+        chunk: str | bytes | bytearray | memoryview,
+    ) -> None:
+        self.downstream_chunks += 1
+        self.downstream_bytes += self._chunk_size(chunk)
 
     def observe_agent_event(self, event: dict) -> None:
         observed_at = _observed_at()
@@ -164,6 +189,7 @@ class _StreamObservation:
             "connected": 0,
             "generator_closed": 1,
             "asyncio_cancelled_unknown": 1,
+            "subscriber_backpressure_detached": 2,
             "downstream_send_failed": 2,
             "client_disconnected": 3,
             "service_shutdown": 4,
@@ -212,6 +238,10 @@ class _StreamObservation:
                 "upstream_data_chunks": self.upstream_data_chunks,
                 "upstream_bytes": self.upstream_bytes,
                 "upstream_parse_errors": self.upstream_parse_errors,
+                "produced_chunks": self.produced_chunks,
+                "produced_bytes": self.produced_bytes,
+                "relayed_chunks": self.relayed_chunks,
+                "relayed_bytes": self.relayed_bytes,
                 "downstream_chunks": self.downstream_chunks,
                 "downstream_bytes": self.downstream_bytes,
             },
@@ -273,8 +303,15 @@ class _StreamObservation:
 class _ObservedStreamingResponse(StreamingResponse):
     """StreamingResponse that retains positive ASGI disconnect evidence."""
 
-    def __init__(self, *args, observation: _StreamObservation, **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        observation: _StreamObservation,
+        on_downstream_final=None,
+        **kwargs,
+    ) -> None:
         self._stream_observation = observation
+        self._on_downstream_final = on_downstream_final
         super().__init__(*args, **kwargs)
 
     async def listen_for_disconnect(self, receive) -> None:
@@ -285,8 +322,26 @@ class _ObservedStreamingResponse(StreamingResponse):
                 break
 
     async def stream_response(self, send) -> None:
+        original_iterator = self.body_iterator
+
+        async def observed_iterator():
+            async for chunk in original_iterator:
+                self._stream_observation.observe_relayed_chunk(chunk)
+                yield chunk
+
+        async def observed_send(message) -> None:
+            await send(message)
+            if (
+                message.get("type") == "http.response.body"
+                and message.get("body")
+            ):
+                self._stream_observation.observe_downstream_chunk(
+                    message["body"]
+                )
+
+        self.body_iterator = observed_iterator()
         try:
-            await super().stream_response(send)
+            await super().stream_response(observed_send)
         except OSError as exc:
             self._stream_observation.mark_downstream(
                 "downstream_send_failed",
@@ -312,6 +367,23 @@ class _ObservedStreamingResponse(StreamingResponse):
                 ):
                     pass
             raise
+        finally:
+            if self._stream_observation.downstream_state == "connected":
+                self._stream_observation.mark_downstream(
+                    "response_completed"
+                )
+            callback = self._on_downstream_final
+            if callable(callback):
+                try:
+                    result = callback(self._stream_observation)
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    logger.exception(
+                        "Backend downstream-final observation callback failed "
+                        "run=%s",
+                        self._stream_observation.run_id,
+                    )
 
 
 def _event_payload(event: dict) -> dict:

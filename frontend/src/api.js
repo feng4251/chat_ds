@@ -2,7 +2,6 @@ const API = '/api'
 
 async function request(path, options = {}) {
   const token = localStorage.getItem('token')
-  console.log('[request]', path, 'token:', token ? token.slice(0, 20) + '...' : 'MISSING')
   const headers = { 'Content-Type': 'application/json', ...options.headers }
   if (token) headers['Authorization'] = 'Bearer ' + token
   const res = await fetch(API + path, { ...options, headers })
@@ -175,6 +174,13 @@ export async function clearGoal(convId) {
 
 export async function getRuns(convId) {
   const res = await request(`/conversations/${convId}/runs`)
+  return await res.json()
+}
+
+export async function getRunCards(convId, rootLimit = 20) {
+  const search = new URLSearchParams()
+  search.set('root_limit', String(rootLimit))
+  const res = await request(`/conversations/${convId}/run-cards?${search}`)
   return await res.json()
 }
 
@@ -405,7 +411,14 @@ export async function uploadSessionFile(convId, file) {
   return await res.json()
 }
 
-export async function chatCompletion(content, conversationId, modelId, imageUrls, onChunk) {
+export async function chatCompletion(
+  content,
+  conversationId,
+  modelId,
+  imageUrls,
+  onChunk,
+  options = {},
+) {
   const token = localStorage.getItem('token')
   return fetch(API + '/chat/completions', {
     method: 'POST',
@@ -418,7 +431,8 @@ export async function chatCompletion(content, conversationId, modelId, imageUrls
       conversation_id: conversationId,
       ...(modelId ? { model_id: modelId } : {}),
       image_urls: imageUrls,
-    })
+    }),
+    signal: options.signal,
   }).then(async (res) => {
     if (!res.ok) {
       const text = await res.text().catch(() => '')
@@ -433,41 +447,49 @@ export async function chatCompletion(content, conversationId, modelId, imageUrls
     let convId = null
     let buf = ''
     let terminalEnvelope = null
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buf += decoder.decode(value, { stream: true })
-      const lines = buf.split('\n')
-      buf = lines.pop()
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          let data
-          try {
-            data = JSON.parse(line.slice(6))
-          } catch {
-            // Ignore partial/non-JSON SSE lines.
-            continue
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+        const lines = buf.split('\n')
+        buf = lines.pop()
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            let data
+            try {
+              data = JSON.parse(line.slice(6))
+            } catch {
+              // Ignore partial/non-JSON SSE lines.
+              continue
+            }
+            if (data.conversation_id) convId = data.conversation_id
+            if (data.stream_terminal) terminalEnvelope = data.stream_terminal
+            // Keep consumer failures distinct from malformed upstream SSE.
+            onChunk(data)
           }
+        }
+      }
+      // Flush remaining buffer
+      if (buf.startsWith('data: ')) {
+        let data
+        try {
+          data = JSON.parse(buf.slice(6))
+        } catch {
+          // Ignore a trailing partial/non-JSON SSE line.
+        }
+        if (data) {
           if (data.conversation_id) convId = data.conversation_id
           if (data.stream_terminal) terminalEnvelope = data.stream_terminal
-          // Keep consumer failures distinct from malformed upstream SSE.
           onChunk(data)
         }
       }
-    }
-    // Flush remaining buffer
-    if (buf.startsWith('data: ')) {
-      let data
-      try {
-        data = JSON.parse(buf.slice(6))
-      } catch {
-        // Ignore a trailing partial/non-JSON SSE line.
-      }
-      if (data) {
-        if (data.conversation_id) convId = data.conversation_id
-        if (data.stream_terminal) terminalEnvelope = data.stream_terminal
-        onChunk(data)
-      }
+    } catch (error) {
+      // Consumer errors and route-change aborts must release the body reader;
+      // otherwise the abandoned response can keep a socket and Backend relay
+      // attached until garbage collection.
+      await reader.cancel().catch(() => {})
+      throw error
     }
     if (!terminalEnvelope) {
       const err = new Error(

@@ -25,6 +25,10 @@ from skills.http_grants import (
     canonical_https_request_url,
 )
 from tools.context import ToolContext
+from tools.execution_fence import (
+    ExecutionAuthorityRevoked,
+    require_execution_authority,
+)
 
 
 DEFAULT_MAX_CHARS = 40_000
@@ -572,6 +576,17 @@ async def skill_http_get(
 ) -> str:
     """GET one exact Skill-declared HTTPS endpoint through a pinned resolver."""
 
+    try:
+        require_execution_authority(
+            context,
+            boundary="skill_http_get.entry",
+        )
+    except ExecutionAuthorityRevoked:
+        return _error(
+            "execution_authority_revoked",
+            "Delegated execution authority was revoked; no request was sent.",
+            request_sent=False,
+        )
     if context is None or not context.allowed_skill_http_prefixes:
         return _error(
             "missing_skill_http_grant",
@@ -665,6 +680,10 @@ async def skill_http_get(
                     ) as session:
                         # This is an auditable dispatch attempt even if TLS or
                         # the peer fails before response headers arrive.
+                        require_execution_authority(
+                            context,
+                            boundary="skill_http_get.request_submit",
+                        )
                         request_sent = True
                         async with session.get(
                             current,
@@ -818,6 +837,16 @@ async def skill_http_get(
                             return json.dumps(payload, ensure_ascii=False)
             finally:
                 _release_request_slot(lease)
+    except ExecutionAuthorityRevoked:
+        return _error(
+            "execution_authority_revoked",
+            "Delegated execution authority was revoked; no further request "
+            "was sent.",
+            request_sent=request_sent,
+            request_number=request_number,
+            root_request_number=root_request_number,
+            redirects_followed=redirects,
+        )
     except asyncio.TimeoutError:
         return _error(
             "skill_http_timeout",
@@ -853,6 +882,17 @@ async def skill_http_post_json(
     307/308 would repeat a potentially state-changing request.
     """
 
+    try:
+        require_execution_authority(
+            context,
+            boundary="skill_http_post_json.entry",
+        )
+    except ExecutionAuthorityRevoked:
+        return _error(
+            "execution_authority_revoked",
+            "Delegated execution authority was revoked; no request was sent.",
+            request_sent=False,
+        )
     if context is None or not context.allowed_skill_http_post_prefixes:
         return _error(
             "missing_skill_http_grant",
@@ -957,6 +997,10 @@ async def skill_http_post_json(
                     "Content-Type": "application/json",
                 },
             ) as session:
+                require_execution_authority(
+                    context,
+                    boundary="skill_http_post_json.request_submit",
+                )
                 request_sent = True
                 async with session.post(
                     current,
@@ -1082,6 +1126,15 @@ async def skill_http_post_json(
                             f"{response.status}."
                         )
                     return json.dumps(payload, ensure_ascii=False)
+    except ExecutionAuthorityRevoked:
+        return _error(
+            "execution_authority_revoked",
+            "Delegated execution authority was revoked; no request was sent.",
+            request_sent=request_sent,
+            request_number=request_number,
+            root_request_number=root_request_number,
+            redirects_followed=0,
+        )
     except asyncio.TimeoutError:
         return _error(
             "skill_http_timeout",

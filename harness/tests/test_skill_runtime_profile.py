@@ -16,8 +16,10 @@ from tools.isolated_skill_executor import (
     snapshot_skill_package,
 )
 from tools.skill_runtime_profile import (
+    assess_skill_runtime_network,
     compile_skill_runtime_profile_manifest,
     select_skill_runtime_profile,
+    skill_runtime_external_network_clients,
 )
 
 
@@ -95,6 +97,235 @@ class SkillRuntimeProfileTests(unittest.TestCase):
         self.assertEqual(
             ("playwright",),
             selection.runtime_node_packages,
+        )
+
+    def test_exact_reachable_python_network_call_is_classified(self) -> None:
+        self.write(
+            "scripts/query.py",
+            "from urllib import request as req\n"
+            "def fetch(url):\n"
+            "    return req.urlopen(url).read()\n",
+        )
+        snapshot = snapshot_skill_package(self.root)
+        selection = select_skill_runtime_profile(
+            snapshot, "scripts/query.py"
+        )
+
+        self.assertEqual("base-v1", selection.runtime_profile)
+        self.assertEqual(
+            ("urllib.request.urlopen",),
+            skill_runtime_external_network_clients(snapshot, selection),
+        )
+
+    def test_unrelated_network_source_is_not_in_entrypoint_classification(
+        self,
+    ) -> None:
+        self.write(
+            "scripts/local.py",
+            "def total(values):\n"
+            "    return sum(values)\n",
+        )
+        self.write(
+            "scripts/unrelated.py",
+            "import requests\nrequests.get('https://api.vendor.test/')\n",
+        )
+        snapshot = snapshot_skill_package(self.root)
+        selection = select_skill_runtime_profile(
+            snapshot, "scripts/local.py"
+        )
+
+        self.assertEqual(
+            (),
+            skill_runtime_external_network_clients(snapshot, selection),
+        )
+
+    def test_remote_database_client_import_is_classified_without_dataflow(
+        self,
+    ) -> None:
+        self.write(
+            "scripts/query.py",
+            "from chembl_webresource_client.new_client import new_client\n"
+            "def lookup(identifier):\n"
+            "    return new_client.molecule.get(identifier)\n",
+        )
+        snapshot = snapshot_skill_package(self.root)
+        selection = select_skill_runtime_profile(
+            snapshot, "scripts/query.py"
+        )
+
+        self.assertEqual(
+            ("python:chembl_webresource_client",),
+            skill_runtime_external_network_clients(snapshot, selection),
+        )
+
+    def test_dead_network_branch_does_not_suppress_local_entrypoint(
+        self,
+    ) -> None:
+        self.write(
+            "scripts/local.py",
+            "import requests\n"
+            "if False:\n"
+            "    requests.get('https://api.vendor.test/')\n"
+            "def local_total(values):\n"
+            "    return sum(values)\n",
+        )
+        snapshot = snapshot_skill_package(self.root)
+        selection = select_skill_runtime_profile(
+            snapshot, "scripts/local.py"
+        )
+
+        assessment = assess_skill_runtime_network(snapshot, selection)
+
+        self.assertFalse(assessment.suppresses_entrypoint)
+        self.assertIsNone(assessment.reason_code)
+
+    def test_unused_network_helper_does_not_suppress_local_callable(
+        self,
+    ) -> None:
+        self.write(
+            "scripts/local.py",
+            "import requests\n"
+            "def remote_lookup(url):\n"
+            "    return requests.get(url).json()\n"
+            "def normalize(values):\n"
+            "    return sorted(set(values))\n",
+        )
+        snapshot = snapshot_skill_package(self.root)
+        selection = select_skill_runtime_profile(
+            snapshot, "scripts/local.py"
+        )
+
+        assessment = assess_skill_runtime_network(snapshot, selection)
+
+        self.assertFalse(assessment.suppresses_entrypoint)
+        self.assertIsNone(assessment.reason_code)
+
+    def test_af_unix_socket_is_not_external_network_evidence(self) -> None:
+        self.write(
+            "scripts/local.py",
+            "import socket\n"
+            "connection = socket.socket("
+            "socket.AF_UNIX, socket.SOCK_STREAM)\n"
+            "def descriptor():\n"
+            "    return connection.fileno()\n",
+        )
+        snapshot = snapshot_skill_package(self.root)
+        selection = select_skill_runtime_profile(
+            snapshot, "scripts/local.py"
+        )
+
+        assessment = assess_skill_runtime_network(snapshot, selection)
+
+        self.assertFalse(assessment.suppresses_entrypoint)
+        self.assertEqual((), assessment.external_clients)
+
+    def test_direct_module_http_call_is_conservative_egress_proof(
+        self,
+    ) -> None:
+        self.write(
+            "scripts/query.py",
+            "from urllib import request as req\n"
+            "payload = req.urlopen('https://api.vendor.test/').read()\n",
+        )
+        snapshot = snapshot_skill_package(self.root)
+        selection = select_skill_runtime_profile(
+            snapshot, "scripts/query.py"
+        )
+
+        assessment = assess_skill_runtime_network(snapshot, selection)
+
+        self.assertTrue(assessment.suppresses_entrypoint)
+        self.assertEqual(
+            "skill_runtime_entrypoint_requires_external_network",
+            assessment.reason_code,
+        )
+        self.assertEqual(
+            "python_module_top_level",
+            assessment.evidence_kind,
+        )
+
+    def test_manifest_can_explicitly_declare_egress_only_entrypoint(
+        self,
+    ) -> None:
+        self.write(
+            "scripts/query.py",
+            "def query(term):\n"
+            "    return {'query': term}\n",
+        )
+        self.write(
+            "chatds-runtime.json",
+            json.dumps({
+                "schema_version": 1,
+                "entrypoints": {
+                    "scripts/query.py": {
+                        "runtime_profile": "base-v1",
+                        "egress_only": True,
+                    },
+                },
+            }),
+        )
+        snapshot = snapshot_skill_package(self.root)
+        selection = select_skill_runtime_profile(
+            snapshot, "scripts/query.py"
+        )
+
+        assessment = assess_skill_runtime_network(snapshot, selection)
+
+        self.assertTrue(selection.egress_only)
+        self.assertTrue(assessment.suppresses_entrypoint)
+        self.assertEqual(
+            "skill_runtime_entrypoint_egress_only",
+            assessment.reason_code,
+        )
+
+    def test_non_utf8_source_has_stable_unavailable_assessment(
+        self,
+    ) -> None:
+        path = self.root / "scripts" / "local.py"
+        path.write_bytes(
+            b"def local_value():\n    return 1\n# invalid: \xff\n"
+        )
+        snapshot = snapshot_skill_package(self.root)
+        selection = select_skill_runtime_profile(
+            snapshot, "scripts/local.py"
+        )
+
+        assessment = assess_skill_runtime_network(snapshot, selection)
+
+        self.assertFalse(assessment.suppresses_entrypoint)
+        self.assertEqual(
+            "skill_runtime_network_source_invalid_utf8",
+            assessment.reason_code,
+        )
+        self.assertEqual(
+            "analysis_unavailable",
+            assessment.evidence_kind,
+        )
+
+    def test_value_error_has_stable_unavailable_assessment(self) -> None:
+        self.write(
+            "scripts/local.py",
+            "def local_value():\n"
+            "    return 1\n",
+        )
+        snapshot = snapshot_skill_package(self.root)
+        selection = select_skill_runtime_profile(
+            snapshot, "scripts/local.py"
+        )
+
+        with patch(
+            "tools.skill_runtime_profile.ast.parse",
+            side_effect=ValueError("fixture parser failure"),
+        ):
+            assessment = assess_skill_runtime_network(
+                snapshot,
+                selection,
+            )
+
+        self.assertFalse(assessment.suppresses_entrypoint)
+        self.assertEqual(
+            "skill_runtime_network_source_invalid_syntax",
+            assessment.reason_code,
         )
 
     def test_unfixed_package_json_dependency_fails_before_runtime(self) -> None:

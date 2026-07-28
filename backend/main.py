@@ -6,7 +6,10 @@ from config import settings
 from database import init_db
 
 from routers.auth_router import router as auth_router
-from routers.chat_router import router as chat_router
+from routers.chat_router import (
+    router as chat_router,
+    shutdown_chat_background_tasks,
+)
 from routers.conv_router import router as conv_router
 from routers.model_router import router as model_router
 from routers.skill_router import router as skill_router
@@ -27,6 +30,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         set_service_shutdown_started(True)
+        await shutdown_chat_background_tasks()
         scheduler_task.cancel()
         try:
             await scheduler_task
