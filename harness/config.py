@@ -34,15 +34,23 @@ class Settings(BaseSettings):
     delegated_retrieval_max_pages_per_chain: int = 12
     delegated_retrieval_max_total_response_bytes: int = 2_400_000
     delegated_retrieval_max_total_request_seconds: float = 360.0
-    # End-to-end wall clock bound for one delegate_task batch. Individual
-    # model/tool calls retain their own shorter timeouts; this outer deadline
-    # prevents one wedged child from holding every completed sibling behind an
-    # unbounded gather barrier.
-    # A batch may contain several long-context children while provider token
-    # admission intentionally runs only a subset concurrently.  Keep the
-    # outer envelope longer than one stream deadline/cohort; child iteration,
-    # stream, retrieval, and convergence bounds remain independently strict.
+    # No-material-progress lease for one child in a delegate_task batch. This is
+    # deliberately not an end-to-end batch wall clock: healthy model/tool
+    # progress renews it and time spent in the runtime-owned provider-admission
+    # queue is exempt. Individual stream/tool limits remain independently
+    # bounded.
     delegation_batch_timeout_seconds: float = 3600.0
+    # Independent hard deadline for a cooperative async delegate_task batch.
+    # Progress and admission waiting never extend it, so a productive complex
+    # workflow can outlive the soft lease without becoming unbounded. Arbitrary
+    # synchronous code on the event-loop thread is not preemptible; built-in
+    # long-running operations must use async I/O or the isolated executors.
+    delegation_batch_hard_timeout_seconds: float = 21600.0
+    # After revoking a delegated child's execution fence, resource close and
+    # task-cancellation acknowledgement each receive this fixed grace. A child
+    # which still resists cancellation is isolated under supervision and the
+    # parent returns a non-retryable uncertain-state result.
+    delegation_cancellation_grace_seconds: float = 5.0
     goal_max_continuations: int = 8
     goal_max_parse_failures: int = 3
     agent_debug_trace: bool = False

@@ -121,6 +121,14 @@ from workspace_patterns import (
     workspace_pattern_matches,
 )
 from tools.context import ToolContext
+from tools.execution_fence import (
+    ChildExecutionFence,
+    ExecutionAuthorityRevoked,
+    bounded_cancel_tasks,
+    register_execution_resource,
+    require_execution_authority,
+    unregister_execution_resource,
+)
 from tools.omission_guard import (
     compacted_history_omission_error,
     contains_compacted_history_omission,
@@ -1910,16 +1918,89 @@ def _tool_debug_result(raw: str) -> dict[str, Any]:
     parsed = _json_object(raw)
     payload: dict[str, Any] = {"raw_chars": len(raw or "")}
     if isinstance(parsed, dict):
-        payload["status"] = parsed.get("status")
+        # Fixed-shape receipt metadata is sufficient to distinguish a
+        # preflight rejection, policy denial, upstream HTTP response,
+        # transport failure, timeout, and isolated-process exit.  Never copy
+        # request URLs, bodies, stdout/stderr, headers, or arbitrary nested
+        # error payloads into the persistent debug trace.
+        for key in (
+            "status",
+            "error_code",
+            "reason",
+            "request_sent",
+            "request_method",
+            "request_number",
+            "root_request_number",
+            "http_status",
+            "content_type",
+            "body_chars",
+            "body_truncated",
+            "redirects_followed",
+            "request_body_bytes",
+            "request_body_sha256",
+            "body_sha256",
+            "returncode",
+            "script_path",
+            "cwd",
+            "runtime_status",
+            "network",
+            "isolated_execution",
+            "managed_fallback",
+            "invocation_mode",
+        ):
+            value = parsed.get(key)
+            if value is not None:
+                payload[key] = value
+        matched_skill = parsed.get("matched_skill")
+        if (
+            isinstance(matched_skill, str)
+            and re.fullmatch(r"[A-Za-z0-9_.-]{1,200}", matched_skill)
+        ):
+            payload["matched_skill"] = matched_skill
+        for source_key, debug_key in (
+            ("url", "request_url_sha256"),
+            ("matched_prefix", "matched_prefix_sha256"),
+        ):
+            value = parsed.get(source_key)
+            if isinstance(value, str) and value:
+                payload[debug_key] = hashlib.sha256(
+                    value.encode("utf-8", errors="replace")
+                ).hexdigest()
         payload["error_excerpt"] = (
             _debug_payload(str(parsed.get("error") or ""))
             if parsed.get("error") is not None
             else None
         )
-        payload["returncode"] = parsed.get("returncode")
-        payload["script_path"] = parsed.get("script_path")
-        payload["cwd"] = parsed.get("cwd")
-        payload["runtime_status"] = parsed.get("runtime_status")
+        available_functions = parsed.get("available_functions")
+        if isinstance(available_functions, list):
+            payload["available_function_names"] = [
+                str(item.get("name") or "")[:128]
+                for item in available_functions[:80]
+                if isinstance(item, dict) and str(item.get("name") or "")
+            ]
+            payload["available_function_count"] = len(available_functions)
+        available_classes = parsed.get("available_classes")
+        if isinstance(available_classes, list):
+            payload["available_class_names"] = [
+                str(item.get("name") or "")[:128]
+                for item in available_classes[:80]
+                if isinstance(item, dict) and str(item.get("name") or "")
+            ]
+            payload["available_class_count"] = len(available_classes)
+        retrieval = parsed.get("retrieval")
+        if isinstance(retrieval, dict):
+            payload["retrieval"] = {
+                key: retrieval.get(key)
+                for key in (
+                    "state",
+                    "status",
+                    "request_number",
+                    "request_elapsed_ms",
+                    "wire_body_complete",
+                    "body_truncated",
+                )
+                if retrieval.get(key) is not None
+            }
         payload["stdout_chars"] = len(str(parsed.get("stdout") or "")) if parsed.get("stdout") is not None else None
         payload["stderr_chars"] = len(str(parsed.get("stderr") or "")) if parsed.get("stderr") is not None else None
         payload = {k: v for k, v in payload.items() if v not in (None, "")}
@@ -5188,8 +5269,16 @@ class HarnessRunState:
                 )
             plan = self.skill_execution_plans.get(skill_name) or {}
             status = str(result.get("status") or "").lower()
+            supplied_completion_quality = result.get(
+                "completion_quality"
+            )
+            completion_quality_supplied = bool(
+                isinstance(supplied_completion_quality, str)
+                and supplied_completion_quality.strip()
+            )
             completion_quality = str(
-                result.get("completion_quality") or "complete"
+                supplied_completion_quality
+                or ("complete" if status == "completed" else "failed")
             ).strip().casefold()
             unresolved_retrieval = (
                 dict(result.get("unresolved_retrieval"))
@@ -5733,6 +5822,16 @@ class HarnessRunState:
                 terminal_reason = str(result.get("terminal_reason") or "")
                 failure_class = str(result.get("failure_class") or "")
                 retryable = result.get("retryable") is True
+            # Completion quality describes the accepted result, not a default
+            # aspiration. Historical timeout/error envelopes often omitted the
+            # field and were incorrectly projected as quality=complete.
+            if (
+                not completion_quality_supplied
+                and status == "awaiting_resource_inspection"
+            ):
+                completion_quality = "pending"
+            elif not completion_quality_supplied and status != "completed":
+                completion_quality = "failed"
             step_key = _delegate_step_key(
                 skill_name, step_type, step_id, worker_id
             )
@@ -10693,6 +10792,9 @@ def _emit_run_cancelled_on_cancellation(func):
         user_id = str(arguments.get("user_id") or "default")
         session_id = str(arguments.get("session_id") or "default")
         event_sink = arguments.get("event_sink")
+        cancellation_attribution = arguments.get(
+            "_cancellation_attribution"
+        )
 
         terminal_seen = False
         maximum_event_seq = 0
@@ -10776,7 +10878,7 @@ def _emit_run_cancelled_on_cancellation(func):
                 yield event
         except (asyncio.CancelledError, GeneratorExit) as exc:
             if run_id and not terminal_seen:
-                cancellation_source = (
+                default_cancellation_source = (
                     "service_shutdown"
                     if _HARNESS_SERVICE_SHUTDOWN_STARTED
                     else (
@@ -10784,6 +10886,40 @@ def _emit_run_cancelled_on_cancellation(func):
                         if isinstance(exc, GeneratorExit)
                         else "asyncio_cancelled_unknown"
                     )
+                )
+                bounded_attribution: dict[str, Any] = {}
+                if isinstance(cancellation_attribution, dict):
+                    for key in (
+                        "cancellation_source",
+                        "terminal_reason",
+                        "failure_class",
+                        "delegation_batch_id",
+                        "deadline_kind",
+                    ):
+                        value = " ".join(
+                            str(
+                                cancellation_attribution.get(key) or ""
+                            ).split()
+                        ).strip()
+                        if value:
+                            bounded_attribution[key] = value[:160]
+                    for key in (
+                        "delegation_slot",
+                        "delegation_batch_size",
+                    ):
+                        value = cancellation_attribution.get(key)
+                        if (
+                            isinstance(value, int)
+                            and not isinstance(value, bool)
+                            and value > 0
+                        ):
+                            bounded_attribution[key] = value
+                    retryable = cancellation_attribution.get("retryable")
+                    if isinstance(retryable, bool):
+                        bounded_attribution["retryable"] = retryable
+                cancellation_source = str(
+                    bounded_attribution.get("cancellation_source")
+                    or default_cancellation_source
                 )
                 cancellation_event = {
                     "type": "agent_event",
@@ -10797,9 +10933,16 @@ def _emit_run_cancelled_on_cancellation(func):
                     "workspace_scope": workspace_scope,
                     "seq": maximum_event_seq + 1,
                     "payload": {
-                        "finish_reason": "task_cancelled",
-                        "terminal_reason": "task_cancelled",
+                        "finish_reason": str(
+                            bounded_attribution.get("terminal_reason")
+                            or "task_cancelled"
+                        ),
+                        "terminal_reason": str(
+                            bounded_attribution.get("terminal_reason")
+                            or "task_cancelled"
+                        ),
                         "cancellation_source": cancellation_source,
+                        **bounded_attribution,
                         "exception_class": type(exc).__name__,
                         "usage": dict(observed_usage),
                     },
@@ -10939,6 +11082,10 @@ async def run_stream(
     temperature_override: float | None = None,
     session_skill_registry: list[dict[str, Any]] | None = None,
     _browser_run_scope_id: str | None = None,
+    _cancellation_attribution: dict[str, Any] | None = None,
+    _runtime_progress_sink: Any | None = None,
+    _execution_fence: ChildExecutionFence | None = None,
+    _execution_fence_generation: int | None = None,
 ) -> AsyncIterator[dict]:
     """Async generator yielding SSE-style dicts for a full agent conversation turn.
 
@@ -11155,7 +11302,44 @@ async def run_stream(
             and declared_artifact_patterns is not None
         ),
         allowed_artifact_write_patterns=tuple(artifact_scope_patterns),
+        execution_fence=_execution_fence,
+        execution_fence_generation=_execution_fence_generation,
     )
+    require_execution_authority(
+        tool_context,
+        boundary="run_stream.child_start",
+    )
+    if tool_context.execution_fence is not None:
+        # These callbacks are registered before model/provider execution. They
+        # are exact child-run cleanups and therefore cannot close sibling
+        # browser/process state under the same root workflow.
+        from tools.browser import close_browser_run
+        from tools.skill_process import cleanup_skill_process_run
+
+        async def close_child_browser_run() -> None:
+            await close_browser_run(
+                user_id,
+                session_id,
+                str(run_id),
+            )
+
+        async def close_child_skill_process_run() -> None:
+            await cleanup_skill_process_run(
+                user_id,
+                session_id,
+                str(run_id),
+            )
+
+        register_execution_resource(
+            tool_context,
+            label="browser_run",
+            closer=close_child_browser_run,
+        )
+        register_execution_resource(
+            tool_context,
+            label="skill_process_run",
+            closer=close_child_skill_process_run,
+        )
     hint_tracker = SubdirectoryHintTracker(user_id, session_id)
     run_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     event_seq = 0
@@ -11492,19 +11676,28 @@ async def run_stream(
     ) -> AdmissionObserver | None:
         """Build a prompt-free observer for one provider HTTP attempt."""
 
-        if not debug_trace_enabled:
+        if not debug_trace_enabled and _runtime_progress_sink is None:
             return None
 
         async def observe(event_type: str, payload: dict[str, Any]) -> None:
-            await emit_debug_event(
-                f"provider.admission.{event_type}",
-                {
-                    **payload,
-                    "iteration": iteration,
-                    "attempt": attempt,
-                    "transport": transport,
-                },
-            )
+            observation = {
+                **payload,
+                "iteration": iteration,
+                "attempt": attempt,
+                "transport": transport,
+            }
+            if _runtime_progress_sink is not None:
+                maybe = _runtime_progress_sink(
+                    f"provider_admission.{event_type}",
+                    observation,
+                )
+                if inspect.isawaitable(maybe):
+                    await maybe
+            if debug_trace_enabled:
+                await emit_debug_event(
+                    f"provider.admission.{event_type}",
+                    observation,
+                )
 
         return observe
 
@@ -11832,6 +12025,7 @@ async def run_stream(
             )
             classification_task = {
                 "skill_name": selected_skill,
+                "agent_name": "Intent classification",
                 "step_type": "intent_classification",
                 "step_id": "intent-classification",
                 "workflow_stage": "intent-classification",
@@ -11885,6 +12079,7 @@ async def run_stream(
             ]
             binding_task = {
                 "skill_name": selected_skill,
+                "agent_name": "Artifact naming and binding",
                 "step_type": "artifact_binding",
                 "step_id": "artifact-bindings",
                 "workflow_stage": "artifact-binding",
@@ -12093,6 +12288,12 @@ async def run_stream(
                 )
                 bootstrap_task = {
                             "skill_name": selected_skill,
+                            "agent_name": str(
+                                source.get("role")
+                                or source.get("title")
+                                or source.get("name")
+                                or source_id
+                            ),
                             "step_type": "knowledge_bootstrap",
                             "step_id": source_id,
                             "workflow_stage": "knowledge_bootstrap",
@@ -12420,6 +12621,7 @@ async def run_stream(
                         )
                     worker_task = {
                                 "skill_name": selected_skill,
+                                "agent_name": role_hint or worker_id,
                                 "step_type": "worker",
                                 "step_id": worker_id,
                                 "worker_id": worker_id,
@@ -12725,6 +12927,13 @@ async def run_stream(
                     )
                 task = {
                     "skill_name": selected_skill,
+                    "agent_name": str(
+                        step.get("role")
+                        or step.get("role_hint")
+                        or step.get("title")
+                        or step.get("name")
+                        or step_id
+                    ),
                     "step_type": "aggregation",
                     "step_id": step_id,
                     "workflow_stage": "aggregation",
@@ -13000,6 +13209,10 @@ async def run_stream(
                 route_scoped_output = output_contract.get("route_scoped") is True
                 synthesis_task = {
                     "skill_name": selected_skill,
+                    "agent_name": str(
+                        output_contract.get("title")
+                        or "Artifact synthesis"
+                    ),
                     "step_type": "artifact_synthesis",
                     "step_id": synthesis_step_id,
                     "workflow_stage": "artifact-synthesis",
@@ -16728,10 +16941,14 @@ async def run_stream(
                             auto_call_id,
                         ),
                     )
-            auto_outcome, auto_detail = _tool_outcome_summary(str(auto_result))
+            auto_outcome, auto_detail = _tool_outcome_summary(
+                str(auto_result),
+                tool_name=auto_tool_name,
+            )
+            auto_completed = _tool_outcome_is_completed(auto_outcome)
             auto_result_data = _json_object(str(auto_result))
             delegate_update: dict[str, Any] | None = None
-            if auto_outcome != "success":
+            if not auto_completed:
                 run_state.tool_error_count += 1
                 run_state.last_tool_error_at = run_state.tool_call_count
             else:
@@ -16776,7 +16993,7 @@ async def run_stream(
                     )
                     if guidance:
                         auto_boundary_guidance.append(guidance)
-            elif auto_outcome == "success":
+            elif auto_completed:
                 if auto_tool_name == CAPABILITY_PLAN_TOOL_NAME:
                     guidance = install_accepted_standard_capability_plan(
                         auto_result_data
@@ -16878,7 +17095,7 @@ async def run_stream(
                     delegate_dispatched_tool_result_count += 1
                     delegate_attempted_tool_names.add(auto_tool_name)
                 _collapse_tool_turn_history(conversation, auto_history_index)
-            if auto_outcome == "success":
+            if auto_completed:
                 if auto_actual_dispatch_attempted:
                     trusted_dispatched_tool_result_count += 1
                     tool_stream_consecutive_no_progress_recoveries = 0
@@ -16909,7 +17126,7 @@ async def run_stream(
 
             safe_auto_detail = _redact_debug_text(auto_detail)
             yield await emit_agent_event(
-                "tool.completed" if auto_outcome == "success" else "tool.failed",
+                "tool.completed" if auto_completed else "tool.failed",
                 {
                     "tool_name": auto_tool_name,
                     "tool_call_id": auto_call_id,
@@ -16980,7 +17197,7 @@ async def run_stream(
                 direct_url_fallback_stage == "browser_navigate"
                 and isinstance(direct_url_browser_fallback, dict)
             ):
-                if auto_outcome == "success":
+                if auto_completed:
                     direct_url_browser_fallback["stage"] = "browser_snapshot"
                     forced_workflow_policy = {
                         "tools": ["browser_snapshot"],
@@ -17025,7 +17242,7 @@ async def run_stream(
                 and isinstance(direct_url_browser_fallback, dict)
             ):
                 direct_url_browser_fallback["stage"] = (
-                    "completed" if auto_outcome == "success" else "failed"
+                    "completed" if auto_completed else "failed"
                 )
                 for debug_evt in await debug_stream_event(
                     "direct_url.browser_fallback",
@@ -17040,7 +17257,7 @@ async def run_stream(
                 ):
                     yield debug_evt
 
-            if deterministic_skill_inspection and auto_outcome != "success":
+            if deterministic_skill_inspection and not auto_completed:
                 msg = (
                     "Deterministic compiled Skill-resource inspection failed closed: "
                     + (safe_auto_detail or auto_error or "unknown skill_view failure")
@@ -19253,6 +19470,10 @@ async def run_stream(
                     nonlocal attempt_raw_content_chars
                     nonlocal attempt_raw_reasoning_chars
                     async with httpx.AsyncClient(timeout=stream_timeout) as client:
+                        require_execution_authority(
+                            tool_context,
+                            boundary="provider.stream_submit",
+                        )
                         async with client.stream(
                             "POST",
                             request_url,
@@ -19388,6 +19609,10 @@ async def run_stream(
                     ),
                 )
                 try:
+                    require_execution_authority(
+                        tool_context,
+                        boundary="provider.admission_release_to_stream",
+                    )
                     stream_deadline_lease = MaterialProgressLease.start(
                         attempt_stream_deadline_plan,
                         now=stream_clock.time(),
@@ -19398,6 +19623,11 @@ async def run_stream(
                             attempt_stream_deadline_plan.planned_deadline_seconds
                         ),
                         material_progress_lease=stream_deadline_lease,
+                        **(
+                            {"execution_context": tool_context}
+                            if tool_context.execution_fence is not None
+                            else {}
+                        ),
                     ):
                         yield stream_event
                 finally:
@@ -25713,6 +25943,10 @@ async def run_stream(
                                 ),
                                 expected_descriptor=expected_mcp_descriptor,
                                 frozen_catalog=run_mcp_catalog,
+                                context=_tool_dispatch_context(
+                                    tool_context,
+                                    tool_call_id,
+                                ),
                             )
                     else:
                         native_preflight = preflight_native_tool_call(
@@ -25808,6 +26042,10 @@ async def run_stream(
                             ),
                             expected_descriptor=expected_mcp_descriptor,
                             frozen_catalog=run_mcp_catalog,
+                            context=_tool_dispatch_context(
+                                tool_context,
+                                tool_call_id,
+                            ),
                         )
                 else:
                     native_preflight = preflight_native_tool_call(
@@ -25847,7 +26085,11 @@ async def run_stream(
                 )
                 if hint and actual_dispatch_attempted:
                     result = str(result) + "\n\n" + hint
-                outcome, outcome_detail = _tool_outcome_summary(str(result))
+                outcome, outcome_detail = _tool_outcome_summary(
+                    str(result),
+                    tool_name=display_tool_name,
+                )
+                tool_completed = _tool_outcome_is_completed(outcome)
                 safe_outcome_detail = _redact_debug_text(outcome_detail)
                 if (
                     actual_dispatch_attempted
@@ -25914,7 +26156,7 @@ async def run_stream(
                                 ),
                             }
                 placeholder_retry_failure: dict[str, Any] | None = None
-                if outcome != "success":
+                if not tool_completed:
                     run_state.tool_error_count += 1
                     run_state.last_tool_error_at = run_state.tool_call_count
                     if (
@@ -26226,7 +26468,7 @@ async def run_stream(
                             tool_call_id=tool_call_id,
                         ):
                             yield debug_evt
-                if outcome == "success":
+                if tool_completed:
                     if actual_dispatch_attempted:
                         trusted_dispatched_tool_result_count += 1
                         tool_stream_consecutive_no_progress_recoveries = 0
@@ -26481,7 +26723,7 @@ async def run_stream(
                     and not delegate_cross_tool_failure_budget_exhausted
                 ):
                     eligible_cross_tool_failure = bool(
-                        outcome != "success"
+                        not tool_completed
                         and display_tool_name in tools
                     )
                     if eligible_cross_tool_failure:
@@ -26543,7 +26785,7 @@ async def run_stream(
                             ),
                         }
                     elif (
-                        outcome == "success"
+                        tool_completed
                         and delegate_semantic_progress_reason is not None
                         and delegate_cross_tool_failure_streak > 0
                     ):
@@ -26602,7 +26844,7 @@ async def run_stream(
                     user_id, session_id, display_tool_name, outcome, safe_outcome_detail[:300],
                 )
                 yield await emit_agent_event(
-                    "tool.completed" if outcome == "success" else "tool.failed",
+                    "tool.completed" if tool_completed else "tool.failed",
                     {
                         "tool_name": display_tool_name,
                         "tool_call_id": tool_call_id,
@@ -29080,6 +29322,7 @@ async def _aiter_with_timeout(
     *,
     timeout_seconds: float,
     material_progress_lease: MaterialProgressLease | None = None,
+    execution_context: ToolContext | None = None,
 ) -> AsyncIterator[dict]:
     if (
         isinstance(timeout_seconds, bool)
@@ -29096,7 +29339,11 @@ async def _aiter_with_timeout(
         raise TypeError(
             "material_progress_lease must be a MaterialProgressLease or None"
         )
-    queue: asyncio.Queue[tuple[bool, Any]] = asyncio.Queue()
+    # One parsed provider item is enough to decouple the transport pump from
+    # the consumer. A bounded queue prevents a cancellation-resistant upstream
+    # iterator from retaining an unbounded stream after the child authority is
+    # revoked.
+    queue: asyncio.Queue[tuple[bool, Any]] = asyncio.Queue(maxsize=1)
     loop = asyncio.get_running_loop()
     fixed_deadline = loop.time() + normalized_timeout
 
@@ -29119,8 +29366,13 @@ async def _aiter_with_timeout(
         return ProviderStreamDeadlineExceeded(metrics)
 
     async def pump() -> None:
+        terminal_value: BaseException | None = None
         try:
             async for item in iterator:
+                require_execution_authority(
+                    execution_context,
+                    boundary="provider_stream_pump.publish",
+                )
                 await queue.put((True, item))
         except asyncio.CancelledError:
             # Preserve task cancellation so the provider iterator is closed by
@@ -29129,11 +29381,71 @@ async def _aiter_with_timeout(
             # the httpx response has released its connection.
             raise
         except BaseException as exc:
-            await queue.put((False, exc))
-        else:
-            await queue.put((False, None))
+            terminal_value = exc
+        finally:
+            close_iterator = getattr(iterator, "aclose", None)
+            if callable(close_iterator):
+                try:
+                    await close_iterator()
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as close_exc:
+                    if terminal_value is None:
+                        terminal_value = close_exc
+                    else:
+                        logger.warning(
+                            "Provider iterator close failed after stream error",
+                            exc_info=(
+                                type(close_exc),
+                                close_exc,
+                                close_exc.__traceback__,
+                            ),
+                        )
+        await queue.put((False, terminal_value))
 
     task = asyncio.create_task(pump())
+    cleanup_grace = max(
+        0.001,
+        min(
+            30.0,
+            float(
+                getattr(
+                    settings,
+                    "delegation_cancellation_grace_seconds",
+                    5.0,
+                )
+            ),
+        ),
+    )
+
+    async def close_provider_pump() -> None:
+        residual = await bounded_cancel_tasks(
+            {task},
+            grace_seconds=cleanup_grace,
+        )
+        if residual:
+            raise RuntimeError(
+                "provider_stream_cancellation_unacknowledged"
+            )
+
+    provider_resource_token: str | None = None
+    try:
+        provider_resource_token = register_execution_resource(
+            execution_context,
+            label="provider_stream_pump",
+            closer=close_provider_pump,
+        )
+    except ExecutionAuthorityRevoked:
+        await bounded_cancel_tasks(
+            {task},
+            grace_seconds=cleanup_grace,
+        )
+        raise
+    # Give the newly-created pump one scheduler turn before evaluating very
+    # small absolute deadlines. This preserves the contract that the iterator
+    # is actually entered (and can establish/close its transport context)
+    # rather than being cancelled while still dormant.
+    await asyncio.sleep(0)
     try:
         while True:
             now = loop.time()
@@ -29163,19 +29475,30 @@ async def _aiter_with_timeout(
         task.cancel()
         raise
     finally:
-        if not task.done():
-            task.cancel()
-        # Cancellation of the outer run is not complete until the pump has
-        # unwound the provider stream.  This await is what closes the active
-        # httpx streaming response instead of leaving an orphan AgentModel
-        # request behind after an SSE disconnect.
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        unregister_execution_resource(
+            execution_context,
+            provider_resource_token,
+        )
+        # Cooperative providers still unwind their httpx response here. A
+        # cancellation-resistant iterator is never awaited without a bound:
+        # it remains supervised and, for delegated runs, its already-revoked
+        # fence prevents any subsequent tool/commit authority.
+        residual = await bounded_cancel_tasks(
+            {task},
+            grace_seconds=cleanup_grace,
+        )
+        if residual:
+            logger.error(
+                "Provider stream pump did not acknowledge cancellation within "
+                "the fixed teardown grace"
+            )
 
 
-def _tool_outcome_summary(raw: str) -> tuple[str, str]:
+def _tool_outcome_summary(
+    raw: str,
+    *,
+    tool_name: str = "",
+) -> tuple[str, str]:
     """Return an auditable status line without exposing a large tool payload."""
     raw_text = str(raw or "").strip()
     raw_lower = raw_text.lower()
@@ -29195,6 +29518,47 @@ def _tool_outcome_summary(raw: str) -> tuple[str, str]:
     if data is None:
         return "success", ""
     status = str(data.get("status", "")).lower()
+    completion_quality = str(
+        data.get("completion_quality") or ""
+    ).strip().casefold()
+    if tool_name == "delegate_task" and (
+        status in {
+            "completed_degraded",
+            "degraded",
+            "warning",
+            "warn",
+        }
+        or (
+            status in {"completed", "success", "succeeded"}
+            and completion_quality in {"degraded", "warning", "warn"}
+        )
+    ):
+        detail = str(
+            data.get("message")
+            or data.get("detail")
+            or (
+                f"completed_count={data.get('completed_count', 0)}, "
+                f"degraded_completed_count="
+                f"{data.get('degraded_completed_count', 0)}, "
+                f"task_count={data.get('task_count', 0)}"
+            )
+        )
+        return "degraded", detail
+    if tool_name == "delegate_task" and status == "partial":
+        detail = str(
+            data.get("error")
+            or data.get("message")
+            or data.get("detail")
+            or (
+                f"completed_count={data.get('completed_count', 0)}, "
+                f"task_count={data.get('task_count', 0)}, "
+                f"retryable_failed_count="
+                f"{len(data.get('retryable_failed_step_ids') or [])}, "
+                f"terminal_failed_count="
+                f"{len(data.get('terminal_failed_step_ids') or [])}"
+            )
+        )
+        return "partial", detail
     if status in {"error", "blocked", "timeout", "failed"}:
         detail = str(data.get("error") or data.get("message") or data.get("detail") or "")
         if not detail:
@@ -29212,6 +29576,15 @@ def _tool_outcome_summary(raw: str) -> tuple[str, str]:
     if data.get("success") is False:
         return "error", str(data.get("message") or data.get("detail") or "")
     return "success", ""
+
+
+def _tool_outcome_is_completed(outcome: str) -> bool:
+    """Whether a handler completed, including an explicit degraded result."""
+
+    return str(outcome or "").strip().casefold() in {
+        "success",
+        "degraded",
+    }
 
 
 def _tool_result_size(raw: str) -> int | None:
@@ -29506,7 +29879,7 @@ def _reconcile_workspace_artifacts(
 
     The skill's declared merge runs via Bash `cat` and its workers via delegate_task;
     neither path flows through _artifact_payloads_from_tool_result, so the produced
-    files (e.g. the merged FULL_REPORT.md) were never visible to completion checks.
+    declared merged artifacts were never visible to completion checks.
     This scans ONLY this session's workspace and registers real files matching the
     skill's declared final/modular artifact names. Strictly workspace-scoped; it does
     not run the merge itself. Returns the newly-registered payloads (may be empty).
@@ -31989,7 +32362,9 @@ def _profiled_skill_script_grants(
 
     from tools.isolated_skill_executor import snapshot_skill_package
     from tools.skill_runtime_profile import (
+        BASE_RUNTIME_PROFILE,
         BROWSER_RUNTIME_PROFILE,
+        assess_skill_runtime_network,
         select_skill_runtime_profile,
     )
 
@@ -32059,7 +32434,10 @@ def _profiled_skill_script_grants(
         except (RuntimeError, ValueError, KeyError) as exc:
             errors.append(
                 f"{path}:"
-                + str(getattr(exc, "code", type(exc).__name__))
+                + str(
+                    getattr(exc, "code", None)
+                    or "skill_runtime_profile_unavailable"
+                )
             )
             continue
         if (
@@ -32068,6 +32446,35 @@ def _profiled_skill_script_grants(
             or actual_digest != inventory_digest
         ):
             errors.append(f"{path}:skill_script_authority_mismatch")
+            continue
+        network_assessment = assess_skill_runtime_network(
+            snapshot,
+            selection,
+        )
+        if (
+            network_assessment.reason_code
+            and network_assessment.evidence_kind
+            == "analysis_unavailable"
+        ):
+            errors.append(
+                f"{path}:{network_assessment.reason_code}"
+            )
+            continue
+        if (
+            selection.runtime_profile == BASE_RUNTIME_PROFILE
+            and network_assessment.suppresses_entrypoint
+        ):
+            # base-v1 deliberately has no DNS or external network route.  Do
+            # not advertise an exact entrypoint proven egress-only. Potential
+            # network helpers and dead branches remain callable so unrelated
+            # local functions in the same module are not hidden.
+            errors.append(
+                f"{path}:"
+                + (
+                    network_assessment.reason_code
+                    or "skill_runtime_entrypoint_requires_external_network"
+                )
+            )
             continue
         manifest_row = manifest_rows.get(path)
         if (
@@ -32078,6 +32485,8 @@ def _profiled_skill_script_grants(
             != selection.runtime_profile
             or manifest_row.get("required_cwd")
             != selection.required_cwd
+            or bool(manifest_row.get("egress_only"))
+            != selection.egress_only
         ):
             errors.append(
                 f"{path}:skill_runtime_profile_authority_mismatch"
@@ -33010,7 +33419,11 @@ def _build_standard_skill_capability_catalog(
         compile_loaded_skill_http_post_grants,
     )
     from tools.isolated_skill_executor import snapshot_skill_package
-    from tools.skill_runtime_profile import select_skill_runtime_profile
+    from tools.skill_runtime_profile import (
+        BASE_RUNTIME_PROFILE,
+        assess_skill_runtime_network,
+        select_skill_runtime_profile,
+    )
 
     skill_package_sha256 = ""
     skill_snapshot = None
@@ -33150,13 +33563,14 @@ def _build_standard_skill_capability_catalog(
         authority_documents,
     )
     script_runtime_profiles: dict[str, dict[str, Any]] = {}
-    profile_unavailable: list[dict[str, str]] = []
+    profile_unavailable: list[dict[str, Any]] = []
     profiled_runnable_scripts: list[tuple[str, str]] = []
     for path, digest in filtered_runnable_scripts:
         if skill_snapshot is None:
             profile_unavailable.append({
                 "kind": "skill_script",
                 "resource_path": path,
+                "reason_code": "skill_runtime_snapshot_unavailable",
                 "reason": (
                     "The exact immutable Skill package could not be captured "
                     "for runtime-profile selection."
@@ -33172,6 +33586,10 @@ def _build_standard_skill_capability_catalog(
             profile_unavailable.append({
                 "kind": "skill_script",
                 "resource_path": path,
+                "reason_code": str(
+                    getattr(exc, "code", None)
+                    or "skill_runtime_profile_unavailable"
+                ),
                 "reason": (
                     "The exact immutable entrypoint has no supported runtime "
                     "profile: "
@@ -33186,9 +33604,52 @@ def _build_standard_skill_capability_catalog(
             profile_unavailable.append({
                 "kind": "skill_script",
                 "resource_path": path,
+                "reason_code": "skill_runtime_profile_authority_mismatch",
                 "reason": (
                     "The runtime-profile snapshot does not match the current "
                     "content-addressed script inventory."
+                ),
+            })
+            continue
+        network_assessment = assess_skill_runtime_network(
+            skill_snapshot,
+            selection,
+        )
+        if (
+            network_assessment.reason_code
+            and network_assessment.evidence_kind
+            == "analysis_unavailable"
+        ):
+            profile_unavailable.append({
+                "kind": "skill_script",
+                "resource_path": path,
+                "reason_code": network_assessment.reason_code,
+                "reason": (
+                    "The exact entrypoint could not be safely classified for "
+                    "the isolated runtime."
+                ),
+            })
+            continue
+        if (
+            selection.runtime_profile == BASE_RUNTIME_PROFILE
+            and network_assessment.suppresses_entrypoint
+        ):
+            profile_unavailable.append({
+                "kind": "skill_script",
+                "resource_path": path,
+                "reason_code": (
+                    network_assessment.reason_code
+                    or "skill_runtime_entrypoint_requires_external_network"
+                ),
+                "evidence_kind": (
+                    network_assessment.evidence_kind or "unknown"
+                ),
+                "reason": (
+                    "The exact entrypoint is proven to require external "
+                    "network access, "
+                    "but the selected isolated base runtime is network-"
+                    "disabled. Use a separately compiled HTTP, browser, or "
+                    "MCP capability."
                 ),
             })
             continue
@@ -33205,6 +33666,7 @@ def _build_standard_skill_capability_catalog(
             ),
             "reachable_sources": list(selection.reachable_sources),
             "required_cwd": selection.required_cwd,
+            "egress_only": selection.egress_only,
         }
         profiled_runnable_scripts.append((path, digest))
     filtered_runnable_scripts = profiled_runnable_scripts
@@ -33250,7 +33712,7 @@ def _build_standard_skill_capability_catalog(
     # a non-literal CommonJS dependency).  The generic "no compatible
     # runtime" pass sees the same rejected entrypoint, so de-duplicate by
     # resource while preserving the profile-specific reason.
-    deduplicated_unavailable: list[dict[str, str]] = []
+    deduplicated_unavailable: list[dict[str, Any]] = []
     seen_unavailable_paths: set[str] = set()
     for item in [
         *profile_unavailable,

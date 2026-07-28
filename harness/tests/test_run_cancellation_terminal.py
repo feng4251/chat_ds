@@ -355,6 +355,50 @@ class RunCancellationTerminalTests(unittest.IsolatedAsyncioTestCase):
             "active provider iterator outlived the cancelled run",
         )
 
+    async def test_cancel_resistant_provider_pump_does_not_block_outer_cancel(
+        self,
+    ):
+        entered = asyncio.Event()
+        resisted = asyncio.Event()
+        release = asyncio.Event()
+        provider_finished = asyncio.Event()
+
+        async def provider_iterator():
+            try:
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    resisted.set()
+                    await release.wait()
+                if False:  # pragma: no cover - async-generator marker
+                    yield {}
+            finally:
+                provider_finished.set()
+
+        async def consume() -> None:
+            async for _item in agent_loop._aiter_with_timeout(
+                provider_iterator(),
+                timeout_seconds=60,
+            ):
+                pass
+
+        with patch.object(
+            agent_loop.settings,
+            "delegation_cancellation_grace_seconds",
+            0.01,
+        ):
+            task = asyncio.create_task(consume())
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=0.2)
+
+        self.assertTrue(resisted.is_set())
+        self.assertFalse(provider_finished.is_set())
+        release.set()
+        await asyncio.wait_for(provider_finished.wait(), timeout=1)
+
     async def test_cancel_while_normal_terminal_sink_is_blocked_records_cancel(self):
         sink_entered = asyncio.Event()
         release_sink = asyncio.Event()

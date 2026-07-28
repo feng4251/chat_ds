@@ -175,12 +175,13 @@ async def upload_session_file(
     if len(contents) > MAX_UPLOAD_SIZE:
         raise HTTPException(400, f"File too large (max {MAX_UPLOAD_SIZE // 1024 // 1024}MB)")
 
-    # Save to session workspace
+    # Resolve the attachment path before any mutation. Skill archives are
+    # persisted by the canonical installer so workspace, package directories,
+    # and registry rows share one rollback/cancellation boundary.
     try:
         dest_path = safe_workspace_path(cur_user.id, cid, filename)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
-    atomic_write_bytes(dest_path, contents)
 
     result = {
         "success": True,
@@ -216,9 +217,14 @@ async def upload_session_file(
                     result["message"] = (
                         f"Installed {result['installed_count']} skills for this session"
                     )
+                result["workspace_attachment"] = install_result.get(
+                    "workspace_attachment"
+                )
+                return result
         except zipfile.BadZipFile:
             pass
 
+    atomic_write_bytes(dest_path, contents)
     return result
 
 @router.get("", response_model=list[ConversationOut])

@@ -31,6 +31,7 @@ from urllib.parse import urlsplit
 from config import settings
 from tools.approval import canonical_http_origin, check_url_safety
 from tools.context import ToolContext
+from tools.execution_fence import require_execution_authority
 
 logger = logging.getLogger(__name__)
 
@@ -605,6 +606,10 @@ def _browser_session_key(
             str(session_id or "default"),
             _DIRECT_CONTEXT_RUN,
         )
+    require_execution_authority(
+        context,
+        boundary="browser.session_access",
+    )
     user = str(context.user_id or "default")
     runtime_session = str(context.session_id or "default")
     runtime_run = str(
@@ -693,6 +698,10 @@ def _bind_browser_policy(
 ) -> tuple[str, ...]:
     """Replace, rather than extend, the policy attached to a browser session."""
 
+    require_execution_authority(
+        context,
+        boundary="browser.action_submit",
+    )
     state_key = session.get("state_key")
     if not (
         isinstance(state_key, tuple)

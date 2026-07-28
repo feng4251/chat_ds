@@ -18,6 +18,10 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, get_args, get_
 
 from skills.route_safety import route_pattern_validation_error
 from tools.context import ToolContext
+from tools.execution_fence import (
+    ExecutionAuthorityRevoked,
+    require_execution_authority,
+)
 from tools.omission_guard import (
     compacted_history_omission_error,
     find_compacted_history_omission_path,
@@ -1840,6 +1844,27 @@ class ToolRegistry:
         workflow batches pass their exact per-turn schema surface here as a
         capability boundary.
         """
+        try:
+            require_execution_authority(
+                context,
+                boundary=f"registry.preflight:{name}",
+            )
+        except ExecutionAuthorityRevoked:
+            return ToolPreflightResult(
+                name=name,
+                args=args,
+                error_payload={
+                    "error": (
+                        "Delegated execution authority was revoked; the tool "
+                        "was not dispatched."
+                    ),
+                    "reason": "execution_authority_revoked",
+                    "tool_name": name,
+                    "actual_dispatch_attempted": False,
+                },
+                reason="execution_authority_revoked",
+            )
+
         entry = self._tools.get(name)
         if not entry:
             return ToolPreflightResult(
@@ -2093,6 +2118,13 @@ class ToolRegistry:
                     call_args["enabled_user_skills"] = list(context.enabled_user_skills)
                 if entry.accepts_context:
                     call_args["context"] = context
+            # Preflight and handler entry are deliberately separate checks.
+            # Revocation can race schema validation; no handler boundary is
+            # crossed unless the same generation remains active here.
+            require_execution_authority(
+                context,
+                boundary=f"registry.dispatch:{name}",
+            )
             if entry.is_async:
                 result = await entry.handler(**call_args)
             else:
@@ -2100,6 +2132,14 @@ class ToolRegistry:
             if ignored_args:
                 result = self._append_ignored_args_notice(str(result), ignored_args)
             return str(result)
+        except ExecutionAuthorityRevoked:
+            return tool_error(
+                "Delegated execution authority was revoked; the tool was not "
+                "dispatched.",
+                reason="execution_authority_revoked",
+                tool_name=name,
+                actual_dispatch_attempted=False,
+            )
         except Exception as e:
             logger.exception("Tool %s dispatch error: %s", name, e)
             return tool_error(

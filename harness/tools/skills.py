@@ -34,6 +34,8 @@ from skills.manager import (
 )
 from skills.path_safety import validate_skill_resource
 from skills.scanner import find_all_skills
+from tools.context import ToolContext
+from tools.execution_fence import require_execution_authority
 from tools.path_security import validate_path
 from tools.workspace_lock import workspace_mutation_guard
 
@@ -1502,6 +1504,7 @@ async def skill_copy_resource(
     user_id: str = "default",
     session_id: str = "default",
     enabled_user_skills: list[str] | None = None,
+    context: ToolContext | None = None,
 ) -> str:
     """Copy one inert Skill resource into the current session workspace.
 
@@ -1526,6 +1529,7 @@ async def skill_copy_resource(
             user_id=user_id,
             session_id=session_id,
             enabled_user_skills=enabled_user_skills,
+            context=context,
         )
 
 
@@ -1538,6 +1542,7 @@ async def _skill_copy_resource_locked(
     user_id: str,
     session_id: str,
     enabled_user_skills: list[str] | None,
+    context: ToolContext | None = None,
 ) -> str:
     """Perform the final no-clobber copy under the workspace mutation lock."""
 
@@ -1620,6 +1625,10 @@ async def _skill_copy_resource_locked(
                 output_stream.flush()
                 os.fsync(output_stream.fileno())
             temp_path = Path(temp_name)
+            require_execution_authority(
+                context,
+                boundary="workspace.skill_copy.commit",
+            )
             if overwrite:
                 os.replace(temp_path, destination)
             else:

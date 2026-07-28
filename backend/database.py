@@ -1,3 +1,6 @@
+import json
+import uuid
+
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase
@@ -35,6 +38,9 @@ _LIGHTWEIGHT_MIGRATIONS = [
     "ALTER TABLE conversations ADD COLUMN enabled_tools TEXT",
     "ALTER TABLE conversations ADD COLUMN fallback_model_ids TEXT",
     "ALTER TABLE conversations ADD COLUMN enabled_user_skills TEXT",
+    "ALTER TABLE conversations ADD COLUMN forked_from_conversation_id VARCHAR(32)",
+    "CREATE INDEX IF NOT EXISTS ix_conversations_forked_from_conversation_id ON conversations (forked_from_conversation_id)",
+    "ALTER TABLE conversations ADD COLUMN fork_snapshot_sha256 VARCHAR(64)",
     "ALTER TABLE conversations ADD COLUMN workspace_version INTEGER NOT NULL DEFAULT 1",
     "ALTER TABLE conversations ADD COLUMN goal_objective TEXT",
     "ALTER TABLE conversations ADD COLUMN goal_status VARCHAR(24)",
@@ -140,6 +146,114 @@ _AGENT_RUN_EVENT_IDENTITY_COLUMNS = (
     "event_type",
     "seq",
 )
+_SKILL_PACKAGE_SCOPE_INDEXES = {
+    "ux_skill_packages_user_session_name": (
+        ("user_id", "session_id", "name"),
+        "session_id IS NOT NULL",
+    ),
+    "ux_skill_packages_user_name": (
+        ("user_id", "name"),
+        "session_id IS NULL",
+    ),
+}
+
+
+async def _ensure_skill_package_scope_identity(conn) -> None:
+    """Make one Skill name unique inside each user/session scope.
+
+    Historic duplicate rows all point at the same canonical directory. Retain
+    the latest inserted registry row (largest SQLite ``rowid``), then install
+    separate partial indexes for session and user scope. This avoids SQLite's
+    ``NULL != NULL`` uniqueness behavior without changing valid packages.
+    """
+
+    if conn.dialect.name != "sqlite":
+        return
+    table_exists = (
+        await conn.execute(text(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'skill_packages'"
+        ))
+    ).scalar_one_or_none()
+    if table_exists is None:
+        return
+
+    index_rows = {
+        str(row.get("name") or ""): row
+        for row in (
+            await conn.execute(text("PRAGMA index_list('skill_packages')"))
+        ).mappings().all()
+    }
+    missing: list[tuple[str, tuple[str, ...], str]] = []
+    for index_name, (expected_columns, predicate) in (
+        _SKILL_PACKAGE_SCOPE_INDEXES.items()
+    ):
+        existing = index_rows.get(index_name)
+        if existing is None:
+            missing.append((index_name, expected_columns, predicate))
+            continue
+        columns = tuple(
+            str(row.get("name") or "")
+            for row in (
+                await conn.execute(text(f"PRAGMA index_info('{index_name}')"))
+            ).mappings().all()
+        )
+        definition = str((
+            await conn.execute(
+                text(
+                    "SELECT sql FROM sqlite_master "
+                    "WHERE type = 'index' AND name = :name"
+                ),
+                {"name": index_name},
+            )
+        ).scalar_one_or_none() or "")
+        normalized_definition = " ".join(definition.upper().split())
+        if (
+            int(existing.get("unique") or 0) != 1
+            or columns != expected_columns
+            or f"WHERE {predicate.upper()}" not in normalized_definition
+        ):
+            raise RuntimeError(
+                f"Existing Skill package identity index '{index_name}' "
+                "has an incompatible definition"
+            )
+
+    if not missing:
+        return
+    await conn.execute(text(
+        "DELETE FROM skill_packages "
+        "WHERE rowid NOT IN ("
+        "SELECT MAX(rowid) FROM skill_packages "
+        "GROUP BY user_id, session_id, name"
+        ")"
+    ))
+    for index_name, columns, predicate in missing:
+        await conn.execute(text(
+            f"CREATE UNIQUE INDEX {index_name} "
+            f"ON skill_packages ({', '.join(columns)}) "
+            f"WHERE {predicate}"
+        ))
+
+
+def _authoritative_terminal_from_rows(rows) -> tuple[str, dict] | None:
+    """Return the first authoritative terminal from ordered SQLite rows."""
+
+    for row in rows:
+        event_type = str(row.get("event_type") or "")
+        try:
+            payload = json.loads(row.get("payload") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        authoritative = payload.get("authoritative")
+        if authoritative is False or (
+            authoritative is not True
+            and payload.get("provisional_terminal") is True
+        ):
+            continue
+        return event_type, payload
+    return None
 
 
 async def _ensure_agent_run_event_identity(conn) -> None:
@@ -204,6 +318,333 @@ async def _ensure_agent_run_event_identity(conn) -> None:
     ))
 
 
+async def _reconcile_orphaned_descendant_runs(conn) -> None:
+    """Cancel runs still active from a previous single Backend process.
+
+    This deployment uses one Uvicorn worker and one Backend container against
+    SQLite. Consequently no in-memory producer can survive process startup:
+    every pre-existing active row is stale. Roots are attributed to process
+    restart; descendants of a root that is (or becomes) terminal are
+    attributed to parent-terminal reconciliation. The caller owns one startup
+    transaction, so events, runs, and task projections move together.
+
+    A future multi-instance deployment must replace this single-owner startup
+    rule with persisted instance leases/heartbeats before sharing a database.
+    """
+
+    if conn.dialect.name != "sqlite":
+        return
+    active_statuses = (
+        "pending",
+        "planned",
+        "queued",
+        "running",
+        "committing",
+    )
+    rows = (
+        await conn.execute(
+            text(
+                "SELECT child.id, child.conversation_id, child.user_id, "
+                "child.parent_run_id, child.root_run_id, "
+                "root.status AS root_status "
+                "FROM agent_runs AS child "
+                "LEFT JOIN agent_runs AS root "
+                "ON root.id = child.root_run_id "
+                "WHERE child.status IN "
+                "('pending', 'planned', 'queued', 'running', 'committing') "
+                "ORDER BY CASE "
+                "WHEN child.parent_run_id IS NULL "
+                "OR child.id = child.root_run_id THEN 0 ELSE 1 END, "
+                "child.started_at, child.id"
+            )
+        )
+    ).mappings().all()
+
+    durable_terminals: dict[str, tuple[str, dict]] = {}
+    for row in rows:
+        terminal_rows = (
+            await conn.execute(
+                text(
+                    "SELECT event_type, payload "
+                    "FROM agent_run_events "
+                    "WHERE conversation_id = :conversation_id "
+                    "AND run_id = :run_id "
+                    "AND event_type IN "
+                    "('run.completed', 'run.failed', 'run.cancelled') "
+                    "ORDER BY seq, event_time, id"
+                ),
+                {
+                    "conversation_id": row["conversation_id"],
+                    "run_id": row["id"],
+                },
+            )
+        ).mappings().all()
+        terminal = _authoritative_terminal_from_rows(terminal_rows)
+        if terminal is not None:
+            durable_terminals[str(row["id"])] = terminal
+
+    for row in rows:
+        run_id = str(row["id"])
+        root_run_id = str(row.get("root_run_id") or run_id)
+        is_root = (
+            row.get("parent_run_id") is None
+            or run_id == root_run_id
+        )
+        root_status = str(row.get("root_status") or "")
+        root_terminal = durable_terminals.get(root_run_id)
+        if root_terminal is not None:
+            root_status = {
+                "run.completed": "succeeded",
+                "run.failed": "failed",
+                "run.cancelled": "cancelled",
+            }[root_terminal[0]]
+        durable_terminal = durable_terminals.get(run_id)
+        if durable_terminal is not None:
+            event_type, terminal_payload = durable_terminal
+            projected_status = {
+                "run.completed": "succeeded",
+                "run.failed": "failed",
+                "run.cancelled": "cancelled",
+            }[event_type]
+            finish_reason = str(
+                terminal_payload.get("finish_reason")
+                or terminal_payload.get("terminal_reason")
+                or (
+                    "stop"
+                    if projected_status == "succeeded"
+                    else "task_cancelled"
+                    if projected_status == "cancelled"
+                    else "agent_run_failed"
+                )
+            )[:256]
+            projected_error = (
+                str(
+                    terminal_payload.get("error")
+                    or "Agent run failed."
+                )[:4000]
+                if projected_status == "failed"
+                else None
+            )
+            await conn.execute(
+                text(
+                    "UPDATE agent_runs "
+                    "SET status = :status, error = :error, "
+                    "finish_reason = :finish_reason, "
+                    "ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP) "
+                    "WHERE id = :run_id "
+                    "AND status IN "
+                    "('pending', 'planned', 'queued', 'running', 'committing')"
+                ),
+                {
+                    "run_id": run_id,
+                    "status": projected_status,
+                    "error": projected_error,
+                    "finish_reason": finish_reason,
+                },
+            )
+            await conn.execute(
+                text(
+                    "UPDATE task_items "
+                    "SET status = :status, error = :error, "
+                    "summary = :summary, "
+                    "ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP), "
+                    "updated_at = CURRENT_TIMESTAMP "
+                    "WHERE run_id = :run_id "
+                    "AND status IN "
+                    "('pending', 'planned', 'queued', 'running', 'committing')"
+                ),
+                {
+                    "run_id": run_id,
+                    "status": projected_status,
+                    "error": projected_error,
+                    "summary": (
+                        "backend_projection_recovered_after_restart"
+                    ),
+                },
+            )
+            if is_root:
+                next_seq = (
+                    await conn.execute(
+                        text(
+                            "SELECT COALESCE(MAX(seq), 0) + 1 "
+                            "FROM agent_run_events "
+                            "WHERE conversation_id = :conversation_id "
+                            "AND run_id = :run_id"
+                        ),
+                        {
+                            "conversation_id": row["conversation_id"],
+                            "run_id": run_id,
+                        },
+                    )
+                ).scalar_one()
+                await conn.execute(
+                    text(
+                        "INSERT INTO agent_run_events ("
+                        "id, run_id, conversation_id, user_id, "
+                        "parent_run_id, seq, event_type, payload, event_time"
+                        ") VALUES ("
+                        ":id, :run_id, :conversation_id, :user_id, NULL, "
+                        ":seq, 'run.projection_aborted', :payload, "
+                        "CURRENT_TIMESTAMP)"
+                    ),
+                    {
+                        "id": uuid.uuid4().hex,
+                        "run_id": run_id,
+                        "conversation_id": row["conversation_id"],
+                        "user_id": row["user_id"],
+                        "seq": int(next_seq),
+                        "payload": json.dumps(
+                            {
+                                "reason": "backend_process_restart",
+                                "recovered_terminal_event_type": event_type,
+                                "authoritative": False,
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    },
+                )
+                latest_role = (
+                    await conn.execute(
+                        text(
+                            "SELECT role FROM messages "
+                            "WHERE conversation_id = :conversation_id "
+                            "ORDER BY created_at DESC, id DESC LIMIT 1"
+                        ),
+                        {"conversation_id": row["conversation_id"]},
+                    )
+                ).scalar_one_or_none()
+                if latest_role == "user":
+                    await conn.execute(
+                        text(
+                            "INSERT INTO messages ("
+                            "id, conversation_id, role, content, model_id, "
+                            "source, input_tokens, output_tokens, "
+                            "total_tokens, created_at"
+                            ") VALUES ("
+                            ":id, :conversation_id, 'assistant', :content, "
+                            "(SELECT COALESCE(resolved_model_id, "
+                            "requested_model_id) FROM agent_runs "
+                            "WHERE id = :run_id), "
+                            "'chat', 0, 0, 0, "
+                            "COALESCE(("
+                            "SELECT strftime("
+                            "'%Y-%m-%d %H:%M:%f', "
+                            "julianday(MAX(created_at)) + "
+                            "(1.0 / 86400000.0)"
+                            ") FROM messages "
+                            "WHERE conversation_id = :conversation_id"
+                            "), CURRENT_TIMESTAMP))"
+                        ),
+                        {
+                            "id": uuid.uuid4().hex,
+                            "conversation_id": row["conversation_id"],
+                            "run_id": run_id,
+                            "content": (
+                                "⚠️ Backend restarted after the task terminal "
+                                "was received but before the assistant response "
+                                "was durably projected. Existing artifacts and "
+                                "run records were preserved."
+                            ),
+                        },
+                    )
+            continue
+        if is_root or root_status not in {
+            "succeeded",
+            "failed",
+            "cancelled",
+            *active_statuses,
+        }:
+            finish_reason = "backend_process_restart"
+            cancellation_source = "backend_startup_orphan_repair"
+            parent_terminal_status = None
+        else:
+            finish_reason = "parent_run_terminal_reconciliation"
+            cancellation_source = "root_run_terminal_startup_repair"
+            parent_terminal_status = (
+                "cancelled"
+                if root_status in active_statuses
+                else root_status
+            )
+        payload = {
+            "authoritative": True,
+            "finish_reason": finish_reason,
+            "terminal_reason": finish_reason,
+            "cancellation_source": cancellation_source,
+        }
+        if parent_terminal_status:
+            payload["parent_terminal_status"] = parent_terminal_status
+
+        next_seq = (
+            await conn.execute(
+                text(
+                    "SELECT COALESCE(MAX(seq), 0) + 1 "
+                    "FROM agent_run_events "
+                    "WHERE conversation_id = :conversation_id "
+                    "AND run_id = :run_id"
+                ),
+                {
+                    "conversation_id": row["conversation_id"],
+                    "run_id": run_id,
+                },
+            )
+        ).scalar_one()
+        await conn.execute(
+            text(
+                "INSERT INTO agent_run_events ("
+                "id, run_id, conversation_id, user_id, parent_run_id, seq, "
+                "event_type, payload, event_time"
+                ") VALUES ("
+                ":id, :run_id, :conversation_id, :user_id, :parent_run_id, "
+                ":seq, 'run.cancelled', :payload, CURRENT_TIMESTAMP)"
+            ),
+            {
+                "id": uuid.uuid4().hex,
+                "run_id": run_id,
+                "conversation_id": row["conversation_id"],
+                "user_id": row["user_id"],
+                "parent_run_id": row.get("parent_run_id"),
+                "seq": int(next_seq),
+                "payload": json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            },
+        )
+        await conn.execute(
+            text(
+                "UPDATE task_items "
+                "SET status = 'cancelled', error = NULL, "
+                "summary = :finish_reason, "
+                "ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP), "
+                "updated_at = CURRENT_TIMESTAMP "
+                "WHERE run_id = :run_id "
+                "AND status IN "
+                "('pending', 'planned', 'queued', 'running', 'committing')"
+            ),
+            {
+                "run_id": run_id,
+                "finish_reason": finish_reason,
+            },
+        )
+        await conn.execute(
+            text(
+                "UPDATE agent_runs "
+                "SET status = 'cancelled', error = NULL, "
+                "finish_reason = :finish_reason, "
+                "ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP) "
+                "WHERE id = :run_id "
+                "AND status IN "
+                "('pending', 'planned', 'queued', 'running', 'committing')"
+            ),
+            {
+                "run_id": run_id,
+                "finish_reason": finish_reason,
+            },
+        )
+
+
 async def init_db():
     from models import Base as ModelBase  # noqa: F811
     async with engine.begin() as conn:
@@ -213,4 +654,6 @@ async def init_db():
                 await conn.execute(text(sql))
             except Exception:
                 pass  # column already exists
+        await _ensure_skill_package_scope_identity(conn)
         await _ensure_agent_run_event_identity(conn)
+        await _reconcile_orphaned_descendant_runs(conn)

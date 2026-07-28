@@ -28,7 +28,7 @@ import stat
 import tempfile
 import uuid
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Callable
 
 from tools.workspace_lock import workspace_mutation_guard
 
@@ -2820,6 +2820,9 @@ async def _prepare_pending_process_sync(
 
 async def _finish_pending_process_sync(
     lease: IsolatedProcessLease,
+    *,
+    execution_authority_check: Callable[[], None] | None = None,
+    apply_artifacts: bool = True,
 ) -> dict[str, Any]:
     operation = lease._pending_sync_operation
     response = lease._pending_sync_response
@@ -2837,8 +2840,19 @@ async def _finish_pending_process_sync(
         )
 
     if lease._pending_sync_applied is None:
-        applied_result = _apply_process_artifacts(lease, response, artifacts)
-        lease._pending_sync_applied = list(applied_result["artifacts"])
+        if execution_authority_check is not None:
+            execution_authority_check()
+        if apply_artifacts:
+            applied_result = _apply_process_artifacts(
+                lease,
+                response,
+                artifacts,
+            )
+            lease._pending_sync_applied = list(
+                applied_result["artifacts"]
+            )
+        else:
+            lease._pending_sync_applied = []
 
     ack_response, _ = await _execute_process_operation(
         lease,
@@ -2849,7 +2863,7 @@ async def _finish_pending_process_sync(
     result = dict(response)
     result.pop("sync_token", None)
     result["artifacts"] = list(lease._pending_sync_applied)
-    result["workspace_applied"] = True
+    result["workspace_applied"] = bool(apply_artifacts)
     result["sync_pending"] = False
     result["sync_acknowledged"] = True
     result["acknowledged_operation"] = ack_response["acknowledged_operation"]
@@ -2870,6 +2884,7 @@ async def sync_isolated_process_artifacts(
     lease: IsolatedProcessLease,
     *,
     op_id: str | None = None,
+    execution_authority_check: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     if lease._pending_sync_operation == "close":
         raise IsolatedSkillExecutorError(
@@ -2881,7 +2896,10 @@ async def sync_isolated_process_artifacts(
         operation="sync",
         op_id=op_id,
     )
-    return await _finish_pending_process_sync(lease)
+    return await _finish_pending_process_sync(
+        lease,
+        execution_authority_check=execution_authority_check,
+    )
 
 
 async def signal_isolated_process(
@@ -2908,6 +2926,8 @@ async def close_isolated_process_lease(
     lease: IsolatedProcessLease,
     *,
     op_id: str | None = None,
+    execution_authority_check: Callable[[], None] | None = None,
+    apply_artifacts: bool = True,
 ) -> dict[str, Any]:
     if lease.closed:
         raise IsolatedSkillExecutorError(
@@ -2920,13 +2940,21 @@ async def close_isolated_process_lease(
             operation="sync",
             op_id=None,
         )
-        await _finish_pending_process_sync(lease)
+        await _finish_pending_process_sync(
+            lease,
+            execution_authority_check=execution_authority_check,
+            apply_artifacts=apply_artifacts,
+        )
     await _prepare_pending_process_sync(
         lease,
         operation="close",
         op_id=op_id,
     )
-    return await _finish_pending_process_sync(lease)
+    return await _finish_pending_process_sync(
+        lease,
+        execution_authority_check=execution_authority_check,
+        apply_artifacts=apply_artifacts,
+    )
 
 
 def probe_isolated_runtime_capabilities(
@@ -3011,6 +3039,7 @@ async def execute_isolated_skill_script(
     expected_skill_sha256: str | None = None,
     socket_path: str = EXECUTOR_SOCKET,
     apply_artifacts: bool = True,
+    execution_authority_check: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Execute a verified Skill snapshot and optionally apply valid artifacts."""
 
@@ -3034,6 +3063,8 @@ async def execute_isolated_skill_script(
     )
     writer: asyncio.StreamWriter | None = None
     try:
+        if execution_authority_check is not None:
+            execution_authority_check()
         reader, writer = await asyncio.wait_for(
             asyncio.open_unix_connection(
                 socket_path,
@@ -3070,6 +3101,8 @@ async def execute_isolated_skill_script(
             item["path"]: (item["size_bytes"], item["sha256"])
             for item in payload["workspace_files"]
         }
+        if execution_authority_check is not None:
+            execution_authority_check()
         applied = (
             apply_artifacts_atomically(Path(workspace), artifacts, baseline=baseline)
             if apply_artifacts and artifacts
@@ -3100,8 +3133,8 @@ async def execute_isolated_skill_script(
         if writer is not None:
             writer.close()
             try:
-                await writer.wait_closed()
-            except (ConnectionError, OSError):
+                await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+            except (ConnectionError, OSError, asyncio.TimeoutError):
                 pass
 
 
@@ -3115,6 +3148,7 @@ async def execute_isolated_declared_command(
     timeout: int = 120,
     socket_path: str = EXECUTOR_SOCKET,
     apply_artifacts: bool = True,
+    execution_authority_check: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Execute one compiled PATH command through the no-shell sidecar."""
     payload, request = build_declared_command_request(
@@ -3127,6 +3161,8 @@ async def execute_isolated_declared_command(
     )
     writer: asyncio.StreamWriter | None = None
     try:
+        if execution_authority_check is not None:
+            execution_authority_check()
         reader, writer = await asyncio.wait_for(
             asyncio.open_unix_connection(socket_path, limit=MAX_RESPONSE_BYTES + 1),
             timeout=3,
@@ -3154,6 +3190,8 @@ async def execute_isolated_declared_command(
             for item in payload["workspace_files"]
         }
         command_succeeded = response.get("status") == "success"
+        if execution_authority_check is not None:
+            execution_authority_check()
         applied = (
             apply_artifacts_atomically(Path(workspace), artifacts, baseline=baseline)
             if apply_artifacts and command_succeeded and artifacts else []
@@ -3188,8 +3226,8 @@ async def execute_isolated_declared_command(
         if writer is not None:
             writer.close()
             try:
-                await writer.wait_closed()
-            except (ConnectionError, OSError):
+                await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+            except (ConnectionError, OSError, asyncio.TimeoutError):
                 pass
 
 
@@ -3201,6 +3239,7 @@ async def execute_isolated_session_code(
     skills_root: Path | None = None,
     socket_path: str = EXECUTOR_SOCKET,
     apply_artifacts: bool = True,
+    execution_authority_check: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Run model-authored Python only in the network-disabled sidecar."""
 
@@ -3212,6 +3251,8 @@ async def execute_isolated_session_code(
     )
     writer: asyncio.StreamWriter | None = None
     try:
+        if execution_authority_check is not None:
+            execution_authority_check()
         reader, writer = await asyncio.wait_for(
             asyncio.open_unix_connection(
                 socket_path,
@@ -3244,6 +3285,8 @@ async def execute_isolated_session_code(
             item["path"]: (item["size_bytes"], item["sha256"])
             for item in payload["workspace_files"]
         }
+        if execution_authority_check is not None:
+            execution_authority_check()
         applied = (
             apply_artifacts_atomically(Path(workspace), artifacts, baseline=baseline)
             if apply_artifacts and artifacts
@@ -3277,6 +3320,6 @@ async def execute_isolated_session_code(
         if writer is not None:
             writer.close()
             try:
-                await writer.wait_closed()
-            except (ConnectionError, OSError):
+                await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+            except (ConnectionError, OSError, asyncio.TimeoutError):
                 pass

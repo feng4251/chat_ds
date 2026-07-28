@@ -741,6 +741,174 @@ class StandardSkillCapabilityPlanTests(unittest.TestCase):
             selected.payload["process_only_skill_scripts"],
         )
 
+    def test_network_dependent_base_script_yields_to_exact_http_bridge(self):
+        root, _package = self._package(
+            "# Remote lookup\n"
+            "Use `scripts/query.py` to query the declared REST endpoint "
+            "https://api.vendor.test/v1/search.\n"
+        )
+        (root / "scripts").mkdir()
+        script = root / "scripts" / "query.py"
+        script.write_text(
+            "import requests\n"
+            "def query(term):\n"
+            "    return requests.get("
+            "'https://api.vendor.test/v1/search', "
+            "params={'q': term}).json()\n",
+            encoding="utf-8",
+        )
+        (root / "chatds-runtime.json").write_text(
+            json.dumps({
+                "schema_version": 1,
+                "entrypoints": {
+                    "scripts/query.py": {
+                        "runtime_profile": "base-v1",
+                        "egress_only": True,
+                    },
+                },
+            }),
+            encoding="utf-8",
+        )
+        package = load_skill_content(
+            root / "SKILL.md",
+            skill_dir=str(root),
+        )
+        package["_chatds_scope"] = "session"
+        inventory = ((
+            "scripts/query.py",
+            hashlib.sha256(script.read_bytes()).hexdigest(),
+        ),)
+
+        catalog = _build_standard_skill_capability_catalog(
+            "portable-skill",
+            package,
+            [
+                "skill_view",
+                "run_skill_process",
+                "run_skill_script",
+                "run_skill_python",
+                "skill_http_get",
+            ],
+            inventory,
+        )
+
+        self.assertFalse(any(
+            item.get("kind") == "skill_script"
+            for item in catalog["candidates"]
+        ))
+        self.assertTrue(any(
+            item.get("kind") == "skill_http_prefix"
+            and item.get("tool_name") == "skill_http_get"
+            for item in catalog["candidates"]
+        ))
+        unavailable = {
+            item.get("resource_path"): item.get("reason")
+            for item in catalog.get("unavailable_capabilities") or []
+        }
+        self.assertIn("scripts/query.py", unavailable)
+        self.assertIn("network-disabled", unavailable["scripts/query.py"])
+        unavailable_record = next(
+            item
+            for item in catalog.get("unavailable_capabilities") or []
+            if item.get("resource_path") == "scripts/query.py"
+        )
+        self.assertEqual(
+            "skill_runtime_entrypoint_egress_only",
+            unavailable_record["reason_code"],
+        )
+        self.assertEqual(
+            "manifest",
+            unavailable_record["evidence_kind"],
+        )
+
+    def test_network_helper_and_unix_socket_keep_local_python_candidate(self):
+        root, _package = self._package(
+            "# Local utilities\n"
+            "Use `scripts/local_tools.py` for deterministic local helpers.\n"
+        )
+        (root / "scripts").mkdir()
+        script = root / "scripts" / "local_tools.py"
+        script.write_text(
+            "import requests\n"
+            "import socket\n"
+            "channel = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+            "if False:\n"
+            "    requests.get('https://api.vendor.test/dead')\n"
+            "def unused_remote_helper(url):\n"
+            "    return requests.get(url).json()\n"
+            "def normalize(values):\n"
+            "    return sorted(set(values))\n",
+            encoding="utf-8",
+        )
+        package = load_skill_content(
+            root / "SKILL.md",
+            skill_dir=str(root),
+        )
+        digest = hashlib.sha256(script.read_bytes()).hexdigest()
+
+        catalog = _build_standard_skill_capability_catalog(
+            "portable-skill",
+            package,
+            [
+                "skill_view",
+                "run_skill_process",
+                "run_skill_script",
+                "run_skill_python",
+            ],
+            (("scripts/local_tools.py", digest),),
+        )
+
+        candidate = next(
+            item
+            for item in catalog.get("candidates") or []
+            if item.get("kind") == "skill_script"
+        )
+        self.assertEqual(
+            "scripts/local_tools.py",
+            candidate["resource_path"],
+        )
+        self.assertIn("run_skill_python", candidate["tool_names"])
+        self.assertEqual(
+            [],
+            catalog.get("unavailable_capabilities"),
+        )
+
+    def test_non_utf8_script_returns_machine_readable_unavailable(self):
+        root, _package = self._package(
+            "# Local utilities\nRun `scripts/local.py`.\n"
+        )
+        (root / "scripts").mkdir()
+        script = root / "scripts" / "local.py"
+        script.write_bytes(
+            b"def local_value():\n    return 1\n# invalid: \xff\n"
+        )
+        package = load_skill_content(
+            root / "SKILL.md",
+            skill_dir=str(root),
+        )
+        digest = hashlib.sha256(script.read_bytes()).hexdigest()
+
+        catalog = _build_standard_skill_capability_catalog(
+            "portable-skill",
+            package,
+            ["skill_view", "run_skill_python"],
+            (("scripts/local.py", digest),),
+        )
+
+        self.assertFalse(any(
+            item.get("kind") == "skill_script"
+            for item in catalog.get("candidates") or []
+        ))
+        unavailable = next(
+            item
+            for item in catalog.get("unavailable_capabilities") or []
+            if item.get("resource_path") == "scripts/local.py"
+        )
+        self.assertEqual(
+            "skill_runtime_network_source_invalid_utf8",
+            unavailable["reason_code"],
+        )
+
     def test_unsafe_dynamic_node_entrypoint_does_not_hide_safe_python_peer(
         self,
     ):

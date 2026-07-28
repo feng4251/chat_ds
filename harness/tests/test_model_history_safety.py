@@ -1,3 +1,4 @@
+import hashlib
 import json
 import unittest
 
@@ -497,6 +498,46 @@ class ModelHistorySafetyTests(unittest.TestCase):
         self.assertNotIn("VERYSECRET", serialized)
         self.assertNotIn("expires=999999", serialized)
         self.assertIn("[url sha256=", serialized)
+
+    def test_tool_debug_result_keeps_safe_failure_classification_fields(self):
+        payload = _tool_debug_result(json.dumps({
+            "status": "error",
+            "error_code": "http_status_error",
+            "error": "Skill endpoint returned HTTP 400.",
+            "request_sent": True,
+            "request_method": "POST",
+            "request_number": 3,
+            "root_request_number": 9,
+            "http_status": 400,
+            "url": "https://api.vendor.test/private?token=SECRET",
+            "matched_prefix": "https://api.vendor.test/",
+            "body": "PRIVATE RESPONSE BODY",
+            "body_chars": 21,
+            "body_truncated": False,
+        }))
+
+        self.assertEqual("http_status_error", payload["error_code"])
+        self.assertTrue(payload["request_sent"])
+        self.assertEqual("POST", payload["request_method"])
+        self.assertEqual(400, payload["http_status"])
+        self.assertEqual(3, payload["request_number"])
+        self.assertEqual(9, payload["root_request_number"])
+        self.assertEqual(
+            hashlib.sha256(
+                b"https://api.vendor.test/private?token=SECRET"
+            ).hexdigest(),
+            payload["request_url_sha256"],
+        )
+        self.assertEqual(
+            hashlib.sha256(
+                b"https://api.vendor.test/"
+            ).hexdigest(),
+            payload["matched_prefix_sha256"],
+        )
+        serialized = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn("api.vendor.test", serialized)
+        self.assertNotIn("SECRET", serialized)
+        self.assertNotIn("PRIVATE RESPONSE BODY", serialized)
 
     def test_output_contract_clean_restart_keeps_task_and_tool_evidence(self):
         base = [

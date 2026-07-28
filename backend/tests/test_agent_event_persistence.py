@@ -21,6 +21,9 @@ def _event(event_type: str, seq: int, *, run_id: str = "child") -> dict:
             "goal": "bounded child task",
             "requested_tools": ["skill_view"],
             "effective_tools": ["skill_view"],
+            "delegation_batch_id": "batch-1",
+            "delegation_slot": 1,
+            "delegation_batch_size": 3,
         }
     elif event_type == "run.started":
         payload = {
@@ -119,6 +122,15 @@ class AgentEventPersistenceTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(*pending, return_exceptions=True)
         chat_router._agent_event_persist_tasks.pop(("conversation", "root"), None)
         chat_router._agent_event_persist_locks.pop("conversation", None)
+        best_effort = [
+            task
+            for task in chat_router._best_effort_tasks
+            if not task.done()
+        ]
+        for task in best_effort:
+            task.cancel()
+        if best_effort:
+            await asyncio.gather(*best_effort, return_exceptions=True)
         await self.engine.dispose()
         self.temp_dir.cleanup()
 
@@ -180,6 +192,7 @@ class AgentEventPersistenceTests(unittest.IsolatedAsyncioTestCase):
             child = await session.get(AgentRun, "child")
             self.assertEqual(child.status, "succeeded")
             self.assertEqual(child.total_tokens, 18)
+            self.assertEqual(child.delegation_tool_call_id, "batch-1")
             task = (await session.execute(
                 select(TaskItem).where(TaskItem.run_id == "child")
             )).scalar_one()
@@ -576,12 +589,34 @@ class AgentEventPersistenceTests(unittest.IsolatedAsyncioTestCase):
         async with self.sessions() as session:
             root = await session.get(AgentRun, "root")
             child = await session.get(AgentRun, "child")
-            self.assertEqual(root.status, "failed")
+            self.assertEqual(root.status, "committing")
+            self.assertIsNone(root.ended_at)
             self.assertEqual(
                 (root.input_tokens, root.output_tokens, root.total_tokens),
                 (21, 9, 30),
             )
             self.assertEqual(child.total_tokens, 999)
+            root_task = (await session.execute(
+                select(TaskItem).where(TaskItem.run_id == "root")
+            )).scalar_one()
+            self.assertEqual("committing", root_task.status)
+
+        # The final assistant/root transaction replays the already-durable
+        # exact terminal event and atomically commits its lifecycle projection.
+        async with self.sessions() as session:
+            await chat_router._persist_agent_events(
+                session,
+                **kwargs,
+                events=[root_failed],
+            )
+            await session.commit()
+        async with self.sessions() as session:
+            root = await session.get(AgentRun, "root")
+            root_task = (await session.execute(
+                select(TaskItem).where(TaskItem.run_id == "root")
+            )).scalar_one()
+            self.assertEqual(root.status, "failed")
+            self.assertEqual(root_task.status, "failed")
 
     async def test_terminal_projection_reconciles_root_usage_only(self):
         child_completed = _event("run.completed", 1)
@@ -632,7 +667,7 @@ class AgentEventPersistenceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(conversation.total_tokens, 18)
             self.assertEqual(message.total_tokens, 18)
 
-    async def test_post_projection_hook_uses_reconciled_root_usage(self):
+    async def test_post_projection_hook_uses_persisted_root_projection(self):
         child_completed = _event("run.completed", 1)
         child_completed["payload"]["usage"] = {
             "input_tokens": 700,
@@ -642,12 +677,24 @@ class AgentEventPersistenceTests(unittest.IsolatedAsyncioTestCase):
         root_failed = _event("run.failed", 2, run_id="root")
         events = [child_completed, root_failed]
 
+        async def persist_fixture(*_args, **_kwargs):
+            async with self.sessions() as session:
+                root = await session.get(AgentRun, "root")
+                root.status = "failed"
+                root.error = "bounded persisted fixture failure"
+                root.input_tokens = 13
+                root.output_tokens = 5
+                root.total_tokens = 18
+                await session.commit()
+            return True
+
         with (
             patch.object(
                 chat_router,
                 "_persist_after_stream",
-                new=AsyncMock(return_value=True),
+                new=AsyncMock(side_effect=persist_fixture),
             ),
+            patch.object(chat_router, "async_session", self.sessions),
             patch.object(chat_router, "emit_event", new=AsyncMock()) as emitted,
         ):
             task = chat_router._spawn_persist_then_emit(
@@ -675,7 +722,10 @@ class AgentEventPersistenceTests(unittest.IsolatedAsyncioTestCase):
         emitted.assert_awaited_once()
         self.assertEqual(emitted.await_args.args[1], "run.failed")
         notification = emitted.await_args.args[2]
-        self.assertEqual(notification["error"], "bounded fixture failure")
+        self.assertEqual(
+            notification["error"],
+            "bounded persisted fixture failure",
+        )
         self.assertEqual(
             notification["usage"],
             {"input_tokens": 13, "output_tokens": 5, "total_tokens": 18},
@@ -758,6 +808,53 @@ class AgentEventPersistenceTests(unittest.IsolatedAsyncioTestCase):
                 select(TaskItem).where(TaskItem.run_id == "root")
             )).scalar_one()
             self.assertEqual(task.status, "succeeded")
+
+    async def test_title_generation_is_outside_durable_projection_barrier(self):
+        title_started = asyncio.Event()
+        release_title = asyncio.Event()
+
+        async def delayed_title(*_args, **_kwargs):
+            title_started.set()
+            await release_title.wait()
+
+        events = [_event("run.completed", 2, run_id="root")]
+        with (
+            patch.object(chat_router, "async_session", self.sessions),
+            patch.object(chat_router, "emit_event", new=AsyncMock()),
+            patch.object(chat_router, "_generate_title", delayed_title),
+        ):
+            projected = await asyncio.wait_for(
+                chat_router._persist_after_stream(
+                    "conversation",
+                    "model",
+                    "complete answer",
+                    "",
+                    "",
+                    "first user request",
+                    "root",
+                    "model",
+                    {
+                        "input_tokens": 11,
+                        "output_tokens": 7,
+                        "total_tokens": 18,
+                    },
+                    "stop",
+                    None,
+                    events,
+                ),
+                timeout=1,
+            )
+            self.assertTrue(projected)
+            await asyncio.wait_for(title_started.wait(), timeout=1)
+            self.assertTrue(any(
+                not task.done()
+                for task in chat_router._best_effort_tasks
+            ))
+            release_title.set()
+            await asyncio.gather(
+                *list(chat_router._best_effort_tasks),
+                return_exceptions=True,
+            )
 
 
 if __name__ == "__main__":

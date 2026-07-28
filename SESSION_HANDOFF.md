@@ -1,4 +1,4 @@
-# ChatDS 当前会话交接（2026-07-27）
+# ChatDS 当前会话交接（2026-07-28）
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
@@ -6,7 +6,8 @@
 
 - 工作目录：`/nfs/yangbb/codes/chat_ds`。
 - 分支：`fix/generic-skill-harness-20260717`。
-- 2026-07-27 最新功能提交：`c21deca0 feat: harden generic skill routing and stream diagnostics`。
+- 2026-07-27 已部署功能提交：`c21deca0 feat: harden generic skill routing and stream diagnostics`。
+- 2026-07-28 release candidate 已补齐断线后后台续跑、权威终态/刷新投影、语义化子 Agent、委派硬期限与撤权 fence，以及 Skill 安装/管理事务；全量回归通过，等待本地提交和生产切换。
 - 前三轮关键提交：`5a7f21d9 feat: enforce generic skill execution contracts`、`e90415a0 feat: close generic skill workflow recovery gaps`、`b0744a33 feat: add generic profile-aware skill sandboxes`。
 - 本轮在既有 process protocol v2、profile-aware sandbox 和 browser egress 基础上，补齐了内容寻址 Workflow IR、exact capability binding、运行生命周期/receipt ledger、MCP frozen catalog、委派 TOCTOU 防护和 Backend 事件幂等落库。
 - `c21deca0` 已按 Backend → Harness → Frontend 顺序部署到生产，并通过数据库迁移、容器健康、跨层 request ID 和无模型调用 smoke。
@@ -163,13 +164,78 @@
 历史第一轮为何取消仍无法唯一追溯：旧证据只能证明 provider request 已开始、没有
 `debug.llm.finish`、admission 随后释放且根事件为 `run.cancelled/task_cancelled`。无法在事后区分浏览器/代理断连、Backend task cancellation 或服务 shutdown。新版能完整覆盖系统实际观测到的边界；进程被强杀、日志丢失或系统外网络故障仍必须保留 `unknown`，不能虚构原因。
 
+### 4.9 2026-07-28 `79c170...` 断线取证与生命周期闭环
+
+本次严格按“持久化会话 + exact Skill + Backend/Harness debug”交叉核对
+`79c1701baaba4a6195d740e9a238b3d0`：
+
+- exact ZIP 的 SHA-256 为
+  `78b890eab57ff516c20a39a565631caa5d784f839b42f6ad9efbdbdd951eb0a0`；
+  包内 19 个 `SKILL.md` 是 1 个 primary 与 18 个 supporting member，不是 19 个独立顶层
+  Skill。
+- root run 从约 08:56 运行至 11:50，route 为
+  `composite_full_protocol_design`，execution 为 `artifact_workflow`；7 个 bootstrap
+  全部结束为 degraded，8 个 required worker 已真实规划，并非主模型伪造 multi-agent。
+- Backend 有正面的 ASGI `http.disconnect` 证据：
+  `termination_source=client_disconnected`、`exception_class=CancelledError`、
+  `root_terminal_status=missing`、`root_phase=executing`、
+  `last_root_event_type=tool.dispatch_started`。上游仍连接，已接收 1372 个数据 chunk，
+  parse error 为 0，已向前端发送约 2.33 MiB；没有 provider typed failure。因而黑屏/
+  `NetworkError` 是客户端连接中断，不是模型自行停止。
+- 断开时 `worker-safety-extraction` 已 completed_degraded，并保留约 17.8 KiB 内部结果；
+  PICO 与 termination-analysis 被旧的固定 3600 秒 delegate batch deadline 取消；AE、
+  target-biology、competitive-landscape 正在运行并随浏览器连接断开取消；literature、
+  I/E、aggregation、11 个模块报告和 final report 尚未到达。因此 workspace 没有业务
+  Markdown 是执行阶段事实，不是已生成文件丢失；已完成的内部 child payload 位于该
+  session 的 `results/`。
+- 页面上 19 个 failed 标签是 tool attempt，不是 19 个 Agent 都失败：4 次是模型猜错
+  Python callable，在 dispatch 前被拒绝；1 次是 URL 超出 exact Skill closure，被安全
+  策略正确拒绝；其余 14 次是 HTTP 400/404、受限脚本 DNS、ClinicalTrials 脚本退出、
+  metasearch 无可接受结果等真实远端/API失败。DrugBank 另需授权数据，PrimeKG 脚本
+  依赖缺失的本地 CSV。不能把这些混写为一个“delegate failed”。
+
+通用修复：
+
+- Backend 在请求被接受后以独立 producer 执行；SSE subscriber 只是有界观察者。浏览器
+  断开只 detach subscriber，不再取消 root run、provider stream 或 child DAG。relay
+  上限为 256 chunks/4 MiB，慢客户端等待 5 秒后脱离，避免断线保护反过来造成无界内存。
+- root 在 durable assistant/terminal barrier 后才完成；title generation 移出该 barrier。
+  第一个持久化 authoritative terminal 永不翻转；缺失 root 终态会合成 `run.failed`。
+  Backend 启动时修复旧 orphan active rows；若已有 durable terminal，只补 projection，
+  不制造冲突终态。
+- run cards 和 AgentRun DTO 有统一上限、截断元数据、global active truth、orphan child
+  projection 与刷新重建；semantic worker identity、batch、completion quality 和失败原因
+  持久化，刷新后不再消失，也不再显示无意义的 `delegate-1/2/3`。
+- delegate batch 的旧固定一小时墙钟改为 material-progress soft lease；provider admission
+  wait 不消耗软租约，另设独立 21600 秒 hard deadline。到期或父级取消时先撤销 child
+  execution fence，再有界关闭 HTTP/MCP/browser/process/provider 资源并取消任务。
+  fence 在 registry、文件、HTTP、MCP、浏览器、进程和 artifact commit 边界复核，防止
+  cancellation-resistant child 在父级结束后继续产生副作用。
+- provider pump 改为单槽有界队列并在每次 publish 前验权；同步 resource closer 被拒绝，
+  内置 closer 均为 async；child 自己的 `TimeoutError` 不再伪装成 batch timeout。
+- Skill ZIP 三类入口统一 per-user/scope 锁、staging/no-clobber、取消安全提交和 exact retry；
+  数据库增加 scope/name 唯一约束及旧库去重迁移。bundle runtime 按 `bundle_id` 内容寻址；
+  delete 使用 quarantine+journal，promote/fork 使用双锁、文件/DB/MCP 同边界恢复；fork
+  保留 source snapshot digest、workspace、Skill、runtime、消息和 bundle metadata。
+
 ## 5. 当前验证证据
 
-2026-07-27 当前最终冻结功能源码 `c21deca0` 已通过：
+2026-07-28 当前 release candidate 已通过：
 
-- Harness 全量（`cd harness && PYTHONPATH=..:.`）：`1484 tests OK, 1 skipped`。
-- Backend：`68 passed`。
-- Frontend：`3 passed`，production build 和本轮相关文件定向 ESLint 通过；全量 ESLint 仍有 2 个本轮未修改的既有 Hook 规则问题（`ModelSelector.jsx`、`SkillLibrary.jsx`）。
+- Harness 全量（`cd harness && PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=..:.`）：
+  `1511 tests OK, 1 skipped`，0 failures/errors。
+- Backend compileall 通过；pytest 为 `121 passed`，只有既有 `crypt`/
+  `datetime.utcnow()` deprecation warnings。
+- Frontend：`18 passed`；production build 和本轮相关文件定向 ESLint 通过。
+- Skill archive/workspace/bundle/install/fork/schema/registry 聚焦组合：
+  `58 passed`。
+- delegation leases、cancellation terminal、provider deadline/fence 聚焦组合：
+  `27 passed`；独立审查无 P0/P1。
+- `git diff --check` 通过。
+- 本轮未执行模型重型 V2.3 E2E。
+
+2026-07-27 已冻结并部署的 `c21deca0` 此前还通过：
+
 - Nginx 配置 `nginx -t` 通过；Frontend SSE 3600 秒和 `X-Request-ID` 响应头已在生产验证。
 - Workflow IR、run contract、MCP、delegation、gate 和 catalog failure 聚焦组合：`276 tests OK`；instruction-source 模块 `24 tests OK`；terminal/run-contract 模块 `170 tests OK`。
 - legacy browser sidecar：`8 tests OK`。
@@ -300,6 +366,20 @@
 ## 10. 已知非 blocker 边界
 
 - V2.3 与 ground truth 的业务级一致性仍需用户手工真实模型 E2E；基础回归不能替代这项验收。
+- 当前 `knowledge_gate.checks[].tools` 还没有完整编译为 exact required/conditional/available
+  candidate OR-groups；旧 alternative 路径会让模型尝试错误 callable。不能把约 134 个候选
+  全标为 required，后续需做通用的候选组 IR 和 schema-grounded dispatch。
+- 同一事件循环里的任意同步阻塞无法被 asyncio hard deadline 抢占；内置长操作已使用
+  async/sandbox，真正要强杀任意同步 Python 仍需进程级隔离/watchdog。deadline 后返回还
+  可能包含两段有界 resource-close/child-cancel grace。
+- cancellation-resistant 第三方协程可能存活到自身返回，但 fence 已撤权、provider 队列
+  有界且不能再 dispatch/commit；极小 dispatch-start/fence race 会安全侧误判为
+  non-retryable，可能少重试一次，不会重复副作用。
+- 兼容 fork API 在客户端未传 `fork_id` 时仍由服务端随机生成；若服务端已完成但响应前
+  断网，旧客户端不知道幂等键，自动重试可能产生第二份 fork。后续应由前端预生成
+  `fork_id`，并增加启动/周期 orphan journal reconciler。
+- Agent event 当前按事件即时持久化，长 run 的事件规模仍可能形成较高写放大；后续可做
+  有界批处理。assistant projection 也还没有数据库级 run→message exactly-once 外键。
 - session-wise 隔离是固定容器池内的 lease/root-run 隔离，不是每 chat 动态创建容器。
 - 依赖 profile 固定且不可运行时安装；复杂动态 Bash/Node/Python 需 exact marker/manifest。
 - browser Skill lane只允许公共 HTTP(S)，不支持 CAPTCHA、stealth、反爬绕过或未确认的重要操作。

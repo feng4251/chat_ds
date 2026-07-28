@@ -20,6 +20,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from tools.context import ToolContext
+from tools.execution_fence import require_execution_authority
 from tools.path_security import sandbox_dir, validate_path
 from tools.approval import check_file_write_safety
 from tools.omission_guard import (
@@ -69,6 +71,7 @@ async def read_file(
     limit: int = 500,
     user_id: str = "default",
     session_id: str = "default",
+    context: ToolContext | None = None,
 ) -> str:
     """Read a file from the user+session sandbox. Lines are 1-indexed.
 
@@ -80,6 +83,10 @@ async def read_file(
         session_id: Session identifier for sandbox isolation.
     """
     try:
+        require_execution_authority(
+            context,
+            boundary="workspace.read",
+        )
         if filepath.startswith("results/"):
             path = validate_path(filepath[len("results/"):], user_id, session_id, sub="results")
         else:
@@ -158,6 +165,7 @@ async def write_file(
     content: str,
     user_id: str = "default",
     session_id: str = "default",
+    context: ToolContext | None = None,
 ) -> str:
     """Write content to a file in the user+session sandbox. Always overwrites.
 
@@ -178,6 +186,7 @@ async def write_file(
             content,
             user_id=user_id,
             session_id=session_id,
+            context=context,
         )
 
 
@@ -186,6 +195,7 @@ async def _write_file_locked(
     content: str,
     user_id: str,
     session_id: str,
+    context: ToolContext | None = None,
 ) -> str:
     """Perform one write while the session workspace mutation lock is held."""
 
@@ -225,6 +235,10 @@ async def _write_file_locked(
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
+        require_execution_authority(
+            context,
+            boundary="workspace.write.commit",
+        )
         os.replace(temp_path, path)
         temp_path = None
         _make_workspace_path_readable(path)
@@ -250,6 +264,7 @@ async def patch_file(
     replace_all: bool = False,
     user_id: str = "default",
     session_id: str = "default",
+    context: ToolContext | None = None,
 ) -> str:
     """Apply an exact, atomic text replacement within a workspace file."""
     if not old_text:
@@ -267,6 +282,7 @@ async def patch_file(
             replace_all=replace_all,
             user_id=user_id,
             session_id=session_id,
+            context=context,
         )
 
 
@@ -278,6 +294,7 @@ async def _patch_file_locked(
     replace_all: bool,
     user_id: str,
     session_id: str,
+    context: ToolContext | None = None,
 ) -> str:
     """Read/CAS-replace one file while the workspace lock is held."""
 
@@ -309,6 +326,10 @@ async def _patch_file_locked(
             handle.write(updated)
             handle.flush()
             os.fsync(handle.fileno())
+        require_execution_authority(
+            context,
+            boundary="workspace.patch.commit",
+        )
         os.replace(temp_path, path)
         _make_workspace_path_readable(path)
     except Exception as exc:
@@ -428,6 +449,7 @@ async def merge_files(
     separator: str = "",
     user_id: str = "default",
     session_id: str = "default",
+    context: ToolContext | None = None,
 ) -> str:
     """Atomically concatenate workspace files in a deterministic order.
 
@@ -444,6 +466,7 @@ async def merge_files(
             separator=separator,
             user_id=user_id,
             session_id=session_id,
+            context=context,
         )
 
 
@@ -454,6 +477,7 @@ async def _merge_files_locked(
     separator: str,
     user_id: str,
     session_id: str,
+    context: ToolContext | None = None,
 ) -> str:
     """Read inputs and atomically replace output under the workspace lock."""
 
@@ -605,6 +629,10 @@ async def _merge_files_locked(
             os.fsync(destination.fileno())
 
         summary = _text_file_summary(Path(temp_path))
+        require_execution_authority(
+            context,
+            boundary="workspace.merge.commit",
+        )
         os.replace(temp_path, output_path)
         temp_path = None
         _make_workspace_path_readable(output_path)

@@ -27,6 +27,10 @@ import uuid
 from typing import Any
 
 from tools.context import ToolContext
+from tools.execution_fence import (
+    ExecutionAuthorityRevoked,
+    require_execution_authority,
+)
 from tools.isolated_skill_executor import (
     MAX_ARGS,
     MAX_ARG_CHARS,
@@ -471,6 +475,7 @@ class _ManagedProcess:
     authority: _VerifiedScriptAuthority
     canonical_script_path: str
     runtime_profile: str
+    execution_run_id: str
     closing: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
@@ -571,6 +576,7 @@ class SkillProcessManager:
                         await close_isolated_process_lease(
                             lease,
                             op_id=_operation_uuid(context, "rollback-close"),
+                            apply_artifacts=False,
                         )
                     except BaseException:
                         # The executor may already own a live/open lease even
@@ -597,6 +603,11 @@ class SkillProcessManager:
                                 f"{authority.script_resource}"
                             ),
                             runtime_profile=runtime_profile,
+                            execution_run_id=str(
+                                context.run_id
+                                or context.browser_run_scope_id
+                                or ""
+                            ),
                         )
                 raise
 
@@ -612,6 +623,11 @@ class SkillProcessManager:
                     f"skills/{authority.skill_name}/{authority.script_resource}"
                 ),
                 runtime_profile=runtime_profile,
+                execution_run_id=str(
+                    context.run_id
+                    or context.browser_run_scope_id
+                    or ""
+                ),
             )
             self._records[process_id] = record
             return record, started
@@ -722,6 +738,12 @@ class SkillProcessManager:
                 response = await close_isolated_process_lease(
                     record.lease,
                     op_id=_operation_uuid(context, "close"),
+                    execution_authority_check=lambda: (
+                        require_execution_authority(
+                            context,
+                            boundary="skill_process.close.commit",
+                        )
+                    ),
                 )
             except BaseException as exc:
                 if (
@@ -752,6 +774,25 @@ class SkillProcessManager:
             reason="root_run",
         )
 
+    async def cleanup_run(
+        self,
+        user_id: str,
+        session_id: str,
+        run_id: str,
+    ) -> dict[str, Any]:
+        """Close leases created by one exact child/root run."""
+
+        normalized_run = str(run_id or "")
+        return await self._cleanup_matching(
+            lambda owner, record=None: False,
+            reason="run",
+            execution_run=(
+                str(user_id),
+                str(session_id),
+                normalized_run,
+            ),
+        )
+
     async def cleanup_session(
         self,
         user_id: str,
@@ -775,12 +816,23 @@ class SkillProcessManager:
         predicate: Any,
         *,
         reason: str,
+        execution_run: tuple[str, str, str] | None = None,
     ) -> dict[str, Any]:
         async with self._lock:
             records = [
                 record
                 for record in self._records.values()
-                if predicate(record.owner) and not record.closing
+                if (
+                    (
+                        predicate(record.owner)
+                        if execution_run is None
+                        else (
+                            record.owner[:2] == execution_run[:2]
+                            and record.execution_run_id == execution_run[2]
+                        )
+                    )
+                    and not record.closing
+                )
             ]
             for record in records:
                 record.closing = True
@@ -793,6 +845,7 @@ class SkillProcessManager:
                     await close_isolated_process_lease(
                         record.lease,
                         op_id=str(uuid.uuid4()),
+                        apply_artifacts=reason != "run",
                     )
                 return record, None, True
             except BaseException as exc:
@@ -830,7 +883,11 @@ class SkillProcessManager:
             }
             for owner in list(self._owner_scopes):
                 if (
-                    predicate(owner)
+                    (
+                        predicate(owner)
+                        if execution_run is None
+                        else owner[:2] == execution_run[:2]
+                    )
                     and owner not in failed_owners
                     and not any(
                         record.owner == owner
@@ -1040,6 +1097,10 @@ async def run_skill_process(
         )
     active_record: _ManagedProcess | None = None
     try:
+        require_execution_authority(
+            context,
+            boundary=f"skill_process.{operation}.entry",
+        )
         if operation not in {
             "start", "write", "stdin_close", "read", "call", "sync",
             "signal", "close",
@@ -1137,6 +1198,10 @@ async def run_skill_process(
             socket_path = runtime_profile_socket_binding(
                 profile
             ).socket_path
+            require_execution_authority(
+                context,
+                boundary="skill_process.start.submit",
+            )
             record, response = await _MANAGER.start(
                 context=context,
                 authority=authority,
@@ -1151,6 +1216,18 @@ async def run_skill_process(
                 runtime_profile=profile,
                 socket_path=socket_path,
             )
+            try:
+                require_execution_authority(
+                    context,
+                    boundary="skill_process.start.publish",
+                )
+            except ExecutionAuthorityRevoked:
+                await _MANAGER.cleanup_run(
+                    context.user_id,
+                    context.session_id,
+                    str(context.run_id or context.browser_run_scope_id or ""),
+                )
+                raise
             if response.get("runtime_profile") != profile:
                 # This cannot safely be converted into a base/native fallback.
                 try:
@@ -1166,6 +1243,10 @@ async def run_skill_process(
 
         safe_process_id = _validate_process_id(process_id)
         if operation == "close":
+            require_execution_authority(
+                context,
+                boundary="skill_process.close.submit",
+            )
             response, already_closed = await _MANAGER.close_explicit(
                 safe_process_id,
                 context,
@@ -1180,6 +1261,10 @@ async def run_skill_process(
         record = await _MANAGER.acquire(safe_process_id, context)
         active_record = record
         async with record.lock:
+            require_execution_authority(
+                context,
+                boundary=f"skill_process.{operation}.submit",
+            )
             if operation == "write":
                 content = _decode_stdin(data, data_base64)
                 response = await write_isolated_process_stdin(
@@ -1222,6 +1307,12 @@ async def run_skill_process(
                 response = await sync_isolated_process_artifacts(
                     record.lease,
                     op_id=_operation_uuid(context, "sync"),
+                    execution_authority_check=lambda: (
+                        require_execution_authority(
+                            context,
+                            boundary="skill_process.sync.commit",
+                        )
+                    ),
                 )
             elif operation == "signal":
                 response = await signal_isolated_process(
@@ -1232,6 +1323,13 @@ async def run_skill_process(
             else:  # pragma: no cover - guarded by the operation set above
                 raise AssertionError(operation)
         return _public_receipt(operation, safe_process_id, response)
+    except ExecutionAuthorityRevoked:
+        return _json_error(
+            "execution_authority_revoked",
+            "Delegated execution authority was revoked; the process operation "
+            "was not submitted.",
+            operation=str(operation or ""),
+        )
     except IsolatedSkillExecutorError as exc:
         code = exc.code
         if code in {
@@ -1260,6 +1358,16 @@ async def cleanup_skill_process_root(
     """Close only leases owned by one root AgentRun."""
 
     return await _MANAGER.cleanup_root(user_id, session_id, root_run_id)
+
+
+async def cleanup_skill_process_run(
+    user_id: str,
+    session_id: str,
+    run_id: str,
+) -> dict[str, Any]:
+    """Close only persistent executor leases created by one exact run."""
+
+    return await _MANAGER.cleanup_run(user_id, session_id, run_id)
 
 
 async def cleanup_skill_process_session(
