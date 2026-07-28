@@ -60,6 +60,9 @@ from skills.loader import load_skill_content
 from tools.web_extract import web_extract
 
 
+_LOADER_WORKFLOW = object()
+
+
 class MultimodalTokenSafetyTests(unittest.TestCase):
     def test_data_url_transport_bytes_are_not_counted_as_text_tokens(self):
         messages = [{
@@ -1373,6 +1376,54 @@ class WorkflowGateToolPolicyTests(unittest.TestCase):
 
 
 class WorkflowActivationBoundaryTests(unittest.TestCase):
+    def _materialized_skill_package(
+        self,
+        name,
+        *,
+        skill_markdown=None,
+        workflow_contract=_LOADER_WORKFLOW,
+        linked_files=None,
+        resource_paths=(),
+    ):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name) / name
+        root.mkdir(parents=True)
+        (root / "SKILL.md").write_text(
+            skill_markdown
+            or (
+                f"---\nname: {name}\n"
+                f"description: Test package for {name}.\n"
+                "---\n# Instructions\nFollow the selected workflow.\n"
+            ),
+            encoding="utf-8",
+        )
+        package = load_skill_content(root / "SKILL.md", skill_dir=str(root))
+
+        declared_paths = list(resource_paths)
+        if isinstance(linked_files, dict):
+            for paths in linked_files.values():
+                if isinstance(paths, list):
+                    declared_paths.extend(paths)
+        for raw_path in dict.fromkeys(str(path) for path in declared_paths):
+            relative = PurePosixPath(raw_path)
+            if (
+                not raw_path
+                or relative.is_absolute()
+                or ".." in relative.parts
+            ):
+                continue
+            target = root.joinpath(*relative.parts)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(f"fixture resource: {raw_path}\n", encoding="utf-8")
+
+        package["_chatds_scope"] = "session"
+        if workflow_contract is not _LOADER_WORKFLOW:
+            package["workflow_contract"] = workflow_contract
+        if linked_files is not None:
+            package["linked_files"] = linked_files
+        return package
+
     def test_intent_route_recompile_drops_other_route_tools_and_commands(self):
         worker_a = {
             "id": "route-a",
@@ -1406,11 +1457,14 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
             "execution_contract": execution,
         }
         loaded = {
-            "router-skill": {
-                "name": "router-skill",
-                "_chatds_scope": "session",
-                "workflow_contract": workflow,
-            },
+            "router-skill": self._materialized_skill_package(
+                "router-skill",
+                workflow_contract=workflow,
+                resource_paths=(
+                    "workers/route-a.yaml",
+                    "workers/route-b.yaml",
+                ),
+            ),
         }
         available = [
             "skills_list", "skill_view", "delegate_task", "web_search",
@@ -1476,11 +1530,11 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
             "Use bulk-skill to create a detailed report",
             ["skills_list", "skill_view", "delegate_task", "write_file"],
             {"bulk-skill"},
-            {"bulk-skill": {
-                "name": "bulk-skill",
-                "_chatds_scope": "session",
-                "workflow_contract": workflow,
-            }},
+            {"bulk-skill": self._materialized_skill_package(
+                "bulk-skill",
+                workflow_contract=workflow,
+                resource_paths=files,
+            )},
             {},
         )
         authorized = {
@@ -1531,17 +1585,17 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
         self.assertEqual((False, ""), state.needs_more_skill_workflow())
 
     def test_standard_selected_skill_can_progressively_read_bundled_resources(self):
+        linked_files = {
+            "references": ["references/REFERENCE.md"],
+            "assets": ["assets/template.json"],
+            "scripts": ["scripts/check.py"],
+        }
         loaded = {
-            "portable-skill": {
-                "name": "portable-skill",
-                "_chatds_scope": "session",
-                "workflow_contract": None,
-                "linked_files": {
-                    "references": ["references/REFERENCE.md"],
-                    "assets": ["assets/template.json"],
-                    "scripts": ["scripts/check.py"],
-                },
-            },
+            "portable-skill": self._materialized_skill_package(
+                "portable-skill",
+                workflow_contract=None,
+                linked_files=linked_files,
+            ),
         }
 
         exposure = _bounded_skill_execution_exposure(
@@ -1606,26 +1660,22 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
         self.assertIn(("write_file",), exposure.required_groups)
 
     def test_standard_skill_main_directives_compile_closed_capabilities(self):
-        from skills.loader import load_skill_content
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / "arithmetic-helper"
-            (root / "references").mkdir(parents=True)
-            (root / "SKILL.md").write_text(
+        package = self._materialized_skill_package(
+            "arithmetic-helper",
+            skill_markdown=(
                 "---\nname: arithmetic-helper\n"
                 "description: Delegate arithmetic and verify the result.\n---\n"
                 "# Instructions\n1. Delegate the calculation to a subagent.\n"
                 "2. Then verify the result with code execution.\n"
                 "```text\nUse write_file to create an example.\n```\n"
-                "> Use web_search in a quoted example.\n",
-                encoding="utf-8",
-            )
-            (root / "references" / "notes.md").write_text(
-                "Use write_file, web_search, and skill_manage.", encoding="utf-8"
-            )
-            package = load_skill_content(
-                root / "SKILL.md", skill_dir=str(root)
-            )
+                "> Use web_search in a quoted example.\n"
+            ),
+            linked_files={"references": ["references/notes.md"]},
+        )
+        (Path(package["skill_dir"]) / "references" / "notes.md").write_text(
+            "Use write_file, web_search, and skill_manage.",
+            encoding="utf-8",
+        )
 
         exposure = _bounded_skill_execution_exposure(
             "Use arithmetic-helper to answer 2+2.",
@@ -1642,21 +1692,15 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
         self.assertIn(("execute_code",), exposure.required_groups)
 
     def test_standard_allowed_tools_grant_only_existing_capabilities(self):
-        from skills.loader import load_skill_content
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / "portable-tools"
-            root.mkdir()
-            (root / "SKILL.md").write_text(
+        package = self._materialized_skill_package(
+            "portable-tools",
+            skill_markdown=(
                 "---\nname: portable-tools\n"
                 "description: Use explicitly pre-approved portable tools.\n"
                 "allowed-tools: Task execute_code Shell(git status:*)\n"
-                "---\n# Usage\nFollow the user's request.\n",
-                encoding="utf-8",
-            )
-            package = load_skill_content(
-                root / "SKILL.md", skill_dir=str(root)
-            )
+                "---\n# Usage\nFollow the user's request.\n"
+            ),
+        )
 
         exposure = _bounded_skill_execution_exposure(
             "Use portable-tools.",
@@ -1684,16 +1728,17 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
             },
         }
         loaded = {
-            "closed-skill": {
-                "name": "closed-skill",
-                "_chatds_scope": "session",
-                "content": (
-                    "# Instructions\nDelegate to a subagent, then verify with "
-                    "code execution."
+            "closed-skill": self._materialized_skill_package(
+                "closed-skill",
+                skill_markdown=(
+                    "---\nname: closed-skill\n"
+                    "description: Test an explicitly closed tool surface.\n"
+                    "---\n# Instructions\n"
+                    "Delegate to a subagent, then verify with code execution."
                 ),
-                "workflow_contract": workflow,
-                "linked_files": {},
-            },
+                workflow_contract=workflow,
+                linked_files={},
+            ),
         }
 
         exposure = _bounded_skill_execution_exposure(
@@ -1726,11 +1771,11 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
                 "patch_file", "run_skill_script", "run_declared_command",
             ],
             {"bulk-skill"},
-            {"bulk-skill": {
-                "name": "bulk-skill",
-                "_chatds_scope": "session",
-                "workflow_contract": workflow,
-            }},
+            {"bulk-skill": self._materialized_skill_package(
+                "bulk-skill",
+                workflow_contract=workflow,
+                resource_paths=files,
+            )},
             {},
         )
         self.assertTrue(any(
@@ -1773,26 +1818,24 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
             },
         }
         loaded = {
-            "parent-workflow": {
-                "name": "parent-workflow",
-                "_chatds_scope": "session",
-                "workflow_contract": workflow,
-            },
-            "schema-helper": {
-                "name": "schema-helper",
-                "_chatds_scope": "session",
-                "workflow_contract": None,
-                "linked_files": {
+            "parent-workflow": self._materialized_skill_package(
+                "parent-workflow",
+                workflow_contract=workflow,
+                resource_paths=("workers/writer.yaml",),
+            ),
+            "schema-helper": self._materialized_skill_package(
+                "schema-helper",
+                workflow_contract=None,
+                linked_files={
                     "references": ["references/schema.md"],
                     "templates": ["templates/record.json"],
                 },
-            },
-            "unrelated-helper": {
-                "name": "unrelated-helper",
-                "_chatds_scope": "session",
-                "workflow_contract": None,
-                "linked_files": {"references": ["references/other.md"]},
-            },
+            ),
+            "unrelated-helper": self._materialized_skill_package(
+                "unrelated-helper",
+                workflow_contract=None,
+                linked_files={"references": ["references/other.md"]},
+            ),
         }
 
         exposure = _bounded_skill_execution_exposure(
@@ -1833,6 +1876,11 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
             },
         }
 
+        parent_package = self._materialized_skill_package(
+            "parent-workflow",
+            workflow_contract=workflow,
+            resource_paths=("workers/writer.yaml",),
+        )
         for label, linked_files, expected_error in (
             (
                 "traversal",
@@ -1852,17 +1900,12 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
         ):
             with self.subTest(label=label):
                 loaded = {
-                    "parent-workflow": {
-                        "name": "parent-workflow",
-                        "_chatds_scope": "session",
-                        "workflow_contract": workflow,
-                    },
-                    "schema-helper": {
-                        "name": "schema-helper",
-                        "_chatds_scope": "session",
-                        "workflow_contract": None,
-                        "linked_files": linked_files,
-                    },
+                    "parent-workflow": parent_package,
+                    "schema-helper": self._materialized_skill_package(
+                        "schema-helper",
+                        workflow_contract=None,
+                        linked_files=linked_files,
+                    ),
                 }
                 exposure = _bounded_skill_execution_exposure(
                     "run parent-workflow",

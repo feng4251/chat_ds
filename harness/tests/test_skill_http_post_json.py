@@ -157,6 +157,12 @@ class SkillHttpPostJsonTests(unittest.IsolatedAsyncioTestCase):
             result["request_body_sha256"],
         )
         self.assertEqual("json-api", result["matched_skill"])
+        self.assertEqual(
+            hashlib.sha256(
+                b"https://api.vendor.test/v1/graphql"
+            ).hexdigest(),
+            result["matched_prefix_sha256"],
+        )
         self.assertEqual(1, result["request_number"])
         self.assertEqual("complete", result["retrieval"]["state"])
         self.assertEqual("POST", result["retrieval"]["request_method"])
@@ -431,7 +437,41 @@ class SkillHttpPostCapabilityTests(unittest.TestCase):
     @staticmethod
     def _structured_exposure(
         capability_package: dict,
+        pipeline_root: Path | None = None,
     ):
+        capability_package = dict(capability_package)
+        capability_root_value = (
+            capability_package.get("skill_dir")
+            or (
+                capability_package.get("resource_graph") or {}
+            ).get("skill_root")
+        )
+        if capability_root_value:
+            capability_root = Path(str(capability_root_value))
+            capability_main = capability_root / "SKILL.md"
+            if capability_main.is_file():
+                capability_package["skill_dir"] = str(capability_root)
+                capability_package["skill_md_sha256"] = hashlib.sha256(
+                    capability_main.read_bytes()
+                ).hexdigest()
+        pipeline_package = {
+            "name": "pipeline",
+            "_chatds_scope": "session",
+            "content": "Execute the declared pipeline.",
+        }
+        if pipeline_root is not None:
+            pipeline_root.mkdir(parents=True, exist_ok=True)
+            pipeline_main = pipeline_root / "SKILL.md"
+            pipeline_main.write_text(
+                "Execute the declared pipeline.",
+                encoding="utf-8",
+            )
+            pipeline_package.update({
+                "skill_dir": str(pipeline_root),
+                "skill_md_sha256": hashlib.sha256(
+                    pipeline_main.read_bytes()
+                ).hexdigest(),
+            })
         worker = {
             "id": "collector",
             "file": "workers/collector.yaml",
@@ -457,9 +497,7 @@ class SkillHttpPostCapabilityTests(unittest.TestCase):
             {"pipeline", "json-api"},
             {
                 "pipeline": {
-                    "name": "pipeline",
-                    "_chatds_scope": "session",
-                    "content": "Execute the declared pipeline.",
+                    **pipeline_package,
                     "workflow_contract": workflow,
                 },
                 "json-api": capability_package,
@@ -560,6 +598,35 @@ class SkillHttpPostCapabilityTests(unittest.TestCase):
             result_data={"request_sent": True, "status": "success"},
             allowed_skill_http_post_prefixes=grant,
         ))
+        safe_prefix_hash = hashlib.sha256(
+            prefix.encode("utf-8")
+        ).hexdigest()
+        self.assertTrue(capability_call_satisfies_candidate(
+            post,
+            tool_name="skill_http_post_json",
+            args={},
+            result_data={
+                "request_sent": True,
+                "status": "success",
+                "matched_skill": "json-api",
+                "matched_prefix_sha256": safe_prefix_hash,
+            },
+            allowed_skill_http_post_prefixes=grant,
+        ))
+        self.assertFalse(capability_call_satisfies_candidate(
+            post,
+            tool_name="skill_http_post_json",
+            args={},
+            result_data={
+                "request_sent": True,
+                "status": "success",
+                "matched_skill": "json-api",
+                "matched_prefix_sha256": hashlib.sha256(
+                    b"https://api.vendor.test/v1/"
+                ).hexdigest(),
+            },
+            allowed_skill_http_post_prefixes=grant,
+        ))
 
     def test_declared_child_gets_bridges_only_for_its_exact_capability_skill(self):
         available = [
@@ -645,7 +712,10 @@ class SkillHttpPostCapabilityTests(unittest.TestCase):
                 "resource_graph": {"skill_root": str(root)},
                 "workflow_contract": None,
             }
-            exposure = self._structured_exposure(package)
+            exposure = self._structured_exposure(
+                package,
+                root.parent / "pipeline",
+            )
 
         self.assertIn("skill_http_post_json", exposure.tools)
         self.assertEqual(
@@ -666,14 +736,28 @@ class SkillHttpPostCapabilityTests(unittest.TestCase):
         )
 
     def test_structured_plain_literal_is_get_only(self):
-        package = {
-            "name": "json-api",
-            "_chatds_scope": "session",
-            "content": "API endpoint: https://api.vendor.test/v1/records",
-            "linked_files": {},
-            "workflow_contract": None,
-        }
-        exposure = self._structured_exposure(package)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "json-api"
+            root.mkdir()
+            (root / "SKILL.md").write_text(
+                "API endpoint: https://api.vendor.test/v1/records",
+                encoding="utf-8",
+            )
+            package = {
+                "name": "json-api",
+                "_chatds_scope": "session",
+                "content": (
+                    "API endpoint: "
+                    "https://api.vendor.test/v1/records"
+                ),
+                "linked_files": {},
+                "resource_graph": {"skill_root": str(root)},
+                "workflow_contract": None,
+            }
+            exposure = self._structured_exposure(
+                package,
+                root.parent / "pipeline",
+            )
 
         self.assertIn("skill_http_get", exposure.tools)
         self.assertNotIn("skill_http_post_json", exposure.tools)

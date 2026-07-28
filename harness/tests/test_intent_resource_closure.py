@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import unittest
@@ -233,7 +234,7 @@ class IntentResourceClosureRunTests(unittest.IsolatedAsyncioTestCase):
     async def test_nonexistent_selected_resource_fails_closed_on_exact_skill(self):
         orchestrator = "orchestration/main.yaml"
         missing = "references/not-present.md"
-        skill_digest = "c" * 64
+        skill_digest = ""
         responses = [
             _tool_call_response("load-skill", "skill_view", {"name": SKILL}),
         ]
@@ -343,6 +344,23 @@ class IntentResourceClosureRunTests(unittest.IsolatedAsyncioTestCase):
         }
 
         with tempfile.TemporaryDirectory() as temp_dir:
+            skill_dir = Path(temp_dir) / "skill-package"
+            orchestrator_file = skill_dir / orchestrator
+            orchestrator_file.parent.mkdir(parents=True, exist_ok=True)
+            skill_main = skill_dir / "SKILL.md"
+            skill_main.write_text(
+                "---\n"
+                f"name: {SKILL}\n"
+                "description: Exact intent-resource closure fixture.\n"
+                "---\n"
+                "# Intent Resource Closure\n",
+                encoding="utf-8",
+            )
+            orchestrator_file.write_text(
+                "intent contract\n",
+                encoding="utf-8",
+            )
+            skill_digest = hashlib.sha256(skill_main.read_bytes()).hexdigest()
             with (
                 patch("workspace_context.WORKSPACE_ROOT", Path(temp_dir)),
                 patch("agent_loop.httpx.AsyncClient", FakeAsyncClient),
@@ -354,6 +372,7 @@ class IntentResourceClosureRunTests(unittest.IsolatedAsyncioTestCase):
                 patch(
                     "skills.loader.load_skill_content",
                     return_value={
+                        "skill_dir": str(skill_dir),
                         "skill_md_sha256": skill_digest,
                         "linked_files": {
                             "orchestration": [orchestrator],

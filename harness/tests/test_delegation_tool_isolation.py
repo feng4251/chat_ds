@@ -71,17 +71,41 @@ def _tool_finished(
     *,
     outcome: str = "success",
     event_type: str = "tool.completed",
+    result_data: dict | None = None,
 ) -> dict:
+    payload = {
+        "tool_name": tool_name,
+        "tool_call_id": tool_call_id,
+        "outcome": outcome,
+    }
+    if result_data is not None:
+        payload.update({
+            "actual_dispatch_attempted": True,
+            "exact_capability_receipt": {
+                "result_data": dict(result_data),
+            },
+        })
     return {
         "type": "agent_event",
         "event_type": event_type,
         "tool_name": tool_name,
         "tool_call_id": tool_call_id,
-        "payload": {
-            "tool_name": tool_name,
-            "tool_call_id": tool_call_id,
-            "outcome": outcome,
-        },
+        "payload": payload,
+    }
+
+
+def _http_result_data(
+    skill_name: str,
+    prefix: str,
+    *,
+    request_sent: bool = True,
+) -> dict:
+    return {
+        "request_sent": request_sent,
+        "matched_skill": skill_name,
+        "matched_prefix_sha256": hashlib.sha256(
+            prefix.encode("utf-8")
+        ).hexdigest(),
     }
 
 
@@ -2295,7 +2319,11 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
                 "get-first",
                 url=first_prefix + "record",
             )
-            yield _tool_finished("skill_http_get", "get-first")
+            yield _tool_finished(
+                "skill_http_get",
+                "get-first",
+                result_data=_http_result_data(skill, first_prefix),
+            )
             yield {
                 "type": "delta",
                 "content": "substantive evidence report with provenance " * 20,
@@ -2376,7 +2404,11 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
                 "get-own",
                 url=own_prefix + "record",
             )
-            yield _tool_finished("skill_http_get", "get-own")
+            yield _tool_finished(
+                "skill_http_get",
+                "get-own",
+                result_data=_http_result_data(skill, own_prefix),
+            )
             yield {
                 "type": "delta",
                 "content": "substantive node-scoped evidence " * 20,
@@ -2522,6 +2554,7 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
                 "get-failed",
                 outcome="error",
                 event_type="tool.failed",
+                result_data=_http_result_data(skill, prefix),
             )
             yield {
                 "type": "delta",
@@ -2592,6 +2625,7 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
                 "get-failed",
                 outcome="error",
                 event_type="tool.failed",
+                result_data=_http_result_data(skill, prefix),
             )
             yield {
                 "type": "delta",

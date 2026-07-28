@@ -816,6 +816,222 @@ class DelegatedBoundaryPropagationTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(ValueError, "UTF-8 byte limit"):
                 _render_exact_child_script_entrypoints([grant])
 
+    def test_exact_python_guidance_lists_only_safe_public_callables(self):
+        from tools.delegation import _render_exact_child_script_entrypoints
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            script = root / "scripts" / "catalog.py"
+            script.parent.mkdir()
+            script.write_text(
+                """
+from elsewhere import imported_public
+
+assigned_callable = lambda value: value
+
+def public_lookup(term: str, limit: int = 5):
+    return []
+
+async def public_async_lookup(term):
+    return []
+
+def _private_lookup(term):
+    return []
+
+class CatalogClient:
+    def __init__(self, endpoint: str):
+        self.endpoint = endpoint
+
+    def search(self, term: str):
+        return []
+
+    async def fetch(self, identifier: str):
+        return {}
+
+    def _private_method(self):
+        return None
+
+    @staticmethod
+    def static_helper():
+        return None
+
+class _PrivateClient:
+    def visible_name_but_private_class(self):
+        return None
+""",
+                encoding="utf-8",
+            )
+            digest = hashlib.sha256(script.read_bytes()).hexdigest()
+            with patch(
+                "tools.skill_script._resolve_session_skill_script",
+                return_value=(script, root, "catalog-database"),
+            ):
+                rendered = _render_exact_child_script_entrypoints(
+                    [(
+                        "catalog-database",
+                        "scripts/catalog.py",
+                        digest,
+                    )],
+                    user_id="u",
+                    session_id="s",
+                )
+
+        self.assertIn("public_lookup", rendered)
+        self.assertIn("public_async_lookup", rendered)
+        self.assertIn("CatalogClient", rendered)
+        self.assertIn("CatalogClient.search", rendered)
+        self.assertIn("CatalogClient.fetch", rendered)
+        for unavailable_name in (
+            "imported_public",
+            "assigned_callable",
+            "_private_lookup",
+            "_private_method",
+            "static_helper",
+            "_PrivateClient",
+            "visible_name_but_private_class",
+            "not_declared_anywhere",
+        ):
+            self.assertNotIn(unavailable_name, rendered)
+
+    def test_python_inventory_failure_is_stable_and_does_not_drop_grant(self):
+        from tools.delegation import _render_exact_child_script_entrypoints
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            script = root / "scripts" / "catalog.py"
+            script.parent.mkdir()
+            script.write_text("def public_lookup():\n    return []\n", encoding="utf-8")
+            digest = hashlib.sha256(script.read_bytes()).hexdigest()
+            with (
+                patch(
+                    "tools.skill_script._resolve_session_skill_script",
+                    return_value=(script, root, "catalog-database"),
+                ),
+                patch(
+                    "tools.skill_python.inspect_public_python_callables",
+                    side_effect=ValueError("sensitive host parse detail"),
+                ),
+            ):
+                rendered = _render_exact_child_script_entrypoints(
+                    [(
+                        "catalog-database",
+                        "scripts/catalog.py",
+                        digest,
+                    )],
+                    user_id="u",
+                    session_id="s",
+                )
+
+        self.assertIn(
+            "skills/catalog-database/scripts/catalog.py", rendered
+        )
+        self.assertIn('{"status":"unavailable"}', rendered)
+        self.assertNotIn("sensitive host parse detail", rendered)
+        self.assertNotIn("public_lookup", rendered)
+
+    def test_non_python_entrypoint_does_not_run_callable_inventory(self):
+        from tools.delegation import _render_exact_child_script_entrypoints
+
+        with (
+            patch(
+                "tools.skill_script._resolve_session_skill_script"
+            ) as resolve_script,
+            patch(
+                "tools.skill_python.inspect_public_python_callables"
+            ) as inspect_callables,
+        ):
+            rendered = _render_exact_child_script_entrypoints(
+                [(
+                    "catalog-database",
+                    "scripts/catalog.sh",
+                    "a" * 64,
+                )],
+                user_id="u",
+                session_id="s",
+            )
+
+        self.assertIn(
+            "skills/catalog-database/scripts/catalog.sh", rendered
+        )
+        self.assertNotIn("public Python callable inventory", rendered)
+        resolve_script.assert_not_called()
+        inspect_callables.assert_not_called()
+
+    def test_python_callable_inventory_total_entry_limit_is_fail_closed(self):
+        from tools.delegation import _render_exact_child_script_entrypoints
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            script = root / "scripts" / "catalog.py"
+            script.parent.mkdir()
+            script.write_text(
+                "def first():\n    return 1\n\n"
+                "def second():\n    return 2\n",
+                encoding="utf-8",
+            )
+            digest = hashlib.sha256(script.read_bytes()).hexdigest()
+            with (
+                patch(
+                    "tools.skill_script._resolve_session_skill_script",
+                    return_value=(script, root, "catalog-database"),
+                ),
+                patch(
+                    "tools.delegation."
+                    "_MAX_CHILD_PYTHON_CALLABLE_INVENTORY_ENTRIES",
+                    1,
+                ),
+            ):
+                rendered = _render_exact_child_script_entrypoints(
+                    [(
+                        "catalog-database",
+                        "scripts/catalog.py",
+                        digest,
+                    )],
+                    user_id="u",
+                    session_id="s",
+                )
+
+        self.assertIn('{"status":"unavailable"}', rendered)
+        self.assertNotIn("first", rendered)
+        self.assertNotIn("second", rendered)
+
+    def test_python_callable_inventory_total_byte_limit_is_fail_closed(self):
+        from tools.delegation import _render_exact_child_script_entrypoints
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            script = root / "scripts" / "catalog.py"
+            script.parent.mkdir()
+            script.write_text(
+                "def visible_function_with_a_long_name(argument: str):\n"
+                "    return argument\n",
+                encoding="utf-8",
+            )
+            digest = hashlib.sha256(script.read_bytes()).hexdigest()
+            with (
+                patch(
+                    "tools.skill_script._resolve_session_skill_script",
+                    return_value=(script, root, "catalog-database"),
+                ),
+                patch(
+                    "tools.delegation."
+                    "_MAX_CHILD_PYTHON_CALLABLE_GUIDANCE_BYTES",
+                    100,
+                ),
+            ):
+                rendered = _render_exact_child_script_entrypoints(
+                    [(
+                        "catalog-database",
+                        "scripts/catalog.py",
+                        digest,
+                    )],
+                    user_id="u",
+                    session_id="s",
+                )
+
+        self.assertIn('{"status":"unavailable"}', rendered)
+        self.assertNotIn("visible_function_with_a_long_name", rendered)
+
     async def test_compiled_worker_cannot_mint_capability_resource_authority(self):
         with (
             patch("agent_loop.run_stream") as run_stream,

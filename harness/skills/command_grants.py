@@ -287,6 +287,66 @@ def grants_for_declaration(
     return list(deduped.values())[:MAX_COMMAND_GRANTS]
 
 
+def _knowledge_gate_command_grants(
+    declaration: Any,
+    *,
+    scope: str,
+) -> list[dict[str, Any]]:
+    """Compile only signed, exact command selectors from one worker gate."""
+
+    if not isinstance(declaration, dict):
+        return []
+    ir = declaration.get("knowledge_gate_ir")
+    if (
+        not isinstance(ir, dict)
+        or ir.get("schema_version") != 1
+        or ir.get("valid") is not True
+    ):
+        return []
+    supplied_digest = ir.get("ir_sha256")
+    projection = {
+        key: value
+        for key, value in ir.items()
+        if key not in {"diagnostic_summary", "ir_sha256", "valid"}
+    }
+    try:
+        actual_digest = hashlib.sha256(json.dumps(
+            projection,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")).hexdigest()
+    except (TypeError, ValueError, RecursionError):
+        return []
+    if not isinstance(supplied_digest, str) or supplied_digest != actual_digest:
+        return []
+
+    grants: list[dict[str, Any]] = []
+    for check in ir.get("checks") or []:
+        if not isinstance(check, dict):
+            continue
+        for branch in check.get("branches") or []:
+            if not isinstance(branch, dict):
+                continue
+            for group in branch.get("selector_groups") or []:
+                if not isinstance(group, dict) or group.get("mode") != "one_of":
+                    continue
+                for selector in group.get("selectors") or []:
+                    grant = command_grant_from_selector(selector)
+                    scoped = (
+                        scope_command_grant(grant, scope)
+                        if grant is not None
+                        else None
+                    )
+                    if scoped is not None:
+                        grants.append(scoped)
+                    if len(grants) >= MAX_COMMAND_GRANTS:
+                        break
+    deduped = {str(item["id"]): item for item in grants}
+    return list(deduped.values())[:MAX_COMMAND_GRANTS]
+
+
 def selected_plan_command_grants(
     execution_contract: Any,
     plan: Any,
@@ -304,8 +364,12 @@ def selected_plan_command_grants(
         workers = plan.get("workers")
         if isinstance(workers, dict):
             for worker_id in plan.get("required_workers") or []:
-                grants.extend(grants_for_declaration(
-                    workers.get(worker_id), scope=f"worker:{worker_id}"
+                worker = workers.get(worker_id)
+                scope = f"worker:{worker_id}"
+                grants.extend(grants_for_declaration(worker, scope=scope))
+                grants.extend(_knowledge_gate_command_grants(
+                    worker,
+                    scope=scope,
                 ))
         for source in plan.get("bootstrap_sources") or []:
             source_id = str(source.get("id") or "") if isinstance(source, dict) else ""
@@ -338,8 +402,11 @@ def all_compiled_command_grants(loaded_skill: Any) -> list[dict[str, Any]]:
     if isinstance(execution, dict):
         for worker in execution.get("workers") or []:
             worker_id = str(worker.get("id") or "") if isinstance(worker, dict) else ""
-            grants.extend(grants_for_declaration(
-                worker, scope=f"worker:{worker_id}"
+            scope = f"worker:{worker_id}"
+            grants.extend(grants_for_declaration(worker, scope=scope))
+            grants.extend(_knowledge_gate_command_grants(
+                worker,
+                scope=scope,
             ))
         bootstrap = execution.get("knowledge_bootstrap") or {}
         if isinstance(bootstrap, dict):

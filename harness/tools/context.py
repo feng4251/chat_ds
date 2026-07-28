@@ -102,6 +102,16 @@ class ToolContext:
     # ambient filesystem/command authority and is never accepted from model
     # arguments.
     skill_capability_catalog: dict[str, Any] | None = None
+    # Declarative workers may carry conditional evidence gates.  The loader
+    # first compiles their syntax and the run boundary then resolves every
+    # selector against frozen exact grants.  This immutable plan is available
+    # only to the typed decision control tool; model arguments cannot replace
+    # it or widen its candidate set.
+    knowledge_gate_plan: dict[str, Any] | None = field(
+        default=None,
+        repr=False,
+    )
+    knowledge_gate_plan_sha256: str = field(default="", repr=False)
     allowed_read_paths: tuple[str, ...] = ()
     # Artifact-synthesis delegates receive a runtime-owned closed write set.
     # This is separate from the read/resource boundary: model-authored task

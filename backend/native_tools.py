@@ -16,6 +16,7 @@ DEFAULT_NATIVE_TOOLS: tuple[str, ...] = (
     "run_skill_script",
     "run_declared_command",
     "submit_skill_capability_plan",
+    "submit_knowledge_gate_decisions",
     "skill_http_get",
     "skill_http_post_json",
     "read_file",

@@ -299,6 +299,20 @@ def _matches_grant(url: str, grants: tuple[tuple[str, str], ...]) -> tuple[str, 
     return None
 
 
+def _matched_grant_receipt(
+    skill_name: str,
+    canonical_prefix: str,
+) -> dict[str, str]:
+    """Return a safe exact-grant identity for orchestration audit events."""
+
+    return {
+        "matched_skill": str(skill_name),
+        "matched_prefix_sha256": hashlib.sha256(
+            canonical_prefix.encode("utf-8")
+        ).hexdigest(),
+    }
+
+
 def _retrieval_receipt(
     *,
     method: str,
@@ -609,6 +623,10 @@ async def skill_http_get(
         )
 
     matched_skill, matched_prefix = matched
+    matched_receipt = _matched_grant_receipt(
+        matched_skill,
+        matched_prefix,
+    )
     redirects = 0
     request_sent = False
     request_number = 0
@@ -636,6 +654,7 @@ async def skill_http_get(
                         "root_request_number"
                     ],
                     redirects_followed=redirects,
+                    **matched_receipt,
                 )
             request_number = lease.request_number
             root_request_number = lease.root_request_number
@@ -700,6 +719,7 @@ async def skill_http_get(
                                         root_request_number=root_request_number,
                                         http_status=response.status,
                                         redirects_followed=redirects,
+                                        **matched_receipt,
                                     )
                                 redirected, redirect_error = _canonical_request_url(
                                     urljoin(current, location)
@@ -719,6 +739,7 @@ async def skill_http_get(
                                         root_request_number=root_request_number,
                                         http_status=response.status,
                                         redirects_followed=redirects,
+                                        **matched_receipt,
                                     )
                                 current = redirected
                                 redirects += 1
@@ -750,6 +771,7 @@ async def skill_http_get(
                                     root_request_number=root_request_number,
                                     http_status=response.status,
                                     redirects_followed=redirects,
+                                    **matched_receipt,
                                 )
                             chunks: list[bytes] = []
                             size = 0
@@ -793,6 +815,7 @@ async def skill_http_get(
                                 "root_request_number": root_request_number,
                                 "matched_skill": matched_skill,
                                 "matched_prefix": matched_prefix,
+                                **matched_receipt,
                                 "url": current,
                                 "http_status": response.status,
                                 "content_type": content_type,
@@ -846,6 +869,7 @@ async def skill_http_get(
             request_number=request_number,
             root_request_number=root_request_number,
             redirects_followed=redirects,
+            **matched_receipt,
         )
     except asyncio.TimeoutError:
         return _error(
@@ -855,6 +879,7 @@ async def skill_http_get(
             request_number=request_number,
             root_request_number=root_request_number,
             redirects_followed=redirects,
+            **matched_receipt,
         )
     except (aiohttp.ClientError, OSError, ValueError) as exc:
         return _error(
@@ -864,6 +889,7 @@ async def skill_http_get(
             request_number=request_number,
             root_request_number=root_request_number,
             redirects_followed=redirects,
+            **matched_receipt,
         )
 
 
@@ -940,6 +966,10 @@ async def skill_http_post_json(
         )
 
     matched_skill, matched_prefix = matched
+    matched_receipt = _matched_grant_receipt(
+        matched_skill,
+        matched_prefix,
+    )
     request_sent = False
     request_number = 0
     root_request_number = 0
@@ -962,6 +992,7 @@ async def skill_http_post_json(
             request_number=admission_error["request_number"],
             root_request_number=admission_error["root_request_number"],
             redirects_followed=0,
+            **matched_receipt,
         )
     request_number = lease.request_number
     root_request_number = lease.root_request_number
@@ -1016,6 +1047,7 @@ async def skill_http_post_json(
                             root_request_number=root_request_number,
                             http_status=response.status,
                             redirects_followed=0,
+                            **matched_receipt,
                         )
 
                     content_type = (
@@ -1037,6 +1069,7 @@ async def skill_http_post_json(
                             root_request_number=root_request_number,
                             http_status=response.status,
                             redirects_followed=0,
+                            **matched_receipt,
                         )
 
                     chunks: list[bytes] = []
@@ -1084,6 +1117,7 @@ async def skill_http_post_json(
                         ).hexdigest(),
                         "matched_skill": matched_skill,
                         "matched_prefix": matched_prefix,
+                        **matched_receipt,
                         "url": current,
                         "http_status": response.status,
                         "content_type": content_type,
@@ -1134,6 +1168,7 @@ async def skill_http_post_json(
             request_number=request_number,
             root_request_number=root_request_number,
             redirects_followed=0,
+            **matched_receipt,
         )
     except asyncio.TimeoutError:
         return _error(
@@ -1143,6 +1178,7 @@ async def skill_http_post_json(
             request_number=request_number,
             root_request_number=root_request_number,
             redirects_followed=0,
+            **matched_receipt,
         )
     except (aiohttp.ClientError, OSError, ValueError) as exc:
         return _error(
@@ -1153,6 +1189,7 @@ async def skill_http_post_json(
             request_number=request_number,
             root_request_number=root_request_number,
             redirects_followed=0,
+            **matched_receipt,
         )
     finally:
         _release_request_slot(lease)
