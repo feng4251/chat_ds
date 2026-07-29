@@ -423,8 +423,12 @@ services:
       # Runtime feature analysis cannot select a second execution environment.
       SKILL_BROWSER_EXECUTOR_SOCKET: /run/chat-ds-executor/executor.sock
       EXECUTOR_SOCKET: /run/chat-ds-executor/executor.sock
-      # Keep Backend and Harness on the same bounded sibling-flock timeout.
+      # Keep Backend and Harness on the same bounded local-flock timeout.
       WORKSPACE_MUTATION_LOCK_TIMEOUT_SECONDS: ${WORKSPACE_MUTATION_LOCK_TIMEOUT_SECONDS:-2}
+      # Cross-service coordination must stay on the host-local Docker volume.
+      # Session content remains on NFS, but no flock operation may reach it.
+      WORKSPACE_MUTATION_LOCK_ROOT: /run/chatds-workspace-lock-plane/locks
+      WORKSPACE_MUTATION_LOCK_REQUIRE_MOUNTPOINT: "1"
       # Ordered physical membership is trusted Harness configuration.  Tools
       # and model prompts receive only the content-bound logical pool digest.
       EXECUTOR_POOL_SOCKETS: >-
@@ -441,6 +445,11 @@ services:
       - executor_socket_3:/run/chat-ds-executor-3:ro
       - executor_socket_4:/run/chat-ds-executor-4:ro
       - browser_cdp_socket:/run/chat-ds-browser:ro
+      - type: volume
+        source: workspace_mutation_locks
+        target: /run/chatds-workspace-lock-plane
+        volume:
+          nocopy: true
     networks:
       - chat_net
       - search_net
@@ -487,9 +496,11 @@ services:
       QWEN3_5_BASE_URL: ${QWEN3_5_BASE_URL:-http://10.10.132.128:1025/v1}
       AGENT_DEBUG_TRACE: ${AGENT_DEBUG_TRACE:-true}
       AGENT_EVENT_IMMEDIATE_PERSIST: ${AGENT_EVENT_IMMEDIATE_PERSIST:-true}
-      # Backend UI/upload/bootstrap mutations share Harness's sibling flock.
+      # Backend UI/upload/bootstrap mutations share Harness's local lock plane.
       # Contention is retryable and bounded so an API request cannot hang.
       WORKSPACE_MUTATION_LOCK_TIMEOUT_SECONDS: ${WORKSPACE_MUTATION_LOCK_TIMEOUT_SECONDS:-2}
+      WORKSPACE_MUTATION_LOCK_ROOT: /run/chatds-workspace-lock-plane/locks
+      WORKSPACE_MUTATION_LOCK_REQUIRE_MOUNTPOINT: "1"
       WORKSPACE_ORPHAN_LOCK_TIMEOUT_SECONDS: ${WORKSPACE_ORPHAN_LOCK_TIMEOUT_SECONDS:-0.25}
       WORKSPACE_ORPHAN_RECONCILE_LIMIT: ${WORKSPACE_ORPHAN_RECONCILE_LIMIT:-256}
       WORKSPACE_ORPHAN_RECONCILE_INTERVAL_SECONDS: ${WORKSPACE_ORPHAN_RECONCILE_INTERVAL_SECONDS:-60}
@@ -497,6 +508,11 @@ services:
       - ./data:/app/data
       - chat_ds_db:/app/db
       - /nfs/temp/chat_ds:/nfs/temp/chat_ds
+      - type: volume
+        source: workspace_mutation_locks
+        target: /run/chatds-workspace-lock-plane
+        volume:
+          nocopy: true
     networks:
       - chat_net
     # Backend is not exposed externally — nginx in frontend container proxies
@@ -541,6 +557,8 @@ volumes:
   executor_socket_3:
     driver: local
   executor_socket_4:
+    driver: local
+  workspace_mutation_locks:
     driver: local
   skill_egress_proxy_socket:
     driver: local

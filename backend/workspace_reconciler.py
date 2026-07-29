@@ -234,8 +234,9 @@ def _remove_orphan_session_tree(
             return "deferred:workspace_cleanup_io"
 
     # The durable marker blocks every new Backend/Harness workspace create and
-    # every post-wait mutation boundary. It is now safe to remove the sibling
-    # lock and the rest of the no-longer-owned session tree.
+    # every post-wait mutation boundary. This path is only the legacy NFS
+    # sibling lock: the content-addressed local lock object is deliberately
+    # permanent, because unlinking it would create a held-file ABA race.
     lock_path = session_dir / WORKSPACE_MUTATION_LOCK_FILENAME
     if lock_path.exists() or lock_path.is_symlink():
         try:
