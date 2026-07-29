@@ -24,6 +24,15 @@ function hasExplicitRecovery(payload = {}) {
   ].some((value) => /recover|salvage/i.test(String(value || '')))
 }
 
+function unresolvedRetrievalAffectsCompletionQuality(value) {
+  if (value === null || value === undefined || value === false) return false
+  return !(
+    value
+    && typeof value === 'object'
+    && value.quality_impact === 'advisory'
+  )
+}
+
 function authoritativeTerminal(event = {}, payload = {}) {
   if (!['run.completed', 'run.failed', 'run.cancelled'].includes(event.event_type)) {
     return false
@@ -142,7 +151,9 @@ function lifecycleStatus(eventType, payload, prior = 'running') {
   if (eventType !== 'run.completed') return prior
   if (
     String(payload.completion_quality || '').toLowerCase() === 'degraded'
-    || payload.unresolved_retrieval
+    || unresolvedRetrievalAffectsCompletionQuality(
+      payload.unresolved_retrieval,
+    )
   ) {
     return 'degraded'
   }

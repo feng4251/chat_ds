@@ -636,6 +636,9 @@ description: A generic instruction-only workflow.
                 "sha256": "a" * 64,
                 "package_sha256": "b" * 64,
                 "tool_names": ["run_skill_script", "run_skill_process"],
+                "sandbox_egress_url_prefixes": [
+                    "https://script.example.test/v1/",
+                ],
             },
             "http-a": {
                 "id": "http-a",
@@ -651,6 +654,9 @@ description: A generic instruction-only workflow.
                 "command_id": "command-a",
                 "executable": "tool-a",
                 "fixed_argv": ["--json"],
+                "sandbox_egress_url_prefixes": [
+                    "https://command.example.test/v1/",
+                ],
             },
         }
 
@@ -678,6 +684,14 @@ description: A generic instruction-only workflow.
         self.assertEqual(
             ["--json"],
             bindings["command-a"]["fixed_argv"],
+        )
+        self.assertEqual(
+            ["https://script.example.test/v1/"],
+            bindings["script-a"]["sandbox_egress_url_prefixes"],
+        )
+        self.assertEqual(
+            ["https://command.example.test/v1/"],
+            bindings["command-a"]["sandbox_egress_url_prefixes"],
         )
         self.assertRegex(
             worker["capability_bindings_sha256"],

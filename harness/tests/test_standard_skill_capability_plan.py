@@ -18,8 +18,12 @@ from agent_loop import (
 )
 from skill_capability_plan import (
     build_capability_catalog,
+    build_callable_skill_result_receipt,
+    build_skill_process_evidence_receipt,
+    callable_skill_result_evidence_outcome,
     capability_call_satisfies_candidate,
     catalog_prompt_payload,
+    skill_process_artifact_manifest_sha256,
     validate_capability_plan,
 )
 from skills.command_grants import (
@@ -31,7 +35,10 @@ from skills.scanner import skill_runnable_script_resources
 from tools.skill_capability_plan import submit_skill_capability_plan
 from tools.context import ToolContext
 from tools.isolated_skill_executor import compute_skill_package_digest
-from tools.registry import delegated_resource_boundary_error
+from tools.registry import (
+    delegated_resource_boundary_error,
+    registry as native_tool_registry,
+)
 
 
 def _tool_response(call_id: str, name: str, arguments: dict) -> list[str]:
@@ -91,6 +98,58 @@ class _Response:
 
 
 class StandardSkillCapabilityPlanTests(unittest.TestCase):
+    def test_frozen_skill_static_url_grants_native_browser_exact_rule(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "browser-skill"
+            root.mkdir()
+            main = root / "SKILL.md"
+            main.write_text(
+                "---\nname: browser-skill\n"
+                "description: Inspect one frozen source.\n---\n"
+                "# Instructions\n"
+                "Use browser_navigate to inspect "
+                "https://source.vendor.test/news/ and summarize it.\n",
+                encoding="utf-8",
+            )
+            package = load_skill_content(main, skill_dir=str(root))
+            package["_chatds_scope"] = "session"
+            catalog = _build_standard_skill_capability_catalog(
+                "browser-skill",
+                package,
+                ["skill_view", "browser_navigate", "browser_snapshot"],
+                (),
+            )
+        navigate = next(
+            candidate
+            for candidate in catalog["candidates"]
+            if candidate.get("tool_name") == "browser_navigate"
+        )
+        self.assertEqual(
+            [{
+                "methods": ["GET", "HEAD"],
+                "url_prefix": (
+                    "https://source.vendor.test:443/news/"
+                ),
+            }],
+            navigate["browser_egress_rules"],
+        )
+        accepted = validate_capability_plan(
+            catalog,
+            skill_name="browser-skill",
+            body_sha256=catalog["body_sha256"],
+            required=[navigate["id"]],
+            optional=[],
+            unsupported=[],
+        )
+        self.assertTrue(accepted.valid)
+        self.assertEqual(
+            [[
+                "https://source.vendor.test:443/news/",
+                ["GET", "HEAD"],
+            ]],
+            accepted.payload["allowed_browser_egress_rules"],
+        )
+
     def _package(self, body: str) -> tuple[Path, dict]:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -138,6 +197,423 @@ class StandardSkillCapabilityPlanTests(unittest.TestCase):
         self.assertEqual(
             "capability_catalog_compilation_failed",
             payload["finish_reason"],
+        )
+
+    def test_callable_runner_receipt_only_classifies_immediate_typed_result(self):
+        for returned, expected_reason in (
+            ({"status": "error"}, "typed_status_failure"),
+            ({"status": "failed"}, "typed_status_failure"),
+            ({"status": "blocked"}, "typed_status_failure"),
+            ({"status": "timeout"}, "typed_status_failure"),
+            ({"success": False}, "typed_success_false"),
+            ({"ok": False}, "typed_ok_false"),
+            (
+                {"error": "upstream query failed"},
+                "typed_error_without_positive_success",
+            ),
+        ):
+            with self.subTest(returned=returned):
+                receipt = build_callable_skill_result_receipt(
+                    "run_skill_python",
+                    {"status": "success", "result": returned},
+                )
+                self.assertTrue(receipt["typed_failure"])
+                self.assertIn(
+                    expected_reason,
+                    receipt["failure_reason_codes"],
+                )
+                self.assertEqual(
+                    "error",
+                    callable_skill_result_evidence_outcome(
+                        "run_skill_python",
+                        {"status": "success", "result": returned},
+                        "success",
+                    ),
+                )
+
+        neutral_rows = {
+            "records": [{
+                "id": "row-1",
+                "error": "a source-owned data field",
+            }],
+        }
+        neutral = build_callable_skill_result_receipt(
+            "run_skill_process",
+            {"status": "success", "result": neutral_rows},
+        )
+        self.assertFalse(neutral["typed_failure"])
+        positive_with_error_field = build_callable_skill_result_receipt(
+            "run_skill_python",
+            {
+                "status": "success",
+                "result": {
+                    "status": "success",
+                    "error": "non-terminal source annotation",
+                },
+            },
+        )
+        self.assertFalse(positive_with_error_field["typed_failure"])
+        self.assertIsNone(build_callable_skill_result_receipt(
+            "web_search",
+            {"result": {"status": "error"}},
+        ))
+
+    def test_process_candidate_requires_exact_terminal_receipt(self):
+        process_id = "sp_" + "a" * 32
+        other_process_id = "sp_" + "b" * 32
+        script_digest = "c" * 64
+        package_digest = "d" * 64
+        candidate = {
+            "id": "script-process",
+            "kind": "skill_script",
+            "skill_name": "portable-skill",
+            "resource_path": "scripts/query.py",
+            "sha256": script_digest,
+            "package_sha256": package_digest,
+            "tool_names": ["run_skill_process"],
+        }
+        allowed = [(
+            "portable-skill",
+            "scripts/query.py",
+            script_digest,
+        )]
+
+        self.assertEqual(
+            "pending",
+            callable_skill_result_evidence_outcome(
+                "run_skill_process",
+                {"status": "success", "operation": "start"},
+                "success",
+            ),
+        )
+        self.assertFalse(capability_call_satisfies_candidate(
+            candidate,
+            tool_name="run_skill_process",
+            args={
+                "operation": "start",
+                "script_path": "skills/portable-skill/scripts/query.py",
+                "args": ["term"],
+            },
+            result_data={"status": "success", "process_id": process_id},
+            outcome="pending",
+            allowed_skill_scripts=allowed,
+        ))
+        self.assertFalse(capability_call_satisfies_candidate(
+            candidate,
+            tool_name="run_skill_process",
+            args={
+                "operation": "call",
+                "process_id": process_id,
+                "method_name": "query",
+                "method_args": ["term"],
+            },
+            result_data={
+                "status": "success",
+                "call_enqueued": True,
+            },
+            outcome="pending",
+            allowed_skill_scripts=allowed,
+        ))
+
+        callable_receipt = build_callable_skill_result_receipt(
+            "run_skill_process",
+            {"result": {"status": "success", "rows": [1]}},
+        )
+        terminal = build_skill_process_evidence_receipt(
+            skill_name="portable-skill",
+            script_resource="scripts/query.py",
+            script_sha256=script_digest,
+            package_sha256=package_digest,
+            process_id=process_id,
+            invocation_mode="instance",
+            completion_kind="structured_call",
+            outcome="success",
+            call_id="11111111-1111-4111-8111-111111111111",
+            method_name="query",
+            call_result_status="success",
+            callable_result_receipt=callable_receipt,
+        )
+        result_data = {
+            "status": "success",
+            "process_evidence_receipt": terminal,
+        }
+        read_args = {"operation": "read", "process_id": process_id}
+        self.assertEqual(
+            "success",
+            callable_skill_result_evidence_outcome(
+                "run_skill_process",
+                result_data,
+                "success",
+            ),
+        )
+        self.assertTrue(capability_call_satisfies_candidate(
+            candidate,
+            tool_name="run_skill_process",
+            args=read_args,
+            result_data=result_data,
+            outcome="success",
+            allowed_skill_scripts=allowed,
+        ))
+        self.assertFalse(capability_call_satisfies_candidate(
+            candidate,
+            tool_name="run_skill_process",
+            args={"operation": "read", "process_id": other_process_id},
+            result_data=result_data,
+            outcome="success",
+            allowed_skill_scripts=allowed,
+        ))
+
+    def test_process_typed_failure_and_artifact_receipts_are_exact(self):
+        process_id = "sp_" + "e" * 32
+        script_digest = "f" * 64
+        package_digest = "1" * 64
+        candidate = {
+            "id": "script-process",
+            "kind": "skill_script",
+            "skill_name": "portable-skill",
+            "resource_path": "scripts/query.py",
+            "sha256": script_digest,
+            "package_sha256": package_digest,
+            "tool_names": ["run_skill_process"],
+        }
+        allowed = [(
+            "portable-skill",
+            "scripts/query.py",
+            script_digest,
+        )]
+        typed_failure = build_callable_skill_result_receipt(
+            "run_skill_process",
+            {"result": {"status": "error", "error": "unavailable"}},
+        )
+        failed = build_skill_process_evidence_receipt(
+            skill_name="portable-skill",
+            script_resource="scripts/query.py",
+            script_sha256=script_digest,
+            package_sha256=package_digest,
+            process_id=process_id,
+            invocation_mode="instance",
+            completion_kind="structured_call",
+            outcome="error",
+            call_id="22222222-2222-4222-8222-222222222222",
+            method_name="query",
+            call_result_status="success",
+            callable_result_receipt=typed_failure,
+        )
+        failed_data = {
+            "status": "success",
+            "process_evidence_receipt": failed,
+        }
+        self.assertEqual(
+            "error",
+            callable_skill_result_evidence_outcome(
+                "run_skill_process",
+                failed_data,
+                "success",
+            ),
+        )
+        self.assertTrue(capability_call_satisfies_candidate(
+            candidate,
+            tool_name="run_skill_process",
+            args={"operation": "read", "process_id": process_id},
+            result_data=failed_data,
+            outcome="error",
+            allowed_skill_scripts=allowed,
+        ))
+
+        artifacts = [{
+            "path": "results/evidence.json",
+            "size_bytes": 12,
+            "sha256": "2" * 64,
+        }]
+        manifest = skill_process_artifact_manifest_sha256(artifacts)
+        self.assertIsNotNone(manifest)
+        artifact_receipt = build_skill_process_evidence_receipt(
+            skill_name="portable-skill",
+            script_resource="scripts/query.py",
+            script_sha256=script_digest,
+            package_sha256=package_digest,
+            process_id=process_id,
+            invocation_mode="instance",
+            completion_kind="artifact_sync",
+            outcome="success",
+            call_id="33333333-3333-4333-8333-333333333333",
+            method_name="query",
+            artifact_count=manifest[0],
+            artifact_manifest_sha256=manifest[1],
+        )
+        self.assertTrue(capability_call_satisfies_candidate(
+            candidate,
+            tool_name="run_skill_process",
+            args={"operation": "sync", "process_id": process_id},
+            result_data={
+                "status": "success",
+                "process_evidence_receipt": artifact_receipt,
+            },
+            outcome="success",
+            artifacts=artifacts,
+            allowed_skill_scripts=allowed,
+        ))
+        self.assertFalse(capability_call_satisfies_candidate(
+            candidate,
+            tool_name="run_skill_process",
+            args={"operation": "read", "process_id": process_id},
+            result_data={
+                "status": "success",
+                "process_evidence_receipt": artifact_receipt,
+            },
+            outcome="success",
+            artifacts=artifacts,
+            allowed_skill_scripts=allowed,
+        ))
+        self.assertFalse(capability_call_satisfies_candidate(
+            candidate,
+            tool_name="run_skill_process",
+            args={"operation": "sync", "process_id": process_id},
+            result_data={
+                "status": "success",
+                "process_evidence_receipt": artifact_receipt,
+            },
+            outcome="success",
+            artifacts=[{**artifacts[0], "sha256": "3" * 64}],
+            allowed_skill_scripts=allowed,
+        ))
+
+    def test_process_completion_kind_requires_exact_observer_operation(self):
+        process_id = "sp_" + "9" * 32
+        script_digest = "8" * 64
+        package_digest = "7" * 64
+        candidate = {
+            "id": "script-process",
+            "kind": "skill_script",
+            "skill_name": "portable-skill",
+            "resource_path": "scripts/query.py",
+            "sha256": script_digest,
+            "package_sha256": package_digest,
+            "tool_names": ["run_skill_process"],
+        }
+        allowed = [(
+            "portable-skill",
+            "scripts/query.py",
+            script_digest,
+        )]
+        callable_receipt = build_callable_skill_result_receipt(
+            "run_skill_process",
+            {"result": {"status": "success", "rows": [1]}},
+        )
+        artifacts = [{
+            "path": "result.json",
+            "size_bytes": 4,
+            "sha256": "6" * 64,
+        }]
+        manifest = skill_process_artifact_manifest_sha256(artifacts)
+        self.assertIsNotNone(manifest)
+        receipts = [
+            (
+                build_skill_process_evidence_receipt(
+                    skill_name="portable-skill",
+                    script_resource="scripts/query.py",
+                    script_sha256=script_digest,
+                    package_sha256=package_digest,
+                    process_id=process_id,
+                    invocation_mode="instance",
+                    completion_kind="structured_call",
+                    outcome="success",
+                    call_id="55555555-5555-4555-8555-555555555555",
+                    method_name="query",
+                    call_result_status="success",
+                    callable_result_receipt=callable_receipt,
+                ),
+                "read",
+                [],
+            ),
+            (
+                build_skill_process_evidence_receipt(
+                    skill_name="portable-skill",
+                    script_resource="scripts/query.py",
+                    script_sha256=script_digest,
+                    package_sha256=package_digest,
+                    process_id=process_id,
+                    invocation_mode="cli",
+                    completion_kind="cli_exit",
+                    outcome="success",
+                    returncode=0,
+                    stdout_size_bytes=4,
+                    stdout_sha256="5" * 64,
+                ),
+                "read",
+                [],
+            ),
+            (
+                build_skill_process_evidence_receipt(
+                    skill_name="portable-skill",
+                    script_resource="scripts/query.py",
+                    script_sha256=script_digest,
+                    package_sha256=package_digest,
+                    process_id=process_id,
+                    invocation_mode="instance",
+                    completion_kind="artifact_sync",
+                    outcome="success",
+                    call_id="66666666-6666-4666-8666-666666666666",
+                    method_name="query",
+                    artifact_count=manifest[0],
+                    artifact_manifest_sha256=manifest[1],
+                ),
+                "sync",
+                artifacts,
+            ),
+            (
+                build_skill_process_evidence_receipt(
+                    skill_name="portable-skill",
+                    script_resource="scripts/query.py",
+                    script_sha256=script_digest,
+                    package_sha256=package_digest,
+                    process_id=process_id,
+                    invocation_mode="instance",
+                    completion_kind="artifact_close",
+                    outcome="success",
+                    call_id="77777777-7777-4777-8777-777777777777",
+                    method_name="query",
+                    artifact_count=manifest[0],
+                    artifact_manifest_sha256=manifest[1],
+                ),
+                "close",
+                artifacts,
+            ),
+        ]
+        operations = {"read", "sync", "close"}
+        for receipt, correct_operation, receipt_artifacts in receipts:
+            with self.subTest(kind=receipt["completion_kind"]):
+                for operation in operations:
+                    matched = capability_call_satisfies_candidate(
+                        candidate,
+                        tool_name="run_skill_process",
+                        args={
+                            "operation": operation,
+                            "process_id": process_id,
+                        },
+                        result_data={
+                            "process_evidence_receipt": receipt,
+                        },
+                        outcome="success",
+                        artifacts=receipt_artifacts,
+                        allowed_skill_scripts=allowed,
+                    )
+                    self.assertEqual(
+                        operation == correct_operation,
+                        matched,
+                    )
+
+    def test_process_artifact_manifest_rejects_more_than_projection_limit(self):
+        artifacts = [
+            {
+                "path": f"results/{index}.json",
+                "size_bytes": index,
+                "sha256": f"{index:064x}",
+            }
+            for index in range(513)
+        ]
+        self.assertIsNone(
+            skill_process_artifact_manifest_sha256(artifacts)
         )
 
     def test_catalog_safe_build_does_not_catch_base_exception(self):
@@ -741,11 +1217,13 @@ class StandardSkillCapabilityPlanTests(unittest.TestCase):
             selected.payload["process_only_skill_scripts"],
         )
 
-    def test_network_dependent_base_script_yields_to_exact_http_bridge(self):
+    def test_network_script_binds_exact_sandbox_egress_closure(self):
         root, _package = self._package(
             "# Remote lookup\n"
             "Use `scripts/query.py` to query the declared REST endpoint "
             "https://api.vendor.test/v1/search.\n"
+            "Submit jobs with POST JSON to "
+            "https://submit.vendor.test/v1/jobs.\n"
         )
         (root / "scripts").mkdir()
         script = root / "scripts" / "query.py"
@@ -778,6 +1256,216 @@ class StandardSkillCapabilityPlanTests(unittest.TestCase):
             "scripts/query.py",
             hashlib.sha256(script.read_bytes()).hexdigest(),
         ),)
+        tools = [
+            "skill_view",
+            "run_skill_process",
+            "run_skill_script",
+            "run_skill_python",
+            "skill_http_get",
+            "skill_http_post_json",
+        ]
+
+        catalog = _build_standard_skill_capability_catalog(
+            "portable-skill",
+            package,
+            tools,
+            inventory,
+        )
+
+        script_candidate = next(
+            item
+            for item in catalog["candidates"]
+            if item.get("kind") == "skill_script"
+        )
+        self.assertEqual(
+            [
+                "https://api.vendor.test/v1/search",
+                "https://submit.vendor.test/v1/jobs",
+            ],
+            script_candidate["sandbox_egress_url_prefixes"],
+        )
+        self.assertEqual(
+            [{
+                "methods": ["GET", "HEAD"],
+                "url_prefix": (
+                    "https://api.vendor.test:443/v1/search"
+                ),
+            }, {
+                "methods": ["GET", "HEAD", "POST"],
+                "url_prefix": (
+                    "https://submit.vendor.test:443/v1/jobs"
+                ),
+            }],
+            script_candidate["sandbox_egress_rules"],
+        )
+        self.assertTrue(any(
+            item.get("kind") == "skill_http_prefix"
+            and item.get("tool_name") == "skill_http_get"
+            for item in catalog["candidates"]
+        ))
+        self.assertEqual([], catalog.get("unavailable_capabilities"))
+
+        selected = validate_capability_plan(
+            catalog,
+            skill_name="portable-skill",
+            body_sha256=catalog["body_sha256"],
+            required=[script_candidate["id"]],
+            optional=[],
+            unsupported=[],
+        )
+        self.assertTrue(selected.valid, selected.payload)
+        self.assertEqual(
+            [],
+            selected.payload["allowed_skill_http_prefixes"],
+        )
+
+        continued = _build_standard_skill_capability_catalog(
+            "portable-skill",
+            package,
+            tools,
+            inventory,
+            request_text="Continue using the previous URL with this Skill.",
+            request_authorization_text=(
+                "Continue using the previous URL with this Skill.\n"
+                "请读取 https://api.vendor.test/v2/items?id=42#summary"
+            ),
+        )
+        continued_candidate = next(
+            item
+            for item in continued["candidates"]
+            if item.get("kind") == "skill_script"
+        )
+        self.assertEqual(
+            script_candidate["sandbox_egress_rules"],
+            continued_candidate["sandbox_egress_rules"],
+        )
+
+        delegated_prose_is_not_authority = (
+            _build_standard_skill_capability_catalog(
+                "portable-skill",
+                package,
+                tools,
+                inventory,
+                request_text=(
+                    "Child task: fetch "
+                    "https://attacker-selected.vendor.test/private"
+                ),
+                request_authorization_text="",
+            )
+        )
+        delegated_candidate = next(
+            item
+            for item in delegated_prose_is_not_authority["candidates"]
+            if item.get("kind") == "skill_script"
+        )
+        self.assertEqual(
+            script_candidate["sandbox_egress_rules"],
+            delegated_candidate["sandbox_egress_rules"],
+        )
+        self.assertNotIn(
+            "attacker-selected.vendor.test",
+            json.dumps(
+                delegated_candidate["sandbox_egress_rules"],
+                ensure_ascii=False,
+            ),
+        )
+        self.assertEqual(
+            [],
+            selected.payload["allowed_skill_http_post_prefixes"],
+        )
+        self.assertEqual(
+            [[
+                "portable-skill",
+                "https://api.vendor.test/v1/search",
+            ], [
+                "portable-skill",
+                "https://submit.vendor.test/v1/jobs",
+            ]],
+            selected.payload[
+                "allowed_skill_sandbox_egress_prefixes"
+            ],
+        )
+        self.assertEqual(
+            [[
+                "portable-skill",
+                "https://api.vendor.test:443/v1/search",
+                ["GET", "HEAD"],
+            ], [
+                "portable-skill",
+                "https://submit.vendor.test:443/v1/jobs",
+                ["GET", "HEAD", "POST"],
+            ]],
+            selected.payload[
+                "allowed_skill_sandbox_egress_rules"
+            ],
+        )
+        get_candidate = next(
+            item
+            for item in catalog["candidates"]
+            if (
+                item.get("kind") == "skill_http_prefix"
+                and item.get("tool_name") == "skill_http_get"
+                and item.get("url_prefix")
+                == "https://api.vendor.test/v1/search"
+            )
+        )
+        mixed = validate_capability_plan(
+            catalog,
+            skill_name="portable-skill",
+            body_sha256=catalog["body_sha256"],
+            required=[script_candidate["id"], get_candidate["id"]],
+            optional=[],
+            unsupported=[],
+        )
+        self.assertTrue(mixed.valid, mixed.payload)
+        self.assertEqual(
+            [[
+                "portable-skill",
+                "https://api.vendor.test/v1/search",
+            ]],
+            mixed.payload["allowed_skill_http_prefixes"],
+        )
+        self.assertEqual(
+            [],
+            mixed.payload["allowed_skill_http_post_prefixes"],
+        )
+        self.assertEqual(
+            selected.payload["allowed_skill_sandbox_egress_prefixes"],
+            mixed.payload["allowed_skill_sandbox_egress_prefixes"],
+        )
+
+    def test_proven_network_script_without_exact_url_fails_fast(self):
+        root, _package = self._package(
+            "# Remote lookup\n"
+            "Use `scripts/query.py` with the runtime-provided endpoint.\n"
+        )
+        (root / "scripts").mkdir()
+        script = root / "scripts" / "query.py"
+        script.write_text(
+            "import os\n"
+            "import requests\n"
+            "def query(term):\n"
+            "    return requests.get(os.environ['REMOTE_ENDPOINT'], "
+            "params={'q': term}).json()\n",
+            encoding="utf-8",
+        )
+        (root / "chatds-runtime.json").write_text(
+            json.dumps({
+                "schema_version": 1,
+                "entrypoints": {
+                    "scripts/query.py": {
+                        "runtime_profile": "base-v1",
+                        "egress_only": True,
+                    },
+                },
+            }),
+            encoding="utf-8",
+        )
+        package = load_skill_content(
+            root / "SKILL.md",
+            skill_dir=str(root),
+        )
+        digest = hashlib.sha256(script.read_bytes()).hexdigest()
 
         catalog = _build_standard_skill_capability_catalog(
             "portable-skill",
@@ -787,38 +1475,205 @@ class StandardSkillCapabilityPlanTests(unittest.TestCase):
                 "run_skill_process",
                 "run_skill_script",
                 "run_skill_python",
-                "skill_http_get",
             ],
-            inventory,
+            (("scripts/query.py", digest),),
         )
 
         self.assertFalse(any(
-            item.get("kind") == "skill_script"
-            for item in catalog["candidates"]
+            candidate.get("kind") == "skill_script"
+            for candidate in catalog.get("candidates") or []
         ))
-        self.assertTrue(any(
-            item.get("kind") == "skill_http_prefix"
-            and item.get("tool_name") == "skill_http_get"
-            for item in catalog["candidates"]
-        ))
-        unavailable = {
-            item.get("resource_path"): item.get("reason")
-            for item in catalog.get("unavailable_capabilities") or []
-        }
-        self.assertIn("scripts/query.py", unavailable)
-        self.assertIn("network-disabled", unavailable["scripts/query.py"])
-        unavailable_record = next(
+        unavailable = next(
             item
             for item in catalog.get("unavailable_capabilities") or []
             if item.get("resource_path") == "scripts/query.py"
         )
         self.assertEqual(
-            "skill_runtime_entrypoint_egress_only",
-            unavailable_record["reason_code"],
+            "skill_runtime_entrypoint_egress_unresolved",
+            unavailable["reason_code"],
+        )
+
+    def test_schema_v2_user_url_binding_is_entrypoint_and_turn_scoped(
+        self,
+    ) -> None:
+        root, _package = self._package(
+            "# Remote lookup\n"
+            "Run `scripts/query.py` with the URL supplied by the user.\n"
+        )
+        (root / "scripts").mkdir()
+        script = root / "scripts" / "query.py"
+        script.write_text(
+            "from urllib import request\n"
+            "def fetch(url):\n"
+            "    return request.urlopen(url).read()\n",
+            encoding="utf-8",
+        )
+        (root / "chatds-runtime.json").write_text(
+            json.dumps({
+                "schema_version": 2,
+                "entrypoints": {
+                    "scripts/query.py": {
+                        "runtime_profile": "base-v1",
+                        "egress_only": True,
+                        "user_url_egress": [{
+                            "source": "python",
+                            "selector": "url",
+                            "callable": "fetch",
+                            "methods": ["GET", "HEAD"],
+                            "scope": "url",
+                        }],
+                    },
+                },
+            }),
+            encoding="utf-8",
+        )
+        package = load_skill_content(
+            root / "SKILL.md",
+            skill_dir=str(root),
+        )
+        inventory = ((
+            "scripts/query.py",
+            hashlib.sha256(script.read_bytes()).hexdigest(),
+        ),)
+        tools = [
+            "skill_view",
+            "run_skill_process",
+            "run_skill_python",
+            "run_skill_script",
+        ]
+
+        without_user_url = _build_standard_skill_capability_catalog(
+            "portable-skill",
+            package,
+            tools,
+            inventory,
+            request_text="请运行这个查询脚本",
+        )
+        self.assertFalse(any(
+            candidate.get("kind") == "skill_script"
+            for candidate in without_user_url["candidates"]
+        ))
+
+        catalog = _build_standard_skill_capability_catalog(
+            "portable-skill",
+            package,
+            tools,
+            inventory,
+            request_text=(
+                "请读取 https://api.vendor.test/v2/items?id=42#summary"
+            ),
+        )
+        candidate = next(
+            candidate
+            for candidate in catalog["candidates"]
+            if candidate.get("kind") == "skill_script"
         )
         self.assertEqual(
-            "manifest",
-            unavailable_record["evidence_kind"],
+            [],
+            candidate["sandbox_egress_url_prefixes"],
+        )
+        self.assertEqual(
+            [],
+            candidate["sandbox_egress_rules"],
+        )
+        self.assertTrue(
+            candidate["invocation_bound_user_url_egress"]
+        )
+
+        selected = validate_capability_plan(
+            catalog,
+            skill_name="portable-skill",
+            body_sha256=catalog["body_sha256"],
+            required=[candidate["id"]],
+            optional=[],
+            unsupported=[],
+        )
+        self.assertTrue(selected.valid, selected.payload)
+        self.assertEqual(
+            [],
+            selected.payload[
+                "allowed_skill_sandbox_egress_rules"
+            ],
+        )
+        self.assertEqual(
+            [],
+            selected.payload["allowed_skill_http_prefixes"],
+        )
+
+    def test_browser_entrypoint_compiles_user_url_origin_without_model_rule(
+        self,
+    ) -> None:
+        root, _package = self._package(
+            "# Browser workflow\n"
+            "Run `scripts/browser_session.cjs` with the user URL.\n"
+        )
+        (root / "scripts").mkdir()
+        script = root / "scripts" / "browser_session.cjs"
+        script.write_text(
+            'const { chromium } = require("playwright");\n'
+            "async function main() {\n"
+            "  const index = process.argv.indexOf('--url');\n"
+            "  const browser = await chromium.launch();\n"
+            "  const page = await browser.newPage();\n"
+            "  await page.goto(process.argv[index + 1]);\n"
+            "}\nmain();\n",
+            encoding="utf-8",
+        )
+        (root / "chatds-runtime.json").write_text(
+            json.dumps({
+                "schema_version": 2,
+                "entrypoints": {
+                    "scripts/browser_session.cjs": {
+                        "runtime_profile": "browser-automation-v1",
+                        "node_packages": {"playwright": "1.61.0"},
+                        "user_url_egress": [{
+                            "source": "argv",
+                            "selector": "--url",
+                            "methods": ["GET", "HEAD"],
+                            "scope": "origin",
+                        }],
+                    },
+                },
+            }),
+            encoding="utf-8",
+        )
+        package = load_skill_content(
+            root / "SKILL.md",
+            skill_dir=str(root),
+        )
+
+        catalog = _build_standard_skill_capability_catalog(
+            "portable-skill",
+            package,
+            ["skill_view", "run_skill_process"],
+            ((
+                "scripts/browser_session.cjs",
+                hashlib.sha256(script.read_bytes()).hexdigest(),
+            ),),
+            request_text=(
+                "请打开 https://portal.vendor.test/news/today 并截图"
+            ),
+        )
+        candidate = next(
+            candidate
+            for candidate in catalog["candidates"]
+            if candidate.get("kind") == "skill_script"
+        )
+
+        self.assertEqual(
+            "browser-automation-v1",
+            candidate["runtime_profile"],
+        )
+        self.assertEqual(
+            ["run_skill_process"],
+            candidate["tool_names"],
+        )
+        self.assertEqual(
+            [],
+            candidate["sandbox_egress_rules"],
+        )
+        self.assertTrue(
+            candidate["invocation_bound_user_url_egress"]
         )
 
     def test_network_helper_and_unix_socket_keep_local_python_candidate(self):
@@ -1377,7 +2232,11 @@ class StandardSkillCapabilityPlanTests(unittest.TestCase):
         self.assertIn("access controls", instructions)
         self.assertIn("unsupported", instructions)
         self.assertIn("ordinary navigation", instructions)
-        self.assertIn("network-disabled isolated executor", instructions)
+        self.assertIn("Direct network dialing is disabled", instructions)
+        self.assertIn(
+            "runtime-compiled HTTP-method and URL-prefix rules",
+            instructions,
+        )
 
     def test_optional_resource_on_same_bridge_cannot_satisfy_required_resource(self):
         root, _package = self._package(
@@ -1594,6 +2453,108 @@ class StandardSkillCapabilityPlanTests(unittest.TestCase):
 
 
 class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
+    async def test_direct_browser_continuation_has_exact_user_authority(self):
+        provider = {
+            "id": "mock-direct-browser-policy",
+            "base_url": "http://model.invalid/v1",
+            "api_model": "mock-direct-browser-policy",
+            "api_key": "EMPTY",
+            "protocol": "openai",
+            "provider": "mock",
+            "context_length": 64_000,
+            "is_multimodal": True,
+        }
+        target = "https://public.example/path?q=1"
+        responses = [
+            _tool_response(
+                "navigate",
+                "browser_navigate",
+                {"url": target},
+            ),
+            _stop_response("已读取用户指定页面。"),
+        ]
+        dispatch_contexts: list[ToolContext] = []
+
+        class Client:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def stream(self, method, url, **kwargs):
+                return _Response(responses.pop(0))
+
+        async def fake_dispatch(name, args, *, context):
+            self.assertEqual("browser_navigate", name)
+            dispatch_contexts.append(context)
+            return "Navigated to the requested page."
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch(
+                    "workspace_context.WORKSPACE_ROOT",
+                    Path(temp_dir) / "ws",
+                ),
+                patch("agent_loop.httpx.AsyncClient", Client),
+                patch("agent_loop.dispatch", fake_dispatch),
+                patch(
+                    "agent_loop.build_system_prompt",
+                    return_value="system",
+                ),
+                patch(
+                    "agent_loop.load_workspace_context",
+                    return_value="",
+                ),
+                patch(
+                    "agent_loop._fetch_goal",
+                    AsyncMock(return_value=None),
+                ),
+                patch("skills.scanner.find_all_skills", return_value=[]),
+            ):
+                events = [event async for event in run_stream(
+                    "mock-direct-browser-policy",
+                    [{
+                        "role": "user",
+                        "content": (
+                            "Please navigate in a browser to "
+                            f"{target} and describe the page."
+                        ),
+                    }, {
+                        "role": "assistant",
+                        "content": "The first browser run is complete.",
+                    }, {
+                        "role": "user",
+                        "content": (
+                            "Continue: navigate in a browser on the "
+                            "previous site."
+                        ),
+                    }],
+                    ["browser_navigate", "browser_snapshot"],
+                    provider_override=provider,
+                    allow_session_mcp=False,
+                    user_id="u-direct-browser",
+                    session_id="s-direct-browser",
+                    max_iterations=3,
+                )]
+
+        self.assertFalse(responses)
+        self.assertEqual(1, len(dispatch_contexts))
+        self.assertEqual(
+            ((
+                "https://public.example:443/",
+                ("GET", "HEAD", "OPTIONS", "POST"),
+            ),),
+            dispatch_contexts[0].allowed_browser_egress_rules,
+        )
+        self.assertEqual(
+            {"type": "done", "finish_reason": "stop"},
+            events[-1],
+        )
+
     async def test_initial_catalog_compiler_exception_fails_before_any_dispatch(self):
         provider = {
             "id": "mock-initial-catalog-failure",
@@ -2005,6 +2966,7 @@ class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
                 authority_documents=(),
                 *,
                 request_text="",
+                request_authorization_text=None,
             ):
                 if authority_documents:
                     raise RuntimeError(
@@ -2017,6 +2979,7 @@ class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
                     runnable_scripts,
                     authority_documents,
                     request_text=request_text,
+                    request_authorization_text=request_authorization_text,
                 )
 
             skill_record = {
@@ -2944,7 +3907,7 @@ class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("browser_click", exposed[2])
         self.assertNotIn("browser_type", exposed[2])
         self.assertIn(
-            "network-disabled",
+            "Direct network dialing is disabled",
             json.dumps(request_bodies[1], ensure_ascii=False),
         )
         browser_context = next(
@@ -2956,7 +3919,217 @@ class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
             browser_context.allowed_browser_private_origins,
         )
         self.assertEqual(
+            ((
+                private_origin + "/",
+                ("GET", "HEAD", "OPTIONS", "POST"),
+            ),),
+            browser_context.allowed_browser_egress_rules,
+        )
+        self.assertEqual(
             {"type": "done", "finish_reason": "stop"}, events[-1]
+        )
+
+    async def test_callable_typed_failure_is_a_failed_evidence_receipt(self):
+        provider = {
+            "id": "mock-callable-result-receipt",
+            "base_url": "http://model.invalid/v1",
+            "api_model": "mock-callable-result-receipt",
+            "api_key": "EMPTY",
+            "protocol": "openai",
+            "provider": "mock",
+            "context_length": 64_000,
+            "is_multimodal": True,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "portable-skill"
+            (root / "scripts").mkdir(parents=True)
+            script = root / "scripts" / "query.py"
+            script.write_text(
+                "def query_records(topic):\n"
+                "    return {'topic': topic}\n",
+                encoding="utf-8",
+            )
+            (root / "SKILL.md").write_text(
+                "---\nname: portable-skill\n"
+                "description: Query one evidence source.\n---\n"
+                "Call `scripts/query.py` function `query_records` with the "
+                "user topic and report a source gap when it fails.\n",
+                encoding="utf-8",
+            )
+            package = load_skill_content(
+                root / "SKILL.md",
+                skill_dir=str(root),
+            )
+            runnable_scripts = ((
+                "scripts/query.py",
+                hashlib.sha256(script.read_bytes()).hexdigest(),
+            ),)
+            enabled = [
+                "skill_view",
+                "submit_skill_capability_plan",
+                "run_skill_python",
+            ]
+            catalog = _build_standard_skill_capability_catalog(
+                "portable-skill",
+                package,
+                enabled,
+                runnable_scripts,
+            )
+            script_candidate = next(
+                item for item in catalog["candidates"]
+                if item.get("kind") == "skill_script"
+                and item.get("resource_path") == "scripts/query.py"
+            )
+            responses = [
+                _tool_response(
+                    "main",
+                    "skill_view",
+                    {"name": "portable-skill"},
+                ),
+                _tool_response(
+                    "plan",
+                    "submit_skill_capability_plan",
+                    {
+                        "skill_name": "portable-skill",
+                        "body_sha256": catalog["body_sha256"],
+                        "required": [script_candidate["id"]],
+                        "optional": [],
+                        "unsupported": [],
+                    },
+                ),
+                _tool_response(
+                    "query",
+                    "run_skill_python",
+                    {
+                        "script_path": (
+                            "skills/portable-skill/scripts/query.py"
+                        ),
+                        "function_name": "query_records",
+                        "function_args": ["Alzheimer"],
+                    },
+                ),
+                _stop_response(
+                    "WARN/degraded: the callable returned a typed source "
+                    "failure, so no evidence claim is made."
+                ),
+            ]
+            request_bodies: list[dict] = []
+
+            class Client:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, exc_type, exc, tb):
+                    return False
+
+                def stream(self, method, url, **kwargs):
+                    request_bodies.append(kwargs["json"])
+                    return _Response(responses.pop(0))
+
+            async def fake_dispatch(name, args, *, context):
+                if name == "skill_view":
+                    return json.dumps({
+                        **package,
+                        "success": True,
+                        "skill_dir": str(root),
+                    }, ensure_ascii=False)
+                if name == "submit_skill_capability_plan":
+                    return await submit_skill_capability_plan(
+                        **args,
+                        context=context,
+                    )
+                if name == "run_skill_python":
+                    return json.dumps({
+                        "status": "success",
+                        "result": {
+                            "status": "error",
+                            "error": "upstream catalog unavailable",
+                        },
+                        "artifacts": [],
+                    })
+                raise AssertionError(name)
+
+            skill_record = {
+                "name": "portable-skill",
+                "description": package["description"],
+                "scope": "session",
+                "path": str(root / "SKILL.md"),
+                "skill_dir": str(root),
+            }
+            with (
+                patch(
+                    "workspace_context.WORKSPACE_ROOT",
+                    Path(temp_dir) / "ws",
+                ),
+                patch("agent_loop.httpx.AsyncClient", Client),
+                patch("agent_loop.dispatch", fake_dispatch),
+                patch("agent_loop.build_system_prompt", return_value="system"),
+                patch("agent_loop.load_workspace_context", return_value=""),
+                patch("agent_loop._fetch_goal", AsyncMock(return_value=None)),
+                patch(
+                    "agent_loop._safe_build_standard_skill_capability_catalog",
+                    return_value=(catalog, None),
+                ),
+                patch(
+                    "skills.scanner.find_all_skills",
+                    return_value=[skill_record],
+                ),
+                patch(
+                    "skills.scanner.skill_runnable_script_resources",
+                    return_value=runnable_scripts,
+                ),
+                patch.object(
+                    native_tool_registry.get_entry("run_skill_python"),
+                    "args_preflight_fn",
+                    None,
+                ),
+            ):
+                events = [event async for event in run_stream(
+                    "mock-callable-result-receipt",
+                    [{
+                        "role": "user",
+                        "content": (
+                            "请运行 portable-skill 查询 Alzheimer 证据"
+                        ),
+                    }],
+                    enabled,
+                    provider_override=provider,
+                    allow_session_mcp=False,
+                    user_id="u-callable-result-receipt",
+                    session_id="s-callable-result-receipt",
+                    max_iterations=6,
+                )]
+
+        self.assertFalse(responses)
+        runner_terminal = next(
+            event["payload"]
+            for event in events
+            if event.get("event_type") == "tool.completed"
+            and event.get("payload", {}).get("tool_name")
+            == "run_skill_python"
+        )
+        self.assertEqual("success", runner_terminal["outcome"])
+        exact = runner_terminal["exact_capability_receipt"]
+        self.assertEqual("error", exact["evidence_outcome"])
+        self.assertTrue(
+            exact["callable_result_receipt"]["typed_failure"]
+        )
+        self.assertIn(
+            "typed_status_failure",
+            exact["callable_result_receipt"]["failure_reason_codes"],
+        )
+        self.assertNotIn(
+            "tool_choice",
+            request_bodies[3],
+            "a failed real-dispatch receipt is consumed once without being "
+            "counted as successful evidence",
+        )
+        self.assertEqual(
+            {"type": "done", "finish_reason": "stop"},
+            events[-1],
         )
 
     async def test_stop_gate_does_not_credit_optional_resource_on_shared_bridge(self):

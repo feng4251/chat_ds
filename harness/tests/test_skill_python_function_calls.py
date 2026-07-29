@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -8,7 +9,13 @@ from unittest.mock import AsyncMock, patch
 
 from tools import skill_python
 from tools.context import ToolContext
-from tools.isolated_skill_executor import IsolatedSkillExecutorError
+from tools.isolated_skill_executor import (
+    IsolatedSkillExecutorError,
+    compute_skill_package_digest,
+)
+from tools.skill_invocation_egress import (
+    bind_python_invocation_parameters,
+)
 
 
 class SkillPythonFunctionCallTests(unittest.IsolatedAsyncioTestCase):
@@ -81,6 +88,28 @@ class SkillPythonFunctionCallTests(unittest.IsolatedAsyncioTestCase):
         )
         return json.loads(result)
 
+    def dynamic_context(
+        self,
+        script: Path,
+        url: str,
+    ) -> ToolContext:
+        relative = script.relative_to(self.skill).as_posix()
+        return ToolContext(
+            user_id=self.user_id,
+            session_id=self.session_id,
+            enabled_user_skills=("database-helper",),
+            allowed_skill_scripts=((
+                "database-helper",
+                relative,
+                hashlib.sha256(script.read_bytes()).hexdigest(),
+            ),),
+            allowed_skill_package_digests=((
+                "database-helper",
+                compute_skill_package_digest(self.skill),
+            ),),
+            user_url_authorization_urls=(url,),
+        )
+
     def test_tool_schema_exposes_declarative_function_mode(self) -> None:
         properties = skill_python.RUN_SKILL_PYTHON_SCHEMA["parameters"]["properties"]
         self.assertIn("function_name", properties)
@@ -94,6 +123,360 @@ class SkillPythonFunctionCallTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("method_kwargs", properties)
         self.assertIn("dotted/private", skill_python.RUN_SKILL_PYTHON_SCHEMA["description"])
         self.assertIn("mutually exclusive", skill_python.RUN_SKILL_PYTHON_SCHEMA["description"])
+
+    def test_dynamic_url_binder_requires_a_complete_python_call(self) -> None:
+        source = (
+            "def fetch(account, /, mode='full', *items, url, required, "
+            "optional='default', **extra):\n"
+            "    return url\n"
+        )
+        valid = bind_python_invocation_parameters(
+            source,
+            callable_name="fetch",
+            positional=["acct", "compact", "one", "two"],
+            keywords={
+                "url": "https://api.example.test/v1",
+                "required": True,
+                "trace": "yes",
+            },
+        )
+        self.assertEqual("acct", valid["account"])
+        self.assertEqual("compact", valid["mode"])
+        self.assertEqual(("one", "two"), valid["items"])
+        self.assertEqual(
+            "https://api.example.test/v1",
+            valid["url"],
+        )
+        self.assertEqual(True, valid["required"])
+        self.assertNotIn("optional", valid)
+        self.assertEqual({"trace": "yes"}, valid["extra"])
+
+        invalid_calls = [
+            # Required keyword-only parameter is missing.
+            (["acct"], {"url": "https://api.example.test/v1"}),
+            # A positional-only parameter supplied by keyword remains missing,
+            # even though **extra could otherwise absorb that spelling.
+            ([], {
+                "account": "acct",
+                "url": "https://api.example.test/v1",
+                "required": True,
+            }),
+            # Duplicate positional/keyword value.
+            (["acct", "compact"], {
+                "mode": "other",
+                "url": "https://api.example.test/v1",
+                "required": True,
+            }),
+        ]
+        for positional, keywords in invalid_calls:
+            with self.subTest(
+                positional=positional,
+                keywords=keywords,
+            ):
+                self.assertIsNone(bind_python_invocation_parameters(
+                    source,
+                    callable_name="fetch",
+                    positional=positional,
+                    keywords=keywords,
+                ))
+
+        strict_source = (
+            "def strict(url, /, count, *, required, optional='x'):\n"
+            "    return url\n"
+        )
+        for positional, keywords in (
+            (
+                ["https://api.example.test/v1", 1, "surplus"],
+                {"required": True},
+            ),
+            (
+                ["https://api.example.test/v1", 1],
+                {},
+            ),
+            (
+                ["https://api.example.test/v1", 1],
+                {"required": True, "unexpected": 3},
+            ),
+        ):
+            with self.subTest(
+                strict_positional=positional,
+                strict_keywords=keywords,
+            ):
+                self.assertIsNone(bind_python_invocation_parameters(
+                    strict_source,
+                    callable_name="strict",
+                    positional=positional,
+                    keywords=keywords,
+                ))
+
+        async_source = (
+            "class InvalidClient:\n"
+            "    async def __init__(self, url):\n"
+            "        self.url = url\n"
+            "class ValidClient:\n"
+            "    async def fetch(self, url, *, required):\n"
+            "        return url\n"
+            "async def build(url, required):\n"
+            "    return ValidClient()\n"
+        )
+        self.assertIsNone(bind_python_invocation_parameters(
+            async_source,
+            callable_name="InvalidClient",
+            positional=["https://api.example.test/v1"],
+            keywords={},
+        ))
+        self.assertEqual(
+            {
+                "url": "https://api.example.test/v1",
+                "required": True,
+            },
+            bind_python_invocation_parameters(
+                async_source,
+                callable_name="ValidClient.fetch",
+                positional=["https://api.example.test/v1"],
+                keywords={"required": True},
+            ),
+        )
+        self.assertEqual(
+            {
+                "url": "https://api.example.test/v1",
+                "required": True,
+            },
+            bind_python_invocation_parameters(
+                async_source,
+                callable_name="build",
+                positional=[
+                    "https://api.example.test/v1",
+                    True,
+                ],
+                keywords={},
+            ),
+        )
+
+    async def test_function_url_binding_is_resolved_from_actual_parameter(
+        self,
+    ) -> None:
+        script = self.write_script(
+            "def fetch(prefix, url):\n"
+            "    return {'prefix': prefix, 'url': url}\n"
+        )
+        (self.skill / "chatds-runtime.json").write_text(
+            json.dumps({
+                "schema_version": 2,
+                "entrypoints": {
+                    "scripts/helper.py": {
+                        "runtime_profile": "base-v1",
+                        "egress_only": True,
+                        "user_url_egress": [{
+                            "source": "python",
+                            "selector": "url",
+                            "callable": "fetch",
+                            "methods": ["GET", "HEAD"],
+                            "scope": "url",
+                        }],
+                    },
+                },
+            }),
+            encoding="utf-8",
+        )
+        authorized = "https://api.example.test:443/v1/items?id=42"
+        context = self.dynamic_context(script, authorized)
+
+        result = await self.call(
+            script_path="skills/database-helper/scripts/helper.py",
+            function_name="fetch",
+            function_args=[
+                "items",
+                "https://api.example.test/v1/items?id=42",
+            ],
+            context=context,
+        )
+        self.assertEqual("success", result["status"])
+        self.assertEqual(
+            ({
+                "url_prefix": authorized,
+                "methods": ["GET", "HEAD"],
+            },),
+            self.isolated.await_args.kwargs["egress_rules"],
+        )
+
+        self.isolated.reset_mock()
+        result = await self.call(
+            script_path="skills/database-helper/scripts/helper.py",
+            function_name="fetch",
+            function_args=[
+                "items",
+                "https://api.example.test/v1/other",
+            ],
+            context=context,
+        )
+        self.assertEqual("success", result["status"])
+        self.assertNotIn(
+            "egress_rules",
+            self.isolated.await_args.kwargs,
+        )
+
+    async def test_invalid_call_cannot_authorize_top_level_import_code(
+        self,
+    ) -> None:
+        script = self.write_script(
+            "from urllib import request\n"
+            "request.urlopen('https://api.example.test/v1/items?id=42')\n"
+            "def fetch(url, required):\n"
+            "    return {'url': url, 'required': required}\n"
+        )
+        (self.skill / "chatds-runtime.json").write_text(
+            json.dumps({
+                "schema_version": 2,
+                "entrypoints": {
+                    "scripts/helper.py": {
+                        "runtime_profile": "base-v1",
+                        "egress_only": True,
+                        "user_url_egress": [{
+                            "source": "python",
+                            "selector": "url",
+                            "callable": "fetch",
+                            "methods": ["GET"],
+                            "scope": "url",
+                        }],
+                    },
+                },
+            }),
+            encoding="utf-8",
+        )
+        authorized = "https://api.example.test:443/v1/items?id=42"
+        context = self.dynamic_context(script, authorized)
+
+        result = await self.call(
+            script_path="skills/database-helper/scripts/helper.py",
+            function_name="fetch",
+            # ``required`` is deliberately missing. The executor may still
+            # import the module before surfacing that Python call error, so no
+            # dynamic URL policy may accompany this invalid invocation.
+            function_args=[
+                "https://api.example.test/v1/items?id=42",
+            ],
+            context=context,
+        )
+
+        self.assertEqual("success", result["status"])
+        self.assertNotIn(
+            "egress_rules",
+            self.isolated.await_args.kwargs,
+        )
+
+    async def test_instance_url_requires_valid_constructor_and_method(
+        self,
+    ) -> None:
+        script = self.write_script(
+            "class Client:\n"
+            "    def __init__(self, token):\n"
+            "        self.token = token\n"
+            "    async def fetch(self, url, *, required):\n"
+            "        return {'url': url, 'required': required}\n"
+            "class InvalidClient:\n"
+            "    async def __init__(self, token):\n"
+            "        self.token = token\n"
+            "    async def fetch(self, url, *, required):\n"
+            "        return {'url': url, 'required': required}\n"
+        )
+        (self.skill / "chatds-runtime.json").write_text(
+            json.dumps({
+                "schema_version": 2,
+                "entrypoints": {
+                    "scripts/helper.py": {
+                        "runtime_profile": "base-v1",
+                        "egress_only": True,
+                        "user_url_egress": [
+                            {
+                                "source": "python",
+                                "selector": "url",
+                                "callable": "Client.fetch",
+                                "methods": ["GET"],
+                                "scope": "url",
+                            },
+                            {
+                                "source": "python",
+                                "selector": "url",
+                                "callable": "InvalidClient.fetch",
+                                "methods": ["GET"],
+                                "scope": "url",
+                            },
+                        ],
+                    },
+                },
+            }),
+            encoding="utf-8",
+        )
+        authorized = "https://api.example.test:443/v1/items"
+        context = self.dynamic_context(script, authorized)
+
+        for constructor_args, method_kwargs in (
+            (
+                [],
+                {
+                    "url": "https://api.example.test/v1/items",
+                    "required": True,
+                },
+            ),
+            (
+                ["token"],
+                {"url": "https://api.example.test/v1/items"},
+            ),
+        ):
+            self.isolated.reset_mock()
+            result = await self.call(
+                script_path="skills/database-helper/scripts/helper.py",
+                class_name="Client",
+                method_name="fetch",
+                constructor_args=constructor_args,
+                method_kwargs=method_kwargs,
+                context=context,
+            )
+            self.assertEqual("success", result["status"])
+            self.assertNotIn(
+                "egress_rules",
+                self.isolated.await_args.kwargs,
+            )
+
+        self.isolated.reset_mock()
+        result = await self.call(
+            script_path="skills/database-helper/scripts/helper.py",
+            class_name="Client",
+            method_name="fetch",
+            constructor_args=["token"],
+            method_kwargs={
+                "url": "https://api.example.test/v1/items",
+                "required": True,
+            },
+            context=context,
+        )
+        self.assertEqual("success", result["status"])
+        self.assertEqual(
+            ({
+                "url_prefix": authorized,
+                "methods": ["GET"],
+            },),
+            self.isolated.await_args.kwargs["egress_rules"],
+        )
+
+        self.isolated.reset_mock()
+        result = await self.call(
+            script_path="skills/database-helper/scripts/helper.py",
+            class_name="InvalidClient",
+            method_name="fetch",
+            constructor_args=["token"],
+            method_kwargs={
+                "url": "https://api.example.test/v1/items",
+                "required": True,
+            },
+            context=context,
+        )
+        self.assertEqual("success", result["status"])
+        self.assertNotIn(
+            "egress_rules",
+            self.isolated.await_args.kwargs,
+        )
 
     def test_pure_preflight_rejects_unknown_function_before_executor(self) -> None:
         self.write_script("def search(query):\n    return {'query': query}\n")

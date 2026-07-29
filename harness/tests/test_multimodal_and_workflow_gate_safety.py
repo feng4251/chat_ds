@@ -2683,20 +2683,21 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
         )
 
         self.assertIn("skill_http_get", exposure.tools)
-        self.assertNotIn("run_skill_process", exposure.tools)
-        self.assertNotIn("run_skill_script", exposure.tools)
-        self.assertNotIn("run_skill_python", exposure.tools)
-        self.assertEqual((), exposure.allowed_skill_scripts)
+        self.assertIn("run_skill_process", exposure.tools)
+        self.assertIn("run_skill_script", exposure.tools)
+        self.assertIn("run_skill_python", exposure.tools)
+        self.assertEqual(
+            (("vendor-database", "scripts/query.py", script_digest),),
+            exposure.allowed_skill_scripts,
+        )
         self.assertEqual(
             (("vendor-database", "https://api.vendor.test/v1/search"),),
             exposure.allowed_skill_http_prefixes,
         )
-        self.assertIn(
-            "capability_skill_runtime_profile_unavailable:"
-            "vendor-database:scripts/query.py:"
-            "skill_runtime_entrypoint_egress_only",
-            exposure.missing_requirements,
-        )
+        self.assertFalse(any(
+            "skill_runtime_entrypoint_egress_only" in requirement
+            for requirement in exposure.missing_requirements
+        ), exposure.missing_requirements)
 
     def test_pure_function_skill_exposes_exact_python_entrypoint(self):
         tempdir = tempfile.TemporaryDirectory()

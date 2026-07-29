@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import json
-import shutil
-from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -13,8 +11,12 @@ from sqlalchemy import desc, func, select
 from config import settings
 from database import get_db
 from hooks import emit_event
-from models import Conversation, Message, SkillPackage
-from workspace import serialize_json_list
+from models import Conversation, Message
+from session_lifecycle import session_control_plane_mutation
+from workspace import (
+    require_session_workspace_active,
+    serialize_json_list,
+)
 
 router = APIRouter(prefix="/internal/sessions", tags=["internal"])
 
@@ -33,6 +35,9 @@ async def _owned(cid: str, user_id: str, db) -> Conversation:
     )).scalar_one_or_none()
     if conv is None:
         raise HTTPException(404, "Conversation not found")
+    # Internal reads are still session-scoped capabilities. Do not expose a
+    # half-published fork target or a deletion-fenced session to an agent.
+    require_session_workspace_active(user_id, cid)
     return conv
 
 
@@ -168,31 +173,36 @@ async def send_session_message(
     db=Depends(get_db),
 ):
     _check(x_internal_token)
-    await _owned(cid, user_id, db)
     source_note = (
         f"[Message from session {source_session_id}]\n"
         if source_session_id else "[Cross-session message]\n"
     )
-    message = Message(
-        conversation_id=cid,
-        role="user",
-        content=source_note + payload.content.strip(),
-        source="session",
-    )
-    db.add(message)
-    await db.commit()
-    await db.refresh(message)
-    await emit_event(
+    async with session_control_plane_mutation(
         user_id,
-        "message.created",
-        {
-            "conversation_id": cid,
-            "message_id": message.id,
-            "role": "user",
-            "source": "session",
-        },
         cid,
-    )
+        source_session_id=source_session_id,
+    ) as (mutation_db, _conversation):
+        message = Message(
+            conversation_id=cid,
+            role="user",
+            content=source_note + payload.content.strip(),
+            source="session",
+        )
+        mutation_db.add(message)
+        require_session_workspace_active(user_id, cid)
+        await mutation_db.commit()
+        await mutation_db.refresh(message)
+        await emit_event(
+            user_id,
+            "message.created",
+            {
+                "conversation_id": cid,
+                "message_id": message.id,
+                "role": "user",
+                "source": "session",
+            },
+            cid,
+        )
     return {
         "ok": True,
         "message_id": message.id,
@@ -204,6 +214,7 @@ async def send_session_message(
 class InternalFork(BaseModel):
     title: str | None = Field(default=None, max_length=256)
     include_messages: bool = True
+    fork_id: str | None = Field(default=None, min_length=32, max_length=32)
 
 
 @router.post("/{cid}/fork")
@@ -211,61 +222,34 @@ async def fork_session(
     cid: str,
     payload: InternalFork,
     user_id: str = Query(...),
+    source_session_id: str = Query(...),
     x_internal_token: str | None = Header(None),
     db=Depends(get_db),
 ):
     _check(x_internal_token)
-    source = await _owned(cid, user_id, db)
-    fork = Conversation(
-        user_id=user_id,
-        title=payload.title or ((source.title or "Session") + " · fork"),
-        model_id=source.model_id,
-        enabled_tools=source.enabled_tools,
-        fallback_model_ids=source.fallback_model_ids,
-    )
-    db.add(fork)
-    await db.flush()
-    if payload.include_messages:
-        messages = (await db.execute(
-            select(Message).where(Message.conversation_id == cid).order_by(Message.created_at)
-        )).scalars().all()
-        for message in messages:
-            db.add(Message(
-                conversation_id=fork.id,
-                role=message.role,
-                content=message.content,
-                reasoning=message.reasoning,
-                tool_progress=message.tool_progress,
-                image_urls=message.image_urls,
-                model_id=message.model_id,
-                source="fork",
-            ))
-    await db.commit()
-    from workspace import clone_session_workspace
-    clone_session_workspace(user_id, cid, fork.id)
-    source_skills = (await db.execute(
-        select(SkillPackage).where(
-            SkillPackage.user_id == user_id,
-            SkillPackage.session_id == cid,
+    if source_session_id != cid:
+        raise HTTPException(
+            409,
+            "Fork source must match the active source session",
         )
-    )).scalars().all()
-    source_skill_dir = Path("data/skills") / user_id / cid
-    target_skill_dir = Path("data/skills") / user_id / fork.id
-    if source_skill_dir.exists():
-        shutil.copytree(source_skill_dir, target_skill_dir, dirs_exist_ok=True)
-    for skill in source_skills:
-        if not (source_skill_dir / skill.name / "SKILL.md").is_file():
-            continue
-        db.add(SkillPackage(
-            user_id=user_id,
-            session_id=fork.id,
-            name=skill.name,
-            description=skill.description,
-            category=skill.category,
-            version=skill.version,
-        ))
-    await db.commit()
-    return {"id": fork.id, "title": fork.title}
+    source = await _owned(cid, user_id, db)
+    # Keep the authenticated control-plane endpoint on the same transactional
+    # fork implementation as the user-facing API.  That implementation stages
+    # and validates the complete workspace/Skill snapshot, publishes it with
+    # no-clobber renames, and only then commits the Conversation projection.
+    # The old implementation committed the Conversation first and subsequently
+    # merged into an existing target with ``dirs_exist_ok=True``.
+    from routers.workspace_router import _fork_conversation_impl
+
+    return await _fork_conversation_impl(
+        cid,
+        title=payload.title or ((source.title or "Session") + " · fork"),
+        include_messages=payload.include_messages,
+        fork_id=payload.fork_id,
+        user=SimpleNamespace(id=user_id),
+        db=db,
+        source_maintenance_lease_already_held=True,
+    )
 
 
 @router.get("/{cid}/goal")
@@ -302,28 +286,46 @@ async def internal_update_goal(
     db=Depends(get_db),
 ):
     _check(x_internal_token)
-    conv = await _owned(cid, user_id, db)
-    if payload.action == "create":
-        if conv.goal_objective and conv.goal_status != "complete":
-            raise HTTPException(409, "An unfinished goal already exists")
-        if not payload.objective or not payload.objective.strip():
-            raise HTTPException(400, "objective is required")
-        conv.goal_objective = payload.objective.strip()
-        conv.goal_status = "active"
-        conv.goal_note = payload.note
-        conv.goal_token_budget = payload.token_budget
-        conv.goal_started_tokens = conv.total_tokens
-    elif payload.action in {"complete", "blocked", "pause", "budget_limited"}:
-        if not conv.goal_objective:
-            raise HTTPException(404, "No goal exists")
-        conv.goal_status = "paused" if payload.action == "pause" else payload.action
-        conv.goal_note = payload.note
-    else:
-        raise HTTPException(
-            400,
-            "Action must be create, complete, blocked, pause, or budget_limited",
-        )
-    await db.commit()
+    async with session_control_plane_mutation(
+        user_id,
+        cid,
+        # Goal tools mutate their own active session and are invoked while the
+        # chat turn already owns its lease. Fresh owner/fence checks still make
+        # deletion authoritative without a recursive acquisition.
+        source_session_id=cid,
+    ) as (mutation_db, conv):
+        if payload.action == "create":
+            if conv.goal_objective and conv.goal_status != "complete":
+                raise HTTPException(409, "An unfinished goal already exists")
+            if not payload.objective or not payload.objective.strip():
+                raise HTTPException(400, "objective is required")
+            conv.goal_objective = payload.objective.strip()
+            conv.goal_status = "active"
+            conv.goal_note = payload.note
+            conv.goal_token_budget = payload.token_budget
+            conv.goal_started_tokens = conv.total_tokens
+        elif payload.action in {
+            "complete",
+            "blocked",
+            "pause",
+            "budget_limited",
+        }:
+            if not conv.goal_objective:
+                raise HTTPException(404, "No goal exists")
+            conv.goal_status = (
+                "paused" if payload.action == "pause" else payload.action
+            )
+            conv.goal_note = payload.note
+        else:
+            raise HTTPException(
+                400,
+                (
+                    "Action must be create, complete, blocked, pause, "
+                    "or budget_limited"
+                ),
+            )
+        require_session_workspace_active(user_id, cid)
+        await mutation_db.commit()
     return {
         "objective": conv.goal_objective,
         "status": conv.goal_status,

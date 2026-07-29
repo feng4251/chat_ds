@@ -397,7 +397,15 @@ def _native_candidates(
     available_tools: set[str],
     resolve_tool_selector: Callable[[str, Iterable[str]], list[str]],
     frozen_mcp_catalog: Any,
+    browser_egress_rules: Iterable[
+        tuple[str, tuple[str, ...]]
+    ] = (),
 ) -> list[dict[str, Any]]:
+    from tools.session_sandbox_policy import browser_egress_rule_tuples
+
+    exact_browser_rules = browser_egress_rule_tuples(
+        browser_egress_rules
+    )
     resolved = resolve_tool_selector(selector, sorted(available_tools))
     candidates: list[dict[str, Any]] = []
     for name in resolved:
@@ -412,7 +420,17 @@ def _native_candidates(
             if mcp is not None:
                 candidates.append(mcp)
             continue
-        coordinates = {"tool_name": name}
+        if name == "browser_navigate" and not exact_browser_rules:
+            continue
+        coordinates: dict[str, Any] = {"tool_name": name}
+        if name == "browser_navigate":
+            coordinates["browser_egress_rules"] = [
+                {
+                    "methods": list(methods),
+                    "url_prefix": prefix,
+                }
+                for prefix, methods in exact_browser_rules
+            ]
         candidates.append({
             "candidate_id": _candidate_id("native", coordinates),
             "kind": "native_tool",
@@ -431,6 +449,10 @@ def _narrowed_command_candidate(
     loaded_packages: dict[str, dict[str, Any]],
     allowed_package_digests: set[tuple[str, str]],
     allowed_commands: set[tuple[str, str, str, tuple[str, ...]]],
+    allowed_sandbox_egress: set[tuple[str, str]],
+    allowed_sandbox_egress_rules: set[
+        tuple[str, str, tuple[str, ...]]
+    ],
 ) -> dict[str, Any] | None:
     """Bind a safe Bash/Shell selector to its exact worker-scoped grant."""
 
@@ -483,6 +505,23 @@ def _narrowed_command_candidate(
         "additional_argv": True,
         "tool_name": "run_declared_command",
         "tool_names": ["run_declared_command"],
+        "sandbox_egress_url_prefixes": [
+            prefix
+            for granted_skill, prefix in sorted(
+                allowed_sandbox_egress
+            )
+            if granted_skill == owner_skill
+        ],
+        "sandbox_egress_rules": [
+            {
+                "methods": list(methods),
+                "url_prefix": prefix,
+            }
+            for granted_skill, prefix, methods in sorted(
+                allowed_sandbox_egress_rules
+            )
+            if granted_skill == owner_skill
+        ],
     }
     return {
         "candidate_id": _candidate_id("command", coordinates),
@@ -502,8 +541,15 @@ def _skill_candidates(
     allowed_commands: set[tuple[str, str, str, tuple[str, ...]]],
     allowed_http_get: set[tuple[str, str]],
     allowed_http_post: set[tuple[str, str]],
+    allowed_sandbox_egress: set[tuple[str, str]],
+    allowed_sandbox_egress_rules: set[
+        tuple[str, str, tuple[str, ...]]
+    ],
     resolve_tool_selector: Callable[[str, Iterable[str]], list[str]],
     frozen_mcp_catalog: Any,
+    browser_egress_rules: Iterable[
+        tuple[str, tuple[str, ...]]
+    ] = (),
 ) -> list[dict[str, Any]]:
     loaded = loaded_packages.get(skill_name)
     if not isinstance(loaded, dict) or loaded.get("error"):
@@ -532,6 +578,21 @@ def _skill_candidates(
     if not package_identity_authorized:
         return []
     candidates: list[dict[str, Any]] = []
+    sandbox_egress_url_prefixes = [
+        prefix
+        for granted_skill, prefix in sorted(allowed_sandbox_egress)
+        if granted_skill == skill_name
+    ]
+    sandbox_egress_rules = [
+        {
+            "methods": list(methods),
+            "url_prefix": prefix,
+        }
+        for granted_skill, prefix, methods in sorted(
+            allowed_sandbox_egress_rules
+        )
+        if granted_skill == skill_name
+    ]
     for granted_skill, path, digest in sorted(allowed_scripts):
         if granted_skill != skill_name:
             continue
@@ -555,6 +616,10 @@ def _skill_candidates(
             "resource_path": path,
             "sha256": digest,
             "tool_names": tool_names,
+            "sandbox_egress_url_prefixes": (
+                sandbox_egress_url_prefixes
+            ),
+            "sandbox_egress_rules": sandbox_egress_rules,
         }
         candidates.append({
             "candidate_id": _candidate_id("script", coordinates),
@@ -575,6 +640,10 @@ def _skill_candidates(
             "executable": executable,
             "fixed_argv": list(fixed_argv),
             "additional_argv": True,
+            "sandbox_egress_url_prefixes": (
+                sandbox_egress_url_prefixes
+            ),
+            "sandbox_egress_rules": sandbox_egress_rules,
         }
         candidates.append({
             "candidate_id": _candidate_id("command", coordinates),
@@ -631,6 +700,7 @@ def _skill_candidates(
             available_tools=available_tools,
             resolve_tool_selector=resolve_tool_selector,
             frozen_mcp_catalog=frozen_mcp_catalog,
+            browser_egress_rules=browser_egress_rules,
         ):
             coordinates = {
                 key: value
@@ -662,7 +732,14 @@ def _runtime_candidates_for_selector(
     allowed_commands: set[tuple[str, str, str, tuple[str, ...]]],
     allowed_http_get: set[tuple[str, str]],
     allowed_http_post: set[tuple[str, str]],
+    allowed_sandbox_egress: set[tuple[str, str]],
+    allowed_sandbox_egress_rules: set[
+        tuple[str, str, tuple[str, ...]]
+    ],
     frozen_mcp_catalog: Any,
+    browser_egress_rules: Iterable[
+        tuple[str, tuple[str, ...]]
+    ] = (),
     resolve_tool_selector: Callable[[str, Iterable[str]], list[str]],
     resource_expansions: dict[str, list[str]] | None = None,
 ) -> list[dict[str, Any]]:
@@ -686,8 +763,13 @@ def _runtime_candidates_for_selector(
             allowed_commands=allowed_commands,
             allowed_http_get=allowed_http_get,
             allowed_http_post=allowed_http_post,
+            allowed_sandbox_egress=allowed_sandbox_egress,
+            allowed_sandbox_egress_rules=(
+                allowed_sandbox_egress_rules
+            ),
             resolve_tool_selector=resolve_tool_selector,
             frozen_mcp_catalog=frozen_mcp_catalog,
+            browser_egress_rules=browser_egress_rules,
         )
     if "(" in selector:
         command = _narrowed_command_candidate(
@@ -698,6 +780,10 @@ def _runtime_candidates_for_selector(
             loaded_packages=loaded_packages,
             allowed_package_digests=allowed_package_digests,
             allowed_commands=allowed_commands,
+            allowed_sandbox_egress=allowed_sandbox_egress,
+            allowed_sandbox_egress_rules=(
+                allowed_sandbox_egress_rules
+            ),
         )
         return [command] if command is not None else []
     expanded_resources = (resource_expansions or {}).get(selector)
@@ -730,8 +816,13 @@ def _runtime_candidates_for_selector(
                 allowed_commands=allowed_commands,
                 allowed_http_get=allowed_http_get,
                 allowed_http_post=allowed_http_post,
+                allowed_sandbox_egress=allowed_sandbox_egress,
+                allowed_sandbox_egress_rules=(
+                    allowed_sandbox_egress_rules
+                ),
                 resolve_tool_selector=resolve_tool_selector,
                 frozen_mcp_catalog=frozen_mcp_catalog,
+                browser_egress_rules=browser_egress_rules,
             )
             if (
                 candidate.get("kind") == "skill_script"
@@ -754,6 +845,7 @@ def _runtime_candidates_for_selector(
         available_tools=available_tools,
         resolve_tool_selector=resolve_tool_selector,
         frozen_mcp_catalog=frozen_mcp_catalog,
+        browser_egress_rules=browser_egress_rules,
     )
 
 
@@ -771,8 +863,15 @@ def compile_runtime_unconditional_capability_plan(
     allowed_commands: Iterable[tuple[str, str, str, tuple[str, ...]]],
     allowed_http_get: Iterable[tuple[str, str]],
     allowed_http_post: Iterable[tuple[str, str]],
+    allowed_sandbox_egress: Iterable[tuple[str, str]],
     frozen_mcp_catalog: Any,
     resolve_tool_selector: Callable[[str, Iterable[str]], list[str]],
+    allowed_sandbox_egress_rules: Iterable[
+        tuple[str, str, tuple[str, ...]]
+    ] = (),
+    allowed_browser_egress_rules: Iterable[
+        tuple[str, tuple[str, ...]]
+    ] = (),
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Compile ordinary worker declarations into exact optional authority.
 
@@ -824,6 +923,8 @@ def compile_runtime_unconditional_capability_plan(
     command_grants = set(allowed_commands)
     http_get_grants = set(allowed_http_get)
     http_post_grants = set(allowed_http_post)
+    sandbox_egress_grants = set(allowed_sandbox_egress)
+    sandbox_egress_rule_grants = set(allowed_sandbox_egress_rules)
     candidate_by_id: dict[str, dict[str, Any]] = {}
     unresolved: list[str] = []
 
@@ -876,8 +977,11 @@ def compile_runtime_unconditional_capability_plan(
             allowed_commands=command_grants,
             allowed_http_get=http_get_grants,
             allowed_http_post=http_post_grants,
+            allowed_sandbox_egress=sandbox_egress_grants,
+            allowed_sandbox_egress_rules=sandbox_egress_rule_grants,
             frozen_mcp_catalog=frozen_mcp_catalog,
             resolve_tool_selector=resolve_tool_selector,
+            browser_egress_rules=allowed_browser_egress_rules,
         )
         if not resolved:
             if is_instruction_only_skill_selector(selector):
@@ -946,8 +1050,15 @@ def compile_runtime_knowledge_gate_plan(
     allowed_commands: Iterable[tuple[str, str, str, tuple[str, ...]]],
     allowed_http_get: Iterable[tuple[str, str]],
     allowed_http_post: Iterable[tuple[str, str]],
+    allowed_sandbox_egress: Iterable[tuple[str, str]],
     frozen_mcp_catalog: Any,
     resolve_tool_selector: Callable[[str, Iterable[str]], list[str]],
+    allowed_sandbox_egress_rules: Iterable[
+        tuple[str, str, tuple[str, ...]]
+    ] = (),
+    allowed_browser_egress_rules: Iterable[
+        tuple[str, tuple[str, ...]]
+    ] = (),
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Lower one loader-owned symbolic gate IR into a frozen exact plan."""
 
@@ -1003,6 +1114,8 @@ def compile_runtime_knowledge_gate_plan(
     command_grants = set(allowed_commands)
     http_get_grants = set(allowed_http_get)
     http_post_grants = set(allowed_http_post)
+    sandbox_egress_grants = set(allowed_sandbox_egress)
+    sandbox_egress_rule_grants = set(allowed_sandbox_egress_rules)
     candidate_by_id: dict[str, dict[str, Any]] = {}
     groups: list[dict[str, Any]] = []
     checks: list[dict[str, Any]] = []
@@ -1112,8 +1225,15 @@ def compile_runtime_knowledge_gate_plan(
                         allowed_commands=command_grants,
                         allowed_http_get=http_get_grants,
                         allowed_http_post=http_post_grants,
+                        allowed_sandbox_egress=sandbox_egress_grants,
+                        allowed_sandbox_egress_rules=(
+                            sandbox_egress_rule_grants
+                        ),
                         frozen_mcp_catalog=frozen_mcp_catalog,
                         resolve_tool_selector=resolve_tool_selector,
+                        browser_egress_rules=(
+                            allowed_browser_egress_rules
+                        ),
                         resource_expansions=resource_expansions,
                     )
                     if not resolved:
@@ -1206,6 +1326,9 @@ _CANDIDATE_AUTHORITY_KEYS = frozenset({
     "command_grants",
     "http_get_grants",
     "http_post_grants",
+    "sandbox_egress_grants",
+    "sandbox_egress_rule_grants",
+    "browser_egress_rule_grants",
     "tool_names",
     "receipt_bindings",
 })
@@ -1230,6 +1353,9 @@ def _authority_projection(
     commands: list[tuple[str, str, str, tuple[str, ...]]] = []
     http_get: list[tuple[str, str]] = []
     http_post: list[tuple[str, str]] = []
+    sandbox_egress: list[tuple[str, str]] = []
+    sandbox_rules: list[tuple[str, str, tuple[str, ...]]] = []
+    browser_rules: list[tuple[str, tuple[str, ...]]] = []
     tools: list[str] = []
     for candidate in candidate_rows:
         kind = str(candidate.get("kind") or "")
@@ -1243,6 +1369,21 @@ def _authority_projection(
                 skill_name,
                 str(candidate.get("resource_path") or ""),
             ))
+        elif (
+            kind == "native_tool"
+            and candidate.get("tool_name") == "browser_navigate"
+        ):
+            browser_rules.extend(
+                (
+                    str(rule.get("url_prefix") or ""),
+                    tuple(
+                        str(method)
+                        for method in rule.get("methods") or []
+                    ),
+                )
+                for rule in candidate.get("browser_egress_rules") or []
+                if isinstance(rule, dict)
+            )
         elif kind == "skill_script":
             script = (
                 skill_name,
@@ -1252,6 +1393,24 @@ def _authority_projection(
             scripts.append(script)
             if "run_skill_process" in candidate_tool_names(candidate):
                 process_only.append(script)
+            sandbox_egress.extend(
+                (skill_name, str(prefix))
+                for prefix in (
+                    candidate.get("sandbox_egress_url_prefixes") or []
+                )
+            )
+            sandbox_rules.extend(
+                (
+                    skill_name,
+                    str(rule.get("url_prefix") or ""),
+                    tuple(
+                        str(method)
+                        for method in rule.get("methods") or []
+                    ),
+                )
+                for rule in candidate.get("sandbox_egress_rules") or []
+                if isinstance(rule, dict)
+            )
         elif kind == "declared_command":
             commands.append((
                 skill_name,
@@ -1262,6 +1421,24 @@ def _authority_projection(
                     for value in candidate.get("fixed_argv") or []
                 ),
             ))
+            sandbox_egress.extend(
+                (skill_name, str(prefix))
+                for prefix in (
+                    candidate.get("sandbox_egress_url_prefixes") or []
+                )
+            )
+            sandbox_rules.extend(
+                (
+                    skill_name,
+                    str(rule.get("url_prefix") or ""),
+                    tuple(
+                        str(method)
+                        for method in rule.get("methods") or []
+                    ),
+                )
+                for rule in candidate.get("sandbox_egress_rules") or []
+                if isinstance(rule, dict)
+            )
         elif kind == "skill_http_prefix":
             grant = (
                 skill_name,
@@ -1294,6 +1471,15 @@ def _authority_projection(
         "command_grants": list(dict.fromkeys(commands)),
         "http_get_grants": list(dict.fromkeys(http_get)),
         "http_post_grants": list(dict.fromkeys(http_post)),
+        "sandbox_egress_grants": list(dict.fromkeys(
+            sandbox_egress
+        )),
+        "sandbox_egress_rule_grants": list(dict.fromkeys(
+            sandbox_rules
+        )),
+        "browser_egress_rule_grants": list(dict.fromkeys(
+            browser_rules
+        )),
         "tool_names": list(dict.fromkeys(tools)),
         "receipt_bindings": candidate_rows,
     }
@@ -1315,7 +1501,22 @@ def validate_knowledge_gate_candidate_authority(
             "knowledge_gate_candidate_authority_missing",
             "A frozen knowledge-gate plan requires one conditional authority bundle.",
         )
-    if set(authority) != _CANDIDATE_AUTHORITY_KEYS:
+    supplied_keys = set(authority)
+    accepted_key_sets = {
+        frozenset(_CANDIDATE_AUTHORITY_KEYS),
+        frozenset(
+            set(_CANDIDATE_AUTHORITY_KEYS)
+            - {"browser_egress_rule_grants"}
+        ),
+        frozenset(
+            set(_CANDIDATE_AUTHORITY_KEYS)
+            - {
+                "sandbox_egress_rule_grants",
+                "browser_egress_rule_grants",
+            }
+        ),
+    }
+    if frozenset(supplied_keys) not in accepted_key_sets:
         raise KnowledgeGateCompileError(
             "knowledge_gate_candidate_authority_schema_invalid",
             "The conditional authority bundle has an invalid field set.",
@@ -1354,6 +1555,8 @@ def validate_knowledge_gate_candidate_authority(
         script_authority_grants=normalized_authorities,
     )
     supplied_projection = dict(authority)
+    supplied_projection.setdefault("sandbox_egress_rule_grants", [])
+    supplied_projection.setdefault("browser_egress_rule_grants", [])
     supplied_projection["script_authority_grants"] = (
         normalized_authorities
     )

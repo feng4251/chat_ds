@@ -1,3 +1,6 @@
+# Legacy development image only. Production Compose uses
+# Dockerfile.browser-runtime:session-sandbox so every supported Skill runtime
+# shares the same immutable dependency and isolation profile.
 FROM python:3.12-slim
 
 WORKDIR /app

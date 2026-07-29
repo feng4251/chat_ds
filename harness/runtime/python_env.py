@@ -9,6 +9,7 @@ import os
 import re
 import signal
 import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -82,7 +83,7 @@ def preflight_isolated_skill_runtime(
     platform_groups: list[dict[str, Any] | list[str] | tuple[str, ...]] | None = None,
     runtime_profile: str | None = None,
 ) -> dict[str, Any]:
-    """Fail closed against the exact network-disabled Skill executor image.
+    """Fail closed against the exact immutable session-sandbox image.
 
     This path never inspects the harness interpreter, command PATH, or secret
     values, and never installs a dependency.  The sidecar evaluates PEP 508
@@ -153,6 +154,9 @@ def preflight_isolated_skill_runtime(
             socket_path = binding.socket_path
             runtime_binding = {
                 "runtime_profile": binding.runtime_profile,
+                "executor_runtime_profile": (
+                    binding.executor_runtime_profile
+                ),
                 "socket_identity_sha256": (
                     binding.socket_identity_sha256
                 ),
@@ -181,6 +185,10 @@ def preflight_isolated_skill_runtime(
             }
 
     try:
+        from tools.executor_slot_pool import (
+            ExecutorSlotPoolError,
+            get_executor_slot_pool,
+        )
         from tools.isolated_skill_executor import (
             IsolatedSkillExecutorError,
             probe_isolated_runtime_capabilities,
@@ -201,18 +209,63 @@ def preflight_isolated_skill_runtime(
             },
             "error_code": error_code,
         }
+
     try:
-        probe_kwargs: dict[str, Any] = {
-            "requirements": required_packages,
-            "commands": required_commands,
-            "environment_variables": required_environment,
-            "platform_groups": allowed_groups,
+        pool = get_executor_slot_pool(primary_socket=socket_path)
+        probe_socket_paths = pool.probe_socket_paths()
+        if not probe_socket_paths:
+            raise ExecutorSlotPoolError(
+                "executor_pool_unavailable",
+                "No healthy executor pool member is available for preflight.",
+            )
+    except ExecutorSlotPoolError as exc:
+        error_code = exc.code
+        return {
+            "valid": False,
+            "checked": True,
+            "execution_runtime": "isolated_skill_executor",
+            "blockers": [{
+                "code": "isolated_executor_preflight_unavailable",
+                "items": [str(error_code)],
+            }],
+            "packages": {
+                "requirements": required_packages,
+                "status": "executor_unavailable",
+            },
+            "error_code": str(error_code),
         }
-        if socket_path is not None:
-            probe_kwargs["socket_path"] = socket_path
-        response = probe_isolated_runtime_capabilities(
-            **probe_kwargs,
-        )
+
+    probe_kwargs: dict[str, Any] = {
+        "requirements": required_packages,
+        "commands": required_commands,
+        "environment_variables": required_environment,
+        "platform_groups": allowed_groups,
+    }
+    response: dict[str, Any] | None = None
+    last_unavailable: IsolatedSkillExecutorError | None = None
+    try:
+        for candidate_socket in probe_socket_paths:
+            try:
+                response = probe_isolated_runtime_capabilities(
+                    **probe_kwargs,
+                    socket_path=candidate_socket,
+                )
+                break
+            except IsolatedSkillExecutorError as exc:
+                # Cross-slot failover is limited to a controller transport
+                # failure before any untrusted execution. Invalid or typed
+                # capability responses remain fail-closed.
+                if exc.code != "executor_unavailable":
+                    raise
+                last_unavailable = exc
+        if response is None:
+            raise (
+                last_unavailable
+                or IsolatedSkillExecutorError(
+                    "executor_pool_unavailable",
+                    "No healthy executor pool member answered preflight.",
+                )
+            )
     except IsolatedSkillExecutorError as exc:
         error_code = exc.code
         return {
@@ -233,7 +286,12 @@ def preflight_isolated_skill_runtime(
     response_identity = response.get("runtime_identity")
     if runtime_profile is not None and (
         not isinstance(response_identity, dict)
-        or response_identity.get("runtime_profile") != runtime_profile
+        or response_identity.get("runtime_profile")
+        != (
+            runtime_binding["executor_runtime_profile"]
+            if runtime_binding is not None
+            else runtime_profile
+        )
     ):
         return {
             "valid": False,
@@ -254,6 +312,9 @@ def preflight_isolated_skill_runtime(
     if runtime_binding is not None:
         capability_identity = {
             "runtime_profile": runtime_binding["runtime_profile"],
+            "executor_runtime_profile": runtime_binding[
+                "executor_runtime_profile"
+            ],
             "socket_identity_sha256": runtime_binding[
                 "socket_identity_sha256"
             ],
@@ -1109,8 +1170,60 @@ def _tail_file(path: Path) -> str:
 
 
 def clean_session_runtime(user_id: str, session_id: str) -> bool:
-    root = _session_root(_safe_component(user_id, "user_id"), _safe_component(session_id, "session_id"))
-    if not root.exists():
+    safe_user = _safe_component(user_id, "user_id")
+    safe_session = _safe_component(session_id, "session_id")
+    try:
+        root_stat = RUNTIME_ROOT.lstat()
+    except FileNotFoundError:
         return False
-    shutil.rmtree(root)
-    return True
+    if (
+        not stat.S_ISDIR(root_stat.st_mode)
+        or stat.S_ISLNK(root_stat.st_mode)
+    ):
+        raise RuntimeError("Skill runtime root must be a real directory.")
+    flags = os.O_RDONLY | os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    root_fd: int | None = None
+    user_fd: int | None = None
+    try:
+        root_fd = os.open(RUNTIME_ROOT, flags)
+        opened_root = os.fstat(root_fd)
+        if (
+            opened_root.st_dev,
+            opened_root.st_ino,
+        ) != (
+            root_stat.st_dev,
+            root_stat.st_ino,
+        ):
+            raise RuntimeError("Skill runtime root changed during cleanup.")
+        try:
+            user_fd = os.open(safe_user, flags, dir_fd=root_fd)
+        except FileNotFoundError:
+            return False
+        try:
+            session_stat = os.stat(
+                safe_session,
+                dir_fd=user_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return False
+        if (
+            not stat.S_ISDIR(session_stat.st_mode)
+            or stat.S_ISLNK(session_stat.st_mode)
+            or not getattr(shutil.rmtree, "avoids_symlink_attacks", False)
+        ):
+            raise RuntimeError(
+                "Session Skill runtime must be a stable real directory."
+            )
+        shutil.rmtree(safe_session, dir_fd=user_fd)
+        os.fsync(user_fd)
+        return True
+    finally:
+        if user_fd is not None:
+            os.close(user_fd)
+        if root_fd is not None:
+            os.close(root_fd)

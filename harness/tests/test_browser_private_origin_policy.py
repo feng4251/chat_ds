@@ -9,9 +9,11 @@ from unittest.mock import AsyncMock, patch
 
 import tools.browser as browser_tools
 
+from agent_loop import _private_origin_authorization_text
 from tools.approval import (
     canonical_http_origin,
     check_url_safety,
+    compile_user_browser_egress_rules,
     compile_user_private_origin_grants,
 )
 from tools.browser import (
@@ -24,6 +26,7 @@ from tools.browser import (
     _guard_browser_request,
     _guard_browser_websocket,
     _type_text,
+    browser_navigate_args_preflight,
 )
 from tools.context import ToolContext
 
@@ -31,7 +34,136 @@ from tools.context import ToolContext
 PRIVATE_ORIGIN = "http://172.30.100.145:5173"
 
 
+def _origin_rules(origin: str) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    return ((origin + "/", ("GET", "HEAD", "OPTIONS", "POST")),)
+
+
 class BrowserPrivateOriginApprovalTests(unittest.TestCase):
+    def test_public_continuation_uses_only_nearest_user_url_turn(self):
+        selected = _private_origin_authorization_text([
+            {
+                "role": "user",
+                "content": (
+                    "Old task https://old.vendor.test/archive/ is done."
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": (
+                    "Try https://assistant-injected.test/private/ instead."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Navigate to https://current.vendor.test/app/item/42."
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": "The browser run has finished.",
+            },
+            {
+                "role": "user",
+                "content": "Continue navigating the previous site.",
+            },
+        ])
+
+        self.assertEqual(
+            ((
+                "https://current.vendor.test:443/",
+                ("GET", "HEAD", "OPTIONS", "POST"),
+            ),),
+            compile_user_browser_egress_rules(selected),
+        )
+
+    def test_public_continuation_never_uses_assistant_url(self):
+        selected = _private_origin_authorization_text([
+            {
+                "role": "assistant",
+                "content": (
+                    "Navigate to https://assistant-injected.test/private/."
+                ),
+            },
+            {
+                "role": "user",
+                "content": "Continue navigating the previous site.",
+            },
+        ])
+
+        self.assertEqual(
+            (),
+            compile_user_browser_egress_rules(selected),
+        )
+
+    def test_current_turn_urls_compile_same_origin_browser_rules(self):
+        self.assertEqual(
+            (
+                (
+                    "https://public.example:443/",
+                    ("GET", "HEAD", "OPTIONS", "POST"),
+                ),
+                (
+                    "http://172.30.100.145:5173/",
+                    ("GET", "HEAD", "OPTIONS", "POST"),
+                ),
+            ),
+            compile_user_browser_egress_rules(
+                "访问 https://public.example/path?q=1 和 "
+                f"{PRIVATE_ORIGIN}/chat/abc"
+            ),
+        )
+        self.assertEqual(
+            (),
+            compile_user_browser_egress_rules(
+                "访问 public.example 或使用先前页面"
+            ),
+        )
+
+    def test_navigation_preflight_rejects_arbitrary_public_model_url(self):
+        context = ToolContext(
+            allowed_browser_egress_rules=(
+                (
+                    "https://allowed.example:443/",
+                    ("GET", "HEAD", "OPTIONS", "POST"),
+                ),
+            ),
+        )
+        self.assertIsNone(browser_navigate_args_preflight(
+            {"url": "https://allowed.example/other"},
+            context,
+        ))
+        self.assertIsNone(browser_navigate_args_preflight(
+            {"url": "https://allowed.example/other#rendered-section"},
+            context,
+        ))
+        denied = browser_navigate_args_preflight(
+            {"url": "https://unmentioned.example/"},
+            context,
+        )
+        self.assertEqual(
+            "browser_egress_policy_violation",
+            (denied or {}).get("reason"),
+        )
+        self.assertFalse((denied or {}).get("actual_dispatch_attempted"))
+
+    def test_selected_skill_rule_is_runtime_authority_not_model_authority(self):
+        context = ToolContext(
+            allowed_skill_sandbox_egress_rules=((
+                "frozen-skill",
+                "https://skill-source.example:443/api/",
+                ("GET", "HEAD"),
+            ),),
+        )
+        self.assertIsNone(browser_navigate_args_preflight(
+            {"url": "https://skill-source.example/api/item"},
+            context,
+        ))
+        self.assertIsNotNone(browser_navigate_args_preflight(
+            {"url": "https://other.example/api/item"},
+            context,
+        ))
+
     def test_opt_in_synthetic_dns_allows_only_named_public_targets(self):
         synthetic_answers = (
             ipaddress.ip_address("198.18.0.71"),
@@ -179,12 +311,33 @@ class BrowserPrivateOriginApprovalTests(unittest.TestCase):
                     ) or "",
                 )
 
-    def test_delegate_context_cannot_carry_private_origin_grant(self):
+    def test_delegate_private_origin_requires_inherited_exact_rule(self):
         self.assertEqual(
             (PRIVATE_ORIGIN,),
             _context_private_origins(ToolContext(
                 agent_kind="primary",
                 source="chat",
+                allowed_browser_egress_rules=_origin_rules(PRIVATE_ORIGIN),
+                allowed_browser_private_origins=(PRIVATE_ORIGIN,),
+            )),
+        )
+        self.assertEqual(
+            (PRIVATE_ORIGIN,),
+            _context_private_origins(ToolContext(
+                agent_kind="delegate",
+                source="delegate",
+                allowed_browser_egress_rules=_origin_rules(PRIVATE_ORIGIN),
+                allowed_browser_private_origins=(PRIVATE_ORIGIN,),
+            )),
+        )
+        self.assertEqual(
+            (),
+            _context_private_origins(ToolContext(
+                agent_kind="delegate",
+                source="delegate",
+                allowed_browser_egress_rules=_origin_rules(
+                    "http://172.30.100.146:5173"
+                ),
                 allowed_browser_private_origins=(PRIVATE_ORIGIN,),
             )),
         )
@@ -205,6 +358,7 @@ class BrowserPrivateOriginApprovalTests(unittest.TestCase):
             agent_kind="primary",
             source="chat",
             allowed_browser_private_origins=(PRIVATE_ORIGIN,),
+            allowed_browser_egress_rules=_origin_rules(PRIVATE_ORIGIN),
         )
         state_key = _browser_session_key("model-controlled", context)
         session = {
@@ -227,6 +381,7 @@ class BrowserPrivateOriginApprovalTests(unittest.TestCase):
                 agent_kind="delegate",
                 source="delegate",
                 allowed_browser_private_origins=(PRIVATE_ORIGIN,),
+                allowed_browser_egress_rules=_origin_rules(PRIVATE_ORIGIN),
             ))
 
     def test_runtime_key_ignores_argument_and_isolates_user_session_and_run(self):
@@ -305,9 +460,16 @@ class _FakeRoute:
 
 
 class _FakeRequest:
-    def __init__(self, url: str, *, navigation: bool = True):
+    def __init__(
+        self,
+        url: str,
+        *,
+        navigation: bool = True,
+        method: str = "GET",
+    ):
         self.url = url
         self._navigation = navigation
+        self.method = method
 
     def is_navigation_request(self):
         return self._navigation
@@ -375,6 +537,76 @@ class _FakeBrowserFactory:
 
 
 class BrowserRequestGuardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_public_cross_origin_redirect_is_blocked_before_dispatch(self):
+        session = {
+            "allowed_private_origins": (),
+            "allowed_egress_rules": _origin_rules(
+                "https://allowed.example:443"
+            ),
+        }
+        route = _FakeRoute()
+        await _guard_browser_request(
+            session,
+            route,
+            _FakeRequest("https://other.example/redirect"),
+        )
+        self.assertFalse(route.continued)
+        self.assertEqual("blockedbyclient", route.aborted_with)
+        self.assertTrue(session["last_blocked_request"]["navigation"])
+
+    async def test_public_cross_origin_subresource_is_blocked(self):
+        session = {
+            "allowed_private_origins": (),
+            "allowed_egress_rules": _origin_rules(
+                "https://allowed.example:443"
+            ),
+        }
+        route = _FakeRoute()
+        await _guard_browser_request(
+            session,
+            route,
+            _FakeRequest(
+                "https://cdn.other.example/asset.js",
+                navigation=False,
+            ),
+        )
+        self.assertEqual("blockedbyclient", route.aborted_with)
+        self.assertFalse(session["last_blocked_request"]["navigation"])
+
+    async def test_request_method_is_part_of_exact_route_policy(self):
+        session = {
+            "allowed_private_origins": (),
+            "allowed_egress_rules": ((
+                "https://allowed.example:443/",
+                ("GET", "POST"),
+            ),),
+        }
+        post_route = _FakeRoute()
+        with patch(
+            "tools.browser._check_browser_url_safety",
+            AsyncMock(return_value=None),
+        ):
+            await _guard_browser_request(
+                session,
+                post_route,
+                _FakeRequest(
+                    "https://allowed.example/search",
+                    method="POST",
+                ),
+            )
+        self.assertTrue(post_route.continued)
+
+        delete_route = _FakeRoute()
+        await _guard_browser_request(
+            session,
+            delete_route,
+            _FakeRequest(
+                "https://allowed.example/item",
+                method="DELETE",
+            ),
+        )
+        self.assertEqual("blockedbyclient", delete_route.aborted_with)
+
     async def test_context_routes_cover_future_popup_before_page_creation(self):
         fake_context = _FakeBrowserContext()
         fake_browser = _FakeBrowser(fake_context)
@@ -383,6 +615,7 @@ class BrowserRequestGuardTests(unittest.IsolatedAsyncioTestCase):
             session_id="context-popup-policy-test",
             run_id="popup-run",
             allowed_browser_private_origins=(PRIVATE_ORIGIN,),
+            allowed_browser_egress_rules=_origin_rules(PRIVATE_ORIGIN),
         )
         session_key = _browser_session_key("model-session", runtime_context)
         browser_tools._sessions.pop(session_key, None)
@@ -434,12 +667,14 @@ class BrowserRequestGuardTests(unittest.IsolatedAsyncioTestCase):
             session_id="same-session",
             run_id="run-a",
             allowed_browser_private_origins=(PRIVATE_ORIGIN,),
+            allowed_browser_egress_rules=_origin_rules(PRIVATE_ORIGIN),
         )
         context_b = ToolContext(
             user_id="same-user",
             session_id="same-session",
             run_id="run-b",
             allowed_browser_private_origins=(origin_b,),
+            allowed_browser_egress_rules=_origin_rules(origin_b),
         )
         key_a = _browser_session_key("forged", context_a)
         key_b = _browser_session_key("forged", context_b)
@@ -486,7 +721,10 @@ class BrowserRequestGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("blockedbyclient", route_b.aborted_with)
 
     async def test_initial_allowed_origin_continues(self):
-        session = {"allowed_private_origins": (PRIVATE_ORIGIN,)}
+        session = {
+            "allowed_private_origins": (PRIVATE_ORIGIN,),
+            "allowed_egress_rules": _origin_rules(PRIVATE_ORIGIN),
+        }
         route = _FakeRoute()
         await _guard_browser_request(
             session,
@@ -507,7 +745,12 @@ class BrowserRequestGuardTests(unittest.IsolatedAsyncioTestCase):
         route = _FakeRoute()
         with patch("tools.browser.check_url_safety", side_effect=check):
             await _guard_browser_request(
-                {"allowed_private_origins": ()},
+                {
+                    "allowed_private_origins": (),
+                    "allowed_egress_rules": _origin_rules(
+                        "https://example.com:443"
+                    ),
+                },
                 route,
                 _FakeRequest("https://example.com"),
             )
@@ -517,7 +760,10 @@ class BrowserRequestGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(event_loop_thread, guard_threads[0])
 
     async def test_redirect_to_other_private_origin_aborts_before_dispatch(self):
-        session = {"allowed_private_origins": (PRIVATE_ORIGIN,)}
+        session = {
+            "allowed_private_origins": (PRIVATE_ORIGIN,),
+            "allowed_egress_rules": _origin_rules(PRIVATE_ORIGIN),
+        }
         route = _FakeRoute()
         await _guard_browser_request(
             session,
@@ -527,17 +773,17 @@ class BrowserRequestGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(route.continued)
         self.assertEqual("blockedbyclient", route.aborted_with)
         self.assertTrue(session["last_blocked_request"]["navigation"])
-        self.assertIn(
-            "private/internal",
-            session["last_blocked_request"]["error"],
-        )
+        self.assertIn("egress policy", session["last_blocked_request"]["error"])
 
     async def test_metadata_subresource_is_blocked_even_if_misconfigured(self):
         session = {
             "allowed_private_origins": (
                 PRIVATE_ORIGIN,
                 "http://169.254.169.254",
-            )
+            ),
+            "allowed_egress_rules": _origin_rules(
+                "http://169.254.169.254"
+            ),
         }
         route = _FakeRoute()
         await _guard_browser_request(

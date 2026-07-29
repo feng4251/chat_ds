@@ -1,18 +1,37 @@
+import asyncio
 import json
 import logging
-import shutil
 from pathlib import Path
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
-from sqlalchemy import select, func, desc, delete
+from sqlalchemy import delete, desc, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from database import get_db
-from models import User, Conversation, Message, SkillPackage
+from models import (
+    AgentRun,
+    AgentRunEvent,
+    Artifact,
+    Conversation,
+    EventHook,
+    Message,
+    ScheduledJob,
+    ScheduledJobRun,
+    SkillPackage,
+    TaskItem,
+    User,
+)
 from schemas import ConversationOut, ConversationTitle
 from auth import get_current_user
-from workspace import atomic_write_bytes, ensure_workspace, safe_workspace_path
+from workspace import (
+    atomic_write_bytes,
+    ensure_workspace_async,
+    publish_session_deletion_tombstone_async,
+    run_session_workspace_mutation_async,
+    safe_workspace_path_in_root,
+)
 from hooks import emit_event
 from config import settings
+from workspace_reconciler import cleanup_deleted_session_workspace
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +40,6 @@ router = APIRouter(prefix="/api/conversations", tags=["conversations"])
 # ── Session file upload ──────────────────────────────────────────────────
 
 SANDBOX_BASE = Path("/nfs/temp/chat_ds")
-SKILLS_DATA_DIR = Path("data/skills")
 MAX_UPLOAD_SIZE = 25 * 1024 * 1024  # 25 MB
 ALLOWED_EXTENSIONS = frozenset({
     ".md", ".py", ".yaml", ".yml", ".json", ".txt",
@@ -134,7 +152,7 @@ async def create_conversation(
     db.add(conv)
     await db.commit()
     await db.refresh(conv)
-    ensure_workspace(cur_user.id, conv.id)
+    await ensure_workspace_async(cur_user.id, conv.id)
     await emit_event(
         cur_user.id, "session.created",
         {"conversation_id": conv.id}, conv.id,
@@ -178,8 +196,9 @@ async def upload_session_file(
     # Resolve the attachment path before any mutation. Skill archives are
     # persisted by the canonical installer so workspace, package directories,
     # and registry rows share one rollback/cancellation boundary.
+    workspace = await ensure_workspace_async(cur_user.id, cid)
     try:
-        dest_path = safe_workspace_path(cur_user.id, cid, filename)
+        dest_path = safe_workspace_path_in_root(workspace, filename)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
 
@@ -224,7 +243,17 @@ async def upload_session_file(
         except zipfile.BadZipFile:
             pass
 
-    atomic_write_bytes(dest_path, contents)
+    def _write_upload(workspace: Path) -> None:
+        # Re-resolve after acquiring the shared lock; the earlier path was
+        # presentation metadata, not mutation authority.
+        locked_destination = safe_workspace_path_in_root(workspace, filename)
+        atomic_write_bytes(locked_destination, contents)
+
+    await run_session_workspace_mutation_async(
+        cur_user.id,
+        cid,
+        _write_upload,
+    )
     return result
 
 @router.get("", response_model=list[ConversationOut])
@@ -254,17 +283,28 @@ async def list_convs(cur_user=Depends(get_current_user), db=Depends(get_db)):
 @router.patch("/{cid}/title")
 async def rename_conv(cid: str, data: ConversationTitle,
     cur_user=Depends(get_current_user), db=Depends(get_db)):
-    conv = (await db.execute(
-        select(Conversation).where(Conversation.id==cid, Conversation.user_id==cur_user.id)
-    )).scalar_one_or_none()
-    if not conv: raise HTTPException(404, "Not found")
-    conv.title = data.title
-    await db.commit()
+    from session_lifecycle import session_control_plane_mutation
+    from workspace import require_session_workspace_active
+
+    async with session_control_plane_mutation(
+        cur_user.id,
+        cid,
+    ) as (mutation_db, conv):
+        conv.title = data.title
+        require_session_workspace_active(cur_user.id, cid)
+        await mutation_db.commit()
     return {"ok": True}
 
 @router.delete("/{cid}")
 async def delete_conv(cid: str,
     cur_user=Depends(get_current_user), db=Depends(get_db)):
+    from routers import skill_router as skill_api
+
+    async with skill_api._skill_install_lock(cur_user.id, cid):
+        return await _delete_conv_locked(cid, cur_user, db, skill_api)
+
+
+async def _delete_conv_locked(cid: str, cur_user, db, skill_api):
     conv = (await db.execute(
         select(Conversation).where(Conversation.id==cid, Conversation.user_id==cur_user.id)
     )).scalar_one_or_none()
@@ -274,32 +314,165 @@ async def delete_conv(cid: str,
         cur_user.id, "session.deleted",
         {"conversation_id": cid, "title": conv.title}, cid,
     )
-    runtime_cleanup = await _cleanup_harness_session(cur_user.id, cid)
-    await db.execute(
-        delete(SkillPackage).where(
-            SkillPackage.user_id == cur_user.id,
-            SkillPackage.session_id == cid,
-        )
-    )
-    await db.delete(conv)
-    await db.commit()
-
-    # Clean up session sandbox directories
-    for sub in ["files", "sandbox", "workspace", "browser", "results"]:
-        d = SANDBOX_BASE / cur_user.id / cid / sub
-        if d.exists():
-            shutil.rmtree(d, ignore_errors=True)
-    # Clean up session skills
-    session_skills = SKILLS_DATA_DIR / cur_user.id / cid
-    if session_skills.exists():
-        shutil.rmtree(session_skills, ignore_errors=True)
-    # Remove parent session dir if empty
-    session_dir = SANDBOX_BASE / cur_user.id / cid
     try:
-        session_dir.rmdir()
-    except OSError:
-        pass
+        # ``publish_*_async`` drains its worker before re-delivering request
+        # cancellation. Once durable, the marker is retained as delete intent
+        # until an exact retry converges; only periodic pre-boot recovery may
+        # clear an abandoned marker whose Conversation is still live.
+        await publish_session_deletion_tombstone_async(cur_user.id, cid)
+        from routers.chat_router import (
+            cancel_conversation_producers,
+            conversation_maintenance_lease,
+        )
 
+        async def _cleanup_all_session_execution():
+            return await asyncio.gather(
+                cancel_conversation_producers(cid),
+                _cleanup_harness_session(cur_user.id, cid),
+                return_exceptions=True,
+            )
+
+        cleanup_values, caller_cancellation = (
+            await skill_api._finish_awaitable_with_result(
+                _cleanup_all_session_execution()
+            )
+        )
+        backend_execution_cleanup, runtime_cleanup = cleanup_values
+        if isinstance(backend_execution_cleanup, BaseException):
+            raise backend_execution_cleanup
+        if isinstance(runtime_cleanup, BaseException):
+            raise runtime_cleanup
+        if backend_execution_cleanup.get("success") is not True:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Conversation execution cancellation did not converge; "
+                    "the session remains deletion-fenced for retry."
+                ),
+            )
+        execution_revocation = runtime_cleanup.get(
+            "execution_revocation",
+        )
+        if (
+            not isinstance(execution_revocation, dict)
+            or execution_revocation.get("success") is not True
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Harness session execution revocation was not proven; "
+                    "the session remains deletion-fenced for retry."
+                ),
+            )
+        if runtime_cleanup.get("success") is not True:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Harness session runtime cleanup did not converge; "
+                    "the session remains deletion-fenced for retry."
+                ),
+            )
+        if caller_cancellation is not None:
+            raise caller_cancellation
+        async with conversation_maintenance_lease(cid):
+            scheduled_job_ids = select(ScheduledJob.id).where(
+                ScheduledJob.conversation_id == cid
+            )
+            await db.execute(
+                delete(ScheduledJobRun).where(
+                    or_(
+                        ScheduledJobRun.conversation_id == cid,
+                        ScheduledJobRun.job_id.in_(scheduled_job_ids),
+                    )
+                )
+            )
+            # Explicit dependency order is intentional. Historic SQLite
+            # databases may have been created before FK clauses existed, so
+            # delete correctness never depends solely on ON DELETE CASCADE.
+            for model in (
+                AgentRunEvent,
+                Artifact,
+                TaskItem,
+                AgentRun,
+                Message,
+            ):
+                await db.execute(
+                    delete(model).where(model.conversation_id == cid)
+                )
+            await db.execute(
+                delete(SkillPackage).where(
+                    SkillPackage.user_id == cur_user.id,
+                    SkillPackage.session_id == cid,
+                )
+            )
+            await db.execute(
+                delete(EventHook).where(
+                    EventHook.conversation_id == cid
+                )
+            )
+            await db.execute(
+                delete(ScheduledJob).where(
+                    ScheduledJob.conversation_id == cid
+                )
+            )
+            await db.execute(
+                update(Conversation)
+                .where(Conversation.forked_from_conversation_id == cid)
+                .values(forked_from_conversation_id=None)
+            )
+            deleted_conversation = await db.execute(
+                delete(Conversation).where(
+                    Conversation.id == cid,
+                    Conversation.user_id == cur_user.id,
+                )
+            )
+            deleted_rowcount = getattr(
+                deleted_conversation,
+                "rowcount",
+                None,
+            )
+            if (
+                isinstance(deleted_rowcount, int)
+                and deleted_rowcount != 1
+            ):
+                raise RuntimeError(
+                    "Conversation ownership changed before delete commit."
+                )
+            await db.commit()
+    except BaseException:
+        # The marker is a durable delete intent, not a transient request flag.
+        # Keep it fail-closed after cancellation, cleanup uncertainty, or DB
+        # ambiguity; an exact retry can safely resume under the lifecycle lock.
+        try:
+            await db.rollback()
+        except BaseException:
+            logger.exception(
+                "Could not roll back failed session deletion user=%s "
+                "session=%s",
+                cur_user.id,
+                cid,
+            )
+        raise
+
+    # This cancellation-drained worker removes the session Skill scope first,
+    # then the workspace tree and sibling lock. A crash/retry therefore never
+    # loses orphan-Skill discovery by deleting the workspace coordinate first.
+    workspace_cleanup_outcome = await cleanup_deleted_session_workspace(
+        cur_user.id,
+        cid,
+    )
+    workspace_cleanup = {
+        "status": (
+            "removed"
+            if workspace_cleanup_outcome == "removed"
+            else "deferred"
+        ),
+        "reason": (
+            None
+            if workspace_cleanup_outcome == "removed"
+            else workspace_cleanup_outcome
+        ),
+    }
     # Invalidate harness skills cache
     try:
         from skills.manager import get_manager
@@ -307,13 +480,21 @@ async def delete_conv(cid: str,
     except Exception:
         pass
 
-    return {"ok": True, "runtime_cleanup": runtime_cleanup}
+    return {
+        "ok": True,
+        "backend_execution_cleanup": backend_execution_cleanup,
+        "runtime_cleanup": runtime_cleanup,
+        "workspace_cleanup": workspace_cleanup,
+    }
 
 
 async def _cleanup_harness_session(user_id: str, session_id: str) -> dict:
     """Best-effort teardown of MCP subprocesses and session config."""
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        # Revocation can spend up to 30s draining fence-owned resources and
+        # persistent process cleanup has a bounded 60s close phase. Keep the
+        # Backend deadline strictly above the Harness transaction's bound.
+        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0)) as client:
             response = await client.post(
                 f"{settings.harness_url}/internal/session/cleanup",
                 headers={

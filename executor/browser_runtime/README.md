@@ -1,13 +1,15 @@
-# Browser automation runtime profile
+# Unified session-sandbox dependency profile
 
-`browser-automation-v1` is an immutable worker image for standard-format Skills
-that ship exact `.cjs`, `.js`, `.mjs`, `.py`, `.sh`, or `.bash` browser
-scripts. It contains:
+The immutable `browser-automation-v1` dependency profile is the superset used
+by the physical `session-sandbox-v1` executor. Standard-format Skills can ship
+exact `.cjs`, `.js`, `.mjs`, `.py`, `.sh`, or `.bash` entrypoints without
+choosing a separate execution environment. It contains:
 
-- Node 22.18.0 and Node Playwright 1.61.0;
+- Node 22.23.1 and Node Playwright 1.61.0;
 - CPython 3.12.11, Python Playwright 1.61.0, and Selenium 4.46.0;
 - the complete shared base Skill Python dependency manifest (scientific,
   data, HTTP, PDF, and Office/report generation libraries);
+- snapshot-pinned `curl` for declared command-line HTTP requests;
 - a Chromium/ChromeDriver pair from one immutable Debian snapshot;
 - Weston headless compositor for scripts that request a visible browser;
 - no runtime npm, npx, pip, or apt frontend.
@@ -37,23 +39,36 @@ as CommonJS scripts without runtime installation.
 ## Required deployment boundary
 
 This image is not safe to attach to an ordinary application, bridge, or host
-network. The production browser executor runs with `network_mode: none`: its
+network. The production session sandbox runs with `network_mode: none`: its
 namespace has loopback but no Ethernet interface, Docker DNS, gateway, or
-default route. The controller owns a fixed `127.0.0.1:18080` pure-byte bridge
-to `/run/chatds-skill-egress/proxy.sock`. That socket is supplied read-only
-from a named volume; only the separately networked policy proxy can resolve
-and dial destinations. Do not mount a Docker socket or expose raw CDP to the
-Skill process.
+default route. For each execution or persistent lease, the controller creates
+one ephemeral loopback byte bridge to
+`/run/chatds-skill-egress/proxy.sock`. The bridge signs the exact HTTP methods
+and canonical URL prefixes compiled from the frozen ToolContext; derived
+origins are only routing metadata and an empty rule set is deny-all. The proxy
+socket is supplied read-only from a named volume,
+and only the separately networked policy proxy can resolve and dial
+destinations. Do not mount a Docker socket or expose raw CDP to the Skill
+process.
 
-The production Skill lane is public-only. Private-origin exceptions are not
-accepted through global proxy environment configuration because that authority
-would otherwise be inherited by every Skill lease. The legacy browser keeps
-its separate per-turn private-origin policy.
+Every request method and URL must match the selected Skill's frozen capability
+closure. A prefix ending in `/` may cover descendants; any other path is exact.
+Private destinations require three independent gates: an exact rule for the
+current Skill, the deployment allowlist, and either an explicit URL in the
+current user turn or an explicit continuation resolved to the nearest bounded
+user-authored URL turn. Assistant, tool, and ambient-history URLs never grant
+authority. A literal private IP is pinned to that exact address; an
+allowlisted hostname must also resolve entirely inside the configured private
+CIDRs. No model argument, request header, proxy environment override, or
+sibling Skill can add a method, URL prefix, or private-network grant.
 
-The lease launcher must inject the fixed environment key
-`SKILL_EGRESS_PROXY_URL`; production fixes it to
-`http://127.0.0.1:18080`. Credentials, paths, query strings, fragments, and
-caller-selected proxy endpoints are forbidden.
+The lease launcher injects the runtime-owned environment key
+`SKILL_EGRESS_PROXY_URL` with the ephemeral loopback endpoint. Proxy
+credentials, fragments, non-canonical URLs, and caller-selected proxy
+endpoints are forbidden; paths and query prefixes remain inside the signed
+rule. Container readiness alone uses a short-lived fixed-port deny-all
+bridge for the baked browser smoke, closes it, and only then starts the
+executor server.
 
 The launcher also exports this endpoint as the standard HTTP(S) proxy
 environment. The Chromium wrapper rejects caller proxy overrides, disables QUIC and
@@ -75,11 +90,9 @@ the only loopback egress service relays to the fail-closed policy proxy.
   compositor started as the worker UID. Its Wayland socket, lock, and log live
   only in the lease-private `XDG_RUNTIME_DIR`; no root-owned display server or
   cross-lease display socket is reachable by untrusted lease code.
-- Browser workers are UID/GID 65529, deliberately distinct from the legacy
+- All untrusted session-sandbox workers are UID/GID 65529, deliberately
+  distinct from the root controller and from the legacy
   browser's 65532 because `RLIMIT_NPROC` accounting is host-UID-global.
-- The base Skill worker likewise uses its own UID/GID 65528 instead of the
-  host's conventional `nobody` identity. This keeps its 64-process budget
-  independent of unrelated host services and of both browser lanes.
 - The controller uses `/usr/bin/prlimit` and native process credentials to
   spawn the exact Skill entrypoint as UID/GID 65529 after clearing every
   supplementary group. Admission is serial and cleanup sweeps that dedicated
@@ -103,13 +116,13 @@ the only loopback egress service relays to the fail-closed policy proxy.
   `no-new-privileges`, bounded
   PID/memory/CPU limits, and writable tmpfs mounts only for `/tmp` and
   `/dev/shm`.
-- Do not apply a finite `RLIMIT_AS` to the browser lane. Chromium 150/V8 uses
+- Do not apply a finite `RLIMIT_AS` to the unified dependency-superset lane.
+  Chromium 150/V8 uses
   architecture- and page-dependent sparse virtual mappings while a renderer's
   observed RSS remains small; 256 GiB, 512 GiB, and 1 TiB limits all stalled a
   real Playwright `newPage()` lease. Resident memory is independently and
   strictly bounded by the 3 GiB container cgroup. The trusted executor accepts
-  `unlimited` only for persistent `browser-automation-v1` processes; the base
-  lane retains its 2 GiB address-space limit.
+  `unlimited` only for the fixed session-sandbox dependency profile.
 - Materialize the exact Skill package read-only in the private execution tmpfs
   and keep its lease workspace as a separate writable descendant.
 - Keep fixed `/workspace`, `/tmp`, and `/dev/shm` roots non-writable to the
@@ -117,8 +130,8 @@ the only loopback egress service relays to the fail-closed policy proxy.
   `HOME`, `TMPDIR`, `XDG_RUNTIME_DIR`, the Wayland socket, and compositor state
   stay inside that tree and are removed during process/lease teardown.
 
-The standalone runtime target defaults to worker UID 65529. Only the
-`browser-executor` target starts the root controller.
+The standalone dependency target defaults to worker UID 65529. The
+`session-sandbox` target starts the single root controller.
 
 ## Health checks
 
@@ -181,12 +194,13 @@ must:
    both integrity/hash locks, and verify the checked-in seccomp JSON derives
    from that Playwright tag's `utils/docker/seccomp_profile.json` with only
    the documented cross-process IPC removals;
-3. build both browser targets, record the resolved Chromium and ChromeDriver
-   patch versions from `installed-manifest.json`, and require their majors to
-   match;
+3. build the immutable dependency and `session-sandbox` targets, record the
+   resolved Chromium and ChromeDriver patch versions from
+   `installed-manifest.json`, and require their majors to match;
 4. rerun static/profile tests, the non-root Node/Python Playwright and Selenium
    readiness smoke, the legacy-browser smoke, direct-egress negative probes,
-   public-only proxy probes, and Compose topology checks; and
+   signed public/private/deny-all origin-policy probes, and Compose topology
+   checks; and
 5. deploy only a tested image digest and update the deployment digest record.
 
 Never replace the timestamp, dependency versions, or deployment image with a

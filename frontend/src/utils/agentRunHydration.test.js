@@ -195,6 +195,34 @@ test('live lifecycle keeps failed attempts distinct from later same-tool success
   assert.equal(runStatusPresentation(runs[0]).label, '降级完成')
 })
 
+test('live lifecycle keeps an explicit advisory retrieval frontier successful', () => {
+  let runs = updateAgentRuns([], {
+    run_id: 'advisory-child',
+    event_type: 'run.completed',
+    payload: {
+      unresolved_retrieval: {
+        quality_impact: 'advisory',
+      },
+    },
+  })
+  runs = updateAgentRuns(runs, {
+    run_id: 'legacy-child',
+    event_type: 'run.completed',
+    payload: {
+      unresolved_retrieval: true,
+    },
+  })
+
+  assert.equal(
+    runs.find((run) => run.id === 'advisory-child').lifecycle_status,
+    'succeeded',
+  )
+  assert.equal(
+    runs.find((run) => run.id === 'legacy-child').lifecycle_status,
+    'degraded',
+  )
+})
+
 test('new-conversation request owns only its bounded route transition', () => {
   const scope = createConversationRequestScope(null)
   assert.equal(conversationRequestOwnsRoute(scope, null), true)

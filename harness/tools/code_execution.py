@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import ast
 import json
 import logging
@@ -29,10 +28,6 @@ SNAPSHOT_EXTENSIONS = {
     ".py", ".json", ".csv", ".tsv", ".txt", ".md", ".yaml", ".yml",
 }
 SKILL_DATA_ROOT = Path(os.environ.get("SKILL_DATA_ROOT", "/app/data/skills"))
-EXECUTOR_SOCKET = os.environ.get(
-    "EXECUTOR_SOCKET", "/run/chat-ds-executor/executor.sock"
-)
-
 _PIP_INSTALL_RE = re.compile(r"\bpip\s+install\b|subprocess\.(?:run|Popen|call)\([^\n]*(?:pip|python\s+-m\s+pip)", re.IGNORECASE)
 _NETWORK_IMPORT_RE = re.compile(
     r"(^|\n)\s*(?:import\s+(requests|httpx|urllib|aiohttp|socket)\b|from\s+(requests|httpx|urllib|aiohttp|socket)\b)",
@@ -597,26 +592,46 @@ async def execute_code(
     code = _code_with_session_snapshot(code, user_id, session_id)
     if len(code.encode("utf-8")) > MAX_CODE_BYTES:
         return json.dumps({"status": "error", "error": "Code plus session snapshot is too large."})
-    request = json.dumps(
-        {"code": code, "timeout": timeout}, ensure_ascii=False
-    ).encode("utf-8") + b"\n"
+    from tools.isolated_skill_executor import (
+        IsolatedSkillExecutorError,
+        execute_isolated_legacy_code,
+    )
 
     try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_unix_connection(EXECUTOR_SOCKET), timeout=3
+        result = await execute_isolated_legacy_code(
+            code=code,
+            timeout=timeout,
+            **(
+                {
+                    "execution_authority_check": lambda: (
+                        require_execution_authority(
+                            context,
+                            boundary="execute_code.executor_commit",
+                        )
+                    )
+                }
+                if (
+                    context is not None
+                    and context.execution_fence is not None
+                )
+                else {}
+            ),
         )
-        writer.write(request)
-        await writer.drain()
-        raw = await asyncio.wait_for(reader.readline(), timeout=timeout + 10)
-        writer.close()
-        await writer.wait_closed()
-        if not raw:
-            raise RuntimeError("executor closed the socket without a response")
-        result = json.loads(raw.decode("utf-8"))
         warnings = check_code_warnings(code)
         if warnings:
             result["warnings"] = warnings
         return json.dumps(result, ensure_ascii=False)
+    except IsolatedSkillExecutorError as exc:
+        logger.warning(
+            "Isolated compatibility-code request failed safely: %s",
+            exc.code,
+        )
+        return json.dumps({
+            "status": "error",
+            "error_code": exc.code,
+            "error": str(exc),
+            "network": "disabled",
+        }, ensure_ascii=False)
     except Exception as exc:
         logger.exception("Isolated executor request failed")
         return json.dumps({

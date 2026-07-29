@@ -202,6 +202,35 @@ class RunContractAdapterTests(unittest.TestCase):
         self.assertEqual(1, snapshot["active_state_counts"]["verified"])
         self.assertEqual(1, snapshot["active_state_counts"]["degraded"])
 
+    def test_agent_result_only_degrades_for_impactful_retrieval_gap(self):
+        advisory = self.apply(_event(
+            "agent.result",
+            payload={
+                "node_id": "worker-advisory",
+                "completion_quality": "complete",
+                "result_receipt_sha256": SHA_A,
+                "unresolved_retrieval": {
+                    "quality_impact": "advisory",
+                },
+            },
+        ))
+        legacy = self.apply(_event(
+            "agent.result",
+            seq=2,
+            payload={
+                "node_id": "worker-legacy",
+                "completion_quality": "complete",
+                "result_receipt_sha256": SHA_B,
+                "unresolved_retrieval": True,
+            },
+        ))
+        snapshot = self.ledger.snapshot()
+
+        self.assertTrue(advisory.applied)
+        self.assertTrue(legacy.applied)
+        self.assertEqual(1, snapshot["active_state_counts"]["verified"])
+        self.assertEqual(1, snapshot["active_state_counts"]["degraded"])
+
     def test_agent_result_retry_supersedes_failed_node_and_allows_completion(self):
         failed = self.apply(_event(
             "agent.result",

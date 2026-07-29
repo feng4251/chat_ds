@@ -1,3 +1,72 @@
+x-session-sandbox-environment: &session-sandbox-environment
+  EXECUTOR_SOCKET: /run/chat-ds-executor/executor.sock
+  EXECUTOR_SOCKET_MODE: "0660"
+  EXECUTOR_SOCKET_GID: "65533"
+  EXECUTOR_V2_AUTH_TOKEN: ${EXECUTOR_V2_AUTH_TOKEN:-}
+  SKILL_EGRESS_POLICY_TOKEN: ${EXECUTOR_V2_AUTH_TOKEN:-}
+  EXECUTOR_RUNTIME_PROFILE: session-sandbox-v1
+  EXECUTOR_WORKER_UID: "65529"
+  EXECUTOR_WORKER_GID: "65529"
+  EXECUTOR_ENFORCE_SHARED_STATE_ISOLATION: "1"
+  EXECUTOR_EXECUTION_TEMP_ROOT: /run/chatds-executor-work
+  EXECUTOR_ALLOWED_REQUEST_KINDS: >-
+    runtime_capabilities,process_lease,skill_script,declared_command,session_code,legacy_code
+  EXECUTOR_MAX_PROCESS_LEASES: "1"
+  EXECUTOR_MAX_PROCESS_LEASES_PER_SCOPE: "1"
+  EXECUTOR_MAX_ADDRESS_SPACE_BYTES: "unlimited"
+  EXECUTOR_PROCESS_MAX_CPU_SECONDS: "3600"
+  # RLIMIT_NPROC is host-real-UID-global across the four containers.  The
+  # per-slot cgroup pids_limit below remains the actual hard concurrency bound.
+  EXECUTOR_PROCESS_MAX_NPROC: "4096"
+  EXECUTOR_PROCESS_MAX_NOFILE: "1024"
+  SE_OFFLINE: "true"
+  SE_AVOID_STATS: "true"
+  SE_AVOID_BROWSER_DOWNLOAD: "true"
+
+x-session-sandbox-slot: &session-sandbox-slot
+  image: chat_ds-session-sandbox
+  build:
+    context: ./executor
+    dockerfile: Dockerfile.browser-runtime
+    target: session-sandbox
+  restart: unless-stopped
+  depends_on:
+    skill-egress-proxy:
+      condition: service_healthy
+  network_mode: none
+  user: "0:0"
+  group_add:
+    - "65530"
+  read_only: true
+  pids_limit: 512
+  mem_limit: 3g
+  cpus: 2.0
+  environment: *session-sandbox-environment
+  cap_drop:
+    - ALL
+  cap_add:
+    - CHOWN
+    - DAC_OVERRIDE
+    - FOWNER
+    - KILL
+    - SETGID
+    - SETUID
+    - SYS_CHROOT
+  security_opt:
+    - no-new-privileges:true
+    - seccomp:./executor/browser_runtime/seccomp_profile.json
+  healthcheck:
+    test: ["CMD", "python", "-I", "/app/server.py", "--healthcheck"]
+    interval: 5s
+    timeout: 3s
+    retries: 20
+    start_period: 15s
+  tmpfs:
+    - /tmp:size=1536m,mode=0755
+    - /dev/shm:size=768m,mode=0755
+    - /run/chatds-executor-work:size=1536m,mode=0755,exec
+  stop_grace_period: 20s
+
 services:
 
   searxng-valkey:
@@ -76,94 +145,32 @@ services:
       start_period: 15s
 
   executor:
-    build:
-      context: ./executor
+    <<: *session-sandbox-slot
     container_name: chat_acits_executor
-    restart: unless-stopped
-    network_mode: none
-    # The controller owns the UDS and process lifecycle. Every untrusted child
-    # is spawned by prlimit under a fixed identity reserved for this lane.
-    # RLIMIT_NPROC is host-UID-global, so do not reuse the host's conventional
-    # nobody identity or either browser lane's worker identity.
-    user: "0:0"
-    read_only: true
-    pids_limit: 64
-    mem_limit: 3g
-    cpus: 2.0
-    environment:
-      EXECUTOR_V2_AUTH_TOKEN: ${EXECUTOR_V2_AUTH_TOKEN:-}
-      EXECUTOR_RUNTIME_PROFILE: base-v1
-      EXECUTOR_WORKER_UID: "65528"
-      EXECUTOR_WORKER_GID: "65528"
-      EXECUTOR_ENFORCE_SHARED_STATE_ISOLATION: "1"
-      # Exact Skill snapshots live on a controller-owned, lease-private,
-      # executable tmpfs. Global /tmp stays noexec; only supported immutable
-      # script suffixes receive an execute bit.
-      EXECUTOR_EXECUTION_TEMP_ROOT: /run/chatds-executor-work
-      # Preserve every current v1 request while making newly added request
-      # kinds fail closed until the deployment list is reviewed.
-      EXECUTOR_ALLOWED_REQUEST_KINDS: >-
-        runtime_capabilities,process_lease,skill_script,declared_command,session_code,legacy_code
-      # One dedicated worker UID is serialized across v1 and persistent
-      # execution so unrelated untrusted processes never overlap.
-      EXECUTOR_MAX_PROCESS_LEASES: "1"
-      EXECUTOR_MAX_PROCESS_LEASES_PER_SCOPE: "1"
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - DAC_OVERRIDE
-      - FOWNER
-      - KILL
-      - SETGID
-      - SETUID
-    security_opt:
-      - no-new-privileges:true
-      # Shared executor deny-by-default profile. The base lane has no
-      # SYS_ADMIN/SYS_CHROOT capability; removed SysV/POSIX IPC calls remain
-      # unavailable to every untrusted Skill process.
-      - seccomp:./executor/runtime/seccomp_profile.json
-    healthcheck:
-      test: ["CMD", "python", "-I", "/app/server.py", "--healthcheck"]
-      interval: 2s
-      timeout: 2s
-      retries: 15
-    tmpfs:
-      # The controller creates/chowns one private tree per execution. The
-      # fixed worker UID cannot leave cross-session files in global /tmp.
-      - /tmp:size=1g,mode=0755
-      - /dev/shm:size=64m,mode=0755
-      - /run/chatds-executor-work:size=1g,mode=0755,exec
     volumes:
       - executor_socket:/run/chat-ds-executor
+      - skill_egress_proxy_socket:/run/chatds-skill-egress:ro
 
-  # Initialize the process-only browser executor socket with a shared
-  # traversal group. Harness receives only a read-only view of this
-  # volume and never receives the proxy socket authority.
-  skill-browser-executor-socket-init:
-    image: chat_ds-skill-browser-executor
-    pull_policy: never
-    container_name: chat_acits_skill_browser_executor_socket_init
-    restart: "no"
-    network_mode: none
-    user: "0:0"
-    read_only: true
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - FOWNER
-    security_opt:
-      - no-new-privileges:true
-    entrypoint: ["/bin/sh", "-ec"]
-    command:
-      - >-
-        test -d /run/chat-ds-skill-browser-executor &&
-        test ! -L /run/chat-ds-skill-browser-executor &&
-        chown 0:65533 /run/chat-ds-skill-browser-executor &&
-        chmod 0750 /run/chat-ds-skill-browser-executor
+  executor-2:
+    <<: *session-sandbox-slot
+    container_name: chat_acits_executor_2
     volumes:
-      - skill_browser_executor_socket:/run/chat-ds-skill-browser-executor
+      - executor_socket_2:/run/chat-ds-executor
+      - skill_egress_proxy_socket:/run/chatds-skill-egress:ro
+
+  executor-3:
+    <<: *session-sandbox-slot
+    container_name: chat_acits_executor_3
+    volumes:
+      - executor_socket_3:/run/chat-ds-executor
+      - skill_egress_proxy_socket:/run/chatds-skill-egress:ro
+
+  executor-4:
+    <<: *session-sandbox-slot
+    container_name: chat_acits_executor_4
+    volumes:
+      - executor_socket_4:/run/chat-ds-executor
+      - skill_egress_proxy_socket:/run/chatds-skill-egress:ro
 
   # The proxy socket directory is owned by the proxy identity. Its setgid
   # bridge group is injected only into the root controller; worker children
@@ -182,6 +189,12 @@ services:
       - ALL
     cap_add:
       - CHOWN
+      # The proxy-only trust directory is deliberately 0700 and owned by the
+      # runtime proxy UID. The root initializer needs DAC_OVERRIDE to inspect
+      # its expected files on restart. A 1/2-file first-generation prefix is
+      # admitted only while no public trust member exists; the proxy then
+      # validates ownership/type and regenerates it crash-safely.
+      - DAC_OVERRIDE
       - FOWNER
     security_opt:
       - no-new-privileges:true
@@ -190,12 +203,41 @@ services:
       - >-
         test -d /run/chatds-skill-egress &&
         test ! -L /run/chatds-skill-egress &&
+        test -d /var/lib/chatds-skill-egress-private &&
+        test ! -L /var/lib/chatds-skill-egress-private &&
+        private_count=0 &&
+        for name in ca.key ca.pem leaf.key; do
+          if test -e "/var/lib/chatds-skill-egress-private/$$name" ||
+             test -L "/var/lib/chatds-skill-egress-private/$$name"; then
+            private_count=$$((private_count + 1));
+          fi;
+        done &&
+        if test "$$private_count" -lt 3; then
+          test ! -e /run/chatds-skill-egress/generation.json &&
+          test ! -L /run/chatds-skill-egress/generation.json &&
+          if test -e /run/chatds-skill-egress/ca.pem ||
+             test -L /run/chatds-skill-egress/ca.pem ||
+             test -e /run/chatds-skill-egress/leaf.spki ||
+            test -L /run/chatds-skill-egress/leaf.spki; then
+            test "$$private_count" -eq 0 &&
+            test "$$SKILL_EGRESS_ALLOW_LEGACY_TRUST_MIGRATION" = 1 &&
+            rm -f /run/chatds-skill-egress/ca.pem /run/chatds-skill-egress/leaf.spki;
+          fi;
+        fi &&
         chown 65531:65530 /run/chatds-skill-egress &&
-        chmod 2710 /run/chatds-skill-egress
+        chmod 2710 /run/chatds-skill-egress &&
+        chown 65531:65531 /var/lib/chatds-skill-egress-private &&
+        chmod 0700 /var/lib/chatds-skill-egress-private
+    environment:
+      # Set to 1 only for the drained, one-time migration from the legacy
+      # public-only trust volume. A normal restart must leave this at 0.
+      SKILL_EGRESS_ALLOW_LEGACY_TRUST_MIGRATION: >-
+        ${SKILL_EGRESS_ALLOW_LEGACY_TRUST_MIGRATION:-0}
     volumes:
       - skill_egress_proxy_socket:/run/chatds-skill-egress
+      - skill_egress_proxy_private:/var/lib/chatds-skill-egress-private
 
-  # The policy proxy is the only browser-Skill component with a network
+  # The policy proxy is the only session-sandbox component with a network
   # attachment. It validates and pins every destination before forwarding.
   skill-egress-proxy:
     image: chat_ds-skill-egress-proxy
@@ -220,15 +262,35 @@ services:
       - no-new-privileges:true
     environment:
       SKILL_EGRESS_SOCKET_PATH: /run/chatds-skill-egress/proxy.sock
+      SKILL_EGRESS_PRIVATE_TRUST_DIRECTORY: >-
+        /var/lib/chatds-skill-egress-private
+      SKILL_EGRESS_POLICY_TOKEN: ${EXECUTOR_V2_AUTH_TOKEN:-}
       SKILL_EGRESS_PUBLIC_PORTS: ${SKILL_EGRESS_PUBLIC_PORTS:-80,443}
+      # Private egress needs all three independent gates: the current user
+      # turn, this deployment allowlist, and the executor-signed run policy.
+      # Hostname origins additionally require every DNS answer to remain
+      # inside the configured CIDRs; literal IP origins are pinned exactly.
+      SKILL_EGRESS_PRIVATE_ORIGIN_ALLOWLIST: ${BROWSER_PRIVATE_ORIGIN_ALLOWLIST:-}
+      SKILL_EGRESS_PRIVATE_CIDR_ALLOWLIST: ${SKILL_EGRESS_PRIVATE_CIDR_ALLOWLIST:-}
+      # Preferred certificate exceptions are scoped to canonical HTTPS
+      # origins as JSON.  The legacy pin list is only consulted after the
+      # signed run origin, deployment private-origin and address/CIDR gates
+      # have all succeeded; neither setting grants destination authority.
+      SKILL_EGRESS_UPSTREAM_TLS_SPKI_PINS: ${SKILL_EGRESS_UPSTREAM_TLS_SPKI_PINS:-}
+      BROWSER_TLS_SPKI_ALLOWLIST: ${BROWSER_TLS_SPKI_ALLOWLIST:-}
       SKILL_EGRESS_CONNECT_TIMEOUT_SECONDS: ${SKILL_EGRESS_CONNECT_TIMEOUT_SECONDS:-10}
       SKILL_EGRESS_IDLE_TIMEOUT_SECONDS: ${SKILL_EGRESS_IDLE_TIMEOUT_SECONDS:-30}
       SKILL_EGRESS_MAX_TUNNEL_SECONDS: ${SKILL_EGRESS_MAX_TUNNEL_SECONDS:-600}
-      SKILL_EGRESS_MAX_CONCURRENT_CONNECTIONS: ${SKILL_EGRESS_MAX_CONCURRENT_CONNECTIONS:-64}
+      # Four homogeneous executor slots expose at most eight bridge
+      # connections each. Keep the global proxy ceiling equal to that fixed
+      # topology so one execution cannot consume every proxy worker.
+      SKILL_EGRESS_MAX_CONCURRENT_CONNECTIONS: ${SKILL_EGRESS_MAX_CONCURRENT_CONNECTIONS:-32}
     tmpfs:
       - /tmp:size=64m,mode=1777
     volumes:
       - skill_egress_proxy_socket:/run/chatds-skill-egress
+      # Private CA/leaf keys never enter any executor mount.
+      - skill_egress_proxy_private:/var/lib/chatds-skill-egress-private
     networks:
       - browser_egress
     healthcheck:
@@ -237,94 +299,6 @@ services:
       timeout: 3s
       retries: 12
       start_period: 5s
-
-  # Fixed browser worker pool: the root controller owns the UDS server and a
-  # fixed loopback-to-proxy-UDS byte bridge. A private per-process Weston
-  # compositor runs only after the worker UID/GID drop. The Skill child has no
-  # supplementary groups or network interface.
-  skill-browser-executor:
-    image: chat_ds-skill-browser-executor
-    build:
-      context: ./executor
-      dockerfile: Dockerfile.browser-runtime
-      target: browser-executor
-    container_name: chat_acits_skill_browser_executor
-    restart: unless-stopped
-    depends_on:
-      skill-browser-executor-socket-init:
-        condition: service_completed_successfully
-      skill-egress-proxy:
-        condition: service_healthy
-    network_mode: none
-    user: "0:0"
-    group_add:
-      - "65530"
-    read_only: true
-    # Chromium 150's headed Wayland path uses roughly 200 threads before a
-    # content renderer is created. Keep a bounded but realistic single-lease
-    # budget for renderer/tab subprocesses.
-    pids_limit: 512
-    mem_limit: 3g
-    cpus: 2.0
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - DAC_OVERRIDE
-      - FOWNER
-      - KILL
-      - SETGID
-      - SETUID
-      # Chromium's namespace sandbox pivots into its own root. The worker has
-      # neither SYS_ADMIN nor a network interface.
-      - SYS_CHROOT
-    security_opt:
-      - no-new-privileges:true
-      # Playwright v1.61's pinned Docker profile with Chromium namespace calls
-      # retained and unused cross-process IPC families removed.
-      - seccomp:./executor/browser_runtime/seccomp_profile.json
-    environment:
-      EXECUTOR_SOCKET: /run/chat-ds-skill-browser-executor/executor.sock
-      EXECUTOR_SOCKET_MODE: "0660"
-      EXECUTOR_SOCKET_GID: "65533"
-      EXECUTOR_V2_AUTH_TOKEN: ${EXECUTOR_V2_AUTH_TOKEN:-}
-      EXECUTOR_RUNTIME_PROFILE: browser-automation-v1
-      # Deliberately distinct from legacy browser UID/GID 65532. RLIMIT_NPROC
-      # is host-UID-global even across container PID namespaces.
-      EXECUTOR_WORKER_UID: "65529"
-      EXECUTOR_WORKER_GID: "65529"
-      EXECUTOR_ENFORCE_SHARED_STATE_ISOLATION: "1"
-      EXECUTOR_EXECUTION_TEMP_ROOT: /run/chatds-executor-work
-      EXECUTOR_ALLOWED_REQUEST_KINDS: runtime_capabilities,process_lease
-      EXECUTOR_MAX_PROCESS_LEASES: "1"
-      EXECUTOR_MAX_PROCESS_LEASES_PER_SCOPE: "1"
-      # Chromium/V8 uses architecture- and page-dependent sparse virtual
-      # mappings, so a finite RLIMIT_AS is not a sound RSS control. Physical
-      # memory remains independently hard-capped by the 3 GiB cgroup.
-      EXECUTOR_MAX_ADDRESS_SPACE_BYTES: "unlimited"
-      EXECUTOR_PROCESS_MAX_CPU_SECONDS: "3600"
-      EXECUTOR_PROCESS_MAX_NPROC: "448"
-      EXECUTOR_PROCESS_MAX_NOFILE: "1024"
-      SKILL_EGRESS_PROXY_URL: http://127.0.0.1:18080
-      SE_OFFLINE: "true"
-      SE_AVOID_STATS: "true"
-      SE_AVOID_BROWSER_DOWNLOAD: "true"
-    tmpfs:
-      # Chromium is forced to use the lease TMPDIR. Neither global writable
-      # root is available for cross-lease sentinels or storage exhaustion.
-      - /tmp:size=1536m,mode=0755
-      - /dev/shm:size=768m,mode=0755
-      - /run/chatds-executor-work:size=1536m,mode=0755,exec
-    volumes:
-      - skill_browser_executor_socket:/run/chat-ds-skill-browser-executor
-      - skill_egress_proxy_socket:/run/chatds-skill-egress:ro
-    healthcheck:
-      test: ["CMD", "python", "-I", "/app/server.py", "--healthcheck"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
-      start_period: 15s
-    stop_grace_period: 20s
 
   # A one-shot, networkless permission initializer is retained even though a
   # brand-new volume copies the sidecar image's ownership metadata.  It also
@@ -402,9 +376,13 @@ services:
     depends_on:
       executor:
         condition: service_healthy
-      browser:
+      executor-2:
         condition: service_healthy
-      skill-browser-executor:
+      executor-3:
+        condition: service_healthy
+      executor-4:
+        condition: service_healthy
+      browser:
         condition: service_healthy
     environment:
       # Backward-compatible env key; this endpoint serves AgentModel (GLM-5.2).
@@ -441,9 +419,16 @@ services:
       # No CDP port or browser service name exists on chat_net.
       BROWSER_CDP_SOCKET: /run/chat-ds-browser/cdp.sock
       BROWSER_CDP_CONNECT_TIMEOUT_SECONDS: ${BROWSER_CDP_CONNECT_TIMEOUT_SECONDS:-10}
-      # Persistent browser-script leases use a separate authenticated UDS.
-      # Harness receives only the controller UDS; worker networking is absent.
-      SKILL_BROWSER_EXECUTOR_SOCKET: /run/chat-ds-skill-browser-executor/executor.sock
+      # Compatibility key intentionally resolves to the same physical sandbox.
+      # Runtime feature analysis cannot select a second execution environment.
+      SKILL_BROWSER_EXECUTOR_SOCKET: /run/chat-ds-executor/executor.sock
+      EXECUTOR_SOCKET: /run/chat-ds-executor/executor.sock
+      # Keep Backend and Harness on the same bounded sibling-flock timeout.
+      WORKSPACE_MUTATION_LOCK_TIMEOUT_SECONDS: ${WORKSPACE_MUTATION_LOCK_TIMEOUT_SECONDS:-2}
+      # Ordered physical membership is trusted Harness configuration.  Tools
+      # and model prompts receive only the content-bound logical pool digest.
+      EXECUTOR_POOL_SOCKETS: >-
+        /run/chat-ds-executor/executor.sock,/run/chat-ds-executor-2/executor.sock,/run/chat-ds-executor-3/executor.sock,/run/chat-ds-executor-4/executor.sock
       EXECUTOR_V2_AUTH_TOKEN: ${EXECUTOR_V2_AUTH_TOKEN:-}
     group_add:
       - "65533"
@@ -451,8 +436,10 @@ services:
       - ./data:/app/data
       - ./harness/data/memories:/app/data/memories
       - /nfs/temp/chat_ds:/nfs/temp/chat_ds
-      - executor_socket:/run/chat-ds-executor
-      - skill_browser_executor_socket:/run/chat-ds-skill-browser-executor:ro
+      - executor_socket:/run/chat-ds-executor:ro
+      - executor_socket_2:/run/chat-ds-executor-2:ro
+      - executor_socket_3:/run/chat-ds-executor-3:ro
+      - executor_socket_4:/run/chat-ds-executor-4:ro
       - browser_cdp_socket:/run/chat-ds-browser:ro
     networks:
       - chat_net
@@ -468,6 +455,10 @@ services:
       timeout: 3s
       retries: 12
       start_period: 10s
+    # Runtime-owned process cleanup can spend up to 60s draining an already
+    # dispatched close transaction.  Keep the Harness alive long enough to
+    # publish that terminal state before the executor slots are stopped.
+    stop_grace_period: 90s
 
   backend:
     build:
@@ -496,6 +487,12 @@ services:
       QWEN3_5_BASE_URL: ${QWEN3_5_BASE_URL:-http://10.10.132.128:1025/v1}
       AGENT_DEBUG_TRACE: ${AGENT_DEBUG_TRACE:-true}
       AGENT_EVENT_IMMEDIATE_PERSIST: ${AGENT_EVENT_IMMEDIATE_PERSIST:-true}
+      # Backend UI/upload/bootstrap mutations share Harness's sibling flock.
+      # Contention is retryable and bounded so an API request cannot hang.
+      WORKSPACE_MUTATION_LOCK_TIMEOUT_SECONDS: ${WORKSPACE_MUTATION_LOCK_TIMEOUT_SECONDS:-2}
+      WORKSPACE_ORPHAN_LOCK_TIMEOUT_SECONDS: ${WORKSPACE_ORPHAN_LOCK_TIMEOUT_SECONDS:-0.25}
+      WORKSPACE_ORPHAN_RECONCILE_LIMIT: ${WORKSPACE_ORPHAN_RECONCILE_LIMIT:-256}
+      WORKSPACE_ORPHAN_RECONCILE_INTERVAL_SECONDS: ${WORKSPACE_ORPHAN_RECONCILE_INTERVAL_SECONDS:-60}
     volumes:
       - ./data:/app/data
       - chat_ds_db:/app/db
@@ -539,9 +536,15 @@ volumes:
     driver: local
   executor_socket:
     driver: local
-  skill_browser_executor_socket:
+  executor_socket_2:
+    driver: local
+  executor_socket_3:
+    driver: local
+  executor_socket_4:
     driver: local
   skill_egress_proxy_socket:
+    driver: local
+  skill_egress_proxy_private:
     driver: local
   browser_cdp_socket:
     driver: local

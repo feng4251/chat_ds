@@ -8,6 +8,7 @@ import re
 import shutil
 import uuid
 from collections import defaultdict
+from contextlib import AsyncExitStack
 from pathlib import Path
 
 import workspace as workspace_store
@@ -39,10 +40,11 @@ from workspace import (
     MAX_WORKSPACE_FILE_CHARS,
     atomic_write_text,
     build_workspace_context,
-    ensure_workspace,
+    ensure_workspace_async,
     list_workspace_files,
     redact_trajectory_value,
-    safe_workspace_path,
+    run_session_workspace_mutation_async,
+    safe_workspace_path_in_root,
     serialize_json_list,
     workspace_file_metadata,
 )
@@ -51,6 +53,10 @@ from native_tools import DEFAULT_NATIVE_TOOL_SET, DEFAULT_NATIVE_TOOLS
 from model_routing import (
     canonical_agent_model_id,
     filter_agentic_fallback_model_ids,
+)
+from workspace_lock import (
+    WORKSPACE_MUTATION_LOCK_FILENAME,
+    run_sync_cancellation_safe,
 )
 
 router = APIRouter(prefix="/api/conversations", tags=["workspace"])
@@ -65,6 +71,7 @@ async def _conversation(cid: str, user_id: str, db: AsyncSession) -> Conversatio
     )).scalar_one_or_none()
     if conv is None:
         raise HTTPException(404, "Conversation not found")
+    workspace_store.require_session_workspace_active(user_id, cid)
     return conv
 
 
@@ -87,7 +94,7 @@ async def workspace_files(
     db=Depends(get_db),
 ):
     await _conversation(cid, user.id, db)
-    ensure_workspace(user.id, cid)
+    await ensure_workspace_async(user.id, cid)
     return {
         "files": list_workspace_files(user.id, cid),
         "context_preview": build_workspace_context(user.id, cid),
@@ -102,8 +109,13 @@ async def read_workspace_file(
     db=Depends(get_db),
 ):
     await _conversation(cid, user.id, db)
+    workspace = await ensure_workspace_async(user.id, cid)
     try:
-        file_path = safe_workspace_path(user.id, cid, path, must_exist=True)
+        file_path = safe_workspace_path_in_root(
+            workspace,
+            path,
+            must_exist=True,
+        )
     except FileNotFoundError:
         raise HTTPException(404, "File not found")
     except ValueError as exc:
@@ -142,8 +154,13 @@ async def raw_workspace_file(
     db=Depends(get_db),
 ):
     await _conversation(cid, user.id, db)
+    workspace = await ensure_workspace_async(user.id, cid)
     try:
-        file_path = safe_workspace_path(user.id, cid, path, must_exist=True)
+        file_path = safe_workspace_path_in_root(
+            workspace,
+            path,
+            must_exist=True,
+        )
     except FileNotFoundError:
         raise HTTPException(404, "File not found")
     except ValueError as exc:
@@ -164,13 +181,17 @@ async def write_workspace_file(
     db=Depends(get_db),
 ):
     await _conversation(cid, user.id, db)
-    try:
-        file_path = safe_workspace_path(user.id, cid, path)
-    except ValueError as exc:
-        raise HTTPException(400, str(exc))
     if Path(path).name.startswith(".env") and Path(path).name != ".env.example":
         raise HTTPException(400, "Secret-bearing .env files are not allowed")
-    atomic_write_text(file_path, payload.content)
+
+    def _write(workspace: Path) -> None:
+        file_path = safe_workspace_path_in_root(workspace, path)
+        atomic_write_text(file_path, payload.content)
+
+    try:
+        await run_session_workspace_mutation_async(user.id, cid, _write)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     return {"ok": True, "path": path, "size": len(payload.content)}
 
 
@@ -184,13 +205,23 @@ async def delete_workspace_file(
     await _conversation(cid, user.id, db)
     if Path(path).name in {"AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "MEMORY.md"}:
         raise HTTPException(400, "Bootstrap files can be emptied but not deleted")
+
+    def _delete(workspace: Path) -> None:
+        file_path = safe_workspace_path_in_root(
+            workspace,
+            path,
+            must_exist=True,
+        )
+        if not file_path.is_file():
+            raise HTTPException(400, "Not a regular file")
+        file_path.unlink()
+
     try:
-        file_path = safe_workspace_path(user.id, cid, path, must_exist=True)
+        await run_session_workspace_mutation_async(user.id, cid, _delete)
     except FileNotFoundError:
         raise HTTPException(404, "File not found")
     except ValueError as exc:
         raise HTTPException(400, str(exc))
-    file_path.unlink()
     return {"ok": True}
 
 
@@ -399,6 +430,369 @@ def _fork_snapshot_sha256(
     ).hexdigest()
 
 
+def _fork_lifecycle_operation_id(
+    *,
+    user_id: str,
+    source_id: str,
+    target_id: str,
+    snapshot_sha256: str,
+) -> str:
+    return hashlib.sha256(
+        "\0".join((
+            "fork-v1",
+            str(user_id),
+            str(source_id),
+            str(target_id),
+            str(snapshot_sha256),
+        )).encode("utf-8")
+    ).hexdigest()
+
+
+def _prepare_fork_skill_snapshot(
+    *,
+    operation_dir: Path,
+    staged_workspace_root: Path,
+    staged_skill_root: Path,
+    source_skill_scope: Path,
+    source: Conversation,
+    messages: list[Message],
+    source_skills: list[SkillPackage],
+    expected_title: str,
+    include_messages: bool,
+    user_id: str,
+    source_id: str,
+    target_id: str,
+    skill_api,
+) -> dict:
+    """Copy/digest/persist a fork stage entirely off the asyncio loop."""
+
+    try:
+        staged_skill_root.mkdir(parents=True)
+        if source_skill_scope.is_symlink():
+            raise HTTPException(
+                status_code=409,
+                detail="Source Skill scope must not be a symbolic link",
+            )
+        for skill in source_skills:
+            source_member = source_skill_scope / str(skill.name)
+            if not source_member.is_dir() or source_member.is_symlink():
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Source Skill '{skill.name}' is missing "
+                        "from the fork snapshot"
+                    ),
+                )
+            shutil.copytree(
+                source_member,
+                staged_skill_root / str(skill.name),
+                symlinks=True,
+            )
+        bundle_ids = sorted({
+            str(skill.bundle_id)
+            for skill in source_skills
+            if skill.bundle_id
+        })
+        for bundle_id in bundle_ids:
+            source_runtime = (
+                source_skill_scope / "_bundle_runtime" / bundle_id
+            )
+            if source_runtime.is_symlink():
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Source Skill runtime must not be a symbolic link"
+                    ),
+                )
+            if source_runtime.is_dir():
+                shutil.copytree(
+                    source_runtime,
+                    staged_skill_root / "_bundle_runtime" / bundle_id,
+                    symlinks=True,
+                )
+
+        workspace_digest = _fork_directory_digest(
+            staged_workspace_root,
+            skill_api,
+            ignore_workspace_lock=True,
+        )
+        skills_digest = skill_api._directory_digest(staged_skill_root)
+        snapshot_sha256 = _fork_snapshot_sha256(
+            source=source,
+            messages=messages,
+            skills=source_skills,
+            title=expected_title,
+            include_messages=include_messages,
+            workspace_digest=workspace_digest,
+            skills_digest=skills_digest,
+        )
+        journal = {
+            "version": 1,
+            "kind": "fork",
+            "user_id": user_id,
+            "source_id": source_id,
+            "target_id": target_id,
+            "title": expected_title,
+            "include_messages": include_messages,
+            "snapshot_sha256": snapshot_sha256,
+            "workspace_digest": workspace_digest,
+            "skills_digest": skills_digest,
+            "state": "prepared",
+        }
+        skill_api._atomic_write_json(
+            operation_dir / "journal.json",
+            journal,
+        )
+        return journal
+    except BaseException:
+        shutil.rmtree(operation_dir, ignore_errors=True)
+        raise
+
+
+def _create_fork_bootstrap_workspace(staged_workspace: Path) -> None:
+    staged_workspace.mkdir(parents=True)
+    for filename, content in workspace_store.BOOTSTRAP_FILES.items():
+        (staged_workspace / filename).write_text(
+            content,
+            encoding="utf-8",
+        )
+
+
+def _fork_directory_digest(
+    path: Path,
+    skill_api,
+    *,
+    ignore_workspace_lock: bool,
+) -> str:
+    if not ignore_workspace_lock:
+        return skill_api._directory_digest(path)
+    if not path.is_dir() or path.is_symlink():
+        raise HTTPException(
+            status_code=409,
+            detail="Expected immutable fork workspace is missing",
+        )
+    digest = hashlib.sha256()
+    for child in sorted(path.rglob("*")):
+        if child.is_symlink():
+            raise HTTPException(
+                status_code=409,
+                detail="Symbolic link found in immutable fork workspace",
+            )
+        if not child.is_file():
+            continue
+        relative = str(child.relative_to(path)).replace("\\", "/")
+        # The shared Backend/Harness flock is session lifecycle metadata, not
+        # user workspace content. It can legitimately appear after publish
+        # and must not invalidate the immutable fork snapshot.
+        if relative == WORKSPACE_MUTATION_LOCK_FILENAME:
+            continue
+        data_digest = skill_api._sha256_file(child)
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(child.stat().st_size).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(data_digest.encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _fork_directory_matches(
+    path: Path,
+    digest: str,
+    skill_api,
+    *,
+    ignore_workspace_lock: bool = False,
+) -> bool:
+    return (
+        path.is_dir()
+        and not path.is_symlink()
+        and _fork_directory_digest(
+            path,
+            skill_api,
+            ignore_workspace_lock=ignore_workspace_lock,
+        ) == digest
+    )
+
+
+def _cleanup_uncommitted_fork_filesystem(
+    *,
+    target_workspace_root: Path,
+    target_skill_dir: Path,
+    operation_dir: Path,
+    journal: dict,
+    skill_api,
+    published_workspace: tuple[Path, int, int] | None = None,
+    published_skills: tuple[Path, int, int] | None = None,
+) -> None:
+    if published_skills is not None:
+        skill_api._remove_request_owned_directory(published_skills)
+    elif _fork_directory_matches(
+        target_skill_dir,
+        str(journal.get("skills_digest") or ""),
+        skill_api,
+    ):
+        shutil.rmtree(target_skill_dir, ignore_errors=True)
+    if published_workspace is not None:
+        skill_api._remove_request_owned_directory(published_workspace)
+    elif _fork_directory_matches(
+        target_workspace_root,
+        str(journal.get("workspace_digest") or ""),
+        skill_api,
+        ignore_workspace_lock=True,
+    ):
+        shutil.rmtree(target_workspace_root, ignore_errors=True)
+    shutil.rmtree(operation_dir, ignore_errors=True)
+
+
+def _cleanup_uncommitted_fork_transaction(
+    *,
+    user_id: str,
+    target_id: str,
+    pending_operation_id: str,
+    target_workspace_root: Path,
+    target_skill_dir: Path,
+    operation_dir: Path,
+    journal: dict,
+    skill_api,
+    published_workspace: tuple[Path, int, int] | None = None,
+    published_skills: tuple[Path, int, int] | None = None,
+) -> None:
+    try:
+        _cleanup_uncommitted_fork_filesystem(
+            target_workspace_root=target_workspace_root,
+            target_skill_dir=target_skill_dir,
+            operation_dir=operation_dir,
+            journal=journal,
+            skill_api=skill_api,
+            published_workspace=published_workspace,
+            published_skills=published_skills,
+        )
+    finally:
+        workspace_store.clear_session_pending_fence(
+            user_id,
+            target_id,
+            pending_operation_id,
+        )
+
+
+def _publish_fork_filesystem(
+    *,
+    target_workspace_root: Path,
+    target_skill_dir: Path,
+    staged_workspace_root: Path,
+    staged_skill_root: Path,
+    journal_path: Path,
+    journal: dict,
+    skill_api,
+) -> tuple[
+    tuple[Path, int, int] | None,
+    tuple[Path, int, int] | None,
+]:
+    """Validate and publish both fork trees in one off-loop transaction."""
+
+    expected_workspace_digest = str(
+        journal.get("workspace_digest") or ""
+    )
+    expected_skills_digest = str(journal.get("skills_digest") or "")
+    published_workspace: tuple[Path, int, int] | None = None
+    published_skills: tuple[Path, int, int] | None = None
+    if target_workspace_root.exists():
+        if not _fork_directory_matches(
+            target_workspace_root,
+            expected_workspace_digest,
+            skill_api,
+            ignore_workspace_lock=True,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Published fork workspace drifted",
+            )
+    else:
+        if not _fork_directory_matches(
+            staged_workspace_root,
+            expected_workspace_digest,
+            skill_api,
+            ignore_workspace_lock=True,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Staged fork workspace is incomplete",
+            )
+        target_workspace_root.parent.mkdir(parents=True, exist_ok=True)
+        published_workspace = skill_api._publish_staged_directory(
+            staged_workspace_root,
+            target_workspace_root,
+        )
+
+    if target_skill_dir.exists():
+        if not _fork_directory_matches(
+            target_skill_dir,
+            expected_skills_digest,
+            skill_api,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Published fork Skill snapshot drifted",
+            )
+    else:
+        if not _fork_directory_matches(
+            staged_skill_root,
+            expected_skills_digest,
+            skill_api,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Staged fork Skill snapshot is incomplete",
+            )
+        target_skill_dir.parent.mkdir(parents=True, exist_ok=True)
+        published_skills = skill_api._publish_staged_directory(
+            staged_skill_root,
+            target_skill_dir,
+        )
+
+    journal["state"] = "published"
+    skill_api._atomic_write_json(journal_path, journal)
+    return published_workspace, published_skills
+
+
+def _verify_committed_fork_filesystem(
+    *,
+    target_workspace_root: Path,
+    target_skill_dir: Path,
+    journal: dict,
+    skill_api,
+) -> bool:
+    return (
+        _fork_directory_matches(
+            target_workspace_root,
+            str(journal.get("workspace_digest") or ""),
+            skill_api,
+            ignore_workspace_lock=True,
+        )
+        and _fork_directory_matches(
+            target_skill_dir,
+            str(journal.get("skills_digest") or ""),
+            skill_api,
+        )
+    )
+
+
+def _complete_fork_journal(
+    *,
+    operation_dir: Path,
+    journal_path: Path,
+    journal: dict,
+    mcp_rebuild: dict,
+    skill_api,
+) -> None:
+    shutil.rmtree(operation_dir / "staging", ignore_errors=True)
+    journal["state"] = "completed"
+    journal["mcp_status"] = str(
+        (mcp_rebuild.get("mcp") or {}).get("status") or "unknown"
+    )
+    skill_api._atomic_write_json(journal_path, journal)
+
+
 @router.post("/{cid}/fork")
 async def fork_conversation(
     cid: str,
@@ -407,6 +801,27 @@ async def fork_conversation(
     fork_id: str | None = None,
     user=Depends(get_current_user),
     db=Depends(get_db),
+):
+    return await _fork_conversation_impl(
+        cid,
+        title=title,
+        include_messages=include_messages,
+        fork_id=fork_id,
+        user=user,
+        db=db,
+        source_maintenance_lease_already_held=False,
+    )
+
+
+async def _fork_conversation_impl(
+    cid: str,
+    *,
+    title: str | None,
+    include_messages: bool,
+    fork_id: str | None,
+    user,
+    db,
+    source_maintenance_lease_already_held: bool,
 ):
     from routers import skill_router as skill_api
 
@@ -419,6 +834,18 @@ async def fork_conversation(
                 status_code=400,
                 detail="fork_id must be a 32-character lowercase hex identifier",
             )
+    if target_id == cid:
+        raise HTTPException(
+            status_code=409,
+            detail="A fork target must differ from its source conversation",
+        )
+    # An exact retry is the only operation allowed to enter a target that is
+    # durably fenced by an earlier post-commit fork failure. Deletion remains
+    # authoritative and is never bypassed.
+    workspace_store.require_session_workspace_not_deleted(
+        user.id,
+        target_id,
+    )
 
     operation_dir = skill_api._skill_operation_dir(
         user_id=user.id,
@@ -433,11 +860,43 @@ async def fork_conversation(
     caller_cancellation: BaseException | None = None
     idempotent = False
 
-    # A fork copies a Skill snapshot from one scope into another. Always lock
-    # source first, then the newly allocated target, and retain both locks
-    # through DB projection and MCP reconciliation.
-    async with skill_api._skill_install_lock(user.id, cid):
-        async with skill_api._skill_install_lock(user.id, target_id):
+    # Retain both lifecycle locks through snapshot, DB projection, and MCP
+    # reconciliation. Stable ordering prevents opposite-direction forks from
+    # deadlocking, and delete/install use the same per-session lock.
+    async with AsyncExitStack() as lifecycle_locks:
+        from session_lifecycle import session_skill_lifecycle_lock
+
+        for session_id in sorted({cid, target_id}):
+            await lifecycle_locks.enter_async_context(
+                session_skill_lifecycle_lock(
+                    user.id,
+                    session_id,
+                    bounded=(
+                        source_maintenance_lease_already_held
+                        and session_id == cid
+                    ),
+                )
+            )
+        from routers.chat_router import conversation_maintenance_lease
+        # A known target id must not admit chat between its DB commit and the
+        # digest/MCP/journal tail. Hold both conversation barriers in the same
+        # stable order as the Skill lifecycle locks until the fork transaction
+        # is fully completed.
+        for session_id in sorted({cid, target_id}):
+            if (
+                source_maintenance_lease_already_held
+                and session_id == cid
+            ):
+                continue
+            await lifecycle_locks.enter_async_context(
+                conversation_maintenance_lease(session_id)
+            )
+        workspace_store.require_session_workspace_active(user.id, cid)
+        workspace_store.require_session_workspace_not_deleted(
+            user.id,
+            target_id,
+        )
+        if True:
             source = await _conversation(cid, user.id, db)
             target = (await db.execute(
                 select(Conversation).where(
@@ -457,7 +916,9 @@ async def fork_conversation(
                 ).order_by(SkillPackage.name, SkillPackage.id)
             )).scalars().all())
 
-            journal = skill_api._read_operation_journal(journal_path)
+            journal = await run_sync_cancellation_safe(
+                lambda: skill_api._read_operation_journal(journal_path)
+            )
             expected_title = title or ((source.title or "会话") + " · 分支")
             recovering_committed = target is not None
             if recovering_committed:
@@ -514,7 +975,12 @@ async def fork_conversation(
                         detail="fork_id already has unowned filesystem state",
                     )
                 if operation_dir.exists():
-                    shutil.rmtree(operation_dir, ignore_errors=True)
+                    await run_sync_cancellation_safe(
+                        lambda: shutil.rmtree(
+                            operation_dir,
+                            ignore_errors=True,
+                        )
+                    )
                 try:
                     staged_workspace = staged_workspace_root / "workspace"
                     source_workspace = (
@@ -523,92 +989,71 @@ async def fork_conversation(
                         / cid
                         / "workspace"
                     )
+                    if source_workspace.is_symlink():
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "Source workspace root must not be a "
+                                "symbolic link"
+                            ),
+                        )
                     if source_workspace.is_dir():
-                        shutil.copytree(
-                            source_workspace,
-                            staged_workspace,
-                            symlinks=True,
-                        )
-                    else:
-                        staged_workspace.mkdir(parents=True)
-                        for filename, content in (
-                            workspace_store.BOOTSTRAP_FILES.items()
-                        ):
-                            (staged_workspace / filename).write_text(
-                                content,
-                                encoding="utf-8",
-                            )
-
-                    staged_skill_root.mkdir(parents=True)
-                    source_skill_scope = (
-                        skill_api.SKILLS_DATA_DIR / user.id / cid
-                    )
-                    for skill in source_skills:
-                        source_member = source_skill_scope / str(skill.name)
-                        if not source_member.is_dir() or source_member.is_symlink():
-                            raise HTTPException(
-                                status_code=409,
-                                detail=(
-                                    f"Source Skill '{skill.name}' is missing "
-                                    "from the fork snapshot"
-                                ),
-                            )
-                        shutil.copytree(
-                            source_member,
-                            staged_skill_root / str(skill.name),
-                            symlinks=True,
-                        )
-                    bundle_ids = sorted({
-                        str(skill.bundle_id)
-                        for skill in source_skills
-                        if skill.bundle_id
-                    })
-                    for bundle_id in bundle_ids:
-                        source_runtime = (
-                            source_skill_scope
-                            / "_bundle_runtime"
-                            / bundle_id
-                        )
-                        if source_runtime.is_dir():
+                        def _copy_source_workspace(
+                            locked_source_workspace: Path,
+                        ) -> None:
+                            if locked_source_workspace.is_symlink():
+                                raise HTTPException(
+                                    status_code=409,
+                                    detail=(
+                                        "Source workspace root changed to a "
+                                        "symbolic link"
+                                    ),
+                                )
                             shutil.copytree(
-                                source_runtime,
-                                staged_skill_root
-                                / "_bundle_runtime"
-                                / bundle_id,
+                                locked_source_workspace,
+                                staged_workspace,
                                 symlinks=True,
                             )
 
-                    workspace_digest = skill_api._directory_digest(
-                        staged_workspace_root
+                        await workspace_store.run_session_workspace_mutation_async(
+                            user.id,
+                            cid,
+                            _copy_source_workspace,
+                        )
+                    else:
+                        await run_sync_cancellation_safe(
+                            lambda: _create_fork_bootstrap_workspace(
+                                staged_workspace
+                            )
+                        )
+
+                    source_skill_scope = (
+                        skill_api.SKILLS_DATA_DIR / user.id / cid
                     )
-                    skills_digest = skill_api._directory_digest(
-                        staged_skill_root
+                    journal = await run_sync_cancellation_safe(
+                        lambda: _prepare_fork_skill_snapshot(
+                            operation_dir=operation_dir,
+                            staged_workspace_root=staged_workspace_root,
+                            staged_skill_root=staged_skill_root,
+                            source_skill_scope=source_skill_scope,
+                            source=source,
+                            messages=messages,
+                            source_skills=source_skills,
+                            expected_title=expected_title,
+                            include_messages=include_messages,
+                            user_id=user.id,
+                            source_id=cid,
+                            target_id=target_id,
+                            skill_api=skill_api,
+                        )
                     )
-                    snapshot_sha256 = _fork_snapshot_sha256(
-                        source=source,
-                        messages=messages,
-                        skills=source_skills,
-                        title=expected_title,
-                        include_messages=include_messages,
-                        workspace_digest=workspace_digest,
-                        skills_digest=skills_digest,
-                    )
-                    journal = {
-                        "version": 1,
-                        "kind": "fork",
-                        "user_id": user.id,
-                        "source_id": cid,
-                        "target_id": target_id,
-                        "title": expected_title,
-                        "include_messages": include_messages,
-                        "snapshot_sha256": snapshot_sha256,
-                        "workspace_digest": workspace_digest,
-                        "skills_digest": skills_digest,
-                        "state": "prepared",
-                    }
-                    skill_api._atomic_write_json(journal_path, journal)
                 except BaseException:
-                    shutil.rmtree(operation_dir, ignore_errors=True)
+                    await run_sync_cancellation_safe(
+                        lambda: shutil.rmtree(
+                            operation_dir,
+                            ignore_errors=True,
+                        )
+                    )
                     raise
 
             if not isinstance(journal, dict):
@@ -616,114 +1061,81 @@ async def fork_conversation(
                     status_code=409,
                     detail="Fork recovery journal is missing or invalid",
                 )
+            pending_operation_id = _fork_lifecycle_operation_id(
+                user_id=user.id,
+                source_id=cid,
+                target_id=target_id,
+                snapshot_sha256=str(journal.get("snapshot_sha256") or ""),
+            )
+            await run_sync_cancellation_safe(
+                lambda: workspace_store.claim_session_pending_fence(
+                    user.id,
+                    target_id,
+                    pending_operation_id,
+                )
+            )
             if not recovering_committed:
-                current_snapshot = _fork_snapshot_sha256(
-                    source=source,
-                    messages=messages,
-                    skills=source_skills,
-                    title=expected_title,
-                    include_messages=include_messages,
-                    workspace_digest=str(
-                        journal.get("workspace_digest") or ""
-                    ),
-                    skills_digest=str(journal.get("skills_digest") or ""),
+                current_snapshot = await run_sync_cancellation_safe(
+                    lambda: _fork_snapshot_sha256(
+                        source=source,
+                        messages=messages,
+                        skills=source_skills,
+                        title=expected_title,
+                        include_messages=include_messages,
+                        workspace_digest=str(
+                            journal.get("workspace_digest") or ""
+                        ),
+                        skills_digest=str(
+                            journal.get("skills_digest") or ""
+                        ),
+                    )
                 )
                 if current_snapshot != journal.get("snapshot_sha256"):
-                    if (
-                        target_skill_dir.is_dir()
-                        and skill_api._directory_digest(target_skill_dir)
-                        == str(journal.get("skills_digest") or "")
-                    ):
-                        shutil.rmtree(target_skill_dir, ignore_errors=True)
-                    if (
-                        target_workspace_root.is_dir()
-                        and skill_api._directory_digest(
-                            target_workspace_root
-                        ) == str(journal.get("workspace_digest") or "")
-                    ):
-                        shutil.rmtree(
-                            target_workspace_root,
-                            ignore_errors=True,
+                    await run_sync_cancellation_safe(
+                        lambda: _cleanup_uncommitted_fork_transaction(
+                            user_id=user.id,
+                            target_id=target_id,
+                            pending_operation_id=pending_operation_id,
+                            target_workspace_root=target_workspace_root,
+                            target_skill_dir=target_skill_dir,
+                            operation_dir=operation_dir,
+                            journal=journal,
+                            skill_api=skill_api,
                         )
-                    shutil.rmtree(operation_dir, ignore_errors=True)
+                    )
                     raise HTTPException(
                         status_code=409,
                         detail=(
                             "Source conversation changed after fork staging; "
                             "retry with a new fork_id"
                         ),
-                    )
+                )
                 fork_committed = False
                 try:
-                    expected_workspace_digest = str(
-                        journal.get("workspace_digest") or ""
+                    if not await run_sync_cancellation_safe(
+                        lambda: workspace_store.session_pending_fence_matches(
+                            user.id,
+                            target_id,
+                            pending_operation_id,
+                        )
+                    ):
+                        raise RuntimeError(
+                            "Fork target lifecycle fence is missing"
+                        )
+                    (
+                        published_workspace,
+                        published_skills,
+                    ) = await run_sync_cancellation_safe(
+                        lambda: _publish_fork_filesystem(
+                            target_workspace_root=target_workspace_root,
+                            target_skill_dir=target_skill_dir,
+                            staged_workspace_root=staged_workspace_root,
+                            staged_skill_root=staged_skill_root,
+                            journal_path=journal_path,
+                            journal=journal,
+                            skill_api=skill_api,
+                        )
                     )
-                    expected_skills_digest = str(
-                        journal.get("skills_digest") or ""
-                    )
-                    if target_workspace_root.exists():
-                        if (
-                            skill_api._directory_digest(target_workspace_root)
-                            != expected_workspace_digest
-                        ):
-                            raise HTTPException(
-                                status_code=409,
-                                detail="Published fork workspace drifted",
-                            )
-                    else:
-                        if (
-                            not staged_workspace_root.is_dir()
-                            or skill_api._directory_digest(
-                                staged_workspace_root
-                            ) != expected_workspace_digest
-                        ):
-                            raise HTTPException(
-                                status_code=409,
-                                detail="Staged fork workspace is incomplete",
-                            )
-                        target_workspace_root.parent.mkdir(
-                            parents=True,
-                            exist_ok=True,
-                        )
-                        published_workspace = (
-                            skill_api._publish_staged_directory(
-                                staged_workspace_root,
-                                target_workspace_root,
-                            )
-                        )
-
-                    if target_skill_dir.exists():
-                        if (
-                            skill_api._directory_digest(target_skill_dir)
-                            != expected_skills_digest
-                        ):
-                            raise HTTPException(
-                                status_code=409,
-                                detail="Published fork Skill snapshot drifted",
-                            )
-                    else:
-                        if (
-                            not staged_skill_root.is_dir()
-                            or skill_api._directory_digest(staged_skill_root)
-                            != expected_skills_digest
-                        ):
-                            raise HTTPException(
-                                status_code=409,
-                                detail="Staged fork Skill snapshot is incomplete",
-                            )
-                        target_skill_dir.parent.mkdir(
-                            parents=True,
-                            exist_ok=True,
-                        )
-                        published_skills = (
-                            skill_api._publish_staged_directory(
-                                staged_skill_root,
-                                target_skill_dir,
-                            )
-                        )
-
-                    journal["state"] = "published"
-                    skill_api._atomic_write_json(journal_path, journal)
                     fork = Conversation(
                         id=target_id,
                         user_id=user.id,
@@ -776,6 +1188,16 @@ async def fork_conversation(
                             bundle_root_name=skill.bundle_root_name,
                             bundle_source_path=skill.bundle_source_path,
                         ))
+                    if not await run_sync_cancellation_safe(
+                        lambda: workspace_store.session_pending_fence_matches(
+                            user.id,
+                            target_id,
+                            pending_operation_id,
+                        )
+                    ):
+                        raise RuntimeError(
+                            "Fork target lifecycle fence changed before commit"
+                        )
                     caller_cancellation = (
                         await skill_api._finish_awaitable_despite_cancellation(
                             db.commit()
@@ -783,36 +1205,30 @@ async def fork_conversation(
                     )
                     fork_committed = True
                     journal["state"] = "committed"
-                    skill_api._atomic_write_json(journal_path, journal)
+                    await run_sync_cancellation_safe(
+                        lambda: skill_api._atomic_write_json(
+                            journal_path,
+                            journal,
+                        )
+                    )
                     target = fork
                 except BaseException:
                     if not fork_committed:
                         await skill_api._rollback_database_best_effort(db)
-                        if published_skills is not None:
-                            skill_api._remove_request_owned_directory(
-                                published_skills
+                        await run_sync_cancellation_safe(
+                            lambda: _cleanup_uncommitted_fork_transaction(
+                                user_id=user.id,
+                                target_id=target_id,
+                                pending_operation_id=pending_operation_id,
+                                target_workspace_root=target_workspace_root,
+                                target_skill_dir=target_skill_dir,
+                                operation_dir=operation_dir,
+                                journal=journal,
+                                skill_api=skill_api,
+                                published_workspace=published_workspace,
+                                published_skills=published_skills,
                             )
-                        elif (
-                            target_skill_dir.is_dir()
-                            and skill_api._directory_digest(target_skill_dir)
-                            == str(journal.get("skills_digest") or "")
-                        ):
-                            shutil.rmtree(target_skill_dir, ignore_errors=True)
-                        if published_workspace is not None:
-                            skill_api._remove_request_owned_directory(
-                                published_workspace
-                            )
-                        elif (
-                            target_workspace_root.is_dir()
-                            and skill_api._directory_digest(
-                                target_workspace_root
-                            ) == str(journal.get("workspace_digest") or "")
-                        ):
-                            shutil.rmtree(
-                                target_workspace_root,
-                                ignore_errors=True,
-                            )
-                        shutil.rmtree(operation_dir, ignore_errors=True)
+                        )
                     raise
 
             if target is None:
@@ -820,14 +1236,25 @@ async def fork_conversation(
                     status_code=409,
                     detail="Fork database projection is incomplete",
                 )
-            if (
-                not target_workspace_root.is_dir()
-                or skill_api._directory_digest(target_workspace_root)
-                != str(journal.get("workspace_digest") or "")
-                or not target_skill_dir.is_dir()
-                or skill_api._directory_digest(target_skill_dir)
-                != str(journal.get("skills_digest") or "")
+            if not await run_sync_cancellation_safe(
+                lambda: workspace_store.session_pending_fence_matches(
+                    user.id,
+                    target_id,
+                    pending_operation_id,
+                )
             ):
+                raise RuntimeError(
+                    "Committed fork target lifecycle fence is missing"
+                )
+            filesystem_complete = await run_sync_cancellation_safe(
+                lambda: _verify_committed_fork_filesystem(
+                    target_workspace_root=target_workspace_root,
+                    target_skill_dir=target_skill_dir,
+                    journal=journal,
+                    skill_api=skill_api,
+                )
+            )
+            if not filesystem_complete:
                 raise HTTPException(
                     status_code=409,
                     detail="Committed fork filesystem snapshot is incomplete",
@@ -889,12 +1316,26 @@ async def fork_conversation(
                     "mcp_by_skill": {},
                     "runtime": [],
                 }
-            shutil.rmtree(operation_dir / "staging", ignore_errors=True)
-            journal["state"] = "completed"
-            journal["mcp_status"] = str(
-                (mcp_rebuild.get("mcp") or {}).get("status") or "unknown"
+            await run_sync_cancellation_safe(
+                lambda: _complete_fork_journal(
+                    operation_dir=operation_dir,
+                    journal_path=journal_path,
+                    journal=journal,
+                    mcp_rebuild=mcp_rebuild,
+                    skill_api=skill_api,
+                )
             )
-            skill_api._atomic_write_json(journal_path, journal)
+            pending_cleared = await run_sync_cancellation_safe(
+                lambda: workspace_store.clear_session_pending_fence(
+                    user.id,
+                    target_id,
+                    pending_operation_id,
+                )
+            )
+            if not pending_cleared:
+                raise RuntimeError(
+                    "Completed fork lifecycle fence was not released"
+                )
 
     if caller_cancellation is not None:
         raise caller_cancellation
@@ -1349,6 +1790,17 @@ def _explicit_recovery(payload: dict) -> tuple[bool, str]:
     return False, ""
 
 
+def _unresolved_retrieval_affects_completion_quality(value: object) -> bool:
+    """Keep legacy receipts fail-closed; only explicit advisory is neutral."""
+
+    if value is None or value is False:
+        return False
+    return not (
+        isinstance(value, dict)
+        and value.get("quality_impact") == "advisory"
+    )
+
+
 def _event_payload(event: AgentRunEvent) -> dict:
     if not event.payload:
         return {}
@@ -1554,7 +2006,9 @@ def _run_card(
     ).strip().casefold()
     if (
         not completion_quality
-        and terminal_payload.get("unresolved_retrieval") is not None
+        and _unresolved_retrieval_affects_completion_quality(
+            terminal_payload.get("unresolved_retrieval")
+        )
     ):
         completion_quality = "degraded"
     recovered, recovery_reason = _explicit_recovery(terminal_payload)

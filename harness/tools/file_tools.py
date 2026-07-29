@@ -28,7 +28,10 @@ from tools.omission_guard import (
     compacted_history_omission_error,
     contains_compacted_history_omission,
 )
-from tools.workspace_lock import workspace_mutation_guard
+from tools.workspace_lock import (
+    run_sync_cancellation_safe,
+    workspace_mutation_guard,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -179,18 +182,21 @@ async def write_file(
         return json.dumps({"error": "content must be a string"})
     if contains_compacted_history_omission(content):
         return json.dumps(compacted_history_omission_error("content"), ensure_ascii=False)
-    workspace = _sandbox_dir(user_id, session_id).resolve()
-    with workspace_mutation_guard(workspace):
-        return await _write_file_locked(
-            filepath,
-            content,
-            user_id=user_id,
-            session_id=session_id,
-            context=context,
-        )
+    def _operation() -> str:
+        workspace = _sandbox_dir(user_id, session_id).resolve()
+        with workspace_mutation_guard(workspace):
+            return _write_file_locked(
+                filepath,
+                content,
+                user_id=user_id,
+                session_id=session_id,
+                context=context,
+            )
+
+    return await run_sync_cancellation_safe(_operation)
 
 
-async def _write_file_locked(
+def _write_file_locked(
     filepath: str,
     content: str,
     user_id: str,
@@ -273,20 +279,23 @@ async def patch_file(
         return json.dumps(compacted_history_omission_error("old_text"), ensure_ascii=False)
     if contains_compacted_history_omission(new_text):
         return json.dumps(compacted_history_omission_error("new_text"), ensure_ascii=False)
-    workspace = _sandbox_dir(user_id, session_id).resolve()
-    with workspace_mutation_guard(workspace):
-        return await _patch_file_locked(
-            filepath,
-            old_text,
-            new_text,
-            replace_all=replace_all,
-            user_id=user_id,
-            session_id=session_id,
-            context=context,
-        )
+    def _operation() -> str:
+        workspace = _sandbox_dir(user_id, session_id).resolve()
+        with workspace_mutation_guard(workspace):
+            return _patch_file_locked(
+                filepath,
+                old_text,
+                new_text,
+                replace_all=replace_all,
+                user_id=user_id,
+                session_id=session_id,
+                context=context,
+            )
+
+    return await run_sync_cancellation_safe(_operation)
 
 
-async def _patch_file_locked(
+def _patch_file_locked(
     filepath: str,
     old_text: str,
     new_text: str,
@@ -457,20 +466,23 @@ async def merge_files(
     expanded in lexicographic workspace-relative order. Files selected more
     than once are included only at their first occurrence.
     """
-    workspace = _sandbox_dir(user_id, session_id).resolve()
-    with workspace_mutation_guard(workspace):
-        return await _merge_files_locked(
-            output_filepath,
-            input_files=input_files,
-            patterns=patterns,
-            separator=separator,
-            user_id=user_id,
-            session_id=session_id,
-            context=context,
-        )
+    def _operation() -> str:
+        workspace = _sandbox_dir(user_id, session_id).resolve()
+        with workspace_mutation_guard(workspace):
+            return _merge_files_locked(
+                output_filepath,
+                input_files=input_files,
+                patterns=patterns,
+                separator=separator,
+                user_id=user_id,
+                session_id=session_id,
+                context=context,
+            )
+
+    return await run_sync_cancellation_safe(_operation)
 
 
-async def _merge_files_locked(
+def _merge_files_locked(
     output_filepath: str,
     input_files: list[str] | None,
     patterns: list[str] | None,

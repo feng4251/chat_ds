@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from tools.path_security import safe_sandbox_dir
+
 WORKSPACE_ROOT = Path("/nfs/temp/chat_ds")
 MAX_CHARS = 20_000
 FILES = (
@@ -23,9 +25,12 @@ INVISIBLE = {"\u200b", "\u200c", "\u2060", "\ufeff", "\u202a", "\u202b", "\u202d
 
 
 def get_workspace(user_id: str, session_id: str) -> Path:
-    root = (WORKSPACE_ROOT / user_id / session_id / "workspace").resolve()
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    return safe_sandbox_dir(
+        WORKSPACE_ROOT,
+        user_id,
+        session_id,
+        "workspace",
+    )
 
 
 def scan(content: str, filename: str, max_chars: int = MAX_CHARS) -> str:

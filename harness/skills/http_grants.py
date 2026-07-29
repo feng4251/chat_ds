@@ -26,6 +26,7 @@ _TEXT_RESOURCE_SUFFIXES = frozenset({
     ".md", ".markdown", ".txt", ".rst", ".yaml", ".yml", ".json", ".toml",
 })
 _URL_RE = re.compile(r"https://[^\s<>\"'`]+", re.IGNORECASE)
+_SANDBOX_URL_RE = re.compile(r"https?://[^\s<>\"'`]+", re.IGNORECASE)
 # A closing brace is deliberately not treated as surrounding Markdown: it can
 # be the meaningful end of a URI-template path segment.  Complete template
 # segments are compiled below; unmatched/partial braces are rejected rather
@@ -50,6 +51,15 @@ _GRAPHQL_ENDPOINT_DECLARATION_RE = re.compile(
 _GRAPHQL_NON_ENDPOINT_RE = re.compile(
     r"\b(?:browser|playground|explorer|docs?|documentation|schema)\b",
     re.IGNORECASE,
+)
+_SANDBOX_HTTP_METHOD_ORDER = (
+    "GET",
+    "HEAD",
+    "OPTIONS",
+    "POST",
+    "PUT",
+    "PATCH",
+    "DELETE",
 )
 _EXAMPLE_HOST_SUFFIXES = (
     ".example", ".invalid", ".localhost", "example.com", "example.org", "example.net",
@@ -278,6 +288,79 @@ def canonical_https_prefix(value: Any) -> str | None:
     return urlunsplit(("https", _canonical_netloc(host), path, "", ""))
 
 
+def canonical_sandbox_http_prefix(value: Any) -> str | None:
+    """Return one exact canonical HTTP(S) path/query prefix for a sandbox.
+
+    Unlike the direct ``skill_http_*`` bridge this compiler may retain HTTP,
+    private addresses, non-default ports, and a literal query prefix.  Those
+    coordinates still confer no ambient private-network access: the runtime
+    separately intersects their derived origins with the deployment/user-turn
+    private grant before signing the executor policy.
+    """
+
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip().rstrip(_TRAILING_MARKDOWN)
+    if not candidate:
+        return None
+    if "{" in candidate or "}" in candidate:
+        try:
+            parsed = urlsplit(candidate)
+        except (TypeError, ValueError):
+            return None
+        if any(
+            "{" in component or "}" in component
+            for component in (
+                parsed.scheme,
+                parsed.netloc,
+                parsed.query,
+                parsed.fragment,
+            )
+        ):
+            return None
+        segments = parsed.path.split("/")
+        first_placeholder: int | None = None
+        for index, segment in enumerate(segments):
+            if "{" not in segment and "}" not in segment:
+                continue
+            if _URI_TEMPLATE_PATH_SEGMENT.fullmatch(segment) is None:
+                return None
+            if first_placeholder is None:
+                first_placeholder = index
+        if first_placeholder is None:
+            return None
+        prefix_path = "/".join(segments[:first_placeholder])
+        if not prefix_path.endswith("/"):
+            prefix_path += "/"
+        candidate = urlunsplit((
+            parsed.scheme,
+            parsed.netloc,
+            prefix_path or "/",
+            parsed.query,
+            "",
+        ))
+    try:
+        from tools.session_sandbox_policy import normalize_http_url_prefix
+
+        canonical = normalize_http_url_prefix(candidate)
+    except (ImportError, ValueError):
+        return None
+    try:
+        host = (urlsplit(canonical).hostname or "").casefold()
+    except ValueError:
+        return None
+    if (
+        host == "localhost"
+        or any(
+            host == suffix.lstrip(".")
+            or host.endswith("." + suffix.lstrip("."))
+            for suffix in _EXAMPLE_HOST_SUFFIXES
+        )
+    ):
+        return None
+    return canonical
+
+
 def extract_literal_https_prefixes(texts: Iterable[str]) -> tuple[str, ...]:
     """Extract a stable, bounded set of literal HTTPS prefixes."""
 
@@ -358,7 +441,10 @@ def _url_has_explicit_json_post_declaration(
     # A canonical endpoint whose final path segment is exactly ``graphql`` is
     # self-declaring. Do not extend this to adjacent documentation/browser
     # paths such as ``/graphql/browser``.
-    canonical = canonical_https_prefix(match.group(0))
+    canonical = (
+        canonical_https_prefix(match.group(0))
+        or canonical_sandbox_http_prefix(match.group(0))
+    )
     if canonical is not None:
         endpoint_path = (urlsplit(canonical).path or "/").rstrip("/")
         if endpoint_path.rsplit("/", 1)[-1].casefold() == "graphql":
@@ -378,6 +464,190 @@ def _url_has_explicit_json_post_declaration(
         ):
             return True
     return False
+
+
+def _bounded_single_url_contexts(
+    text: str,
+    match: re.Match[str],
+) -> tuple[tuple[str, int, int], ...]:
+    """Return bounded line/paragraph contexts that bind one URL occurrence.
+
+    A method token in prose must never leak onto a neighbouring endpoint.
+    Contexts larger than the compiler bound or containing another literal
+    HTTP(S) URL are therefore ineligible for method authority.
+    """
+
+    spans: list[tuple[int, int]] = []
+    line_start = text.rfind("\n", 0, match.start()) + 1
+    line_end = text.find("\n", match.end())
+    if line_end < 0:
+        line_end = len(text)
+    spans.append((line_start, line_end))
+
+    preceding = tuple(re.finditer(r"\n[ \t]*\n", text[:match.start()]))
+    paragraph_start = preceding[-1].end() if preceding else 0
+    following = re.search(r"\n[ \t]*\n", text[match.end():])
+    paragraph_end = (
+        match.end() + following.start()
+        if following is not None else len(text)
+    )
+    spans.append((paragraph_start, paragraph_end))
+
+    contexts: list[tuple[str, int, int]] = []
+    for start, end in dict.fromkeys(spans):
+        if (
+            start < 0
+            or end < match.end()
+            or end - start > MAX_HTTP_METHOD_DECLARATION_CHARS
+        ):
+            continue
+        context = text[start:end]
+        occurrences = tuple(_SANDBOX_URL_RE.finditer(context))
+        relative_start = match.start() - start
+        relative_end = match.end() - start
+        if (
+            len(occurrences) != 1
+            or occurrences[0].start() != relative_start
+        ):
+            continue
+        contexts.append((context, relative_start, relative_end))
+    return tuple(contexts)
+
+
+def _context_negates_http_method(context: str, method: str) -> bool:
+    """Return whether a bounded declaration explicitly denies one method."""
+
+    token = re.escape(method)
+    return bool(
+        re.search(
+            rf"(?:"
+            rf"\b(?:do\s+not|don['’]?t|never|must\s+not|should\s+not|"
+            rf"cannot|can['’]?t|without|no)\b.{{0,40}}\b{token}\b|"
+            rf"\b{token}\b.{{0,32}}\b(?:is\s+not|not\s+allowed|"
+            rf"forbidden|prohibited|unsupported|disabled)\b|"
+            rf"(?:不要|不得|禁止|切勿|不能|不可|无需).{{0,20}}{token}"
+            rf")",
+            context,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _context_explicitly_binds_http_method(
+    context: str,
+    relative_start: int,
+    relative_end: int,
+    method: str,
+) -> bool:
+    """Recognize deterministic method declarations for one literal URL."""
+
+    token = re.escape(method)
+    declaration_context = (
+        context[:relative_start]
+        + (" " * (relative_end - relative_start))
+        + context[relative_end:]
+    )
+    if _context_negates_http_method(declaration_context, method):
+        return False
+
+    # Exact command/code shapes.  The single-URL context invariant above
+    # makes the method-to-URL binding unambiguous.
+    if re.search(r"\bcurl(?:\.exe)?\b", context, re.IGNORECASE) and re.search(
+        rf"(?:^|\s)(?:-X|--request(?:=|\s))\s*{token}\b",
+        context,
+        re.IGNORECASE,
+    ):
+        return True
+    before = context[:relative_start]
+    if re.search(
+        rf"\b(?:requests|httpx|session|client)\s*\.\s*{token}\s*"
+        rf"\(\s*(?:url\s*=\s*)?(?:[rubf]{{0,2}})?[\"'`]\s*$",
+        before,
+        re.IGNORECASE,
+    ):
+        return True
+    if re.search(
+        rf"\b(?:method|http_method|httpMethod)\s*[:=]\s*"
+        rf"[\"'`]?\s*{token}\b",
+        context,
+        re.IGNORECASE,
+    ):
+        return True
+
+    # Protocol notation immediately adjacent to the URL, including table
+    # rows such as ``| PATCH | https://... |`` and concise instructions such
+    # as ``use DELETE request at https://...``.  This is intentionally much
+    # narrower than inferring a method from arbitrary prose in the paragraph.
+    left = before[-128:]
+    right = context[relative_end:relative_end + 128]
+    if re.search(
+        rf"(?:^|[\s|`(])(?:use\s+|using\s+|via\s+)?{token}"
+        rf"(?:\s+(?:HTTP\s+)?(?:request|method|operation|endpoint))?"
+        rf"(?:\s+(?:to|at|via|for|调用|请求|方法|到))?"
+        rf"[\s:|=`'\"—–-]*$",
+        left,
+        re.IGNORECASE,
+    ):
+        return True
+    if re.match(
+        rf"^[\s:|=`'\"),.;—–-]*(?:using\s+|via\s+|method\s*[:=]\s*)?"
+        rf"{token}\b",
+        right,
+        re.IGNORECASE,
+    ):
+        return True
+    return False
+
+
+def _explicit_sandbox_http_methods_for_url(
+    text: str,
+    match: re.Match[str],
+) -> set[str]:
+    """Compile non-default methods from exact code/protocol declarations."""
+
+    methods: set[str] = set()
+    contexts = _bounded_single_url_contexts(text, match)
+    for method in _SANDBOX_HTTP_METHOD_ORDER:
+        if any(
+            _context_explicitly_binds_http_method(
+                context,
+                relative_start,
+                relative_end,
+                method,
+            )
+            for context, relative_start, relative_end in contexts
+        ):
+            methods.add(method)
+    # Preserve the existing conservative POST/GraphQL classifier.  It also
+    # recognizes a canonical ``.../graphql`` endpoint whose path is
+    # self-declaring, while explicitly rejecting POST negations.
+    if _url_has_explicit_json_post_declaration(text, match):
+        methods.add("POST")
+    return methods
+
+
+def _negated_sandbox_http_methods_for_url(
+    text: str,
+    match: re.Match[str],
+) -> set[str]:
+    """Return methods explicitly denied for this single URL occurrence."""
+
+    contexts = _bounded_single_url_contexts(text, match)
+    return {
+        method
+        for method in _SANDBOX_HTTP_METHOD_ORDER
+        if any(
+            _context_negates_http_method(
+                (
+                    context[:relative_start]
+                    + (" " * (relative_end - relative_start))
+                    + context[relative_end:]
+                ),
+                method,
+            )
+            for context, relative_start, relative_end in contexts
+        )
+    }
 
 
 def extract_literal_https_post_prefixes(
@@ -409,6 +679,371 @@ def extract_literal_https_post_prefixes(
     return tuple(prefixes)
 
 
+def extract_literal_sandbox_egress_rules(
+    texts: Iterable[str],
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Compile exact sandbox URL prefixes with explicit method sets.
+
+    Every literal URL grants retrieval only (GET/HEAD). POST is added solely
+    for the same URL occurrence when the existing bounded POST/GraphQL
+    declaration classifier proves it. Multiple occurrences are aggregated by
+    canonical prefix without widening path or query scope.
+    """
+
+    methods_by_prefix: dict[str, set[str]] = {}
+    total_bytes = 0
+    for raw_text in texts:
+        if not isinstance(raw_text, str) or not raw_text:
+            continue
+        encoded = raw_text.encode("utf-8", errors="replace")
+        remaining = MAX_HTTP_GRANT_TEXT_BYTES - total_bytes
+        if remaining <= 0:
+            break
+        if len(encoded) > remaining:
+            encoded = encoded[:remaining]
+            raw_text = encoded.decode("utf-8", errors="ignore")
+        total_bytes += len(encoded)
+        for match in _SANDBOX_URL_RE.finditer(raw_text):
+            prefix = canonical_sandbox_http_prefix(match.group(0))
+            if prefix is None:
+                continue
+            occurrence_methods = {"GET", "HEAD"}.difference(
+                _negated_sandbox_http_methods_for_url(raw_text, match)
+            )
+            occurrence_methods.update(
+                _explicit_sandbox_http_methods_for_url(raw_text, match)
+            )
+            if occurrence_methods:
+                methods_by_prefix.setdefault(prefix, set()).update(
+                    occurrence_methods
+                )
+            if len(methods_by_prefix) > MAX_HTTP_GRANTS_PER_SKILL:
+                # Authority compilation is atomic. Never return a
+                # hash/order-dependent partial set after an overflow.
+                return ()
+    return tuple(
+        (
+            prefix,
+            tuple(
+                method
+                for method in _SANDBOX_HTTP_METHOD_ORDER
+                if method in methods
+            ),
+        )
+        for prefix, methods in sorted(methods_by_prefix.items())
+    )
+
+
+def compile_user_sandbox_egress_urls(
+    user_text: str,
+) -> tuple[str, ...]:
+    """Return method-free exact URL identities from bounded user-authored text.
+
+    These values are deliberately *not* egress rules.  A URL becomes network
+    authority only immediately before an exact content-addressed Skill
+    entrypoint is dispatched, after one manifest binding is proven to select
+    that same URL from the actual invocation arguments.
+    """
+
+    from tools.session_sandbox_policy import (
+        SessionSandboxPolicyError,
+        normalize_http_url_prefix,
+    )
+
+    if not isinstance(user_text, str):
+        return ()
+    encoded = user_text.encode("utf-8", errors="replace")
+    if len(encoded) > MAX_HTTP_GRANT_TEXT_BYTES:
+        user_text = encoded[:MAX_HTTP_GRANT_TEXT_BYTES].decode(
+            "utf-8",
+            errors="ignore",
+        )
+    urls: list[str] = []
+    for match in _SANDBOX_URL_RE.finditer(user_text):
+        raw = match.group(0).rstrip(_TRAILING_MARKDOWN + "}》】）")
+        try:
+            parsed = urlsplit(raw)
+            # Fragments are browser-local and never appear on the HTTP wire.
+            canonical = normalize_http_url_prefix(urlunsplit((
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                parsed.query,
+                "",
+            )))
+        except (TypeError, ValueError, SessionSandboxPolicyError):
+            continue
+        if canonical not in urls:
+            urls.append(canonical)
+        if len(urls) >= MAX_HTTP_GRANTS_PER_SKILL:
+            break
+    return tuple(urls)
+
+
+def _argv_user_url_value(
+    arguments: tuple[str, ...],
+    selector: str | int,
+) -> str | None:
+    """Resolve one exact argv selector without guessing or last-value wins."""
+
+    if type(selector) is int:
+        return arguments[selector] if selector < len(arguments) else None
+    if not isinstance(selector, str) or not selector.startswith("--"):
+        return None
+    matches: list[str] = []
+    index = 0
+    while index < len(arguments):
+        value = arguments[index]
+        if value == selector:
+            if index + 1 >= len(arguments):
+                return None
+            matches.append(arguments[index + 1])
+            index += 2
+            continue
+        prefix = selector + "="
+        if value.startswith(prefix):
+            matches.append(value[len(prefix):])
+        index += 1
+    # Duplicate flags are ambiguous even when both values happen to match.
+    return matches[0] if len(matches) == 1 else None
+
+
+def compile_user_sandbox_egress_rules(
+    authorized_urls: Iterable[str],
+    bindings: Iterable[dict[str, Any]],
+    *,
+    invocation: dict[str, Any],
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Compile only rules proven by one exact, actual Skill invocation.
+
+    ``authorized_urls`` is the runtime-owned method-free ledger compiled from
+    the bounded current user context.  ``bindings`` comes from the selected
+    immutable entrypoint manifest.  ``invocation`` is built by the runner from
+    already validated actual argv/callable/payload data.  No candidate rule is
+    safe to preinstall before all three identities intersect.
+    """
+
+    from tools.session_sandbox_policy import (
+        SessionSandboxPolicyError,
+        normalize_http_origin,
+        normalize_http_url_prefix,
+        normalize_session_sandbox_methods,
+    )
+
+    if (
+        isinstance(authorized_urls, (str, bytes, dict))
+        or not isinstance(invocation, dict)
+        or set(invocation).difference({
+            "source",
+            "args",
+            "callable",
+            "parameters",
+            "command",
+            "payload",
+        })
+    ):
+        return ()
+    try:
+        raw_urls = tuple(authorized_urls)
+        binding_rows = tuple(bindings)
+    except TypeError:
+        return ()
+    if (
+        not raw_urls
+        or len(raw_urls) > MAX_HTTP_GRANTS_PER_SKILL
+        or any(not isinstance(value, str) for value in raw_urls)
+        or not binding_rows
+        or len(binding_rows) > 8
+        or any(not isinstance(binding, dict) for binding in binding_rows)
+    ):
+        return ()
+    canonical_urls: set[str] = set()
+    try:
+        for value in raw_urls:
+            canonical = normalize_http_url_prefix(value)
+            if canonical != value:
+                return ()
+            canonical_urls.add(canonical)
+    except SessionSandboxPolicyError:
+        return ()
+    if len(canonical_urls) != len(raw_urls):
+        return ()
+
+    invocation_source = invocation.get("source")
+    if invocation_source not in {"argv", "python", "stdin_json"}:
+        return ()
+    argv: tuple[str, ...] = ()
+    parameters: dict[str, Any] = {}
+    payload: dict[str, Any] = {}
+    invocation_callable: str | None = None
+    invocation_command: str | None = None
+    if invocation_source == "argv":
+        raw_args = invocation.get("args")
+        if (
+            set(invocation) != {"source", "args"}
+            or not isinstance(raw_args, (list, tuple))
+            or len(raw_args) > 64
+            or any(not isinstance(value, str) for value in raw_args)
+        ):
+            return ()
+        argv = tuple(raw_args)
+    elif invocation_source == "python":
+        raw_parameters = invocation.get("parameters")
+        invocation_callable = invocation.get("callable")
+        if (
+            set(invocation) != {"source", "callable", "parameters"}
+            or not isinstance(invocation_callable, str)
+            or not isinstance(raw_parameters, dict)
+            or len(raw_parameters) > 128
+            or any(not isinstance(key, str) for key in raw_parameters)
+        ):
+            return ()
+        parameters = raw_parameters
+    else:
+        raw_payload = invocation.get("payload")
+        invocation_command = invocation.get("command")
+        if (
+            set(invocation) != {"source", "command", "payload"}
+            or not isinstance(invocation_command, str)
+            or not isinstance(raw_payload, dict)
+            or len(raw_payload) > 128
+            or any(not isinstance(key, str) for key in raw_payload)
+        ):
+            return ()
+        payload = raw_payload
+
+    methods_by_prefix: dict[str, set[str]] = {}
+    for binding in binding_rows:
+        if set(binding).difference({
+            "source",
+            "selector",
+            "methods",
+            "scope",
+            "callable",
+            "command",
+        }):
+            return ()
+        source = binding.get("source")
+        selector = binding.get("selector")
+        scope = binding.get("scope")
+        callable_name = binding.get("callable")
+        command = binding.get("command")
+        if (
+            source not in {"argv", "python", "stdin_json"}
+            or scope not in {"url", "origin"}
+            or isinstance(selector, bool)
+            or not isinstance(selector, (str, int))
+            or (source == "argv" and not (
+                (
+                    type(selector) is int
+                    and 0 <= selector < 64
+                )
+                or (
+                    isinstance(selector, str)
+                    and re.fullmatch(
+                        r"--[A-Za-z0-9][A-Za-z0-9_-]{0,126}",
+                        selector,
+                    )
+                    is not None
+                )
+            ))
+            or (source == "argv" and (
+                callable_name is not None or command is not None
+            ))
+            or (source == "python" and (
+                not isinstance(selector, str)
+                or re.fullmatch(
+                    r"[A-Za-z][A-Za-z0-9_]{0,127}",
+                    selector,
+                )
+                is None
+                or not isinstance(callable_name, str)
+                or re.fullmatch(
+                    r"[A-Za-z][A-Za-z0-9_]{0,127}"
+                    r"(?:\.[A-Za-z][A-Za-z0-9_]{0,127})?",
+                    callable_name,
+                )
+                is None
+                or command is not None
+            ))
+            or (source == "stdin_json" and (
+                not isinstance(selector, str)
+                or re.fullmatch(
+                    r"[A-Za-z][A-Za-z0-9_]{0,127}",
+                    selector,
+                )
+                is None
+                or not isinstance(command, str)
+                or re.fullmatch(
+                    r"[A-Za-z][A-Za-z0-9_]{0,127}",
+                    command,
+                )
+                is None
+                or callable_name is not None
+            ))
+        ):
+            return ()
+        try:
+            methods = normalize_session_sandbox_methods(
+                binding.get("methods")
+            )
+        except SessionSandboxPolicyError:
+            return ()
+
+        # Validate every binding atomically, but only the actual invocation's
+        # source/callable/command may contribute a destination.
+        if source != invocation_source:
+            continue
+        value: Any = None
+        if source == "argv":
+            value = _argv_user_url_value(argv, selector)
+        elif source == "python" and callable_name == invocation_callable:
+            value = parameters.get(str(selector))
+        elif source == "stdin_json" and command == invocation_command:
+            value = payload.get(str(selector))
+        if not isinstance(value, str):
+            continue
+        try:
+            parsed = urlsplit(value)
+            canonical = normalize_http_url_prefix(urlunsplit((
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                parsed.query,
+                "",
+            )))
+        except (TypeError, ValueError, SessionSandboxPolicyError):
+            continue
+        # Exact equality prevents a different path, query, origin, or scheme
+        # in model-authored invocation arguments from borrowing user intent.
+        if canonical not in canonical_urls:
+            continue
+        try:
+            prefix = (
+                normalize_http_url_prefix(
+                    normalize_http_origin(canonical) + "/"
+                )
+                if scope == "origin"
+                else canonical
+            )
+        except SessionSandboxPolicyError:
+            continue
+        methods_by_prefix.setdefault(prefix, set()).update(methods)
+        if len(methods_by_prefix) > MAX_HTTP_GRANTS_PER_SKILL:
+            return ()
+    return tuple(
+        (
+            prefix,
+            tuple(
+                method
+                for method in _SANDBOX_HTTP_METHOD_ORDER
+                if method in methods
+            ),
+        )
+        for prefix, methods in sorted(methods_by_prefix.items())
+    )
+
+
 def _text_explicitly_references_resource(text: str, relative_path: str) -> bool:
     """Whether package text names one exact allowed relative resource path."""
 
@@ -434,7 +1069,8 @@ def _compile_loaded_skill_http_grants(
     allowed_resource_paths: Iterable[str] = (),
     *,
     post_only: bool = False,
-) -> tuple[tuple[str, str], ...]:
+    sandbox_rules: bool = False,
+) -> tuple[tuple[Any, ...], ...]:
     """Compile ``(skill_name, prefix)`` grants from a loaded session Skill.
 
     The caller must already have selected the package and compiled its exact
@@ -539,6 +1175,11 @@ def _compile_loaded_skill_http_grants(
                 continue
             searchable_text = "\n".join(newly_loaded)
 
+    if sandbox_rules:
+        return tuple(
+            (skill_name, prefix, methods)
+            for prefix, methods in extract_literal_sandbox_egress_rules(texts)
+        )
     extractor = (
         extract_literal_https_post_prefixes
         if post_only else extract_literal_https_prefixes
@@ -572,4 +1213,24 @@ def compile_loaded_skill_http_post_grants(
         loaded_package,
         allowed_resource_paths,
         post_only=True,
+    )
+
+
+def compile_loaded_skill_sandbox_egress_rules(
+    skill_name: str,
+    loaded_package: dict[str, Any],
+    allowed_resource_paths: Iterable[str] = (),
+) -> tuple[tuple[str, str, tuple[str, ...]], ...]:
+    """Compile exact method-and-prefix rules for Skill sandbox execution."""
+
+    rows = _compile_loaded_skill_http_grants(
+        skill_name,
+        loaded_package,
+        allowed_resource_paths,
+        sandbox_rules=True,
+    )
+    return tuple(
+        (str(row[0]), str(row[1]), tuple(row[2]))
+        for row in rows
+        if len(row) == 3
     )

@@ -9,6 +9,9 @@ import unittest
 from unittest.mock import patch
 
 from runtime import python_env
+from tools.executor_slot_pool import (
+    reset_executor_slot_pool_registry_for_tests,
+)
 from tools.isolated_skill_executor import (
     IsolatedSkillExecutorError,
     build_process_lease_open_request,
@@ -18,6 +21,7 @@ from tools.isolated_skill_executor import (
 from tools.skill_runtime_profile import (
     assess_skill_runtime_network,
     compile_skill_runtime_profile_manifest,
+    runtime_profile_socket_binding,
     select_skill_runtime_profile,
     skill_runtime_external_network_clients,
 )
@@ -556,6 +560,120 @@ class SkillRuntimeProfileTests(unittest.TestCase):
             [row["entrypoint"] for row in compiled["scripts"]],
         )
         self.assertTrue(compiled["scripts"][0]["manifest_declared"])
+
+    def test_schema_v2_declares_content_addressed_user_url_bindings(
+        self,
+    ) -> None:
+        self.write(
+            "scripts/browser.py",
+            "from selenium import webdriver\n"
+            "def open(url):\n"
+            "    driver = webdriver.Chrome()\n"
+            "    driver.get(url)\n",
+        )
+        manifest = self.write(
+            "chatds-runtime.json",
+            json.dumps({
+                "schema_version": 2,
+                "entrypoints": [{
+                    "path": "scripts/browser.py",
+                    "runtime_profile": "browser-automation-v1",
+                    "python_requirements": ["selenium==4.46.0"],
+                    "user_url_egress": [
+                        {
+                            "source": "argv",
+                            "selector": "--url",
+                            "methods": ["GET", "HEAD"],
+                            "scope": "origin",
+                        },
+                        {
+                            "source": "python",
+                            "selector": "url",
+                            "callable": "open",
+                            "methods": ["GET"],
+                            "scope": "url",
+                        },
+                    ],
+                }],
+            }),
+        )
+        snapshot = snapshot_skill_package(self.root)
+
+        selection = select_skill_runtime_profile(
+            snapshot,
+            "scripts/browser.py",
+        )
+        compiled = compile_skill_runtime_profile_manifest(
+            self.root,
+            (),
+        )
+
+        self.assertEqual(2, len(selection.user_url_egress))
+        self.assertEqual("--url", selection.user_url_egress[0].selector)
+        self.assertEqual("open", selection.user_url_egress[1].callable_name)
+        self.assertEqual(
+            2,
+            compiled["entrypoint_manifest"]["schema_version"],
+        )
+        self.assertEqual(
+            hashlib.sha256(manifest.read_bytes()).hexdigest(),
+            compiled["entrypoint_manifest"]["sha256"],
+        )
+        self.assertEqual(
+            [
+                {
+                    "source": "argv",
+                    "selector": "--url",
+                    "methods": ["GET", "HEAD"],
+                    "scope": "origin",
+                },
+                {
+                    "source": "python",
+                    "selector": "url",
+                    "methods": ["GET"],
+                    "scope": "url",
+                    "callable": "open",
+                },
+            ],
+            compiled["scripts"][0]["user_url_egress"],
+        )
+
+    def test_schema_v1_cannot_mint_user_url_binding_authority(self) -> None:
+        self.write(
+            "scripts/query.py",
+            "from urllib import request\n"
+            "def fetch(url):\n"
+            "    return request.urlopen(url).read()\n",
+        )
+        self.write(
+            "chatds-runtime.json",
+            json.dumps({
+                "schema_version": 1,
+                "entrypoints": [{
+                    "path": "scripts/query.py",
+                    "runtime_profile": "base-v1",
+                    "user_url_egress": [{
+                        "source": "python",
+                        "selector": "url",
+                        "callable": "fetch",
+                        "methods": ["GET"],
+                        "scope": "url",
+                    }],
+                }],
+            }),
+        )
+        snapshot = snapshot_skill_package(self.root)
+
+        with self.assertRaises(IsolatedSkillExecutorError) as raised:
+            select_skill_runtime_profile(
+                snapshot,
+                "scripts/query.py",
+            )
+
+        self.assertEqual(
+            "skill_runtime_manifest_invalid",
+            raised.exception.code,
+        )
 
     def test_runtime_manifest_does_not_authorize_undeclared_dynamic_peer(
         self,
@@ -1772,10 +1890,10 @@ class SkillRuntimeProfileTests(unittest.TestCase):
                 "platform": "linux",
                 "network": "disabled",
                 "dependency_install": "disabled",
-                "runtime_profile": "browser-automation-v1",
+                "runtime_profile": "session-sandbox-v1",
                 "network_policy": {
                     "direct": "disabled",
-                    "egress": "policy_proxy",
+                    "egress": "none",
                 },
             },
             "requirements": [],
@@ -1786,7 +1904,12 @@ class SkillRuntimeProfileTests(unittest.TestCase):
         with (
             patch.dict(
                 os.environ,
-                {"SKILL_BROWSER_EXECUTOR_SOCKET": "/browser.sock"},
+                {
+                    "EXECUTOR_SOCKET": "/session-sandbox.sock",
+                    "SKILL_BROWSER_EXECUTOR_SOCKET": (
+                        "/session-sandbox.sock"
+                    ),
+                },
             ),
             patch(
                 "tools.isolated_skill_executor."
@@ -1805,8 +1928,16 @@ class SkillRuntimeProfileTests(unittest.TestCase):
             result["runtime_binding"]["runtime_profile"],
         )
         self.assertEqual(
+            "session-sandbox-v1",
+            result["runtime_binding"]["executor_runtime_profile"],
+        )
+        self.assertEqual(
             64,
             len(result["runtime_binding"]["socket_identity_sha256"]),
+        )
+        self.assertNotIn(
+            "socket_paths",
+            result["runtime_binding"],
         )
         self.assertEqual(
             64,
@@ -1821,7 +1952,146 @@ class SkillRuntimeProfileTests(unittest.TestCase):
             commands=["node"],
             environment_variables=[],
             platform_groups=[],
-            socket_path="/browser.sock",
+            socket_path="/session-sandbox.sock",
+        )
+
+    def test_profile_preflight_fails_over_within_healthy_pool(self) -> None:
+        paths = (
+            "/pool/one.sock",
+            "/pool/two.sock",
+            "/pool/three.sock",
+        )
+        response = {
+            "valid": True,
+            "runtime_identity": {
+                "execution_runtime": "isolated_skill_executor",
+                "python_implementation": "cpython",
+                "python_version": "3.12.1",
+                "platform": "linux",
+                "network": "disabled",
+                "dependency_install": "disabled",
+                "runtime_profile": "session-sandbox-v1",
+                "network_policy": {
+                    "direct": "disabled",
+                    "egress": "none",
+                },
+            },
+            "requirements": [],
+            "commands": [{"name": "node", "available": True}],
+            "environment_variables": [],
+            "platform_groups": [],
+        }
+        calls: list[str] = []
+
+        def probe(**kwargs):
+            calls.append(kwargs["socket_path"])
+            if len(calls) == 1:
+                raise IsolatedSkillExecutorError(
+                    "executor_unavailable",
+                    "The first pool member is unavailable.",
+                )
+            return response
+
+        reset_executor_slot_pool_registry_for_tests()
+        try:
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "EXECUTOR_SOCKET": paths[0],
+                        "EXECUTOR_POOL_SOCKETS": ",".join(paths),
+                        "SKILL_BROWSER_EXECUTOR_SOCKET": paths[0],
+                    },
+                ),
+                patch(
+                    "tools.isolated_skill_executor."
+                    "probe_isolated_runtime_capabilities",
+                    side_effect=probe,
+                ),
+            ):
+                result = python_env.preflight_isolated_skill_runtime(
+                    commands=["node"],
+                    runtime_profile="browser-automation-v1",
+                )
+        finally:
+            reset_executor_slot_pool_registry_for_tests()
+
+        self.assertTrue(result["valid"], result)
+        self.assertEqual(list(paths[:2]), calls)
+
+    def test_profile_preflight_does_not_fail_over_invalid_response(
+        self,
+    ) -> None:
+        paths = ("/pool/one.sock", "/pool/two.sock")
+        calls: list[str] = []
+
+        def probe(**kwargs):
+            calls.append(kwargs["socket_path"])
+            raise IsolatedSkillExecutorError(
+                "invalid_response",
+                "The selected executor returned an invalid receipt.",
+            )
+
+        reset_executor_slot_pool_registry_for_tests()
+        try:
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "EXECUTOR_SOCKET": paths[0],
+                        "EXECUTOR_POOL_SOCKETS": ",".join(paths),
+                        "SKILL_BROWSER_EXECUTOR_SOCKET": paths[0],
+                    },
+                ),
+                patch(
+                    "tools.isolated_skill_executor."
+                    "probe_isolated_runtime_capabilities",
+                    side_effect=probe,
+                ),
+            ):
+                result = python_env.preflight_isolated_skill_runtime(
+                    commands=["node"],
+                    runtime_profile="browser-automation-v1",
+                )
+        finally:
+            reset_executor_slot_pool_registry_for_tests()
+
+        self.assertFalse(result["valid"])
+        self.assertEqual("invalid_response", result["error_code"])
+        self.assertEqual([paths[0]], calls)
+
+    def test_runtime_binding_digest_covers_complete_hidden_pool(self) -> None:
+        first_pool = (
+            "/pool/one.sock,/pool/two.sock,/pool/three.sock,"
+            "/pool/four.sock"
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "EXECUTOR_SOCKET": "/pool/one.sock",
+                "EXECUTOR_POOL_SOCKETS": first_pool,
+                "SKILL_BROWSER_EXECUTOR_SOCKET": "/pool/one.sock",
+            },
+        ):
+            first = runtime_profile_socket_binding("base-v1")
+        with patch.dict(
+            os.environ,
+            {
+                "EXECUTOR_SOCKET": "/pool/one.sock",
+                "EXECUTOR_POOL_SOCKETS": (
+                    "/pool/one.sock,/pool/two.sock,/pool/four.sock,"
+                    "/pool/three.sock"
+                ),
+                "SKILL_BROWSER_EXECUTOR_SOCKET": "/pool/one.sock",
+            },
+        ):
+            reordered = runtime_profile_socket_binding("base-v1")
+
+        self.assertEqual("/pool/one.sock", first.socket_path)
+        self.assertEqual(4, len(first.socket_paths))
+        self.assertNotEqual(
+            first.socket_identity_sha256,
+            reordered.socket_identity_sha256,
         )
 
     def test_profile_preflight_rejects_wrong_executor_identity(self) -> None:
@@ -1848,7 +2118,12 @@ class SkillRuntimeProfileTests(unittest.TestCase):
         with (
             patch.dict(
                 os.environ,
-                {"SKILL_BROWSER_EXECUTOR_SOCKET": "/browser.sock"},
+                {
+                    "EXECUTOR_SOCKET": "/session-sandbox.sock",
+                    "SKILL_BROWSER_EXECUTOR_SOCKET": (
+                        "/session-sandbox.sock"
+                    ),
+                },
             ),
             patch(
                 "tools.isolated_skill_executor."

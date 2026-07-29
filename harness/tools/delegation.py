@@ -15,6 +15,11 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from config import settings
+from retrieval_completeness import (
+    RETRIEVAL_QUALITY_IMPACT_ADVISORY,
+    RETRIEVAL_QUALITY_IMPACT_DEGRADED,
+    retrieval_receipt_affects_completion_quality,
+)
 from retrieval_policy import (
     RETRIEVAL_COMPLETENESS_POLICIES,
     normalize_retrieval_completeness_policy,
@@ -37,6 +42,7 @@ from tools.execution_fence import (
 from tools.omission_guard import contains_compacted_history_omission
 from tools.registry import dispatch as registry_dispatch, get_metadata
 from tools.tool_result_storage import persist_result_for_history
+from tools.workspace_lock import run_sync_cancellation_safe
 from workspace_context import get_workspace
 from result_fan_in import plan_persisted_result_fan_in
 from result_fan_in_runtime import (
@@ -53,7 +59,10 @@ from result_fan_in_runtime import (
     materialize_fan_in_plan,
 )
 from skill_capability_plan import (
+    CALLABLE_SKILL_RESULT_RECEIPT_VERSION,
+    callable_skill_result_receipt_is_failure,
     capability_call_satisfies_candidate,
+    normalize_skill_process_evidence_receipt,
     script_call_has_semantic_task_binding,
 )
 from knowledge_gate import (
@@ -845,6 +854,9 @@ _EXACT_CAPABILITY_BINDING_FIELDS = {
     "http_method",
     "runtime_profile",
     "required_cwd",
+    "sandbox_egress_url_prefixes",
+    "sandbox_egress_rules",
+    "browser_egress_rules",
     "schema_sha256",
     "descriptor_sha256",
 }
@@ -1374,9 +1386,9 @@ async def _run_child_with_dispatch_receipts(
             # entered. Persist that child terminal before touching the parent
             # sink, which may already belong to a disconnected SSE request.
             if bool(getattr(settings, "agent_debug_trace", False)):
-                from agent_loop import _append_workspace_debug_event
+                from agent_loop import _append_workspace_debug_event_async
 
-                _append_workspace_debug_event(
+                await _append_workspace_debug_event_async(
                     child_context.user_id,
                     child_context.session_id,
                     cancellation_event,
@@ -1451,6 +1463,43 @@ def _contract_failure_fields(reason: str = "delegation_contract_invalid") -> dic
     )
 
 
+def _normalized_callable_result_receipt(
+    value: Any,
+) -> dict[str, Any] | None:
+    """Accept only the bounded machine receipt emitted by AgentLoop."""
+
+    if (
+        not isinstance(value, dict)
+        or value.get("version")
+        != CALLABLE_SKILL_RESULT_RECEIPT_VERSION
+        or not isinstance(value.get("typed_failure"), bool)
+    ):
+        return None
+    normalized = {
+        "version": CALLABLE_SKILL_RESULT_RECEIPT_VERSION,
+        "typed_failure": value["typed_failure"],
+    }
+    for key in (
+        "result_object_observed",
+        "positive_success_observed",
+    ):
+        if isinstance(value.get(key), bool):
+            normalized[key] = value[key]
+    reasons = value.get("failure_reason_codes")
+    if isinstance(reasons, list):
+        normalized["failure_reason_codes"] = [
+            item
+            for item in reasons[:4]
+            if item in {
+                "typed_status_failure",
+                "typed_success_false",
+                "typed_ok_false",
+                "typed_error_without_positive_success",
+            }
+        ]
+    return normalized
+
+
 def _normalized_unresolved_retrieval(value: Any) -> dict[str, Any] | None:
     """Accept only the secret-free harness retrieval-gap receipt shape."""
 
@@ -1466,6 +1515,12 @@ def _normalized_unresolved_retrieval(value: Any) -> dict[str, Any] | None:
         "status": "unresolved",
         "source": "harness_http_retrieval_completeness",
     }
+    quality_impact = value.get("quality_impact")
+    if quality_impact in {
+        RETRIEVAL_QUALITY_IMPACT_ADVISORY,
+        RETRIEVAL_QUALITY_IMPACT_DEGRADED,
+    }:
+        normalized["quality_impact"] = quality_impact
     for key in (
         "terminal_reason",
         "terminal_failure",
@@ -1638,15 +1693,28 @@ def _inject_unresolved_retrieval_gap(
     policy = str(
         receipt.get("retrieval_completeness_policy") or "bounded"
     )
-    status_text = (
-        "explicit exhaustive HTTP retrieval requirement remains unmet"
-        if policy == "exhaustive"
-        else "bounded HTTP acquisition ended with partial coverage"
+    advisory = (
+        receipt.get("quality_impact")
+        == RETRIEVAL_QUALITY_IMPACT_ADVISORY
     )
-    gap_lines = [
-        f"Status: WARN/degraded — {status_text}.",
-        marker,
-    ]
+    if advisory:
+        gap_lines = [
+            (
+                "Coverage: bounded HTTP acquisition ended at an optional "
+                "pagination frontier; claims are limited to observed pages."
+            ),
+            marker,
+        ]
+    else:
+        status_text = (
+            "explicit exhaustive HTTP retrieval requirement remains unmet"
+            if policy == "exhaustive"
+            else "bounded HTTP acquisition ended with partial coverage"
+        )
+        gap_lines = [
+            f"Status: WARN/degraded — {status_text}.",
+            marker,
+        ]
     if footer_index is None:
         return value + ("\n\n" if value else "") + "\n".join(gap_lines)
     return "\n".join([
@@ -2089,6 +2157,40 @@ def _exact_capability_skill_http_post_grants(
         (skill_name, prefix)
         for skill_name, prefix in context.allowed_skill_http_post_prefixes
         if skill_name in required and prefix
+    ))
+
+
+def _exact_capability_skill_sandbox_egress_grants(
+    capability_skills: set[str],
+    *,
+    context: ToolContext,
+) -> list[tuple[str, str]]:
+    """Narrow sandbox-only egress without minting a direct HTTP grant."""
+
+    if not context.skill_execution_resource_boundary:
+        return []
+    return list(dict.fromkeys(
+        (skill_name, prefix)
+        for skill_name, prefix
+        in context.allowed_skill_sandbox_egress_prefixes
+        if skill_name in capability_skills and prefix
+    ))
+
+
+def _exact_capability_skill_sandbox_egress_rule_grants(
+    capability_skills: set[str],
+    *,
+    context: ToolContext,
+) -> list[tuple[str, str, tuple[str, ...]]]:
+    """Narrow method-preserving sandbox rules to exact child Skills."""
+
+    if not context.skill_execution_resource_boundary:
+        return []
+    return list(dict.fromkeys(
+        (skill_name, prefix, methods)
+        for skill_name, prefix, methods
+        in context.allowed_skill_sandbox_egress_rules
+        if skill_name in capability_skills and prefix and methods
     ))
 
 
@@ -2563,6 +2665,156 @@ def _strict_exact_capability_bindings(
         ):
             return [], actual_digest, (
                 f"{label}.additional_argv must be a boolean."
+            )
+        raw_sandbox_egress = binding.get(
+            "sandbox_egress_url_prefixes"
+        )
+        raw_sandbox_rules = binding.get("sandbox_egress_rules")
+        raw_browser_rules = binding.get("browser_egress_rules")
+        if kind in {"skill_script", "declared_command"}:
+            from skills.http_grants import canonical_https_prefix
+            from tools.session_sandbox_policy import (
+                SessionSandboxPolicyError,
+                normalize_http_url_prefix,
+                normalize_session_sandbox_methods,
+            )
+
+            if (
+                not isinstance(raw_sandbox_egress, list)
+                or len(raw_sandbox_egress) > 256
+                or any(
+                    not isinstance(prefix, str)
+                    for prefix in raw_sandbox_egress
+                )
+                or len(set(raw_sandbox_egress))
+                != len(raw_sandbox_egress)
+                or any(
+                    canonical_https_prefix(prefix) != prefix
+                    for prefix in raw_sandbox_egress
+                )
+            ):
+                return [], actual_digest, (
+                    f"{label}.sandbox_egress_url_prefixes must be a "
+                    "duplicate-free bounded list of canonical exact HTTPS "
+                    "prefixes."
+                )
+            if raw_sandbox_rules is not None:
+                if (
+                    not isinstance(raw_sandbox_rules, list)
+                    or len(raw_sandbox_rules) > 256
+                ):
+                    return [], actual_digest, (
+                        f"{label}.sandbox_egress_rules must be a bounded "
+                        "exact method-and-prefix rule list."
+                    )
+                seen_rules: set[
+                    tuple[str, tuple[str, ...]]
+                ] = set()
+                for rule in raw_sandbox_rules:
+                    if (
+                        not isinstance(rule, dict)
+                        or set(rule) != {"methods", "url_prefix"}
+                        or not isinstance(rule.get("url_prefix"), str)
+                    ):
+                        return [], actual_digest, (
+                            f"{label}.sandbox_egress_rules contains a "
+                            "malformed rule."
+                        )
+                    try:
+                        prefix = normalize_http_url_prefix(
+                            rule["url_prefix"]
+                        )
+                        methods = normalize_session_sandbox_methods(
+                            rule.get("methods")
+                        )
+                    except SessionSandboxPolicyError:
+                        return [], actual_digest, (
+                            f"{label}.sandbox_egress_rules contains a "
+                            "noncanonical rule."
+                        )
+                    coordinate = (prefix, methods)
+                    if (
+                        prefix != rule["url_prefix"]
+                        or list(methods) != rule.get("methods")
+                        or coordinate in seen_rules
+                    ):
+                        return [], actual_digest, (
+                            f"{label}.sandbox_egress_rules contains a "
+                            "noncanonical or duplicate rule."
+                        )
+                    seen_rules.add(coordinate)
+        elif raw_sandbox_egress is not None:
+            return [], actual_digest, (
+                f"{label}.sandbox_egress_url_prefixes is valid only for "
+                "script or declared-command bindings."
+            )
+        elif raw_sandbox_rules is not None:
+            return [], actual_digest, (
+                f"{label}.sandbox_egress_rules is valid only for script or "
+                "declared-command bindings."
+            )
+
+        if raw_browser_rules is not None:
+            from tools.session_sandbox_policy import (
+                SessionSandboxPolicyError,
+                normalize_http_url_prefix,
+                normalize_session_sandbox_methods,
+            )
+
+            if (
+                kind != "native_tool"
+                or tool_name != "browser_navigate"
+                or raw_tool_names != ["browser_navigate"]
+                or not isinstance(raw_browser_rules, list)
+                or not raw_browser_rules
+                or len(raw_browser_rules) > 256
+            ):
+                return [], actual_digest, (
+                    f"{label}.browser_egress_rules is valid only for one "
+                    "native browser_navigate binding and must be bounded."
+                )
+            seen_browser_rules: set[
+                tuple[str, tuple[str, ...]]
+            ] = set()
+            for rule in raw_browser_rules:
+                if (
+                    not isinstance(rule, dict)
+                    or set(rule) != {"methods", "url_prefix"}
+                    or not isinstance(rule.get("url_prefix"), str)
+                ):
+                    return [], actual_digest, (
+                        f"{label}.browser_egress_rules contains a malformed "
+                        "rule."
+                    )
+                try:
+                    prefix = normalize_http_url_prefix(
+                        rule["url_prefix"]
+                    )
+                    methods = normalize_session_sandbox_methods(
+                        rule.get("methods")
+                    )
+                except SessionSandboxPolicyError:
+                    return [], actual_digest, (
+                        f"{label}.browser_egress_rules contains a "
+                        "noncanonical rule."
+                    )
+                coordinate = (prefix, methods)
+                if (
+                    prefix != rule["url_prefix"]
+                    or list(methods) != rule.get("methods")
+                    or coordinate in seen_browser_rules
+                ):
+                    return [], actual_digest, (
+                        f"{label}.browser_egress_rules contains a "
+                        "noncanonical or duplicate rule."
+                    )
+                seen_browser_rules.add(coordinate)
+        elif kind == "native_tool" and tool_name == "browser_navigate":
+            # A delegated browser candidate without an exact URL ledger would
+            # otherwise inherit ambient parent public egress.
+            return [], actual_digest, (
+                f"{label}.browser_egress_rules is required for delegated "
+                "browser_navigate."
             )
 
         if kind in {"native_tool", "mcp_tool"}:
@@ -3334,6 +3586,9 @@ def _exact_node_capability_grants(
         "command_grants": [],
         "http_get_grants": [],
         "http_post_grants": [],
+        "sandbox_egress_grants": [],
+        "sandbox_egress_rule_grants": [],
+        "browser_egress_rule_grants": [],
         "bound_tool_names": [],
         "receipt_bindings": [],
     }
@@ -3352,12 +3607,28 @@ def _exact_node_capability_grants(
     parent_commands = set(context.allowed_skill_commands)
     parent_http_get = set(context.allowed_skill_http_prefixes)
     parent_http_post = set(context.allowed_skill_http_post_prefixes)
+    parent_sandbox_egress = set(
+        context.allowed_skill_sandbox_egress_prefixes
+    )
+    parent_sandbox_rules = set(
+        context.allowed_skill_sandbox_egress_rules
+    )
+    from tools.session_sandbox_policy import (
+        SessionSandboxPolicyError,
+        browser_context_egress_rules,
+        intersect_browser_egress_rules,
+    )
+
+    parent_browser_rules = browser_context_egress_rules(context)
     resources: list[tuple[str, str]] = []
     scripts: list[tuple[str, str, str]] = []
     packages: list[tuple[str, str]] = []
     commands: list[tuple[str, str, str, tuple[str, ...]]] = []
     http_get: list[tuple[str, str]] = []
     http_post: list[tuple[str, str]] = []
+    sandbox_egress: list[tuple[str, str]] = []
+    sandbox_rules: list[tuple[str, str, tuple[str, ...]]] = []
+    browser_rules: list[tuple[str, tuple[str, ...]]] = []
     bound_tools: list[str] = []
     receipts: list[dict[str, Any]] = []
     binding_capability_skills: list[str] = []
@@ -3414,6 +3685,7 @@ def _exact_node_capability_grants(
         }
         for field in (
             "skill_name",
+            "skill_md_sha256",
             "resource_path",
             "sha256",
             "package_sha256",
@@ -3439,6 +3711,37 @@ def _exact_node_capability_grants(
             catalog_projection["additional_argv"] = (
                 catalog_candidate["additional_argv"]
             )
+        catalog_sandbox_egress = catalog_candidate.get(
+            "sandbox_egress_url_prefixes"
+        )
+        if isinstance(catalog_sandbox_egress, list):
+            catalog_projection["sandbox_egress_url_prefixes"] = list(
+                catalog_sandbox_egress
+            )
+        catalog_sandbox_rules = catalog_candidate.get(
+            "sandbox_egress_rules"
+        )
+        if isinstance(catalog_sandbox_rules, list):
+            catalog_projection["sandbox_egress_rules"] = [
+                {
+                    "methods": list(rule.get("methods") or []),
+                    "url_prefix": str(rule.get("url_prefix") or ""),
+                }
+                for rule in catalog_sandbox_rules
+                if isinstance(rule, dict)
+            ]
+        catalog_browser_rules = catalog_candidate.get(
+            "browser_egress_rules"
+        )
+        if isinstance(catalog_browser_rules, list):
+            catalog_projection["browser_egress_rules"] = [
+                {
+                    "methods": list(rule.get("methods") or []),
+                    "url_prefix": str(rule.get("url_prefix") or ""),
+                }
+                for rule in catalog_browser_rules
+                if isinstance(rule, dict)
+            ]
         if binding != catalog_projection:
             return empty, (
                 f"Exact capability candidate {candidate_id} coordinates differ "
@@ -3495,6 +3798,104 @@ def _exact_node_capability_grants(
                         "changed after Workflow IR compilation."
                     )
             resources.append(grant)
+        elif kind == "native_tool":
+            if binding.get("tool_name") == "browser_navigate":
+                native_skill = str(binding.get("skill_name") or "")
+                expected_main = str(
+                    binding.get("skill_md_sha256") or ""
+                )
+                expected_package = str(
+                    binding.get("package_sha256") or ""
+                )
+                if native_skill:
+                    main_grant = (native_skill, "SKILL.md")
+                    package_grant = (
+                        native_skill,
+                        expected_package,
+                    )
+                    if (
+                        not expected_main
+                        or not expected_package
+                        or main_grant not in parent_resources
+                        or package_grant not in parent_packages
+                    ):
+                        return empty, (
+                            f"Exact capability candidate {candidate_id} "
+                            "browser package identity is outside the parent "
+                            "grant."
+                        )
+                    try:
+                        from skills.scanner import resolve_skill_path
+                        from tools.isolated_skill_executor import (
+                            compute_skill_package_digest,
+                        )
+
+                        skill_md = resolve_skill_path(
+                            native_skill,
+                            context.user_id,
+                            context.session_id,
+                            enabled_user_skills=list(
+                                context.enabled_user_skills
+                            ),
+                        )
+                        if skill_md is None:
+                            raise ValueError(
+                                "canonical Skill is unavailable"
+                            )
+                        root = skill_md.parent.resolve(strict=True)
+                        actual_main = hashlib.sha256(
+                            skill_md.read_bytes()
+                        ).hexdigest()
+                        actual_package = compute_skill_package_digest(root)
+                    except (
+                        OSError,
+                        RuntimeError,
+                        TypeError,
+                        ValueError,
+                    ) as exc:
+                        return empty, (
+                            f"Exact capability candidate {candidate_id} "
+                            f"browser package cannot be revalidated: {exc}"
+                        )
+                    if (
+                        actual_main != expected_main
+                        or actual_package != expected_package
+                    ):
+                        return empty, (
+                            f"Exact capability candidate {candidate_id} "
+                            "browser package changed after capability-plan "
+                            "compilation."
+                        )
+                    resources.append(main_grant)
+                    packages.append(package_grant)
+                requested_browser_rules = [
+                    (
+                        str(rule.get("url_prefix") or ""),
+                        tuple(
+                            str(method)
+                            for method in rule.get("methods") or []
+                        ),
+                    )
+                    for rule in binding.get("browser_egress_rules") or []
+                ]
+                try:
+                    narrowed_browser_rules = intersect_browser_egress_rules(
+                        parent_browser_rules,
+                        requested_browser_rules,
+                    )
+                except SessionSandboxPolicyError:
+                    return empty, (
+                        f"Exact capability candidate {candidate_id} browser "
+                        "egress rule is outside the parent grant."
+                    )
+                if len(narrowed_browser_rules) != len(
+                    requested_browser_rules
+                ):
+                    return empty, (
+                        f"Exact capability candidate {candidate_id} browser "
+                        "egress closure is incomplete."
+                    )
+                browser_rules.extend(narrowed_browser_rules)
         elif kind == "skill_script":
             binding_capability_skills.append(skill)
             grant = (
@@ -3508,6 +3909,28 @@ def _exact_node_capability_grants(
                     "outside the parent content-addressed grant."
                 )
             scripts.append(grant)
+            for prefix in binding.get(
+                "sandbox_egress_url_prefixes"
+            ) or []:
+                egress_grant = (skill, str(prefix))
+                if egress_grant not in parent_sandbox_egress:
+                    return empty, (
+                        f"Exact capability candidate {candidate_id} sandbox "
+                        "egress prefix is outside the parent grant."
+                    )
+                sandbox_egress.append(egress_grant)
+            for rule in binding.get("sandbox_egress_rules") or []:
+                egress_rule = (
+                    skill,
+                    str(rule.get("url_prefix") or ""),
+                    tuple(str(method) for method in rule.get("methods") or []),
+                )
+                if egress_rule not in parent_sandbox_rules:
+                    return empty, (
+                        f"Exact capability candidate {candidate_id} sandbox "
+                        "egress rule is outside the parent grant."
+                    )
+                sandbox_rules.append(egress_rule)
             package_digest = str(binding.get("package_sha256") or "")
             if package_digest:
                 package_grant = (skill, package_digest)
@@ -3531,6 +3954,28 @@ def _exact_node_capability_grants(
                     "outside the parent grant."
                 )
             commands.append(grant)
+            for prefix in binding.get(
+                "sandbox_egress_url_prefixes"
+            ) or []:
+                egress_grant = (skill, str(prefix))
+                if egress_grant not in parent_sandbox_egress:
+                    return empty, (
+                        f"Exact capability candidate {candidate_id} sandbox "
+                        "egress prefix is outside the parent grant."
+                    )
+                sandbox_egress.append(egress_grant)
+            for rule in binding.get("sandbox_egress_rules") or []:
+                egress_rule = (
+                    skill,
+                    str(rule.get("url_prefix") or ""),
+                    tuple(str(method) for method in rule.get("methods") or []),
+                )
+                if egress_rule not in parent_sandbox_rules:
+                    return empty, (
+                        f"Exact capability candidate {candidate_id} sandbox "
+                        "egress rule is outside the parent grant."
+                    )
+                sandbox_rules.append(egress_rule)
         elif kind == "skill_http_prefix":
             binding_capability_skills.append(skill)
             grant = (skill, str(binding.get("url_prefix") or ""))
@@ -3571,6 +4016,15 @@ def _exact_node_capability_grants(
         "command_grants": list(dict.fromkeys(commands)),
         "http_get_grants": list(dict.fromkeys(http_get)),
         "http_post_grants": list(dict.fromkeys(http_post)),
+        "sandbox_egress_grants": list(dict.fromkeys(
+            sandbox_egress
+        )),
+        "sandbox_egress_rule_grants": list(dict.fromkeys(
+            sandbox_rules
+        )),
+        "browser_egress_rule_grants": list(dict.fromkeys(
+            browser_rules
+        )),
         "bound_tool_names": list(dict.fromkeys(bound_tools)),
         "receipt_bindings": receipts,
     }, None
@@ -3599,6 +4053,9 @@ def _exact_knowledge_gate_candidate_grants(
         "command_grants": [],
         "http_get_grants": [],
         "http_post_grants": [],
+        "sandbox_egress_grants": [],
+        "sandbox_egress_rule_grants": [],
+        "browser_egress_rule_grants": [],
         "tool_names": [],
         "receipt_bindings": [],
     }
@@ -3618,12 +4075,28 @@ def _exact_knowledge_gate_candidate_grants(
     parent_commands = set(context.allowed_skill_commands)
     parent_http_get = set(context.allowed_skill_http_prefixes)
     parent_http_post = set(context.allowed_skill_http_post_prefixes)
+    parent_sandbox_egress = set(
+        context.allowed_skill_sandbox_egress_prefixes
+    )
+    parent_sandbox_rules = set(
+        context.allowed_skill_sandbox_egress_rules
+    )
+    from tools.session_sandbox_policy import (
+        SessionSandboxPolicyError,
+        browser_context_egress_rules,
+        intersect_browser_egress_rules,
+    )
+
+    parent_browser_rules = browser_context_egress_rules(context)
     resources: list[tuple[str, str]] = []
     scripts: list[tuple[str, str, str]] = []
     packages: list[tuple[str, str]] = []
     commands: list[tuple[str, str, str, tuple[str, ...]]] = []
     http_get: list[tuple[str, str]] = []
     http_post: list[tuple[str, str]] = []
+    sandbox_egress: list[tuple[str, str]] = []
+    sandbox_rules: list[tuple[str, str, tuple[str, ...]]] = []
+    browser_rules: list[tuple[str, tuple[str, ...]]] = []
     bound_tools: list[str] = []
     receipts: list[dict[str, Any]] = []
     resolved_roots: dict[str, Any] = {}
@@ -3748,6 +4221,35 @@ def _exact_knowledge_gate_candidate_grants(
                     f"Knowledge-gate candidate {candidate_id} native tool is "
                     "outside the parent grant."
                 )
+            if tool_name == "browser_navigate":
+                requested_browser_rules = [
+                    (
+                        str(rule.get("url_prefix") or ""),
+                        tuple(
+                            str(method)
+                            for method in rule.get("methods") or []
+                        ),
+                    )
+                    for rule in candidate.get("browser_egress_rules") or []
+                ]
+                try:
+                    narrowed_browser_rules = intersect_browser_egress_rules(
+                        parent_browser_rules,
+                        requested_browser_rules,
+                    )
+                except SessionSandboxPolicyError:
+                    return empty, (
+                        f"Knowledge-gate candidate {candidate_id} browser "
+                        "egress rule is outside the parent grant."
+                    )
+                if len(narrowed_browser_rules) != len(
+                    requested_browser_rules
+                ):
+                    return empty, (
+                        f"Knowledge-gate candidate {candidate_id} browser "
+                        "egress closure is incomplete."
+                    )
+                browser_rules.extend(narrowed_browser_rules)
         elif kind == "mcp_tool":
             tool_name = str(candidate.get("tool_name") or "")
             parent_catalog = context.frozen_mcp_catalog
@@ -3813,6 +4315,28 @@ def _exact_knowledge_gate_candidate_grants(
                     f"Knowledge-gate candidate {candidate_id} {file_error}."
                 )
             scripts.append(grant)
+            for prefix in candidate.get(
+                "sandbox_egress_url_prefixes"
+            ) or []:
+                egress_grant = (skill, str(prefix))
+                if egress_grant not in parent_sandbox_egress:
+                    return empty, (
+                        f"Knowledge-gate candidate {candidate_id} sandbox "
+                        "egress prefix is outside the parent grant."
+                    )
+                sandbox_egress.append(egress_grant)
+            for rule in candidate.get("sandbox_egress_rules") or []:
+                egress_rule = (
+                    skill,
+                    str(rule.get("url_prefix") or ""),
+                    tuple(str(method) for method in rule.get("methods") or []),
+                )
+                if egress_rule not in parent_sandbox_rules:
+                    return empty, (
+                        f"Knowledge-gate candidate {candidate_id} sandbox "
+                        "egress rule is outside the parent grant."
+                    )
+                sandbox_rules.append(egress_rule)
             package_digest = str(candidate.get("package_sha256") or "")
             if package_digest:
                 package_grant = (skill, package_digest)
@@ -3857,6 +4381,28 @@ def _exact_knowledge_gate_candidate_grants(
                     "outside the parent grant."
                 )
             commands.append(grant)
+            for prefix in candidate.get(
+                "sandbox_egress_url_prefixes"
+            ) or []:
+                egress_grant = (skill, str(prefix))
+                if egress_grant not in parent_sandbox_egress:
+                    return empty, (
+                        f"Knowledge-gate candidate {candidate_id} sandbox "
+                        "egress prefix is outside the parent grant."
+                    )
+                sandbox_egress.append(egress_grant)
+            for rule in candidate.get("sandbox_egress_rules") or []:
+                egress_rule = (
+                    skill,
+                    str(rule.get("url_prefix") or ""),
+                    tuple(str(method) for method in rule.get("methods") or []),
+                )
+                if egress_rule not in parent_sandbox_rules:
+                    return empty, (
+                        f"Knowledge-gate candidate {candidate_id} sandbox "
+                        "egress rule is outside the parent grant."
+                    )
+                sandbox_rules.append(egress_rule)
         elif kind == "skill_http_prefix":
             grant = (skill, str(candidate.get("url_prefix") or ""))
             if candidate.get("tool_name") == "skill_http_post_json":
@@ -3906,6 +4452,15 @@ def _exact_knowledge_gate_candidate_grants(
         "command_grants": list(dict.fromkeys(commands)),
         "http_get_grants": list(dict.fromkeys(http_get)),
         "http_post_grants": list(dict.fromkeys(http_post)),
+        "sandbox_egress_grants": list(dict.fromkeys(
+            sandbox_egress
+        )),
+        "sandbox_egress_rule_grants": list(dict.fromkeys(
+            sandbox_rules
+        )),
+        "browser_egress_rule_grants": list(dict.fromkeys(
+            browser_rules
+        )),
         "tool_names": list(dict.fromkeys(bound_tools)),
         "receipt_bindings": receipts,
     }, None
@@ -5161,15 +5716,29 @@ def _knowledge_gate_receipt_audit(
         for group_id in activated_group_ids
         if group_by_id[group_id].get("candidate_ids")
     ]
-    candidate_dispatch_calls = [
-        (index, call)
-        for index, call in enumerate(dispatched_tool_calls)
+    candidate_dispatch_calls: list[tuple[int, dict[str, Any]]] = []
+    seen_process_receipt_ids: set[str] = set()
+    for index, call in enumerate(dispatched_tool_calls):
         if (
-            index > decision_call_index
-            and call.get("tool_name") != _KNOWLEDGE_GATE_DECISION_TOOL
-            and call.get("deterministic_prerequisite_preload") is not True
+            index <= decision_call_index
+            or call.get("tool_name") == _KNOWLEDGE_GATE_DECISION_TOOL
+            or call.get("deterministic_prerequisite_preload") is True
+        ):
+            continue
+        result_data = (
+            call.get("result_data")
+            if isinstance(call.get("result_data"), dict)
+            else {}
         )
-    ]
+        process_receipt = normalize_skill_process_evidence_receipt(
+            result_data.get("process_evidence_receipt")
+        )
+        if process_receipt is not None:
+            receipt_id = process_receipt["receipt_id"]
+            if receipt_id in seen_process_receipt_ids:
+                continue
+            seen_process_receipt_ids.add(receipt_id)
+        candidate_dispatch_calls.append((index, call))
 
     def call_matches_group(
         group_id: str,
@@ -5286,6 +5855,25 @@ def _knowledge_gate_receipt_audit(
             ),
             "tool_name": str(call.get("tool_name") or ""),
             "outcome": str(call.get("outcome") or "error"),
+            **(
+                {
+                    "transport_outcome": str(
+                        call.get("transport_outcome") or ""
+                    ),
+                    "callable_result_failure_reason_codes": list(
+                        (
+                            call.get("callable_result_receipt")
+                            or {}
+                        ).get("failure_reason_codes")
+                        or []
+                    ),
+                }
+                if isinstance(
+                    call.get("callable_result_receipt"),
+                    dict,
+                )
+                else {}
+            ),
         })
     gap_ids = (
         [f"check:{check_id}:unknown" for check_id in unknown_check_ids]
@@ -6621,6 +7209,7 @@ async def _run_child(
         tuple[str, dict[str, Any], list[dict[str, Any]]]
     ] = []
     dispatched_tool_calls: list[dict[str, Any]] = []
+    consumed_process_evidence_receipt_ids: set[str] = set()
     non_evidentiary_runner_calls: list[dict[str, Any]] = []
     successful_artifact_calls: list[
         tuple[str, str, dict[str, Any], list[dict[str, Any]]]
@@ -6684,9 +7273,9 @@ async def _run_child(
                 # Import lazily to avoid the agent_loop <-> delegation import
                 # cycle.  Record the forwarded copy so workspace and SSE share
                 # the exact parent-owned sequence number.
-                from agent_loop import _append_workspace_debug_event
+                from agent_loop import _append_workspace_debug_event_async
 
-                _append_workspace_debug_event(
+                await _append_workspace_debug_event_async(
                     context.user_id,
                     context.session_id,
                     forwarded,
@@ -6733,8 +7322,9 @@ async def _run_child(
                 payload.get("unresolved_retrieval")
             )
             if unresolved is not None:
-                runtime_completion_quality = "degraded"
                 runtime_unresolved_retrieval = unresolved
+                if retrieval_receipt_affects_completion_quality(unresolved):
+                    runtime_completion_quality = "degraded"
         if event_type in {"run.failed", "run.cancelled"}:
             observed_error = str(
                 payload.get("error")
@@ -7161,21 +7751,23 @@ async def _run_child(
                     context,
                     boundary="delegation.intent_result.commit",
                 )
-                result_path = persist_result_for_history(
-                    deterministic_content,
-                    "delegate_" + (
-                        "_".join(
-                            part for part in (
-                                skill_name,
-                                worker_id,
-                                workflow_stage,
+                result_path = await run_sync_cancellation_safe(
+                    lambda: persist_result_for_history(
+                        deterministic_content,
+                        "delegate_" + (
+                            "_".join(
+                                part for part in (
+                                    skill_name,
+                                    worker_id,
+                                    workflow_stage,
+                                )
+                                if part
                             )
-                            if part
-                        )
-                        or "intent"
+                            or "intent"
+                        ),
+                        user_id=context.user_id,
+                        session_id=context.session_id,
                     ),
-                    user_id=context.user_id,
-                    session_id=context.session_id,
                 )
             except Exception as exc:
                 deterministic_error = (
@@ -7486,6 +8078,44 @@ async def _run_child(
             context=context,
         )
     )
+    allowed_skill_sandbox_egress_prefixes = (
+        exact_grants("sandbox_egress_grants")
+        if exact_grants_active
+        else _exact_capability_skill_sandbox_egress_grants(
+            {
+                *(
+                    skill
+                    for skill, _path, _digest
+                    in allowed_skill_scripts
+                ),
+                *(
+                    skill
+                    for skill, _command_id, _executable, _argv
+                    in allowed_skill_commands
+                ),
+            },
+            context=context,
+        )
+    )
+    allowed_skill_sandbox_egress_rules = (
+        exact_grants("sandbox_egress_rule_grants")
+        if exact_grants_active
+        else _exact_capability_skill_sandbox_egress_rule_grants(
+            {
+                *(
+                    skill
+                    for skill, _path, _digest
+                    in allowed_skill_scripts
+                ),
+                *(
+                    skill
+                    for skill, _command_id, _executable, _argv
+                    in allowed_skill_commands
+                ),
+            },
+            context=context,
+        )
+    )
     allowed_read_paths = list(dict.fromkeys(required_result_paths))
     has_on_demand_capability_resources = any(
         path != "SKILL.md"
@@ -7514,6 +8144,26 @@ async def _run_child(
         if delegated_resource_boundary
         else list(runtime_base_tools)
     )
+    from tools.session_sandbox_policy import browser_context_egress_rules
+
+    parent_browser_egress_rules = browser_context_egress_rules(context)
+    if exact_grants_active:
+        child_browser_egress_rules = tuple(
+            exact_grants("browser_egress_rule_grants")
+        )
+        if (
+            knowledge_gate_plan is not None
+            and not child_browser_egress_rules
+        ):
+            # Conditional candidates remain unavailable until the runtime
+            # installs their exact branch-selected rules.
+            child_browser_egress_rules = ()
+    else:
+        child_browser_egress_rules = (
+            parent_browser_egress_rules
+            if "browser_navigate" in set(model_tools)
+            else ()
+        )
     preloaded_reader_tools = sorted(
         set(runtime_base_tools) - set(model_tools)
     )
@@ -8720,7 +9370,6 @@ async def _run_child(
         await forward_event(event)
 
     from agent_loop import run_stream
-
     child_runtime_stream = run_stream(
         context.model_id,
         [{"role": "user", "content": prompt}],
@@ -8767,6 +9416,12 @@ async def _run_child(
         allowed_skill_commands=allowed_skill_commands,
         allowed_skill_http_prefixes=allowed_skill_http_prefixes,
         allowed_skill_http_post_prefixes=allowed_skill_http_post_prefixes,
+        allowed_skill_sandbox_egress_prefixes=(
+            allowed_skill_sandbox_egress_prefixes
+        ),
+        allowed_skill_sandbox_egress_rules=(
+            allowed_skill_sandbox_egress_rules
+        ),
         allowed_read_paths=allowed_read_paths,
         # The child stop/closure gate and this outer authoritative acceptance
         # audit must use the same typed-output contract.  This gives the child
@@ -8796,6 +9451,15 @@ async def _run_child(
         _execution_fence=context.execution_fence,
         _execution_fence_generation=(
             context.execution_fence_generation
+        ),
+        _inherited_browser_private_origins=tuple(
+            context.allowed_browser_private_origins
+        ),
+        _inherited_browser_egress_rules=(
+            child_browser_egress_rules
+        ),
+        _inherited_user_url_authorization_urls=(
+            context.user_url_authorization_urls
         ),
     )
     from tools.mcp_client import (
@@ -8997,10 +9661,72 @@ async def _run_child(
                 )
                 if not isinstance(receipt_result_data, dict):
                     receipt_result_data = {}
+                process_evidence_receipt = (
+                    normalize_skill_process_evidence_receipt(
+                        receipt_result_data.get(
+                            "process_evidence_receipt"
+                        )
+                    )
+                )
+                duplicate_process_evidence = bool(
+                    process_evidence_receipt is not None
+                    and process_evidence_receipt["receipt_id"]
+                    in consumed_process_evidence_receipt_ids
+                )
+                if (
+                    process_evidence_receipt is not None
+                    and not duplicate_process_evidence
+                ):
+                    consumed_process_evidence_receipt_ids.add(
+                        process_evidence_receipt["receipt_id"]
+                    )
+                callable_result_receipt = (
+                    _normalized_callable_result_receipt(
+                        exact_capability_receipt.get(
+                            "callable_result_receipt"
+                        )
+                    )
+                )
+                reported_evidence_outcome = str(
+                    exact_capability_receipt.get("evidence_outcome") or ""
+                )
+                evidence_outcome = (
+                    reported_evidence_outcome
+                    if (
+                        succeeded
+                        and reported_evidence_outcome
+                        in {"success", "error", "pending"}
+                    )
+                    else (
+                        "success"
+                        if (
+                            succeeded
+                            and not callable_skill_result_receipt_is_failure(
+                                callable_result_receipt
+                            )
+                        )
+                        else "error"
+                    )
+                )
+                if duplicate_process_evidence:
+                    evidence_outcome = "pending"
+                evidence_succeeded = evidence_outcome == "success"
                 dispatched_tool_calls.append({
                     "tool_name": tool_name,
                     "args": canonical_args,
-                    "outcome": "success" if succeeded else "error",
+                    "outcome": evidence_outcome,
+                    "transport_outcome": (
+                        "success" if succeeded else "error"
+                    ),
+                    **(
+                        {
+                            "callable_result_receipt": (
+                                callable_result_receipt
+                            ),
+                        }
+                        if callable_result_receipt is not None
+                        else {}
+                    ),
                     "artifacts": emitted_artifacts,
                     "result_data": {
                         key: value
@@ -9016,6 +9742,7 @@ async def _run_child(
                             "unknown_check_ids",
                             "matched_skill",
                             "matched_prefix_sha256",
+                            "process_evidence_receipt",
                         }
                     },
                     "skill_resource_complete": (
@@ -9031,7 +9758,7 @@ async def _run_child(
                         else None
                     ),
                 })
-                if not succeeded:
+                if not evidence_succeeded:
                     continue
                 successful_tools.add(tool_name)
                 successful_tool_calls.append((
@@ -9441,6 +10168,7 @@ async def _run_child(
             (exact_node_capability_grants or {}).get("receipt_bindings") or []
         )
         unmatched_call_indexes = set(range(len(dispatched_tool_calls)))
+        matched_process_receipt_ids: set[str] = set()
         exact_receipts: list[dict[str, Any]] = []
         missing_exact_candidate_ids: list[str] = []
         failed_exact_candidate_ids: list[str] = []
@@ -9460,15 +10188,25 @@ async def _run_child(
                     if isinstance(call.get("artifacts"), list)
                     else []
                 )
+                call_result_data = (
+                    call.get("result_data")
+                    if isinstance(call.get("result_data"), dict)
+                    else {}
+                )
+                process_receipt = normalize_skill_process_evidence_receipt(
+                    call_result_data.get("process_evidence_receipt")
+                )
+                if (
+                    process_receipt is not None
+                    and process_receipt["receipt_id"]
+                    in matched_process_receipt_ids
+                ):
+                    continue
                 if capability_call_satisfies_candidate(
                     binding,
                     tool_name=call_tool_name,
                     args=call_args,
-                    result_data=(
-                        call.get("result_data")
-                        if isinstance(call.get("result_data"), dict)
-                        else {}
-                    ),
+                    result_data=call_result_data,
                     outcome=str(call.get("outcome") or "error"),
                     skill_resource_complete=call.get(
                         "skill_resource_complete"
@@ -9491,12 +10229,44 @@ async def _run_child(
                 continue
             unmatched_call_indexes.remove(matched_index)
             matched_call = dispatched_tool_calls[matched_index]
+            matched_process_receipt = normalize_skill_process_evidence_receipt(
+                (
+                    matched_call.get("result_data")
+                    if isinstance(matched_call.get("result_data"), dict)
+                    else {}
+                ).get("process_evidence_receipt")
+            )
+            if matched_process_receipt is not None:
+                matched_process_receipt_ids.add(
+                    matched_process_receipt["receipt_id"]
+                )
             matched_outcome = str(matched_call.get("outcome") or "error")
             exact_receipts.append({
                 "candidate_id": candidate_id,
                 "kind": str(binding.get("kind") or ""),
                 "tool_name": str(matched_call.get("tool_name") or ""),
                 "outcome": matched_outcome,
+                **(
+                    {
+                        "transport_outcome": str(
+                            matched_call.get("transport_outcome") or ""
+                        ),
+                        "callable_result_failure_reason_codes": list(
+                            (
+                                matched_call.get(
+                                    "callable_result_receipt"
+                                )
+                                or {}
+                            ).get("failure_reason_codes")
+                            or []
+                        ),
+                    }
+                    if isinstance(
+                        matched_call.get("callable_result_receipt"),
+                        dict,
+                    )
+                    else {}
+                ),
             })
             if matched_outcome == "success":
                 successful_exact_candidate_ids.append(candidate_id)
@@ -9833,7 +10603,9 @@ async def _run_child(
     # mere presence of a supporting Skill.
     unverified_typed_evidence = no_verified_value_source
     receipt_degraded_reasons: list[str] = []
-    if runtime_unresolved_retrieval is not None:
+    if retrieval_receipt_affects_completion_quality(
+        runtime_unresolved_retrieval
+    ):
         receipt_degraded_reasons.append("runtime_unresolved_retrieval")
     if result_field_audit.get("degraded"):
         receipt_degraded_reasons.append("typed_result_field_gap")
@@ -9906,7 +10678,9 @@ async def _run_child(
         )
         or verified_exact_capability_gap_ledger
         or verified_knowledge_gate_gap_ledger
-        or runtime_unresolved_retrieval is not None
+        or retrieval_receipt_affects_completion_quality(
+            runtime_unresolved_retrieval
+        )
     )
     if (
         validation_error is None
@@ -10017,18 +10791,24 @@ async def _run_child(
                 context,
                 boundary="delegation.result.commit",
             )
-            result_path = persist_result_for_history(
-                content,
-                "delegate_" + (
-                    "_".join(
-                        part
-                        for part in (skill_name, worker_id, workflow_stage)
-                        if part
-                    )
-                    or "worker"
+            result_path = await run_sync_cancellation_safe(
+                lambda: persist_result_for_history(
+                    content,
+                    "delegate_" + (
+                        "_".join(
+                            part
+                            for part in (
+                                skill_name,
+                                worker_id,
+                                workflow_stage,
+                            )
+                            if part
+                        )
+                        or "worker"
+                    ),
+                    user_id=context.user_id,
+                    session_id=context.session_id,
                 ),
-                user_id=context.user_id,
-                session_id=context.session_id,
             )
         except Exception:
             # Persistence is part of the child output contract.  Do not leak a

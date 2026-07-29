@@ -27,6 +27,8 @@ from skills.http_grants import canonical_https_request_url
 
 RETRIEVAL_RECEIPT_VERSION = 1
 EVIDENCE_LEDGER_VERSION = 1
+RETRIEVAL_QUALITY_IMPACT_ADVISORY = "advisory"
+RETRIEVAL_QUALITY_IMPACT_DEGRADED = "degraded"
 MAX_PAGINATION_SCAN_DEPTH = 8
 MAX_PAGINATION_SCAN_NODES = 1_024
 MAX_PAGINATION_HINTS = 4
@@ -148,6 +150,23 @@ _TOTAL_METADATA_CONTAINER_KEYS = frozenset({
     "pagination",
     "summary",
 })
+
+
+def retrieval_receipt_affects_completion_quality(value: Any) -> bool:
+    """Whether a persisted unresolved-retrieval receipt degrades completion.
+
+    Only a producer-classified bounded optional frontier is advisory. Legacy
+    receipts without ``quality_impact``, malformed projections, and unknown
+    future values remain fail-closed as quality-degrading.
+    """
+
+    if value is None or value is False:
+        return False
+    return not (
+        isinstance(value, Mapping)
+        and value.get("quality_impact")
+        == RETRIEVAL_QUALITY_IMPACT_ADVISORY
+    )
 
 
 def _normalized_key(value: Any) -> str:
@@ -2106,6 +2125,13 @@ class RetrievalCompletenessTracker:
             and self.terminal_failure is None
             and not self.requires_mandatory_continuation(normalized)
         )
+
+    def closure_quality_impact(self, policy: str) -> str:
+        """Classify the current open frontier at the tracker authority."""
+
+        if self.has_optional_pagination_frontier(policy):
+            return RETRIEVAL_QUALITY_IMPACT_ADVISORY
+        return RETRIEVAL_QUALITY_IMPACT_DEGRADED
 
     def next_continuation_action(self) -> dict[str, Any] | None:
         """Return the exact harness-generated action for the next open chain.

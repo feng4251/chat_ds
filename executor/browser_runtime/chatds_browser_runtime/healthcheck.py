@@ -21,6 +21,7 @@ from . import PROFILE_ID
 
 PROFILE_PATH = Path("/opt/chatds-browser-runtime/profile.json")
 INSTALLED_PATH = Path("/opt/chatds-browser-runtime/installed-manifest.json")
+SESSION_SANDBOX_PROFILE_ID = "session-sandbox-v1"
 NODE_MODULES = "/opt/chatds-browser-runtime/node_modules"
 PLAYWRIGHT_BROWSERS = "/opt/chatds-browser-runtime/ms-playwright"
 COMMON_REQUIREMENTS_PATH = Path(
@@ -43,10 +44,23 @@ def _run(command: list[str], *, timeout: float = 10) -> str:
         value = os.environ.get(name)
         if value:
             environment[name] = value
-    if os.environ.get("SKILL_EGRESS_PROXY_URL"):
-        environment["SKILL_EGRESS_PROXY_URL"] = os.environ[
-            "SKILL_EGRESS_PROXY_URL"
-        ]
+    for name in (
+        "SKILL_EGRESS_PROXY_URL",
+        "SKILL_EGRESS_CA_CERT_PATH",
+        "SKILL_EGRESS_LEAF_SPKI_PATH",
+        "SKILL_EGRESS_TRUST_GENERATION_MANIFEST_PATH",
+        "SKILL_EGRESS_TRUST_GENERATION",
+        "SSL_CERT_FILE",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS",
+        "NODE_USE_ENV_PROXY",
+        "GIT_SSL_CAINFO",
+        "AWS_CA_BUNDLE",
+    ):
+        value = os.environ.get(name)
+        if value:
+            environment[name] = value
     completed = subprocess.run(
         command,
         check=True,
@@ -91,6 +105,7 @@ def collect_installed() -> dict[str, Any]:
     for package in (
         "chromium",
         "chromium-driver",
+        "curl",
         "util-linux",
         "weston",
     ):
@@ -160,6 +175,7 @@ def validate_static(
         for name in (
             "chromium",
             "chromium-driver",
+            "curl",
             "util-linux",
             "weston",
         )
@@ -195,7 +211,10 @@ def validate_static(
         "/usr/local/bin/chatds-chromium-proxy"
     ).resolve():
         raise HealthError("Playwright is not bound to the controlled Chromium wrapper")
-    if os.environ.get("EXECUTOR_RUNTIME_PROFILE") == PROFILE_ID:
+    if os.environ.get("EXECUTOR_RUNTIME_PROFILE") in {
+        PROFILE_ID,
+        SESSION_SANDBOX_PROFILE_ID,
+    }:
         for fixed_path in (Path("/workspace"), Path("/tmp"), Path("/dev/shm")):
             if os.access(fixed_path, os.W_OK):
                 raise HealthError(

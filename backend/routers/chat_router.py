@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Awaitable, Callable, Optional, TypeVar
@@ -27,7 +28,13 @@ from models import (
     SkillPackage,
 )
 from schemas import ChatRequest
-from workspace import ensure_workspace, safe_workspace_path, serialize_json_list, workspace_file_metadata
+from workspace import (
+    ensure_workspace_async,
+    require_session_workspace_active,
+    safe_workspace_path_in_root,
+    serialize_json_list,
+    workspace_file_metadata,
+)
 from hooks import emit_event
 from native_tools import DEFAULT_NATIVE_TOOLS
 from model_routing import (
@@ -55,6 +62,10 @@ router = APIRouter(prefix="/api/chat", tags=["chat"])
 # Background tasks (keep references so they don't get GC'd before completion).
 _background_tasks: set[asyncio.Task] = set()
 _detached_chat_producers: set[asyncio.Task] = set()
+_detached_chat_producers_by_conversation: dict[
+    str,
+    set[asyncio.Task],
+] = {}
 _best_effort_tasks: set[asyncio.Task] = set()
 _INCOMPLETE_RESPONSE_MARKERS = (
     "⚠️ 本次任务执行失败：",
@@ -245,10 +256,24 @@ def _track_detached_chat_producer(
     task = asyncio.create_task(operation)
     _background_tasks.add(task)
     _detached_chat_producers.add(task)
+    _detached_chat_producers_by_conversation.setdefault(
+        str(conv_id),
+        set(),
+    ).add(task)
 
     def finish(completed: asyncio.Task) -> None:
         _background_tasks.discard(completed)
         _detached_chat_producers.discard(completed)
+        conversation_tasks = (
+            _detached_chat_producers_by_conversation.get(str(conv_id))
+        )
+        if conversation_tasks is not None:
+            conversation_tasks.discard(completed)
+            if not conversation_tasks:
+                _detached_chat_producers_by_conversation.pop(
+                    str(conv_id),
+                    None,
+                )
         error: BaseException | None = None
         try:
             error = completed.exception()
@@ -280,6 +305,83 @@ def _track_detached_chat_producer(
     return task
 
 
+async def cancel_conversation_producers(
+    conv_id: str,
+    *,
+    grace_seconds: float = 15.0,
+) -> dict[str, int | bool]:
+    """Cancel and drain every detached producer owned by one conversation."""
+
+    tasks = {
+        task
+        for task in _detached_chat_producers_by_conversation.get(
+            str(conv_id),
+            set(),
+        )
+        if not task.done()
+    }
+    for task in tasks:
+        task.cancel()
+    timeout = max(0.1, min(float(grace_seconds), 60.0))
+    done: set[asyncio.Task] = set()
+    residual: set[asyncio.Task] = set()
+    if tasks:
+        done, residual = await asyncio.wait(
+            tasks,
+            timeout=timeout,
+            return_when=asyncio.ALL_COMPLETED,
+        )
+    for task in done:
+        try:
+            task.exception()
+        except BaseException:
+            pass
+    barrier_tasks: set[asyncio.Task] = set()
+    state = _conversation_turn_states.get(str(conv_id))
+    if state is not None:
+        # Failed projections intentionally remain tracked until a lifecycle
+        # barrier observes them. Include already-completed failures here:
+        # deletion has published a durable tombstone and owns the explicit
+        # purge, so an expected fail-closed projection must be consumed rather
+        # than making the first delete attempt fail with a stale barrier.
+        barrier_tasks.update(state.projection_tasks)
+    for (task_conv_id, _root_run_id), pending in list(
+        _agent_event_persist_tasks.items()
+    ):
+        if task_conv_id == str(conv_id):
+            barrier_tasks.update(
+                task for task in pending if not task.done()
+            )
+    barrier_done: set[asyncio.Task] = set()
+    barrier_residual: set[asyncio.Task] = set()
+    if not residual and barrier_tasks:
+        barrier_done, barrier_residual = await asyncio.wait(
+            barrier_tasks,
+            timeout=timeout,
+            return_when=asyncio.ALL_COMPLETED,
+        )
+        for task in barrier_done:
+            try:
+                task.exception()
+            except BaseException:
+                pass
+        # Delete only needs proof that every projection stopped. A projection
+        # may fail closed because the durable tombstone revoked its commit
+        # authority; consume that expected failure so the maintenance lease
+        # can proceed to the explicit database purge.
+        if state is not None:
+            for task in barrier_done:
+                state.projection_tasks.discard(task)
+            _cleanup_conversation_turn_state(str(conv_id), state)
+    return {
+        "success": not residual and not barrier_residual,
+        "cancelled_count": len(done),
+        "residual_count": len(residual),
+        "projection_drained_count": len(barrier_done),
+        "projection_residual_count": len(barrier_residual),
+    }
+
+
 async def shutdown_chat_background_tasks(
     *,
     producer_cancel_seconds: float = 3.0,
@@ -300,10 +402,20 @@ async def shutdown_chat_background_tasks(
     for task in best_effort:
         task.cancel()
 
-    producers = [
+    # Registered non-chat executions (notably scheduled jobs) live in the
+    # per-conversation registry rather than _detached_chat_producers. Shutdown
+    # must cancel the union or a long cron can outlive Backend lifespan.
+    producers = {
         task for task in _detached_chat_producers
         if not task.done()
-    ]
+    }
+    for conversation_tasks in (
+        _detached_chat_producers_by_conversation.values()
+    ):
+        producers.update(
+            task for task in conversation_tasks
+            if not task.done()
+        )
     for task in producers:
         task.cancel()
     if producers:
@@ -322,17 +434,16 @@ async def shutdown_chat_background_tasks(
         task for task in _background_tasks
         if not task.done()
     ]
-    if not projections:
-        return
-    _done, pending = await asyncio.wait(
-        projections,
-        timeout=max(0.1, float(projection_grace_seconds)),
-    )
-    if pending:
-        logger.error(
-            "Backend shutdown projection grace expired with %s task(s)",
-            len(pending),
+    if projections:
+        _done, pending = await asyncio.wait(
+            projections,
+            timeout=max(0.1, float(projection_grace_seconds)),
         )
+        if pending:
+            logger.error(
+                "Backend shutdown projection grace expired with %s task(s)",
+                len(pending),
+            )
     late_best_effort = [
         task for task in _best_effort_tasks
         if not task.done()
@@ -461,6 +572,65 @@ def _release_conversation_turn(
         state.lock.release()
     state.references = max(0, state.references - 1)
     _cleanup_conversation_turn_state(conv_id, state)
+
+
+@asynccontextmanager
+async def conversation_maintenance_lease(conv_id: str):
+    """Exclude new turns while a lifecycle operation snapshots or deletes.
+
+    The lease also drains any terminal projection left by a producer that was
+    cancelled or detached immediately before the maintenance operation.
+    """
+
+    lease = await _acquire_conversation_turn(str(conv_id))
+    try:
+        yield
+    finally:
+        _release_conversation_turn(str(conv_id), lease)
+
+
+@asynccontextmanager
+async def registered_conversation_execution(
+    user_id: str,
+    conv_id: str,
+):
+    """Register a non-chat producer and hold the conversation turn lease.
+
+    Scheduled jobs use this path so delete observes/cancels them through the
+    same registry as chat producers. Double marker checks close the
+    publish-vs-register race before any session-owned commit can begin.
+    """
+
+    conversation_key = str(conv_id)
+    task = asyncio.current_task()
+    if task is None:
+        raise RuntimeError("Conversation execution requires an asyncio task.")
+    require_session_workspace_active(str(user_id), conversation_key)
+    _background_tasks.add(task)
+    _detached_chat_producers_by_conversation.setdefault(
+        conversation_key,
+        set(),
+    ).add(task)
+    try:
+        require_session_workspace_active(str(user_id), conversation_key)
+        async with conversation_maintenance_lease(conversation_key):
+            require_session_workspace_active(
+                str(user_id),
+                conversation_key,
+            )
+            yield
+    finally:
+        conversation_tasks = _detached_chat_producers_by_conversation.get(
+            conversation_key
+        )
+        if conversation_tasks is not None:
+            conversation_tasks.discard(task)
+            if not conversation_tasks:
+                _detached_chat_producers_by_conversation.pop(
+                    conversation_key,
+                    None,
+                )
+        _background_tasks.discard(task)
 
 
 def _track_conversation_projection(
@@ -1084,7 +1254,12 @@ async def _project_artifact_event(
     sha256 = payload.get("sha256")
     if path:
         try:
-            file_path = safe_workspace_path(user_id, conv_id, path, must_exist=True)
+            workspace = await ensure_workspace_async(user_id, conv_id)
+            file_path = safe_workspace_path_in_root(
+                workspace,
+                path,
+                must_exist=True,
+            )
             if file_path.is_file():
                 stat = file_path.stat()
                 meta = workspace_file_metadata(file_path)
@@ -1588,6 +1763,15 @@ async def _persist_agent_event_once(
 ) -> bool:
     async with async_session() as s:
         try:
+            require_session_workspace_active(user_id, conv_id)
+            conversation_exists = (await s.execute(
+                select(Conversation.id).where(
+                    Conversation.id == conv_id,
+                    Conversation.user_id == user_id,
+                )
+            )).scalar_one_or_none()
+            if conversation_exists is None:
+                return False
             run_id = str(event.get("run_id") or "")
             event_type = str(event.get("event_type") or "")
             seq = int(event.get("seq"))
@@ -1625,6 +1809,7 @@ async def _persist_agent_event_once(
                 events=[event],
                 defer_root_terminal=True,
             )
+            require_session_workspace_active(user_id, conv_id)
             await s.commit()
             return True
         except BaseException:
@@ -1913,6 +2098,16 @@ async def _persist_stream_projection_once(
         assistant_message = None
         event_user_id = None
         try:
+            conv = (await s.execute(
+                select(Conversation).where(
+                    Conversation.id == conv_id
+                )
+            )).scalar_one_or_none()
+            if conv is None:
+                raise _ConversationProjectionBarrierError(
+                    "Conversation was deleted before terminal projection."
+                )
+            require_session_workspace_active(str(conv.user_id), conv_id)
             terminal_status, _ = _agent_event_terminal_status(
                 agent_events, run_id=run_id
             )
@@ -1942,24 +2137,20 @@ async def _persist_stream_projection_once(
                 created_at=await _next_message_created_at(s, conv_id),
             )
             s.add(assistant_message)
-            conv = (await s.execute(
-                select(Conversation).where(Conversation.id == conv_id)
-            )).scalar_one_or_none()
-            if conv:
-                event_user_id = conv.user_id
-                conv.input_tokens += input_tokens
-                conv.output_tokens += output_tokens
-                conv.total_tokens += total_tokens
-                if (
-                    conv.goal_token_budget
-                    and conv.goal_status == "active"
-                    and (
-                        conv.total_tokens - conv.goal_started_tokens
-                        >= conv.goal_token_budget
-                    )
-                ):
-                    conv.goal_status = "budget_limited"
-                    conv.goal_note = "Goal token budget reached."
+            event_user_id = conv.user_id
+            conv.input_tokens += input_tokens
+            conv.output_tokens += output_tokens
+            conv.total_tokens += total_tokens
+            if (
+                conv.goal_token_budget
+                and conv.goal_status == "active"
+                and (
+                    conv.total_tokens - conv.goal_started_tokens
+                    >= conv.goal_token_budget
+                )
+            ):
+                conv.goal_status = "budget_limited"
+                conv.goal_note = "Goal token budget reached."
             await _persist_agent_events(
                 s,
                 conv_id=conv_id,
@@ -2011,6 +2202,7 @@ async def _persist_stream_projection_once(
                 run.output_tokens = output_tokens
                 run.total_tokens = total_tokens
                 run.ended_at = datetime.utcnow()
+            require_session_workspace_active(str(conv.user_id), conv_id)
             await s.commit()
             return (
                 assistant_message.id if assistant_message is not None else None,
@@ -2553,7 +2745,7 @@ async def _chat_stream(
                 # here: the harness may retain it for an explicit image turn.
                 conv.model_id = model_id
                 await db.commit()
-            ensure_workspace(cur_user.id, conv_id)
+            await ensure_workspace_async(cur_user.id, conv_id)
         else:
             model_id = canonical_agent_model_id(
                 await _detect_model(req, str(cur_user.id))
@@ -2564,7 +2756,7 @@ async def _chat_stream(
             await db.refresh(conv)
             conv_id = conv.id
             turn_lease = await _acquire_conversation_turn(conv_id)
-            ensure_workspace(cur_user.id, conv_id)
+            await ensure_workspace_async(cur_user.id, conv_id)
             await emit_event(
                 cur_user.id,
                 "session.created",
@@ -3147,7 +3339,7 @@ async def _chat_stream_with_turn(
                 None,
             )
             if isinstance(termination_debug_event, dict):
-                _append_backend_stream_debug_file(
+                await _append_backend_stream_debug_file(
                     user_id=str(cur_user.id),
                     session_id=conv_id,
                     run_id=run.id,
@@ -3322,11 +3514,16 @@ async def _chat_stream_with_turn(
                 "observation_kind": "downstream_final",
             },
         }
-        _append_backend_stream_debug_file(
-            user_id=str(cur_user.id),
-            session_id=conv_id,
-            run_id=run.id,
-            event=event,
+        _track_best_effort_task(
+            _append_backend_stream_debug_file(
+                user_id=str(cur_user.id),
+                session_id=conv_id,
+                run_id=run.id,
+                event=event,
+            ),
+            description=(
+                f"backend stream debug mirror conv={conv_id} run={run.id}"
+            ),
         )
         if _should_persist_agent_event_immediately(event["event_type"]):
             _spawn_agent_event_immediate_persist(

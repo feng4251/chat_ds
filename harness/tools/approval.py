@@ -320,6 +320,8 @@ def _private_origin_is_allowlist_eligible(origin: str) -> bool:
 
 _EXPLICIT_HTTP_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 _URL_TRAILING_PUNCTUATION = ".,;:!?)]}\u3002\uff0c\uff1b\uff1a\uff01\uff1f\uff09\u3011\u300b"
+_MAX_USER_BROWSER_EGRESS_ORIGINS = 32
+_DEFAULT_USER_BROWSER_METHODS = ("GET", "HEAD", "OPTIONS", "POST")
 
 
 def compile_user_private_origin_grants(
@@ -356,6 +358,44 @@ def compile_user_private_origin_grants(
         if origin in configured and origin not in grants:
             grants.append(origin)
     return tuple(grants)
+
+
+def compile_user_browser_egress_rules(
+    user_text: str,
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Compile same-origin browser authority from bounded user-authored URLs.
+
+    This compiler is intentionally syntactic and side-effect free. DNS/IP
+    safety and the independent private-origin deployment intersection are
+    revalidated immediately before navigation and for every browser request.
+    Skill prose, assistant/tool turns, redirects, and model-authored tool
+    arguments are not inputs.  The Harness may supply the latest user turn
+    plus one bounded nearest user URL turn when that latest turn explicitly
+    refers to continuing the prior URL/site/Skill.
+    """
+
+    from tools.session_sandbox_policy import (
+        SessionSandboxPolicyError,
+        browser_egress_rule_tuples,
+        normalize_http_url_prefix,
+    )
+
+    rows: list[tuple[str, tuple[str, ...]]] = []
+    seen_origins: set[str] = set()
+    for match in _EXPLICIT_HTTP_URL_RE.finditer(str(user_text or "")):
+        value = match.group(0).rstrip(_URL_TRAILING_PUNCTUATION)
+        origin = canonical_http_origin(value)
+        if origin is None or origin in seen_origins:
+            continue
+        try:
+            prefix = normalize_http_url_prefix(origin + "/")
+        except SessionSandboxPolicyError:
+            continue
+        rows.append((prefix, _DEFAULT_USER_BROWSER_METHODS))
+        seen_origins.add(origin)
+        if len(rows) >= _MAX_USER_BROWSER_EGRESS_ORIGINS:
+            break
+    return browser_egress_rule_tuples(rows)
 
 
 def check_url_safety(

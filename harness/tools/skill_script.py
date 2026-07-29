@@ -29,8 +29,16 @@ from tools.omission_guard import (
 from tools.isolated_skill_executor import (
     IsolatedSkillExecutorError,
     execute_isolated_skill_script,
+    snapshot_skill_package,
 )
 from tools.path_security import sandbox_dir
+from tools.session_sandbox_policy import (
+    SessionSandboxPolicyError,
+)
+from tools.skill_invocation_egress import (
+    invocation_bound_skill_egress_policy,
+)
+from tools.skill_runtime_profile import select_skill_runtime_profile
 
 
 DEFAULT_TIMEOUT = 120
@@ -162,9 +170,34 @@ async def run_skill_script(
             context,
             skill_name,
         )
-    except SkillScriptError as exc:
+        entrypoint = script.relative_to(skill_dir).as_posix()
+        profile_selection = select_skill_runtime_profile(
+            snapshot_skill_package(skill_dir),
+            entrypoint,
+        )
+        if (
+            expected_skill_sha256 is not None
+            and profile_selection.package_sha256
+            != expected_skill_sha256
+        ):
+            raise SkillScriptError(
+                "skill_package_authority_mismatch",
+                "The exact Skill package changed after capability "
+                "compilation. Recompile before executing it.",
+            )
+        egress_policy = invocation_bound_skill_egress_policy(
+            context,
+            skill_name,
+            profile_selection,
+            invocation={"source": "argv", "args": safe_args},
+        )
+    except (
+        IsolatedSkillExecutorError,
+        SkillScriptError,
+        SessionSandboxPolicyError,
+    ) as exc:
         return _error(
-            exc.code,
+            str(getattr(exc, "code", "invalid_session_sandbox_policy")),
             str(exc),
             script_path=str(script_path or ""),
             supported_extensions=list(SUPPORTED_EXTENSIONS),
@@ -178,7 +211,7 @@ async def run_skill_script(
             "skill_runtime_prerequisites_unsatisfied",
             (
                 "The installed Skill's declared runtime dependencies are not "
-                "available in the network-disabled isolated executor."
+                "available in the controlled isolated session sandbox."
             ),
             script_path=display_path,
             runtime_preflight=runtime_preflight,
@@ -190,7 +223,7 @@ async def run_skill_script(
         payload = await execute_isolated_skill_script(
             skill_root=skill_dir,
             workspace=workspace,
-            entrypoint=script.relative_to(skill_dir).as_posix(),
+            entrypoint=entrypoint,
             args=safe_args,
             timeout=safe_timeout,
             cwd=safe_cwd,
@@ -198,6 +231,13 @@ async def run_skill_script(
                 {"expected_skill_sha256": expected_skill_sha256}
                 if expected_skill_sha256 is not None
                 else {}
+            ),
+            **(
+                {
+                    "egress_rules": egress_policy.rule_payload(),
+                    "private_origins": egress_policy.private_origins,
+                }
+                if egress_policy.rules else {}
             ),
             **(
                 {
@@ -221,7 +261,11 @@ async def run_skill_script(
             str(exc),
             script_path=display_path,
             execution_runtime="isolated_skill_executor",
-            network="disabled",
+            network=(
+                "controlled_egress"
+                if egress_policy.rules
+                else "disabled"
+            ),
             fallback_attempted=False,
         )
     payload["script_path"] = display_path
@@ -229,6 +273,9 @@ async def run_skill_script(
     payload["script_type"] = script.suffix.lstrip(".")
     payload["execution_runtime"] = "isolated_skill_executor"
     payload["environment_policy"] = "ephemeral_snapshot_no_secrets"
+    payload["egress_policy"] = (
+        "compiled_exact_url_policy" if egress_policy.rules else "none"
+    )
     payload["runtime_preflight"] = runtime_preflight
     payload["fallback_attempted"] = False
     payload["workspace_output_dir"] = "workspace/output_result"
@@ -680,7 +727,7 @@ RUN_SKILL_SCRIPT_SCHEMA = {
         "Run a real script declared inside the exact installed Skill selected for this run. "
         "Supported extensions are .py, .sh, .bash, .js, .mjs, and .cjs. The harness "
         "sends an immutable, content-addressed Skill/workspace snapshot to a "
-        "network-disabled sidecar and selects a fixed Python, bash, or node "
+        "controlled session sandbox and selects a fixed Python, bash, or node "
         "interpreter from the extension. Provide argv as "
         "separate strings; command strings, custom interpreters, shell eval, and "
         "fallback execution are never accepted. Only validated changed workspace "

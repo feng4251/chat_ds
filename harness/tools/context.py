@@ -92,6 +92,35 @@ class ToolContext:
     # Method-level subset of the literal HTTPS ledger. A prefix enters this
     # set only when canonical Skill text explicitly declares POST/GraphQL.
     allowed_skill_http_post_prefixes: tuple[tuple[str, str], ...] = ()
+    # Runtime-only network authority for exact Skill scripts and declared
+    # commands.  Keep this separate from the method-level HTTP tool ledgers
+    # above: selecting a sandboxed entrypoint must not make skill_http_get or
+    # skill_http_post_json callable for any additional URL.
+    allowed_skill_sandbox_egress_prefixes: tuple[
+        tuple[str, str], ...
+    ] = ()
+    # Method-preserving sandbox authority. Each entry is
+    # (canonical Skill name, canonical HTTP(S) URL prefix, canonical method
+    # tuple). The legacy prefix ledger above remains a compatibility view only;
+    # executor/proxy authorization uses these exact rules when present.
+    allowed_skill_sandbox_egress_rules: tuple[
+        tuple[str, str, tuple[str, ...]], ...
+    ] = ()
+    # Method-free exact URL identities compiled only from the bounded current
+    # user context.  These are not permissions and are never projected into a
+    # capability plan.  An exact Skill runner may consume them only at its
+    # final dispatch boundary by proving one schema-v2 binding against the
+    # actual invocation arguments.
+    user_url_authorization_urls: tuple[str, ...] = ()
+    # Runtime-owned HTTP(S) authority for the native browser. Each entry is
+    # (canonical URL prefix, canonical method tuple). The primary compiler
+    # derives this only from explicit URLs in the current original user turn;
+    # selected frozen Skill rules are projected separately from the exact
+    # Skill ledger at dispatch. Delegates receive only a parent-intersected
+    # immutable projection and never reinterpret their model-authored task.
+    allowed_browser_egress_rules: tuple[
+        tuple[str, tuple[str, ...]], ...
+    ] = ()
     # Exact private HTTP(S) origins compiled from the intersection of the
     # deployment allowlist and explicit URLs in this primary user turn.  This
     # never comes from Skill prose or model-authored tool arguments.

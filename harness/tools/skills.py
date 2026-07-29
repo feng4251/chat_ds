@@ -37,7 +37,10 @@ from skills.scanner import find_all_skills
 from tools.context import ToolContext
 from tools.execution_fence import require_execution_authority
 from tools.path_security import validate_path
-from tools.workspace_lock import workspace_mutation_guard
+from tools.workspace_lock import (
+    run_sync_cancellation_safe,
+    workspace_mutation_guard,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1514,26 +1517,29 @@ async def skill_copy_resource(
     atomic copy, and the receipt includes an integrity hash for downstream
     artifact verification.
     """
-    workspace = validate_path(
-        ".",
-        user_id,
-        session_id,
-        sub="workspace",
-    )
-    with workspace_mutation_guard(workspace):
-        return await _skill_copy_resource_locked(
-            name,
-            source_path,
-            destination_path,
-            overwrite=overwrite,
-            user_id=user_id,
-            session_id=session_id,
-            enabled_user_skills=enabled_user_skills,
-            context=context,
+    def _operation() -> str:
+        workspace = validate_path(
+            ".",
+            user_id,
+            session_id,
+            sub="workspace",
         )
+        with workspace_mutation_guard(workspace):
+            return _skill_copy_resource_locked(
+                name,
+                source_path,
+                destination_path,
+                overwrite=overwrite,
+                user_id=user_id,
+                session_id=session_id,
+                enabled_user_skills=enabled_user_skills,
+                context=context,
+            )
+
+    return await run_sync_cancellation_safe(_operation)
 
 
-async def _skill_copy_resource_locked(
+def _skill_copy_resource_locked(
     name: str,
     source_path: str,
     destination_path: str,

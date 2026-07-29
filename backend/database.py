@@ -1,12 +1,35 @@
 import json
+import logging
 import uuid
 
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase
 from config import settings
 
+logger = logging.getLogger(__name__)
+
 engine = create_async_engine(settings.database_url, echo=False)
+
+
+@event.listens_for(engine.sync_engine, "connect")
+def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
+    """Enable FK enforcement on every SQLite connection, including tests."""
+
+    if engine.sync_engine.dialect.name != "sqlite":
+        return
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA foreign_keys")
+        row = cursor.fetchone()
+        if row is None or int(row[0]) != 1:
+            raise RuntimeError(
+                "SQLite connection did not enable foreign key enforcement."
+            )
+    finally:
+        cursor.close()
+
 
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
@@ -156,6 +179,187 @@ _SKILL_PACKAGE_SCOPE_INDEXES = {
         "session_id IS NULL",
     ),
 }
+_ORPHAN_REPAIR_BATCH_SIZE = 500
+_SESSION_CONVERSATION_COLUMNS = (
+    ("agent_run_events", "conversation_id"),
+    ("artifacts", "conversation_id"),
+    ("task_items", "conversation_id"),
+    ("agent_runs", "conversation_id"),
+    ("messages", "conversation_id"),
+    ("skill_packages", "session_id"),
+    ("event_hooks", "conversation_id"),
+    ("scheduled_jobs", "conversation_id"),
+)
+_USER_OWNED_TABLES = (
+    ("agent_run_events", "user_id"),
+    ("artifacts", "user_id"),
+    ("task_items", "user_id"),
+    ("agent_runs", "user_id"),
+    ("skill_packages", "user_id"),
+    ("event_hooks", "user_id"),
+    ("scheduled_jobs", "user_id"),
+    ("custom_model_configs", "user_id"),
+    ("conversations", "user_id"),
+)
+
+
+async def _delete_legacy_conversation_orphans(
+    conn,
+    *,
+    table_name: str,
+    column_name: str,
+) -> int:
+    """Delete bounded rowid cohorts whose declared Conversation is absent."""
+
+    total = 0
+    while True:
+        await conn.execute(text(
+            f"DELETE FROM {table_name} "
+            "WHERE rowid IN ("
+            f"SELECT child.rowid FROM {table_name} AS child "
+            "LEFT JOIN conversations AS parent "
+            f"ON parent.id = child.{column_name} "
+            "LEFT JOIN users AS parent_owner "
+            "ON parent_owner.id = parent.user_id "
+            f"WHERE child.{column_name} IS NOT NULL "
+            "AND (parent.id IS NULL OR parent_owner.id IS NULL) "
+            "ORDER BY child.rowid "
+            f"LIMIT {_ORPHAN_REPAIR_BATCH_SIZE}"
+            ")"
+        ))
+        removed = int((
+            await conn.execute(text("SELECT changes()"))
+        ).scalar_one())
+        total += removed
+        if removed < _ORPHAN_REPAIR_BATCH_SIZE:
+            return total
+
+
+async def _delete_legacy_user_orphans(
+    conn,
+    *,
+    table_name: str,
+    column_name: str,
+) -> int:
+    total = 0
+    while True:
+        await conn.execute(text(
+            f"DELETE FROM {table_name} "
+            "WHERE rowid IN ("
+            f"SELECT child.rowid FROM {table_name} AS child "
+            "LEFT JOIN users AS parent "
+            f"ON parent.id = child.{column_name} "
+            f"WHERE child.{column_name} IS NOT NULL "
+            "AND parent.id IS NULL "
+            "ORDER BY child.rowid "
+            f"LIMIT {_ORPHAN_REPAIR_BATCH_SIZE}"
+            ")"
+        ))
+        removed = int((
+            await conn.execute(text("SELECT changes()"))
+        ).scalar_one())
+        total += removed
+        if removed < _ORPHAN_REPAIR_BATCH_SIZE:
+            return total
+
+
+async def _repair_legacy_foreign_key_orphans(conn) -> dict[str, int]:
+    """Repair only rows whose owning Conversation no longer exists.
+
+    Old deployments ran SQLite with ``foreign_keys=0``. The bounded,
+    deterministic cleanup runs in the caller's startup transaction, preserving
+    every row that still has a live Conversation owner.
+    """
+
+    if conn.dialect.name != "sqlite":
+        return {}
+    repaired: dict[str, int] = {}
+
+    # Runs of an orphan scheduled job must be removed before the job. Direct
+    # conversation orphans are also session-owned historic rows.
+    total_job_runs = 0
+    while True:
+        await conn.execute(text(
+            "DELETE FROM scheduled_job_runs "
+            "WHERE rowid IN ("
+            "SELECT run.rowid FROM scheduled_job_runs AS run "
+            "LEFT JOIN scheduled_jobs AS job ON job.id = run.job_id "
+            "LEFT JOIN users AS job_owner ON job_owner.id = job.user_id "
+            "LEFT JOIN conversations AS direct_parent "
+            "ON direct_parent.id = run.conversation_id "
+            "LEFT JOIN users AS direct_parent_owner "
+            "ON direct_parent_owner.id = direct_parent.user_id "
+            "LEFT JOIN conversations AS job_parent "
+            "ON job_parent.id = job.conversation_id "
+            "LEFT JOIN users AS job_parent_owner "
+            "ON job_parent_owner.id = job_parent.user_id "
+            "WHERE job.id IS NULL "
+            "OR job_owner.id IS NULL "
+            "OR (run.conversation_id IS NOT NULL "
+            "AND (direct_parent.id IS NULL "
+            "OR direct_parent_owner.id IS NULL)) "
+            "OR (job.conversation_id IS NOT NULL "
+            "AND (job_parent.id IS NULL "
+            "OR job_parent_owner.id IS NULL)) "
+            "ORDER BY run.rowid "
+            f"LIMIT {_ORPHAN_REPAIR_BATCH_SIZE}"
+            ")"
+        ))
+        removed = int((
+            await conn.execute(text("SELECT changes()"))
+        ).scalar_one())
+        total_job_runs += removed
+        if removed < _ORPHAN_REPAIR_BATCH_SIZE:
+            break
+    if total_job_runs:
+        repaired["scheduled_job_runs"] = total_job_runs
+
+    for table_name, column_name in _SESSION_CONVERSATION_COLUMNS:
+        removed = await _delete_legacy_conversation_orphans(
+            conn,
+            table_name=table_name,
+            column_name=column_name,
+        )
+        if removed:
+            repaired[table_name] = removed
+    # Conversation-descendant rows were removed first, so deleting a
+    # Conversation whose User is absent cannot strand raw legacy tables that
+    # predate FK declarations. Global user-owned rows are handled here too.
+    for table_name, column_name in _USER_OWNED_TABLES:
+        removed = await _delete_legacy_user_orphans(
+            conn,
+            table_name=table_name,
+            column_name=column_name,
+        )
+        if removed:
+            repaired[table_name] = (
+                repaired.get(table_name, 0) + removed
+            )
+    if repaired:
+        logger.warning(
+            "Repaired legacy rows with missing Conversation owners: %s",
+            repaired,
+        )
+    return repaired
+
+
+async def _assert_sqlite_foreign_key_integrity(conn) -> None:
+    if conn.dialect.name != "sqlite":
+        return
+    result = await conn.execute(text("PRAGMA foreign_key_check"))
+    rows = result.fetchmany(1001)
+    if not rows:
+        return
+    truncated = len(rows) > 1000
+    evidence_rows = rows[:1000]
+    counts: dict[str, int] = {}
+    for row in evidence_rows:
+        table_name = str(row[0] or "unknown")
+        counts[table_name] = counts.get(table_name, 0) + 1
+    raise RuntimeError(
+        "SQLite foreign-key integrity check failed after bounded legacy "
+        f"repair: sample_counts={counts}, truncated={truncated}"
+    )
 
 
 async def _ensure_skill_package_scope_identity(conn) -> None:
@@ -645,15 +849,73 @@ async def _reconcile_orphaned_descendant_runs(conn) -> None:
         )
 
 
+async def _reconcile_orphaned_scheduled_job_runs(conn) -> int:
+    """Terminalize cron executions left running by a prior Backend process.
+
+    The scheduler is process-owned and this deployment has one Backend worker,
+    so no persisted ``running`` row can still have a live execution at startup.
+    Recurring jobs retain the next time claimed before dispatch; one-shot jobs
+    are disabled so a restart cannot duplicate an unattended side effect.
+    """
+
+    if conn.dialect.name != "sqlite":
+        return 0
+    stale_count = int((await conn.execute(text(
+        "SELECT COUNT(*) FROM scheduled_job_runs WHERE status = 'running'"
+    ))).scalar_one())
+    if stale_count == 0:
+        return 0
+    await conn.execute(text(
+        "UPDATE scheduled_jobs "
+        "SET last_status = 'cancelled', "
+        "enabled = CASE WHEN schedule_kind = 'once' THEN 0 ELSE enabled END, "
+        "updated_at = CURRENT_TIMESTAMP "
+        "WHERE id IN ("
+        "SELECT stale.job_id FROM scheduled_job_runs AS stale "
+        "WHERE stale.status = 'running' "
+        "AND stale.rowid = ("
+        "SELECT MAX(latest.rowid) FROM scheduled_job_runs AS latest "
+        "WHERE latest.job_id = stale.job_id"
+        ")"
+        ")"
+    ))
+    await conn.execute(text(
+        "UPDATE scheduled_job_runs "
+        "SET status = 'cancelled', "
+        "error = COALESCE(NULLIF(error, ''), 'backend_process_restart'), "
+        "ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP) "
+        "WHERE status = 'running'"
+    ))
+    return stale_count
+
+
 async def init_db():
     from models import Base as ModelBase  # noqa: F811
     async with engine.begin() as conn:
+        if conn.dialect.name == "sqlite":
+            enabled = (
+                await conn.execute(text("PRAGMA foreign_keys"))
+            ).scalar_one()
+            if int(enabled) != 1:
+                raise RuntimeError(
+                    "SQLite foreign key enforcement is disabled."
+                )
         await conn.run_sync(ModelBase.metadata.create_all)
         for sql in _LIGHTWEIGHT_MIGRATIONS:
             try:
                 await conn.execute(text(sql))
             except Exception:
                 pass  # column already exists
+        await _repair_legacy_foreign_key_orphans(conn)
         await _ensure_skill_package_scope_identity(conn)
         await _ensure_agent_run_event_identity(conn)
+        repaired_scheduled_runs = (
+            await _reconcile_orphaned_scheduled_job_runs(conn)
+        )
+        if repaired_scheduled_runs:
+            logger.warning(
+                "Cancelled %s orphaned scheduled run(s) during startup",
+                repaired_scheduled_runs,
+            )
         await _reconcile_orphaned_descendant_runs(conn)
+        await _assert_sqlite_foreign_key_integrity(conn)

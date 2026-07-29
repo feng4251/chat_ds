@@ -15,6 +15,10 @@ from pydantic import BaseModel, field_validator
 from auth import get_current_user
 from config import settings
 from models import User
+from session_lifecycle import (
+    require_owned_active_session,
+    session_control_plane_mutation,
+)
 
 router = APIRouter(prefix="/api/mcp", tags=["mcp"])
 
@@ -72,14 +76,20 @@ async def list_servers(
     session_id: Optional[str] = Query(None),
     user: User = Depends(get_current_user),
 ):
-    return await _harness_request(
+    scoped_session = session_id or "default"
+    if scoped_session != "default":
+        await require_owned_active_session(str(user.id), scoped_session)
+    result = await _harness_request(
         "GET",
         "/internal/mcp/servers",
         params={
             "user_id": str(user.id),
-            "session_id": session_id or "default",
+            "session_id": scoped_session,
         },
     )
+    if scoped_session != "default":
+        await require_owned_active_session(str(user.id), scoped_session)
+    return result
 
 
 @router.post("/servers")
@@ -97,9 +107,22 @@ async def add_server(
         user_id=str(user.id),
         session_id=config.session_id or "default",
     )
-    return await _harness_request(
-        "POST", "/internal/mcp/server/add", json=payload
-    )
+    scoped_session = config.session_id or "default"
+    if scoped_session == "default":
+        return await _harness_request(
+            "POST", "/internal/mcp/server/add", json=payload
+        )
+    # Use the same Skill -> conversation lock order as install/fork/delete.
+    # The Harness call is retained inside the lease so deletion cannot finish
+    # while an MCP configuration write is in flight.
+    async with session_control_plane_mutation(
+        str(user.id),
+        scoped_session,
+        acquire_skill_lock=True,
+    ):
+        return await _harness_request(
+            "POST", "/internal/mcp/server/add", json=payload
+        )
 
 
 @router.delete("/servers/{name}")
@@ -108,12 +131,25 @@ async def delete_server(
     session_id: Optional[str] = Query(None),
     user: User = Depends(get_current_user),
 ):
-    return await _harness_request(
-        "POST",
-        "/internal/mcp/server/remove",
-        json={
-            "name": name,
-            "user_id": str(user.id),
-            "session_id": session_id or "default",
-        },
-    )
+    scoped_session = session_id or "default"
+    payload = {
+        "name": name,
+        "user_id": str(user.id),
+        "session_id": scoped_session,
+    }
+    if scoped_session == "default":
+        return await _harness_request(
+            "POST",
+            "/internal/mcp/server/remove",
+            json=payload,
+        )
+    async with session_control_plane_mutation(
+        str(user.id),
+        scoped_session,
+        acquire_skill_lock=True,
+    ):
+        return await _harness_request(
+            "POST",
+            "/internal/mcp/server/remove",
+            json=payload,
+        )

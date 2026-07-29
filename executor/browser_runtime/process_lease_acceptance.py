@@ -1,4 +1,4 @@
-"""Repeatable real-socket acceptance runner for the browser executor profile.
+"""Repeatable real-socket acceptance runner for the unified session sandbox.
 
 This is deployment-test orchestration, not Harness routing logic. It uses the
 same authenticated client and exact Skill snapshots as production.
@@ -16,6 +16,7 @@ import tempfile
 import time
 import types
 from typing import Any
+from urllib.parse import urlsplit
 
 
 HARNESS_ROOT = Path(os.environ.get("CHATDS_ACCEPTANCE_HARNESS_ROOT", "/test/harness"))
@@ -74,17 +75,23 @@ async def _run_cli(
     entrypoint: str,
     expected: bytes,
     socket_path: str,
+    egress_rules: tuple[dict[str, object], ...] = (),
+    private_origins: tuple[str, ...] = (),
+    args: list[str] | None = None,
 ) -> dict[str, Any]:
     lease, opened = await client.open_isolated_process_lease(
         owner_scope=scope,
         skill_root=skill_root,
         workspace=workspace,
         entrypoint=entrypoint,
+        args=args,
         socket_path=socket_path,
         idle_ttl_seconds=120,
         max_runtime_seconds=300,
+        egress_rules=egress_rules,
+        private_origins=private_origins,
     )
-    assert opened["runtime_profile"] in {"base-v1", "browser-automation-v1"}
+    assert opened["runtime_profile"] == "session-sandbox-v1", opened
     await client.start_isolated_process_lease(lease)
     stdin_closed = await client.close_isolated_process_stdin(lease)
     assert stdin_closed["stdin_closed"] is True
@@ -253,6 +260,38 @@ async def _run_persistent_probe(
     }
 
 
+def _canonical_http_origin(url: str) -> str:
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise AssertionError(f"acceptance URL is not HTTP(S): {url!r}")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise AssertionError(
+            f"acceptance URL has an invalid port: {url!r}"
+        ) from exc
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80
+    host = parsed.hostname.lower().rstrip(".")
+    if ":" in host:
+        host = f"[{host}]"
+    return f"{parsed.scheme}://{host}:{port}"
+
+
+def _retrieval_rule(origin: str) -> dict[str, object]:
+    """Return the exact root retrieval rule used by deployment acceptance."""
+
+    canonical = _canonical_http_origin(origin)
+    if canonical != origin:
+        raise AssertionError(
+            f"acceptance origin is not canonical: {origin!r}"
+        )
+    return {
+        "methods": ["GET", "HEAD"],
+        "url_prefix": canonical + "/",
+    }
+
+
 async def _run_exact_visual_skill(
     scope: client.ProcessOwnerScope,
     *,
@@ -261,6 +300,16 @@ async def _run_exact_visual_skill(
     socket_path: str,
     public_url: str | None = None,
 ) -> dict[str, Any]:
+    public_origin = (
+        _canonical_http_origin(public_url)
+        if public_url
+        else None
+    )
+    egress_rules = (
+        (_retrieval_rule(public_origin),)
+        if public_origin is not None
+        else ()
+    )
     lease, opened = await client.open_isolated_process_lease(
         owner_scope=scope,
         skill_root=skill_root,
@@ -271,6 +320,8 @@ async def _run_exact_visual_skill(
         socket_path=socket_path,
         idle_ttl_seconds=120,
         max_runtime_seconds=300,
+        egress_rules=egress_rules,
+        private_origins=(),
     )
     await client.start_isolated_process_lease(lease)
     observed, stdout_offset, stderr_offset = await _call_and_read(
@@ -401,6 +452,28 @@ async def _main(arguments: argparse.Namespace) -> dict[str, Any]:
                 case for case in cli_cases if case[0] == arguments.cli_only
             )
         for index, (entrypoint, expected) in enumerate(cli_cases):
+            egress_rules: tuple[dict[str, object], ...] = ()
+            private_origins: tuple[str, ...] = ()
+            script_args: list[str] | None = None
+            if entrypoint == "network_identity_probe.py":
+                public_origin = "https://example.com:443"
+                egress_rules = (_retrieval_rule(public_origin),)
+                if arguments.private_origin:
+                    private_origin = _canonical_http_origin(
+                        arguments.private_origin
+                    )
+                    parsed_private = urlsplit(private_origin)
+                    assert parsed_private.hostname is not None
+                    assert parsed_private.port is not None
+                    egress_rules = (
+                        *egress_rules,
+                        _retrieval_rule(private_origin),
+                    )
+                    private_origins = (private_origin,)
+                    script_args = [
+                        parsed_private.hostname,
+                        str(parsed_private.port),
+                    ]
             results["cli"].append(
                 await _run_cli(
                     scope,
@@ -409,6 +482,9 @@ async def _main(arguments: argparse.Namespace) -> dict[str, Any]:
                     entrypoint=entrypoint,
                     expected=expected,
                     socket_path=socket_path,
+                    egress_rules=egress_rules,
+                    private_origins=private_origins,
+                    args=script_args,
                 )
             )
         if arguments.cli_only:
@@ -456,11 +532,18 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--socket",
-        default="/run/chat-ds-skill-browser-executor/executor.sock",
+        default="/run/chat-ds-executor/executor.sock",
     )
     parser.add_argument("--smoke-skill-root", required=True)
     parser.add_argument("--exact-skill-root")
     parser.add_argument("--exact-public-url")
+    parser.add_argument(
+        "--private-origin",
+        help=(
+            "Optional deployment-allowlisted private HTTPS origin used by "
+            "the network identity probe."
+        ),
+    )
     parser.add_argument("--abandon-running-lease", action="store_true")
     parser.add_argument(
         "--cli-only",

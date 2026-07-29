@@ -2,23 +2,23 @@
 set -eu
 
 if [ "$(id -u)" -ne 0 ]; then
-  echo "browser executor controller must start as root" >&2
+  echo "session sandbox controller must start as root" >&2
   exit 78
 fi
 case "${EXECUTOR_WORKER_UID:-}" in
   ""|0)
-    echo "browser executor requires a distinct non-root worker UID" >&2
+    echo "session sandbox requires a distinct non-root worker UID" >&2
     exit 78
     ;;
 esac
 
-bridge_pid=""
 server_pid=""
 readiness_root=""
+readiness_bridge_pid=""
 
 cleanup() {
   trap - EXIT
-  for pid in "${server_pid}" "${bridge_pid}"; do
+  for pid in "${server_pid}" "${readiness_bridge_pid}"; do
     if [ -n "${pid}" ]; then
       kill -TERM "${pid}" 2>/dev/null || true
     fi
@@ -26,7 +26,7 @@ cleanup() {
   if [ -n "${readiness_root}" ]; then
     rm -rf -- "${readiness_root}"
   fi
-  for pid in "${server_pid}" "${bridge_pid}"; do
+  for pid in "${server_pid}" "${readiness_bridge_pid}"; do
     if [ -n "${pid}" ]; then
       wait "${pid}" 2>/dev/null || true
     fi
@@ -45,20 +45,24 @@ while [ ! -S "/run/chatds-skill-egress/proxy.sock" ]; do
   sleep 0.05
 done
 
+# Browser readiness must exercise the real mandatory Chromium proxy wrapper,
+# but production egress authority remains per execution. Start a temporary
+# signed bridge with an empty origin set (deny all), use it only for the baked
+# smoke clients, and stop it before accepting any Harness request.
 /usr/local/bin/chatds-skill-egress-bridge &
-bridge_pid=$!
+readiness_bridge_pid=$!
 
 attempt=0
 while ! /usr/local/bin/python -I -c \
   'import socket; socket.create_connection(("127.0.0.1", 18080), 0.2).close()' \
   >/dev/null 2>&1; do
-  if ! kill -0 "${bridge_pid}" 2>/dev/null; then
-    echo "controller proxy bridge exited before becoming ready" >&2
+  if ! kill -0 "${readiness_bridge_pid}" 2>/dev/null; then
+    echo "readiness proxy bridge exited before becoming ready" >&2
     exit 70
   fi
   attempt=$((attempt + 1))
   if [ "${attempt}" -ge 100 ]; then
-    echo "controller proxy bridge did not become ready" >&2
+    echo "readiness proxy bridge did not become ready" >&2
     exit 70
   fi
   sleep 0.05
@@ -78,34 +82,90 @@ chown \
   "${EXECUTOR_WORKER_UID}:${EXECUTOR_WORKER_GID:-${EXECUTOR_WORKER_UID}}" \
   "${readiness_root}"
 chmod 0700 "${readiness_root}"
+/usr/local/bin/python -I -c '
+import sys
+from pathlib import Path
+from chatds_browser_runtime.proxy_bridge import (
+    EXPECTED_BRIDGE_GID,
+    EXPECTED_PROXY_UID,
+    PROXY_CA_CERTIFICATE_PATH,
+    PROXY_LEAF_SPKI_PATH,
+    ProxyTrustAuthority,
+)
+ProxyTrustAuthority(
+    PROXY_CA_CERTIFICATE_PATH,
+    PROXY_LEAF_SPKI_PATH,
+    expected_uid=EXPECTED_PROXY_UID,
+    expected_gid=EXPECTED_BRIDGE_GID,
+).materialize(
+    Path(sys.argv[1]),
+    worker_uid=int(sys.argv[2]),
+    worker_gid=int(sys.argv[3]),
+)
+' \
+  "${readiness_root}" \
+  "${EXECUTOR_WORKER_UID}" \
+  "${EXECUTOR_WORKER_GID:-${EXECUTOR_WORKER_UID}}"
+readiness_ca="${readiness_root}/.chatds-egress-trust/ca.pem"
+readiness_spki="${readiness_root}/.chatds-egress-trust/leaf.spki"
+readiness_manifest="${readiness_root}/.chatds-egress-trust/generation.json"
+readiness_generation="$(
+  /usr/local/bin/python -I -c '
+import json
+import sys
+with open(sys.argv[1], "r", encoding="ascii") as stream:
+    value = json.load(stream)["generation_id"]
+if not isinstance(value, str):
+    raise SystemExit(1)
+print(value)
+' "${readiness_manifest}"
+)"
 /usr/bin/setpriv \
   --reuid="${EXECUTOR_WORKER_UID}" \
   --regid="${EXECUTOR_WORKER_GID:-${EXECUTOR_WORKER_UID}}" \
   --clear-groups \
   --no-new-privs \
-  -- /usr/bin/env \
+  -- /usr/bin/env -i \
+  PATH="/usr/local/bin:/usr/bin:/bin" \
+  LANG="C.UTF-8" \
   HOME="${readiness_root}/home" \
   TMPDIR="${readiness_root}/tmp" \
+  SKILL_EGRESS_PROXY_URL="http://127.0.0.1:18080" \
+  SKILL_EGRESS_CA_CERT_PATH="${readiness_ca}" \
+  SKILL_EGRESS_LEAF_SPKI_PATH="${readiness_spki}" \
+  SKILL_EGRESS_TRUST_GENERATION_MANIFEST_PATH="${readiness_manifest}" \
+  SKILL_EGRESS_TRUST_GENERATION="${readiness_generation}" \
+  SSL_CERT_FILE="${readiness_ca}" \
+  REQUESTS_CA_BUNDLE="${readiness_ca}" \
+  CURL_CA_BUNDLE="${readiness_ca}" \
+  NODE_EXTRA_CA_CERTS="${readiness_ca}" \
+  NODE_USE_ENV_PROXY="1" \
+  GIT_SSL_CAINFO="${readiness_ca}" \
+  AWS_CA_BUNDLE="${readiness_ca}" \
   /usr/local/bin/chatds-browser-runtime-health --browser-smoke
 rm -rf -- "${readiness_root}"
 readiness_root=""
 
+kill -TERM "${readiness_bridge_pid}" 2>/dev/null || true
+set +e
+wait "${readiness_bridge_pid}"
+bridge_status=$?
+set -e
+readiness_bridge_pid=""
+if [ "${bridge_status}" -ne 0 ] && [ "${bridge_status}" -ne 143 ]; then
+  echo "readiness proxy bridge exited unexpectedly" >&2
+  exit 70
+fi
+
 /usr/local/bin/python -I /app/server.py &
 server_pid=$!
 
-while
-  kill -0 "${server_pid}" 2>/dev/null &&
-  kill -0 "${bridge_pid}" 2>/dev/null
-do
+while kill -0 "${server_pid}" 2>/dev/null; do
   sleep 1
 done
 
-if ! kill -0 "${server_pid}" 2>/dev/null; then
-  set +e
-  wait "${server_pid}"
-  status=$?
-  set -e
-  exit "${status}"
-fi
-echo "browser executor controller dependency exited unexpectedly" >&2
-exit 70
+set +e
+wait "${server_pid}"
+status=$?
+set -e
+exit "${status}"

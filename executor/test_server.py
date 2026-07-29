@@ -8,15 +8,36 @@ import os
 from pathlib import Path
 import tempfile
 import sys
+import threading
 import time
 import unittest
 import uuid
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from executor import server
 
 
 V2_AUTH_TOKEN = "test-only-v2-auth-token-" + "x" * 32
+
+
+class _FakeEgressBridge:
+    def __init__(self, port: int = 19081) -> None:
+        proxy = f"http://127.0.0.1:{port}"
+        self.environment = {
+            "SKILL_EGRESS_PROXY_URL": proxy,
+            "HTTP_PROXY": proxy,
+            "HTTPS_PROXY": proxy,
+            "ALL_PROXY": proxy,
+            "http_proxy": proxy,
+            "https_proxy": proxy,
+            "all_proxy": proxy,
+            "NO_PROXY": "localhost,127.0.0.1,[::1]",
+            "no_proxy": "localhost,127.0.0.1,[::1]",
+        }
+        self.close_count = 0
+
+    def close(self) -> None:
+        self.close_count += 1
 
 
 def _file(path: str, content: bytes) -> dict[str, object]:
@@ -77,6 +98,28 @@ def _sign_v2(payload: dict[str, object]) -> dict[str, object]:
     return result
 
 
+def _egress_rules(origins: tuple[str, ...] | list[str]) -> list[dict[str, object]]:
+    return [
+        {
+            "methods": ["GET", "HEAD"],
+            "url_prefix": f"{origin}/",
+        }
+        for origin in origins
+    ]
+
+
+def _set_exact_egress_policy(
+    payload: dict[str, object],
+    origins: tuple[str, ...] | list[str],
+) -> None:
+    payload.update({
+        "egress_policy_version": 2,
+        "egress_rules": _egress_rules(origins),
+        "egress_origins": list(origins),
+        "private_origins": [],
+    })
+
+
 def _process_open_request(
     script: bytes,
     *,
@@ -84,12 +127,13 @@ def _process_open_request(
     owner_scope: dict[str, str] | None = None,
     invocation: dict[str, object] | None = None,
     idle_ttl_seconds: int = 30,
+    egress_origins: list[str] | None = None,
 ) -> dict[str, object]:
     skill_files = [
         _file("SKILL.md", b"---\nname: process-fixture\n---\n"),
         _file(entrypoint, script),
     ]
-    return _sign_v2({
+    payload: dict[str, object] = {
         "protocol_version": server.PROCESS_PROTOCOL_VERSION,
         "kind": "process_lease",
         "operation": "open",
@@ -106,7 +150,10 @@ def _process_open_request(
         "script_sha256": hashlib.sha256(script).hexdigest(),
         "skill_files": skill_files,
         "workspace_files": [_file("input.txt", b"initial")],
-    })
+    }
+    if egress_origins is not None:
+        _set_exact_egress_policy(payload, egress_origins)
+    return _sign_v2(payload)
 
 
 def _process_operation(
@@ -166,13 +213,17 @@ def _request(script: bytes, *, entrypoint: str = "scripts/task.py") -> dict[str,
     }
 
 
-def _command_request(*, executable: str = "python") -> dict[str, object]:
+def _command_request(
+    *,
+    executable: str = "python",
+    egress_origins: tuple[str, ...] = (),
+) -> dict[str, object]:
     code = (
         "import os,sys; from pathlib import Path; "
         "Path(os.environ['CHATDS_WORKSPACE']).joinpath('command.txt').write_text(sys.argv[1]); "
         "print(sys.argv[1])"
     )
-    return {
+    payload: dict[str, object] = {
         "protocol_version": server.PROTOCOL_VERSION,
         "kind": "declared_command",
         "request_id": str(uuid.uuid4()),
@@ -183,9 +234,174 @@ def _command_request(*, executable: str = "python") -> dict[str, object]:
         "skill_files": [_file("SKILL.md", b"---\nname: command-fixture\n---\n")],
         "workspace_files": [],
     }
+    _set_exact_egress_policy(payload, egress_origins)
+    return payload
 
 
 class SkillScriptServerTests(unittest.TestCase):
+    def test_serialized_worker_contention_fails_immediately_and_never_runs_later(
+        self,
+    ) -> None:
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        calls: list[str] = []
+        first_result: dict[str, object] = {}
+
+        def runner(payload: dict[str, object]) -> dict[str, object]:
+            calls.append(str(payload["request_id"]))
+            first_entered.set()
+            if not release_first.wait(timeout=5):
+                raise AssertionError("test runner was not released")
+            return {
+                "status": "success",
+                "request_id": payload["request_id"],
+            }
+
+        first_request = _request(b"print('first')\n")
+        second_request = _request(b"print('must never run')\n")
+
+        def run_first() -> None:
+            first_result.update(
+                server._run_v1_serialized(first_request, runner)
+            )
+
+        with patch.object(
+            server,
+            "_sweep_configured_worker_uid",
+            return_value=None,
+        ), patch.object(
+            server,
+            "_purge_configured_worker_shared_state",
+            return_value=None,
+        ):
+            first_thread = threading.Thread(target=run_first)
+            first_thread.start()
+            try:
+                self.assertTrue(first_entered.wait(timeout=1))
+                started_at = time.monotonic()
+                blocked = server._run_v1_serialized(second_request, runner)
+                elapsed = time.monotonic() - started_at
+
+                self.assertLess(elapsed, 0.5)
+                self.assertEqual("error", blocked["status"])
+                self.assertEqual("worker_busy", blocked["error_code"])
+                self.assertEqual(
+                    server._configured_runtime_profile(),
+                    blocked["runtime_profile"],
+                )
+                self.assertEqual(
+                    {"direct": "disabled", "egress": "none"},
+                    blocked["network_policy"],
+                )
+                self.assertEqual(
+                    [str(first_request["request_id"])],
+                    calls,
+                )
+            finally:
+                release_first.set()
+                first_thread.join(timeout=2)
+
+        self.assertFalse(first_thread.is_alive())
+        self.assertEqual("success", first_result["status"])
+        self.assertEqual([str(first_request["request_id"])], calls)
+
+    def test_every_one_shot_kind_quarantines_until_failed_tree_is_reaped(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "legacy_code",
+                {"code": "print('legacy-ok')\n", "timeout": 5},
+            ),
+            (
+                "session_code",
+                {
+                    "protocol_version": server.PROTOCOL_VERSION,
+                    "kind": "session_code",
+                    "request_id": str(uuid.uuid4()),
+                    "code": "print('session-code-ok')\n",
+                    "timeout": 5,
+                    "skill_files": [],
+                    "workspace_files": [],
+                },
+            ),
+            ("skill_script", _request(b"print('skill-ok')\n")),
+            (
+                "declared_command",
+                _command_request(executable="python3"),
+            ),
+        )
+
+        for label, original_request in cases:
+            with self.subTest(kind=label):
+                server._shutdown_all_process_leases()
+                request = json.loads(json.dumps(original_request))
+                if "request_id" in request:
+                    request["request_id"] = str(uuid.uuid4())
+                original_remove = server._remove_process_tree
+                remove_calls = 0
+
+                def fail_first_tree_remove(path: Path) -> bool:
+                    nonlocal remove_calls
+                    remove_calls += 1
+                    if remove_calls == 1:
+                        return False
+                    return original_remove(path)
+
+                with (
+                    patch.object(
+                        server,
+                        "_prepare_worker_tree",
+                        return_value=None,
+                    ),
+                    patch.object(
+                        server,
+                        "_sweep_configured_worker_uid",
+                        return_value=None,
+                    ),
+                    patch.object(
+                        server,
+                        "_purge_configured_worker_shared_state",
+                        return_value=None,
+                    ),
+                    patch.object(
+                        server,
+                        "_remove_process_tree",
+                        side_effect=fail_first_tree_remove,
+                    ),
+                ):
+                    failed = server._run(request)
+                    self.assertEqual("error", failed["status"])
+                    self.assertEqual(
+                        "worker_containment_failed",
+                        failed["error_code"],
+                    )
+                    self.assertTrue(server._ACTIVE_V1_EXECUTION)
+                    self.assertTrue(
+                        server._ACTIVE_V1_EXECUTION_QUARANTINED
+                    )
+                    self.assertIsNotNone(server._ACTIVE_V1_TEMP_DIR)
+
+                    blocked = server._run(request)
+                    self.assertEqual("error", blocked["status"])
+                    self.assertEqual("worker_busy", blocked["error_code"])
+                    self.assertEqual(1, remove_calls)
+
+                    self.assertEqual(
+                        1,
+                        server._controller_reap_process_leases(),
+                    )
+                    self.assertFalse(server._ACTIVE_V1_EXECUTION)
+                    self.assertFalse(
+                        server._ACTIVE_V1_EXECUTION_QUARANTINED
+                    )
+                    self.assertIsNone(server._ACTIVE_V1_TEMP_DIR)
+
+                    completed = server._run(request)
+                    self.assertEqual("success", completed["status"])
+                    self.assertGreaterEqual(remove_calls, 3)
+                server._shutdown_all_process_leases()
+
     def test_immutable_snapshot_executes_only_supported_script_suffixes(self) -> None:
         with tempfile.TemporaryDirectory() as text:
             temp_root = Path(text) / "lease"
@@ -246,14 +462,204 @@ class SkillScriptServerTests(unittest.TestCase):
                 (skill_root / "assets/input.json").stat().st_mode & 0o777,
             )
 
+    def test_session_sandbox_networkless_script_gets_scoped_deny_all_bridge(
+        self,
+    ) -> None:
+        bridge = _FakeEgressBridge()
+        script = b"""
+import json
+import os
+print(json.dumps({
+    "proxy": os.environ.get("SKILL_EGRESS_PROXY_URL"),
+    "https_proxy": os.environ.get("HTTPS_PROXY"),
+}))
+"""
+        request = _request(script)
+        with patch.dict(
+            os.environ,
+            {
+                "EXECUTOR_RUNTIME_PROFILE": (
+                    server.SESSION_SANDBOX_RUNTIME_PROFILE
+                ),
+                "HTTPS_PROXY": "http://ambient-authority.invalid:9",
+            },
+        ), patch.object(
+            server,
+            "_browser_runtime_command",
+            side_effect=lambda runner, arguments: [
+                sys.executable,
+                "-I",
+                "-B",
+                str(runner),
+                *arguments,
+            ],
+        ), patch.object(
+            server,
+            "_start_egress_bridge",
+            return_value=bridge,
+        ) as start_bridge:
+            response = server._run_skill_script(request)
+
+        self.assertEqual("success", response["status"])
+        self.assertEqual(
+            {"direct": "disabled", "egress": "none"},
+            response["network_policy"],
+        )
+        start_bridge.assert_called_once_with(
+            (),
+            egress_rules=(),
+            private_origins=(),
+            runtime_root=ANY,
+        )
+        observed = json.loads(response["stdout"])
+        self.assertEqual(
+            bridge.environment["SKILL_EGRESS_PROXY_URL"],
+            observed["proxy"],
+        )
+        self.assertEqual(
+            bridge.environment["HTTPS_PROXY"],
+            observed["https_proxy"],
+        )
+        self.assertNotEqual(
+            "http://ambient-authority.invalid:9",
+            observed["https_proxy"],
+        )
+        self.assertEqual(1, bridge.close_count)
+
+    def test_one_shot_origin_allowlist_is_scoped_and_receipted(self) -> None:
+        bridge = _FakeEgressBridge(port=19082)
+        request = _request(
+            b"import os; print(os.environ['SKILL_EGRESS_PROXY_URL'])\n"
+        )
+        _set_exact_egress_policy(
+            request,
+            ("https://example.com:443",),
+        )
+        with patch.object(
+            server,
+            "_start_egress_bridge",
+            return_value=bridge,
+        ) as start_bridge:
+            response = server._run_skill_script(request)
+
+        self.assertEqual("success", response["status"])
+        self.assertEqual(
+            {
+                "direct": "disabled",
+                "egress": "origin_allowlist_proxy",
+            },
+            response["network_policy"],
+        )
+        start_bridge.assert_called_once_with(
+            ("https://example.com:443",),
+            egress_rules=tuple(
+                _egress_rules(("https://example.com:443",))
+            ),
+            private_origins=(),
+            runtime_root=ANY,
+        )
+        self.assertEqual(
+            bridge.environment["SKILL_EGRESS_PROXY_URL"],
+            response["stdout"].strip(),
+        )
+        self.assertEqual(1, bridge.close_count)
+
+    def test_executor_rejects_invalid_egress_before_bridge_start(
+        self,
+    ) -> None:
+        for origin in (
+            "https://*.example.com:443",
+            "https://api.*.example.com:443",
+            "https://[fe80::1%25eth0]:443",
+            "https://example.com:0",
+        ):
+            request = _request(b"print('must not execute')\n")
+            request["egress_origins"] = [origin]
+            with self.subTest(origin=origin), patch.object(
+                server,
+                "_start_egress_bridge",
+            ) as start_bridge:
+                response = server._run_skill_script(request)
+                self.assertEqual(
+                    "invalid_egress_policy",
+                    response["error_code"],
+                )
+                start_bridge.assert_not_called()
+
+    def test_skill_errors_preserve_runtime_and_requested_egress_receipt(
+        self,
+    ) -> None:
+        request = _request(b"print('must not execute')\n")
+        _set_exact_egress_policy(
+            request,
+            ("https://api.example.test:443",),
+        )
+        request["skill_files"] = [
+            item
+            for item in request["skill_files"]
+            if item["path"] != "SKILL.md"
+        ]
+        response = server._run_skill_script(request)
+        self.assertEqual("invalid_skill_snapshot", response["error_code"])
+        self.assertEqual(
+            server._configured_runtime_profile(),
+            response["runtime_profile"],
+        )
+        self.assertEqual(
+            {
+                "direct": "disabled",
+                "egress": "origin_allowlist_proxy",
+            },
+            response["network_policy"],
+        )
+        self.assertEqual("cli", response["invocation_mode"])
+
+        request = _request(b"print('must not execute')\n")
+        _set_exact_egress_policy(
+            request,
+            ("https://api.example.test:443",),
+        )
+        with patch.object(
+            server,
+            "_start_egress_bridge",
+            side_effect=server.ProtocolError(
+                "egress_bridge_unavailable",
+                "fixture bridge failure",
+            ),
+        ):
+            response = server._run_skill_script(request)
+        self.assertEqual("egress_bridge_unavailable", response["error_code"])
+        self.assertEqual(
+            {
+                "direct": "disabled",
+                "egress": "origin_allowlist_proxy",
+            },
+            response["network_policy"],
+        )
+
     def test_declared_command_uses_literal_argv_without_shell_and_receipts_artifact(self) -> None:
         request = _command_request()
-        with patch.object(server.shutil, "which", return_value=sys.executable):
+        with patch.object(
+            server.shutil,
+            "which",
+            return_value=sys.executable,
+        ), patch.object(
+            server,
+            "_start_egress_bridge",
+        ) as start_bridge:
             response = server._run_declared_command(request)
 
+        start_bridge.assert_not_called()
         self.assertEqual("success", response["status"])
         self.assertIs(response["shell"], False)
         self.assertEqual("disabled", response["network"])
+        self.assertEqual(
+            {
+                "direct": "disabled",
+                "egress": "none",
+            },
+            response["network_policy"],
+        )
         self.assertEqual("literal; $(touch never) | ignored\n", response["stdout"])
         expected_receipt = hashlib.sha256(json.dumps(
             [request["executable"], *request["argv"]],
@@ -266,6 +672,97 @@ class SkillScriptServerTests(unittest.TestCase):
         self.assertEqual(
             b"literal; $(touch never) | ignored",
             base64.b64decode(artifact["content_b64"]),
+        )
+
+    def test_declared_command_uses_and_closes_scoped_egress_bridge(self) -> None:
+        origins = ("https://api.example.test:443",)
+        request = _command_request(egress_origins=origins)
+        bridge = _FakeEgressBridge()
+        observed_environment: dict[str, str] = {}
+        real_popen = server.subprocess.Popen
+
+        def capture_popen(*args: object, **kwargs: object):
+            observed_environment.update(kwargs.get("env") or {})
+            return real_popen(*args, **kwargs)
+
+        with patch.object(
+            server.shutil,
+            "which",
+            return_value=sys.executable,
+        ), patch.object(
+            server,
+            "_start_egress_bridge",
+            return_value=bridge,
+        ) as start_bridge, patch.object(
+            server.subprocess,
+            "Popen",
+            side_effect=capture_popen,
+        ):
+            response = server._run_declared_command(request)
+
+        start_bridge.assert_called_once_with(
+            origins,
+            egress_rules=tuple(_egress_rules(origins)),
+            private_origins=(),
+            runtime_root=ANY,
+        )
+        self.assertEqual(1, bridge.close_count)
+        self.assertEqual(
+            bridge.environment["HTTPS_PROXY"],
+            observed_environment["HTTPS_PROXY"],
+        )
+        self.assertEqual("success", response["status"])
+        self.assertEqual(
+            {
+                "direct": "disabled",
+                "egress": "origin_allowlist_proxy",
+            },
+            response["network_policy"],
+        )
+
+    def test_declared_command_rejects_invalid_egress_before_dispatch(self) -> None:
+        request = _command_request()
+        request["egress_origins"] = ["https://*.example.test:443"]
+        with patch.object(
+            server,
+            "_start_egress_bridge",
+        ) as start_bridge, patch.object(
+            server.subprocess,
+            "Popen",
+        ) as popen:
+            response = server._run_declared_command(request)
+
+        self.assertEqual("invalid_egress_policy", response["error_code"])
+        start_bridge.assert_not_called()
+        popen.assert_not_called()
+
+    def test_declared_command_closes_egress_bridge_when_spawn_fails(self) -> None:
+        origins = ("https://api.example.test:443",)
+        request = _command_request(egress_origins=origins)
+        bridge = _FakeEgressBridge()
+        with patch.object(
+            server.shutil,
+            "which",
+            return_value=sys.executable,
+        ), patch.object(
+            server,
+            "_start_egress_bridge",
+            return_value=bridge,
+        ), patch.object(
+            server.subprocess,
+            "Popen",
+            side_effect=OSError("fixture spawn failure"),
+        ):
+            response = server._run_declared_command(request)
+
+        self.assertEqual("command_spawn_failed", response["error_code"])
+        self.assertEqual(1, bridge.close_count)
+        self.assertEqual(
+            {
+                "direct": "disabled",
+                "egress": "origin_allowlist_proxy",
+            },
+            response["network_policy"],
         )
 
     def test_declared_command_rejects_paths_and_reports_missing_runtime_command(self) -> None:
@@ -329,6 +826,58 @@ class SkillScriptServerTests(unittest.TestCase):
         self.assertTrue(response["platform_groups"][0]["satisfied"])
         self.assertFalse(response["platform_groups"][1]["satisfied"])
         self.assertEqual("disabled", response["runtime_identity"]["dependency_install"])
+        self.assertRegex(
+            response["runtime_identity"]["runtime_build_sha256"],
+            r"^[0-9a-f]{64}$",
+        )
+
+    def test_runtime_capability_build_identity_is_content_addressed_and_deterministic(
+        self,
+    ) -> None:
+        request = {
+            "protocol_version": server.PROTOCOL_VERSION,
+            "kind": "runtime_capabilities",
+            "request_id": str(uuid.uuid4()),
+            "requirements": [],
+            "commands": [],
+            "environment_variables": [],
+            "platform_groups": [],
+        }
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            control = root / "control.py"
+            absent = root / "installed-manifest.json"
+            control.write_bytes(b"build-a")
+            components = (
+                ("control", control),
+                ("installed_manifest", absent),
+            )
+            with patch.object(
+                server,
+                "RUNTIME_BUILD_COMPONENTS",
+                components,
+            ):
+                first = server._run_runtime_capabilities(request)
+                repeated = server._run_runtime_capabilities(request)
+                control.write_bytes(b"build-b")
+                heterogeneous = server._run_runtime_capabilities(request)
+                absent.write_bytes(b'{"version":1}')
+                completed = server._run_runtime_capabilities(request)
+
+        first_digest = first["runtime_identity"]["runtime_build_sha256"]
+        self.assertRegex(first_digest, r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            first_digest,
+            repeated["runtime_identity"]["runtime_build_sha256"],
+        )
+        self.assertNotEqual(
+            first_digest,
+            heterogeneous["runtime_identity"]["runtime_build_sha256"],
+        )
+        self.assertNotEqual(
+            heterogeneous["runtime_identity"]["runtime_build_sha256"],
+            completed["runtime_identity"]["runtime_build_sha256"],
+        )
 
     def test_runtime_capability_request_rejects_direct_references_without_installing(self) -> None:
         response = server._run_runtime_capabilities({
@@ -679,6 +1228,47 @@ class QueryClient:
 
 
 class ResourceLimitConfigurationTests(unittest.TestCase):
+    def test_unified_pool_preserves_host_uid_aggregate_nproc_ceiling(
+        self,
+    ) -> None:
+        with patch.object(
+            server,
+            "_trusted_resource_launcher",
+            return_value="/usr/bin/prlimit",
+        ), patch.dict(
+            os.environ,
+            {
+                "EXECUTOR_RUNTIME_PROFILE": "session-sandbox-v1",
+                "EXECUTOR_PROCESS_MAX_NPROC": "4096",
+            },
+            clear=True,
+        ):
+            command = server._resource_limited_command(
+                ["/bin/true"],
+                cpu_seconds=60,
+                persistent=False,
+            )
+        self.assertIn("--nproc=4096:4096", command)
+
+        with patch.object(
+            server,
+            "_trusted_resource_launcher",
+            return_value="/usr/bin/prlimit",
+        ), patch.dict(
+            os.environ,
+            {
+                "EXECUTOR_RUNTIME_PROFILE": "browser-automation-v1",
+                "EXECUTOR_PROCESS_MAX_NPROC": "4096",
+            },
+            clear=True,
+        ):
+            legacy = server._resource_limited_command(
+                ["/bin/true"],
+                cpu_seconds=60,
+                persistent=True,
+            )
+        self.assertIn("--nproc=512:512", legacy)
+
     def test_trusted_browser_nproc_override_is_preserved_but_base_defaults_low(self) -> None:
         with patch.object(
             server,
@@ -864,6 +1454,7 @@ class PersistentProcessServerTests(unittest.TestCase):
         )
 
     def test_browser_profile_wraps_cli_and_persistent_object_entrypoints(self) -> None:
+        bridge = _FakeEgressBridge(port=19085)
         wrapper = patch.object(
             server,
             "_browser_runtime_command",
@@ -876,7 +1467,11 @@ class PersistentProcessServerTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {"EXECUTOR_RUNTIME_PROFILE": "browser-automation-v1"},
-        ), wrapper as wrapped:
+        ), wrapper as wrapped, patch.object(
+            server,
+            "_start_egress_bridge",
+            return_value=bridge,
+        ):
             cli_opened = server._run(
                 _process_open_request(
                     b"print('browser cli')\n",
@@ -953,6 +1548,62 @@ class PersistentProcessServerTests(unittest.TestCase):
             allowed = server._run({"code": "print('after ack')"})
             self.assertEqual("success", allowed["status"])
             self.assertEqual("after ack", allowed["output"].strip())
+
+    def test_busy_skill_and_command_errors_keep_typed_identity_receipts(
+        self,
+    ) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "EXECUTOR_ALLOWED_REQUEST_KINDS": (
+                    "runtime_capabilities,process_lease,skill_script,"
+                    "declared_command"
+                ),
+            },
+        ):
+            opened = server._run(
+                _process_open_request(b"print('not started')\n")
+            )
+
+            skill_request = _request(b"print('must not run')\n")
+            _set_exact_egress_policy(
+                skill_request,
+                ("https://api.example.test:443",),
+            )
+            skill_response = server._run(skill_request)
+            self.assertEqual("worker_busy", skill_response["error_code"])
+            self.assertEqual("cli", skill_response["invocation_mode"])
+            self.assertEqual(
+                server._configured_runtime_profile(),
+                skill_response["runtime_profile"],
+            )
+            self.assertEqual(
+                {
+                    "direct": "disabled",
+                    "egress": "origin_allowlist_proxy",
+                },
+                skill_response["network_policy"],
+            )
+
+            command_request = _command_request(
+                egress_origins=("https://api.example.test:443",)
+            )
+            command_response = server._run(command_request)
+            self.assertEqual("worker_busy", command_response["error_code"])
+            self.assertEqual(
+                server._declared_command_request_sha256(command_request),
+                command_response["command_sha256"],
+            )
+            self.assertEqual(
+                {
+                    "direct": "disabled",
+                    "egress": "origin_allowlist_proxy",
+                },
+                command_response["network_policy"],
+            )
+
+            prepared = server._run(_process_operation(opened, "close"))
+            _ack_process_batch(opened, prepared)
 
     def test_ndjson_three_rounds_scope_binding_idempotency_sync_and_close(self) -> None:
         script = b"""
@@ -1067,6 +1718,377 @@ for line in sys.stdin:
         replay_close = _sign_v2(replay_close)
         repeated_close = server._run(replay_close)
         self.assertTrue(repeated_close["idempotent_replay"])
+
+    def test_live_sync_never_follows_directory_swapped_to_outside_symlink(
+        self,
+    ) -> None:
+        canary_bytes = b"OUTSIDE-CANARY-BYTES-MUST-NEVER-BE-SYNCED"
+        with tempfile.TemporaryDirectory() as temporary:
+            outside = Path(temporary) / "outside"
+            outside.mkdir()
+            canary_name = "OUTSIDE_CANARY_DO_NOT_RETURN.bin"
+            (outside / canary_name).write_bytes(canary_bytes)
+            outside_literal = json.dumps(str(outside))
+            script = f"""
+import os
+from pathlib import Path
+import signal
+import time
+
+workspace = Path(os.environ["CHATDS_WORKSPACE"])
+outside = Path({outside_literal})
+slot = workspace / "flapping"
+holding = workspace / "flapping.hold"
+slot.mkdir()
+(slot / "safe.txt").write_text("workspace-only", encoding="utf-8")
+for index in range(64):
+    (workspace / f"padding-{{index:02d}}.txt").write_text(
+        "bounded-workspace-data",
+        encoding="utf-8",
+    )
+
+stopping = False
+def stop(_signum, _frame):
+    global stopping
+    stopping = True
+
+signal.signal(signal.SIGTERM, stop)
+cycles = 0
+while not stopping:
+    try:
+        os.rename(slot, holding)
+        os.symlink(outside, slot, target_is_directory=True)
+        time.sleep(0.0005)
+        os.unlink(slot)
+        os.rename(holding, slot)
+        time.sleep(0.0005)
+        cycles += 1
+        if cycles == 8:
+            print("ready", flush=True)
+    except FileNotFoundError:
+        pass
+
+if slot.is_symlink():
+    slot.unlink()
+if holding.exists() and not slot.exists():
+    os.rename(holding, slot)
+""".encode("utf-8")
+
+            opened = server._run(_process_open_request(script))
+            self.assertEqual("success", opened["status"])
+            handle = str(opened["lease_handle"])
+            lease = server._PROCESS_LEASES[handle]
+            temp_dir = lease.temp_dir
+            server._run(_process_operation(opened, "start"))
+            ready = server._run(_process_operation(
+                opened,
+                "read",
+                stdout_offset=0,
+                stderr_offset=0,
+                max_bytes=4096,
+                wait_ms=1_000,
+            ))
+            self.assertIn(b"ready", base64.b64decode(ready["stdout_b64"]))
+
+            outcomes: set[str] = set()
+            for _ in range(40):
+                synced = server._run(_process_operation(opened, "sync"))
+                outcomes.add(str(synced["status"]))
+                if synced["status"] == "error":
+                    self.assertIn(
+                        synced["error_code"],
+                        {
+                            "unsafe_workspace_output",
+                            "workspace_output_race",
+                        },
+                    )
+                    self.assertNotIn(canary_name, json.dumps(synced))
+                    continue
+                for artifact in synced["artifacts"]:
+                    self.assertNotIn(canary_name, artifact["path"])
+                    self.assertNotIn(
+                        canary_bytes,
+                        base64.b64decode(artifact["content_b64"]),
+                    )
+                _ack_process_batch(opened, synced)
+
+            self.assertTrue(outcomes)
+            prepared = server._run(_process_operation(opened, "close"))
+            self.assertEqual("success", prepared["status"])
+            closed = _ack_process_batch(opened, prepared)
+            self.assertEqual("closed", closed["state"])
+            self.assertIsNotNone(lease.process)
+            self.assertIsNotNone(lease.process.poll())
+            self.assertFalse(temp_dir.exists())
+
+    def test_artifact_walk_bounds_directory_entries_before_sorting(
+        self,
+    ) -> None:
+        class Entry:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+        class Scanner:
+            def __init__(self) -> None:
+                self.emitted = 0
+                self.closed = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback) -> None:
+                self.closed = True
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if self.emitted > server.MAX_OUTPUT_ENTRIES:
+                    raise AssertionError(
+                        "artifact collector consumed beyond remaining+1"
+                    )
+                self.emitted += 1
+                return Entry(f"entry-{self.emitted:08d}")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            workspace.mkdir()
+            scanner = Scanner()
+            with (
+                patch.object(
+                    server,
+                    "_require_safe_output_fd_api",
+                    return_value=None,
+                ),
+                patch.object(server.os, "scandir", return_value=scanner),
+                patch.object(
+                    server.os,
+                    "listdir",
+                    side_effect=AssertionError(
+                        "artifact collector must not allocate os.listdir"
+                    ),
+                ),
+            ):
+                with self.assertRaises(server.ProtocolError) as caught:
+                    server._collect_workspace_artifacts_with_state(
+                        workspace,
+                        {},
+                    )
+
+        self.assertEqual("output_limit_exceeded", caught.exception.code)
+        self.assertEqual(server.MAX_OUTPUT_ENTRIES + 1, scanner.emitted)
+        self.assertTrue(scanner.closed)
+
+    def test_close_collection_failure_discards_tree_releases_slot_and_replays(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            outside = Path(temporary) / "outside"
+            outside.mkdir()
+            (outside / "canary.txt").write_text(
+                "must-not-cross",
+                encoding="utf-8",
+            )
+            opened = server._run(
+                _process_open_request(b"print('not started')\n")
+            )
+            handle = str(opened["lease_handle"])
+            lease = server._PROCESS_LEASES[handle]
+            temp_dir = lease.temp_dir
+            (lease.workspace / "unsafe").symlink_to(
+                outside,
+                target_is_directory=True,
+            )
+            op_id = str(uuid.uuid4())
+            close_request = _process_operation(
+                opened,
+                "close",
+                op_id=op_id,
+            )
+
+            failed = server._run(close_request)
+            self.assertEqual("error", failed["status"])
+            self.assertEqual(
+                "close_artifact_collection_failed",
+                failed["error_code"],
+            )
+            self.assertEqual("closed", failed["terminal_lease_state"])
+            self.assertEqual(
+                "unsafe_workspace_output",
+                failed["artifact_error_code"],
+            )
+            self.assertTrue(failed["artifacts_discarded"])
+            self.assertEqual([], failed["artifacts"])
+            self.assertFalse(temp_dir.exists())
+            self.assertIsNone(server._ACTIVE_PROCESS_LEASE_HANDLE)
+            self.assertEqual(
+                "must-not-cross",
+                (outside / "canary.txt").read_text(encoding="utf-8"),
+            )
+
+            replay = dict(close_request)
+            replay["request_id"] = str(uuid.uuid4())
+            replay = _sign_v2(replay)
+            repeated = server._run(replay)
+            self.assertEqual(failed["error_code"], repeated["error_code"])
+            self.assertEqual("closed", repeated["terminal_lease_state"])
+            self.assertTrue(repeated["idempotent_replay"])
+
+    def test_close_collection_cleanup_failure_quarantines_until_contained(
+        self,
+    ) -> None:
+        opened = server._run(
+            _process_open_request(b"print('not started')\n")
+        )
+        handle = str(opened["lease_handle"])
+        lease = server._PROCESS_LEASES[handle]
+        temp_dir = lease.temp_dir
+        (lease.workspace / "unsafe").symlink_to("/tmp")
+        close_request = _process_operation(opened, "close")
+
+        with patch.object(
+            server,
+            "_remove_process_tree",
+            return_value=False,
+        ):
+            failed = server._run(close_request)
+            replay = dict(close_request)
+            replay["request_id"] = str(uuid.uuid4())
+            replay = _sign_v2(replay)
+            repeated = server._run(replay)
+
+        self.assertEqual("worker_containment_failed", failed["error_code"])
+        self.assertEqual("quarantined", failed["terminal_lease_state"])
+        self.assertEqual("quarantined", lease.state)
+        self.assertTrue(temp_dir.exists())
+        self.assertEqual(handle, server._ACTIVE_PROCESS_LEASE_HANDLE)
+        self.assertEqual(failed["error_code"], repeated["error_code"])
+        self.assertTrue(repeated["idempotent_replay"])
+
+        self.assertEqual(1, server._cleanup_expired_process_leases())
+        self.assertEqual("expired", lease.state)
+        self.assertFalse(temp_dir.exists())
+        self.assertIsNone(server._ACTIVE_PROCESS_LEASE_HANDLE)
+
+    def test_prepared_sync_and_close_have_bounded_ack_expiry_grace(
+        self,
+    ) -> None:
+        opened = server._run(
+            _process_open_request(b"print('not started')\n")
+        )
+        handle = str(opened["lease_handle"])
+        lease = server._PROCESS_LEASES[handle]
+        (lease.workspace / "result.txt").write_text(
+            "prepared",
+            encoding="utf-8",
+        )
+
+        synced = server._run(_process_operation(opened, "sync"))
+        self.assertEqual(
+            server.PROCESS_SYNC_ACK_GRACE_SECONDS,
+            synced["sync_ack_grace_seconds"],
+        )
+        sync_deadline = lease.pending_sync_ack_deadline
+        self.assertIsNotNone(sync_deadline)
+        lease.last_activity = 0
+        lease.absolute_expires_at = 0
+        self.assertEqual(
+            0,
+            server._cleanup_expired_process_leases(
+                now=float(sync_deadline) - 0.001,
+            ),
+        )
+        self.assertEqual("open", lease.state)
+        self.assertTrue(lease.temp_dir.exists())
+        _ack_process_batch(opened, synced)
+        lease.last_activity = time.monotonic()
+        lease.absolute_expires_at = lease.last_activity + 60
+
+        prepared_close = server._run(
+            _process_operation(opened, "close")
+        )
+        close_deadline = lease.pending_sync_ack_deadline
+        self.assertEqual("closing", lease.state)
+        self.assertIsNotNone(close_deadline)
+        lease.last_activity = 0
+        lease.absolute_expires_at = 0
+        self.assertEqual(
+            0,
+            server._cleanup_expired_process_leases(
+                now=float(close_deadline) - 0.001,
+            ),
+        )
+        self.assertEqual("closing", lease.state)
+        closed = _ack_process_batch(opened, prepared_close)
+        self.assertEqual("closed", closed["state"])
+        self.assertIsNone(lease.pending_sync_ack_deadline)
+        self.assertFalse(lease.temp_dir.exists())
+
+        second = server._run(
+            _process_open_request(b"print('not started')\n")
+        )
+        second_lease = server._PROCESS_LEASES[
+            str(second["lease_handle"])
+        ]
+        sync_request = _process_operation(second, "sync")
+        pending = server._run(sync_request)
+        pending_op_id = str(sync_request["op_id"])
+        self.assertIn(pending_op_id, second_lease.operations)
+        expiry = second_lease.pending_sync_ack_deadline
+        self.assertIsNotNone(expiry)
+        self.assertEqual(
+            1,
+            server._cleanup_expired_process_leases(
+                now=float(expiry),
+            ),
+        )
+        self.assertEqual("expired", second_lease.state)
+        self.assertEqual("sync_ack_timeout", second_lease.close_reason)
+        self.assertIsNone(second_lease.pending_sync_token)
+        self.assertIsNone(second_lease.pending_sync_prepare_op_id)
+        self.assertNotIn(pending_op_id, second_lease.operations)
+        self.assertFalse(second_lease.temp_dir.exists())
+        self.assertIsNone(server._ACTIVE_PROCESS_LEASE_HANDLE)
+
+        stale_replay = dict(sync_request)
+        stale_replay["request_id"] = str(uuid.uuid4())
+        stale_replay = _sign_v2(stale_replay)
+        rejected = server._run(stale_replay)
+        self.assertEqual("error", rejected["status"])
+        self.assertEqual("lease_expired", rejected["error_code"])
+
+        third = server._run(
+            _process_open_request(b"print('not started')\n")
+        )
+        third_lease = server._PROCESS_LEASES[
+            str(third["lease_handle"])
+        ]
+        close_request = _process_operation(third, "close")
+        pending_close = server._run(close_request)
+        self.assertEqual("success", pending_close["status"])
+        close_op_id = str(close_request["op_id"])
+        close_expiry = third_lease.pending_sync_ack_deadline
+        self.assertIsNotNone(close_expiry)
+        self.assertEqual(
+            1,
+            server._cleanup_expired_process_leases(
+                now=float(close_expiry),
+            ),
+        )
+        self.assertEqual("expired", third_lease.state)
+        self.assertEqual("close_ack_timeout", third_lease.close_reason)
+        self.assertIsNone(third_lease.pending_sync_token)
+        self.assertIsNone(third_lease.pending_sync_prepare_op_id)
+        self.assertNotIn(close_op_id, third_lease.operations)
+        self.assertFalse(third_lease.temp_dir.exists())
+        self.assertIsNone(server._ACTIVE_PROCESS_LEASE_HANDLE)
+
+        stale_close_replay = dict(close_request)
+        stale_close_replay["request_id"] = str(uuid.uuid4())
+        stale_close_replay = _sign_v2(stale_close_replay)
+        rejected_close = server._run(stale_close_replay)
+        self.assertEqual("error", rejected_close["status"])
+        self.assertEqual("lease_expired", rejected_close["error_code"])
 
     def test_persistent_commonjs_entrypoint(self) -> None:
         script = b"""
@@ -1463,7 +2485,118 @@ print(child.pid, flush=True)
         else:
             self.fail("orphaned process-group child survived lease close")
 
-    def test_browser_profile_forwards_only_fixed_runtime_environment_and_policy_receipt(self) -> None:
+    def test_session_sandbox_process_owns_deny_all_bridge_until_close(
+        self,
+    ) -> None:
+        bridge = _FakeEgressBridge(port=19083)
+        with patch.dict(
+            os.environ,
+            {
+                "EXECUTOR_RUNTIME_PROFILE": (
+                    server.SESSION_SANDBOX_RUNTIME_PROFILE
+                ),
+            },
+        ), patch.object(
+            server,
+            "_browser_runtime_command",
+            side_effect=lambda runner, arguments: [
+                sys.executable,
+                "-I",
+                "-B",
+                str(runner),
+                *arguments,
+            ],
+        ), patch.object(
+            server,
+            "_start_egress_bridge",
+            return_value=bridge,
+        ) as start_bridge:
+            opened = server._run(
+                _process_open_request(b"print('not started')\n")
+            )
+            self.assertEqual("success", opened["status"])
+            self.assertEqual(
+                {"direct": "disabled", "egress": "none"},
+                opened["network_policy"],
+            )
+            start_bridge.assert_called_once_with(
+                (),
+                egress_rules=(),
+                private_origins=(),
+                runtime_root=ANY,
+            )
+            lease = server._PROCESS_LEASES[
+                str(opened["lease_handle"])
+            ]
+            self.assertIs(bridge, lease.egress_bridge)
+            self.assertEqual(
+                bridge.environment["SKILL_EGRESS_PROXY_URL"],
+                lease.environment["SKILL_EGRESS_PROXY_URL"],
+            )
+            self.assertEqual(0, bridge.close_count)
+
+            prepared = server._run(
+                _process_operation(opened, "close")
+            )
+            closed = _ack_process_batch(opened, prepared)
+
+        self.assertEqual("closed", closed["state"])
+        self.assertEqual(1, bridge.close_count)
+
+    def test_process_origin_allowlist_is_receipted_and_not_ambient(
+        self,
+    ) -> None:
+        bridge = _FakeEgressBridge(port=19084)
+        origins = ["https://example.com:443"]
+        with patch.dict(
+            os.environ,
+            {"HTTPS_PROXY": "http://ambient-authority.invalid:9"},
+        ), patch.object(
+            server,
+            "_start_egress_bridge",
+            return_value=bridge,
+        ) as start_bridge:
+            opened = server._run(
+                _process_open_request(
+                    b"print('not started')\n",
+                    egress_origins=origins,
+                )
+            )
+            self.assertEqual("success", opened["status"])
+            self.assertEqual(
+                {
+                    "direct": "disabled",
+                    "egress": "origin_allowlist_proxy",
+                },
+                opened["network_policy"],
+            )
+            start_bridge.assert_called_once_with(
+                tuple(origins),
+                egress_rules=tuple(_egress_rules(origins)),
+                private_origins=(),
+                runtime_root=ANY,
+            )
+            lease = server._PROCESS_LEASES[
+                str(opened["lease_handle"])
+            ]
+            self.assertEqual(
+                bridge.environment["HTTPS_PROXY"],
+                lease.environment["HTTPS_PROXY"],
+            )
+            self.assertNotEqual(
+                "http://ambient-authority.invalid:9",
+                lease.environment["HTTPS_PROXY"],
+            )
+
+            prepared = server._run(
+                _process_operation(opened, "close")
+            )
+            _ack_process_batch(opened, prepared)
+
+        self.assertEqual(1, bridge.close_count)
+
+    def test_browser_profile_does_not_forward_ambient_proxy_authority(self) -> None:
+        bridge = _FakeEgressBridge(port=19086)
         profile_environment = {
             "EXECUTOR_RUNTIME_PROFILE": "browser-automation-v1",
             "EXECUTOR_ALLOWED_REQUEST_KINDS": "runtime_capabilities,process_lease",
@@ -1488,6 +2621,10 @@ print(child.pid, flush=True)
                 str(script),
                 *arguments,
             ],
+        ), patch.object(
+            server,
+            "_start_egress_bridge",
+            return_value=bridge,
         ):
             capabilities = server._run({
                 "protocol_version": server.PROTOCOL_VERSION,
@@ -1528,13 +2665,13 @@ print(child.pid, flush=True)
                     "SE_OFFLINE",
                     "SE_AVOID_STATS",
                     "SE_AVOID_BROWSER_DOWNLOAD",
-                    "SKILL_EGRESS_PROXY_URL",
                 )
             ))
+            self.assertFalse(availability["SKILL_EGRESS_PROXY_URL"])
             self.assertFalse(availability["DISPLAY"])
             self.assertFalse(availability["SE_SECRET"])
             self.assertEqual(
-                {"direct": "disabled", "egress": "policy_proxy"},
+                {"direct": "disabled", "egress": "none"},
                 capabilities["runtime_identity"]["network_policy"],
             )
             self.assertEqual(
@@ -1550,18 +2687,18 @@ print(child.pid, flush=True)
             self.assertEqual("success", opened["status"])
             self.assertEqual("browser-automation-v1", opened["runtime_profile"])
             self.assertEqual(
-                {"direct": "disabled", "egress": "policy_proxy"},
+                {"direct": "disabled", "egress": "none"},
                 opened["network_policy"],
             )
             lease = server._PROCESS_LEASES[str(opened["lease_handle"])]
             self.assertNotIn("DISPLAY", lease.environment)
             self.assertNotIn("WAYLAND_DISPLAY", lease.environment)
             self.assertEqual(
-                "http://skill-egress-proxy:8080",
+                bridge.environment["HTTPS_PROXY"],
                 lease.environment["HTTPS_PROXY"],
             )
             self.assertEqual(
-                "localhost,127.0.0.1,[::1]",
+                bridge.environment["NO_PROXY"],
                 lease.environment["NO_PROXY"],
             )
             self.assertNotIn("EXECUTOR_V2_AUTH_TOKEN", lease.environment)
@@ -1676,6 +2813,58 @@ class WorkerContainmentTests(unittest.TestCase):
             "worker_shared_state_unavailable",
             caught.exception.code,
         )
+
+    def test_shared_state_audit_bounds_entries_before_buffering(self) -> None:
+        class Entry:
+            pass
+
+        class Scanner:
+            def __init__(self) -> None:
+                self.emitted = 0
+                self.closed = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback) -> None:
+                self.closed = True
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if self.emitted > server.MAX_OUTPUT_ENTRIES:
+                    raise AssertionError(
+                        "shared-state audit consumed beyond remaining+1"
+                    )
+                self.emitted += 1
+                return Entry()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "shared"
+            root.mkdir(mode=0o755)
+            root.chmod(0o755)
+            scanner = Scanner()
+            with (
+                patch.object(
+                    server,
+                    "_worker_shared_state_roots",
+                    return_value=(root,),
+                ),
+                patch.object(server.os, "scandir", return_value=scanner),
+            ):
+                with self.assertRaises(server.ProtocolError) as caught:
+                    server._worker_owned_shared_entries(
+                        worker_uid=os.getuid() + 10_000,
+                        worker_gid=os.getgid() + 10_000,
+                    )
+
+        self.assertEqual(
+            "worker_shared_state_unavailable",
+            caught.exception.code,
+        )
+        self.assertEqual(server.MAX_OUTPUT_ENTRIES + 1, scanner.emitted)
+        self.assertTrue(scanner.closed)
 
     def test_shared_roots_reject_mutable_file_owned_by_another_uid(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

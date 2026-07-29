@@ -27,6 +27,9 @@ try:
         RunLifecycleMachine,
         TerminalOutcome,
     )
+    from .retrieval_completeness import (
+        retrieval_receipt_affects_completion_quality,
+    )
 except ImportError:  # pragma: no cover - direct Harness module loading
     from run_contract import (
         LifecycleDecision,
@@ -34,6 +37,9 @@ except ImportError:  # pragma: no cover - direct Harness module loading
         RunContractLedger,
         RunLifecycleMachine,
         TerminalOutcome,
+    )
+    from retrieval_completeness import (
+        retrieval_receipt_affects_completion_quality,
     )
 
 
@@ -451,7 +457,9 @@ def _apply_node(
         else QualityState.VERIFIED
     )
     state = _quality(quality_value, default=default_quality)
-    if payload.get("unresolved_retrieval"):
+    if retrieval_receipt_affects_completion_quality(
+        payload.get("unresolved_retrieval")
+    ):
         state = QualityState.DEGRADED.value
     receipt_sha = _result_sha256(payload)
     reason = _reason_code(

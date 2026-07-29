@@ -71,6 +71,7 @@ def _empty_authority(candidates: list[dict]) -> dict:
         "command_grants": [],
         "http_get_grants": [],
         "http_post_grants": [],
+        "sandbox_egress_grants": [],
         "tool_names": [
             candidate["tool_name"]
             for candidate in candidates

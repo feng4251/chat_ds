@@ -200,6 +200,8 @@ class KnowledgeGateRuntimeTests(unittest.IsolatedAsyncioTestCase):
         allowed_commands=(),
         allowed_http_get=(),
         allowed_http_post=(),
+        allowed_sandbox_egress=(),
+        allowed_sandbox_egress_rules=(),
         frozen_mcp_catalog=None,
         resolve_tool_selector=_resolve_declared_tool_selector,
         worker_id="worker-evidence",
@@ -234,6 +236,10 @@ class KnowledgeGateRuntimeTests(unittest.IsolatedAsyncioTestCase):
             allowed_commands=allowed_commands,
             allowed_http_get=allowed_http_get,
             allowed_http_post=allowed_http_post,
+            allowed_sandbox_egress=allowed_sandbox_egress,
+            allowed_sandbox_egress_rules=(
+                allowed_sandbox_egress_rules
+            ),
             frozen_mcp_catalog=frozen_mcp_catalog,
             resolve_tool_selector=resolve_tool_selector,
         )
@@ -251,6 +257,8 @@ class KnowledgeGateRuntimeTests(unittest.IsolatedAsyncioTestCase):
         allowed_commands=(),
         allowed_http_get=(),
         allowed_http_post=(),
+        allowed_sandbox_egress=(),
+        allowed_sandbox_egress_rules=(),
         frozen_mcp_catalog=None,
         resolve_tool_selector=_resolve_declared_tool_selector,
         worker_id="worker-evidence",
@@ -285,6 +293,10 @@ class KnowledgeGateRuntimeTests(unittest.IsolatedAsyncioTestCase):
             allowed_commands=allowed_commands,
             allowed_http_get=allowed_http_get,
             allowed_http_post=allowed_http_post,
+            allowed_sandbox_egress=allowed_sandbox_egress,
+            allowed_sandbox_egress_rules=(
+                allowed_sandbox_egress_rules
+            ),
             frozen_mcp_catalog=frozen_mcp_catalog,
             resolve_tool_selector=resolve_tool_selector,
         )
@@ -420,6 +432,18 @@ class KnowledgeGateRuntimeTests(unittest.IsolatedAsyncioTestCase):
         package_sha = snapshot_skill_package(self.adapter_root).sha256
         get_prefix = "https://catalog.example/api/"
         post_prefix = "https://catalog.example/graphql"
+        sandbox_rules = {
+            (
+                ADAPTER_SKILL,
+                "https://catalog.example:443/api/",
+                ("GET", "HEAD"),
+            ),
+            (
+                ADAPTER_SKILL,
+                "https://catalog.example:443/graphql",
+                ("GET", "HEAD", "POST"),
+            ),
+        }
         command = (
             ADAPTER_SKILL,
             "query-cli",
@@ -441,6 +465,11 @@ class KnowledgeGateRuntimeTests(unittest.IsolatedAsyncioTestCase):
             allowed_commands={command},
             allowed_http_get={(ADAPTER_SKILL, get_prefix)},
             allowed_http_post={(ADAPTER_SKILL, post_prefix)},
+            allowed_sandbox_egress={
+                (ADAPTER_SKILL, get_prefix),
+                (ADAPTER_SKILL, post_prefix),
+            },
+            allowed_sandbox_egress_rules=sandbox_rules,
         )
 
         assert plan is not None
@@ -474,6 +503,11 @@ class KnowledgeGateRuntimeTests(unittest.IsolatedAsyncioTestCase):
             allowed_skill_http_post_prefixes=(
                 (ADAPTER_SKILL, post_prefix),
             ),
+            allowed_skill_sandbox_egress_prefixes=(
+                (ADAPTER_SKILL, get_prefix),
+                (ADAPTER_SKILL, post_prefix),
+            ),
+            allowed_skill_sandbox_egress_rules=tuple(sorted(sandbox_rules)),
         )
         with patch(
             "skills.scanner.resolve_skill_path",
@@ -496,6 +530,17 @@ class KnowledgeGateRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [(ADAPTER_SKILL, post_prefix)],
             authority["http_post_grants"],
+        )
+        self.assertEqual(
+            [
+                (ADAPTER_SKILL, get_prefix),
+                (ADAPTER_SKILL, post_prefix),
+            ],
+            authority["sandbox_egress_grants"],
+        )
+        self.assertEqual(
+            sorted(sandbox_rules),
+            authority["sandbox_egress_rule_grants"],
         )
 
     def test_unconditional_local_resource_is_content_addressed(self):
