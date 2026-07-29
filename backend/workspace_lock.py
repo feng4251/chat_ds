@@ -1,9 +1,10 @@
 """Bounded cross-process coordination for one session workspace.
 
 The Harness has an intentionally separate implementation because its image
-does not contain the Backend.  Both implementations use the same private
-sibling file and POSIX ``flock`` protocol, so a Backend mutation cannot race a
-Harness compare-and-swap/apply operation.
+does not contain the Backend. Both implementations derive the same logical
+session identity and lock a file on one shared *local* lock volume, so no
+``flock`` operation touches the NFS workspace filesystem. The historical
+sibling lock remains only as an unset-environment compatibility fallback.
 """
 
 from __future__ import annotations
@@ -11,16 +12,25 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import errno
+import hashlib
 import os
 import stat
 import threading
 import time
+import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterator, TypeVar
 
 
 WORKSPACE_MUTATION_LOCK_FILENAME = ".chatds-workspace-mutation.lock"
+WORKSPACE_MUTATION_LOCK_ROOT_ENV = "WORKSPACE_MUTATION_LOCK_ROOT"
+WORKSPACE_MUTATION_LOCK_REQUIRE_MOUNTPOINT_ENV = (
+    "WORKSPACE_MUTATION_LOCK_REQUIRE_MOUNTPOINT"
+)
+WORKSPACE_MUTATION_LOCK_IDENTITY_DOMAIN = (
+    b"chatds-workspace-mutation-lock-v1\0"
+)
 SESSION_TOMBSTONE_DIRECTORY = ".chatds-session-tombstones"
 SESSION_TOMBSTONE_SUFFIX = ".deleted"
 SESSION_PENDING_DIRECTORY = ".chatds-session-pending"
@@ -114,19 +124,273 @@ def _workspace_identity(workspace: Path) -> tuple[Path, tuple[int, int]]:
 
 
 def _lock_file_is_current(
-    lock_path: Path,
+    parent_descriptor: int,
+    lock_name: str,
     descriptor_stat: os.stat_result,
 ) -> bool:
     try:
-        path_stat = lock_path.lstat()
+        path_stat = os.stat(
+            lock_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
     except OSError:
         return False
     return (
         stat.S_ISREG(path_stat.st_mode)
         and path_stat.st_nlink == 1
+        and stat.S_IMODE(path_stat.st_mode) == 0o600
+        and path_stat.st_uid == os.geteuid()
         and (path_stat.st_dev, path_stat.st_ino)
         == (descriptor_stat.st_dev, descriptor_stat.st_ino)
     )
+
+
+def _workspace_session_identity(root: Path) -> tuple[str, str]:
+    """Return the canonical logical coordinate shared with the Harness.
+
+    The lock plane deliberately does not use NFS device/inode values as its
+    cross-container identity.  Backend and Harness instead derive the same
+    identity from the only accepted session workspace shape:
+    ``<storage>/<user>/<session>/workspace``.
+    """
+
+    if (
+        root.name != "workspace"
+        or root.parent == root
+        or root.parent.parent == root.parent
+    ):
+        raise WorkspaceMutationLockError(
+            "Workspace does not have a canonical session coordinate.",
+            code="workspace_lock_unsafe",
+        )
+    user_id = unicodedata.normalize("NFC", root.parent.parent.name)
+    session_id = unicodedata.normalize("NFC", root.parent.name)
+    for value in (user_id, session_id):
+        if (
+            not value
+            or value in {".", ".."}
+            or "\x00" in value
+            or Path(value).name != value
+        ):
+            raise WorkspaceMutationLockError(
+                "Workspace session coordinate is unsafe.",
+                code="workspace_lock_unsafe",
+            )
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise WorkspaceMutationLockError(
+                "Workspace session coordinate is not valid UTF-8.",
+                code="workspace_lock_unsafe",
+            ) from exc
+        if len(encoded) > 255:
+            raise WorkspaceMutationLockError(
+                "Workspace session coordinate is too long.",
+                code="workspace_lock_unsafe",
+            )
+    return user_id, session_id
+
+
+def _workspace_lock_identity(root: Path) -> str:
+    user_id, session_id = _workspace_session_identity(root)
+    user_bytes = user_id.encode("utf-8")
+    session_bytes = session_id.encode("utf-8")
+    digest = hashlib.sha256()
+    digest.update(WORKSPACE_MUTATION_LOCK_IDENTITY_DOMAIN)
+    digest.update(len(user_bytes).to_bytes(4, "big"))
+    digest.update(user_bytes)
+    digest.update(len(session_bytes).to_bytes(4, "big"))
+    digest.update(session_bytes)
+    return digest.hexdigest()
+
+
+def _configured_local_lock_root() -> Path | None:
+    require_mountpoint_raw = os.environ.get(
+        WORKSPACE_MUTATION_LOCK_REQUIRE_MOUNTPOINT_ENV,
+        "0",
+    )
+    if require_mountpoint_raw not in {"0", "1"}:
+        raise WorkspaceMutationLockError(
+            "Workspace mutation lock mount policy is invalid.",
+            code="workspace_lock_unsafe",
+        )
+    raw = os.environ.get(WORKSPACE_MUTATION_LOCK_ROOT_ENV)
+    if raw is None or not raw.strip():
+        if require_mountpoint_raw == "1":
+            raise WorkspaceMutationLockError(
+                "Workspace mutation lock root is required.",
+                code="workspace_lock_unsafe",
+            )
+        return None
+    if raw != raw.strip():
+        raise WorkspaceMutationLockError(
+            "Workspace mutation lock root is not canonical.",
+            code="workspace_lock_unsafe",
+        )
+    candidate = Path(raw)
+    if (
+        not candidate.is_absolute()
+        or candidate == Path("/")
+        or ".." in candidate.parts
+    ):
+        raise WorkspaceMutationLockError(
+            "Workspace mutation lock root must be an absolute safe path.",
+            code="workspace_lock_unsafe",
+        )
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        directory_flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    descriptor = os.open("/", directory_flags)
+    current = Path("/")
+    try:
+        # Every parent component must already exist. In production the direct
+        # parent is a Docker named-volume mountpoint; recursively creating a
+        # missing parent would silently put Backend and Harness on different
+        # container overlay filesystems.
+        for component in candidate.parent.parts[1:]:
+            if (
+                not component
+                or component in {".", ".."}
+                or "\x00" in component
+            ):
+                raise WorkspaceMutationLockError(
+                    "Workspace mutation lock root is unsafe.",
+                    code="workspace_lock_unsafe",
+                )
+            try:
+                child_descriptor = os.open(
+                    component,
+                    directory_flags,
+                    dir_fd=descriptor,
+                )
+            except OSError as exc:
+                raise WorkspaceMutationLockError(
+                    "Workspace mutation lock root contains an unsafe path.",
+                    code="workspace_lock_unsafe",
+                ) from exc
+            try:
+                descriptor_stat = os.fstat(child_descriptor)
+                path_stat = os.stat(
+                    component,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISDIR(descriptor_stat.st_mode)
+                    or not stat.S_ISDIR(path_stat.st_mode)
+                    or stat.S_ISLNK(path_stat.st_mode)
+                    or (descriptor_stat.st_dev, descriptor_stat.st_ino)
+                    != (path_stat.st_dev, path_stat.st_ino)
+                ):
+                    raise WorkspaceMutationLockError(
+                        "Workspace mutation lock root changed during validation.",
+                        code="workspace_lock_unsafe",
+                    )
+            except BaseException:
+                os.close(child_descriptor)
+                raise
+            os.close(descriptor)
+            descriptor = child_descriptor
+            current /= component
+
+        parent_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(parent_stat.st_mode)
+            or parent_stat.st_mode & 0o022
+            or parent_stat.st_uid != os.geteuid()
+        ):
+            raise WorkspaceMutationLockError(
+                "Workspace mutation lock parent is unsafe.",
+                code="workspace_lock_unsafe",
+            )
+        if require_mountpoint_raw == "1" and (
+            current == Path("/") or not os.path.ismount(current)
+        ):
+            raise WorkspaceMutationLockError(
+                "Workspace mutation lock parent is not a mounted volume.",
+                code="workspace_lock_unsafe",
+            )
+
+        leaf_name = candidate.name
+        if (
+            not leaf_name
+            or leaf_name in {".", ".."}
+            or "\x00" in leaf_name
+        ):
+            raise WorkspaceMutationLockError(
+                "Workspace mutation lock root leaf is unsafe.",
+                code="workspace_lock_unsafe",
+            )
+        try:
+            os.mkdir(
+                leaf_name,
+                mode=0o700,
+                dir_fd=descriptor,
+            )
+            os.fsync(descriptor)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise WorkspaceMutationLockError(
+                "Workspace mutation lock root cannot be created safely.",
+                code="workspace_lock_io",
+            ) from exc
+        try:
+            root_descriptor = os.open(
+                leaf_name,
+                directory_flags,
+                dir_fd=descriptor,
+            )
+        except OSError as exc:
+            raise WorkspaceMutationLockError(
+                "Workspace mutation lock root is unsafe.",
+                code="workspace_lock_unsafe",
+            ) from exc
+        try:
+            root_stat = os.fstat(root_descriptor)
+            path_stat = os.stat(
+                leaf_name,
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+        finally:
+            os.close(root_descriptor)
+        if (
+            not stat.S_ISDIR(root_stat.st_mode)
+            or not stat.S_ISDIR(path_stat.st_mode)
+            or stat.S_ISLNK(path_stat.st_mode)
+            or stat.S_IMODE(root_stat.st_mode) != 0o700
+            or root_stat.st_uid != os.geteuid()
+            or (root_stat.st_dev, root_stat.st_ino)
+            != (path_stat.st_dev, path_stat.st_ino)
+        ):
+            raise WorkspaceMutationLockError(
+                "Workspace mutation lock root must be private and owned.",
+                code="workspace_lock_unsafe",
+            )
+    finally:
+        os.close(descriptor)
+    return candidate
+
+
+def workspace_mutation_lock_path(workspace: Path) -> Path:
+    """Return the deterministic lock object for a session workspace.
+
+    Production configures a local Docker volume through
+    ``WORKSPACE_MUTATION_LOCK_ROOT``.  The sibling path remains only as a
+    backward-compatible source/test fallback; a deployment must switch
+    Backend and Harness to the shared local root atomically.
+    """
+
+    root, _identity = _workspace_identity(workspace)
+    local_root = _configured_local_lock_root()
+    if local_root is None:
+        return root.parent / WORKSPACE_MUTATION_LOCK_FILENAME
+    return local_root / f"v1-{_workspace_lock_identity(root)}.lock"
 
 
 def session_tombstone_path_for_workspace(workspace: Path) -> Path | None:
@@ -230,9 +494,10 @@ def workspace_mutation_lock_is_held(workspace: Path) -> bool:
 
     try:
         root, identity = _workspace_identity(workspace)
+        lock_path = workspace_mutation_lock_path(root)
     except WorkspaceMutationLockError:
         return False
-    held = _held_workspace_locks().get(str(root))
+    held = _held_workspace_locks().get(str(lock_path))
     return held is not None and held[0] == identity and held[1] > 0
 
 
@@ -303,7 +568,8 @@ def workspace_mutation_guard(
         _raise_if_session_deleted(root)
     if not allow_pending:
         _raise_if_session_pending(root)
-    lock_key = str(root)
+    lock_path = workspace_mutation_lock_path(root)
+    lock_key = str(lock_path)
     held_locks = _held_workspace_locks()
     existing = held_locks.get(lock_key)
     if existing is not None:
@@ -335,7 +601,6 @@ def workspace_mutation_guard(
             f"{MAX_WORKSPACE_MUTATION_LOCK_TIMEOUT_SECONDS:g}"
         )
 
-    lock_path = root.parent / WORKSPACE_MUTATION_LOCK_FILENAME
     flags = os.O_RDWR | os.O_CREAT
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
@@ -343,16 +608,46 @@ def workspace_mutation_guard(
         flags |= os.O_NOFOLLOW
 
     descriptor: int | None = None
+    parent_descriptor: int | None = None
     locked = False
     entered_body = False
     try:
-        descriptor = os.open(lock_path, flags, 0o600)
+        parent_flags = os.O_RDONLY | os.O_DIRECTORY
+        if hasattr(os, "O_CLOEXEC"):
+            parent_flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            parent_flags |= os.O_NOFOLLOW
+        parent_descriptor = os.open(lock_path.parent, parent_flags)
+        parent_stat = os.fstat(parent_descriptor)
+        lexical_parent_stat = lock_path.parent.lstat()
+        if (
+            not stat.S_ISDIR(parent_stat.st_mode)
+            or not stat.S_ISDIR(lexical_parent_stat.st_mode)
+            or stat.S_ISLNK(lexical_parent_stat.st_mode)
+            or (parent_stat.st_dev, parent_stat.st_ino)
+            != (lexical_parent_stat.st_dev, lexical_parent_stat.st_ino)
+        ):
+            raise WorkspaceMutationLockError(
+                "Workspace mutation lock directory is unsafe.",
+                code="workspace_lock_unsafe",
+            )
+        descriptor = os.open(
+            lock_path.name,
+            flags,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
         descriptor_stat = os.fstat(descriptor)
         if (
             not stat.S_ISREG(descriptor_stat.st_mode)
             or descriptor_stat.st_nlink != 1
-            or descriptor_stat.st_mode & 0o077
-            or not _lock_file_is_current(lock_path, descriptor_stat)
+            or stat.S_IMODE(descriptor_stat.st_mode) != 0o600
+            or descriptor_stat.st_uid != os.geteuid()
+            or not _lock_file_is_current(
+                parent_descriptor,
+                lock_path.name,
+                descriptor_stat,
+            )
         ):
             raise WorkspaceMutationLockError(
                 "Workspace mutation lock must be a private regular file.",
@@ -384,7 +679,11 @@ def workspace_mutation_guard(
         if (
             (current_workspace_stat.st_dev, current_workspace_stat.st_ino)
             != expected_workspace_identity
-            or not _lock_file_is_current(lock_path, descriptor_stat)
+            or not _lock_file_is_current(
+                parent_descriptor,
+                lock_path.name,
+                descriptor_stat,
+            )
         ):
             raise WorkspaceMutationLockError(
                 "Workspace or mutation lock changed during acquisition.",
@@ -423,5 +722,10 @@ def workspace_mutation_guard(
                     pass
             try:
                 os.close(descriptor)
+            except OSError:
+                pass
+        if parent_descriptor is not None:
+            try:
+                os.close(parent_descriptor)
             except OSError:
                 pass

@@ -7,6 +7,7 @@ import os
 import queue
 import stat
 import time
+import unicodedata
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -14,6 +15,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 import workspace
+import workspace_lock
 import workspace_reconciler
 import stream_observability
 from main import workspace_mutation_lock_error_handler
@@ -25,12 +27,27 @@ from workspace_reconciler import (
     reconcile_orphan_session_workspaces,
 )
 from workspace_lock import (
+    WORKSPACE_MUTATION_LOCK_IDENTITY_DOMAIN,
     WorkspaceMutationLockError,
     workspace_mutation_guard,
+    workspace_mutation_lock_path,
 )
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.fixture(autouse=True)
+def local_workspace_lock_plane(
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Path:
+    """Exercise Backend tests on the production-style local lock plane."""
+
+    lock_root = tmp_path_factory.mktemp("workspace-mutation-locks")
+    lock_root.chmod(0o700)
+    monkeypatch.setenv("WORKSPACE_MUTATION_LOCK_ROOT", str(lock_root))
+    return lock_root
 
 
 def _acquire_harness_workspace_lock(
@@ -132,21 +149,174 @@ def workspace_path(tmp_path: Path) -> Path:
 def test_backend_lock_is_private_and_rejects_symlink(
     workspace_path: Path,
 ) -> None:
-    lock_path = workspace_path.parent / ".chatds-workspace-mutation.lock"
+    lock_path = workspace_mutation_lock_path(workspace_path)
     with workspace_mutation_guard(workspace_path):
         lock_stat = lock_path.stat()
         assert stat.S_ISREG(lock_stat.st_mode)
-        assert stat.S_IMODE(lock_stat.st_mode) & 0o077 == 0
-        assert not (workspace_path / lock_path.name).exists()
+        assert stat.S_IMODE(lock_stat.st_mode) == 0o600
+        assert lock_path.parent != workspace_path.parent
+        assert not (
+            workspace_path.parent / ".chatds-workspace-mutation.lock"
+        ).exists()
 
     lock_path.unlink()
-    target = workspace_path.parent / "attacker-file"
+    target = lock_path.parent / "attacker-file"
     target.write_text("x", encoding="utf-8")
     lock_path.symlink_to(target)
     with pytest.raises(WorkspaceMutationLockError) as exc_info:
         with workspace_mutation_guard(workspace_path):
             raise AssertionError("unsafe lock must not be entered")
     assert exc_info.value.code == "workspace_lock_unsafe"
+
+
+def test_local_lock_identity_is_content_addressed_and_nfc_stable(
+    tmp_path: Path,
+    local_workspace_lock_plane: Path,
+) -> None:
+    composed = tmp_path / "usér" / "session" / "workspace"
+    decomposed = (
+        tmp_path
+        / unicodedata.normalize("NFD", "usér")
+        / "session"
+        / "workspace"
+    )
+    composed.mkdir(parents=True)
+    decomposed.mkdir(parents=True)
+
+    user_bytes = "usér".encode("utf-8")
+    session_bytes = b"session"
+    expected = hashlib.sha256(
+        WORKSPACE_MUTATION_LOCK_IDENTITY_DOMAIN
+        + len(user_bytes).to_bytes(4, "big")
+        + user_bytes
+        + len(session_bytes).to_bytes(4, "big")
+        + session_bytes
+    ).hexdigest()
+    expected_path = local_workspace_lock_plane / f"v1-{expected}.lock"
+    assert workspace_mutation_lock_path(composed) == expected_path
+    assert workspace_mutation_lock_path(decomposed) == expected_path
+    module_path = REPOSITORY_ROOT / "harness" / "tools" / "workspace_lock.py"
+    spec = importlib.util.spec_from_file_location(
+        "chatds_harness_workspace_lock_identity",
+        module_path,
+    )
+    assert spec is not None and spec.loader is not None
+    harness_lock = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(harness_lock)
+    assert harness_lock.workspace_mutation_lock_path(composed) == expected_path
+    assert (
+        harness_lock.workspace_mutation_lock_path(decomposed)
+        == expected_path
+    )
+
+
+def test_local_lock_root_rejects_relative_symlink_and_writable_roots(
+    workspace_path: Path,
+    tmp_path: Path,
+) -> None:
+    with (
+        patch.dict(
+            os.environ,
+            {"WORKSPACE_MUTATION_LOCK_ROOT": "relative/locks"},
+        ),
+        pytest.raises(WorkspaceMutationLockError) as relative_error,
+    ):
+        workspace_mutation_lock_path(workspace_path)
+    assert relative_error.value.code == "workspace_lock_unsafe"
+
+    real_root = tmp_path / "real-lock-root"
+    real_root.mkdir(mode=0o700)
+    linked_root = tmp_path / "linked-lock-root"
+    linked_root.symlink_to(real_root, target_is_directory=True)
+    with (
+        patch.dict(
+            os.environ,
+            {"WORKSPACE_MUTATION_LOCK_ROOT": str(linked_root)},
+        ),
+        pytest.raises(WorkspaceMutationLockError) as symlink_error,
+    ):
+        workspace_mutation_lock_path(workspace_path)
+    assert symlink_error.value.code == "workspace_lock_unsafe"
+
+    writable_root = tmp_path / "writable-lock-root"
+    writable_root.mkdir(mode=0o777)
+    writable_root.chmod(0o777)
+    with (
+        patch.dict(
+            os.environ,
+            {"WORKSPACE_MUTATION_LOCK_ROOT": str(writable_root)},
+        ),
+        pytest.raises(WorkspaceMutationLockError) as writable_error,
+    ):
+        workspace_mutation_lock_path(workspace_path)
+    assert writable_error.value.code == "workspace_lock_unsafe"
+
+    with (
+        patch.dict(
+            os.environ,
+            {
+                "WORKSPACE_MUTATION_LOCK_ROOT": str(
+                    tmp_path / "missing-parent" / "locks"
+                )
+            },
+        ),
+        pytest.raises(WorkspaceMutationLockError) as missing_parent_error,
+    ):
+        workspace_mutation_lock_path(workspace_path)
+    assert missing_parent_error.value.code == "workspace_lock_unsafe"
+
+    with (
+        patch.dict(
+            os.environ,
+            {
+                "WORKSPACE_MUTATION_LOCK_ROOT": str(real_root),
+                "WORKSPACE_MUTATION_LOCK_REQUIRE_MOUNTPOINT": "1",
+            },
+        ),
+        pytest.raises(WorkspaceMutationLockError) as mountpoint_error,
+    ):
+        workspace_mutation_lock_path(workspace_path)
+    assert mountpoint_error.value.code == "workspace_lock_unsafe"
+
+    with (
+        patch.dict(
+            os.environ,
+            {"WORKSPACE_MUTATION_LOCK_REQUIRE_MOUNTPOINT": "1"},
+        ),
+        patch.dict(
+            os.environ,
+            {"WORKSPACE_MUTATION_LOCK_ROOT": ""},
+        ),
+        pytest.raises(WorkspaceMutationLockError) as missing_root_error,
+    ):
+        workspace_mutation_lock_path(workspace_path)
+    assert missing_root_error.value.code == "workspace_lock_unsafe"
+
+
+def test_local_plane_flock_descriptor_never_targets_workspace_storage(
+    workspace_path: Path,
+    local_workspace_lock_plane: Path,
+) -> None:
+    observed: list[Path] = []
+    real_flock = workspace_lock.fcntl.flock
+
+    def _tracking_flock(descriptor: int, operation: int) -> None:
+        observed.append(
+            Path(os.readlink(f"/proc/self/fd/{descriptor}")).resolve()
+        )
+        real_flock(descriptor, operation)
+
+    with patch.object(
+        workspace_lock.fcntl,
+        "flock",
+        side_effect=_tracking_flock,
+    ):
+        with workspace_mutation_guard(workspace_path):
+            pass
+
+    assert observed
+    assert all(path.parent == local_workspace_lock_plane for path in observed)
+    assert all(workspace_path.parent not in path.parents for path in observed)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX flock")
@@ -513,6 +683,7 @@ def test_deletion_tombstone_rejects_waiter_and_prevents_workspace_revival(
 ) -> None:
     with patch.object(workspace, "WORKSPACE_ROOT", tmp_path):
         root = workspace.ensure_workspace("user", "session")
+        local_lock_path = workspace_mutation_lock_path(root)
         context = multiprocessing.get_context("fork")
         events = context.Queue()
         process = None
@@ -541,6 +712,10 @@ def test_deletion_tombstone_rejects_waiter_and_prevents_workspace_revival(
         )
         assert outcome == "removed"
         assert not root.parent.exists()
+        # Local lock objects are intentionally permanent. Unlinking one would
+        # let an old waiter and a new opener hold different inodes for the
+        # same logical session (the classic lock-file ABA race).
+        assert local_lock_path.is_file()
         assert not (
             root.parent / ".chatds-workspace-mutation.lock"
         ).exists()

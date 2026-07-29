@@ -139,6 +139,11 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
 
     def test_harness_reaches_only_the_unified_controller_uds(self):
         harness = self.services["harness"]
+        short_mounts = {
+            volume
+            for volume in harness["volumes"]
+            if isinstance(volume, str)
+        }
         expected_mounts = {
             "executor_socket:/run/chat-ds-executor:ro",
             "executor_socket_2:/run/chat-ds-executor-2:ro",
@@ -146,10 +151,13 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
             "executor_socket_4:/run/chat-ds-executor-4:ro",
         }
         self.assertTrue(
-            expected_mounts.issubset(set(harness["volumes"])),
+            expected_mounts.issubset(short_mounts),
         )
         self.assertIn("65533", harness["group_add"])
-        self.assertNotIn("skill_egress_proxy_socket", "\n".join(harness["volumes"]))
+        self.assertNotIn(
+            "skill_egress_proxy_socket",
+            "\n".join(sorted(short_mounts)),
+        )
         self.assertNotIn(
             "SKILL_EGRESS_POLICY_TOKEN",
             harness["environment"],
@@ -184,6 +192,58 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
                 set(harness["depends_on"])
             )
         )
+
+    def test_workspace_lock_plane_is_local_and_backend_harness_only(self):
+        self.assertEqual(
+            self.compose["volumes"]["workspace_mutation_locks"],
+            {"driver": "local"},
+        )
+        expected_mount = {
+            "type": "volume",
+            "source": "workspace_mutation_locks",
+            "target": "/run/chatds-workspace-lock-plane",
+            "volume": {"nocopy": True},
+        }
+        consumers = set()
+        for name, service in self.services.items():
+            for mount in service.get("volumes", []):
+                if (
+                    isinstance(mount, dict)
+                    and mount.get("source") == "workspace_mutation_locks"
+                ):
+                    consumers.add(name)
+                    self.assertEqual(expected_mount, mount)
+                    self.assertFalse(mount.get("read_only", False))
+                elif (
+                    isinstance(mount, str)
+                    and mount.split(":", 1)[0]
+                    == "workspace_mutation_locks"
+                ):
+                    self.fail(
+                        "workspace lock plane must use nocopy long syntax"
+                    )
+        self.assertEqual(consumers, {"backend", "harness"})
+        for name in consumers:
+            environment = self.services[name]["environment"]
+            self.assertEqual(
+                environment["WORKSPACE_MUTATION_LOCK_ROOT"],
+                "/run/chatds-workspace-lock-plane/locks",
+            )
+            self.assertEqual(
+                environment[
+                    "WORKSPACE_MUTATION_LOCK_REQUIRE_MOUNTPOINT"
+                ],
+                "1",
+            )
+        for name in (
+            *self.executor_names,
+            "browser",
+            "skill-egress-proxy",
+            "frontend",
+            "searxng",
+            "searxng-valkey",
+        ):
+            self.assertNotIn(name, consumers)
 
     def test_unified_sandbox_has_root_controller_and_fixed_nonroot_worker(self):
         sandbox = self.services["executor"]
