@@ -2,18 +2,22 @@ import asyncio
 import hashlib
 import importlib.util
 import json
+import logging
 import multiprocessing
 import os
 import queue
 import stat
 import time
+import traceback
 import unicodedata
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+import main as backend_main
 import workspace
 import workspace_lock
 import workspace_reconciler
@@ -35,6 +39,18 @@ from workspace_lock import (
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_pytest_storage_defaults_are_isolated_from_production() -> None:
+    from routers import skill_router
+
+    production_root = Path("/nfs/temp/chat_ds")
+    assert workspace.WORKSPACE_ROOT != production_root
+    assert conv_router.SANDBOX_BASE == workspace.WORKSPACE_ROOT
+    assert skill_router.SKILLS_DATA_DIR != REPOSITORY_ROOT / "data" / "skills"
+    assert workspace_reconciler._DISCOVERY_CURSOR is None
+    assert workspace_reconciler._DEFERRED_RETRY == {}
+    assert workspace_reconciler._DEFERRED_RETRY_TURN == {}
 
 
 @pytest.fixture(autouse=True)
@@ -808,7 +824,7 @@ def _active_owner_resolver(rows):
     return resolve
 
 
-def test_restart_reconciler_uses_db_authority_and_recovers_deferred_cleanup(
+def test_restart_reconciler_uses_db_authority_and_cleans_tombstoned_orphan(
     tmp_path: Path,
 ) -> None:
     live_rows = [("user", "live-session")]
@@ -826,10 +842,14 @@ def test_restart_reconciler_uses_db_authority_and_recovers_deferred_cleanup(
         (orphan / "remove.md").write_text("orphan", encoding="utf-8")
 
         # A crash after fence publication but before DB commit must be repaired
-        # as live, while DB-absent state is durably fenced and removed.
+        # as live, while a DB-absent, already-fenced tree is removed.
         workspace.publish_session_deletion_tombstone(
             "user",
             "live-session",
+        )
+        workspace.publish_session_deletion_tombstone(
+            "user",
+            "orphan-session",
         )
         # Simulate a fence inherited from a crashed earlier Backend process.
         stale_marker = workspace.session_tombstone_path(
@@ -845,6 +865,7 @@ def test_restart_reconciler_uses_db_authority_and_recovers_deferred_cleanup(
         )
         assert first["stale_tombstones_cleared"] == 1
         assert first["removed"] == 1
+        assert first["fenced"] == 0
         assert live.is_dir()
         assert (live / "keep.md").read_text(encoding="utf-8") == "live"
         assert not orphan.parent.exists()
@@ -954,7 +975,617 @@ def test_live_conversation_query_is_chunked_below_sqlite_limits() -> None:
     assert db.calls == 3
 
 
-def test_historical_fence_markers_do_not_starve_real_orphan_limit(
+def test_empty_database_retains_unfenced_workspaces_without_deferred_queue(
+    tmp_path: Path,
+) -> None:
+    candidates = [
+        ("possibly-sensitive-user", f"unfenced-{index}")
+        for index in range(3)
+    ]
+    with (
+        patch.object(workspace, "WORKSPACE_ROOT", tmp_path),
+        patch.object(
+            workspace_reconciler,
+            "_next_session_candidate_batch",
+            return_value=(candidates, True, len(candidates)),
+        ),
+        patch.object(
+            workspace_reconciler,
+            "_conversation_owner_is_active",
+            new=_active_owner_resolver([]),
+        ),
+        patch(
+            "routers.skill_router.SKILLS_DATA_DIR",
+            tmp_path / "skills",
+        ),
+        patch.object(
+            workspace_reconciler,
+            "_queue_deferred_candidate",
+        ) as deferred_queue,
+    ):
+        for user_id, session_id in candidates:
+            workspace_path = workspace.ensure_workspace(
+                user_id,
+                session_id,
+            )
+            (workspace_path / "keep.md").write_text(
+                session_id,
+                encoding="utf-8",
+            )
+            skill_path = (
+                tmp_path
+                / "skills"
+                / user_id
+                / session_id
+                / "fixture-skill"
+            )
+            skill_path.mkdir(parents=True)
+            (skill_path / "SKILL.md").write_text(
+                "# Preserve me",
+                encoding="utf-8",
+            )
+
+        for _round in range(2):
+            result = asyncio.run(
+                reconcile_orphan_session_workspaces(
+                    _LiveConversationDb([])
+                )
+            )
+
+            assert result["candidates"] == 3
+            assert result["unfenced_orphans_retained"] == 3
+            assert result["unresolved_pending_retained"] == 0
+            assert result["removed"] == 0
+            assert result["deferred"] == 0
+            assert result["fenced"] == 0
+        deferred_queue.assert_not_called()
+        for user_id, session_id in candidates:
+            assert (
+                tmp_path
+                / user_id
+                / session_id
+                / "workspace"
+                / "keep.md"
+            ).read_text(encoding="utf-8") == session_id
+            assert not workspace.session_deletion_tombstone_exists(
+                user_id,
+                session_id,
+            )
+            assert (
+                tmp_path
+                / "skills"
+                / user_id
+                / session_id
+                / "fixture-skill"
+                / "SKILL.md"
+            ).read_text(encoding="utf-8") == "# Preserve me"
+
+
+def test_database_query_error_retains_all_discovered_workspaces(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    candidates = [
+        ("possibly-sensitive-user", f"db-error-{index}")
+        for index in range(3)
+    ]
+
+    class _FailingConversationDb:
+        async def execute(self, _statement):
+            raise RuntimeError("database contents must not enter logs")
+
+    with (
+        patch.object(workspace, "WORKSPACE_ROOT", tmp_path),
+        patch.object(
+            workspace_reconciler,
+            "_next_session_candidate_batch",
+            return_value=(candidates, True, len(candidates)),
+        ),
+    ):
+        for user_id, session_id in candidates:
+            workspace_path = workspace.ensure_workspace(
+                user_id,
+                session_id,
+            )
+            (workspace_path / "keep.md").write_text(
+                session_id,
+                encoding="utf-8",
+            )
+
+        with (
+            caplog.at_level(
+                logging.WARNING,
+                logger="workspace_reconciler",
+            ),
+            pytest.raises(RuntimeError),
+        ):
+            asyncio.run(
+                reconcile_orphan_session_workspaces(
+                    _FailingConversationDb()
+                )
+            )
+
+        assert len(caplog.records) == 1
+        assert all(record.exc_info is None for record in caplog.records)
+        audit_text = "\n".join(
+            record.getMessage() for record in caplog.records
+        )
+        assert "possibly-sensitive-user" not in audit_text
+        assert "database contents must not enter logs" not in audit_text
+        assert "snapshot_query_failed" in audit_text
+        for user_id, session_id in candidates:
+            assert session_id not in audit_text
+            session_digest = hashlib.sha256(
+                (
+                    "chatds-workspace-reconcile-session-v1\0"
+                    + session_id
+                ).encode("utf-8")
+            ).hexdigest()
+            assert session_digest in audit_text
+            assert (
+                tmp_path
+                / user_id
+                / session_id
+                / "workspace"
+                / "keep.md"
+            ).is_file()
+            assert not workspace.session_deletion_tombstone_exists(
+                user_id,
+                session_id,
+            )
+
+
+@pytest.mark.parametrize(
+    "journal_contents",
+    [None, "{not valid json"],
+    ids=["missing-journal", "malformed-journal"],
+)
+def test_pending_with_bad_journal_is_retained_without_deferred_retry(
+    tmp_path: Path,
+    journal_contents: str | None,
+) -> None:
+    user_id = "user"
+    session_id = "pending-bad-journal"
+    operation_id = "a" * 64
+    skill_root = tmp_path / "skills"
+    operation_dir = (
+        skill_root
+        / user_id
+        / ".chatds_operations"
+        / f"fork-{'b' * 64}"
+    )
+    operation_dir.mkdir(parents=True)
+    if journal_contents is not None:
+        (operation_dir / "journal.json").write_text(
+            journal_contents,
+            encoding="utf-8",
+        )
+    with (
+        patch.object(workspace, "WORKSPACE_ROOT", tmp_path / "workspaces"),
+        patch(
+            "routers.skill_router.SKILLS_DATA_DIR",
+            skill_root,
+        ),
+        patch.object(
+            workspace_reconciler,
+            "_next_session_candidate_batch",
+            return_value=([(user_id, session_id)], True, 1),
+        ),
+        patch.object(
+            workspace_reconciler,
+            "_conversation_owner_is_active",
+            new=_active_owner_resolver([]),
+        ),
+        patch.object(
+            workspace_reconciler,
+            "_queue_deferred_candidate",
+        ) as deferred_queue,
+    ):
+        workspace_path = workspace.ensure_workspace(user_id, session_id)
+        (workspace_path / "keep.md").write_text(
+            "pending",
+            encoding="utf-8",
+        )
+        workspace.claim_session_pending_fence(
+            user_id,
+            session_id,
+            operation_id,
+        )
+
+        result = asyncio.run(
+            reconcile_orphan_session_workspaces(
+                _LiveConversationDb([])
+            )
+        )
+
+        assert result["candidates"] == 1
+        assert result["recoverable_pending"] == 0
+        assert result["unresolved_pending_retained"] == 1
+        assert result["unfenced_orphans_retained"] == 0
+        assert result["removed"] == 0
+        assert result["deferred"] == 0
+        deferred_queue.assert_not_called()
+        assert (workspace_path / "keep.md").is_file()
+        assert workspace.session_pending_fence_path(
+            user_id,
+            session_id,
+        ).is_file()
+        assert not workspace.session_deletion_tombstone_exists(
+            user_id,
+            session_id,
+        )
+
+
+def test_existing_deletion_tombstone_authorizes_orphan_cleanup(
+    tmp_path: Path,
+) -> None:
+    user_id = "user"
+    session_id = "already-tombstoned"
+    skill_root = tmp_path / "skills"
+    workspace_root = tmp_path / "workspaces"
+    with (
+        patch.object(workspace, "WORKSPACE_ROOT", workspace_root),
+        patch(
+            "routers.skill_router.SKILLS_DATA_DIR",
+            skill_root,
+        ),
+        patch.object(
+            workspace_reconciler,
+            "_next_session_candidate_batch",
+            return_value=([(user_id, session_id)], True, 1),
+        ),
+        patch.object(
+            workspace_reconciler,
+            "_conversation_owner_is_active",
+            new=_active_owner_resolver([]),
+        ),
+    ):
+        workspace_path = workspace.ensure_workspace(user_id, session_id)
+        (workspace_path / "remove.md").write_text(
+            "delete",
+            encoding="utf-8",
+        )
+        workspace.publish_session_deletion_tombstone(user_id, session_id)
+
+        result = asyncio.run(
+            reconcile_orphan_session_workspaces(
+                _LiveConversationDb([])
+            )
+        )
+
+        assert result["candidates"] == 1
+        assert result["removed"] == 1
+        assert result["fenced"] == 0
+        assert result["unfenced_orphans_retained"] == 0
+        assert result["tombstoned_orphans"] == 1
+        assert result["deletion_fence_unresolved"] == 0
+        assert not (workspace_root / user_id / session_id).exists()
+        assert workspace.session_deletion_tombstone_exists(
+            user_id,
+            session_id,
+        )
+
+
+@pytest.mark.parametrize(
+    "marker_payload",
+    [
+        b"",
+        b"chatds-session-deletion-v1\n",
+        b"chatds-session-deletion-v2\nboot_id=abc\n",
+        (
+            b"chatds-session-deletion-v2\nboot_id="
+            + b"g" * 32
+            + b"\n"
+        ),
+        (
+            b"chatds-session-deletion-v2\nboot_id="
+            + b"a" * 32
+            + b"\ntrailing-data"
+        ),
+        b"x" * 257,
+    ],
+    ids=[
+        "empty",
+        "legacy-version",
+        "truncated-boot-id",
+        "non-hex-boot-id",
+        "trailing-data",
+        "overlong",
+    ],
+)
+def test_unrecognized_deletion_marker_never_authorizes_cleanup(
+    tmp_path: Path,
+    marker_payload: bytes,
+) -> None:
+    user_id = "user"
+    session_id = "invalid-delete-record"
+    workspace_root = tmp_path / "workspaces"
+    skill_root = tmp_path / "skills"
+    with (
+        patch.object(workspace, "WORKSPACE_ROOT", workspace_root),
+        patch(
+            "routers.skill_router.SKILLS_DATA_DIR",
+            skill_root,
+        ),
+        patch.object(
+            workspace_reconciler,
+            "_next_session_candidate_batch",
+            return_value=([(user_id, session_id)], True, 1),
+        ),
+        patch.object(
+            workspace_reconciler,
+            "_conversation_owner_is_active",
+            new=_active_owner_resolver([]),
+        ),
+        patch.object(
+            workspace_reconciler,
+            "_queue_deferred_candidate",
+        ) as deferred_queue,
+    ):
+        workspace_path = workspace.ensure_workspace(user_id, session_id)
+        (workspace_path / "keep.md").write_text(
+            "preserve",
+            encoding="utf-8",
+        )
+        skill_path = skill_root / user_id / session_id / "fixture-skill"
+        skill_path.mkdir(parents=True)
+        (skill_path / "SKILL.md").write_text(
+            "# Preserve me",
+            encoding="utf-8",
+        )
+        workspace.claim_session_pending_fence(
+            user_id,
+            session_id,
+            "d" * 64,
+        )
+        marker = workspace.session_tombstone_path(user_id, session_id)
+        marker.parent.mkdir(mode=0o700)
+        marker.write_bytes(marker_payload)
+        marker.chmod(0o600)
+
+        result = asyncio.run(
+            reconcile_orphan_session_workspaces(
+                _LiveConversationDb([])
+            )
+        )
+
+        assert result["candidates"] == 1
+        assert result["removed"] == 0
+        assert result["deferred"] == 1
+        assert result["fenced"] == 0
+        assert result["tombstoned_orphans"] == 0
+        assert result["deletion_fence_unresolved"] == 1
+        deferred_queue.assert_called_once_with(user_id, session_id)
+        assert (workspace_path / "keep.md").is_file()
+        assert (skill_path / "SKILL.md").is_file()
+        assert workspace.session_pending_fence_path(
+            user_id,
+            session_id,
+        ).is_file()
+        assert marker.is_file()
+        with pytest.raises(WorkspaceMutationLockError) as invalid:
+            workspace.session_deletion_tombstone_authorizes_cleanup(
+                user_id,
+                session_id,
+            )
+        assert invalid.value.code == "workspace_lock_unsafe"
+
+
+@pytest.mark.parametrize(
+    "metadata_mutation",
+    [
+        "file-mode",
+        "directory-mode",
+        "hardlink",
+        "symlink",
+        "owner-mismatch",
+    ],
+)
+def test_unsafe_deletion_marker_metadata_never_authorizes_cleanup(
+    tmp_path: Path,
+    metadata_mutation: str,
+) -> None:
+    user_id = "user"
+    session_id = "unsafe-delete-record"
+    workspace_root = tmp_path / "workspaces"
+    skill_root = tmp_path / "skills"
+    with (
+        patch.object(workspace, "WORKSPACE_ROOT", workspace_root),
+        patch(
+            "routers.skill_router.SKILLS_DATA_DIR",
+            skill_root,
+        ),
+    ):
+        workspace_path = workspace.ensure_workspace(user_id, session_id)
+        (workspace_path / "keep.md").write_text(
+            "preserve",
+            encoding="utf-8",
+        )
+        skill_path = skill_root / user_id / session_id / "fixture-skill"
+        skill_path.mkdir(parents=True)
+        (skill_path / "SKILL.md").write_text(
+            "# Preserve me",
+            encoding="utf-8",
+        )
+        marker = workspace.publish_session_deletion_tombstone(
+            user_id,
+            session_id,
+        )
+        actual_euid = os.geteuid()
+        owner_patch = None
+        if metadata_mutation == "file-mode":
+            marker.chmod(0o640)
+        elif metadata_mutation == "directory-mode":
+            marker.parent.chmod(0o750)
+        elif metadata_mutation == "hardlink":
+            os.link(marker, marker.parent / "second-link")
+        elif metadata_mutation == "symlink":
+            payload = marker.read_bytes()
+            target = marker.parent / "alternate-marker"
+            target.write_bytes(payload)
+            target.chmod(0o600)
+            marker.unlink()
+            marker.symlink_to(target.name)
+        else:
+            owner_patch = patch.object(
+                workspace.os,
+                "geteuid",
+                return_value=actual_euid + 1,
+            )
+
+        context = owner_patch if owner_patch is not None else nullcontext()
+        with context:
+            outcome = asyncio.run(
+                cleanup_deleted_session_workspace(user_id, session_id)
+            )
+
+        assert outcome == "deferred:workspace_lock_unsafe"
+        assert (workspace_path / "keep.md").is_file()
+        assert (skill_path / "SKILL.md").is_file()
+
+
+def test_periodic_reconcile_log_omits_exception_contents(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sentinel = "database-password-must-not-be-logged"
+
+    async def scenario() -> None:
+        stop_event = asyncio.Event()
+
+        async def failing_reconcile(**_kwargs):
+            stop_event.set()
+            raise RuntimeError(sentinel)
+
+        async def immediate_timeout(awaitable, *, timeout):
+            del timeout
+            awaitable.close()
+            raise asyncio.TimeoutError
+
+        with (
+            patch.object(
+                workspace_reconciler,
+                "reconcile_orphan_session_workspaces",
+                new=failing_reconcile,
+            ),
+            patch.object(
+                workspace_reconciler.asyncio,
+                "wait_for",
+                new=immediate_timeout,
+            ),
+        ):
+            await workspace_reconciler.periodic_workspace_reconciler(
+                stop_event,
+                interval_seconds=1.0,
+            )
+
+    with caplog.at_level(logging.WARNING, logger="workspace_reconciler"):
+        asyncio.run(scenario())
+
+    rendered = "\n".join(record.getMessage() for record in caplog.records)
+    assert sentinel not in rendered
+    assert "error_type=RuntimeError" in rendered
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+def test_startup_reconcile_failure_is_safely_wrapped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sentinel = "database-password-must-not-be-logged"
+
+    async def scenario() -> None:
+        with (
+            patch.object(
+                backend_main,
+                "init_db",
+                new=AsyncMock(),
+            ),
+            patch.object(
+                backend_main,
+                "reconcile_orphan_session_workspaces",
+                new=AsyncMock(side_effect=RuntimeError(sentinel)),
+            ),
+        ):
+            async with backend_main.lifespan(backend_main.app):
+                raise AssertionError("lifespan must not start")
+
+    with (
+        caplog.at_level(logging.ERROR, logger="main"),
+        pytest.raises(RuntimeError) as failure,
+    ):
+        asyncio.run(scenario())
+
+    assert str(failure.value) == (
+        "Startup workspace reconciliation failed safely."
+    )
+    rendered_exception = "".join(
+        traceback.format_exception(failure.value)
+    )
+    rendered_logs = "\n".join(
+        record.getMessage() for record in caplog.records
+    )
+    assert sentinel not in rendered_exception
+    assert sentinel not in rendered_logs
+    assert "error_type=RuntimeError" in rendered_logs
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+def test_existing_deletion_tombstone_wins_over_pending_fence(
+    tmp_path: Path,
+) -> None:
+    user_id = "user"
+    session_id = "delete-wins"
+    workspace_root = tmp_path / "workspaces"
+    with (
+        patch.object(workspace, "WORKSPACE_ROOT", workspace_root),
+        patch(
+            "routers.skill_router.SKILLS_DATA_DIR",
+            tmp_path / "skills",
+        ),
+        patch.object(
+            workspace_reconciler,
+            "_next_session_candidate_batch",
+            return_value=([(user_id, session_id)], True, 1),
+        ),
+        patch.object(
+            workspace_reconciler,
+            "_conversation_owner_is_active",
+            new=_active_owner_resolver([]),
+        ),
+    ):
+        workspace_path = workspace.ensure_workspace(user_id, session_id)
+        (workspace_path / "remove.md").write_text(
+            "delete",
+            encoding="utf-8",
+        )
+        workspace.claim_session_pending_fence(
+            user_id,
+            session_id,
+            "c" * 64,
+        )
+        workspace.publish_session_deletion_tombstone(user_id, session_id)
+
+        result = asyncio.run(
+            reconcile_orphan_session_workspaces(
+                _LiveConversationDb([])
+            )
+        )
+
+        assert result["candidates"] == 1
+        assert result["removed"] == 1
+        assert result["recoverable_pending"] == 0
+        assert result["unresolved_pending_retained"] == 0
+        assert not (workspace_root / user_id / session_id).exists()
+        assert not workspace.session_pending_fence_path(
+            user_id,
+            session_id,
+        ).exists()
+        assert workspace.session_deletion_tombstone_exists(
+            user_id,
+            session_id,
+        )
+
+
+def test_tombstoned_orphans_are_cleaned_with_bounded_limit(
     tmp_path: Path,
 ) -> None:
     with (
@@ -976,20 +1607,36 @@ def test_historical_fence_markers_do_not_starve_real_orphan_limit(
             )
         orphan = workspace.ensure_workspace("user", "real-orphan")
         (orphan / "remove.md").write_text("orphan", encoding="utf-8")
-
-        result = asyncio.run(
-            reconcile_orphan_session_workspaces(
-                _LiveConversationDb([])
-            )
+        workspace.publish_session_deletion_tombstone(
+            "user",
+            "real-orphan",
         )
-        assert result["candidates"] == 1
-        assert result["removed"] == 1
+
+        results = []
+        for _index in range(12):
+            result = asyncio.run(
+                reconcile_orphan_session_workspaces(
+                    _LiveConversationDb([])
+                )
+            )
+            results.append(result)
+            assert result["scanned"] <= 1
+            if result["cycle_complete"]:
+                break
+        assert results[-1]["cycle_complete"] == 1
+        # Marker containers are never discovered as session coordinates. Each
+        # of the five tombstone publications did create a real session tree,
+        # and every tree must be visited without exceeding the batch limit.
+        assert sum(item["removed"] for item in results) == 5
         assert not orphan.parent.exists()
         for index in range(4):
             assert workspace.session_deletion_tombstone_exists(
                 "user",
                 f"historical-{index}",
             )
+            assert not (
+                tmp_path / "user" / f"historical-{index}"
+            ).exists()
 
 
 def test_pending_marker_container_is_never_discovered_as_session_tree(
@@ -1041,7 +1688,7 @@ def test_pending_marker_container_is_never_discovered_as_session_tree(
             assert blocked.value.code == "workspace_session_pending"
 
 
-def test_live_session_directories_do_not_starve_real_orphan_limit(
+def test_live_sessions_do_not_starve_tombstoned_cleanup_limit(
     tmp_path: Path,
 ) -> None:
     with (
@@ -1058,6 +1705,10 @@ def test_live_session_directories_do_not_starve_real_orphan_limit(
             workspace.ensure_workspace("user", session_id)
         orphan = workspace.ensure_workspace("user", "zzz-real-orphan")
         (orphan / "remove.md").write_text("orphan", encoding="utf-8")
+        workspace.publish_session_deletion_tombstone(
+            "user",
+            "zzz-real-orphan",
+        )
 
         results = []
         with patch.object(

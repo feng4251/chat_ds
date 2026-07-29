@@ -35,6 +35,9 @@ _SESSION_DELETION_MARKER = (
     "chatds-session-deletion-v2\n"
     f"boot_id={_PROCESS_BOOT_ID}\n"
 ).encode("ascii")
+_SESSION_DELETION_MARKER_PATTERN = re.compile(
+    rb"chatds-session-deletion-v2\nboot_id=[a-f0-9]{32}\n"
+)
 
 BOOTSTRAP_FILES: dict[str, str] = {
     "AGENTS.md": """# Session Instructions
@@ -436,6 +439,24 @@ def session_deletion_tombstone_exists(
     return _read_session_deletion_tombstone(user_id, session_id) is not None
 
 
+def session_deletion_tombstone_authorizes_cleanup(
+    user_id: str,
+    session_id: str,
+) -> bool:
+    """Require a complete, recognized delete record before removing data."""
+
+    state = _read_session_deletion_tombstone(user_id, session_id)
+    if state is None:
+        return False
+    payload, _identity = state
+    if _SESSION_DELETION_MARKER_PATTERN.fullmatch(payload) is None:
+        raise WorkspaceMutationLockError(
+            "Session deletion fence payload is invalid.",
+            code="workspace_lock_unsafe",
+        )
+    return True
+
+
 def _read_session_deletion_tombstone(
     user_id: str,
     session_id: str,
@@ -463,6 +484,17 @@ def _read_session_deletion_tombstone(
         ):
             raise WorkspaceMutationLockError(
                 "Session deletion fence path is unsafe.",
+                code="workspace_lock_unsafe",
+            )
+        if (
+            component == SESSION_TOMBSTONE_DIRECTORY
+            and (
+                stat.S_IMODE(component_stat.st_mode) != 0o700
+                or component_stat.st_uid != os.geteuid()
+            )
+        ):
+            raise WorkspaceMutationLockError(
+                "Session deletion fence directory is not private and owned.",
                 code="workspace_lock_unsafe",
             )
     marker_parent = _safe_directory_chain(
@@ -511,7 +543,9 @@ def _read_session_deletion_tombstone(
             or not stat.S_ISREG(path_stat.st_mode)
             or stat.S_ISLNK(path_stat.st_mode)
             or marker_stat.st_nlink != 1
-            or marker_stat.st_mode & 0o077
+            or stat.S_IMODE(marker_stat.st_mode) != 0o600
+            or marker_stat.st_uid != os.geteuid()
+            or marker_stat.st_size > 256
             or (marker_stat.st_dev, marker_stat.st_ino)
             != (path_stat.st_dev, path_stat.st_ino)
         ):
@@ -571,10 +605,7 @@ def session_deletion_tombstone_is_current_process(
     if state is None:
         return False
     payload, _identity = state
-    return (
-        f"boot_id={_PROCESS_BOOT_ID}\n".encode("ascii")
-        in payload
-    )
+    return payload == _SESSION_DELETION_MARKER
 
 
 def _session_pending_fence_payload(operation_id: str) -> bytes:
@@ -840,7 +871,10 @@ def clear_session_pending_fence_after_deletion(
 ) -> bool:
     """Remove any lifecycle fence only after durable deletion wins."""
 
-    if not session_deletion_tombstone_exists(user_id, session_id):
+    if not session_deletion_tombstone_authorizes_cleanup(
+        user_id,
+        session_id,
+    ):
         raise WorkspaceMutationLockError(
             "Lifecycle fence cleanup requires a durable deletion marker.",
             code="workspace_lock_unsafe",
@@ -888,7 +922,8 @@ def _publish_session_deletion_tombstone_unlocked(
     if (
         not stat.S_ISDIR(directory_stat.st_mode)
         or stat.S_ISLNK(directory_stat.st_mode)
-        or directory_stat.st_mode & 0o077
+        or stat.S_IMODE(directory_stat.st_mode) != 0o700
+        or directory_stat.st_uid != os.geteuid()
     ):
         raise WorkspaceMutationLockError(
             "Session deletion fence directory is unsafe.",
@@ -939,7 +974,8 @@ def _publish_session_deletion_tombstone_unlocked(
             or not stat.S_ISREG(path_stat.st_mode)
             or stat.S_ISLNK(path_stat.st_mode)
             or descriptor_stat.st_nlink != 1
-            or descriptor_stat.st_mode & 0o077
+            or stat.S_IMODE(descriptor_stat.st_mode) != 0o600
+            or descriptor_stat.st_uid != os.geteuid()
             or (descriptor_stat.st_dev, descriptor_stat.st_ino)
             != (path_stat.st_dev, path_stat.st_ino)
         ):
@@ -1055,10 +1091,7 @@ def clear_stale_session_deletion_tombstone(
         if state is None:
             return False
         payload, expected_identity = state
-        if (
-            f"boot_id={_PROCESS_BOOT_ID}\n".encode("ascii")
-            in payload
-        ):
+        if payload == _SESSION_DELETION_MARKER:
             return False
         marker_parent = _safe_directory_chain(
             (safe_user, SESSION_TOMBSTONE_DIRECTORY),

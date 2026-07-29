@@ -38,9 +38,18 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     set_service_shutdown_started(False)
     await init_db()
-    workspace_reconcile = await reconcile_orphan_session_workspaces(
-        clear_live_tombstones=True,
-    )
+    try:
+        workspace_reconcile = await reconcile_orphan_session_workspaces(
+            clear_live_tombstones=True,
+        )
+    except Exception as exc:
+        logger.error(
+            "Startup workspace reconcile failed safely: error_type=%s",
+            type(exc).__name__,
+        )
+        raise RuntimeError(
+            "Startup workspace reconciliation failed safely."
+        ) from None
     logger.info("Startup workspace reconcile: %s", workspace_reconcile)
     workspace_reconcile_stop = asyncio.Event()
     workspace_reconcile_task = asyncio.create_task(

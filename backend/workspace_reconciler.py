@@ -1,17 +1,19 @@
-"""Crash-durable cleanup for session trees whose database owner is gone."""
+"""Cleanup for deletion-tombstoned trees whose database owner is gone."""
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import logging
 import os
 import re
 import shutil
 import stat
 import threading
-import logging
 from pathlib import Path
 
+from fastapi import HTTPException
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,6 +36,7 @@ MIN_ORPHAN_RECONCILE_INTERVAL_SECONDS = 1.0
 MAX_ORPHAN_RECONCILE_INTERVAL_SECONDS = 3600.0
 MAX_LIVE_CONVERSATION_QUERY_BATCH = 400
 MAX_PENDING_FORK_JOURNALS_PER_CANDIDATE = 4096
+MAX_RECONCILE_AUDIT_SAMPLES = 16
 
 logger = logging.getLogger(__name__)
 
@@ -202,10 +205,16 @@ def _remove_orphan_session_tree(
 ) -> str:
     """Remove one fenced tree; never call this without a durable tombstone."""
 
-    if not workspace_store.session_deletion_tombstone_exists(
-        user_id,
-        session_id,
-    ):
+    try:
+        cleanup_authorized = (
+            workspace_store.session_deletion_tombstone_authorizes_cleanup(
+                user_id,
+                session_id,
+            )
+        )
+    except WorkspaceMutationLockError as exc:
+        return f"deferred:{exc.code}"
+    if not cleanup_authorized:
         return "not_fenced"
     skill_cleanup = _remove_orphan_session_skills(
         user_id,
@@ -233,6 +242,18 @@ def _remove_orphan_session_tree(
         except OSError:
             return "deferred:workspace_cleanup_io"
 
+    # Clear a pending lifecycle fence while the discoverable session directory
+    # still exists. If this step fails or the process crashes, the next scan can
+    # find the session again and retry. Removing the directory first would
+    # strand the marker in an excluded metadata container after a restart.
+    try:
+        workspace_store.clear_session_pending_fence_after_deletion(
+            user_id,
+            session_id,
+        )
+    except WorkspaceMutationLockError as exc:
+        return f"deferred:{exc.code}"
+
     # The durable marker blocks every new Backend/Harness workspace create and
     # every post-wait mutation boundary. This path is only the legacy NFS
     # sibling lock: the content-addressed local lock object is deliberately
@@ -259,13 +280,6 @@ def _remove_orphan_session_tree(
             shutil.rmtree(session_dir)
         except OSError:
             return "deferred:session_cleanup_io"
-    try:
-        workspace_store.clear_session_pending_fence_after_deletion(
-            user_id,
-            session_id,
-        )
-    except WorkspaceMutationLockError as exc:
-        return f"deferred:{exc.code}"
     return "removed"
 
 
@@ -623,7 +637,7 @@ def _recoverable_pending_fork_state(
                     return True
             except (OSError, ValueError, WorkspaceMutationLockError):
                 return None
-            except Exception:
+            except HTTPException:
                 # Digest validation can raise an HTTP error for a malformed
                 # tree. That is a completed negative classification, not a
                 # reason to trust the transaction.
@@ -656,6 +670,36 @@ async def _reconcile_session_candidate(
                 )
             return "live", cleared, None
 
+        # A deletion tombstone is an explicit, durable authorization produced
+        # by the delete transaction.  Database absence alone must never create
+        # that authorization: an empty, stale, or incorrectly configured
+        # database can otherwise turn reconciliation into bulk data loss.
+        try:
+            marker_exists = await run_sync_cancellation_safe(
+                lambda: (
+                    workspace_store
+                    .session_deletion_tombstone_authorizes_cleanup(
+                        user_id,
+                        session_id,
+                    )
+                )
+            )
+        except WorkspaceMutationLockError as exc:
+            return (
+                "deletion_fence_unresolved",
+                False,
+                f"deferred:{exc.code}",
+            )
+        if marker_exists:
+            # Delete intent wins over any pending marker left by an older
+            # operation.  Cleanup revalidates the tombstone and clears the
+            # pending fence only after the fenced tree has been removed.
+            outcome = await cleanup_deleted_session_workspace(
+                user_id,
+                session_id,
+            )
+            return "tombstoned_orphan", False, outcome
+
         try:
             pending_exists = await run_sync_cancellation_safe(
                 lambda: (
@@ -667,7 +711,15 @@ async def _reconcile_session_candidate(
                 )
             )
         except WorkspaceMutationLockError as exc:
-            return "pending", False, f"deferred:{exc.code}"
+            # An unsafe/unreadable pending marker is still evidence that a
+            # lifecycle operation may own this DB-absent tree.  Retain it as a
+            # stable safety outcome rather than converting it into deletion or
+            # a hot deferred-retry loop.
+            return (
+                "unresolved_pending_retained",
+                False,
+                f"retained:{exc.code}",
+            )
         if pending_exists:
             recovery_state = await run_sync_cancellation_safe(
                 lambda: _recoverable_pending_fork_state(
@@ -677,35 +729,81 @@ async def _reconcile_session_candidate(
             )
             if recovery_state is True:
                 return (
-                    "pending",
+                    "recoverable_pending_retained",
                     False,
-                    "deferred:recoverable_pending_fork",
+                    "retained:recoverable_pending_fork",
                 )
-            if recovery_state is None:
-                return (
-                    "pending",
-                    False,
-                    "deferred:pending_recovery_inspection",
-                )
+            return (
+                "unresolved_pending_retained",
+                False,
+                (
+                    "retained:pending_recovery_inspection"
+                    if recovery_state is None
+                    else "retained:pending_without_recoverable_journal"
+                ),
+            )
 
-        fenced = False
-        marker_exists = await run_sync_cancellation_safe(
-            lambda: workspace_store.session_deletion_tombstone_exists(
-                user_id,
-                session_id,
-            )
+        return (
+            "unfenced_orphan_retained",
+            False,
+            "retained:no_deletion_tombstone",
         )
-        if not marker_exists:
-            await workspace_store.publish_session_deletion_tombstone_async(
-                user_id,
-                session_id,
-            )
-            fenced = True
-        outcome = await cleanup_deleted_session_workspace(
-            user_id,
-            session_id,
-        )
-        return "orphan", fenced, outcome
+
+
+def _candidate_audit_sample(
+    *,
+    user_id: str,
+    session_id: str,
+    snapshot_owner_present: bool | None,
+    state: str,
+    outcome: str | None,
+) -> dict[str, str]:
+    """Build one credential-safe audit sample without logging raw identities."""
+
+    user_digest = hashlib.sha256(
+        (
+            "chatds-workspace-reconcile-user-v1\0"
+            + str(user_id)
+        ).encode("utf-8")
+    ).hexdigest()
+    session_digest = hashlib.sha256(
+        (
+            "chatds-workspace-reconcile-session-v1\0"
+            + str(session_id)
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "user_sha256": user_digest,
+        "session_sha256": session_digest,
+        "snapshot_owner_present": (
+            "unknown"
+            if snapshot_owner_present is None
+            else str(int(snapshot_owner_present))
+        ),
+        "decision": state,
+        "outcome": outcome or "none",
+    }
+
+
+def _emit_reconcile_audit(
+    *,
+    total: int,
+    state_counts: dict[str, int],
+    samples: list[dict[str, str]],
+) -> None:
+    """Emit one bounded aggregate record for an anomalous reconcile cohort."""
+
+    logger.warning(
+        "Workspace reconcile safety audit: total=%s state_counts=%s "
+        "samples=%s",
+        total,
+        json.dumps(state_counts, sort_keys=True, separators=(",", ":")),
+        json.dumps(
+            samples[:MAX_RECONCILE_AUDIT_SAMPLES],
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
 
 
 async def reconcile_orphan_session_workspaces(
@@ -713,7 +811,7 @@ async def reconcile_orphan_session_workspaces(
     *,
     clear_live_tombstones: bool = True,
 ) -> dict[str, int]:
-    """Reconcile a bounded startup cohort using the database as authority."""
+    """Reconcile a bounded cohort using DB ownership and deletion intent."""
 
     discovered, cycle_complete, inspected = await run_sync_cancellation_safe(
         _next_session_candidate_batch
@@ -723,6 +821,25 @@ async def reconcile_orphan_session_workspaces(
         db = async_session()
     try:
         snapshot_live = await _live_conversation_keys(db, discovered)
+    except Exception as exc:
+        samples = [
+            _candidate_audit_sample(
+                user_id=user_id,
+                session_id=session_id,
+                snapshot_owner_present=None,
+                state="snapshot_query_failed",
+                outcome=f"aborted:{type(exc).__name__}",
+            )
+            for user_id, session_id in discovered[
+                :MAX_RECONCILE_AUDIT_SAMPLES
+            ]
+        ]
+        _emit_reconcile_audit(
+            total=len(discovered),
+            state_counts={"snapshot_query_failed": len(discovered)},
+            samples=samples,
+        )
+        raise
     finally:
         if owns_session:
             await db.close()
@@ -736,35 +853,98 @@ async def reconcile_orphan_session_workspaces(
         "snapshot_owner_drift": 0,
         "live": 0,
         "recoverable_pending": 0,
+        "unresolved_pending_retained": 0,
+        "unfenced_orphans_retained": 0,
+        "tombstoned_orphans": 0,
+        "deletion_fence_unresolved": 0,
         "removed": 0,
         "deferred": 0,
+        # Compatibility metric: reconciliation no longer creates deletion
+        # fences from DB absence, so non-live paths leave this at zero.
         "fenced": 0,
         "stale_tombstones_cleared": 0,
     }
+    audit_state_counts: dict[str, int] = {}
+    audit_samples: list[dict[str, str]] = []
+
+    def record_audit(
+        *,
+        user_id: str,
+        session_id: str,
+        snapshot_owner_present: bool,
+        state: str,
+        outcome: str | None,
+    ) -> None:
+        audit_state_counts[state] = audit_state_counts.get(state, 0) + 1
+        if (
+            state != "live"
+            and len(audit_samples) < MAX_RECONCILE_AUDIT_SAMPLES
+        ):
+            audit_samples.append(
+                _candidate_audit_sample(
+                    user_id=user_id,
+                    session_id=session_id,
+                    snapshot_owner_present=snapshot_owner_present,
+                    state=state,
+                    outcome=outcome,
+                )
+            )
     # ``snapshot_live`` is deliberately not authoritative. Every discovered
     # coordinate enters the same lifecycle lock used by fork/delete/install,
     # then opens a fresh exact DB snapshot before a fence can be published or
     # cleared. This closes filesystem-publish -> DB-commit races in both
     # directions while retaining the bounded batch query for observability.
     for user_id, session_id in discovered:
-        state, fenced, outcome = await _reconcile_session_candidate(
-            user_id,
-            session_id,
-            clear_live_tombstones=clear_live_tombstones,
+        snapshot_owner_present = (user_id, session_id) in snapshot_live
+        try:
+            state, fenced, outcome = await _reconcile_session_candidate(
+                user_id,
+                session_id,
+                clear_live_tombstones=clear_live_tombstones,
+            )
+        except Exception as exc:
+            record_audit(
+                user_id=user_id,
+                session_id=session_id,
+                snapshot_owner_present=snapshot_owner_present,
+                state="candidate_verification_failed",
+                outcome=f"aborted:{type(exc).__name__}",
+            )
+            _emit_reconcile_audit(
+                total=sum(audit_state_counts.values()),
+                state_counts=audit_state_counts,
+                samples=audit_samples,
+            )
+            raise
+        record_audit(
+            user_id=user_id,
+            session_id=session_id,
+            snapshot_owner_present=snapshot_owner_present,
+            state=state,
+            outcome=outcome,
         )
-        if ((user_id, session_id) in snapshot_live) != (state == "live"):
+        if snapshot_owner_present != (state == "live"):
             counts["snapshot_owner_drift"] += 1
         if state == "live":
             counts["live"] += 1
             if fenced:
                 counts["stale_tombstones_cleared"] += 1
             continue
-        if state == "pending":
-            counts["recoverable_pending"] += int(
-                outcome == "deferred:recoverable_pending_fork"
-            )
 
         counts["candidates"] += 1
+        if state == "recoverable_pending_retained":
+            counts["recoverable_pending"] += 1
+            continue
+        if state == "unresolved_pending_retained":
+            counts["unresolved_pending_retained"] += 1
+            continue
+        if state == "unfenced_orphan_retained":
+            counts["unfenced_orphans_retained"] += 1
+            continue
+        if state == "tombstoned_orphan":
+            counts["tombstoned_orphans"] += 1
+        elif state == "deletion_fence_unresolved":
+            counts["deletion_fence_unresolved"] += 1
         if fenced:
             counts["fenced"] += 1
         if outcome == "removed":
@@ -776,6 +956,12 @@ async def reconcile_orphan_session_workspaces(
                     _queue_deferred_candidate(user_id, session_id)
                 )
             )
+    if any(state != "live" for state in audit_state_counts):
+        _emit_reconcile_audit(
+            total=sum(audit_state_counts.values()),
+            state_counts=audit_state_counts,
+            samples=audit_samples,
+        )
     return counts
 
 
@@ -826,5 +1012,8 @@ async def periodic_workspace_reconciler(
             logger.info("Periodic workspace reconcile: %s", result)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.exception("Periodic workspace reconcile failed")
+        except Exception as exc:
+            logger.warning(
+                "Periodic workspace reconcile failed safely: error_type=%s",
+                type(exc).__name__,
+            )
