@@ -18,14 +18,18 @@ from knowledge_gate_runtime import (
     activated_knowledge_gate_candidate_authority,
     canonical_json_sha256,
     compile_runtime_knowledge_gate_plan,
+    compile_runtime_unconditional_capability_plan,
     decision_tool_schema,
+    ordinary_worker_capability_selectors,
     validate_knowledge_gate_candidate_authority,
     validate_knowledge_gate_decisions,
 )
 from tools.context import ToolContext
 from tools.delegation import (
     _exact_knowledge_gate_candidate_grants,
+    _exact_unconditional_capability_grants,
     _strict_knowledge_gate_plan,
+    _strict_unconditional_capability_plan,
 )
 from tools.isolated_skill_executor import snapshot_skill_package
 from tools.knowledge_gate import (
@@ -87,6 +91,61 @@ def _symbolic(*checks: dict) -> dict:
 
 
 class KnowledgeGateRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    def test_decision_prompt_withholds_inactive_candidate_coordinates(self):
+        plan = {
+            "schema_version": 1,
+            "worker_id": "worker-a",
+            "owner_skill": OWNER_SKILL,
+            "checks": [{
+                "id": "KG-1",
+                "question": "Which evidence branch is required?",
+                "branches": [{
+                    "outcome": "no",
+                    "action": "Retrieve the active source.",
+                    "group_ids": ["group-active"],
+                }],
+                "legacy_ambiguous": False,
+            }],
+            "groups": [{
+                "id": "group-active",
+                "check_id": "KG-1",
+                "outcome": "no",
+                "mode": "one_of",
+                "candidate_ids": ["candidate-active"],
+                "selectors": ["skill:active"],
+                "unresolved_selectors": [],
+            }],
+            "candidates": [{
+                "candidate_id": "candidate-active",
+                "kind": "skill_http_prefix",
+                "tool_name": "skill_http_get",
+                "tool_names": ["skill_http_get"],
+                "skill_name": "active",
+                "url_prefix": "https://secret.example/api",
+                "http_method": "GET",
+            }],
+        }
+
+        payload = runtime.plan_prompt_payload(
+            plan,
+            canonical_json_sha256(plan),
+        )
+        encoded = json.dumps(payload, sort_keys=True)
+
+        self.assertNotIn("candidates", payload)
+        self.assertNotIn("candidate-active", encoded)
+        self.assertNotIn("https://secret.example/api", encoded)
+        self.assertNotIn("selectors", payload["groups"][0])
+        self.assertEqual(1, payload["groups"][0]["selector_count"])
+        self.assertEqual(
+            0,
+            payload["groups"][0]["unresolved_selector_count"],
+        )
+        self.assertEqual(
+            1,
+            payload["groups"][0]["resolved_candidate_count"],
+        )
+
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
@@ -178,6 +237,329 @@ class KnowledgeGateRuntimeTests(unittest.IsolatedAsyncioTestCase):
             frozen_mcp_catalog=frozen_mcp_catalog,
             resolve_tool_selector=resolve_tool_selector,
         )
+
+    def _compile_static(
+        self,
+        selectors,
+        *,
+        available_tools=(),
+        loaded_packages=None,
+        allowed_resources=(),
+        allowed_scripts=(),
+        process_only_scripts=(),
+        allowed_package_digests=None,
+        allowed_commands=(),
+        allowed_http_get=(),
+        allowed_http_post=(),
+        frozen_mcp_catalog=None,
+        resolve_tool_selector=_resolve_declared_tool_selector,
+        worker_id="worker-evidence",
+    ):
+        packages = (
+            self.loaded_packages
+            if loaded_packages is None
+            else loaded_packages
+        )
+        if allowed_package_digests is None:
+            allowed_package_digests = {
+                (
+                    skill_name,
+                    snapshot_skill_package(Path(loaded["skill_dir"])).sha256,
+                )
+                for skill_name, loaded in packages.items()
+                if (
+                    isinstance(loaded, dict)
+                    and isinstance(loaded.get("skill_dir"), str)
+                )
+            }
+        return compile_runtime_unconditional_capability_plan(
+            selectors,
+            worker_id=worker_id,
+            owner_skill=OWNER_SKILL,
+            available_tools=available_tools,
+            loaded_packages=packages,
+            allowed_resources=allowed_resources,
+            allowed_scripts=allowed_scripts,
+            process_only_scripts=process_only_scripts,
+            allowed_package_digests=allowed_package_digests,
+            allowed_commands=allowed_commands,
+            allowed_http_get=allowed_http_get,
+            allowed_http_post=allowed_http_post,
+            frozen_mcp_catalog=frozen_mcp_catalog,
+            resolve_tool_selector=resolve_tool_selector,
+        )
+
+    def test_ordinary_selector_helper_excludes_gate_only_sources(self):
+        worker = {
+            "tools": [{
+                "name": "remote-source",
+                "source": "via Bash/WebFetch",
+            }],
+            "capabilities": [{"tool": "web_search", "optional": True}],
+            "skills": ["static-adapter"],
+            "local_resources": ["references/local.pdf"],
+            "environment_contract": {
+                "allowed_tools": ["mcp_catalog_lookup"],
+            },
+            "knowledge_gate_skill_refs": ["gate-only-adapter"],
+            "knowledge_gate_local_resources": [
+                "references/gate-only.md",
+            ],
+            "knowledge_gate_ir": {
+                "checks": [{
+                    "selectors": ["skill:gate-only-adapter"],
+                }],
+            },
+        }
+
+        selectors = ordinary_worker_capability_selectors(
+            worker,
+            available_tools={
+                "web_extract",
+                "web_search",
+                "mcp_catalog_lookup",
+            },
+            resolve_tool_selector=_resolve_declared_tool_selector,
+        )
+
+        self.assertEqual(
+            [
+                "WebFetch",
+                "web_search",
+                "skill:static-adapter",
+                "references/local.pdf",
+                "mcp_catalog_lookup",
+            ],
+            selectors,
+        )
+        self.assertNotIn("skill:gate-only-adapter", selectors)
+        self.assertNotIn("references/gate-only.md", selectors)
+
+    def test_unconditional_plan_is_exact_authority_without_gate_shape(self):
+        descriptor = SimpleNamespace(
+            schema_sha256="a" * 64,
+            descriptor_sha256="b" * 64,
+        )
+        plan, digest = self._compile_static(
+            ["WebFetch", "mcp_catalog_lookup"],
+            available_tools={"web_extract", "mcp_catalog_lookup"},
+            frozen_mcp_catalog={"mcp_catalog_lookup": descriptor},
+        )
+
+        assert plan is not None and digest is not None
+        self.assertEqual(
+            {"native_tool", "mcp_tool"},
+            {candidate["kind"] for candidate in plan["candidates"]},
+        )
+        self.assertNotIn("checks", plan)
+        self.assertNotIn("groups", plan)
+        strict, strict_digest, error = _strict_unconditional_capability_plan({
+            "skill_name": OWNER_SKILL,
+            "worker_id": "worker-evidence",
+            "unconditional_capability_plan": plan,
+            "unconditional_capability_plan_sha256": digest,
+        })
+        self.assertIsNone(error)
+        self.assertEqual(plan, strict)
+        self.assertEqual(digest, strict_digest)
+
+        context = ToolContext(
+            user_id="user",
+            session_id="session",
+            enabled_tools=("web_extract", "mcp_catalog_lookup"),
+            frozen_mcp_catalog={
+                "mcp_catalog_lookup": descriptor,
+            },
+            skill_execution_resource_boundary=True,
+        )
+        authority, authority_error = (
+            _exact_unconditional_capability_grants(
+                strict,
+                context=context,
+            )
+        )
+        self.assertIsNone(authority_error)
+        self.assertEqual(
+            {"web_extract", "mcp_catalog_lookup"},
+            set(authority["tool_names"]),
+        )
+        # Bindings are retained for coordinate validation/debug only; the
+        # delegated runtime does not audit them as mandatory receipts.
+        self.assertEqual(plan["candidates"], authority["receipt_bindings"])
+
+    def test_unconditional_plan_fails_closed_on_unresolved_selector(self):
+        with self.assertRaisesRegex(
+            KnowledgeGateCompileError,
+            "did not resolve",
+        ):
+            self._compile_static(
+                ["unknown-provider-tool"],
+                available_tools={"web_search"},
+            )
+
+    def test_instruction_only_skill_remains_preload_not_static_action(self):
+        package_sha = snapshot_skill_package(self.adapter_root).sha256
+        plan, digest = self._compile_static(
+            [f"skill:{ADAPTER_SKILL}"],
+            available_tools={"skill_view"},
+            allowed_resources={(ADAPTER_SKILL, "SKILL.md")},
+            allowed_package_digests={(ADAPTER_SKILL, package_sha)},
+        )
+        self.assertIsNone(plan)
+        self.assertIsNone(digest)
+
+    def test_unconditional_skill_expands_exact_bridge_coordinates(self):
+        scripts = self.adapter_root / "scripts"
+        scripts.mkdir()
+        script = scripts / "query.py"
+        script.write_text(
+            "def query(term):\n    return {'term': term}\n",
+            encoding="utf-8",
+        )
+        script_sha = hashlib.sha256(script.read_bytes()).hexdigest()
+        package_sha = snapshot_skill_package(self.adapter_root).sha256
+        get_prefix = "https://catalog.example/api/"
+        post_prefix = "https://catalog.example/graphql"
+        command = (
+            ADAPTER_SKILL,
+            "query-cli",
+            "python",
+            ("-m", "catalog_client"),
+        )
+        plan, _digest = self._compile_static(
+            [f"skill:{ADAPTER_SKILL}"],
+            available_tools={
+                "run_skill_script",
+                "run_skill_python",
+                "run_declared_command",
+                "skill_http_get",
+                "skill_http_post_json",
+            },
+            allowed_scripts={
+                (ADAPTER_SKILL, "scripts/query.py", script_sha),
+            },
+            allowed_commands={command},
+            allowed_http_get={(ADAPTER_SKILL, get_prefix)},
+            allowed_http_post={(ADAPTER_SKILL, post_prefix)},
+        )
+
+        assert plan is not None
+        self.assertEqual(
+            {
+                "skill_script",
+                "declared_command",
+                "skill_http_prefix",
+            },
+            {candidate["kind"] for candidate in plan["candidates"]},
+        )
+        context = ToolContext(
+            user_id="user",
+            session_id="session",
+            enabled_tools=(
+                "run_skill_script",
+                "run_skill_python",
+                "run_declared_command",
+                "skill_http_get",
+                "skill_http_post_json",
+            ),
+            enabled_user_skills=(ADAPTER_SKILL,),
+            skill_execution_resource_boundary=True,
+            allowed_skill_resources=((ADAPTER_SKILL, "SKILL.md"),),
+            allowed_skill_scripts=(
+                (ADAPTER_SKILL, "scripts/query.py", script_sha),
+            ),
+            allowed_skill_package_digests=((ADAPTER_SKILL, package_sha),),
+            allowed_skill_commands=(command,),
+            allowed_skill_http_prefixes=((ADAPTER_SKILL, get_prefix),),
+            allowed_skill_http_post_prefixes=(
+                (ADAPTER_SKILL, post_prefix),
+            ),
+        )
+        with patch(
+            "skills.scanner.resolve_skill_path",
+            return_value=self.adapter_root / "SKILL.md",
+        ):
+            authority, error = _exact_unconditional_capability_grants(
+                plan,
+                context=context,
+            )
+        self.assertIsNone(error)
+        self.assertEqual(
+            [(ADAPTER_SKILL, "scripts/query.py", script_sha)],
+            authority["script_grants"],
+        )
+        self.assertEqual([command], authority["command_grants"])
+        self.assertEqual(
+            [(ADAPTER_SKILL, get_prefix)],
+            authority["http_get_grants"],
+        )
+        self.assertEqual(
+            [(ADAPTER_SKILL, post_prefix)],
+            authority["http_post_grants"],
+        )
+
+    def test_unconditional_local_resource_is_content_addressed(self):
+        resource_path = "references/static.md"
+        resource = self.owner_root / resource_path
+        resource.parent.mkdir()
+        resource.write_text("static evidence\n", encoding="utf-8")
+        package_sha = snapshot_skill_package(self.owner_root).sha256
+        plan, _digest = self._compile_static(
+            [resource_path],
+            available_tools={"skill_view"},
+            allowed_resources={(OWNER_SKILL, resource_path)},
+        )
+        assert plan is not None
+        candidate = plan["candidates"][0]
+        self.assertEqual("skill_resource", candidate["kind"])
+        self.assertEqual(
+            hashlib.sha256(resource.read_bytes()).hexdigest(),
+            candidate["sha256"],
+        )
+        context = ToolContext(
+            user_id="user",
+            session_id="session",
+            enabled_tools=("skill_view",),
+            enabled_user_skills=(OWNER_SKILL,),
+            skill_execution_resource_boundary=True,
+            allowed_skill_resources=(
+                (OWNER_SKILL, "SKILL.md"),
+                (OWNER_SKILL, resource_path),
+            ),
+            allowed_skill_package_digests=((OWNER_SKILL, package_sha),),
+        )
+        with patch(
+            "skills.scanner.resolve_skill_path",
+            return_value=self.owner_root / "SKILL.md",
+        ):
+            authority, error = _exact_unconditional_capability_grants(
+                plan,
+                context=context,
+            )
+        self.assertIsNone(error)
+        self.assertEqual(
+            [(OWNER_SKILL, resource_path)],
+            authority["resource_grants"],
+        )
+
+    def test_unconditional_owner_script_path_binds_runner_not_reader(self):
+        script_path = "scripts/local.py"
+        script = self.owner_root / script_path
+        script.parent.mkdir()
+        script.write_text("def run():\n    return 1\n", encoding="utf-8")
+        script_sha = hashlib.sha256(script.read_bytes()).hexdigest()
+        plan, _digest = self._compile_static(
+            [script_path],
+            available_tools={"skill_view", "run_skill_python"},
+            allowed_resources={(OWNER_SKILL, script_path)},
+            allowed_scripts={(OWNER_SKILL, script_path, script_sha)},
+        )
+        assert plan is not None
+        self.assertEqual(1, len(plan["candidates"]))
+        candidate = plan["candidates"][0]
+        self.assertEqual("skill_script", candidate["kind"])
+        self.assertEqual(script_path, candidate["resource_path"])
+        self.assertEqual(["run_skill_python"], candidate["tool_names"])
 
     def test_unicode_symbolic_ids_reach_strict_delegated_boundary(self):
         worker_id = "_研究员"

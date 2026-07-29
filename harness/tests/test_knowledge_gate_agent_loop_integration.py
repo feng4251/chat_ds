@@ -4,7 +4,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from agent_loop import run_stream
+from agent_loop import (
+    _knowledge_gate_pending_resource_coordinate_matches,
+    run_stream,
+)
 from knowledge_gate_runtime import canonical_json_sha256
 from tools.mcp_contract import (
     build_mcp_tool_descriptor,
@@ -92,6 +95,56 @@ class KnowledgeGateAgentLoopIntegrationTests(
         "supports_thinking_toggle": True,
         "thinking_enabled_by_default": True,
     }
+
+    def test_resource_coordinate_match_distinguishes_paging_from_drift(self):
+        candidate = {
+            "candidate_id": "candidate-resource",
+            "kind": "skill_resource",
+            "skill_name": "evidence-adapter",
+            "resource_path": "references/query.md",
+        }
+        plan = {
+            "groups": [{
+                "id": "group-resource",
+                "candidate_ids": ["candidate-resource"],
+            }],
+            "candidates": [candidate],
+        }
+
+        self.assertTrue(
+            _knowledge_gate_pending_resource_coordinate_matches(
+                plan,
+                ["group-resource"],
+                tool_name="skill_view",
+                args={
+                    "name": "evidence-adapter",
+                    "file_path": "references/query.md",
+                    "offset": 4096,
+                },
+            )
+        )
+        self.assertFalse(
+            _knowledge_gate_pending_resource_coordinate_matches(
+                plan,
+                ["group-resource"],
+                tool_name="skill_view",
+                args={
+                    "name": "inactive-adapter",
+                    "file_path": "references/query.md",
+                },
+            )
+        )
+        self.assertFalse(
+            _knowledge_gate_pending_resource_coordinate_matches(
+                plan,
+                ["group-resource"],
+                tool_name="skill_view",
+                args={
+                    "name": "evidence-adapter",
+                    "file_path": "references/other.md",
+                },
+            )
+        )
 
     async def _run(
         self,
@@ -391,10 +444,28 @@ class KnowledgeGateAgentLoopIntegrationTests(
             ["submit_knowledge_gate_decisions"],
             [tool["function"]["name"] for tool in bodies[0]["tools"]],
         )
+        decision_messages = json.dumps(
+            bodies[0]["messages"],
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        self.assertNotIn(candidate["candidate_id"], decision_messages)
+        self.assertNotIn(candidate["schema_sha256"], decision_messages)
+        self.assertNotIn(
+            candidate["descriptor_sha256"],
+            decision_messages,
+        )
         self.assertEqual(
             ["mcp_evidence_lookup"],
             [tool["function"]["name"] for tool in bodies[1]["tools"]],
         )
+        activated_messages = json.dumps(
+            bodies[1]["messages"],
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        self.assertIn(candidate["candidate_id"], activated_messages)
+        self.assertIn("mcp_evidence_lookup", activated_messages)
         dispatch_mcp.assert_awaited_once()
         self.assertFalse(any(
             event.get("event_type") == "run.failed"

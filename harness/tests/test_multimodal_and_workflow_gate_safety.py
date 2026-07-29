@@ -30,10 +30,12 @@ from agent_loop import (
     _explicit_required_child_capability_tools,
     _explicit_declared_intent_selections,
     _is_repeated_length_response,
+    _knowledge_gate_activated_frontier_payload,
     _looks_like_complex_artifact_request,
     _looks_like_file_artifact_request,
     _preferred_initial_required_capability_tools,
     _profile_bound_child_runner_kwargs,
+    _provider_stream_transport_timeout,
     _retry_max_tokens_from_context_overflow,
     _should_recover_tool_failure,
     _skill_documentation_tool_exposure,
@@ -271,6 +273,81 @@ class MultimodalTokenSafetyTests(unittest.TestCase):
         self.assertTrue(_stream_retry_is_safe("", ""))
         self.assertFalse(_stream_retry_is_safe("partial", ""))
         self.assertFalse(_stream_retry_is_safe("", "reasoning"))
+        self.assertFalse(
+            _stream_retry_is_safe(
+                "",
+                "",
+                raw_content_chars=1,
+            )
+        )
+        self.assertFalse(
+            _stream_retry_is_safe(
+                "",
+                "",
+                raw_reasoning_chars=1,
+            )
+        )
+        self.assertFalse(
+            _stream_retry_is_safe(
+                "",
+                "",
+                tool_call_fragment_count=1,
+            )
+        )
+
+    def test_stream_transport_has_no_fixed_read_deadline(self):
+        timeout = _provider_stream_transport_timeout()
+
+        self.assertIsNone(timeout.read)
+        self.assertGreater(timeout.connect, 0)
+
+    def test_knowledge_gate_frontier_exposes_only_activated_candidates(self):
+        plan = {
+            "groups": [
+                {
+                    "id": "group-active",
+                    "selectors": ["skill:active"],
+                    "candidate_ids": ["candidate-active"],
+                },
+                {
+                    "id": "group-inactive",
+                    "selectors": ["skill:inactive"],
+                    "candidate_ids": ["candidate-inactive"],
+                },
+            ],
+            "candidates": [
+                {
+                    "candidate_id": "candidate-active",
+                    "kind": "skill_http_prefix",
+                    "tool_name": "skill_http_get",
+                    "tool_names": ["skill_http_get"],
+                    "skill_name": "active",
+                    "url_prefix": "https://active.example/api",
+                    "http_method": "GET",
+                },
+                {
+                    "candidate_id": "candidate-inactive",
+                    "kind": "skill_http_prefix",
+                    "tool_name": "skill_http_get",
+                    "tool_names": ["skill_http_get"],
+                    "skill_name": "inactive",
+                    "url_prefix": "https://inactive.example/api",
+                    "http_method": "GET",
+                },
+            ],
+        }
+        receipt = {
+            "plan_sha256": "a" * 64,
+            "activated_group_ids": ["group-active"],
+        }
+
+        payload = _knowledge_gate_activated_frontier_payload(plan, receipt)
+        encoded = json.dumps(payload, sort_keys=True)
+
+        self.assertIn("candidate-active", encoded)
+        self.assertIn("https://active.example/api", encoded)
+        self.assertNotIn("candidate-inactive", encoded)
+        self.assertNotIn("https://inactive.example/api", encoded)
 
     def test_markdown_chat_format_is_not_durable_artifact_intent(self):
         self.assertFalse(_looks_like_file_artifact_request("将这张图的文本转为markdown输出"))
@@ -1751,6 +1828,56 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
 
         self.assertEqual(("skills_list", "skill_view"), exposure.tools)
         self.assertFalse(exposure.required_groups)
+
+    def test_static_skill_also_named_by_gate_remains_required(self):
+        """A conditional reference must not erase an ordinary declaration."""
+
+        loaded = {
+            "mixed-authority": self._materialized_skill_package(
+                "mixed-authority",
+                workflow_contract=None,
+            ),
+        }
+        plan = {
+            "selection": "compiled",
+            "required_workers": ["worker-a"],
+            "workers": {
+                "worker-a": {
+                    "id": "worker-a",
+                    "skills": ["shared-adapter"],
+                    "knowledge_gate_skill_refs": ["shared-adapter"],
+                    "knowledge_gate_ir": {
+                        "checks": [{
+                            "id": "gate-a",
+                            "branches": [{
+                                "outcome": "no",
+                                "selector_groups": [{
+                                    "mode": "one_of",
+                                    "selectors": [
+                                        "skill:shared-adapter",
+                                    ],
+                                }],
+                            }],
+                        }],
+                    },
+                },
+            },
+        }
+
+        exposure = _bounded_skill_execution_exposure(
+            "Use mixed-authority.",
+            ["skills_list", "skill_view", "delegate_task"],
+            {"mixed-authority"},
+            loaded,
+            {},
+            selected_skill_names=("mixed-authority",),
+            compiled_plans={"mixed-authority": plan},
+        )
+
+        self.assertIn(
+            "capability_skill_package_unavailable:shared-adapter",
+            exposure.missing_requirements,
+        )
 
     def test_selected_resource_closure_over_256_fails_before_mutation(self):
         files = [f"references/input-{index:03d}.md" for index in range(257)]

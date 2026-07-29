@@ -2806,52 +2806,33 @@ def _normalize_worker_config(
         field=f"workers[{worker_id}]",
         source_file=source_file,
     )
-    local_resources = [
+    ordinary_local_resources = [
         str(value)
         for value in _bounded_sequence(
-            _dedupe([
-                *local_resources,
-                *gate_compilation.local_resources,
-            ]),
+            _dedupe(local_resources),
             limit=MAX_DECLARED_LOCAL_RESOURCES,
             diagnostics=diagnostics,
             field=f"workers[{worker_id}].local_resources",
             source_file=source_file,
         )
     ]
-    declared_skills = config.get("skills")
-    if gate_compilation.skill_refs:
-        existing_gate_skill_names: set[str] = set()
-        declared_skill_items = (
-            sorted(declared_skills, key=str)
-            if isinstance(declared_skills, set)
-            else list(declared_skills)
-            if isinstance(declared_skills, (list, tuple))
-            else [declared_skills]
-            if declared_skills is not None
-            else []
+    knowledge_gate_local_resources = [
+        str(value)
+        for value in _bounded_sequence(
+            _dedupe(gate_compilation.local_resources),
+            limit=MAX_DECLARED_LOCAL_RESOURCES,
+            diagnostics=diagnostics,
+            field=(
+                f"workers[{worker_id}].knowledge_gate_local_resources"
+            ),
+            source_file=source_file,
         )
-        for declared_skill in declared_skill_items:
-            if not isinstance(declared_skill, str):
-                continue
-            declared_name = declared_skill.strip()
-            if declared_name.casefold().startswith("skill:"):
-                declared_name = declared_name.split(":", 1)[1].strip()
-            if declared_name:
-                existing_gate_skill_names.add(declared_name.casefold())
-        gate_skill_selectors = [
-            f"skill:{skill_name}"
-            for skill_name in gate_compilation.skill_refs
-            if skill_name.casefold() not in existing_gate_skill_names
-        ]
-        if not gate_skill_selectors:
-            pass
-        elif declared_skills is None:
-            declared_skills = gate_skill_selectors
-        elif isinstance(declared_skills, (list, tuple, set)):
-            declared_skills = [*declared_skill_items, *gate_skill_selectors]
-        else:
-            declared_skills = [declared_skills, *gate_skill_selectors]
+    ]
+    # Ordinary node capabilities and branch-conditional knowledge-gate
+    # candidates are different authority classes.  Preserve them separately:
+    # mirroring gate-only refs into ``skills`` makes downstream compilation
+    # silently treat a conditional adapter as unconditionally available.
+    declared_skills = config.get("skills")
     environment_contract = _compile_nested_environment_contract(
         config,
         source_file=source_file,
@@ -2893,6 +2874,9 @@ def _normalize_worker_config(
         ),
         "knowledge_gate_ir": gate_compilation.ir,
         "knowledge_gate_skill_refs": list(gate_compilation.skill_refs),
+        "knowledge_gate_local_resources": (
+            knowledge_gate_local_resources
+        ),
         "tools": _compact_mapping(
             config.get("tools"),
             max_items=80,
@@ -2917,7 +2901,7 @@ def _normalize_worker_config(
             field=f"workers[{worker_id}].skills",
             source_file=source_file,
         ),
-        "local_resources": local_resources,
+        "local_resources": ordinary_local_resources,
         "environment_contract": environment_contract,
         "output_schema": _compact_mapping(
             config.get("output_schema") or config.get("output_format"),

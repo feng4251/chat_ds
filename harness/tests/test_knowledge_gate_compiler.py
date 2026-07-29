@@ -443,13 +443,16 @@ class SymbolicKnowledgeGateCompilerTests(unittest.TestCase):
                 [
                     "existing-helper",
                     "evidence-catalog",
-                    "skill:gate-only-helper",
                 ],
                 worker["skills"],
             )
             self.assertEqual(
+                [],
+                worker.get("local_resources", []),
+            )
+            self.assertEqual(
                 ["references/one.md", "references/two.md"],
-                worker["local_resources"],
+                worker["knowledge_gate_local_resources"],
             )
             self.assertEqual(
                 ["evidence-catalog", "gate-only-helper"],

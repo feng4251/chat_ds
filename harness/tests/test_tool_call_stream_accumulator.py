@@ -1816,10 +1816,17 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
                 max_iterations=1,
             )
 
-        self.assertEqual(3, len(requests))
+        # A structured tool fragment is material provider output even when no
+        # visible text was emitted. Replaying this attempt could later
+        # dispatch a duplicated call, so fail closed after the first broken
+        # stream instead of spending the transport retry budget.
+        self.assertEqual(1, len(requests))
         dispatch_mock.assert_not_awaited()
         self.assertEqual("error", events[-1]["type"])
-        self.assertIn("authoritative finish_reason", events[-1]["msg"])
+        self.assertIn(
+            "did not transparently replay",
+            events[-1]["msg"],
+        )
 
     async def test_bounded_http_repair_caps_arguments_at_2048(self):
         requests, dispatch_mock, events = await self._run_stream_sequence(
