@@ -377,7 +377,7 @@ class InternalSessionForkTransactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(target)
         self.assertEqual("source-session", target.forked_from_conversation_id)
 
-    async def test_reconciler_still_fences_and_removes_true_orphan(self):
+    async def test_reconciler_removes_previously_tombstoned_orphan(self):
         orphan_id = "9" * 32
         orphan_workspace = workspace.ensure_workspace(
             "user-1",
@@ -397,6 +397,10 @@ class InternalSessionForkTransactionTests(unittest.IsolatedAsyncioTestCase):
         (orphan_skill / "SKILL.md").write_text(
             "# Orphan",
             encoding="utf-8",
+        )
+        workspace.publish_session_deletion_tombstone(
+            "user-1",
+            orphan_id,
         )
 
         async with self.sessions() as snapshot_db:
@@ -421,7 +425,7 @@ class InternalSessionForkTransactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, result["snapshot_owner_drift"])
         self.assertEqual(0, result["live"])
         self.assertEqual(1, result["candidates"])
-        self.assertEqual(1, result["fenced"])
+        self.assertEqual(0, result["fenced"])
         self.assertEqual(1, result["removed"])
         self.assertFalse(
             (self.workspace_root / "user-1" / orphan_id).exists()
@@ -748,9 +752,9 @@ class InternalSessionForkTransactionTests(unittest.IsolatedAsyncioTestCase):
             ).is_file()
         )
 
-        # Startup orphan repair must recognize the exact pending fork
-        # transaction. Treating the published target as an ordinary DB-absent
-        # orphan would publish a deletion tombstone and make retry impossible.
+        # Startup orphan repair may classify the exact pending fork for
+        # observability, but the pending fence alone must retain a DB-absent
+        # target and preserve retry.
         async with self.sessions() as reconcile_db:
             with patch.object(
                 workspace_reconciler,

@@ -474,6 +474,11 @@ services:
       context: ./backend
     container_name: chat_acits_backend
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
     # Let detached chat producers record service-shutdown cancellation and
     # finish their durable terminal projection before SIGKILL.
     # Uvicorn stops waiting on live SSE requests after 3s; Backend then has a
