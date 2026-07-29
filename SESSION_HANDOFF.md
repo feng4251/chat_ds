@@ -1,4 +1,4 @@
-# ChatDS 当前会话交接（2026-07-28）
+# ChatDS 当前会话交接（2026-07-29）
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
@@ -6,7 +6,17 @@
 
 - 工作目录：`/nfs/yangbb/codes/chat_ds`。
 - 分支：`fix/generic-skill-harness-20260717`。
-- 2026-07-28 最新功能提交：
+- 2026-07-29 最新功能提交：
+  `7bbc0809 fix: harden generic skill workflow execution`。
+- `7bbc0809` 已修复 `0147f...` 暴露的通用 Skill 执行问题：run-scoped 冻结包快照、
+  optional Knowledge Gate 最小权限、receipt 驱动的完成质量、typed gap ledger、
+  delegate 可观测性，以及异常/正常 EOF 缺终态的安全闭合。未加入疾病、文件名、
+  session ID 或 V2.3 特判。
+- 2026-07-29 已把完整生产从 `10.10.130.178` / `172.30.100.145` 切换到本机
+  `10.10.132.126` / `172.30.100.126`；新入口为
+  `http://10.10.132.126:5173` 和 `http://172.30.100.126:5173`。旧主机项目容器与
+  5173 监听均为 0，旧数据库卷保留为回滚点。
+- 上一轮 Knowledge Gate 功能提交：
   `6785e443 feat: compile exact conditional skill knowledge gates`。
 - `6785e443` 已把 `knowledge_gate.checks[].tools` 通用编译为签名的条件候选组，
   补齐 plan/digest、两阶段最小权限、TOCTOU、精确 receipt 和 gap ledger；全量回归
@@ -251,9 +261,62 @@
   `group.receipt`、`activation.failed` 和 delegated `final_audit`，只记录安全 ID、
   数量、摘要和终态。
 
+### 4.11 2026-07-29 `0147f...` 失败闭环与通用执行加固
+
+本轮继续按“持久化会话 + exact Skill + Backend/Harness debug/tool/AgentRun”交叉核对
+`0147f478e52841fa8ed50ffd0a364506`：
+
+- `pending inspection receipts` 旧文案被前端误读为资源读取失败；它实际表示工作流仍在等待
+  检查回执。delegate 的安全参数投影只显示通用占位符，也使正常 dispatch 难以定位。
+- FDA/EMA/target/competitive bootstrap 中既有真实远端失败，也有成功但不满足证据合同的
+  模型结果。旧逻辑会把仅有 preload、免责声明或模型自报字段当成成功 receipt，DrugBank
+  等来源因此可能出现“无真实取证却填充事实”的假阳性。
+- ICH 文档中的普通标题被旧 `DEGRADED/WARN` 解析器误判为降级；相反，Markdown 形式的
+  显式 YES 有时又被误判为缺失。
+- 根 run 完成 bootstrap 后进入 declared-route Knowledge Gate 编译时，
+  `loaded_packages` 只在 explicit-skill 分支初始化，触发未捕获 `NameError`。旧 Harness
+  producer 只写入 EOF sentinel，没有 authoritative terminal event，所以前端最终显示
+  `Harness stream ended without a terminal run event`。它不是单纯网站不可达。
+
+通用修复：
+
+- explicit、declared-route 和 semantic selection 统一创建 run-scoped frozen package
+  snapshot；intent/route 重编译、reference amendment 和依赖闭包始终复用同一内容寻址
+  身份。运行中 package drift 会撤销全部派生权限并 fail closed。
+- optional Knowledge Gate 候选只有在 package/resource/snapshot 审计全部成功后才获得
+  HTTP、script、command、MCP 或 tool authority；坏 OR 分支保持 unresolved，不能因同组
+  另一个候选成功而泄漏权限。
+- 新增严格 `COMPLETION_QUALITY_JSON`、`CAPABILITY_GAPS_JSON` 和
+  `KNOWLEDGE_GAPS_JSON` 校验。Harness receipt ledger 覆盖模型自报；仅 preload 不算证据。
+  当任务要求 acquisition/bootstrap/retrieval 时，零成功 evidence receipt 却填充 typed
+  facts 必须失败，合法 nullable/degraded envelope 则可完成为 degraded。
+- delegate 的安全投影现在保留任务数量与语义名称，资源状态改为
+  `pending inspection receipts`；既不泄漏大参数，也不再显示无意义的
+  `delegate-1/2/3`。
+- `run_stream`、Harness wrapper 和 SSE producer 都会为未捕获异常或正常 EOF 缺终态生成
+  唯一、安全、可持久化的 `run.failed`，错误码区分
+  `missing_terminal_event` / `harness_lifecycle_error`；启动前非法参数仍严格抛出。
+- completion-quality legacy parser 修复标题假阳性和 Markdown YES 假阴性；精确 gap
+  ledger 对重复块、超限 JSON、非有限数值和歧义结构 fail closed。
+
 ## 5. 当前验证证据
 
-2026-07-28 当前功能提交 `6785e443` 已通过：
+2026-07-29 当前功能提交 `7bbc0809` 已通过：
+
+- Harness 全量：
+  `1585 tests OK, 1 skipped`，0 failures/errors。
+- Backend：compileall 通过，`121 passed`；Frontend：`18 passed`，production build
+  通过，仅保留既有约 694.5 KiB chunk warning。
+- 候选镜像内两组聚焦回归合计 `262 tests OK`；生命周期/Skill 路由、quality、snapshot、
+  optional authority、receipt 和 terminal fallback 定向验证均通过。
+- clean Git archive 构建的 Harness、Backend、Frontend、Browser 候选均通过隔离 smoke：
+  base executor startup reap、Harness health/model/auth、Backend migration/SQLite、
+  Frontend Nginx/反代，以及 legacy Browser UDS/CDP 打开 `https://example.com/`。
+- `py_compile`、`git diff --check`、genericity scan、secret scan 通过；独立审阅未发现
+  P0/P1 blocker。
+- 本轮未执行模型重型 V2.3 E2E。
+
+2026-07-28 功能提交 `6785e443` 此前已通过：
 
 - Harness 全量（`cd harness && PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=..:.`）：
   `1565 tests OK, 1 skipped`，0 failures/errors。
@@ -298,21 +361,29 @@
 
 ## 6. 生产与部署状态
 
-- 生产主机：用户访问地址 `172.30.100.145`；历史管理地址/secret 文件名为 `10.10.130.178`。二者指向同一 ChatDS 主机。
+- 当前生产主机：本机 `10.10.132.126` / `172.30.100.126`。
+- 原生产主机：`10.10.130.178` / `172.30.100.145`，已下线。
 - Compose project：`chat_ds`。
 - 生产工作目录：`/nfs/yangbb/codes/chat_ds`。
-- 前端：`http://172.30.100.145:5173`。
-- 搜索机：`10.10.132.126`，Harness 使用 SearXNG `http://10.10.132.126:8088`。
-- 只读部署预检已确认：
-  - 新服务无公开端口、无现有数据卷迁移；
-  - UID 65528/65529 当前无宿主进程冲突；
-  - 根盘约 87 GiB 可用，内存约 26 GiB available；
-  - Compose 2.32.4 支持当前声明。
-- 2026-07-28 19:10（Asia/Shanghai）完成 `6785e443` 最新生产切换。固定使用
-  project `chat_ds` 和原 bind/data 路径；因旧 Backend 尚不发送内部 gate control、
-  而新 Harness 向后兼容，先切换 Harness 并验证健康，再切换 Backend。Frontend、
-  DB volume、search、browser 和两个 Skill executor 均未重建。
+- 前端：`http://10.10.132.126:5173`、`http://172.30.100.126:5173`。
+- Harness 使用同机 SearXNG `http://10.10.132.126:8088`；既有 SearXNG/Valkey 在切换
+  中未重建，健康状态和数据卷保持不变。
+- 2026-07-29（Asia/Shanghai）完成 `7bbc0809` 完整生产迁移：
+  - 先确认旧生产 active run、未结束 run 和 5173 established connection 全为 0；
+  - 停止旧 Frontend 后再次确认，再停止旧 Backend/Harness/所有执行器和 Browser；
+  - 旧 SQLite `quick_check=ok`，核心表计数为
+    `195 / 757 / 373 / 56048 / 327`；
+  - 以只读 tar stream 迁移 Docker volume，源/目标文件均为 105,021,440 bytes，
+    SHA-256 均为
+    `38e788407247862f95e5bc84d8f75674aa9bb66b6366c46affd5810d944de10b`；
+  - 本机被替换的旧测试 DB 已备份到
+    `/nfs/yangbb/chat_ds_backups/20260729_114726_pre_local_migration/` 并通过 checksum；
+  - 新生产验收通过后，旧主机执行 `docker compose down`（未使用 `-v`），项目容器和
+    5173 listener 均为 0；旧 `chat_ds_chat_ds_db` 卷仍保留且哈希不变。
 - `.env` 已原子生成独立 `EXECUTOR_V2_AUTH_TOKEN`，mode 为 0600；base/browser/Harness 三方值一致且长度合规，值未输出或写入 Git。
+- 当前非 root 运维用户不能直接读取 `.env`。不要把 `.env` 通过 `/dev/stdin` 交给
+  Compose：Compose 会重复读取并可能渲染为空。需要时在隔离 subshell 中从只读挂载解析
+  环境，并配合 `--env-file /dev/null`；不得输出或落盘 secret。
 - Harness stream ceiling 为 2400 秒，Backend proxy deadline 为 3000 秒，Frontend Nginx SSE deadline 为 3600 秒。
 
 当前生产镜像：
@@ -322,40 +393,24 @@
 | `chat_acits_executor` | `sha256:a7afa67c6c2f0ffe08e27cd8b5b5101b08444e71e6008b85efacf9c6784ad14f` | healthy |
 | `chat_acits_skill_egress_proxy` | `sha256:c5ee4fdc2ee785868f15036706f01d327b05b358f2b7812fcca8bfb7454f9c05` | healthy |
 | `chat_acits_skill_browser_executor` | `sha256:76acea01fdf89f324fef6c48e44d6270841bbb8127887e8cf2e082cd76a84b90` | healthy |
-| `chat_acits_browser` | `sha256:391260b06964c7cfbd2bb934501f35b47ed5d093ac6e1d51f769c41e3576087d` | healthy |
-| `chat_acits_harness` | `sha256:b726d2aafd64a22b08867fe25912b934207c39aa0a95f5e5ebdbc97ca0873b1a` | healthy / restart 0 / revision `6785e443` |
-| `chat_acits_backend` | `sha256:3b450245d9a26f57e8d8029d82b58f50c4bb1d80cfedb98abe38b822fbbaf668` | running / restart 0 / revision `6785e443` / `/api/health` 200 |
-| `chat_acits_frontend` | `sha256:e3de411f03c037ac4307a78141e80f42c53645a625d09b830676c3b2dae979fd` | running / restart 0 / `/` 200 |
+| `chat_acits_browser` | `sha256:08bcf8860c10ba8fcd647b6d1a96c2c12e13e46db800c812acea82e17007240c` | healthy / restart 0 / revision `7bbc0809` |
+| `chat_acits_harness` | `sha256:9cdf01fe2074b2ea5bbc6dd69d11df7a000926e62ad46d261e7afc3d1fe690ca` | healthy / restart 0 / revision `7bbc0809` |
+| `chat_acits_backend` | `sha256:cc5a2dad4f18cd4703ece288965629d0caa175177bd13425d433825fe8edbb8c` | running / restart 0 / revision `7bbc0809` / `/api/health` 200 |
+| `chat_acits_frontend` | `sha256:48e48710856eaa1b84e975ed4daeedc36f1416d7444979d60cff3907cfc7f91a` | running / restart 0 / revision `7bbc0809` / `/` 200 |
 
 生产 smoke 证据：
 
-- browser worker 只有 loopback、无 route、UID/GID 65529、零 capabilities；直连 public/private/metadata 均失败。
-- proxy public HTTPS 成功；loopback/private/metadata 均为 403；worker 无 controller/proxy UDS authority。
-- 真实 `run_skill_process` 四路通过：base identity、`${SKILL_DIR}` Bash direct helper、headed Node Playwright、persistent Python BrowserProbe；snapshot digest 全匹配，cleanup retained=0。
-- legacy CDP browser 真实打开 `https://example.com/` 并得到 `Example Domain`。
-- Harness `/health` 和 `/v1/models` 正常；未鉴权 `/internal/*` 为 401，Backend 持有的正确 token 为 200。
-- Frontend `/` 与 `/api/health` 均为 200。
-- `6785e443` 切换后 Backend/Harness revision label 正确、restart 均为 0；Frontend
-  保持 `da70dc51`。最近日志没有 traceback、critical、fatal、unhandled 或
-  migration failure。
-- 生产容器内 Knowledge Gate 49 项 smoke 全通过；Harness `/health`、`/v1/models`、
-  Frontend `/` 和 `/api/health` 均为 200，`active_agent_runs=0`。
-- 启动 orphan repair 将历史 19 条 stale `running` AgentRun 全部闭合，生产
-  `active_count=0`。`79c170...` 最后 3 个 child 以
-  `parent_run_terminal_reconciliation` 取消，未覆盖已有 root authoritative
-  `task_cancelled`。
-- 真实生产 SQLite 已有 conversation fork provenance 两列，以及
-  `ux_skill_packages_user_session_name`、`ux_skill_packages_user_name` 两个唯一索引。
-- Frontend Nginx `nginx -t` 通过，SSE location 为 3600 秒；`/api/chat/completions` 的无鉴权 HEAD smoke 返回 `X-Request-ID`，未触发模型。
-- Harness `/health` 为 200；`/v1/models` 无模型调用地报告 AgentModel context length `303872`、Qwen context length `262144`。
-- 真实生产 SQLite 已存在 `ux_agent_run_events_conversation_run_type_seq`，列顺序为 `conversation_id, run_id, event_type, seq`。
-- 真实生产 SQLite 的 `skill_packages` 已有 4 个 bundle identity 列和 `ix_skill_packages_bundle_id`。
-- 本轮 Backend/Harness/Frontend 启动后均为 restart 0，近期日志无 traceback、critical、fatal、unhandled 或 migration failure。
-- legacy browser 对两个精确私网 origin 均成功跟随 302 到 OpenEMR login 页面并取得 DOM snapshot；未列入 allowlist 的私网 origin 和 metadata 地址仍被拦截。
-- Chromium 进程含精确 SPKI exception flag，且不含全局 `--ignore-certificate-errors`。
-- SearXNG 真实查询返回 46 条结果，前十条 provenance 包括 360search、Baidu、Mojeek、Sogou。
-- worker UID 65528/65529 在 smoke 后宿主任务数均为 0；Harness 镜像内 baked runtime-data 文件数为 0。
-- 本轮切换前最近一小时真实 AgentRun `running` 数为 0。
+- `127.0.0.1`、`10.10.132.126`、`172.30.100.126` 的 Frontend `/` 和
+  `/api/health` 均为 200。
+- base executor、browser、skill egress proxy、skill-browser-executor 健康；Harness
+  `/health`、`/v1/models` 为 200，模型数为 2；未鉴权 `/internal/*` 为 401。
+- 生产 SQLite `quick_check=ok`，核心表计数与源端一致，`active_runs=0`，并确认
+  `0147f478e52841fa8ed50ffd0a364506` 会话存在。
+- SearXNG 真实 `OpenAI` 查询返回 14 条结果；Valkey `PONG`。
+- 四个应用容器 revision label 均为完整提交
+  `7bbc08097a75c618fc8a7338ff96b6577b8772d4`；所有长期容器 restart 均为 0。
+- executor/proxy/skill-browser/Harness/Backend/Frontend 日志未发现 traceback、
+  critical、fatal、unhandled、ProtocolError 或 exception。
 - 本轮没有运行模型重型 V2.3 E2E；下一项仍是用户手工业务验收。
 
 回滚点：
@@ -373,6 +428,9 @@
   `chat_ds-backend:rollback-pre-6785e443` 和
   `chat_ds-harness:rollback-pre-6785e443`；候选镜像分别标记为
   `chat_ds-backend:deploy-6785e443`、`chat_ds-harness:deploy-6785e443`。
+- 本机 `7bbc0809` 切换前 Harness/Backend/Frontend/Browser 分别保留
+  `rollback-pre-7bbc0809-local`；候选镜像均保留 `deploy-7bbc0809` tag。旧主机
+  Compose 已 down，但旧数据库卷和旧镜像未删除。
 - 可重建的旧 Harness 代码镜像：`chat_ds-harness:rollback-d224db33`，image `sha256:e7d16ee538fc69e638f20bb93035df90d76008721116ebfedb7d07ccb986abef`。
 - `c21deca0` 的 Backend/Harness 从只包含三项服务目录的 clean Git archive 构建。Docker Hub metadata 临时连接重置时，Frontend 使用已经本地验证的同一提交 `dist`，在 `rollback-pre-c21deca0` 的既有 Nginx runtime 上清空旧静态文件后封装；配置和资源 marker 均做了生产验证。部署上下文/日志位于生产主机 `/tmp/chat_ds_deploy_c21deca0/`，不属于 Git。
 - `da70dc51` 的 Backend/Harness/Frontend 源码均来自 clean Git archive
