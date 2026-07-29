@@ -7,6 +7,13 @@
 - 工作目录：`/nfs/yangbb/codes/chat_ds`。
 - 分支：`fix/generic-skill-harness-20260717`。
 - 2026-07-29 最新功能提交：
+  `7116bb1f fix: separate compiled skill authority from obligations`。
+- `7116bb1f` 已把 ordinary/static 能力、conditional Knowledge Gate authority 和
+  mandatory receipt obligation 分成三个独立、内容寻址且逐层求交的平面；修复
+  `3146526e0e284d50b5f70b7412832b8d` 暴露的静态工具被 KG exact 模式误拒、
+  delegated provider 固定 120 秒读超时、条件分支共享 bridge 漂移，以及取消/损坏流
+  的错误重放问题。Harness 已从该提交的 clean Git archive 构建并部署本机生产。
+- 上一轮功能提交：
   `7bbc0809 fix: harden generic skill workflow execution`。
 - `7bbc0809` 已修复 `0147f...` 暴露的通用 Skill 执行问题：run-scoped 冻结包快照、
   optional Knowledge Gate 最小权限、receipt 驱动的完成质量、typed gap ledger、
@@ -299,9 +306,69 @@
 - completion-quality legacy parser 修复标题假阳性和 Markdown YES 假阴性；精确 gap
   ledger 对重复块、超限 JSON、非有限数值和歧义结构 fail closed。
 
+### 4.12 2026-07-29 `314652...` 编译回归与三平面闭环
+
+本轮同样交叉核对持久化对话、该 session 实际安装的 Skill 包以及 root/child debug：
+
+- route、intent、7 个 bootstrap 和 worker wave 均正确；失败不是网站不可达。
+- Safety worker 的普通 `WebFetch → web_extract` 属于无条件执行能力，却因存在
+  Knowledge Gate plan 被旧 exact validator 当成条件候选而拒绝。
+- PICO child 已获得约 1768 秒动态 lease，但 HTTPX 仍使用固定 120 秒 read timeout，
+  因此 provider 在 Harness lease 之前被截断。
+- Termination worker 正确选中 PubMed 条件分支后，模型仍能从决策 prompt 看见未激活
+  ClinicalTrials 坐标；两者共用 `skill_http_get`，导致 off-prefix 调用被 handler
+  fail-closed。
+- worker 阶段未完成，所以没有生成 Markdown；不是 artifact verifier 删除了结果。
+
+通用修复：
+
+- 新增签名 `unconditional_capability_plan`：ordinary worker 的 native/MCP/Skill
+  resource/script/command/HTTP 能力使用与 KG 相同的 exact candidate compiler，但它们
+  只是可用 authority，不被错误升级为“每个候选都必须调用”。
+- Loader 将 ordinary `skills/local_resources` 与
+  `knowledge_gate_skill_refs/knowledge_gate_local_resources` 分开保存；gate-only
+  候选不再泄漏进初始 preload、required Skill 或静态 bridge。若同一 Skill 被两类声明，
+  普通能力仍保持 required，不会被旧兼容过滤器误剥离。
+- Delegation schema、digest、forced-policy、batch/single task、parent-authority
+  intersection、TOCTOU 和 final receipt audit 全部验证 static plan；KG 仍只在 typed
+  decision 后激活。
+- 决策阶段不再暴露任一分支的 selector/path/URL；接受决策后只发布当前 activated
+  frontier。共享 bridge 调错未激活坐标会得到 exact-frontier 纠偏；正确的分页
+  `skill_view` 在 EOF 前不会被误报为分支漂移。
+- delegated provider 的 HTTPX read timeout 改为无限，由
+  `MaterialProgressLease` 统一执行 idle/progress/hard deadline；provider admission
+  release 由 runtime-owned single-flight task 完成，调用者取消也不会泄漏配额。
+- 已出现 visible/reasoning/tool-call fragment 的流不再透明整轮重放；避免重复草稿或
+  重复副作用。
+
+零模型 exact compile 复核实际当前 Skill：
+
+- 8 个 selected workers、53 个 checks、53 个 KG OR groups 全部通过 strict validation
+  和 parent-grant revalidation；所有组都有候选。
+- Static 编译 0 unresolved。KG 中 `drugbank-database` 有 5 次不可证明 callable route
+  的 unresolved occurrence，但所在 OR group 均有其他 exact alternatives，不构成
+  blocker，也没有获得说明文字推导出的权限。
+- parent closure 覆盖 18/19 个实际引用包；未引用包未获授权。Loader 为 0 errors，
+  只有 3 个非阻断 section-mapping warnings。
+
 ## 5. 当前验证证据
 
-2026-07-29 当前功能提交 `7bbc0809` 已通过：
+2026-07-29 当前功能提交 `7116bb1f` 已通过：
+
+- Harness 全量（`cd harness && PYTHONPATH=.. python -m pytest -q`）：
+  `1602 passed, 1 skipped, 575 subtests passed`，0 failures/errors。
+- Knowledge Gate/runtime/AgentLoop/authority 聚焦组合最终为
+  `142 passed, 105 subtests passed`；独立 release audit 另跑
+  `331 passed, 151 subtests passed`。
+- `py_compile`、`git diff --check`、staged secret scan 和生产代码 genericity scan
+  通过；新增生产逻辑没有疾病、报告文件名、session ID、固定 worker 数或 V2.3 特判。
+- 复杂测试 Skill 的零模型 exact compile 通过 8 workers / 53 checks / 53 groups；
+  static/KG 分权、ordinary/KG 重叠、parent exact authority 均通过。
+- clean Git archive 镜像通过离线 `compileall`、`import main`、revision label 检查；
+  部署后 Harness health/model、三入口、active-run 和日志检查通过。
+- 本轮未执行模型重型 V2.3 E2E，下一项仍是用户手工业务验收。
+
+2026-07-29 上一功能提交 `7bbc0809` 已通过：
 
 - Harness 全量：
   `1585 tests OK, 1 skipped`，0 failures/errors。
@@ -394,7 +461,7 @@
 | `chat_acits_skill_egress_proxy` | `sha256:c5ee4fdc2ee785868f15036706f01d327b05b358f2b7812fcca8bfb7454f9c05` | healthy |
 | `chat_acits_skill_browser_executor` | `sha256:76acea01fdf89f324fef6c48e44d6270841bbb8127887e8cf2e082cd76a84b90` | healthy |
 | `chat_acits_browser` | `sha256:08bcf8860c10ba8fcd647b6d1a96c2c12e13e46db800c812acea82e17007240c` | healthy / restart 0 / revision `7bbc0809` |
-| `chat_acits_harness` | `sha256:9cdf01fe2074b2ea5bbc6dd69d11df7a000926e62ad46d261e7afc3d1fe690ca` | healthy / restart 0 / revision `7bbc0809` |
+| `chat_acits_harness` | `sha256:9a092115964ca6855021c202147907152691351a4c4a554aa44d0ca60093c04d` | healthy / restart 0 / revision `7116bb1f` |
 | `chat_acits_backend` | `sha256:cc5a2dad4f18cd4703ece288965629d0caa175177bd13425d433825fe8edbb8c` | running / restart 0 / revision `7bbc0809` / `/api/health` 200 |
 | `chat_acits_frontend` | `sha256:48e48710856eaa1b84e975ed4daeedc36f1416d7444979d60cff3907cfc7f91a` | running / restart 0 / revision `7bbc0809` / `/` 200 |
 
@@ -407,8 +474,9 @@
 - 生产 SQLite `quick_check=ok`，核心表计数与源端一致，`active_runs=0`，并确认
   `0147f478e52841fa8ed50ffd0a364506` 会话存在。
 - SearXNG 真实 `OpenAI` 查询返回 14 条结果；Valkey `PONG`。
-- 四个应用容器 revision label 均为完整提交
-  `7bbc08097a75c618fc8a7338ff96b6577b8772d4`；所有长期容器 restart 均为 0。
+- Harness revision label 为完整提交
+  `7116bb1f909a35a7d50097b5109ea1647231086a`；Backend、Frontend 和 legacy Browser
+  仍为兼容基线 `7bbc08097a75c618fc8a7338ff96b6577b8772d4`。所有长期容器 restart 均为 0。
 - executor/proxy/skill-browser/Harness/Backend/Frontend 日志未发现 traceback、
   critical、fatal、unhandled、ProtocolError 或 exception。
 - 本轮没有运行模型重型 V2.3 E2E；下一项仍是用户手工业务验收。
@@ -431,6 +499,11 @@
 - 本机 `7bbc0809` 切换前 Harness/Backend/Frontend/Browser 分别保留
   `rollback-pre-7bbc0809-local`；候选镜像均保留 `deploy-7bbc0809` tag。旧主机
   Compose 已 down，但旧数据库卷和旧镜像未删除。
+- `7116bb1f` 仅重建 Harness；候选镜像为
+  `chat_ds-harness:deploy-7116bb1f`，切换前镜像保留为
+  `chat_ds-harness:rollback-pre-7116bb1f-local`。第一次入口探测遇到 Frontend
+  刚启动时的瞬时 connection reset，自动回滚成功；加入 bounded readiness retry 后
+  第二次切换和三入口复核全部通过。
 - 可重建的旧 Harness 代码镜像：`chat_ds-harness:rollback-d224db33`，image `sha256:e7d16ee538fc69e638f20bb93035df90d76008721116ebfedb7d07ccb986abef`。
 - `c21deca0` 的 Backend/Harness 从只包含三项服务目录的 clean Git archive 构建。Docker Hub metadata 临时连接重置时，Frontend 使用已经本地验证的同一提交 `dist`，在 `rollback-pre-c21deca0` 的既有 Nginx runtime 上清空旧静态文件后封装；配置和资源 marker 均做了生产验证。部署上下文/日志位于生产主机 `/tmp/chat_ds_deploy_c21deca0/`，不属于 Git。
 - `da70dc51` 的 Backend/Harness/Frontend 源码均来自 clean Git archive
