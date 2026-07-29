@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable
 
@@ -32,12 +33,16 @@ from knowledge_gate import (
 
 
 KNOWLEDGE_GATE_PLAN_SCHEMA_VERSION = 1
+UNCONDITIONAL_CAPABILITY_PLAN_SCHEMA_VERSION = 1
 KNOWLEDGE_GATE_DECISION_TOOL_NAME = "submit_knowledge_gate_decisions"
 MAX_KNOWLEDGE_GATE_PLAN_BYTES = 512 * 1024
+MAX_UNCONDITIONAL_CAPABILITY_PLAN_BYTES = 512 * 1024
 MAX_GATE_CHECKS = 128
 MAX_GATE_GROUPS = 256
 MAX_GATE_CANDIDATES = 512
 MAX_GATE_SELECTORS_PER_GROUP = 64
+MAX_UNCONDITIONAL_CAPABILITY_SELECTORS = 256
+MAX_UNCONDITIONAL_CAPABILITY_SELECTOR_CHARS = 4_096
 MAX_GATE_TEXT_CHARS = 8_000
 MAX_GATE_DECISION_REASON_CHARS = 1_000
 _RESOURCE_SUFFIXES = frozenset({
@@ -128,6 +133,157 @@ def candidate_tool_names(candidate: dict[str, Any]) -> list[str]:
             if isinstance(name, str) and name
         )
     return list(dict.fromkeys(names))
+
+
+def ordinary_worker_capability_selectors(
+    worker: dict[str, Any] | None,
+    *,
+    available_tools: Iterable[str],
+    resolve_tool_selector: Callable[[str, Iterable[str]], list[str]],
+) -> list[str]:
+    """Return canonical selectors for one normalized worker's static surface.
+
+    Input fields are the loader-owned ordinary declarations only:
+    ``tools``, ``capabilities``, ``skills``, ``local_resources``, and
+    ``environment_contract.allowed_tools``.  Knowledge-gate fields are
+    deliberately never traversed.  ``skill:<name>`` means the exact runnable
+    and declared HTTP/command/native adapters in that frozen package; concrete
+    relative resource paths remain path selectors and are content-addressed by
+    the runtime compiler.
+    """
+
+    if not isinstance(worker, dict):
+        return []
+    available = {str(name) for name in available_tools if str(name)}
+    selectors: list[str] = []
+
+    def add(candidate: Any, *, field: str = "") -> None:
+        text = str(candidate or "").strip()
+        if not text:
+            return
+        if field in {"skill", "skills"}:
+            name = (
+                text.split(":", 1)[1].strip()
+                if text.casefold().startswith("skill:")
+                else text
+            )
+            if name:
+                selectors.append(f"skill:{name}")
+            return
+        if text.casefold().startswith("skill:"):
+            selectors.append("skill:" + text.split(":", 1)[1].strip())
+            return
+        selectors.append(text)
+
+    def source_selectors(value: Any) -> list[str]:
+        text = str(value or "").strip()
+        folded = text.casefold()
+        if (
+            not text
+            or folded in {
+                "builtin", "built-in", "harness", "internal", "project",
+                "local", "workspace", "file", "resource",
+                "available_skills",
+            }
+        ):
+            return []
+        if folded.startswith("skill:"):
+            return [text]
+        selector_pattern = r"[A-Za-z][A-Za-z0-9_.-]*(?:\([^)]*\))?"
+        candidates: list[str] = []
+        if folded.startswith("tool:"):
+            candidates.append(text.split(":", 1)[1].strip())
+        elif re.fullmatch(selector_pattern, text):
+            candidates.append(text)
+        else:
+            tool_match = re.fullmatch(
+                rf"(?i)({selector_pattern})\s+tool",
+                text,
+            )
+            via_match = re.fullmatch(r"(?i)via\s+(.+)", text)
+            if tool_match:
+                candidates.append(tool_match.group(1))
+            elif via_match:
+                candidates.extend(
+                    part
+                    for part in re.split(
+                        r"\s*(?:/|,|\||\bor\b)\s*",
+                        via_match.group(1),
+                        flags=re.IGNORECASE,
+                    )[:8]
+                    if re.fullmatch(selector_pattern, part)
+                )
+        # Preserve every independently resolvable spelling.  A source such as
+        # ``via Bash/WebFetch`` may contain an intentionally unresolved command
+        # family plus one exact supported fetch adapter; unresolved values are
+        # omitted only when another spelling carries the declared capability.
+        resolved = [
+            candidate
+            for candidate in dict.fromkeys(candidates)
+            if resolve_tool_selector(candidate, available)
+        ]
+        return resolved or list(dict.fromkeys(candidates[:1]))
+
+    path_fields = {
+        "path", "paths", "file", "files", "resource", "resources",
+        "local_resources",
+    }
+    native_fields = {
+        "tool", "tools", "capability", "capabilities", "allowed_tools",
+        "selector", "tool_selector",
+    }
+
+    def collect(value: Any, *, field: str) -> None:
+        if isinstance(value, str):
+            if field == "source":
+                for selector in source_selectors(value):
+                    add(selector)
+            else:
+                add(value, field=field)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                collect(item, field=field)
+            return
+        if not isinstance(value, dict):
+            return
+        semantic_keys = (
+            native_fields
+            | path_fields
+            | {"skill", "skills", "source", "name", "id"}
+        )
+        recognized_descriptor = bool(semantic_keys.intersection(value))
+        for key in (
+            "tool", "tools", "capability", "capabilities", "selector",
+            "tool_selector", "source", "path", "paths", "file", "files",
+            "resource", "resources", "local_resources", "skill", "skills",
+        ):
+            if key in value:
+                collect(value.get(key), field=key)
+        if field in native_fields and not recognized_descriptor:
+            for selector, enabled in value.items():
+                if enabled in (False, None):
+                    continue
+                add(selector)
+        elif field in {"skill", "skills"} and not recognized_descriptor:
+            for skill_name, enabled in value.items():
+                if enabled in (False, None):
+                    continue
+                add(skill_name, field="skills")
+
+    collect(worker.get("tools"), field="tools")
+    collect(worker.get("capabilities"), field="capabilities")
+    collect(worker.get("skills"), field="skills")
+    collect(worker.get("local_resources"), field="local_resources")
+    environment = worker.get("environment_contract")
+    if isinstance(environment, dict):
+        collect(environment.get("allowed_tools"), field="allowed_tools")
+    # Do not silently drop an unfamiliar declaration.  The exact compiler
+    # either resolves every returned selector against parent-owned authority
+    # or fails closed with the original selector in its diagnostic.
+    return list(dict.fromkeys(
+        selector for selector in selectors if selector
+    ))
 
 
 def _execution_contract(loaded: dict[str, Any]) -> dict[str, Any]:
@@ -492,6 +648,290 @@ def _skill_candidates(
     return candidates
 
 
+def _runtime_candidates_for_selector(
+    selector: str,
+    *,
+    owner_skill: str,
+    worker_id: str,
+    available_tools: set[str],
+    loaded_packages: dict[str, dict[str, Any]],
+    allowed_resources: set[tuple[str, str]],
+    allowed_scripts: set[tuple[str, str, str]],
+    process_only_scripts: set[tuple[str, str, str]],
+    allowed_package_digests: set[tuple[str, str]],
+    allowed_commands: set[tuple[str, str, str, tuple[str, ...]]],
+    allowed_http_get: set[tuple[str, str]],
+    allowed_http_post: set[tuple[str, str]],
+    frozen_mcp_catalog: Any,
+    resolve_tool_selector: Callable[[str, Iterable[str]], list[str]],
+    resource_expansions: dict[str, list[str]] | None = None,
+) -> list[dict[str, Any]]:
+    """Resolve one loader-owned selector to exact run-owned candidates.
+
+    Both unconditional worker capabilities and conditional knowledge-gate
+    branches use this single lowering boundary.  Keeping one resolver prevents
+    aliases, MCP descriptor pinning, and Skill script/HTTP/command coordinates
+    from drifting between the two authority classes.
+    """
+
+    if selector.casefold().startswith("skill:"):
+        name = selector.split(":", 1)[1].strip()
+        return _skill_candidates(
+            name,
+            available_tools=available_tools,
+            loaded_packages=loaded_packages,
+            allowed_scripts=allowed_scripts,
+            process_only_scripts=process_only_scripts,
+            allowed_package_digests=allowed_package_digests,
+            allowed_commands=allowed_commands,
+            allowed_http_get=allowed_http_get,
+            allowed_http_post=allowed_http_post,
+            resolve_tool_selector=resolve_tool_selector,
+            frozen_mcp_catalog=frozen_mcp_catalog,
+        )
+    if "(" in selector:
+        command = _narrowed_command_candidate(
+            selector,
+            owner_skill=owner_skill,
+            worker_id=worker_id,
+            available_tools=available_tools,
+            loaded_packages=loaded_packages,
+            allowed_package_digests=allowed_package_digests,
+            allowed_commands=allowed_commands,
+        )
+        return [command] if command is not None else []
+    expanded_resources = (resource_expansions or {}).get(selector)
+    if expanded_resources is not None:
+        return [
+            candidate
+            for resource_path in expanded_resources
+            for candidate in [
+                _resource_candidate(
+                    owner_skill=owner_skill,
+                    resource_path=resource_path,
+                    loaded_packages=loaded_packages,
+                    allowed_resources=allowed_resources,
+                    allowed_package_digests=allowed_package_digests,
+                )
+            ]
+            if candidate is not None
+        ]
+    suffix = PurePosixPath(selector).suffix.casefold()
+    if suffix in {".py", ".sh", ".bash", ".js", ".mjs", ".cjs"}:
+        exact_scripts = [
+            candidate
+            for candidate in _skill_candidates(
+                owner_skill,
+                available_tools=available_tools,
+                loaded_packages=loaded_packages,
+                allowed_scripts=allowed_scripts,
+                process_only_scripts=process_only_scripts,
+                allowed_package_digests=allowed_package_digests,
+                allowed_commands=allowed_commands,
+                allowed_http_get=allowed_http_get,
+                allowed_http_post=allowed_http_post,
+                resolve_tool_selector=resolve_tool_selector,
+                frozen_mcp_catalog=frozen_mcp_catalog,
+            )
+            if (
+                candidate.get("kind") == "skill_script"
+                and candidate.get("resource_path") == selector
+            )
+        ]
+        if exact_scripts:
+            return exact_scripts
+    if "/" in selector or suffix in _RESOURCE_SUFFIXES:
+        candidate = _resource_candidate(
+            owner_skill=owner_skill,
+            resource_path=selector,
+            loaded_packages=loaded_packages,
+            allowed_resources=allowed_resources,
+            allowed_package_digests=allowed_package_digests,
+        )
+        return [candidate] if candidate is not None else []
+    return _native_candidates(
+        selector,
+        available_tools=available_tools,
+        resolve_tool_selector=resolve_tool_selector,
+        frozen_mcp_catalog=frozen_mcp_catalog,
+    )
+
+
+def compile_runtime_unconditional_capability_plan(
+    selectors: Iterable[str],
+    *,
+    worker_id: str,
+    owner_skill: str,
+    available_tools: Iterable[str],
+    loaded_packages: dict[str, dict[str, Any]],
+    allowed_resources: Iterable[tuple[str, str]],
+    allowed_scripts: Iterable[tuple[str, str, str]],
+    process_only_scripts: Iterable[tuple[str, str, str]],
+    allowed_package_digests: Iterable[tuple[str, str]],
+    allowed_commands: Iterable[tuple[str, str, str, tuple[str, ...]]],
+    allowed_http_get: Iterable[tuple[str, str]],
+    allowed_http_post: Iterable[tuple[str, str]],
+    frozen_mcp_catalog: Any,
+    resolve_tool_selector: Callable[[str, Iterable[str]], list[str]],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Compile ordinary worker declarations into exact optional authority.
+
+    This plan intentionally carries no receipt semantics.  A candidate is
+    available to the delegated node, but it is not mandatory merely because
+    the Skill declared it.  Explicit required/mandatory markers remain a
+    separate result-contract concern.
+    """
+
+    raw_selectors = list(selectors)
+    if not raw_selectors:
+        return None, None
+    if (
+        len(raw_selectors) > MAX_UNCONDITIONAL_CAPABILITY_SELECTORS
+        or any(
+            not isinstance(selector, str)
+            or not selector
+            or selector != selector.strip()
+            or len(selector)
+            > MAX_UNCONDITIONAL_CAPABILITY_SELECTOR_CHARS
+            or any(char in selector for char in "\r\n\x00")
+            for selector in raw_selectors
+        )
+    ):
+        raise KnowledgeGateCompileError(
+            "unconditional_capability_selector_invalid",
+            "Unconditional capability selectors must be one bounded list of "
+            "non-empty canonical strings.",
+        )
+    if not is_canonical_knowledge_gate_identifier(worker_id):
+        raise KnowledgeGateCompileError(
+            "unconditional_capability_worker_id_invalid",
+            "The unconditional capability worker ID is not one canonical "
+            f"bounded identifier of at most {MAX_GATE_IDENTIFIER_CHARS} "
+            "characters.",
+        )
+    if not isinstance(owner_skill, str) or not owner_skill.strip():
+        raise KnowledgeGateCompileError(
+            "unconditional_capability_owner_invalid",
+            "An unconditional capability plan requires one owning Skill.",
+        )
+
+    normalized_selectors = list(dict.fromkeys(raw_selectors))
+    available = {str(name) for name in available_tools if str(name)}
+    resource_grants = set(allowed_resources)
+    script_grants = set(allowed_scripts)
+    process_grants = set(process_only_scripts)
+    package_grants = set(allowed_package_digests)
+    command_grants = set(allowed_commands)
+    http_get_grants = set(allowed_http_get)
+    http_post_grants = set(allowed_http_post)
+    candidate_by_id: dict[str, dict[str, Any]] = {}
+    unresolved: list[str] = []
+
+    def is_instruction_only_skill_selector(selector: str) -> bool:
+        if not selector.casefold().startswith("skill:"):
+            return False
+        name = selector.split(":", 1)[1].strip()
+        loaded = loaded_packages.get(name)
+        if not isinstance(loaded, dict) or loaded.get("error"):
+            return False
+        skill_dir = loaded.get("skill_dir")
+        main_digest = str(loaded.get("skill_md_sha256") or "")
+        if (
+            not isinstance(skill_dir, str)
+            or not skill_dir
+            or not main_digest
+            or (name, "SKILL.md") not in resource_grants
+        ):
+            return False
+        if (
+            any(skill == name for skill, _path, _digest in script_grants)
+            or any(skill == name for skill, *_rest in command_grants)
+            or any(skill == name for skill, _prefix in http_get_grants)
+            or any(skill == name for skill, _prefix in http_post_grants)
+            or _declared_package_tool_selectors(loaded)
+        ):
+            return False
+        try:
+            from tools.isolated_skill_executor import snapshot_skill_package
+
+            snapshot = snapshot_skill_package(Path(skill_dir))
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+            return False
+        return bool(
+            snapshot.file_sha256("SKILL.md") == main_digest
+            and (name, snapshot.sha256) in package_grants
+        )
+
+    for selector in normalized_selectors:
+        resolved = _runtime_candidates_for_selector(
+            selector,
+            owner_skill=owner_skill,
+            worker_id=worker_id,
+            available_tools=available,
+            loaded_packages=loaded_packages,
+            allowed_resources=resource_grants,
+            allowed_scripts=script_grants,
+            process_only_scripts=process_grants,
+            allowed_package_digests=package_grants,
+            allowed_commands=command_grants,
+            allowed_http_get=http_get_grants,
+            allowed_http_post=http_post_grants,
+            frozen_mcp_catalog=frozen_mcp_catalog,
+            resolve_tool_selector=resolve_tool_selector,
+        )
+        if not resolved:
+            if is_instruction_only_skill_selector(selector):
+                continue
+            unresolved.append(selector)
+            continue
+        for candidate in resolved:
+            candidate_by_id.setdefault(str(candidate["candidate_id"]), candidate)
+    if unresolved:
+        raise KnowledgeGateCompileError(
+            "unconditional_capability_selector_unresolved",
+            "Ordinary worker capability selectors did not resolve to exact "
+            "run-owned authority: " + ", ".join(unresolved[:32]),
+        )
+    candidates = sorted(
+        candidate_by_id.values(),
+        key=lambda item: str(item.get("candidate_id") or ""),
+    )
+    if not candidates:
+        # A declared supporting Skill may be instruction-only. Its exact
+        # SKILL.md preload remains in required_capability_skills, but it does
+        # not create a callable static authority plan or a false receipt
+        # obligation.
+        return None, None
+    if len(candidates) > MAX_GATE_CANDIDATES:
+        raise KnowledgeGateCompileError(
+            "unconditional_capability_candidate_limit",
+            "An unconditional capability plan may contain at most "
+            f"{MAX_GATE_CANDIDATES} candidates.",
+        )
+    plan = {
+        "schema_version": UNCONDITIONAL_CAPABILITY_PLAN_SCHEMA_VERSION,
+        "worker_id": worker_id,
+        "owner_skill": owner_skill,
+        "selectors": normalized_selectors,
+        "candidates": candidates,
+    }
+    encoded_plan = json.dumps(
+        plan,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    if len(encoded_plan) > MAX_UNCONDITIONAL_CAPABILITY_PLAN_BYTES:
+        raise KnowledgeGateCompileError(
+            "unconditional_capability_plan_size_limit",
+            "The frozen unconditional capability plan exceeds the bounded "
+            f"canonical size of {MAX_UNCONDITIONAL_CAPABILITY_PLAN_BYTES} "
+            "bytes.",
+        )
+    return plan, canonical_json_sha256(plan)
+
+
 def compile_runtime_knowledge_gate_plan(
     symbolic_ir: dict[str, Any] | None,
     *,
@@ -577,65 +1017,6 @@ def compile_runtime_knowledge_gate_plan(
         and str(expansion.get("selector") or "")
     }
 
-    def candidates_for_selector(selector: str) -> list[dict[str, Any]]:
-        if selector.casefold().startswith("skill:"):
-            name = selector.split(":", 1)[1].strip()
-            return _skill_candidates(
-                name,
-                available_tools=available,
-                loaded_packages=loaded_packages,
-                allowed_scripts=script_grants,
-                process_only_scripts=process_grants,
-                allowed_package_digests=package_grants,
-                allowed_commands=command_grants,
-                allowed_http_get=http_get_grants,
-                allowed_http_post=http_post_grants,
-                resolve_tool_selector=resolve_tool_selector,
-                frozen_mcp_catalog=frozen_mcp_catalog,
-            )
-        if "(" in selector:
-            command = _narrowed_command_candidate(
-                selector,
-                owner_skill=owner_skill,
-                worker_id=worker_id,
-                available_tools=available,
-                loaded_packages=loaded_packages,
-                allowed_package_digests=package_grants,
-                allowed_commands=command_grants,
-            )
-            return [command] if command is not None else []
-        if selector in resource_expansions:
-            return [
-                candidate
-                for resource_path in resource_expansions[selector]
-                for candidate in [
-                    _resource_candidate(
-                        owner_skill=owner_skill,
-                        resource_path=resource_path,
-                        loaded_packages=loaded_packages,
-                        allowed_resources=resource_grants,
-                        allowed_package_digests=package_grants,
-                    )
-                ]
-                if candidate is not None
-            ]
-        suffix = PurePosixPath(selector).suffix.casefold()
-        if "/" in selector or suffix in _RESOURCE_SUFFIXES:
-            candidate = _resource_candidate(
-                owner_skill=owner_skill,
-                resource_path=selector,
-                loaded_packages=loaded_packages,
-                allowed_resources=resource_grants,
-                allowed_package_digests=package_grants,
-            )
-            return [candidate] if candidate is not None else []
-        return _native_candidates(
-            selector,
-            available_tools=available,
-            resolve_tool_selector=resolve_tool_selector,
-            frozen_mcp_catalog=frozen_mcp_catalog,
-        )
-
     for check_index, raw_check in enumerate(raw_checks):
         if not isinstance(raw_check, dict):
             raise KnowledgeGateCompileError(
@@ -718,7 +1099,23 @@ def compile_runtime_knowledge_gate_plan(
                 candidate_ids: list[str] = []
                 unresolved: list[str] = []
                 for selector in dict.fromkeys(selectors):
-                    resolved = candidates_for_selector(selector)
+                    resolved = _runtime_candidates_for_selector(
+                        selector,
+                        owner_skill=owner_skill,
+                        worker_id=worker_id,
+                        available_tools=available,
+                        loaded_packages=loaded_packages,
+                        allowed_resources=resource_grants,
+                        allowed_scripts=script_grants,
+                        process_only_scripts=process_grants,
+                        allowed_package_digests=package_grants,
+                        allowed_commands=command_grants,
+                        allowed_http_get=http_get_grants,
+                        allowed_http_post=http_post_grants,
+                        frozen_mcp_catalog=frozen_mcp_catalog,
+                        resolve_tool_selector=resolve_tool_selector,
+                        resource_expansions=resource_expansions,
+                    )
                     if not resolved:
                         unresolved.append(selector)
                     for candidate in resolved:
@@ -1234,7 +1631,31 @@ def decision_tool_schema(plan: dict[str, Any]) -> dict[str, Any]:
 
 
 def plan_prompt_payload(plan: dict[str, Any], digest: str) -> dict[str, Any]:
-    """Return the bounded model-visible decision and candidate projection."""
+    """Return the bounded decision projection without inactive coordinates.
+
+    Exact candidates are authority, not decision input.  Keeping every branch's
+    URLs/scripts/resources in the model context after a decision lets public
+    bridge tools such as ``skill_http_get`` drift across branches.  The runtime
+    publishes only the selected frontier after accepting the typed decision.
+    """
+
+    groups = [
+        {
+            "id": group.get("id"),
+            "check_id": group.get("check_id"),
+            "outcome": group.get("outcome"),
+            "mode": group.get("mode"),
+            "selector_count": len(group.get("selectors") or []),
+            "unresolved_selector_count": len(
+                group.get("unresolved_selectors") or []
+            ),
+            "resolved_candidate_count": len(
+                group.get("candidate_ids") or []
+            ),
+        }
+        for group in plan.get("groups") or []
+        if isinstance(group, dict)
+    ]
 
     return {
         "schema_version": plan.get("schema_version"),
@@ -1242,17 +1663,16 @@ def plan_prompt_payload(plan: dict[str, Any], digest: str) -> dict[str, Any]:
         "owner_skill": plan.get("owner_skill"),
         "plan_sha256": digest,
         "checks": plan.get("checks") or [],
-        "groups": plan.get("groups") or [],
-        "candidates": plan.get("candidates") or [],
+        "groups": groups,
         "instructions": (
             "Before ordinary execution, call submit_knowledge_gate_decisions "
             "once with every check. yes/no activates only the matching branch; "
             "unknown never guesses a branch and must remain an explicit "
-            "WARN/degraded knowledge gap. For each activated group, obtain "
-            "one exact candidate "
-            "dispatch receipt. Candidate IDs within one group are alternatives; "
-            "separate groups require separate receipts. Use only the displayed "
-            "exact tool/path/Skill coordinates and follow branch actions. "
+            "WARN/degraded knowledge gap. Exact candidate coordinates are "
+            "intentionally withheld during this decision phase. After the "
+            "decision is accepted, follow only the runtime-owned activated "
+            "frontier: candidate IDs within one group are alternatives and "
+            "separate groups require separate dispatch receipts. "
             "Unresolved selectors are machine-owned gaps, never permission to "
             "invent a callable or ambient fallback."
         ),

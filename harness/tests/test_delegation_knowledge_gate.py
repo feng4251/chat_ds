@@ -7,7 +7,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from agent_loop import _declared_workflow_batch_preflight
+from agent_loop import (
+    _declared_workflow_batch_preflight,
+    _workflow_gate_call_error,
+)
 from tools.context import ToolContext
 from knowledge_gate_runtime import (
     activated_knowledge_gate_candidate_authority,
@@ -21,7 +24,9 @@ from tools.delegation import (
     _knowledge_gate_receipt_audit,
     _run_child,
     _strict_knowledge_gate_plan,
+    _strict_unconditional_capability_plan,
 )
+from tools.isolated_skill_executor import snapshot_skill_package
 
 
 def _digest(value: object) -> str:
@@ -75,6 +80,21 @@ def _native_plan(*, two_groups: bool = False) -> dict:
             "kind": "native_tool",
             "tool_name": "web_search",
             "tool_names": ["web_search"],
+        }],
+    }
+
+
+def _static_native_plan(tool_name: str = "web_extract") -> dict:
+    return {
+        "schema_version": 1,
+        "worker_id": "worker-a",
+        "owner_skill": "generic-skill",
+        "selectors": ["WebFetch"],
+        "candidates": [{
+            "candidate_id": "candidate-static-fetch",
+            "kind": "native_tool",
+            "tool_name": tool_name,
+            "tool_names": [tool_name],
         }],
     }
 
@@ -289,6 +309,92 @@ class KnowledgeGatePlanContractTests(unittest.TestCase):
         task_properties = properties["tasks"]["items"]["properties"]
         self.assertIn("knowledge_gate_plan", task_properties)
         self.assertIn("knowledge_gate_plan_sha256", task_properties)
+        self.assertIn("unconditional_capability_plan", properties)
+        self.assertIn(
+            "unconditional_capability_plan_sha256",
+            properties,
+        )
+        self.assertIn(
+            "unconditional_capability_plan",
+            task_properties,
+        )
+        self.assertIn(
+            "unconditional_capability_plan_sha256",
+            task_properties,
+        )
+
+    def test_static_plan_and_digest_are_paired_and_identity_bound(self):
+        plan = _static_native_plan()
+        task = {
+            "skill_name": "generic-skill",
+            "worker_id": "worker-a",
+            "unconditional_capability_plan": plan,
+            "unconditional_capability_plan_sha256": _digest(plan),
+        }
+        normalized, digest, error = (
+            _strict_unconditional_capability_plan(task)
+        )
+        self.assertIsNone(error)
+        self.assertEqual(plan, normalized)
+        self.assertEqual(_digest(plan), digest)
+
+        forged = dict(task)
+        forged["unconditional_capability_plan_sha256"] = "0" * 64
+        normalized, _digest_value, error = (
+            _strict_unconditional_capability_plan(forged)
+        )
+        self.assertIsNone(normalized)
+        self.assertIn("does not match", error)
+
+    def test_forced_workflow_freezes_static_plan_and_digest(self):
+        plan = _static_native_plan()
+        digest = _digest(plan)
+        policy = {
+            "tools": ["delegate_task"],
+            "max_calls": 1,
+            "delegate_step_type": "worker",
+            "expected_step_ids": ["worker-a"],
+            "expected_unconditional_capability_plans": {
+                "worker-a": plan,
+            },
+            "expected_unconditional_capability_plan_sha256": {
+                "worker-a": digest,
+            },
+        }
+        task = {
+            "goal": "Run the exact worker.",
+            "skill_name": "generic-skill",
+            "step_type": "worker",
+            "step_id": "worker-a",
+            "worker_id": "worker-a",
+            "worker_file": "workers/worker-a.yaml",
+            "tools": ["web_extract"],
+            "unconditional_capability_plan": plan,
+            "unconditional_capability_plan_sha256": digest,
+        }
+
+        self.assertEqual(
+            "",
+            _workflow_gate_call_error(
+                policy,
+                "delegate_task",
+                {"tasks": [task]},
+                prior_call_count=0,
+            ),
+        )
+        forged = {
+            **task,
+            "unconditional_capability_plan_sha256": "0" * 64,
+        }
+        self.assertIn(
+            "exact Harness-compiled",
+            _workflow_gate_call_error(
+                policy,
+                "delegate_task",
+                {"tasks": [forged]},
+                prior_call_count=0,
+            ),
+        )
 
     def test_plan_and_digest_are_paired_and_identity_bound(self):
         plan = _native_plan()
@@ -838,6 +944,223 @@ class KnowledgeGatePlanContractTests(unittest.TestCase):
 
 
 class KnowledgeGateDelegatedChildTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unmarked_static_candidate_requires_no_receipt(self):
+        plan = _static_native_plan()
+
+        async def fake_run_stream(*args, **kwargs):
+            self.assertEqual(["web_extract"], args[2])
+            self.assertIsNone(kwargs.get("knowledge_gate_plan"))
+            yield {
+                "type": "delta",
+                "content": (
+                    "The optional static capability was not needed for this "
+                    "bounded substantive result. " * 20
+                ),
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                return_value="results/static-optional.txt",
+            ),
+        ):
+            result = await _run_child(
+                {
+                    "goal": "answer using the static capability only if needed",
+                    "skill_name": "generic-skill",
+                    "worker_id": "worker-a",
+                    "step_type": "knowledge_bootstrap",
+                    "tools": ["web_extract"],
+                    "unconditional_capability_plan": plan,
+                    "unconditional_capability_plan_sha256": _digest(plan),
+                },
+                _context("web_extract"),
+                0,
+            )
+
+        self.assertEqual("completed", result["status"], result.get("error"))
+        self.assertEqual(
+            [],
+            result["capability_receipt_audit"]["required_tool_names"],
+        )
+
+    async def test_static_skill_candidate_requires_declared_main_preload(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            main = root / "SKILL.md"
+            main.write_text(
+                "---\n"
+                "name: supporting-adapter\n"
+                "description: Static adapter fixture.\n"
+                "---\n",
+                encoding="utf-8",
+            )
+            main_sha = hashlib.sha256(main.read_bytes()).hexdigest()
+            package_sha = snapshot_skill_package(root).sha256
+            plan = _static_native_plan()
+            plan["selectors"] = ["skill:supporting-adapter"]
+            plan["candidates"][0].update({
+                "skill_name": "supporting-adapter",
+                "skill_md_sha256": main_sha,
+                "package_sha256": package_sha,
+            })
+            context = replace(
+                _context("web_extract"),
+                enabled_user_skills=("supporting-adapter",),
+                allowed_skill_resources=(
+                    ("supporting-adapter", "SKILL.md"),
+                ),
+                allowed_skill_package_digests=(
+                    ("supporting-adapter", package_sha),
+                ),
+            )
+            with (
+                patch(
+                    "skills.scanner.resolve_skill_path",
+                    return_value=main,
+                ),
+                patch("agent_loop.run_stream") as run_stream,
+            ):
+                result = await _run_child(
+                    {
+                        "goal": "use one static supporting adapter",
+                        "skill_name": "generic-skill",
+                        "worker_id": "worker-a",
+                        "step_type": "knowledge_bootstrap",
+                        "tools": ["web_extract"],
+                        "unconditional_capability_plan": plan,
+                        "unconditional_capability_plan_sha256": _digest(
+                            plan
+                        ),
+                    },
+                    context,
+                    0,
+                )
+
+        self.assertEqual("error", result["status"])
+        self.assertIn(
+            "required_capability_skills",
+            result["error"],
+        )
+        self.assertIn("supporting-adapter", result["error"])
+        run_stream.assert_not_called()
+
+    async def test_gate_does_not_hide_unconditional_static_tool(self):
+        gate_plan = _native_plan()
+        static_plan = _static_native_plan()
+
+        def started(name: str, call_id: str, args: dict) -> dict:
+            return {
+                "type": "agent_event",
+                "event_type": "tool.started",
+                "tool_name": name,
+                "tool_call_id": call_id,
+                "payload": {
+                    "tool_name": name,
+                    "tool_call_id": call_id,
+                    "args_compacted": args,
+                },
+            }
+
+        def completed(name: str, call_id: str) -> dict:
+            return {
+                "type": "agent_event",
+                "event_type": "tool.completed",
+                "tool_name": name,
+                "tool_call_id": call_id,
+                "payload": {
+                    "tool_name": name,
+                    "tool_call_id": call_id,
+                    "outcome": "success",
+                    "actual_dispatch_attempted": True,
+                    "exact_capability_receipt": {"result_data": {}},
+                },
+            }
+
+        async def fake_run_stream(*args, **kwargs):
+            # run_stream receives the complete static base authority. Its
+            # knowledge-gate middleware exposes only the decision schema until
+            # the first typed receipt, then restores web_extract even though
+            # the web_search branch below was not selected.
+            self.assertEqual(
+                {
+                    "submit_knowledge_gate_decisions",
+                    "web_extract",
+                },
+                set(args[2]),
+            )
+            self.assertEqual(
+                ["web_search"],
+                kwargs["knowledge_gate_candidate_authority"]["tool_names"],
+            )
+            yield started(
+                "submit_knowledge_gate_decisions",
+                "decision-1",
+                _decision_call(gate_plan, outcome="no")["args"],
+            )
+            yield completed(
+                "submit_knowledge_gate_decisions",
+                "decision-1",
+            )
+            yield started(
+                "web_extract",
+                "extract-1",
+                {"url": "https://example.test/evidence"},
+            )
+            yield completed("web_extract", "extract-1")
+            yield {
+                "type": "delta",
+                "content": (
+                    "Substantive evidence extracted through the ordinary "
+                    "static capability. " * 20
+                ),
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                return_value="results/static-worker.txt",
+            ),
+        ):
+            result = await _run_child(
+                {
+                    "goal": "perform one bounded static evidence check",
+                    "skill_name": "generic-skill",
+                    "worker_id": "worker-a",
+                    "step_type": "knowledge_bootstrap",
+                    "tools": [
+                        "submit_knowledge_gate_decisions",
+                        "web_search",
+                        "web_extract",
+                    ],
+                    "required_capability_tools": ["web_extract"],
+                    "unconditional_capability_plan": static_plan,
+                    "unconditional_capability_plan_sha256": _digest(
+                        static_plan
+                    ),
+                    "knowledge_gate_plan": gate_plan,
+                    "knowledge_gate_plan_sha256": _digest(gate_plan),
+                },
+                _context("web_search", "web_extract"),
+                0,
+            )
+
+        self.assertEqual("completed", result["status"], result.get("error"))
+        self.assertIn(
+            "web_extract",
+            result["capability_receipt_audit"][
+                "successful_tool_names"
+            ],
+        )
+        self.assertEqual(
+            [],
+            result["knowledge_gate_receipt_audit"]["activated_group_ids"],
+        )
+
     async def test_decision_control_is_not_exposed_without_a_valid_plan(self):
         async def fake_run_stream(*args, **kwargs):
             self.assertEqual(["web_search"], args[2])

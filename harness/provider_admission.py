@@ -226,6 +226,8 @@ class ProviderAdmissionLease:
         self._acquired_at = acquired_at
         self._observer = observer
         self._released = False
+        self._release_task: asyncio.Task[dict[str, Any]] | None = None
+        self._release_observer_emitted = False
 
     @property
     def enabled(self) -> bool:
@@ -239,17 +241,52 @@ class ProviderAdmissionLease:
             return
         if asyncio.get_running_loop() is not self._loop:
             raise RuntimeError("provider admission lease released on a different event loop")
-        self._released = True
-        payload = await self._controller._release(
-            identity=self._identity,
-            state=self._state,
-            limits=self._limits,
-            weight=self._weight,
-            ticket=self._ticket,
-            wait_seconds=self._wait_seconds,
-            acquired_at=self._acquired_at,
-        )
-        await _emit_observer(self._observer, "released", payload)
+        # Releasing capacity is a runtime-owned single-flight operation.  A
+        # caller may be cancelled while its provider stream is unwinding; that
+        # cancellation must propagate promptly without cancelling the actual
+        # decrement and permanently stranding provider capacity.  Retain the
+        # task on the lease so an exact retry joins the same operation instead
+        # of decrementing a later request.
+        if self._release_task is None:
+            async def release_once() -> dict[str, Any]:
+                payload = await self._controller._release(
+                    identity=self._identity,
+                    state=self._state,
+                    limits=self._limits,
+                    weight=self._weight,
+                    ticket=self._ticket,
+                    wait_seconds=self._wait_seconds,
+                    acquired_at=self._acquired_at,
+                )
+                # State and observability belong to the shielded cleanup, not
+                # to whichever caller happened to await it.  They therefore
+                # complete even when that caller is cancelled and nobody
+                # retries ``release``.
+                self._released = True
+                if not self._release_observer_emitted:
+                    self._release_observer_emitted = True
+                    await _emit_observer(
+                        self._observer,
+                        "released",
+                        payload,
+                    )
+                return payload
+
+            self._release_task = self._loop.create_task(
+                release_once()
+            )
+
+            def consume_release_exception(
+                task: asyncio.Task[dict[str, Any]],
+            ) -> None:
+                try:
+                    task.exception()
+                except BaseException:
+                    pass
+
+            self._release_task.add_done_callback(consume_release_exception)
+
+        await asyncio.shield(self._release_task)
 
     async def __aenter__(self) -> "ProviderAdmissionLease":
         return self

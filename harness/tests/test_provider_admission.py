@@ -129,6 +129,51 @@ class ProviderAdmissionTests(unittest.IsolatedAsyncioTestCase):
         lease = await asyncio.wait_for(self._acquire(100), timeout=1)
         await lease.release()
 
+    async def test_cancelled_release_finishes_once_without_leaking_capacity(self):
+        events: list[str] = []
+
+        async def observer(event_type, _payload):
+            events.append(event_type)
+
+        lease = await self._acquire(100, observer=observer)
+        state = lease._state
+        self.assertIsNotNone(state)
+
+        # Hold the condition so cancellation deterministically lands after the
+        # release single-flight has started but before it can decrement.
+        await state.condition.acquire()
+        joining_release = None
+        try:
+            release = asyncio.create_task(lease.release())
+            joining_release = asyncio.create_task(lease.release())
+            await asyncio.sleep(0)
+            release.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await release
+            self.assertEqual(1, state.active_requests)
+        finally:
+            state.condition.release()
+        await asyncio.wait_for(joining_release, timeout=1)
+
+        # The runtime-owned release continues after its cancelled waiter.  A
+        # following request must therefore acquire the full capacity.
+        next_lease = await asyncio.wait_for(
+            self._acquire(100),
+            timeout=1,
+        )
+        self.assertEqual(1, state.active_requests)
+
+        # Exact retries join the completed release task.  They must not
+        # decrement capacity now owned by the following request, and the
+        # release observer is emitted at most once.
+        await lease.release()
+        await lease.release()
+        self.assertEqual(1, state.active_requests)
+        self.assertEqual(1, events.count("released"))
+
+        await next_lease.release()
+        self.assertEqual(0, state.active_requests)
+
     async def test_oversize_request_waits_for_exclusive_access(self):
         active = await self._acquire(20)
         oversize_task = asyncio.create_task(self._acquire(150))

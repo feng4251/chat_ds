@@ -25,7 +25,7 @@ import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Iterable, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -59,7 +59,9 @@ from knowledge_gate_runtime import (
     candidate_tool_names as knowledge_gate_candidate_tool_names,
     canonical_json_sha256 as knowledge_gate_plan_sha256_for,
     compile_runtime_knowledge_gate_plan,
+    compile_runtime_unconditional_capability_plan,
     decision_tool_schema as knowledge_gate_decision_tool_schema,
+    ordinary_worker_capability_selectors,
     plan_prompt_payload as knowledge_gate_plan_prompt_payload,
     validate_knowledge_gate_candidate_authority,
 )
@@ -833,9 +835,188 @@ def _continuation_unique_suffix(previous: str, current: str) -> str:
     return latest
 
 
-def _stream_retry_is_safe(full_content: str, full_reasoning: str) -> bool:
-    """A provider request may be replayed only before any streamed text."""
-    return not bool(str(full_content or "") or str(full_reasoning or ""))
+def _stream_retry_is_safe(
+    full_content: str,
+    full_reasoning: str,
+    *,
+    raw_content_chars: int = 0,
+    raw_reasoning_chars: int = 0,
+    tool_call_fragment_count: int = 0,
+) -> bool:
+    """Replay only a provider attempt that emitted no material fragment.
+
+    Scrubbing can intentionally remove provider text from ``full_*`` and a
+    structured tool-call stream may contain no visible text at all.  Both are
+    still partial provider output: replaying either attempt can duplicate a
+    side effect once the reconstructed call later crosses dispatch.
+    """
+
+    return not bool(
+        str(full_content or "")
+        or str(full_reasoning or "")
+        or max(0, int(raw_content_chars))
+        or max(0, int(raw_reasoning_chars))
+        or max(0, int(tool_call_fragment_count))
+    )
+
+
+def _provider_stream_transport_timeout() -> httpx.Timeout:
+    """Leave stream liveness to the adaptive material-progress lease.
+
+    A fixed HTTPX read timeout races the request-size-aware first-byte,
+    progress, and hard deadlines and used to abort long-thinking providers at
+    120 seconds even when the Harness had granted a much larger lease.
+    """
+
+    return httpx.Timeout(
+        connect=max(
+            1.0,
+            float(settings.llm_stream_connect_timeout_seconds),
+        ),
+        read=None,
+        write=30.0,
+        pool=30.0,
+    )
+
+
+def _knowledge_gate_activated_frontier_payload(
+    plan: dict[str, Any] | None,
+    decision_receipt: dict[str, Any] | None,
+    *,
+    completed_group_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    """Project only active, still-pending exact candidates for the child.
+
+    Several candidate kinds intentionally share one public bridge tool.  Tool
+    names alone therefore cannot tell the model which URL, script, command, or
+    resource belongs to the selected branch.  This runtime-owned projection
+    retains exact candidate identity without exposing any inactive branch.
+    """
+
+    if not isinstance(plan, dict) or not isinstance(decision_receipt, dict):
+        return {"groups": []}
+    completed = {
+        str(group_id)
+        for group_id in (completed_group_ids or set())
+        if str(group_id)
+    }
+    candidate_by_id = {
+        str(candidate.get("candidate_id") or ""): candidate
+        for candidate in plan.get("candidates") or []
+        if (
+            isinstance(candidate, dict)
+            and str(candidate.get("candidate_id") or "")
+        )
+    }
+    group_by_id = {
+        str(group.get("id") or ""): group
+        for group in plan.get("groups") or []
+        if isinstance(group, dict) and str(group.get("id") or "")
+    }
+    visible_candidate_fields = (
+        "candidate_id",
+        "kind",
+        "tool_name",
+        "tool_names",
+        "skill_name",
+        "resource_path",
+        "command_id",
+        "executable",
+        "fixed_argv",
+        "additional_argv",
+        "url_prefix",
+        "http_method",
+        "runtime_profile",
+        "required_cwd",
+    )
+    groups: list[dict[str, Any]] = []
+    for raw_group_id in decision_receipt.get("activated_group_ids") or []:
+        group_id = str(raw_group_id)
+        group = group_by_id.get(group_id)
+        if not isinstance(group, dict) or group_id in completed:
+            continue
+        candidates = [
+            {
+                key: candidate.get(key)
+                for key in visible_candidate_fields
+                if candidate.get(key) not in (None, "", [])
+            }
+            for candidate_id in group.get("candidate_ids") or []
+            for candidate in [candidate_by_id.get(str(candidate_id))]
+            if isinstance(candidate, dict)
+        ]
+        groups.append({
+            "group_id": group_id,
+            "mode": "one_of",
+            "selectors": list(group.get("selectors") or []),
+            "candidates": candidates,
+        })
+    return {
+        "plan_sha256": str(decision_receipt.get("plan_sha256") or ""),
+        "groups": groups,
+        "instructions": (
+            "For every listed group, dispatch one listed exact candidate. "
+            "Candidates within a group are alternatives; separate groups "
+            "require separate calls. Do not use coordinates from an inactive "
+            "or previously completed group."
+        ),
+    }
+
+
+def _knowledge_gate_pending_resource_coordinate_matches(
+    plan: dict[str, Any] | None,
+    pending_group_ids: Iterable[str],
+    *,
+    tool_name: str,
+    args: dict[str, Any] | None,
+) -> bool:
+    """Return whether one Skill read targets an active resource candidate.
+
+    This intentionally checks only the immutable Skill/path coordinate, not
+    receipt completion. A valid paginated read remains on the active frontier
+    before EOF, while an off-branch Skill/path must receive mismatch recovery.
+    """
+
+    if (
+        tool_name != "skill_view"
+        or not isinstance(plan, dict)
+        or not isinstance(args, dict)
+    ):
+        return False
+    requested_skill = str(args.get("name") or "")
+    requested_path = args.get("file_path")
+    if requested_path in {None, ""}:
+        requested_path = "SKILL.md"
+    requested_path = str(requested_path)
+    if not requested_skill or not requested_path:
+        return False
+    pending = {str(group_id) for group_id in pending_group_ids if group_id}
+    candidate_by_id = {
+        str(candidate.get("candidate_id") or ""): candidate
+        for candidate in plan.get("candidates") or []
+        if (
+            isinstance(candidate, dict)
+            and str(candidate.get("candidate_id") or "")
+        )
+    }
+    for group in plan.get("groups") or []:
+        if (
+            not isinstance(group, dict)
+            or str(group.get("id") or "") not in pending
+        ):
+            continue
+        for candidate_id in group.get("candidate_ids") or []:
+            candidate = candidate_by_id.get(str(candidate_id))
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("kind") == "skill_resource"
+                and requested_skill
+                == str(candidate.get("skill_name") or "")
+                and requested_path
+                == str(candidate.get("resource_path") or "")
+            ):
+                return True
+    return False
 
 
 def _update_compressor_usage(
@@ -8590,6 +8771,51 @@ def _workflow_gate_call_error(
             "workflow gate and may not be added or changed."
         )
 
+    expected_unconditional_plans = policy.get(
+        "expected_unconditional_capability_plans"
+    )
+    expected_unconditional_hashes = policy.get(
+        "expected_unconditional_capability_plan_sha256"
+    )
+    if isinstance(expected_unconditional_plans, dict) and isinstance(
+        expected_unconditional_hashes, dict
+    ):
+        for task in delegated_tasks:
+            task_id = str(task.get("step_id") or "")
+            expected_plan = expected_unconditional_plans.get(task_id)
+            expected_hash = expected_unconditional_hashes.get(task_id)
+            supplied_plan = task.get("unconditional_capability_plan")
+            supplied_hash = task.get(
+                "unconditional_capability_plan_sha256"
+            )
+            if expected_plan is None and expected_hash is None:
+                if supplied_plan is not None or supplied_hash is not None:
+                    return (
+                        f"Declared step {task_id or '<missing>'} may not add "
+                        "unconditional-capability metadata."
+                    )
+                continue
+            if (
+                not isinstance(expected_plan, dict)
+                or not isinstance(expected_hash, str)
+                or supplied_plan != expected_plan
+                or supplied_hash != expected_hash
+            ):
+                return (
+                    f"Declared step {task_id or '<missing>'} requires the "
+                    "exact Harness-compiled unconditional_capability_plan "
+                    "and digest."
+                )
+    elif any(
+        "unconditional_capability_plan" in task
+        or "unconditional_capability_plan_sha256" in task
+        for task in delegated_tasks
+    ):
+        return (
+            "unconditional_capability_plan metadata was not declared for "
+            "this exact workflow gate and may not be added or changed."
+        )
+
     expected_capability_bindings = policy.get(
         "expected_capability_bindings"
     )
@@ -12303,6 +12529,7 @@ async def run_stream(
     knowledge_gate_activation_failure: dict[str, Any] | None = None
     knowledge_gate_group_receipts: dict[str, dict[str, Any]] = {}
     knowledge_gate_dispatch_ledger: list[dict[str, Any]] = []
+    knowledge_gate_candidate_mismatch_count = 0
     knowledge_gate_candidate_by_id = {
         str(candidate.get("candidate_id") or ""): candidate
         for candidate in (
@@ -12374,6 +12601,27 @@ async def run_stream(
             if clean:
                 result.append(clean)
         return result
+
+    def pending_knowledge_gate_resource_coordinate_matches(
+        tool_name: str,
+        args: dict[str, Any] | None,
+    ) -> bool:
+        """Distinguish a valid partial resource page from branch drift.
+
+        A successful ``skill_view`` page is not a gate receipt until the
+        runtime has observed a contiguous, digest-stable chain through EOF.
+        Its exact Skill/path coordinate is nevertheless valid while paging,
+        so mismatch recovery must not tell the model that the active
+        coordinate is inactive. Calls aimed at a different Skill or path do
+        get the same exact-frontier correction as any other shared bridge.
+        """
+
+        return _knowledge_gate_pending_resource_coordinate_matches(
+            delegated_knowledge_gate_plan,
+            pending_knowledge_gate_group_ids(),
+            tool_name=tool_name,
+            args=args,
+        )
 
     def record_knowledge_gate_candidate_receipt(
         tool_name: str,
@@ -13365,6 +13613,12 @@ async def run_stream(
                 expected_worker_knowledge_gate_plan_hashes: dict[
                     str, str
                 ] = {}
+                expected_worker_unconditional_capability_plans: dict[
+                    str, dict[str, Any]
+                ] = {}
+                expected_worker_unconditional_capability_plan_hashes: dict[
+                    str, str
+                ] = {}
                 expected_worker_result_fields: dict[str, list[str]] = {}
                 expected_worker_result_schemas: dict[str, dict[str, Any]] = {}
                 expected_worker_result_paths: dict[str, list[str]] = {}
@@ -13411,8 +13665,16 @@ async def run_stream(
                         "skills": meta.get("skills"),
                         "local_resources": meta.get("local_resources"),
                         "environment_contract": meta.get("environment_contract"),
-                        "knowledge_gate_ir": meta.get("knowledge_gate_ir"),
                     }
+                    unconditional_capability_selectors = (
+                        ordinary_worker_capability_selectors(
+                            meta,
+                            available_tools=run_state.available_tools,
+                            resolve_tool_selector=(
+                                _resolve_declared_tool_selector
+                            ),
+                        )
+                    )
                     required_capability_skills = (
                         _declared_capability_skill_names(declared_capabilities)
                     )
@@ -13445,6 +13707,144 @@ async def run_stream(
                             )
                         ),
                     )
+                    exact_unconditional_capability_plan: (
+                        dict[str, Any] | None
+                    ) = None
+                    exact_unconditional_capability_plan_sha256 = ""
+                    if unconditional_capability_selectors:
+                        snapshot_error = (
+                            bind_selected_skill_package_snapshot(
+                                (selected_skill,)
+                            )
+                        )
+                        if (
+                            snapshot_error
+                            or selected_skill
+                            not in loaded_package_snapshot_identities
+                            or not isinstance(
+                                loaded_packages.get(selected_skill),
+                                dict,
+                            )
+                        ):
+                            pending_workflow_contract_compile_failure = {
+                                "skill_name": selected_skill,
+                                "step_type": "worker",
+                                "step_id": worker_id,
+                                "workflow_reason": reason,
+                                "contract_path": (
+                                    "execution_contract.workers."
+                                    + worker_id
+                                    + ".capabilities"
+                                ),
+                                "error_code": (
+                                    snapshot_error
+                                    or "skill_package_snapshot_unbound"
+                                ),
+                                "error": (
+                                    "The exact selected Skill package snapshot "
+                                    "was unavailable or changed before "
+                                    "unconditional capability compilation."
+                                ),
+                            }
+                            forced_workflow_policy = None
+                            return
+                        try:
+                            (
+                                exact_unconditional_capability_plan,
+                                compiled_unconditional_digest,
+                            ) = (
+                                compile_runtime_unconditional_capability_plan(
+                                    unconditional_capability_selectors,
+                                    worker_id=worker_id,
+                                    owner_skill=selected_skill,
+                                    available_tools=(
+                                        run_state.available_tools
+                                    ),
+                                    loaded_packages=loaded_packages,
+                                    allowed_resources=(
+                                        tool_context
+                                        .allowed_skill_resources
+                                    ),
+                                    allowed_scripts=(
+                                        tool_context.allowed_skill_scripts
+                                    ),
+                                    process_only_scripts=(
+                                        tool_context
+                                        .process_only_skill_scripts
+                                    ),
+                                    allowed_package_digests=(
+                                        tool_context
+                                        .allowed_skill_package_digests
+                                    ),
+                                    allowed_commands=(
+                                        tool_context.allowed_skill_commands
+                                    ),
+                                    allowed_http_get=(
+                                        tool_context
+                                        .allowed_skill_http_prefixes
+                                    ),
+                                    allowed_http_post=(
+                                        tool_context
+                                        .allowed_skill_http_post_prefixes
+                                    ),
+                                    frozen_mcp_catalog=(
+                                        tool_context.frozen_mcp_catalog
+                                    ),
+                                    resolve_tool_selector=(
+                                        _resolve_declared_tool_selector
+                                    ),
+                                )
+                            )
+                            exact_unconditional_capability_plan_sha256 = str(
+                                compiled_unconditional_digest or ""
+                            )
+                        except KnowledgeGateCompileError as exc:
+                            pending_workflow_contract_compile_failure = {
+                                "skill_name": selected_skill,
+                                "step_type": "worker",
+                                "step_id": worker_id,
+                                "workflow_reason": reason,
+                                "contract_path": (
+                                    "execution_contract.workers."
+                                    + worker_id
+                                    + ".capabilities"
+                                ),
+                                "error_code": exc.code,
+                                "error": str(exc)[:4_000],
+                            }
+                            forced_workflow_policy = None
+                            return
+                    if exact_unconditional_capability_plan is not None:
+                        unconditional_candidates = [
+                            candidate
+                            for candidate in (
+                                exact_unconditional_capability_plan.get(
+                                    "candidates"
+                                ) or []
+                            )
+                            if isinstance(candidate, dict)
+                        ]
+                        required_capability_skills = list(dict.fromkeys([
+                            *required_capability_skills,
+                            *[
+                                str(candidate.get("skill_name") or "")
+                                for candidate in unconditional_candidates
+                                if str(candidate.get("skill_name") or "")
+                            ],
+                        ]))
+                        worker_tools = list(dict.fromkeys([
+                            *worker_tools,
+                            *[
+                                name
+                                for candidate in unconditional_candidates
+                                for name in (
+                                    knowledge_gate_candidate_tool_names(
+                                        candidate
+                                    )
+                                )
+                                if name in run_state.available_tools
+                            ],
+                        ]))
                     exact_knowledge_gate_plan: dict[str, Any] | None = None
                     exact_knowledge_gate_plan_sha256 = ""
                     symbolic_knowledge_gate = meta.get("knowledge_gate_ir")
@@ -13735,6 +14135,21 @@ async def run_stream(
                         expected_worker_knowledge_gate_plan_hashes[
                             worker_id
                         ] = exact_knowledge_gate_plan_sha256
+                    if exact_unconditional_capability_plan is not None:
+                        worker_task["unconditional_capability_plan"] = (
+                            exact_unconditional_capability_plan
+                        )
+                        worker_task[
+                            "unconditional_capability_plan_sha256"
+                        ] = exact_unconditional_capability_plan_sha256
+                        expected_worker_unconditional_capability_plans[
+                            worker_id
+                        ] = exact_unconditional_capability_plan
+                        expected_worker_unconditional_capability_plan_hashes[
+                            worker_id
+                        ] = (
+                            exact_unconditional_capability_plan_sha256
+                        )
                     if workflow_ir_exact_bindings:
                         worker_task["capability_bindings"] = (
                             exact_capability_bindings
@@ -13795,6 +14210,14 @@ async def run_stream(
                     forced_workflow_policy[
                         "expected_knowledge_gate_plan_sha256"
                     ] = expected_worker_knowledge_gate_plan_hashes
+                    forced_workflow_policy[
+                        "expected_unconditional_capability_plans"
+                    ] = expected_worker_unconditional_capability_plans
+                    forced_workflow_policy[
+                        "expected_unconditional_capability_plan_sha256"
+                    ] = (
+                        expected_worker_unconditional_capability_plan_hashes
+                    )
                     if plan.get("selection") == "workflow_ir":
                         forced_workflow_policy[
                             "expected_capability_bindings"
@@ -21108,12 +21531,7 @@ async def run_stream(
                         request_body.get("max_tokens") or effective_max_tokens
                     ),
                 )
-                stream_timeout = httpx.Timeout(
-                    connect=max(1.0, float(settings.llm_stream_connect_timeout_seconds)),
-                    read=max(5.0, float(settings.llm_stream_read_timeout_seconds)),
-                    write=30.0,
-                    pool=30.0,
-                )
+                stream_timeout = _provider_stream_transport_timeout()
                 stream_deadline_lease: MaterialProgressLease | None = None
                 stream_clock = asyncio.get_running_loop()
 
@@ -22074,7 +22492,15 @@ async def run_stream(
                     yield {"type": "tool_progress", "msg": progress_message}
                     stream_interruption_recovery_queued = True
                     break
-                if not _stream_retry_is_safe(full_content, full_reasoning):
+                if not _stream_retry_is_safe(
+                    full_content,
+                    full_reasoning,
+                    raw_content_chars=attempt_raw_content_chars,
+                    raw_reasoning_chars=attempt_raw_reasoning_chars,
+                    tool_call_fragment_count=(
+                        tool_call_accumulator.fragment_count
+                    ),
+                ):
                     primary_reasoning_only_terminal = bool(
                         agent_kind == "primary"
                         and not delegated_subtask
@@ -22357,7 +22783,15 @@ async def run_stream(
                     yield {"type": "tool_progress", "msg": progress_message}
                     stream_interruption_recovery_queued = True
                     break
-                if not _stream_retry_is_safe(full_content, full_reasoning):
+                if not _stream_retry_is_safe(
+                    full_content,
+                    full_reasoning,
+                    raw_content_chars=attempt_raw_content_chars,
+                    raw_reasoning_chars=attempt_raw_reasoning_chars,
+                    tool_call_fragment_count=(
+                        tool_call_accumulator.fragment_count
+                    ),
+                ):
                     primary_reasoning_only_terminal = bool(
                         agent_kind == "primary"
                         and not delegated_subtask
@@ -28241,6 +28675,15 @@ async def run_stream(
                                 decision_result
                             )
                             workflow_state_changed = True
+                            activated_frontier = (
+                                _knowledge_gate_activated_frontier_payload(
+                                    delegated_knowledge_gate_plan,
+                                    knowledge_gate_decision_receipt,
+                                    completed_group_ids=set(
+                                        knowledge_gate_group_receipts
+                                    ),
+                                )
+                            )
                             boundary_guidance_messages.append(
                                 "The knowledge-gate decision was accepted and "
                                 "only its branch-selected exact authority was "
@@ -28248,7 +28691,14 @@ async def run_stream(
                                 "every activated group before terminal "
                                 "synthesis; separate groups require distinct "
                                 "dispatches. Preserve unknown or unresolved "
-                                "groups as explicit WARN/degraded gaps."
+                                "groups as explicit WARN/degraded gaps. "
+                                "Runtime-owned activated frontier: "
+                                + json.dumps(
+                                    activated_frontier,
+                                    ensure_ascii=False,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                )
                             )
                 elif (
                     display_tool_name == CAPABILITY_PLAN_TOOL_NAME
@@ -28370,6 +28820,70 @@ async def run_stream(
                         if guidance:
                             boundary_guidance_messages.append(guidance)
                     workflow_state_changed = True
+                knowledge_gate_candidate_mismatch_observation: (
+                    dict[str, Any] | None
+                ) = None
+                pending_gate_groups = pending_knowledge_gate_group_ids()
+                pending_gate_tool_names = {
+                    name
+                    for group in pending_knowledge_gate_tool_groups()
+                    for name in group
+                }
+                if (
+                    actual_dispatch_attempted
+                    and knowledge_gate_decision_receipt is not None
+                    and pending_gate_groups
+                    and display_tool_name in pending_gate_tool_names
+                    and knowledge_gate_exact_receipt is None
+                    and not (
+                        pending_knowledge_gate_resource_coordinate_matches(
+                            display_tool_name,
+                            (
+                                receipt_args
+                                if isinstance(receipt_args, dict)
+                                else {}
+                            ),
+                        )
+                    )
+                ):
+                    knowledge_gate_candidate_mismatch_count += 1
+                    active_frontier = (
+                        _knowledge_gate_activated_frontier_payload(
+                            delegated_knowledge_gate_plan,
+                            knowledge_gate_decision_receipt,
+                            completed_group_ids=set(
+                                knowledge_gate_group_receipts
+                            ),
+                        )
+                    )
+                    knowledge_gate_candidate_mismatch_observation = {
+                        "plan_sha256": (
+                            delegated_knowledge_gate_plan_sha256
+                        ),
+                        "tool_name": display_tool_name,
+                        "pending_group_ids": pending_gate_groups,
+                        "mismatch_count": (
+                            knowledge_gate_candidate_mismatch_count
+                        ),
+                        "request_sent": (
+                            (_json_object(str(result)) or {}).get(
+                                "request_sent"
+                            )
+                        ),
+                    }
+                    boundary_guidance_messages.append(
+                        "The preceding call did not match any still-pending "
+                        "activated Knowledge Gate candidate and therefore did "
+                        "not advance the gate. Do not repeat or vary an "
+                        "inactive coordinate. Use one exact candidate from "
+                        "this runtime-owned pending frontier: "
+                        + json.dumps(
+                            active_frontier,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                    )
                 delegate_no_progress_observation: dict[str, Any] | None = None
                 delegate_semantic_progress_reason: str | None = None
                 delegate_semantic_result_sha256: str | None = None
@@ -28580,6 +29094,14 @@ async def run_stream(
                     for debug_evt in await debug_stream_event(
                         "tool.failure_streak_reset",
                         delegate_failure_streak_reset,
+                        tool_name=display_tool_name,
+                        tool_call_id=tool_call_id,
+                    ):
+                        yield debug_evt
+                if knowledge_gate_candidate_mismatch_observation is not None:
+                    for debug_evt in await debug_stream_event(
+                        "knowledge_gate.candidate.dispatch_unmatched",
+                        knowledge_gate_candidate_mismatch_observation,
                         tool_name=display_tool_name,
                         tool_call_id=tool_call_id,
                     ):
@@ -37059,6 +37581,21 @@ def _bounded_skill_execution_exposure(
                             for path in (worker.get("local_resources") or [])
                             if isinstance(path, str)
                         )
+                        # Conditional local candidates are parent authority
+                        # material but are not ordinary worker preloads or
+                        # unconditional capabilities.  Keep them in the root
+                        # exact resource closure so Knowledge Gate lowering can
+                        # bind their path/digest and withhold them until the
+                        # selected branch activates.
+                        declared_resource_paths.extend(
+                            str(path)
+                            for path in (
+                                worker.get(
+                                    "knowledge_gate_local_resources"
+                                ) or []
+                            )
+                            if isinstance(path, str)
+                        )
             for step_group in (
                 plan.get("bootstrap_sources") or [],
                 plan.get("aggregation_steps") or [],
@@ -37206,16 +37743,11 @@ def _bounded_skill_execution_exposure(
                             "knowledge_gate_skill_refs",
                         }
                     }
-                    # The loader may mirror gate-only refs into ``skills`` for
-                    # child preload. Remove those mirrored values here; the
-                    # KG compiler preserves their OR/unresolved semantics.
-                    if isinstance(ordinary_worker.get("skills"), list):
-                        ordinary_worker["skills"] = [
-                            value
-                            for value in ordinary_worker["skills"]
-                            if str(value).removeprefix("skill:")
-                            not in gate_skill_names
-                        ]
+                    # The loader owns the separation between ordinary static
+                    # capability declarations and Knowledge Gate references.
+                    # Do not subtract names merely because they also occur in
+                    # a conditional branch: a Skill may legitimately be both
+                    # an unconditional worker input and a gate candidate.
                     ordinary_skill_names = set(
                         _declared_capability_skill_names(ordinary_worker)
                     )

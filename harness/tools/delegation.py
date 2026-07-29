@@ -63,6 +63,7 @@ from knowledge_gate import (
 from knowledge_gate_runtime import (
     MAX_GATE_TEXT_CHARS as _MAX_KNOWLEDGE_GATE_TEXT_CHARS,
     MAX_KNOWLEDGE_GATE_PLAN_BYTES as _MAX_KNOWLEDGE_GATE_PLAN_BYTES,
+    MAX_UNCONDITIONAL_CAPABILITY_PLAN_BYTES,
 )
 from tools.path_security import sandbox_dir
 from workspace_patterns import (
@@ -808,6 +809,10 @@ _MAX_KNOWLEDGE_GATE_CHECKS = 128
 _MAX_KNOWLEDGE_GATE_GROUPS = 256
 _MAX_KNOWLEDGE_GATE_CANDIDATES = 512
 _MAX_KNOWLEDGE_GATE_SELECTORS = 64
+_MAX_UNCONDITIONAL_CAPABILITY_SELECTORS = 256
+_MAX_UNCONDITIONAL_CAPABILITY_PLAN_BYTES = (
+    MAX_UNCONDITIONAL_CAPABILITY_PLAN_BYTES
+)
 _KNOWLEDGE_GATE_DECISION_TOOL = "submit_knowledge_gate_decisions"
 _PRELOADED_READER_TOOLS = {"skill_view", "read_file", "search_files"}
 _DECLARED_SKILL_NAME_RE = re.compile(
@@ -3133,6 +3138,187 @@ def _strict_knowledge_gate_plan(
     return plan, actual_digest, None
 
 
+def _strict_unconditional_capability_plan(
+    task: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str, str | None]:
+    """Validate exact static authority without creating receipt obligations."""
+
+    has_plan = "unconditional_capability_plan" in task
+    has_digest = "unconditional_capability_plan_sha256" in task
+    if not has_plan and not has_digest:
+        return None, "", None
+    if not has_plan or not has_digest:
+        return None, "", (
+            "unconditional_capability_plan and "
+            "unconditional_capability_plan_sha256 must be supplied together."
+        )
+    raw = task.get("unconditional_capability_plan")
+    supplied_digest = task.get("unconditional_capability_plan_sha256")
+    if not isinstance(raw, dict):
+        return None, "", (
+            "unconditional_capability_plan must be one explicit object."
+        )
+    if (
+        not isinstance(supplied_digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", supplied_digest)
+    ):
+        return None, "", (
+            "unconditional_capability_plan_sha256 must be one lowercase full "
+            "SHA-256."
+        )
+    try:
+        encoded = json.dumps(
+            raw,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, RecursionError):
+        return None, "", (
+            "unconditional_capability_plan must contain only finite, acyclic "
+            "JSON values."
+        )
+    if len(encoded) > _MAX_UNCONDITIONAL_CAPABILITY_PLAN_BYTES:
+        return None, "", (
+            "unconditional_capability_plan exceeds the bounded UTF-8 metadata "
+            f"limit of {_MAX_UNCONDITIONAL_CAPABILITY_PLAN_BYTES} bytes."
+        )
+    actual_digest = hashlib.sha256(encoded).hexdigest()
+    if actual_digest != supplied_digest:
+        return None, actual_digest, (
+            "unconditional_capability_plan_sha256 does not match the exact "
+            "canonical unconditional_capability_plan object."
+        )
+    plan = json.loads(encoded.decode("utf-8"))
+    if set(plan) != {
+        "schema_version",
+        "worker_id",
+        "owner_skill",
+        "selectors",
+        "candidates",
+    }:
+        return None, actual_digest, (
+            "unconditional_capability_plan must contain exactly "
+            "schema_version, worker_id, owner_skill, selectors, and candidates."
+        )
+    if plan.get("schema_version") != 1:
+        return None, actual_digest, (
+            "unconditional_capability_plan.schema_version must be exactly 1."
+        )
+    plan_worker, error = _bounded_knowledge_gate_identifier(
+        plan.get("worker_id"),
+        label="unconditional_capability_plan.worker_id",
+    )
+    if error:
+        return None, actual_digest, error
+    plan_skill = plan.get("owner_skill")
+    if (
+        not isinstance(plan_skill, str)
+        or len(plan_skill) > _MAX_DECLARED_SKILL_NAME_CHARS
+        or not _DECLARED_SKILL_NAME_RE.fullmatch(plan_skill)
+    ):
+        return None, actual_digest, (
+            "unconditional_capability_plan.owner_skill must be one exact safe "
+            "Skill name."
+        )
+    if plan_worker != str(task.get("worker_id") or "").strip():
+        return None, actual_digest, (
+            "unconditional_capability_plan.worker_id does not match the "
+            "delegated worker."
+        )
+    if plan_skill != str(task.get("skill_name") or "").strip():
+        return None, actual_digest, (
+            "unconditional_capability_plan.owner_skill does not match the "
+            "delegated Skill."
+        )
+    selectors, error = _strict_knowledge_gate_string_list(
+        plan.get("selectors"),
+        label="unconditional_capability_plan.selectors",
+        max_items=_MAX_UNCONDITIONAL_CAPABILITY_SELECTORS,
+    )
+    if error or not selectors:
+        return None, actual_digest, (
+            error
+            or "unconditional_capability_plan.selectors must not be empty."
+        )
+    candidates = plan.get("candidates")
+    if (
+        not isinstance(candidates, list)
+        or not candidates
+        or len(candidates) > _MAX_KNOWLEDGE_GATE_CANDIDATES
+    ):
+        return None, actual_digest, (
+            "unconditional_capability_plan.candidates must be a non-empty "
+            "bounded list."
+        )
+    normalized_candidates: list[dict[str, Any]] = []
+    for offset in range(0, len(candidates), _MAX_EXACT_CAPABILITY_BINDINGS):
+        chunk = candidates[offset:offset + _MAX_EXACT_CAPABILITY_BINDINGS]
+        chunk_encoded = json.dumps(
+            chunk,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        validated, _digest, candidate_error = (
+            _strict_exact_capability_bindings({
+                "capability_bindings": chunk,
+                "capability_bindings_sha256": hashlib.sha256(
+                    chunk_encoded
+                ).hexdigest(),
+            })
+        )
+        if candidate_error:
+            return None, actual_digest, (
+                "unconditional_capability_plan.candidates is invalid: "
+                + candidate_error
+            )
+        normalized_candidates.extend(validated)
+    candidate_ids = [
+        str(candidate.get("candidate_id") or "")
+        for candidate in normalized_candidates
+    ]
+    if len(set(candidate_ids)) != len(candidate_ids):
+        return None, actual_digest, (
+            "unconditional_capability_plan.candidates repeats a candidate_id."
+        )
+    if any(
+        _KNOWLEDGE_GATE_DECISION_TOOL
+        in set(candidate.get("tool_names") or [])
+        for candidate in normalized_candidates
+    ):
+        return None, actual_digest, (
+            "The knowledge-gate decision control tool cannot be an "
+            "unconditional capability candidate."
+        )
+    for index, candidate in enumerate(normalized_candidates):
+        skill_identity = str(candidate.get("skill_name") or "")
+        has_skill_identity_digest = any(
+            candidate.get(field) is not None
+            for field in ("skill_md_sha256", "package_sha256")
+        )
+        if skill_identity and (
+            not isinstance(candidate.get("skill_md_sha256"), str)
+            or not isinstance(candidate.get("package_sha256"), str)
+        ):
+            return None, actual_digest, (
+                "unconditional_capability_plan.candidates["
+                f"{index}] derives from Skill {skill_identity!r} and must bind "
+                "both skill_md_sha256 and package_sha256."
+            )
+        if not skill_identity and has_skill_identity_digest:
+            return None, actual_digest, (
+                "unconditional_capability_plan.candidates["
+                f"{index}] cannot carry Skill identity digests without an "
+                "exact skill_name."
+            )
+    plan["selectors"] = selectors
+    plan["candidates"] = normalized_candidates
+    return plan, actual_digest, None
+
+
 def _exact_node_capability_grants(
     bindings: list[dict[str, Any]],
     *,
@@ -3723,6 +3909,34 @@ def _exact_knowledge_gate_candidate_grants(
         "tool_names": list(dict.fromkeys(bound_tools)),
         "receipt_bindings": receipts,
     }, None
+
+
+def _exact_unconditional_capability_grants(
+    plan: dict[str, Any] | None,
+    *,
+    context: ToolContext,
+) -> tuple[dict[str, Any], str | None]:
+    """Authenticate static candidates against the same parent-owned grants.
+
+    Conditional and unconditional plans intentionally share exact coordinate
+    validation.  Their only semantic difference is activation and receipts:
+    this static bundle is installed in the child's base ToolContext and its
+    ``receipt_bindings`` are never interpreted as mandatory dispatches.
+    """
+
+    grants, error = _exact_knowledge_gate_candidate_grants(
+        plan,
+        context=context,
+    )
+    if error:
+        error = error.replace(
+            "Knowledge-gate candidate",
+            "Unconditional capability candidate",
+        ).replace(
+            "knowledge-gate compilation",
+            "unconditional capability compilation",
+        )
+    return grants, error
 
 
 def _strict_result_field_list(
@@ -5331,6 +5545,11 @@ async def _run_child(
         capability_bindings_metadata_error,
     ) = _strict_exact_capability_bindings(task)
     (
+        unconditional_capability_plan,
+        unconditional_capability_plan_sha256,
+        unconditional_capability_plan_metadata_error,
+    ) = _strict_unconditional_capability_plan(task)
+    (
         knowledge_gate_plan,
         knowledge_gate_plan_sha256,
         knowledge_gate_plan_metadata_error,
@@ -5678,6 +5897,7 @@ async def _run_child(
         or capability_metadata_error
         or capability_skill_metadata_error
         or capability_bindings_metadata_error
+        or unconditional_capability_plan_metadata_error
         or knowledge_gate_plan_metadata_error
         or skill_inspection_metadata_error
         or instruction_source_metadata_error
@@ -5697,6 +5917,7 @@ async def _run_child(
                 + ", ".join(missing_capability_grants)
             )
     exact_node_capability_grants: dict[str, Any] | None = None
+    unconditional_capability_grants: dict[str, Any] | None = None
     knowledge_gate_candidate_grants: dict[str, Any] | None = None
     if metadata_error is None and capability_bindings:
         binding_capability_skills = list(dict.fromkeys(
@@ -5713,15 +5934,27 @@ async def _run_child(
             exact_binding_boundary_error,
         ) = _exact_node_capability_grants(
             capability_bindings,
-            required_capability_skills=(
-                binding_capability_skills
-                if knowledge_gate_plan is not None
-                else required_capability_skills
-            ),
+            # The task-level Skill preload list may also contain ordinary
+            # static or conditional packages.  Authenticate this authority
+            # class against only the exact Skills carried by its own bindings.
+            required_capability_skills=binding_capability_skills,
             context=context,
         )
         if exact_binding_boundary_error:
             metadata_error = exact_binding_boundary_error
+    if (
+        metadata_error is None
+        and unconditional_capability_plan is not None
+    ):
+        (
+            unconditional_capability_grants,
+            unconditional_boundary_error,
+        ) = _exact_unconditional_capability_grants(
+            unconditional_capability_plan,
+            context=context,
+        )
+        if unconditional_boundary_error:
+            metadata_error = unconditional_boundary_error
     if metadata_error is None and knowledge_gate_plan is not None:
         (
             knowledge_gate_candidate_grants,
@@ -5732,44 +5965,57 @@ async def _run_child(
         )
         if gate_boundary_error:
             metadata_error = gate_boundary_error
-        else:
-            gate_capability_skills = {
-                str(candidate.get("skill_name") or "")
-                for candidate in knowledge_gate_plan.get("candidates") or []
-                if (
-                    str(candidate.get("skill_name") or "")
-                )
-            }
-            missing_gate_skill_preloads = sorted(
-                gate_capability_skills
-                - set(required_capability_skills)
+    if metadata_error is None and (
+        unconditional_capability_plan is not None
+        or knowledge_gate_plan is not None
+    ):
+        exact_plan_capability_skills = {
+            str(candidate.get("skill_name") or "")
+            for plan in (
+                unconditional_capability_plan,
+                knowledge_gate_plan,
             )
-            if missing_gate_skill_preloads:
-                metadata_error = (
-                    "knowledge_gate_plan capability Skills must be declared in "
-                    "required_capability_skills for exact main-file preloading; "
-                    "missing: " + ", ".join(missing_gate_skill_preloads)
-                )
-            missing_parent_gate_mains = sorted(
-                f"{capability_skill}/SKILL.md"
-                for capability_skill in required_capability_skills
-                if (
-                    capability_skill,
-                    "SKILL.md",
-                ) not in set(context.allowed_skill_resources)
+            if isinstance(plan, dict)
+            for candidate in plan.get("candidates") or []
+            if (
+                isinstance(candidate, dict)
+                and str(candidate.get("skill_name") or "")
             )
-            if metadata_error is None and missing_parent_gate_mains:
-                metadata_error = (
-                    "knowledge_gate_plan capability Skill mains are outside "
-                    "the parent resource grant: "
-                    + ", ".join(missing_parent_gate_mains)
-                )
+        }
+        missing_plan_skill_preloads = sorted(
+            exact_plan_capability_skills
+            - set(required_capability_skills)
+        )
+        if missing_plan_skill_preloads:
+            metadata_error = (
+                "Exact static/conditional capability Skills must be declared "
+                "in required_capability_skills for exact main-file preloading; "
+                "missing: " + ", ".join(missing_plan_skill_preloads)
+            )
+        missing_parent_plan_mains = sorted(
+            f"{capability_skill}/SKILL.md"
+            for capability_skill in required_capability_skills
+            if (
+                capability_skill,
+                "SKILL.md",
+            ) not in set(context.allowed_skill_resources)
+        )
+        if metadata_error is None and missing_parent_plan_mains:
+            metadata_error = (
+                "Exact static/conditional capability Skill mains are outside "
+                "the parent resource grant: "
+                + ", ".join(missing_parent_plan_mains)
+            )
     exact_authority_active = bool(
-        capability_bindings or knowledge_gate_plan is not None
+        capability_bindings
+        or unconditional_capability_plan is not None
+        or knowledge_gate_plan is not None
     )
     if metadata_error is None and exact_authority_active:
         exact_bound_tools = set(
             (exact_node_capability_grants or {}).get("bound_tool_names") or []
+        ) | set(
+            (unconditional_capability_grants or {}).get("tool_names") or []
         ) | set(
             (knowledge_gate_candidate_grants or {}).get(
                 "tool_names"
@@ -5797,9 +6043,10 @@ async def _run_child(
         )
         if metadata_error is None and unexpected_tools:
             metadata_error = (
-                "Exact Workflow IR node tools must be limited to its own "
-                "mandatory/conditional capability bindings, the knowledge-gate "
-                "decision control, and deterministic prerequisite readers; "
+                "Exact delegated node tools must be limited to its own "
+                "mandatory, unconditional, or conditional capability "
+                "bindings, the knowledge-gate decision control, and "
+                "deterministic prerequisite readers; "
                 "unexpected: " + ", ".join(unexpected_tools)
             )
         for binding in (
@@ -5923,6 +6170,18 @@ async def _run_child(
         )
     if (
         metadata_error is None
+        and unconditional_capability_plan is not None
+        and (
+            "deterministic_intent_selections" in task
+            or "required_skill_files" in task
+        )
+    ):
+        metadata_error = (
+            "unconditional_capability_plan is not valid on the deterministic "
+            "intent-only delegation path."
+        )
+    if (
+        metadata_error is None
         and knowledge_gate_plan is not None
         and (
             "deterministic_intent_selections" in task
@@ -5957,6 +6216,17 @@ async def _run_child(
             "capability_binding_candidate_ids": [
                 str(binding.get("candidate_id") or "")
                 for binding in capability_bindings
+            ],
+            "unconditional_capability_plan_sha256": (
+                unconditional_capability_plan_sha256 or None
+            ),
+            "unconditional_capability_candidate_ids": [
+                str(candidate.get("candidate_id") or "")
+                for candidate in (
+                    (unconditional_capability_plan or {}).get(
+                        "candidates"
+                    ) or []
+                )
             ],
             "knowledge_gate_plan_sha256": (
                 knowledge_gate_plan_sha256 or None
@@ -6081,38 +6351,32 @@ async def _run_child(
             if capability_bindings else ""
         )
         + (
-            "Frozen conditional knowledge-gate plan (copy its digest unchanged "
-            "into exactly one submit_knowledge_gate_decisions call before "
-            "ordinary evidence dispatch). Every yes/no/unknown decision "
-            "activates only its matching declared branch. Branch groups are "
-            "AND obligations and "
-            "candidate IDs inside one one_of group are alternatives. Every "
-            "activated group with candidates requires its own distinct actual "
-            "dispatch; another group's receipt cannot be reused. An unknown "
-            "decision, an activated group with no resolved candidates, or a "
-            "group whose matching dispatches all fail requires a result-level "
-            "degraded status and exactly one single-line ledger "
+            "A frozen conditional knowledge-gate plan is bound to this child. "
+            "The runtime appends its decision-only projection and digest; copy "
+            "that digest unchanged into exactly one "
+            "submit_knowledge_gate_decisions call before ordinary evidence "
+            "dispatch. Every yes/no/unknown decision activates only its "
+            "matching declared branch. The runtime then appends only the "
+            "activated exact candidate frontier. Branch groups are AND "
+            "obligations and candidates inside one one_of group are "
+            "alternatives. Every activated group with candidates requires its "
+            "own distinct actual dispatch; another group's receipt cannot be "
+            "reused. An unknown decision, an activated group with no resolved "
+            "candidates, or a group whose matching dispatches all fail requires "
+            "a result-level degraded status and exactly one single-line ledger "
             '`KNOWLEDGE_GATE_GAPS_JSON: {"status":"degraded",'
             '"gap_ids":["<exact Harness gap id>",...]}`. Use only these '
             "deterministic IDs: `check:<check_id>:unknown`, "
             "`group:<group_id>:unresolved`, and "
             "`group:<group_id>:failed`. Do not report "
-            "unselected branches or unused alternatives as gaps. Plan: "
-            + json.dumps(
-                {
-                    **(knowledge_gate_plan or {}),
-                    "plan_sha256": knowledge_gate_plan_sha256,
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-            )
+            "unselected branches or unused alternatives as gaps. "
             + "\n"
             if knowledge_gate_plan is not None else ""
         )
         + (
             "Required evidence capabilities (at least one must actually be "
             f"attempted): {', '.join(required_capability_tools)}\n"
-            if required_capability_tools and not exact_authority_active else ""
+            if required_capability_tools else ""
         )
         + (
             "Required capability Skill mains already loaded by the harness "
@@ -6162,6 +6426,7 @@ async def _run_child(
                 or required_capability_tools
                 or required_capability_skills
                 or capability_bindings
+                or unconditional_capability_plan is not None
                 or knowledge_gate_plan is not None
             )
             else ""
@@ -6546,6 +6811,14 @@ async def _run_child(
                 capability_bindings_sha256 or None
             ),
             "capability_binding_count": len(capability_bindings),
+            "unconditional_capability_plan_sha256": (
+                unconditional_capability_plan_sha256 or None
+            ),
+            "unconditional_capability_candidate_count": len(
+                (unconditional_capability_plan or {}).get(
+                    "candidates"
+                ) or []
+            ),
             "knowledge_gate_plan_sha256": (
                 knowledge_gate_plan_sha256 or None
             ),
@@ -7064,7 +7337,9 @@ async def _run_child(
     )
     capability_resource_grant_error = None
     exact_grants_active = bool(
-        capability_bindings or knowledge_gate_plan is not None
+        capability_bindings
+        or unconditional_capability_plan is not None
+        or knowledge_gate_plan is not None
     )
 
     def exact_grants(field: str) -> list[Any]:
@@ -7072,9 +7347,17 @@ async def _run_child(
         # child's initial ToolContext.  They travel in the separately sealed
         # runtime authority bundle and are installed only after the typed
         # decision control activates their exact groups.
-        return list(dict.fromkeys(
-            (exact_node_capability_grants or {}).get(field) or []
-        ))
+        static_field = (
+            "tool_names"
+            if field == "bound_tool_names"
+            else field
+        )
+        return list(dict.fromkeys([
+            *((exact_node_capability_grants or {}).get(field) or []),
+            *((unconditional_capability_grants or {}).get(
+                static_field
+            ) or []),
+        ]))
 
     if exact_grants_active:
         capability_resource_grants = exact_grants("resource_grants")
@@ -7208,15 +7491,13 @@ async def _run_child(
         path != "SKILL.md"
         for skill, path in capability_resource_grants
     )
-    mandatory_exact_tool_names = set(
-        (exact_node_capability_grants or {}).get("bound_tool_names") or []
-    )
+    base_exact_tool_names = set(exact_grants("bound_tool_names"))
     runtime_base_tools = (
         [
             name
             for name in tools
             if (
-                name in mandatory_exact_tool_names
+                name in base_exact_tool_names
                 or name in _PRELOADED_READER_TOOLS
                 or name == _KNOWLEDGE_GATE_DECISION_TOOL
             )
@@ -7341,6 +7622,29 @@ async def _run_child(
         for binding in capability_bindings
         if binding.get("kind") == "skill_resource"
     }
+    exact_resource_binding_digests.update({
+        (
+            str(binding.get("skill_name") or ""),
+            str(binding.get("resource_path") or ""),
+        ): str(binding.get("sha256") or "")
+        for binding in (
+            (unconditional_capability_plan or {}).get("candidates") or []
+        )
+        if binding.get("kind") == "skill_resource"
+    })
+    exact_resource_binding_digests.update({
+        (
+            str(binding.get("skill_name") or ""),
+            "SKILL.md",
+        ): str(binding.get("skill_md_sha256") or "")
+        for binding in (
+            (unconditional_capability_plan or {}).get("candidates") or []
+        )
+        if (
+            str(binding.get("skill_name") or "")
+            and str(binding.get("skill_md_sha256") or "")
+        )
+    })
     exact_resource_binding_digests.update({
         (
             str(binding.get("skill_name") or ""),
@@ -9392,11 +9696,7 @@ async def _run_child(
         if gate_gap_error:
             validation_error = gate_gap_error
 
-    for script_runner in (
-        ("run_skill_python", "run_skill_script")
-        if not exact_grants_active
-        else ()
-    ):
+    for script_runner in ("run_skill_python", "run_skill_script"):
         if not (
             required_capability_skills
             and script_runner in successful_required_capabilities
@@ -9446,7 +9746,6 @@ async def _run_child(
                 })
     if (
         validation_error is None
-        and not exact_grants_active
         and required_capability_tools
         and not attempted_required_capabilities
     ):
@@ -9456,7 +9755,6 @@ async def _run_child(
         )
     if (
         validation_error is None
-        and not exact_grants_active
         and attempted_required_capabilities
         and not successful_required_capabilities
         and completion_quality_declaration.get("status") != "degraded"
@@ -9465,10 +9763,9 @@ async def _run_child(
             "Every attempted required evidence capability failed; completion "
             "requires an explicit WARN/degraded report naming the evidence gap."
         )
-    if not exact_grants_active:
-        capability_receipt_audit["successful_tool_names"] = list(
-            successful_required_capabilities
-        )
+    capability_receipt_audit["successful_tool_names"] = list(
+        successful_required_capabilities
+    )
 
     # Completion quality is derived from Harness-owned dispatch receipts and
     # typed gap ledgers before consulting model-authored prose.  In
@@ -9486,30 +9783,45 @@ async def _run_child(
     capability_audit_mode = str(
         capability_receipt_audit.get("mode") or ""
     )
-    if capability_audit_mode == "exact_candidate":
-        attempted_evidence_receipt_count = len(
-            capability_receipt_audit.get("receipts") or []
+    successful_required_receipt_count = sum(
+        1
+        for call in legacy_evidence_receipts
+        if (
+            str(call.get("outcome") or "") == "success"
+            and str(call.get("tool_name") or "")
+            in successful_required_capabilities
         )
-        successful_evidence_receipt_count = len(
-            capability_receipt_audit.get("successful_candidate_ids") or []
+    )
+    if capability_audit_mode == "exact_candidate":
+        attempted_evidence_receipt_count = max(
+            len(capability_receipt_audit.get("receipts") or []),
+            len(legacy_evidence_receipts),
+        )
+        successful_evidence_receipt_count = max(
+            len(
+                capability_receipt_audit.get(
+                    "successful_candidate_ids"
+                ) or []
+            ),
+            successful_required_receipt_count,
         )
     elif capability_audit_mode == "conditional_knowledge_gate_plan":
-        attempted_evidence_receipt_count = len(
-            knowledge_gate_receipt_audit.get("receipts") or []
+        attempted_evidence_receipt_count = max(
+            len(knowledge_gate_receipt_audit.get("receipts") or []),
+            len(legacy_evidence_receipts),
         )
-        successful_evidence_receipt_count = len(
-            knowledge_gate_receipt_audit.get("successful_group_ids") or []
+        successful_evidence_receipt_count = max(
+            len(
+                knowledge_gate_receipt_audit.get(
+                    "successful_group_ids"
+                ) or []
+            ),
+            successful_required_receipt_count,
         )
     else:
         attempted_evidence_receipt_count = len(legacy_evidence_receipts)
-        successful_evidence_receipt_count = sum(
-            1
-            for call in legacy_evidence_receipts
-            if (
-                str(call.get("outcome") or "") == "success"
-                and str(call.get("tool_name") or "")
-                in successful_required_capabilities
-            )
+        successful_evidence_receipt_count = (
+            successful_required_receipt_count
         )
 
     no_verified_value_source = bool(
@@ -9928,6 +10240,9 @@ async def _run_child(
         "capability_bindings_sha256": (
             capability_bindings_sha256 or None
         ),
+        "unconditional_capability_plan_sha256": (
+            unconditional_capability_plan_sha256 or None
+        ),
         "capability_receipt_audit": capability_receipt_audit,
         "knowledge_gate_plan_sha256": (
             knowledge_gate_plan_sha256 or None
@@ -10042,6 +10357,8 @@ async def delegate_task(
     required_capability_skills: list[str] | None = None,
     capability_bindings: list[dict[str, Any]] | None = None,
     capability_bindings_sha256: str | None = None,
+    unconditional_capability_plan: dict[str, Any] | None = None,
+    unconditional_capability_plan_sha256: str | None = None,
     knowledge_gate_plan: dict[str, Any] | None = None,
     knowledge_gate_plan_sha256: str | None = None,
     required_skill_files_to_inspect: list[str] | None = None,
@@ -10090,6 +10407,16 @@ async def delegate_task(
             single_task["capability_bindings"] = capability_bindings
             single_task["capability_bindings_sha256"] = (
                 capability_bindings_sha256
+            )
+        if (
+            unconditional_capability_plan is not None
+            or unconditional_capability_plan_sha256 is not None
+        ):
+            single_task["unconditional_capability_plan"] = (
+                unconditional_capability_plan
+            )
+            single_task["unconditional_capability_plan_sha256"] = (
+                unconditional_capability_plan_sha256
             )
         if (
             knowledge_gate_plan is not None
@@ -10953,6 +11280,35 @@ _KNOWLEDGE_GATE_PLAN_PARAMETER_SCHEMA = {
     ],
 }
 
+_UNCONDITIONAL_CAPABILITY_PLAN_PARAMETER_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "schema_version": {"type": "integer", "enum": [1]},
+        "worker_id": {"type": "string"},
+        "owner_skill": {"type": "string"},
+        "selectors": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": _MAX_UNCONDITIONAL_CAPABILITY_SELECTORS,
+            "items": {"type": "string"},
+        },
+        "candidates": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": _MAX_KNOWLEDGE_GATE_CANDIDATES,
+            "items": _EXACT_CAPABILITY_BINDINGS_PARAMETER_SCHEMA["items"],
+        },
+    },
+    "required": [
+        "schema_version",
+        "worker_id",
+        "owner_skill",
+        "selectors",
+        "candidates",
+    ],
+}
+
 _INSTRUCTION_SOURCE_BINDINGS_PARAMETER_SCHEMA = {
     "type": "array",
     "minItems": 1,
@@ -11108,6 +11464,22 @@ DELEGATE_TASK_SCHEMA = {
                     "Canonical SHA-256 of capability_bindings. Copy unchanged."
                 ),
             },
+            "unconditional_capability_plan": {
+                **_UNCONDITIONAL_CAPABILITY_PLAN_PARAMETER_SCHEMA,
+                "description": (
+                    "Harness-compiled exact static capability authority for "
+                    "one delegated node. Candidates are available but do not "
+                    "create dispatch receipt obligations. Copy unchanged."
+                ),
+            },
+            "unconditional_capability_plan_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": (
+                    "Canonical SHA-256 of unconditional_capability_plan. Copy "
+                    "unchanged."
+                ),
+            },
             "knowledge_gate_plan": {
                 **_KNOWLEDGE_GATE_PLAN_PARAMETER_SCHEMA,
                 "description": (
@@ -11229,6 +11601,13 @@ DELEGATE_TASK_SCHEMA = {
                             _EXACT_CAPABILITY_BINDINGS_PARAMETER_SCHEMA
                         ),
                         "capability_bindings_sha256": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{64}$",
+                        },
+                        "unconditional_capability_plan": (
+                            _UNCONDITIONAL_CAPABILITY_PLAN_PARAMETER_SCHEMA
+                        ),
+                        "unconditional_capability_plan_sha256": {
                             "type": "string",
                             "pattern": "^[0-9a-f]{64}$",
                         },
