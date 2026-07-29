@@ -20,6 +20,7 @@ from retrieval_policy import (
     normalize_retrieval_completeness_policy,
 )
 from delegated_result_contract import (
+    _mask_markdown_code_for_protocol_audit,
     audit_raw_tool_protocol,
     audit_result_fields as _result_field_audit,
     normalize_result_field_schema,
@@ -104,6 +105,17 @@ _MODEL_INTENT_CLASSIFIER_STEP_TYPES = {
     "intent_classification",
     "classification",
 }
+_EVIDENCE_ACQUISITION_STEP_TYPES = {
+    "knowledge_bootstrap",
+    "bootstrap",
+    "retrieval",
+    "evidence_retrieval",
+    "evidence_acquisition",
+    "source_retrieval",
+    "source_acquisition",
+    "data_retrieval",
+    "data_acquisition",
+}
 _MAX_INTENT_CLASSIFIER_ITERATIONS = 2
 _MAX_INTENT_CLASSIFIER_OUTPUT_TOKENS = 4_096
 
@@ -115,36 +127,7 @@ _TERMINAL_BUDGET_OR_LENGTH_REASONS = {
     "model_hit_max_output_tokens",
 }
 
-_DEGRADED_REPORT_PATTERN = re.compile(
-    r"\b(?:warn(?:ing)?|degraded)\b|警告|降级",
-    re.IGNORECASE,
-)
-
-_EXPLICIT_DEGRADED_STATUS_PATTERN = re.compile(
-    r"""
-    (?:
-        ["'](?:status|completion[_\s-]*quality|quality)["']
-        \s*:\s*
-        ["'](?:degraded|warn(?:ing)?)["']
-    )
-    |
-    (?:
-        ^\s*\#{1,6}\s+
-        [^\r\n]{0,120}
-        (?:degraded[\s_-]*status|fallback\s*/\s*degraded|降级状态)
-        [^\r\n]{0,120}$
-    )
-    |
-    (?:
-        ^\s*(?:[-*]\s*)?(?:\#{1,6}\s*)?
-        (?:status|completion[\s_-]*quality|quality|result|状态|完成质量|结果)
-        \s*(?:[:：=]|[—-]\s+|\|\s*)
-        (?:\*\*)?(?:degraded|warn(?:ing)?|降级|警告)(?:\*\*)?
-        (?:\s|$|\|)
-    )
-    """,
-    re.IGNORECASE | re.MULTILINE | re.VERBOSE,
-)
+_MAX_COMPLETION_QUALITY_JSON_BYTES = 4_096
 
 _WEAK_DELEGATE_NAME_PATTERN = re.compile(
     r"^(?:delegate|agent|worker)[-_ ]?\d+$",
@@ -231,62 +214,350 @@ def _cancellation_attribution_payload(
         projected["retryable"] = retryable
     return projected
 
-_EXPLICIT_DEGRADED_MARKER_PATTERN = re.compile(
-    r"""
-    (?:
-        (?<!NOT\ )(?<!NON-)\bDEGRADED\b
-    )
-    |
-    (?:
-        (?<!NO\ )(?<!NOT\ )\bWARN(?:ING)?\b
-    )
-    |
-    (?:
-        ^\s*(?:[-*]\s*)?(?:\#{1,6}\s*)?
-        (?:\*\*)?(?:DEGRADED(?:\s+GAP)?|WARN(?:ING)?)(?:\*\*)?
-        (?:\s*(?:[:：—-]|\||$))
-    )
-    |
-    (?:
-        (?:[:：—-]|\|)\s*
-        (?:\*\*)?(?:DEGRADED(?:\s+GAP)?|WARN(?:ING)?)(?:\*\*)?
-        (?:\s*(?:[:：—-]|\||$))
-    )
-    |
-    (?:
-        ^\s*(?:[-*]\s*)?(?:\#{1,6}\s*)?
-        (?:降级(?:状态|结果|完成|缺口)?|警告(?:状态|结果|缺口)?)
-        (?:\s*(?:[:：—-]|\||$))
-    )
-    """,
-    re.MULTILINE | re.VERBOSE,
-)
-
-
-def _content_declares_degraded_completion(content: str) -> bool:
-    """Return true only for an explicit, result-level degraded declaration.
-
-    A child may truthfully finish with evidence gaps.  The outer workflow must
-    preserve that quality state instead of upgrading it to ``complete`` merely
-    because the prose/output contract passed.  Conversely, an incidental
-    sentence such as "this result is not degraded" is not a machine quality
-    declaration, so the accepted forms are deliberately status-shaped,
-    uppercase markers, or Chinese status headings.
-    """
-
-    value = str(content or "")
-    return bool(
-        _EXPLICIT_DEGRADED_STATUS_PATTERN.search(value)
-        or _EXPLICIT_DEGRADED_MARKER_PATTERN.search(value)
-    )
-
-
 _CAPABILITY_GAPS_JSON_PATTERN = re.compile(
     r"(?m)^\s*CAPABILITY_GAPS_JSON:\s*(\{[^\r\n]*\})\s*$"
 )
 _KNOWLEDGE_GATE_GAPS_JSON_PATTERN = re.compile(
     r"(?m)^\s*KNOWLEDGE_GATE_GAPS_JSON:\s*(\{[^\r\n]*\})\s*$"
 )
+
+
+def _strict_single_line_json_object(
+    raw: str,
+    *,
+    ledger_name: str,
+    max_bytes: int,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Decode one bounded JSON object while rejecting duplicate keys."""
+
+    if len(raw.encode("utf-8")) > max_bytes:
+        return None, f"{ledger_name} exceeds its bounded size limit"
+
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate key: {key}")
+            value[key] = item
+        return value
+
+    try:
+        payload = json.loads(
+            raw,
+            object_pairs_hook=reject_duplicates,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON constant: {value}")
+            ),
+        )
+    except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
+        return None, f"{ledger_name} must contain valid finite JSON"
+    if not isinstance(payload, dict):
+        return None, f"{ledger_name} must contain one JSON object"
+    return payload, None
+
+
+def _legacy_completion_quality_status(content: str) -> str | None:
+    """Parse bounded legacy status shapes without treating headings as state.
+
+    This compatibility path intentionally recognizes only status/value rows,
+    exact table cells, and historical uppercase WARN/DEGRADED markers.  A
+    heading such as ``Fallback / Degraded Status`` describes a report section,
+    not its value, and therefore cannot determine completion quality.
+    """
+
+    statuses: list[str] = []
+    for original_line in str(content or "").splitlines():
+        raw_line = original_line.strip()
+        if not raw_line:
+            continue
+        if raw_line.startswith((
+            "CAPABILITY_GAPS_JSON:",
+            "KNOWLEDGE_GATE_GAPS_JSON:",
+        )):
+            # These ledgers become authoritative only after the task-scoped
+            # receipt audit validates their exact Harness-owned IDs.
+            continue
+
+        # A complete JSON result may historically carry completion_quality as
+        # one of its own machine fields.  Parse only the whole line/object; do
+        # not search arbitrary prose for JSON-shaped substrings.
+        if raw_line.startswith("{") and raw_line.endswith("}"):
+            payload, error = _strict_single_line_json_object(
+                raw_line,
+                ledger_name="legacy completion-quality object",
+                max_bytes=_MAX_COMPLETION_QUALITY_JSON_BYTES,
+            )
+            if error is None and isinstance(payload, dict):
+                status = str(
+                    payload.get("completion_quality") or ""
+                ).strip().casefold()
+                if status in {"degraded", "warn", "warning"}:
+                    statuses.append("degraded")
+                    continue
+                if status in {"complete", "completed", "success"}:
+                    statuses.append("complete")
+                    continue
+
+        # Exact Markdown table cells remain supported for historical worker
+        # outputs, but descriptive labels such as "Degraded evidence" do not
+        # equal the status token "degraded".
+        if raw_line.startswith("|") and raw_line.endswith("|"):
+            cells = [
+                re.sub(r"[*_`~]+", "", cell).strip().casefold()
+                for cell in raw_line.strip("|").split("|")
+            ]
+            if any(cell in {"degraded", "warn", "warning"} for cell in cells):
+                statuses.append("degraded")
+                continue
+            if any(
+                cell in {"complete", "completed", "success"}
+                for cell in cells
+            ):
+                statuses.append("complete")
+                continue
+            # Other table cells are descriptive data. Do not feed a label such
+            # as "Degraded evidence" into the prose compatibility matcher.
+            continue
+
+        plain = re.sub(r"^\s*#{1,6}\s+", "", raw_line)
+        plain = re.sub(r"^\s*[-*+]\s+", "", plain)
+        plain = re.sub(r"[*_`~]+", "", plain).strip()
+
+        degraded_boolean = re.match(
+            r"^(?:overall\s+)?(?:degraded|warning|warn)[\s_-]*status"
+            r"\s*(?:[:：=]|[—-]\s+|\|\s*)"
+            r"\s*"
+            r"(yes|true|degraded|warn(?:ing)?|no|false|none|complete)"
+            r"(?:\b|\s|$|\|)",
+            plain,
+            re.IGNORECASE,
+        )
+        if degraded_boolean:
+            value = degraded_boolean.group(1).casefold()
+            statuses.append(
+                "degraded"
+                if value in {
+                    "yes",
+                    "true",
+                    "degraded",
+                    "warn",
+                    "warning",
+                }
+                else "complete"
+            )
+            continue
+
+        chinese_degraded_boolean = re.match(
+            r"^(?:总体)?(?:降级|警告)(?:状态|结果|完成质量)?"
+            r"\s*(?:[:：=]|[—-]\s+|\|\s*)"
+            r"\s*"
+            r"(是|有|真|降级|警告|否|无|假|完整|完成)",
+            plain,
+        )
+        if chinese_degraded_boolean:
+            statuses.append(
+                "degraded"
+                if chinese_degraded_boolean.group(1)
+                in {"是", "有", "真", "降级", "警告"}
+                else "complete"
+            )
+            continue
+
+        status_value = re.match(
+            r"^(?:overall\s+)?"
+            r"(?:status|completion[\s_-]*quality|quality|result)"
+            r"\s*(?:[:：=]|[—-]\s+|\|\s*)"
+            r"\s*"
+            r"(not\s+degraded|no\s+warning|degraded|warn(?:ing)?|"
+            r"complete(?:d)?|success)"
+            r"(?:\b|\s|$|\|)",
+            plain,
+            re.IGNORECASE,
+        )
+        if status_value:
+            value = " ".join(status_value.group(1).casefold().split())
+            statuses.append(
+                "degraded"
+                if value in {"degraded", "warn", "warning"}
+                else "complete"
+            )
+            continue
+
+        chinese_status = re.match(
+            r"^(?:总体)?(?:状态|完成质量|质量|结果)"
+            r"\s*(?:[:：=]|[—-]\s+|\|\s*)"
+            r"\s*"
+            r"(降级|警告|完整|完成|成功)",
+            plain,
+        )
+        if chinese_status:
+            statuses.append(
+                "degraded"
+                if chinese_status.group(1) in {"降级", "警告"}
+                else "complete"
+            )
+            continue
+
+        # Historical typed workers emitted uppercase markers adjacent to one
+        # exact check/field ID.  Preserve that shape while excluding negated
+        # status sentences and section headings without a value.
+        upper = plain.upper()
+        if (
+            re.search(
+                r"\b(?:DEGRADED(?:\s+GAP)?|WARN(?:ING)?)\b",
+                plain,
+            )
+            and not re.search(
+                r"\b(?:NOT|NO|NON-)\s+(?:DEGRADED|WARN(?:ING)?)\b",
+                upper,
+            )
+            and not re.fullmatch(
+                r"(?:FALLBACK\s*/\s*)?(?:DEGRADED|WARNING|WARN)"
+                r"[\s_-]*STATUS",
+                upper,
+            )
+        ):
+            statuses.append("degraded")
+
+    if "degraded" in statuses:
+        return "degraded"
+    if "complete" in statuses:
+        return "complete"
+    return None
+
+
+def _completion_quality_declaration(content: str) -> dict[str, Any]:
+    """Resolve child-declared quality with machine ledgers taking priority."""
+
+    value = _mask_markdown_code_for_protocol_audit(str(content or ""))
+    candidate_lines = [
+        line.strip()
+        for line in value.splitlines()
+        if line.strip().startswith("COMPLETION_QUALITY_JSON:")
+    ]
+    if len(candidate_lines) > 1:
+        return {
+            "status": None,
+            "source": "completion_quality_json",
+            "error": (
+                "exactly one COMPLETION_QUALITY_JSON ledger is allowed"
+            ),
+        }
+
+    declared_status: str | None = None
+    sources: list[str] = []
+    if candidate_lines:
+        raw = candidate_lines[0][
+            len("COMPLETION_QUALITY_JSON:"):
+        ].strip()
+        payload, error = _strict_single_line_json_object(
+            raw,
+            ledger_name="COMPLETION_QUALITY_JSON",
+            max_bytes=_MAX_COMPLETION_QUALITY_JSON_BYTES,
+        )
+        if error is not None:
+            return {
+                "status": None,
+                "source": "completion_quality_json",
+                "error": error,
+            }
+        assert payload is not None
+        if not set(payload).issubset({"status", "reason"}) or "status" not in payload:
+            return {
+                "status": None,
+                "source": "completion_quality_json",
+                "error": (
+                    "COMPLETION_QUALITY_JSON may contain only status and "
+                    "an optional reason"
+                ),
+            }
+        status = payload.get("status")
+        if status not in {"complete", "degraded"}:
+            return {
+                "status": None,
+                "source": "completion_quality_json",
+                "error": (
+                    "COMPLETION_QUALITY_JSON status must be exactly complete "
+                    "or degraded"
+                ),
+            }
+        reason = payload.get("reason")
+        if (
+            reason is not None
+            and (
+                not isinstance(reason, str)
+                or not reason.strip()
+                or len(reason) > 1_000
+                or "\n" in reason
+                or "\r" in reason
+            )
+        ):
+            return {
+                "status": None,
+                "source": "completion_quality_json",
+                "error": (
+                    "COMPLETION_QUALITY_JSON reason must be a non-empty "
+                    "single-line string of at most 1000 characters"
+                ),
+            }
+        if status == "degraded" and not isinstance(reason, str):
+            return {
+                "status": None,
+                "source": "completion_quality_json",
+                "error": (
+                    "degraded COMPLETION_QUALITY_JSON requires a reason"
+                ),
+            }
+        declared_status = status
+        sources.append("completion_quality_json")
+
+    if declared_status is not None:
+        return {
+            "status": declared_status,
+            "source": "+".join(dict.fromkeys(sources)),
+            "error": None,
+        }
+
+    legacy_status = _legacy_completion_quality_status(value)
+    return {
+        "status": legacy_status,
+        "source": "legacy_status" if legacy_status else "none",
+        "error": None,
+    }
+
+
+def _content_declares_degraded_completion(content: str) -> bool:
+    """Compatibility wrapper around the strict quality declaration parser."""
+
+    declaration = _completion_quality_declaration(content)
+    return (
+        declaration.get("error") is None
+        and declaration.get("status") == "degraded"
+    )
+
+
+def _validated_typed_result_ledger(
+    content: str,
+    result_field_audit: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the already-validated terminal typed ledger without coercion."""
+
+    if result_field_audit.get("footer_valid") is not True:
+        return {}
+    lines = [
+        line.strip()
+        for line in str(content or "").rstrip().splitlines()
+        if line.strip()
+    ]
+    prefix = "RESULT_FIELDS_JSON:"
+    if not lines or not lines[-1].startswith(prefix):
+        return {}
+    payload, error = _strict_single_line_json_object(
+        lines[-1][len(prefix):].strip(),
+        ledger_name="RESULT_FIELDS_JSON",
+        max_bytes=65_536,
+    )
+    return payload if error is None and payload is not None else {}
 
 
 def _exact_capability_gap_ledger_error(
@@ -300,19 +571,21 @@ def _exact_capability_gap_ledger_error(
         for identifier in failed_candidate_ids
         if str(identifier)
     ))
-    matches = _CAPABILITY_GAPS_JSON_PATTERN.findall(str(content or ""))
+    masked = _mask_markdown_code_for_protocol_audit(str(content or ""))
+    matches = _CAPABILITY_GAPS_JSON_PATTERN.findall(masked)
     if len(matches) != 1:
         return (
             "failed exact capability candidates require exactly one "
             "single-line CAPABILITY_GAPS_JSON ledger"
         )
-    raw = matches[0]
-    if len(raw.encode("utf-8")) > 32_768:
-        return "CAPABILITY_GAPS_JSON exceeds the bounded 32 KiB limit"
-    try:
-        payload = json.loads(raw)
-    except (TypeError, ValueError):
-        return "CAPABILITY_GAPS_JSON must contain valid JSON"
+    payload, payload_error = _strict_single_line_json_object(
+        matches[0],
+        ledger_name="CAPABILITY_GAPS_JSON",
+        max_bytes=32_768,
+    )
+    if payload_error is not None:
+        return payload_error
+    assert payload is not None
     if not isinstance(payload, dict) or set(payload) != {
         "status",
         "failed_candidate_ids",
@@ -357,7 +630,8 @@ def _exact_knowledge_gate_gap_ledger_error(
         for identifier in expected_gap_ids
         if str(identifier)
     ))
-    matches = _KNOWLEDGE_GATE_GAPS_JSON_PATTERN.findall(str(content or ""))
+    masked = _mask_markdown_code_for_protocol_audit(str(content or ""))
+    matches = _KNOWLEDGE_GATE_GAPS_JSON_PATTERN.findall(masked)
     if not expected:
         if matches:
             return (
@@ -370,13 +644,14 @@ def _exact_knowledge_gate_gap_ledger_error(
             "knowledge-gate gaps require exactly one single-line "
             "KNOWLEDGE_GATE_GAPS_JSON ledger"
         )
-    raw = matches[0]
-    if len(raw.encode("utf-8")) > _MAX_KNOWLEDGE_GATE_GAP_LEDGER_BYTES:
-        return "KNOWLEDGE_GATE_GAPS_JSON exceeds the bounded 32 KiB limit"
-    try:
-        payload = json.loads(raw)
-    except (TypeError, ValueError):
-        return "KNOWLEDGE_GATE_GAPS_JSON must contain valid JSON"
+    payload, payload_error = _strict_single_line_json_object(
+        matches[0],
+        ledger_name="KNOWLEDGE_GATE_GAPS_JSON",
+        max_bytes=_MAX_KNOWLEDGE_GATE_GAP_LEDGER_BYTES,
+    )
+    if payload_error is not None:
+        return payload_error
+    assert payload is not None
     if not isinstance(payload, dict) or set(payload) != {
         "status",
         "gap_ids",
@@ -4970,6 +5245,21 @@ async def _run_child(
     step_type = str(task.get("step_type") or ("worker" if worker_id else "")).strip()
     step_id = str(task.get("step_id") or worker_id or "").strip()
     normalized_step_type = step_type.casefold()
+    normalized_step_semantics = re.sub(
+        r"[\s-]+",
+        "_",
+        normalized_step_type,
+    )
+    normalized_workflow_stage = re.sub(
+        r"[\s-]+",
+        "_",
+        workflow_stage.casefold(),
+    )
+    is_evidence_acquisition_step = bool(
+        normalized_step_semantics in _EVIDENCE_ACQUISITION_STEP_TYPES
+        or normalized_workflow_stage in _EVIDENCE_ACQUISITION_STEP_TYPES
+        or task.get("retrieval_completeness_policy") is not None
+    )
     is_model_intent_classifier = (
         normalized_step_type in _MODEL_INTENT_CLASSIFIER_STEP_TYPES
         and "deterministic_intent_selections" not in task
@@ -5008,6 +5298,11 @@ async def _run_child(
     )
     retrieval_completeness_policy, retrieval_policy_metadata_error = (
         _strict_retrieval_completeness_policy(task)
+    )
+    typed_evidence_dispatch_expected = bool(
+        required_result_fields
+        and is_evidence_acquisition_step
+        and not is_artifact_synthesis
     )
     required_result_paths, result_path_metadata_error = (
         _strict_task_string_list(
@@ -5848,6 +6143,39 @@ async def _run_child(
             if skill_name and worker_file else ""
         )
         + (f"Context supplied by the parent:\n{extra}\n\n" if extra else "")
+        + (
+            "Whole-result completion quality is a machine protocol, not a "
+            "section title. Emit exactly one protocol-visible single-line "
+            '`COMPLETION_QUALITY_JSON: {"status":"complete"}` when every '
+            "declared evidence obligation is backed by successful Harness "
+            "receipts, or "
+            '`COMPLETION_QUALITY_JSON: {"status":"degraded","reason":"..."}` '
+            "when evidence is unavailable, incomplete, unverified, or supported "
+            "only by a failed/unresolved capability. Put this line before the "
+            "terminal RESULT_FIELDS_JSON line when typed fields are required. "
+            "It supplements rather than replaces any required "
+            "CAPABILITY_GAPS_JSON or KNOWLEDGE_GATE_GAPS_JSON ledger. A heading "
+            "such as `Fallback / Degraded Status` is descriptive only and does "
+            "not declare quality. "
+            if (
+                required_result_fields
+                or required_capability_tools
+                or required_capability_skills
+                or capability_bindings
+                or knowledge_gate_plan is not None
+            )
+            else ""
+        )
+        + (
+            "This is a declared evidence-acquisition step. When no successful "
+            "evidence receipt backs the typed output, never populate fields "
+            "with inferred or unverified values: use JSON null only when each "
+            "field's declared schema "
+            "permits null, or use its declared degraded status-envelope shape "
+            "with a non-empty reason and provenance. Otherwise the typed result "
+            "must fail closed rather than launder an unsupported fact. "
+            if typed_evidence_dispatch_expected else ""
+        )
         + "Work independently. Use the shared session workspace when needed. "
           "Return the substantive result in the exact format declared by this "
           "goal, worker/output schema, checks, and typed fields. Do not invent "
@@ -8510,6 +8838,7 @@ async def _run_child(
         required_result_fields,
         required_result_schema,
     )
+    completion_quality_declaration = _completion_quality_declaration(content)
     output_protocol_audit = audit_raw_tool_protocol(
         content,
         successful_tools,
@@ -8520,7 +8849,16 @@ async def _run_child(
         else []
     )
     validation_error = None
-    if is_model_intent_classifier and intent_selections is None:
+    if completion_quality_declaration.get("error"):
+        validation_error = (
+            "Delegated completion-quality protocol is invalid: "
+            + str(completion_quality_declaration["error"])
+        )
+    if (
+        validation_error is None
+        and is_model_intent_classifier
+        and intent_selections is None
+    ):
         validation_error = (
             "Delegated intent classification did not return a valid final "
             "INTENT_SELECTIONS_JSON object."
@@ -8793,6 +9131,7 @@ async def _run_child(
         required_capability_set & successful_tools
     )
     capability_receipt_audit: dict[str, Any] = {}
+    verified_exact_capability_gap_ledger = False
     if capability_bindings:
         required_exact_bindings = list(
             (exact_node_capability_grants or {}).get("receipt_bindings") or []
@@ -8882,7 +9221,7 @@ async def _run_child(
                 + ", ".join(missing_exact_candidate_ids)
             )
         if validation_error is None and failed_exact_candidate_ids:
-            if not _content_declares_degraded_completion(content):
+            if completion_quality_declaration.get("status") != "degraded":
                 validation_error = (
                     "One or more exact required capability candidates failed; "
                     "completion requires an explicit result-level degraded "
@@ -8899,6 +9238,8 @@ async def _run_child(
                         gap_ledger_error + "; failed candidates: "
                         + ", ".join(failed_exact_candidate_ids)
                     )
+                else:
+                    verified_exact_capability_gap_ledger = True
     elif knowledge_gate_plan is not None:
         capability_receipt_audit = {
             "mode": "conditional_knowledge_gate_plan",
@@ -9019,12 +9360,13 @@ async def _run_child(
     knowledge_gate_gap_ids = list(
         knowledge_gate_receipt_audit.get("gap_ids") or []
     )
+    verified_knowledge_gate_gap_ledger = False
     if (
         validation_error is None
         and knowledge_gate_plan is not None
         and knowledge_gate_gap_ids
     ):
-        if not _content_declares_degraded_completion(content):
+        if completion_quality_declaration.get("status") != "degraded":
             validation_error = (
                 "Knowledge-gate unknown, unresolved, or failed branches require "
                 "an explicit result-level degraded status and an exact "
@@ -9037,6 +9379,8 @@ async def _run_child(
             )
             if gate_gap_error:
                 validation_error = gate_gap_error
+            else:
+                verified_knowledge_gate_gap_ledger = True
     elif (
         validation_error is None
         and knowledge_gate_plan is not None
@@ -9115,7 +9459,7 @@ async def _run_child(
         and not exact_grants_active
         and attempted_required_capabilities
         and not successful_required_capabilities
-        and not _DEGRADED_REPORT_PATTERN.search(content)
+        and completion_quality_declaration.get("status") != "degraded"
     ):
         validation_error = (
             "Every attempted required evidence capability failed; completion "
@@ -9125,6 +9469,198 @@ async def _run_child(
         capability_receipt_audit["successful_tool_names"] = list(
             successful_required_capabilities
         )
+
+    # Completion quality is derived from Harness-owned dispatch receipts and
+    # typed gap ledgers before consulting model-authored prose.  In
+    # particular, deterministic Skill/instruction preloads prove authority
+    # and instruction delivery; they are not evidence-query receipts unless
+    # an exact compiled capability candidate explicitly binds that resource.
+    legacy_evidence_receipts = [
+        call
+        for call in dispatched_tool_calls
+        if (
+            str(call.get("tool_name") or "") in required_capability_set
+            and call.get("deterministic_prerequisite_preload") is not True
+        )
+    ]
+    capability_audit_mode = str(
+        capability_receipt_audit.get("mode") or ""
+    )
+    if capability_audit_mode == "exact_candidate":
+        attempted_evidence_receipt_count = len(
+            capability_receipt_audit.get("receipts") or []
+        )
+        successful_evidence_receipt_count = len(
+            capability_receipt_audit.get("successful_candidate_ids") or []
+        )
+    elif capability_audit_mode == "conditional_knowledge_gate_plan":
+        attempted_evidence_receipt_count = len(
+            knowledge_gate_receipt_audit.get("receipts") or []
+        )
+        successful_evidence_receipt_count = len(
+            knowledge_gate_receipt_audit.get("successful_group_ids") or []
+        )
+    else:
+        attempted_evidence_receipt_count = len(legacy_evidence_receipts)
+        successful_evidence_receipt_count = sum(
+            1
+            for call in legacy_evidence_receipts
+            if (
+                str(call.get("outcome") or "") == "success"
+                and str(call.get("tool_name") or "")
+                in successful_required_capabilities
+            )
+        )
+
+    no_verified_value_source = bool(
+        typed_evidence_dispatch_expected
+        and successful_evidence_receipt_count == 0
+    )
+    # Compatibility key retained in the child audit; its meaning is now
+    # deliberately scoped to declared acquisition semantics instead of the
+    # mere presence of a supporting Skill.
+    unverified_typed_evidence = no_verified_value_source
+    receipt_degraded_reasons: list[str] = []
+    if runtime_unresolved_retrieval is not None:
+        receipt_degraded_reasons.append("runtime_unresolved_retrieval")
+    if result_field_audit.get("degraded"):
+        receipt_degraded_reasons.append("typed_result_field_gap")
+    if capability_receipt_audit.get("failed_candidate_ids"):
+        receipt_degraded_reasons.append("failed_exact_capability_candidate")
+    if knowledge_gate_gap_ids:
+        receipt_degraded_reasons.append("knowledge_gate_gap")
+    if (
+        capability_audit_mode == "legacy_tool_alternative"
+        and attempted_evidence_receipt_count > 0
+        and successful_evidence_receipt_count == 0
+    ):
+        receipt_degraded_reasons.append("all_evidence_dispatches_failed")
+    if no_verified_value_source:
+        receipt_degraded_reasons.append(
+            "no_verified_evidence_dispatch_receipt"
+        )
+    receipt_degraded_reasons = list(dict.fromkeys(
+        receipt_degraded_reasons
+    ))
+    receipt_forced_degraded = bool(receipt_degraded_reasons)
+    strict_complete_conflict_reasons = (
+        receipt_degraded_reasons
+        if (
+            completion_quality_declaration.get("status") == "complete"
+            and completion_quality_declaration.get("source")
+            == "completion_quality_json"
+        )
+        else []
+    )
+    if validation_error is None and strict_complete_conflict_reasons:
+        validation_error = (
+            "COMPLETION_QUALITY_JSON declares complete while Harness-owned "
+            "receipts or the validated typed ledger require degraded quality: "
+            + ", ".join(strict_complete_conflict_reasons)
+        )
+    typed_result_ledger = _validated_typed_result_ledger(
+        content,
+        result_field_audit,
+    )
+    typed_null_gap_fields = [
+        field
+        for field in required_result_fields
+        if field in typed_result_ledger
+        and typed_result_ledger.get(field) is None
+    ]
+    typed_degraded_gap_fields = list(
+        result_field_audit.get("degraded") or []
+    )
+    typed_gap_field_set = set(
+        typed_null_gap_fields + typed_degraded_gap_fields
+    )
+    populated_typed_value_fields = [
+        field
+        for field in result_field_audit.get("present") or []
+        if field not in typed_gap_field_set
+    ]
+    unverified_typed_value_fields = (
+        populated_typed_value_fields
+        if no_verified_value_source
+        else []
+    )
+    declaration_sources = set(
+        str(completion_quality_declaration.get("source") or "").split("+")
+    )
+    machine_degraded_evidence = bool(
+        (
+            completion_quality_declaration.get("status") == "degraded"
+            and "completion_quality_json" in declaration_sources
+        )
+        or verified_exact_capability_gap_ledger
+        or verified_knowledge_gate_gap_ledger
+        or runtime_unresolved_retrieval is not None
+    )
+    if (
+        validation_error is None
+        and no_verified_value_source
+        and required_result_fields
+        and unverified_typed_value_fields
+    ):
+        validation_error = (
+            "Delegated typed result contains populated field values without "
+            "verifiable evidence receipts; degraded completion cannot "
+            "launder unverified facts. Return only schema-valid null values "
+            "or declared degraded field envelopes for: "
+            + ", ".join(unverified_typed_value_fields[:30])
+        )
+    if (
+        validation_error is None
+        and no_verified_value_source
+        and required_result_fields
+        and not unverified_typed_value_fields
+        and not machine_degraded_evidence
+    ):
+        validation_error = (
+            "Delegated typed evidence gaps require a machine-readable "
+            "degraded completion declaration or exact machine gap ledger."
+        )
+    completion_quality_audit = {
+        "declared_status": completion_quality_declaration.get("status"),
+        "declaration_source": completion_quality_declaration.get("source"),
+        "receipt_forced_degraded": receipt_forced_degraded,
+        "receipt_degraded_reasons": receipt_degraded_reasons,
+        "strict_complete_conflict_reasons": (
+            strict_complete_conflict_reasons
+        ),
+        "attempted_evidence_receipt_count": (
+            attempted_evidence_receipt_count
+        ),
+        "successful_evidence_receipt_count": (
+            successful_evidence_receipt_count
+        ),
+        "typed_capability_evidence_expected": typed_evidence_dispatch_expected,
+        "typed_evidence_dispatch_expected": typed_evidence_dispatch_expected,
+        "evidence_acquisition_step": is_evidence_acquisition_step,
+        "no_verified_value_source": no_verified_value_source,
+        "unverified_typed_evidence": unverified_typed_evidence,
+        "typed_null_gap_fields": typed_null_gap_fields,
+        "typed_degraded_gap_fields": typed_degraded_gap_fields,
+        "populated_typed_value_fields": populated_typed_value_fields,
+        "unverified_typed_value_fields": unverified_typed_value_fields,
+        "machine_degraded_evidence": machine_degraded_evidence,
+        "verified_exact_capability_gap_ledger": (
+            verified_exact_capability_gap_ledger
+        ),
+        "verified_knowledge_gate_gap_ledger": (
+            verified_knowledge_gate_gap_ledger
+        ),
+    }
+    if (
+        completion_quality_declaration.get("status") == "degraded"
+        or receipt_forced_degraded
+    ):
+        runtime_completion_quality = "degraded"
+    await forward_event(child_event(
+        "debug.completion_quality.final_audit",
+        completion_quality_audit,
+    ))
+
     # A provider may report length/budget exhaustion after already returning a
     # machine-complete child payload. Accept it only when every typed output,
     # prerequisite, Skill inspection, and capability audit above passed;
@@ -9162,11 +9698,6 @@ async def _run_child(
         error = validation_error
     else:
         error = None
-    if (
-        error is None
-        and _content_declares_degraded_completion(content)
-    ):
-        runtime_completion_quality = "degraded"
     persistence_failed = False
     if error is None:
         try:
@@ -9330,6 +9861,7 @@ async def _run_child(
         completed_payload: dict[str, Any] = {
             "finish_reason": "stop",
             "completion_quality": runtime_completion_quality,
+            "completion_quality_audit": completion_quality_audit,
             "provisional_terminal": False,
             "authoritative": True,
             "usage": usage,
@@ -9359,6 +9891,7 @@ async def _run_child(
     else:
         failed_payload: dict[str, Any] = {
             "error": str(error),
+            "completion_quality_audit": completion_quality_audit,
             "finish_reason": str(
                 failure_fields.get("terminal_reason")
                 or terminal_reason
@@ -9414,6 +9947,7 @@ async def _run_child(
         "completion_quality": (
             runtime_completion_quality if error is None else None
         ),
+        "completion_quality_audit": completion_quality_audit,
         "unresolved_retrieval": (
             dict(runtime_unresolved_retrieval)
             if error is None and runtime_unresolved_retrieval is not None

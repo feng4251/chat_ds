@@ -3,15 +3,20 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from agent_loop import (
     HarnessRunState,
+    _bounded_skill_execution_exposure,
     _compiled_skill_inspection_auto_call_limit,
     _compiled_skill_inspection_target,
     _refresh_skill_workflow_continuation_allowance,
     _workflow_gate_call_error,
     run_stream,
+)
+from knowledge_gate import compile_symbolic_knowledge_gate
+from tools.skill_runtime_profile import (
+    compile_skill_runtime_profile_manifest,
 )
 
 
@@ -127,6 +132,268 @@ class _FakeResponse:
 
 
 class DeterministicSkillInspectionUnitTests(unittest.TestCase):
+    def test_rejected_optional_gate_skill_receives_no_execution_authority(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root_dir = Path(temp_dir) / "root-skill"
+            adapter_dir = Path(temp_dir) / "invalid-adapter"
+            (adapter_dir / "scripts").mkdir(parents=True)
+            adapter_skill_md = (
+                "---\n"
+                "name: invalid-adapter\n"
+                "description: Invalid optional test adapter.\n"
+                "---\n"
+                "# Invalid adapter\n"
+                "Run `scripts/query.py` or GET "
+                "https://api.invalid.test/v1/search.\n"
+            )
+            (adapter_dir / "SKILL.md").write_text(
+                adapter_skill_md,
+                encoding="utf-8",
+            )
+            adapter_script = adapter_dir / "scripts/query.py"
+            adapter_script.write_text(
+                "print('query')\n",
+                encoding="utf-8",
+            )
+            adapter_script_digest = hashlib.sha256(
+                adapter_script.read_bytes()
+            ).hexdigest()
+            adapter = {
+                "name": "invalid-adapter",
+                "skill_dir": str(adapter_dir),
+                "skill_md_sha256": hashlib.sha256(
+                    (adapter_dir / "SKILL.md").read_bytes()
+                ).hexdigest(),
+                "content": adapter_skill_md,
+                "linked_files": {"scripts": ["scripts/query.py"]},
+                "runtime_profile_manifest": (
+                    compile_skill_runtime_profile_manifest(
+                        adapter_dir,
+                        ("scripts/query.py",),
+                    )
+                ),
+                "workflow_contract": {
+                    "script_candidates": ["scripts/query.py"],
+                    "resource_authority": {
+                        "reasons": {
+                            "scripts/query.py": [
+                                "explicit_skill_reference",
+                            ],
+                        },
+                    },
+                    "execution_contract": {
+                        "schema_version": 1,
+                        "environment_contract": {
+                            "commands": [{
+                                "name": "git",
+                                "source_files": ["SKILL.md"],
+                            }],
+                            "allowed_tools": [
+                                "Bash(git status:*)",
+                            ],
+                        },
+                    },
+                },
+                # The package scanner is authoritative.  The deliberately
+                # executable-looking declarations above must remain inert once
+                # this package fails that audit.
+                "package_diagnostics": {
+                    "valid": False,
+                    "errors": ["synthetic invalid package"],
+                    "warnings": [],
+                },
+            }
+            gate = compile_symbolic_knowledge_gate(
+                {
+                    "checks": [{
+                        "id": "coverage",
+                        "question": "Is another evidence lookup required?",
+                        "if_yes": {
+                            "tool_groups": [{
+                                "id": "evidence-source",
+                                "any_of": [
+                                    "skill:invalid-adapter",
+                                    "web_search",
+                                ],
+                            }],
+                        },
+                    }],
+                },
+                skill_dir=root_dir,
+                source_file="workers/research.yaml",
+                worker_id="research",
+            ).ir
+            root = _precompiled_package(
+                skill_dir=root_dir,
+                linked_files={"workers": ["workers/research.yaml"]},
+                workflow_contract={
+                    "worker_files": ["workers/research.yaml"],
+                    "requires_worker_outputs": True,
+                },
+            )
+            plan = {
+                "selection": "matched",
+                "route_id": "research",
+                "workers": {
+                    "research": {
+                        "id": "research",
+                        "file": "workers/research.yaml",
+                        "tools": ["web_search"],
+                        "knowledge_gate_ir": gate,
+                        "knowledge_gate_skill_refs": ["invalid-adapter"],
+                    },
+                },
+                "required_workers": ["research"],
+                "bootstrap_sources": [],
+                "aggregation_steps": [],
+            }
+
+            exposure = _bounded_skill_execution_exposure(
+                "Produce a ZEBRA report",
+                [
+                    "skill_view",
+                    "delegate_task",
+                    "web_search",
+                    "submit_knowledge_gate_decisions",
+                    "run_skill_process",
+                    "run_skill_script",
+                    "run_skill_python",
+                    "skill_http_get",
+                    "skill_http_post_json",
+                    "run_declared_command",
+                ],
+                {"root-skill", "invalid-adapter"},
+                {
+                    "root-skill": root,
+                    "invalid-adapter": adapter,
+                },
+                {
+                    "root-skill": (),
+                    "invalid-adapter": ((
+                        "scripts/query.py",
+                        adapter_script_digest,
+                    ),),
+                },
+                selected_skill_names=("root-skill",),
+                compiled_plans={"root-skill": plan},
+            )
+
+        self.assertIn("delegate_task", exposure.tools)
+        self.assertIn("web_search", exposure.tools)
+        for denied_tool in (
+            "run_skill_process",
+            "run_skill_script",
+            "run_skill_python",
+            "skill_http_get",
+            "skill_http_post_json",
+            "run_declared_command",
+        ):
+            self.assertNotIn(denied_tool, exposure.tools)
+        self.assertFalse(any(
+            row[0] == "invalid-adapter"
+            for row in exposure.allowed_skill_resources
+        ))
+        self.assertFalse(any(
+            row[0] == "invalid-adapter"
+            for row in exposure.allowed_skill_scripts
+        ))
+        self.assertFalse(any(
+            row[0] == "invalid-adapter"
+            for row in exposure.allowed_skill_commands
+        ))
+        self.assertFalse(any(
+            row[0] == "invalid-adapter"
+            for row in exposure.allowed_skill_http_prefixes
+        ))
+        self.assertFalse(any(
+            row[0] == "invalid-adapter"
+            for row in exposure.allowed_skill_http_post_prefixes
+        ))
+        self.assertFalse(any(
+            row[0] == "invalid-adapter"
+            for row in exposure.allowed_skill_package_digests
+        ))
+
+    def test_optional_gate_skill_failure_keeps_native_or_candidate(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_dir = Path(temp_dir) / "root-skill"
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            gate = compile_symbolic_knowledge_gate(
+                {
+                    "checks": [{
+                        "id": "coverage",
+                        "question": "Is another evidence lookup required?",
+                        "if_yes": {
+                            "tool_groups": [{
+                                "id": "evidence-source",
+                                "any_of": [
+                                    "skill:missing-adapter",
+                                    "web_search",
+                                ],
+                            }],
+                        },
+                    }],
+                },
+                skill_dir=skill_dir,
+                source_file="workers/research.yaml",
+                worker_id="research",
+            ).ir
+            execution = {
+                "workers": [{
+                    "id": "research",
+                    "file": "workers/research.yaml",
+                    "tools": ["web_search"],
+                    "knowledge_gate_ir": gate,
+                    "knowledge_gate_skill_refs": ["missing-adapter"],
+                }],
+                "routes": [{
+                    "id": "selected",
+                    "patterns": ["ZEBRA"],
+                    "requires_full_output": False,
+                    "waves": [{
+                        "id": "research-wave",
+                        "mode": "sequential",
+                        "workers": ["research"],
+                        "dependencies": [],
+                    }],
+                }],
+                "intent_classification": {"dimensions": []},
+                "knowledge_bootstrap": {"sources": []},
+                "diagnostics": {"errors": [], "warnings": []},
+            }
+            contract = {
+                "worker_files": ["workers/research.yaml"],
+                "workers": execution["workers"],
+                "execution_contract": execution,
+                "requires_worker_outputs": True,
+            }
+            root = _precompiled_package(
+                skill_dir=skill_dir,
+                linked_files={"workers": ["workers/research.yaml"]},
+                workflow_contract=contract,
+            )
+
+            exposure = _bounded_skill_execution_exposure(
+                "Produce a ZEBRA report",
+                [
+                    "skill_view",
+                    "delegate_task",
+                    "web_search",
+                    "submit_knowledge_gate_decisions",
+                ],
+                {"root-skill"},
+                {"root-skill": root},
+                {"root-skill": ()},
+                selected_skill_names=("root-skill",),
+            )
+
+        self.assertIn("delegate_task", exposure.tools)
+        self.assertIn("web_search", exposure.tools)
+        self.assertNotIn(
+            "capability_skill_package_unavailable:missing-adapter",
+            exposure.missing_requirements,
+        )
+
     def test_dynamic_resource_allowance_tracks_monotonic_observed_union(self):
         skill_name = "dynamic-resource-skill"
         orchestrator = "orchestration/main.yaml"
@@ -359,7 +626,8 @@ class DeterministicSkillInspectionUnitTests(unittest.TestCase):
         target, error = _compiled_skill_inspection_target(
             state,
             "inspect explicit workflow resources for session skill "
-            "'compiled-skill' (missing 1 of 1 declared files)",
+            "'compiled-skill' "
+            "(pending 1 of 1 declared-resource inspection receipts)",
         )
         self.assertIsNone(target)
         self.assertIn("unsafe compiled resource path", error)
@@ -1147,6 +1415,349 @@ class DeterministicSkillInspectionRunTests(unittest.IsolatedAsyncioTestCase):
             analytics_tasks[0]["required_result_schema"]["bins"]["type"],
         )
 
+    async def test_selected_snapshot_failures_are_terminal_before_dispatch(self):
+        skill_name = "snapshot-failure-portable"
+
+        class NoModelClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def stream(self, method, url, **kwargs):
+                raise AssertionError(
+                    "an invalid selected snapshot must fail before model IO"
+                )
+
+        schemas = [{
+            "type": "function",
+            "function": {
+                "name": "skill_view",
+                "description": "skill_view",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }]
+        for case in ("identity_missing", "script_inventory_failed"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temp_dir:
+                skill_dir = Path(temp_dir) / "skill-package"
+                valid_package = _precompiled_package(skill_dir=skill_dir)
+                loaded_package = (
+                    {
+                        **valid_package,
+                        "skill_dir": "",
+                    }
+                    if case == "identity_missing"
+                    else valid_package
+                )
+                scanner_side_effect = (
+                    RuntimeError("raw scanner detail")
+                    if case == "script_inventory_failed"
+                    else None
+                )
+                record = {
+                    "name": skill_name,
+                    "description": "Portable failure fixture.",
+                    "scope": "session",
+                    "path": str(skill_dir / "SKILL.md"),
+                    "skill_dir": str(skill_dir),
+                }
+                with (
+                    patch("workspace_context.WORKSPACE_ROOT", Path(temp_dir)),
+                    patch("agent_loop.httpx.AsyncClient", NoModelClient),
+                    patch("agent_loop.get_schemas", return_value=schemas),
+                    patch(
+                        "agent_loop.build_system_prompt",
+                        return_value="system",
+                    ),
+                    patch(
+                        "agent_loop.load_workspace_context",
+                        return_value="",
+                    ),
+                    patch(
+                        "agent_loop._fetch_goal",
+                        AsyncMock(return_value=None),
+                    ),
+                    patch(
+                        "skills.loader.load_skill_content",
+                        return_value=loaded_package,
+                    ),
+                    patch(
+                        "skills.scanner.find_all_skills",
+                        return_value=[record],
+                    ),
+                    patch(
+                        "skills.scanner.skill_runnable_script_resources",
+                        side_effect=scanner_side_effect,
+                        return_value=(),
+                    ),
+                ):
+                    events = [
+                        event
+                        async for event in run_stream(
+                            "mock-skill-inspection",
+                            [{
+                                "role": "user",
+                                "content": (
+                                    f"Use {skill_name} to produce a "
+                                    "comprehensive evidence report."
+                                ),
+                            }],
+                            ["skill_view"],
+                            provider_override=self.provider,
+                            allow_session_mcp=False,
+                            user_id="u-snapshot-failure",
+                            session_id=f"s-{case}",
+                            max_iterations=2,
+                        )
+                    ]
+
+                failed = [
+                    event for event in events
+                    if event.get("event_type") == "run.failed"
+                ]
+                self.assertEqual(1, len(failed))
+                self.assertEqual(
+                    "skill_package_snapshot_invalid",
+                    failed[0]["payload"]["finish_reason"],
+                )
+                diagnostic = failed[0]["payload"]["contract_diagnostic"]
+                self.assertTrue(
+                    str(diagnostic["error_code"]).startswith(
+                        "skill_"
+                    )
+                )
+                self.assertNotIn(
+                    "raw scanner detail",
+                    json.dumps(events),
+                )
+
+    async def test_declared_route_snapshot_survives_bootstrap_into_kg_worker(self):
+        """Regression for a non-explicit route reaching the KG worker phase.
+
+        The selected Skill name never appears in the request.  Selection is
+        therefore owned by its unique declared route, and the package snapshot
+        bound at ingress must still be available after bootstrap when the
+        worker's symbolic knowledge gate is compiled.
+        """
+
+        skill_name = "route-bound-portable-workflow"
+        worker_id = "evidence-worker"
+        worker_path = "workers/evidence.yaml"
+        request = (
+            "Produce a comprehensive multi-agent evidence report for "
+            "the exact ZEBRA-ROUTE readiness scenario."
+        )
+        delegated_tasks: list[dict] = []
+        dispatches: list[tuple[str, dict]] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_dir = Path(temp_dir) / "skill-package"
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            symbolic_gate = compile_symbolic_knowledge_gate(
+                {
+                    "checks": [{
+                        "id": "source-ready",
+                        "question": "Is the prerequisite source ready?",
+                    }],
+                },
+                skill_dir=skill_dir,
+                source_file=worker_path,
+                worker_id=worker_id,
+            ).ir
+            execution = {
+                "workers": [{
+                    "id": worker_id,
+                    "file": worker_path,
+                    "tools": [{"name": "read_file"}],
+                    "knowledge_gate_ir": symbolic_gate,
+                    "required_gate_ids": ["source-ready"],
+                }],
+                "routes": [{
+                    "id": "zebra-readiness",
+                    "patterns": ["ZEBRA-ROUTE"],
+                    "requires_full_output": False,
+                    "waves": [{
+                        "id": "evidence-wave",
+                        "mode": "sequential",
+                        "workers": [worker_id],
+                        "dependencies": [],
+                    }],
+                }],
+                "intent_classification": {"dimensions": []},
+                "knowledge_bootstrap": {"sources": [{
+                    "id": "baseline-source",
+                    "tool": "read_file",
+                    "extract_fields": [{
+                        "field": "baseline",
+                        "description": "Bounded prerequisite evidence",
+                    }],
+                }]},
+                "diagnostics": {"errors": [], "warnings": []},
+            }
+            contract = {
+                "worker_files": [worker_path],
+                "workers": execution["workers"],
+                "execution_contract": execution,
+                "requires_worker_outputs": True,
+            }
+            package = _precompiled_package(
+                skill_dir=skill_dir,
+                linked_files={"workers": [worker_path]},
+                workflow_contract=contract,
+            )
+            record = {
+                "name": skill_name,
+                "description": "Unrelated portable orchestration fixture.",
+                "scope": "session",
+                "path": str(skill_dir / "SKILL.md"),
+                "skill_dir": str(skill_dir),
+            }
+
+            class NoModelClient:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, exc_type, exc, tb):
+                    return False
+
+                def stream(self, method, url, **kwargs):
+                    raise AssertionError(
+                        "declared workflow prerequisites must auto-dispatch"
+                    )
+
+            async def fake_dispatch(name, args, *, context):
+                dispatches.append((name, dict(args)))
+                if name == "skill_view" and not args.get("file_path"):
+                    return json.dumps({
+                        "name": skill_name,
+                        "skill_md_sha256": _SKILL_MD_SHA256,
+                        "linked_files": {"workers": [worker_path]},
+                        "resource_graph": {
+                            "categories": {
+                                "workers": {"sample": [worker_path]},
+                            },
+                        },
+                        "workflow_contract": contract,
+                    })
+                if name == "skill_view":
+                    return json.dumps({
+                        "name": skill_name,
+                        "file_path": args["file_path"],
+                        "content": "bounded worker instructions",
+                    })
+                self.assertEqual("delegate_task", name)
+                tasks = (
+                    [dict(args)]
+                    if str(args.get("goal") or "").strip()
+                    else [dict(task) for task in (args.get("tasks") or [])]
+                )
+                delegated_tasks.extend(tasks)
+                if tasks[0]["step_type"] == "knowledge_bootstrap":
+                    return json.dumps({
+                        "status": "completed",
+                        "task_count": 1,
+                        "completed_count": 1,
+                        "results": [{
+                            "status": "completed",
+                            "skill_name": skill_name,
+                            "step_type": "knowledge_bootstrap",
+                            "step_id": "baseline-source",
+                            "result_path": "results/baseline.md",
+                            "result_chars": 256,
+                            "summary": "baseline — PASS",
+                        }],
+                    })
+                return json.dumps({
+                    "status": "error",
+                    "task_count": 1,
+                    "results": [{
+                        "status": "error",
+                        "skill_name": skill_name,
+                        "step_type": "worker",
+                        "step_id": worker_id,
+                        "worker_id": worker_id,
+                        "error": "bounded synthetic stop after KG capture",
+                        "terminal_reason": "synthetic_stop",
+                        "failure_class": "test_stop",
+                        "retryable": False,
+                    }],
+                })
+
+            schemas = [{
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": name,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            } for name in ("skill_view", "delegate_task", "read_file")]
+
+            with (
+                patch("workspace_context.WORKSPACE_ROOT", Path(temp_dir)),
+                patch("agent_loop.httpx.AsyncClient", NoModelClient),
+                patch("agent_loop.dispatch", fake_dispatch),
+                patch("agent_loop.get_schemas", return_value=schemas),
+                patch("agent_loop.build_system_prompt", return_value="system"),
+                patch("agent_loop.load_workspace_context", return_value=""),
+                patch("agent_loop._fetch_goal", AsyncMock(return_value=None)),
+                patch(
+                    "skills.loader.load_skill_content",
+                    return_value=package,
+                ),
+                patch(
+                    "skills.scanner.find_all_skills",
+                    return_value=[record],
+                ),
+                patch(
+                    "skills.scanner.skill_runnable_script_resources",
+                    return_value=(),
+                ),
+            ):
+                events = [
+                    event
+                    async for event in run_stream(
+                        "mock-skill-inspection",
+                        [{"role": "user", "content": request}],
+                        ["skill_view", "delegate_task", "read_file"],
+                        provider_override=self.provider,
+                        allow_session_mcp=False,
+                        user_id="u-declared-route-kg",
+                        session_id="s-declared-route-kg",
+                        max_iterations=8,
+                    )
+                ]
+
+        self.assertEqual(
+            ["knowledge_bootstrap", "worker"],
+            [task["step_type"] for task in delegated_tasks],
+        )
+        worker_task = delegated_tasks[-1]
+        self.assertEqual(worker_id, worker_task["worker_id"])
+        self.assertEqual(
+            "source-ready",
+            worker_task["knowledge_gate_plan"]["checks"][0]["id"],
+        )
+        self.assertRegex(
+            worker_task["knowledge_gate_plan_sha256"],
+            r"^[0-9a-f]{64}$",
+        )
+        self.assertIn(
+            "submit_knowledge_gate_decisions",
+            worker_task["tools"],
+        )
+        self.assertFalse(any(
+            event.get("payload", {}).get("exception_class") == "NameError"
+            for event in events
+            if isinstance(event, dict)
+        ))
+
     async def test_disjoint_intent_and_route_resources_both_auto_dispatch(self):
         skill_name = "two-stage-auto-skill"
         orchestrator = "orchestration/main.yaml"
@@ -1302,6 +1913,44 @@ class DeterministicSkillInspectionRunTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         with tempfile.TemporaryDirectory() as temp_dir:
+            selected_package = _precompiled_package(
+                skill_dir=Path(temp_dir) / "skill-package",
+                linked_files={
+                    "orchestration": [orchestrator],
+                    "intent": intent_paths,
+                    "workers": worker_paths,
+                },
+                workflow_contract=contract,
+            )
+            unrelated_package = _precompiled_package(
+                skill_dir=Path(temp_dir) / "unrelated-package",
+            )
+            package_loader = Mock(side_effect=lambda path, **_kwargs: (
+                unrelated_package
+                if "unrelated-package" in str(path)
+                else selected_package
+            ))
+            script_inventory = Mock(return_value=())
+            skill_records = [
+                {
+                    "name": skill_name,
+                    "description": "Selected two-stage workflow.",
+                    "scope": "session",
+                    "path": str(
+                        Path(selected_package["skill_dir"]) / "SKILL.md"
+                    ),
+                    "skill_dir": selected_package["skill_dir"],
+                },
+                {
+                    "name": "unrelated-package",
+                    "description": "Unrelated package that must remain unread.",
+                    "scope": "session",
+                    "path": str(
+                        Path(unrelated_package["skill_dir"]) / "SKILL.md"
+                    ),
+                    "skill_dir": unrelated_package["skill_dir"],
+                },
+            ]
             with (
                 patch("workspace_context.WORKSPACE_ROOT", Path(temp_dir)),
                 patch("agent_loop.httpx.AsyncClient", FakeAsyncClient),
@@ -1312,19 +1961,15 @@ class DeterministicSkillInspectionRunTests(unittest.IsolatedAsyncioTestCase):
                 patch("agent_loop._fetch_goal", AsyncMock(return_value=None)),
                 patch(
                     "skills.loader.load_skill_content",
-                    return_value=_precompiled_package(
-                        skill_dir=Path(temp_dir) / "skill-package",
-                        linked_files={
-                            "orchestration": [orchestrator],
-                            "intent": intent_paths,
-                            "workers": worker_paths,
-                        },
-                        workflow_contract=contract,
-                    ),
+                    package_loader,
                 ),
                 patch(
                     "skills.scanner.find_all_skills",
-                    return_value=[{"name": skill_name, "scope": "session"}],
+                    return_value=skill_records,
+                ),
+                patch(
+                    "skills.scanner.skill_runnable_script_resources",
+                    script_inventory,
                 ),
             ):
                 events = [
@@ -1352,6 +1997,15 @@ class DeterministicSkillInspectionRunTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(inspected_paths), 63)
         self.assertEqual(len(request_bodies), 1)
+        # Initial binding loads/scans only the exact selected package. The
+        # intent-driven route recompilation must reuse that frozen snapshot,
+        # not traverse or reload the unrelated session catalog.
+        self.assertEqual(1, package_loader.call_count)
+        self.assertEqual(1, script_inventory.call_count)
+        self.assertNotIn(
+            "unrelated-package",
+            [str(call.args[0]) for call in package_loader.call_args_list],
+        )
         self.assertEqual(events[-1]["type"], "error")
         self.assertIn(
             f"{skill_name}/worker/{worker_ids[0]}",

@@ -19,6 +19,7 @@ import re
 import shutil
 import stat
 import sys
+import traceback
 import unicodedata
 import uuid
 from dataclasses import dataclass, field, replace
@@ -1194,10 +1195,54 @@ def _tool_call_history_requires_collapse(tool_name: str, arguments: str) -> bool
     )
 
 
-def _safe_tool_argument_record(arguments: str) -> str:
+def _safe_tool_argument_record(
+    arguments: str,
+    *,
+    tool_name: str = "",
+) -> str:
     parsed = _safe_parse_args(arguments or "")
     if not isinstance(parsed, dict):
-        return "(arguments unavailable)"
+        return "arguments unavailable: non-object JSON"
+    if "__tool_arg_parse_error" in parsed:
+        return "arguments unavailable: malformed JSON"
+    if contains_compacted_history_omission(parsed):
+        return "arguments unavailable: compacted-history placeholder"
+    if tool_name == "delegate_task":
+        raw_tasks = (
+            [parsed]
+            if str(parsed.get("goal") or "").strip()
+            else parsed.get("tasks")
+        )
+        tasks = (
+            [task for task in raw_tasks if isinstance(task, dict)]
+            if isinstance(raw_tasks, list)
+            else []
+        )
+        labels: list[str] = []
+        for task in tasks[:6]:
+            label = next(
+                (
+                    task.get(key)
+                    for key in ("agent_name", "worker_id", "step_id")
+                    if isinstance(task.get(key), str)
+                    and str(task.get(key)).strip()
+                ),
+                "",
+            )
+            if not label:
+                continue
+            safe_label = " ".join(
+                _redact_debug_text(str(label)).split()
+            ).strip()[:80]
+            if safe_label and safe_label not in labels:
+                labels.append(safe_label)
+        projection = [
+            "structured arguments hidden",
+            f"task_count={len(tasks)}",
+        ]
+        if labels:
+            projection.append("agents=" + ", ".join(labels))
+        return "; ".join(projection)
     parts: list[str] = []
     for key in _MODEL_HISTORY_SAFE_ARGUMENT_KEYS:
         value = parsed.get(key)
@@ -1205,7 +1250,14 @@ def _safe_tool_argument_record(arguments: str) -> str:
             text = str(value).replace("\n", " ").strip()
             if text:
                 parts.append(f"{key}={text[:240]}")
-    return ", ".join(parts) if parts else "(large or invalid arguments withheld)"
+    return (
+        ", ".join(parts)
+        if parts
+        else (
+            "structured arguments hidden; "
+            f"field_count={len(parsed)}"
+        )
+    )
 
 
 def _safe_delegated_result_records(value: Any) -> list[dict[str, Any]]:
@@ -1348,7 +1400,8 @@ def _collapse_tool_turn_history(
             continue
         result_message = result_by_id.get(call_id, {})
         records.append(
-            f"- {tool_name}: {_safe_tool_argument_record(arguments)}; "
+            f"- {tool_name}: "
+            f"{_safe_tool_argument_record(arguments, tool_name=tool_name)}; "
             f"result={_safe_tool_result_record(result_message.get('content'))}"
         )
 
@@ -6324,8 +6377,9 @@ class HarnessRunState:
                 if missing_selected:
                     return True, (
                         f"inspect selected intent resources for session skill '{skill_name}' "
-                        f"(missing {len(missing_selected)} of "
-                        f"{len(required_selected)} selected local files)"
+                        f"(pending {len(missing_selected)} of "
+                        f"{len(required_selected)} selected-resource "
+                        "inspection receipts)"
                     )
             full_output_required = (
                 not plan or plan.get("requires_full_output") is True
@@ -6352,7 +6406,9 @@ class HarnessRunState:
             if missing_required:
                 return True, (
                     f"inspect explicit workflow resources for session skill '{skill_name}' "
-                    f"(missing {len(missing_required)} of {len(required_files)} declared files)"
+                    f"(pending {len(missing_required)} of "
+                    f"{len(required_files)} declared-resource inspection "
+                    "receipts)"
                 )
 
             execution_workflow_categories = {"orchestration", "workers", "workflows"}
@@ -10879,6 +10935,80 @@ def _compiled_skill_inspection_target(
     return target, ""
 
 
+def _safe_exception_stack_projection(
+    exception: BaseException,
+) -> list[dict[str, Any]]:
+    """Return a bounded traceback projection without exception text/locals."""
+
+    return [
+        {
+            "file": Path(frame.filename).name[:160],
+            "line": max(0, int(frame.lineno or 0)),
+            "function": str(frame.name or "")[:160],
+        }
+        for frame in traceback.extract_tb(exception.__traceback__)[-16:]
+    ]
+
+
+def _safe_unhandled_run_failure_event(
+    *,
+    run_id: str,
+    root_run_id: str | None,
+    parent_run_id: str | None,
+    agent_kind: str,
+    agent_name: str,
+    depth: int,
+    workspace_scope: str,
+    seq: int,
+    usage: dict[str, int] | None = None,
+    source: str = "chat",
+    exception: BaseException | None = None,
+    terminal_reason: str = "unhandled_harness_exception",
+    failure_class: str = "harness_internal_error",
+    error_message: str = (
+        "Harness encountered an unexpected internal execution error."
+    ),
+) -> dict[str, Any]:
+    """Build a content-safe terminal for an unexpected Harness exception."""
+
+    delegated = agent_kind == "delegate" and source == "delegate"
+    payload: dict[str, Any] = {
+        "error": str(error_message)[:320],
+        "finish_reason": str(failure_class)[:128],
+        "terminal_reason": str(terminal_reason)[:128],
+        "failure_class": str(failure_class)[:128],
+        "retryable": False,
+        "harness_generated": True,
+        "authoritative": not delegated,
+        "usage": dict(usage or {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        }),
+    }
+    if delegated:
+        payload["provisional_terminal"] = True
+    if exception is not None:
+        payload["exception_class"] = type(exception).__name__[:128]
+        safe_stack = _safe_exception_stack_projection(exception)
+        if safe_stack:
+            payload["failure_location"] = dict(safe_stack[-1])
+            payload["failure_stack"] = safe_stack
+    return {
+        "type": "agent_event",
+        "event_type": "run.failed",
+        "run_id": run_id,
+        "root_run_id": root_run_id or run_id,
+        "parent_run_id": parent_run_id,
+        "agent_kind": agent_kind,
+        "agent_name": agent_name,
+        "depth": depth,
+        "workspace_scope": workspace_scope,
+        "seq": max(1, int(seq)),
+        "payload": payload,
+    }
+
+
 def _emit_run_cancelled_on_cancellation(func):
     """Give every cancelled run one durable lifecycle boundary.
 
@@ -10913,12 +11043,17 @@ def _emit_run_cancelled_on_cancellation(func):
             # The scope is runtime-owned and never comes from model arguments.
             # It lets the outer lifecycle wrapper clean up compatibility calls
             # that have no durable AgentRun identifier.
-            kwargs = dict(kwargs)
-            kwargs["_browser_run_scope_id"] = browser_run_scope_id
-        root_run_id = arguments.get("root_run_id") or run_id
+            arguments["_browser_run_scope_id"] = browser_run_scope_id
+        run_id = str(run_id or browser_run_scope_id)
+        if "run_id" in signature.parameters:
+            arguments["run_id"] = run_id
+        root_run_id = str(arguments.get("root_run_id") or run_id)
+        if "root_run_id" in signature.parameters:
+            arguments["root_run_id"] = root_run_id
         parent_run_id = arguments.get("parent_run_id")
         agent_kind = str(arguments.get("agent_kind") or "primary")
         agent_name = arguments.get("agent_name") or agent_kind
+        source = str(arguments.get("source") or "chat")
         depth = int(arguments.get("depth") or 0)
         workspace_scope = str(
             arguments.get("workspace_scope") or "shared_session"
@@ -10931,6 +11066,7 @@ def _emit_run_cancelled_on_cancellation(func):
         )
 
         terminal_seen = False
+        run_started_seen = False
         maximum_event_seq = 0
         observed_usage = {
             "input_tokens": 0,
@@ -10976,7 +11112,11 @@ def _emit_run_cancelled_on_cancellation(func):
                 observed_usage["total_tokens"] += total_tokens
 
         try:
-            async for event in func(*args, **kwargs):
+            # Invoke from the bound arguments so a compatibility caller that
+            # omitted run identity cannot cause the inner generator to mint a
+            # second UUID. This also handles positional ``run_id=None``
+            # without adding a duplicate keyword argument.
+            async for event in func(*bound.args, **bound.kwargs):
                 if isinstance(event, dict):
                     event_type = str(event.get("event_type") or "")
                     if (
@@ -11001,6 +11141,8 @@ def _emit_run_cancelled_on_cancellation(func):
                             observe_usage(
                                 payload.get("api_usage"), cumulative=False
                             )
+                        if event_type == "run.started":
+                            run_started_seen = True
                         if event_type in {
                             "run.completed",
                             "run.failed",
@@ -11010,6 +11152,52 @@ def _emit_run_cancelled_on_cancellation(func):
                     elif event.get("type") == "usage":
                         observe_usage(event, cumulative=True)
                 yield event
+            if run_started_seen and not terminal_seen:
+                # Once a lifecycle has started, a clean async-generator return
+                # without a terminal is invalid. Pre-start compatibility
+                # generators remain the outer SSE producer's responsibility.
+                # Convert the started-run case here so no provider adapter or
+                # future early-return branch can surface as a naked SSE EOF.
+                failure_event = _safe_unhandled_run_failure_event(
+                    run_id=run_id,
+                    root_run_id=str(root_run_id or run_id),
+                    parent_run_id=parent_run_id,
+                    agent_kind=agent_kind,
+                    agent_name=str(agent_name),
+                    depth=depth,
+                    workspace_scope=workspace_scope,
+                    seq=maximum_event_seq + 1,
+                    usage=observed_usage,
+                    source=source,
+                    terminal_reason="missing_terminal_event",
+                    failure_class="harness_lifecycle_error",
+                    error_message=(
+                        "Harness execution ended without a terminal run event."
+                    ),
+                )
+                if bool(getattr(settings, "agent_debug_trace", False)):
+                    _append_workspace_debug_event(
+                        user_id,
+                        session_id,
+                        failure_event,
+                    )
+                if event_sink is not None:
+                    try:
+                        maybe = event_sink(failure_event)
+                        if inspect.isawaitable(maybe):
+                            await asyncio.wait_for(maybe, timeout=0.25)
+                    except BaseException:
+                        logger.debug(
+                            "Missing-terminal event sink unavailable run=%s",
+                            run_id,
+                            exc_info=True,
+                        )
+                terminal_seen = True
+                yield failure_event
+                yield {
+                    "type": "error",
+                    "msg": failure_event["payload"]["error"],
+                }
         except (asyncio.CancelledError, GeneratorExit) as exc:
             if run_id and not terminal_seen:
                 default_cancellation_source = (
@@ -11106,6 +11294,67 @@ def _emit_run_cancelled_on_cancellation(func):
             # server or direct async-generator client may close the iterator
             # explicitly instead of cancelling the awaiting task.
             raise
+        except Exception as exc:
+            # Argument/provider-contract validation occurs inside the async
+            # generator before its first yield.  Preserve that public strict
+            # validation contract for in-process callers.  The outer SSE
+            # producer owns transport-safe conversion when no run has started;
+            # this lifecycle wrapper only synthesizes a terminal after the
+            # inner run has emitted its authoritative start boundary.
+            if not run_started_seen:
+                raise
+            # An internal exception is a lifecycle outcome, not an implicit
+            # EOF. Do not serialize the exception text: provider responses,
+            # package contents, or credentials can be embedded in it.
+            logger.error(
+                "Unhandled Harness run exception run=%s class=%s stack=%s",
+                run_id,
+                type(exc).__name__,
+                json.dumps(
+                    _safe_exception_stack_projection(exc),
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                ),
+            )
+            if run_id and not terminal_seen:
+                failure_event = _safe_unhandled_run_failure_event(
+                    run_id=run_id,
+                    root_run_id=str(root_run_id or run_id),
+                    parent_run_id=parent_run_id,
+                    agent_kind=agent_kind,
+                    agent_name=str(agent_name),
+                    depth=depth,
+                    workspace_scope=workspace_scope,
+                    seq=maximum_event_seq + 1,
+                    usage=observed_usage,
+                    source=source,
+                    exception=exc,
+                )
+                # Persist before notifying a possibly failing/disconnected
+                # sink so the authoritative reason survives transport loss.
+                if bool(getattr(settings, "agent_debug_trace", False)):
+                    _append_workspace_debug_event(
+                        user_id,
+                        session_id,
+                        failure_event,
+                    )
+                if event_sink is not None:
+                    try:
+                        maybe = event_sink(failure_event)
+                        if inspect.isawaitable(maybe):
+                            await asyncio.wait_for(maybe, timeout=0.25)
+                    except BaseException:
+                        logger.debug(
+                            "Failed-run event sink unavailable run=%s",
+                            run_id,
+                            exc_info=True,
+                        )
+                terminal_seen = True
+                yield failure_event
+                yield {
+                    "type": "error",
+                    "msg": failure_event["payload"]["error"],
+                }
         finally:
             try:
                 from tools.browser import close_browser_run
@@ -12534,6 +12783,19 @@ async def run_stream(
     pending_workflow_auto_call: dict[str, Any] | None = None
     direct_url_browser_fallback: dict[str, Any] | None = None
     pending_workflow_contract_compile_failure: dict[str, Any] | None = None
+    # These maps are a run-scoped, content-addressed package snapshot.  Every
+    # exact Skill-selection path (explicit name, declared route, lexical or
+    # semantic relevance) binds them once before compiler-owned worker plans
+    # can use package resources.  In particular, do not declare them only
+    # inside the explicit-name branch: a declared-route workflow reaches the
+    # same knowledge-gate compiler after bootstrap.
+    loaded_packages: dict[str, dict[str, Any]] = {}
+    runnable_scripts: dict[str, tuple[tuple[str, str], ...]] = {}
+    loaded_package_snapshot_identities: dict[
+        str, tuple[str, str, str]
+    ] = {}
+    loaded_package_snapshot_errors: dict[str, str] = {}
+    loaded_package_snapshot_selected: tuple[str, ...] = ()
     # A streamed tool-call batch that also contains provider text/reasoning
     # cannot be repaired by grafting a second sample onto the first one. One
     # *consecutive corruption episode* may instead spend one existing
@@ -13187,6 +13449,42 @@ async def run_stream(
                     exact_knowledge_gate_plan_sha256 = ""
                     symbolic_knowledge_gate = meta.get("knowledge_gate_ir")
                     if isinstance(symbolic_knowledge_gate, dict):
+                        snapshot_error = (
+                            bind_selected_skill_package_snapshot(
+                                (selected_skill,)
+                            )
+                        )
+                        if (
+                            snapshot_error
+                            or selected_skill
+                            not in loaded_package_snapshot_identities
+                            or not isinstance(
+                                loaded_packages.get(selected_skill),
+                                dict,
+                            )
+                        ):
+                            pending_workflow_contract_compile_failure = {
+                                "skill_name": selected_skill,
+                                "step_type": "worker",
+                                "step_id": worker_id,
+                                "workflow_reason": reason,
+                                "contract_path": (
+                                    "execution_contract.workers."
+                                    + worker_id
+                                    + ".knowledge_gate_ir"
+                                ),
+                                "error_code": (
+                                    snapshot_error
+                                    or "skill_package_snapshot_unbound"
+                                ),
+                                "error": (
+                                    "The exact selected Skill package snapshot "
+                                    "was unavailable or changed before runtime "
+                                    "knowledge-gate compilation."
+                                ),
+                            }
+                            forced_workflow_policy = None
+                            return
                         try:
                             (
                                 exact_knowledge_gate_plan,
@@ -14412,6 +14710,310 @@ async def run_stream(
                 # must not later force inspection of every installed package.
                 run_state.session_skill_names.clear()
 
+    def bind_selected_skill_package_snapshot(
+        selected_skill_names: tuple[str, ...],
+    ) -> str:
+        """Bind one immutable package inventory to an exact run selection.
+
+        The selected root and only its exact declared capability closure are
+        loaded because supporting Skills can be part of its authority.
+        Selection itself remains exact and immutable. Re-entry reuses that
+        content-addressed snapshot instead of silently rebuilding authority
+        from a changed filesystem tree.
+
+        A stable error code is returned for fail-closed compiler gates. The
+        loaded records are still retained when a synthetic/test package lacks
+        a snapshot identity so read-only Skill disclosure can report its
+        ordinary package diagnostics; no knowledge-gate authority is issued
+        from such a record.
+        """
+
+        nonlocal loaded_packages, runnable_scripts
+        nonlocal loaded_package_snapshot_identities
+        nonlocal loaded_package_snapshot_errors
+        nonlocal loaded_package_snapshot_selected
+
+        selected = tuple(dict.fromkeys(
+            str(name).strip()
+            for name in selected_skill_names
+            if isinstance(name, str) and str(name).strip()
+        ))
+        if not selected:
+            return "skill_package_snapshot_selection_empty"
+
+        if loaded_package_snapshot_selected:
+            if selected != loaded_package_snapshot_selected:
+                return "skill_package_snapshot_selection_changed"
+            # The immutable maps/digests are reused without rescanning the
+            # complete closure for every worker. Exact consumers already
+            # revalidate only the package identities they dispatch (KG
+            # candidate lowering, Skill resource reads, command/HTTP grants,
+            # and executor boundaries), avoiding O(packages × workers) NFS
+            # hashing while preserving compile→dispatch TOCTOU checks.
+            return next(
+                (
+                    loaded_package_snapshot_errors[name]
+                    for name in selected
+                    if name in loaded_package_snapshot_errors
+                ),
+                "",
+            )
+
+        local_packages: dict[str, dict[str, Any]] = {}
+        local_scripts: dict[str, tuple[tuple[str, str], ...]] = {}
+        local_identities: dict[str, tuple[str, str, str]] = {}
+        local_errors: dict[str, str] = {}
+        try:
+            from skills.loader import load_skill_content
+            from skills.scanner import skill_runnable_script_resources
+            from tools.isolated_skill_executor import snapshot_skill_package
+        except (ImportError, RuntimeError):
+            loaded_package_snapshot_selected = selected
+            loaded_package_snapshot_errors = {
+                name: "skill_package_snapshot_runtime_unavailable"
+                for name in selected
+            }
+            return "skill_package_snapshot_runtime_unavailable"
+
+        # Snapshot only the selected package closure. A session may expose
+        # dozens of unrelated Skills; hashing all of them at ingress and
+        # before every worker is both unnecessary authority and an NFS/DoS
+        # multiplier. Dependencies are exact package names declared by the
+        # selected root (including knowledge-gate Skill refs), expanded
+        # recursively under the same finite package limit.
+        pending_package_names = list(selected)
+        seen_package_names: set[str] = set()
+        while pending_package_names:
+            skill_name = pending_package_names.pop(0)
+            if skill_name in seen_package_names:
+                continue
+            seen_package_names.add(skill_name)
+            if (
+                len(seen_package_names)
+                > _MAX_SESSION_SKILL_DECLARED_ROUTE_PACKAGES
+            ):
+                for selected_name in selected:
+                    local_errors[selected_name] = (
+                        "skill_package_snapshot_dependency_limit"
+                    )
+                break
+            record = explicit_skill_catalog.get(skill_name)
+            if not isinstance(record, dict):
+                local_errors[skill_name] = (
+                    "skill_package_catalog_record_invalid"
+                )
+                continue
+            try:
+                loaded = load_skill_content(
+                    Path(str(record.get("path") or "")),
+                    skill_dir=str(record.get("skill_dir") or ""),
+                    session_id=session_id,
+                )
+            except Exception:
+                # Loader implementations can surface parser/package failures
+                # through arbitrary exception classes. Keep only a stable
+                # code; raw exception strings can contain package content.
+                local_errors[skill_name] = "skill_package_load_failed"
+                continue
+            if not isinstance(loaded, dict):
+                local_errors[skill_name] = "skill_package_load_invalid"
+                continue
+            loaded = dict(loaded)
+            loaded["_chatds_scope"] = str(record.get("scope") or "")
+            local_packages[skill_name] = loaded
+            try:
+                local_scripts[skill_name] = (
+                    skill_runnable_script_resources(
+                        skill_name,
+                        user_id,
+                        session_id,
+                        enabled_user_skills,
+                    )
+                )
+            except Exception:
+                local_scripts[skill_name] = ()
+                loaded["_chatds_runnable_script_inventory_error"] = (
+                    "skill_runnable_script_inventory_failed"
+                )
+                local_errors[skill_name] = (
+                    "skill_runnable_script_inventory_failed"
+                )
+
+            diagnostics = loaded.get("package_diagnostics")
+            if (
+                loaded.get("error")
+                or (
+                    isinstance(diagnostics, dict)
+                    and diagnostics.get("valid") is False
+                )
+            ):
+                local_errors[skill_name] = (
+                    "skill_package_diagnostics_invalid"
+                )
+                continue
+            skill_dir = str(loaded.get("skill_dir") or "")
+            expected_main = str(loaded.get("skill_md_sha256") or "")
+            if not skill_dir or not expected_main:
+                local_errors[skill_name] = (
+                    "skill_package_snapshot_identity_incomplete"
+                )
+                continue
+            try:
+                package_snapshot = snapshot_skill_package(Path(skill_dir))
+                actual_main = package_snapshot.file_sha256("SKILL.md")
+            except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+                local_errors[skill_name] = (
+                    "skill_package_snapshot_unavailable"
+                )
+                continue
+            if actual_main != expected_main:
+                local_errors[skill_name] = (
+                    "skill_package_snapshot_main_mismatch"
+                )
+                continue
+            local_identities[skill_name] = (
+                str(Path(skill_dir).resolve()),
+                actual_main,
+                package_snapshot.sha256,
+            )
+
+            workflow = loaded.get("workflow_contract")
+            execution = (
+                _execution_contract_from_workflow(workflow)
+                if isinstance(workflow, dict)
+                else {}
+            )
+            declared_dependencies: list[str] = []
+            workers = execution.get("workers")
+            if isinstance(workers, dict):
+                worker_rows = workers.values()
+            elif isinstance(workers, list):
+                worker_rows = workers
+            else:
+                worker_rows = ()
+            for worker in worker_rows:
+                if isinstance(worker, dict):
+                    declared_dependencies.extend(
+                        _declared_capability_skill_names(worker)
+                    )
+            bootstrap = execution.get("knowledge_bootstrap")
+            for source in (
+                bootstrap.get("sources") or []
+                if isinstance(bootstrap, dict)
+                else []
+            ):
+                if isinstance(source, dict):
+                    declared_dependencies.extend(
+                        _declared_capability_skill_names(source)
+                    )
+            aggregation = execution.get("aggregation")
+            for step in (
+                aggregation.get("steps") or []
+                if isinstance(aggregation, dict)
+                else []
+            ):
+                if isinstance(step, dict):
+                    declared_dependencies.extend(
+                        _declared_capability_skill_names(step)
+                    )
+            for dependency_name in declared_dependencies:
+                if (
+                    dependency_name not in seen_package_names
+                    and dependency_name not in pending_package_names
+                ):
+                    pending_package_names.append(dependency_name)
+
+        for skill_name in selected:
+            if skill_name not in explicit_skill_catalog:
+                local_errors[skill_name] = (
+                    "skill_package_snapshot_selection_unavailable"
+                )
+            elif skill_name not in local_packages:
+                local_errors.setdefault(
+                    skill_name,
+                    "skill_package_snapshot_selection_unavailable",
+                )
+            elif skill_name not in local_identities:
+                local_errors.setdefault(
+                    skill_name,
+                    "skill_package_snapshot_identity_incomplete",
+                )
+
+        # Publish once, after the complete inventory pass. All later users
+        # reuse these exact objects and validate their content identities.
+        loaded_packages = local_packages
+        runnable_scripts = local_scripts
+        loaded_package_snapshot_identities = local_identities
+        loaded_package_snapshot_errors = local_errors
+        loaded_package_snapshot_selected = selected
+        return next(
+            (
+                local_errors[name]
+                for name in selected
+                if name in local_errors
+            ),
+            "",
+        )
+
+    def frozen_skill_package_snapshot_error(skill_name: str) -> str:
+        """Revalidate one consumer against the run's immutable package ID."""
+
+        if loaded_package_snapshot_errors.get(skill_name):
+            return loaded_package_snapshot_errors[skill_name]
+        identity = loaded_package_snapshot_identities.get(skill_name)
+        loaded = loaded_packages.get(skill_name)
+        if (
+            not isinstance(identity, tuple)
+            or len(identity) != 3
+            or not all(isinstance(item, str) and item for item in identity)
+            or not isinstance(loaded, dict)
+        ):
+            return "skill_package_snapshot_identity_incomplete"
+        try:
+            from tools.isolated_skill_executor import snapshot_skill_package
+
+            package_root = Path(
+                str(loaded.get("skill_dir") or "")
+            ).resolve(strict=True)
+            current = snapshot_skill_package(package_root)
+            current_main = current.file_sha256("SKILL.md")
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+            return "skill_package_snapshot_unavailable"
+        if (
+            str(package_root) != identity[0]
+            or current_main != identity[1]
+            or current.sha256 != identity[2]
+            or current_main != str(loaded.get("skill_md_sha256") or "")
+        ):
+            return "skill_package_snapshot_identity_changed"
+        return ""
+
+    # Exact-name activation can compile an execution surface immediately and
+    # therefore binds at ingress. Relevance/declared-route selection grants
+    # only the canonical main-document read; bind that package after the
+    # successful ``skill_view`` receipt in
+    # ``install_deterministic_complex_skill_boundary``. Loading it here would
+    # turn a metadata-only relevance decision into premature package access
+    # and can fail an otherwise valid read-only inspection.
+    initial_snapshot_selection = explicit_selected_skill_names
+    if len(initial_snapshot_selection) == 1:
+        initial_snapshot_error = bind_selected_skill_package_snapshot(
+            initial_snapshot_selection
+        )
+        if initial_snapshot_error:
+            pending_workflow_contract_compile_failure = {
+                "skill_name": initial_snapshot_selection[0],
+                "step_type": "skill_package_snapshot",
+                "step_id": "selected-package",
+                "workflow_reason": "bind exact selected Skill package",
+                "contract_path": "selected_skill.package_snapshot",
+                "error_code": initial_snapshot_error,
+                "error": (
+                    "The exact selected Skill package could not be bound to "
+                    "one immutable content-addressed snapshot."
+                ),
+            }
+
     requested_tool_count = len(tools)
     effective_allow_session_mcp = allow_session_mcp
     tool_exposure_reasons: list[str] = []
@@ -14518,6 +15120,71 @@ async def run_stream(
         events.append({"type": "error", "msg": message})
         return events
 
+    def seal_skill_package_snapshot_failure(
+        skill_name: str,
+        *,
+        step_id: str,
+        workflow_reason: str,
+        error_code: str,
+    ) -> str:
+        """Revoke a mutable boundary when its frozen package no longer holds."""
+
+        nonlocal tools, tool_context
+        nonlocal pending_workflow_contract_compile_failure
+        nonlocal forced_workflow_policy, pending_workflow_auto_call
+        nonlocal direct_required_tool_groups, direct_missing_requirements
+        nonlocal direct_mcp_policy, direct_mcp_exact_names
+        nonlocal effective_allow_session_mcp
+        nonlocal standard_plan_execution_window_pending
+
+        pending_workflow_contract_compile_failure = {
+            "skill_name": skill_name,
+            "step_type": "skill_package_snapshot",
+            "step_id": step_id,
+            "workflow_reason": workflow_reason,
+            "contract_path": "selected_skill.package_snapshot",
+            "error_code": error_code,
+            "error": (
+                "The selected Skill package no longer matches the immutable "
+                "snapshot bound at the start of this run."
+            ),
+        }
+        _clear_skill_runtime_ir_authority(run_state, skill_name)
+        tools = []
+        run_state.available_tools.clear()
+        tool_context = replace(
+            tool_context,
+            enabled_tools=(),
+            skill_execution_resource_boundary=True,
+            allowed_skill_resources=(),
+            selected_skill_browse_roots=(),
+            allowed_skill_scripts=(),
+            process_only_skill_scripts=(),
+            allowed_skill_script_authorities=(),
+            allowed_skill_package_digests=(),
+            allowed_skill_commands=(),
+            allowed_skill_http_prefixes=(),
+            allowed_skill_http_post_prefixes=(),
+            skill_capability_catalog=None,
+        )
+        forced_workflow_policy = None
+        pending_workflow_auto_call = None
+        direct_required_tool_groups = []
+        direct_missing_requirements = [error_code]
+        direct_mcp_policy = "none"
+        direct_mcp_exact_names = ()
+        effective_allow_session_mcp = False
+        standard_required_candidates.clear()
+        standard_completed_required_candidate_ids.clear()
+        standard_required_candidate_receipts.clear()
+        standard_plan_execution_window_pending = False
+        return (
+            "[Harness Skill package snapshot blocked] The selected package "
+            "is unavailable, invalid, or changed relative to this run's "
+            "content-addressed snapshot. All Skill-derived execution "
+            "authority was revoked."
+        )
+
     # A session MCP catalog is mutable (tools/list_changed).  Once discovery
     # finishes, every schema shown to the model and every dispatch in this run
     # must use the same content-addressed descriptor snapshot.
@@ -14535,59 +15202,7 @@ async def run_stream(
         and explicit_selected_skill_names
     ):
         selected_skill_names = explicit_selected_skill_names
-        loaded_packages: dict[str, dict[str, Any]] = {}
-        runnable_scripts: dict[str, tuple[tuple[str, str], ...]] = {}
-        try:
-            from skills.loader import load_skill_content
-            from skills.scanner import skill_runnable_script_resources
-
-            for skill_name in selected_skill_names:
-                record = explicit_skill_catalog.get(skill_name)
-                if not isinstance(record, dict):
-                    continue
-                loaded_package = load_skill_content(
-                    Path(str(record.get("path") or "")),
-                    skill_dir=str(record.get("skill_dir") or ""),
-                    session_id=session_id,
-                )
-                if isinstance(loaded_package, dict):
-                    loaded_package = dict(loaded_package)
-                    loaded_package["_chatds_scope"] = str(
-                        record.get("scope") or ""
-                    )
-                loaded_packages[skill_name] = loaded_package
-            # Capability Skills are resolved later from the selected package's
-            # declarations. Inventory only the already-visible canonical
-            # packages and their content-addressed entrypoints.
-            for skill_name in explicit_skill_catalog:
-                if skill_name not in loaded_packages:
-                    record = explicit_skill_catalog.get(skill_name)
-                    if isinstance(record, dict):
-                        loaded_package = load_skill_content(
-                            Path(str(record.get("path") or "")),
-                            skill_dir=str(record.get("skill_dir") or ""),
-                            session_id=session_id,
-                        )
-                        if isinstance(loaded_package, dict):
-                            loaded_package = dict(loaded_package)
-                            loaded_package["_chatds_scope"] = str(
-                                record.get("scope") or ""
-                            )
-                        loaded_packages[skill_name] = loaded_package
-                runnable_scripts[skill_name] = skill_runnable_script_resources(
-                    skill_name,
-                    user_id,
-                    session_id,
-                    enabled_user_skills,
-                )
-        except Exception:
-            logger.debug(
-                "Failed to compile bounded session Skill execution surface "
-                "for user=%s session=%s",
-                user_id,
-                session_id,
-                exc_info=True,
-            )
+        bind_selected_skill_package_snapshot(selected_skill_names)
         bounded_skill_exposure = _bounded_skill_execution_exposure(
             run_state.original_user_text,
             skill_compiler_tool_universe,
@@ -14597,6 +15212,11 @@ async def run_stream(
             ),
             loaded_packages,
             runnable_scripts,
+            selected_skill_names=selected_skill_names,
+            package_snapshot_identities=(
+                loaded_package_snapshot_identities
+            ),
+            package_snapshot_errors=loaded_package_snapshot_errors,
         )
         if len(selected_skill_names) == 1:
             standard_name = selected_skill_names[0]
@@ -16326,6 +16946,7 @@ async def run_stream(
         """Install one exact current-package boundary after deterministic select."""
         nonlocal tools, tool_context, forced_workflow_policy
         nonlocal pending_workflow_auto_call
+        nonlocal pending_workflow_contract_compile_failure
         nonlocal direct_required_tool_groups, direct_missing_requirements
 
         if (
@@ -16347,39 +16968,33 @@ async def run_stream(
         # invalid or unavailable selected package must fail as that package;
         # it must never fall through to inspecting unrelated catalog entries.
         run_state.session_skill_names = {viewed_skill_name}
-        try:
-            from skills.loader import load_skill_content
-            from skills.scanner import skill_runnable_script_resources
-
-            current_packages: dict[str, dict[str, Any]] = {}
-            current_scripts: dict[str, tuple[tuple[str, str], ...]] = {}
-            for skill_name, record in explicit_skill_catalog.items():
-                if not isinstance(record, dict):
-                    continue
-                loaded = load_skill_content(
-                    Path(str(record.get("path") or "")),
-                    skill_dir=str(record.get("skill_dir") or ""),
-                    session_id=session_id,
-                )
-                if isinstance(loaded, dict):
-                    loaded = dict(loaded)
-                    loaded["_chatds_scope"] = str(record.get("scope") or "")
-                current_packages[skill_name] = loaded
-                current_scripts[skill_name] = skill_runnable_script_resources(
-                    skill_name,
-                    user_id,
-                    session_id,
-                    enabled_user_skills,
-                )
-        except Exception:
-            logger.debug(
-                "Failed to load current packages for dynamic Skill boundary "
-                "user=%s session=%s",
-                user_id,
-                session_id,
-                exc_info=True,
+        snapshot_error = bind_selected_skill_package_snapshot(
+            (viewed_skill_name,)
+        )
+        if snapshot_error:
+            pending_workflow_contract_compile_failure = {
+                "skill_name": viewed_skill_name,
+                "step_type": "skill_package_snapshot",
+                "step_id": "selected-package",
+                "workflow_reason": (
+                    "install deterministic selected Skill boundary"
+                ),
+                "contract_path": "selected_skill.package_snapshot",
+                "error_code": snapshot_error,
+                "error": (
+                    "The exact selected Skill package could not be bound to "
+                    "one immutable content-addressed snapshot."
+                ),
+            }
+            forced_workflow_policy = None
+            pending_workflow_auto_call = None
+            return (
+                "[Harness Skill package snapshot blocked] The exact selected "
+                "package is unavailable, invalid, or changed. No Skill "
+                "execution authority was installed."
             )
-            return None
+        current_packages = loaded_packages
+        current_scripts = runnable_scripts
 
         selected = _deterministic_complex_skill_selection(
             run_state.original_user_text,
@@ -16654,6 +17269,10 @@ async def run_stream(
             current_packages,
             current_scripts,
             selected_skill_names=selected,
+            package_snapshot_identities=(
+                loaded_package_snapshot_identities
+            ),
+            package_snapshot_errors=loaded_package_snapshot_errors,
         )
         if exposure.selected_skills != selected:
             return None
@@ -17202,26 +17821,38 @@ async def run_stream(
         )
         if not authority_documents:
             return None
-        record = explicit_skill_catalog.get(skill_name)
-        if not isinstance(record, dict):
-            return None
-        try:
-            from skills.loader import load_skill_content
-            from skills.path_safety import validate_skill_resource
-            from skills.scanner import skill_runnable_script_resources
-
-            loaded_package = load_skill_content(
-                Path(str(record.get("path") or "")),
-                skill_dir=str(record.get("skill_dir") or ""),
-                session_id=session_id,
+        snapshot_error = (
+            bind_selected_skill_package_snapshot((skill_name,))
+            or frozen_skill_package_snapshot_error(skill_name)
+        )
+        if snapshot_error:
+            return seal_skill_package_snapshot_failure(
+                skill_name,
+                step_id="capability-catalog-amendment",
+                workflow_reason=(
+                    "recompile standard Skill catalog after exact reference "
+                    "disclosure"
+                ),
+                error_code=snapshot_error,
             )
-            package_root = Path(
-                str(
-                    loaded_package.get("skill_dir")
-                    or record.get("skill_dir")
-                    or Path(str(record.get("path") or "")).parent
-                )
-            ).resolve(strict=True)
+        loaded_package = loaded_packages.get(skill_name)
+        identity = loaded_package_snapshot_identities.get(skill_name)
+        if not isinstance(loaded_package, dict) or not isinstance(
+            identity, tuple
+        ):
+            return seal_skill_package_snapshot_failure(
+                skill_name,
+                step_id="capability-catalog-amendment",
+                workflow_reason=(
+                    "recompile standard Skill catalog after exact reference "
+                    "disclosure"
+                ),
+                error_code="skill_package_snapshot_identity_incomplete",
+            )
+        try:
+            from skills.path_safety import validate_skill_resource
+
+            package_root = Path(identity[0]).resolve(strict=True)
             current_authority_documents: list[dict[str, str]] = []
             for document in authority_documents:
                 resource_path = str(document.get("resource_path") or "")
@@ -17240,23 +17871,33 @@ async def run_stream(
                     continue
                 current_authority_documents.append(dict(document))
             if not current_authority_documents:
-                return None
-            runnable_scripts = skill_runnable_script_resources(
-                skill_name,
+                return seal_skill_package_snapshot_failure(
+                    skill_name,
+                    step_id="capability-catalog-amendment",
+                    workflow_reason=(
+                        "revalidate disclosed standard Skill references"
+                    ),
+                    error_code=(
+                        "skill_reference_authority_snapshot_mismatch"
+                    ),
+                )
+        except Exception as exc:
+            logger.warning(
+                "Standard Skill reference amendment failed closed "
+                "user=%s session=%s skill=%s failure_type=%s",
                 user_id,
                 session_id,
-                enabled_user_skills,
-            )
-        except Exception:
-            logger.debug(
-                "Failed to compile standard Skill reference amendment "
-                "user=%s session=%s skill=%s",
-                user_id,
-                session_id,
                 skill_name,
-                exc_info=True,
+                type(exc).__name__,
             )
-            return None
+            return seal_skill_package_snapshot_failure(
+                skill_name,
+                step_id="capability-catalog-amendment",
+                workflow_reason=(
+                    "revalidate disclosed standard Skill references"
+                ),
+                error_code="skill_reference_authority_revalidation_failed",
+            )
 
         compiler_tools = list(dict.fromkeys([
             *skill_compiler_tool_universe,
@@ -17267,7 +17908,7 @@ async def run_stream(
                 skill_name,
                 loaded_package,
                 compiler_tools,
-                tuple(runnable_scripts or ()),
+                tuple(runnable_scripts.get(skill_name) or ()),
                 tuple(current_authority_documents),
                 request_text=run_state.original_user_text,
                 phase="amendment",
@@ -17359,42 +18000,22 @@ async def run_stream(
         current_plan = run_state.skill_execution_plans.get(skill_name)
         if not isinstance(current_plan, dict):
             return None
-        try:
-            from skills.loader import load_skill_content
-            from skills.scanner import skill_runnable_script_resources
-
-            current_packages: dict[str, dict[str, Any]] = {}
-            current_scripts: dict[str, tuple[tuple[str, str], ...]] = {}
-            for current_name, record in explicit_skill_catalog.items():
-                if not isinstance(record, dict):
-                    continue
-                loaded = load_skill_content(
-                    Path(str(record.get("path") or "")),
-                    skill_dir=str(record.get("skill_dir") or ""),
-                    session_id=session_id,
-                )
-                if isinstance(loaded, dict):
-                    loaded = dict(loaded)
-                    loaded["_chatds_scope"] = str(record.get("scope") or "")
-                current_packages[current_name] = loaded
-                current_scripts[current_name] = (
-                    skill_runnable_script_resources(
-                        current_name,
-                        user_id,
-                        session_id,
-                        enabled_user_skills,
-                    )
-                )
-        except Exception:
-            logger.debug(
-                "Failed to reload current packages for selected-plan boundary "
-                "user=%s session=%s skill=%s",
-                user_id,
-                session_id,
+        snapshot_error = (
+            bind_selected_skill_package_snapshot((skill_name,))
+            or frozen_skill_package_snapshot_error(skill_name)
+        )
+        if snapshot_error:
+            return seal_skill_package_snapshot_failure(
                 skill_name,
-                exc_info=True,
+                step_id="selected-route-boundary",
+                workflow_reason=(
+                    "recompile selected Skill boundary after validated "
+                    "intent state change"
+                ),
+                error_code=snapshot_error,
             )
-            return None
+        current_packages = loaded_packages
+        current_scripts = runnable_scripts
 
         pending = run_state.skill_pending_intent_resource_closure.get(skill_name)
         selected_resource_overrides = {
@@ -17420,9 +18041,20 @@ async def run_stream(
             selected_skill_names=(skill_name,),
             compiled_plans={skill_name: current_plan},
             selected_resource_overrides=selected_resource_overrides,
+            package_snapshot_identities=(
+                loaded_package_snapshot_identities
+            ),
+            package_snapshot_errors=loaded_package_snapshot_errors,
         )
         if exposure.selected_skills != (skill_name,):
-            return None
+            return seal_skill_package_snapshot_failure(
+                skill_name,
+                step_id="selected-route-boundary",
+                workflow_reason=(
+                    "compile exact selected Skill execution exposure"
+                ),
+                error_code="skill_execution_exposure_selection_mismatch",
+            )
 
         exact_mcp = {name.casefold() for name in exposure.mcp_exact_names}
         selected_mcp_tools: list[str] = []
@@ -17671,12 +18303,23 @@ async def run_stream(
             failure = dict(pending_workflow_contract_compile_failure)
             pending_workflow_contract_compile_failure = None
             error_detail = str(failure.get("error") or "invalid result schema")
+            failure_code = str(failure.get("error_code") or "")
+            snapshot_failure = failure_code.startswith(
+                "skill_package_snapshot_"
+            ) or failure_code == "skill_runnable_script_inventory_failed"
             msg = (
-                "Compiled Skill result contract failed closed before dispatch: "
-                + str(failure.get("contract_path") or "unknown contract path")
-                + " — "
-                + error_detail
-            )
+                (
+                    "Selected Skill package snapshot failed closed before "
+                    "dispatch: "
+                )
+                if snapshot_failure
+                else (
+                    "Compiled Skill result contract failed closed before "
+                    "dispatch: "
+                )
+            ) + str(
+                failure.get("contract_path") or "unknown contract path"
+            ) + " — " + error_detail
             diagnostic = {
                 **failure,
                 "actual_dispatch_attempted": False,
@@ -17688,7 +18331,11 @@ async def run_stream(
                 yield debug_evt
             yield await emit_agent_event("run.failed", {
                 "error": msg,
-                "finish_reason": "skill_result_contract_invalid",
+                "finish_reason": (
+                    "skill_package_snapshot_invalid"
+                    if snapshot_failure
+                    else "skill_result_contract_invalid"
+                ),
                 "contract_diagnostic": diagnostic,
                 "actual_dispatch_attempted": False,
             })
@@ -17803,7 +18450,8 @@ async def run_stream(
             yield {
                 "type": "tool_progress",
                 "msg": (
-                    f"🔧 {auto_tool_name}({_safe_tool_argument_record(auto_observability_json)}) "
+                    f"🔧 {auto_tool_name}("
+                    f"{_safe_tool_argument_record(auto_observability_json, tool_name=auto_tool_name)}) "
                     "[contract auto-dispatch]"
                 ),
             }
@@ -26755,7 +27403,10 @@ async def run_stream(
             for tc in assembled_calls:
                 run_state.tool_call_count += 1
                 tool_call_id = str(tc.id)
-                args_summary = _safe_tool_argument_record(tc.arguments)
+                args_summary = _safe_tool_argument_record(
+                    tc.arguments,
+                    tool_name=tc.name,
+                )
                 display_tool_name = tc.name
                 history_will_collapse = _tool_call_history_requires_collapse(
                     tc.name,
@@ -36208,6 +36859,10 @@ def _bounded_skill_execution_exposure(
     selected_skill_names: tuple[str, ...] | None = None,
     compiled_plans: dict[str, dict[str, Any]] | None = None,
     selected_resource_overrides: dict[str, list[str]] | None = None,
+    package_snapshot_identities: (
+        dict[str, tuple[str, str, str]] | None
+    ) = None,
+    package_snapshot_errors: dict[str, str] | None = None,
 ) -> SkillExecutionExposure:
     """Compile the least-privilege surface for one explicit Skill execution.
 
@@ -36247,6 +36902,33 @@ def _bounded_skill_execution_exposure(
             allowed_skill_package_digests=(),
             allowed_skill_commands=(),
         )
+    frozen_snapshot_required = bool(
+        package_snapshot_identities is not None
+        or package_snapshot_errors is not None
+    )
+
+    def frozen_snapshot_identity(
+        skill_name: str,
+    ) -> tuple[str, str, str] | None:
+        if not frozen_snapshot_required:
+            return None
+        if (
+            isinstance(package_snapshot_errors, dict)
+            and package_snapshot_errors.get(skill_name)
+        ):
+            return None
+        identity = (
+            package_snapshot_identities.get(skill_name)
+            if isinstance(package_snapshot_identities, dict)
+            else None
+        )
+        if (
+            not isinstance(identity, tuple)
+            or len(identity) != 3
+            or not all(isinstance(item, str) and item for item in identity)
+        ):
+            return None
+        return identity
 
     requested: set[str] = {
         name for name in ("skills_list", "skill_view") if name in available
@@ -36267,11 +36949,14 @@ def _bounded_skill_execution_exposure(
     execution_capabilities: set[str] = set()
     has_compiled_orchestration = False
     declared_capability_skills: set[str] = set()
+    required_capability_skills: set[str] = set()
+    optional_gate_capability_skills: set[str] = set()
     selected_main_tools_explicitly_empty = False
     standard_body_capability_plans: list[DirectToolExposure] = []
 
     for skill_name in selected:
         loaded = loaded_packages.get(skill_name)
+        selected_frozen_identity = frozen_snapshot_identity(skill_name)
         package_diagnostics = (
             loaded.get("package_diagnostics")
             if isinstance(loaded, dict) else None
@@ -36279,6 +36964,10 @@ def _bounded_skill_execution_exposure(
         if (
             not isinstance(loaded, dict)
             or loaded.get("error")
+            or (
+                frozen_snapshot_required
+                and selected_frozen_identity is None
+            )
             or (
                 isinstance(package_diagnostics, dict)
                 and package_diagnostics.get("valid") is False
@@ -36297,6 +36986,15 @@ def _bounded_skill_execution_exposure(
                 != str(loaded.get("skill_md_sha256") or "")
             ):
                 raise ValueError("loaded Skill main digest changed")
+            if selected_frozen_identity is not None and (
+                str(Path(str(loaded.get("skill_dir") or "")).resolve())
+                != selected_frozen_identity[0]
+                or selected_snapshot.file_sha256("SKILL.md")
+                != selected_frozen_identity[1]
+                or selected_snapshot.sha256
+                != selected_frozen_identity[2]
+            ):
+                raise ValueError("loaded Skill snapshot identity changed")
         except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
             missing.append(
                 f"skill_snapshot_unavailable:{skill_name}:"
@@ -36489,19 +37187,61 @@ def _bounded_skill_execution_exposure(
             for worker_id in plan.get("required_workers") or []:
                 worker = workers.get(worker_id)
                 if isinstance(worker, dict):
+                    gate_skill_names = set(
+                        _declared_capability_skill_names({
+                            "knowledge_gate_ir": worker.get(
+                                "knowledge_gate_ir"
+                            ),
+                            "skill_refs": worker.get(
+                                "knowledge_gate_skill_refs"
+                            ),
+                        })
+                    )
+                    ordinary_worker = {
+                        key: value
+                        for key, value in worker.items()
+                        if key not in {
+                            "knowledge_gate",
+                            "knowledge_gate_ir",
+                            "knowledge_gate_skill_refs",
+                        }
+                    }
+                    # The loader may mirror gate-only refs into ``skills`` for
+                    # child preload. Remove those mirrored values here; the
+                    # KG compiler preserves their OR/unresolved semantics.
+                    if isinstance(ordinary_worker.get("skills"), list):
+                        ordinary_worker["skills"] = [
+                            value
+                            for value in ordinary_worker["skills"]
+                            if str(value).removeprefix("skill:")
+                            not in gate_skill_names
+                        ]
+                    ordinary_skill_names = set(
+                        _declared_capability_skill_names(ordinary_worker)
+                    )
+                    required_capability_skills.update(
+                        ordinary_skill_names
+                    )
+                    optional_gate_capability_skills.update(
+                        gate_skill_names - ordinary_skill_names
+                    )
                     declared_capability_skills.update(
-                        _declared_capability_skill_names(worker)
+                        gate_skill_names | ordinary_skill_names
                     )
         for source in plan.get("bootstrap_sources") or []:
             if isinstance(source, dict):
-                declared_capability_skills.update(
+                source_skills = set(
                     _declared_capability_skill_names(source)
                 )
+                declared_capability_skills.update(source_skills)
+                required_capability_skills.update(source_skills)
         for step in plan.get("aggregation_steps") or []:
             if isinstance(step, dict):
-                declared_capability_skills.update(
+                step_skills = set(
                     _declared_capability_skill_names(step)
                 )
+                declared_capability_skills.update(step_skills)
+                required_capability_skills.update(step_skills)
 
         artifact_output = bool(
             isinstance(plan, dict) and _plan_requires_artifact_output(plan)
@@ -36539,9 +37279,23 @@ def _bounded_skill_execution_exposure(
     # later intersects it with the one worker's declared capability names.
     capability_resource_closure: set[tuple[str, str]] = set()
     capability_http_resource_inventory: dict[str, tuple[str, ...]] = {}
+    # A declared name is not authority.  Only capability packages that pass
+    # the complete package/diagnostics, script-inventory, resource-closure,
+    # and immutable-snapshot audit may participate in any later authorization
+    # lane.  In particular, a rejected optional selector in a knowledge-gate
+    # ``one_of`` group must not regain HTTP, script, or command authority just
+    # because another selector can satisfy the group.
+    eligible_capability_skills: set[str] = set()
     capability_resource_error = False
     for capability_skill in sorted(declared_capability_skills):
+        gate_optional = bool(
+            capability_skill in optional_gate_capability_skills
+            and capability_skill not in required_capability_skills
+        )
         capability_loaded = loaded_packages.get(capability_skill)
+        capability_frozen_identity = frozen_snapshot_identity(
+            capability_skill
+        )
         capability_diagnostics = (
             capability_loaded.get("package_diagnostics")
             if isinstance(capability_loaded, dict) else None
@@ -36550,12 +37304,32 @@ def _bounded_skill_execution_exposure(
             not isinstance(capability_loaded, dict)
             or capability_loaded.get("error")
             or (
+                frozen_snapshot_required
+                and capability_frozen_identity is None
+            )
+            or (
                 isinstance(capability_diagnostics, dict)
                 and capability_diagnostics.get("valid") is False
             )
         ):
+            if gate_optional:
+                # A missing Skill selector inside a KG one_of group remains a
+                # compiler-owned unresolved selector. Another exact candidate
+                # may satisfy the group; do not fail the selected root here.
+                continue
             missing.append(
                 f"capability_skill_package_unavailable:{capability_skill}"
+            )
+            capability_resource_error = True
+            continue
+        if capability_loaded.get(
+            "_chatds_runnable_script_inventory_error"
+        ):
+            if gate_optional:
+                continue
+            missing.append(
+                "capability_skill_script_inventory_unavailable:"
+                f"{capability_skill}"
             )
             capability_resource_error = True
             continue
@@ -36563,6 +37337,8 @@ def _bounded_skill_execution_exposure(
             _compiled_capability_supporting_resources(capability_loaded)
         )
         if inventory_error:
+            if gate_optional:
+                continue
             missing.append(
                 "capability_skill_resource_closure_invalid:"
                 f"{capability_skill}: {inventory_error}"
@@ -36580,13 +37356,31 @@ def _bounded_skill_execution_exposure(
                 != str(capability_loaded.get("skill_md_sha256") or "")
             ):
                 raise ValueError("loaded Skill main digest changed")
+            if capability_frozen_identity is not None and (
+                str(
+                    Path(
+                        str(capability_loaded.get("skill_dir") or "")
+                    ).resolve()
+                )
+                != capability_frozen_identity[0]
+                or capability_snapshot.file_sha256("SKILL.md")
+                != capability_frozen_identity[1]
+                or capability_snapshot.sha256
+                != capability_frozen_identity[2]
+            ):
+                raise ValueError(
+                    "loaded capability Skill snapshot identity changed"
+                )
         except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            if gate_optional:
+                continue
             missing.append(
                 "capability_skill_snapshot_unavailable:"
                 f"{capability_skill}:{type(exc).__name__}"
             )
             capability_resource_error = True
             continue
+        eligible_capability_skills.add(capability_skill)
         # This content identity is not executable authority by itself. It lets
         # conditional HTTP/command/native-adapter candidates bind and later
         # revalidate the complete supporting package even when it has no
@@ -36642,7 +37436,7 @@ def _bounded_skill_execution_exposure(
         "skill_http_get", "skill_http_post_json",
     }.intersection(available)
     if available_http_bridges:
-        http_grant_skills = set(selected) | set(declared_capability_skills)
+        http_grant_skills = set(selected) | eligible_capability_skills
         for http_skill in sorted(http_grant_skills):
             loaded_http_skill = loaded_packages.get(http_skill)
             if not isinstance(loaded_http_skill, dict):
@@ -36683,7 +37477,7 @@ def _bounded_skill_execution_exposure(
     # at least one such package has a content-addressed executable resource.
     capability_scripts: list[tuple[str, str, str]] = []
     capability_process_only: set[tuple[str, str, str]] = set()
-    for capability_skill in sorted(declared_capability_skills):
+    for capability_skill in sorted(eligible_capability_skills):
         capability_loaded = loaded_packages.get(capability_skill)
         if not isinstance(capability_loaded, dict):
             continue
@@ -36729,7 +37523,7 @@ def _bounded_skill_execution_exposure(
     from skills.command_grants import grant_tuple, selected_plan_command_grants
 
     capability_command_grants: list[tuple[str, str, str, tuple[str, ...]]] = []
-    for capability_skill in sorted(declared_capability_skills):
+    for capability_skill in sorted(eligible_capability_skills):
         capability_loaded = loaded_packages.get(capability_skill)
         if (
             not isinstance(capability_loaded, dict)

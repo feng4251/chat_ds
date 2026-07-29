@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import unittest
@@ -14,7 +15,10 @@ from tools.context import ToolContext
 from tools.delegation import (
     DELEGATE_TASK_SCHEMA,
     _child_failure_fields,
+    _completion_quality_declaration,
     _content_declares_degraded_completion,
+    _exact_capability_gap_ledger_error,
+    _exact_knowledge_gate_gap_ledger_error,
     _result_field_audit,
     _run_child,
     _strict_result_field_schema,
@@ -116,6 +120,149 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
                 "NO WARNING\nAll declared evidence checks passed."
             )
         )
+        self.assertFalse(
+            _content_declares_degraded_completion(
+                "### Fallback / Degraded Status\n"
+                "| Degraded evidence | None |\n"
+                "All calls succeeded; no degraded evidence status applies."
+            )
+        )
+        self.assertTrue(
+            _content_declares_degraded_completion(
+                "- **Degraded status**: YES — no live source receipt"
+            )
+        )
+        self.assertFalse(
+            _content_declares_degraded_completion(
+                'COMPLETION_QUALITY_JSON: {"status":"complete"}'
+            )
+        )
+        self.assertTrue(
+            _content_declares_degraded_completion(
+                "COMPLETION_QUALITY_JSON: "
+                '{"status":"degraded","reason":"source unavailable"}'
+            )
+        )
+        self.assertFalse(
+            _content_declares_degraded_completion(
+                "```json\n"
+                "COMPLETION_QUALITY_JSON: "
+                '{"status":"degraded","reason":"format example"}\n'
+                "```"
+            )
+        )
+
+    def test_completion_quality_machine_ledger_is_strict_and_unscoped_gaps_do_not_win(self):
+        complete = _completion_quality_declaration(
+            'COMPLETION_QUALITY_JSON: {"status":"complete"}'
+        )
+        degraded = _completion_quality_declaration(
+            "COMPLETION_QUALITY_JSON: "
+            '{"status":"degraded","reason":"bounded source gap"}'
+        )
+        duplicate_key = _completion_quality_declaration(
+            "COMPLETION_QUALITY_JSON: "
+            '{"status":"complete","status":"degraded"}'
+        )
+        malformed = _completion_quality_declaration(
+            'COMPLETION_QUALITY_JSON: {"status":'
+        )
+        unscoped_gap_with_complete = _completion_quality_declaration(
+            'COMPLETION_QUALITY_JSON: {"status":"complete"}\n'
+            "CAPABILITY_GAPS_JSON: "
+            '{"status":"degraded","failed_candidate_ids":["candidate-1"]}'
+        )
+        unscoped_gap_only = _completion_quality_declaration(
+            "KNOWLEDGE_GATE_GAPS_JSON: "
+            '{"status":"degraded","gap_ids":["check-1"]}'
+        )
+
+        self.assertEqual("complete", complete["status"])
+        self.assertEqual("completion_quality_json", complete["source"])
+        self.assertIsNone(complete["error"])
+        self.assertEqual("degraded", degraded["status"])
+        self.assertIsNone(degraded["error"])
+        self.assertIsNotNone(duplicate_key["error"])
+        self.assertIsNotNone(malformed["error"])
+        self.assertEqual("complete", unscoped_gap_with_complete["status"])
+        self.assertIsNone(unscoped_gap_with_complete["error"])
+        self.assertIsNone(unscoped_gap_only["status"])
+        self.assertEqual("none", unscoped_gap_only["source"])
+
+    def test_exact_gap_ledgers_ignore_examples_and_reject_ambiguous_json(self):
+        cases = (
+            (
+                _exact_capability_gap_ledger_error,
+                "CAPABILITY_GAPS_JSON",
+                "failed_candidate_ids",
+                ["candidate-1"],
+            ),
+            (
+                _exact_knowledge_gate_gap_ledger_error,
+                "KNOWLEDGE_GATE_GAPS_JSON",
+                "gap_ids",
+                ["group:gate-1:failed"],
+            ),
+        )
+        for validator, prefix, identifier_key, expected_ids in cases:
+            valid = (
+                f'{prefix}: {{"status":"degraded","{identifier_key}":'
+                + json.dumps(expected_ids, separators=(",", ":"))
+                + "}"
+            )
+            fenced = "```json\n" + valid + "\n```"
+            duplicate_key = (
+                f'{prefix}: {{"status":"complete","status":"degraded",'
+                f'"{identifier_key}":'
+                + json.dumps(expected_ids, separators=(",", ":"))
+                + "}"
+            )
+            nonfinite = (
+                f'{prefix}: {{"status":NaN,"{identifier_key}":'
+                + json.dumps(expected_ids, separators=(",", ":"))
+                + "}"
+            )
+            oversized_identifier = "x" * 33_000
+            oversized = (
+                f'{prefix}: {{"status":"degraded","{identifier_key}":'
+                + json.dumps(
+                    [oversized_identifier],
+                    separators=(",", ":"),
+                )
+                + "}"
+            )
+
+            with self.subTest(prefix=prefix, case="valid"):
+                self.assertIsNone(validator(valid, expected_ids))
+            with self.subTest(prefix=prefix, case="fenced_only"):
+                self.assertIn(
+                    "exactly one",
+                    validator(fenced, expected_ids) or "",
+                )
+            with self.subTest(prefix=prefix, case="fenced_plus_real"):
+                self.assertIsNone(
+                    validator(fenced + "\n" + valid, expected_ids)
+                )
+            with self.subTest(prefix=prefix, case="duplicate_key"):
+                self.assertIn(
+                    "valid finite JSON",
+                    validator(duplicate_key, expected_ids) or "",
+                )
+            with self.subTest(prefix=prefix, case="multiple_ledgers"):
+                self.assertIn(
+                    "exactly one",
+                    validator(valid + "\n" + valid, expected_ids) or "",
+                )
+            with self.subTest(prefix=prefix, case="nonfinite"):
+                self.assertIn(
+                    "valid finite JSON",
+                    validator(nonfinite, expected_ids) or "",
+                )
+            with self.subTest(prefix=prefix, case="oversized"):
+                self.assertIn(
+                    "bounded size",
+                    validator(oversized, [oversized_identifier]) or "",
+                )
 
     def test_parenthesized_raw_tool_call_dialect_is_rejected(self):
         content = (
@@ -1006,6 +1153,509 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("completed", result["status"])
         self.assertTrue(result["result_field_audit"]["footer_valid"])
+
+    async def test_populated_typed_result_without_evidence_receipt_fails_contract(self):
+        observed: dict[str, object] = {}
+        skill_body = (
+            "# Catalog database\n"
+            "Use the declared database query capability for live evidence."
+        )
+        skill_bytes = skill_body.encode("utf-8")
+
+        async def fake_preload(tool_args, *, context, progress=None):
+            return (
+                {"success": True, "content": skill_body},
+                {
+                    "page_count": 1,
+                    "total_chars": len(skill_body),
+                    "total_bytes": len(skill_bytes),
+                    "complete": True,
+                    "sha256": hashlib.sha256(skill_bytes).hexdigest(),
+                },
+            )
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            observed["prompt"] = str(messages[0]["content"])
+            yield {
+                "type": "delta",
+                "content": (
+                    "# Result\n"
+                    "A typed value was supplied without a live query receipt.\n"
+                    'COMPLETION_QUALITY_JSON: {"status":"complete"}\n'
+                    'RESULT_FIELDS_JSON: {"record_id":"DB-1"}'
+                ),
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        with (
+            patch(
+                "tools.delegation._load_complete_skill_view_preload",
+                fake_preload,
+            ),
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                return_value="results/unverified_typed_evidence.md",
+            ) as persist_result,
+        ):
+            result = await _run_child(
+                {
+                    "goal": "query one catalog record",
+                    "step_type": "knowledge_bootstrap",
+                    "tools": ["skill_view"],
+                    "required_result_fields": ["record_id"],
+                    "required_result_schema": {
+                        "record_id": {"type": "string"},
+                    },
+                    "required_capability_skills": ["catalog-database"],
+                },
+                _context("skill_view"),
+                0,
+            )
+
+        self.assertEqual("error", result["status"])
+        self.assertIsNone(result["completion_quality"])
+        self.assertIn(
+            "COMPLETION_QUALITY_JSON declares complete",
+            result["error"],
+        )
+        self.assertIn(
+            "no_verified_evidence_dispatch_receipt",
+            result["error"],
+        )
+        self.assertTrue(result["retryable"])
+        persist_result.assert_not_called()
+        audit = result["completion_quality_audit"]
+        self.assertEqual("complete", audit["declared_status"])
+        self.assertTrue(audit["receipt_forced_degraded"])
+        self.assertTrue(audit["unverified_typed_evidence"])
+        self.assertEqual(0, audit["attempted_evidence_receipt_count"])
+        self.assertEqual(0, audit["successful_evidence_receipt_count"])
+        self.assertIn(
+            "no_verified_evidence_dispatch_receipt",
+            audit["receipt_degraded_reasons"],
+        )
+        self.assertEqual(
+            ["record_id"],
+            audit["unverified_typed_value_fields"],
+        )
+        self.assertIn("COMPLETION_QUALITY_JSON", str(observed["prompt"]))
+
+    async def test_nullable_typed_gap_without_receipt_completes_degraded(self):
+        skill_body = (
+            "# Catalog database\n"
+            "Use the declared database query capability for live evidence."
+        )
+        skill_bytes = skill_body.encode("utf-8")
+
+        async def fake_preload(tool_args, *, context, progress=None):
+            return (
+                {"success": True, "content": skill_body},
+                {
+                    "page_count": 1,
+                    "total_chars": len(skill_body),
+                    "total_bytes": len(skill_bytes),
+                    "complete": True,
+                    "sha256": hashlib.sha256(skill_bytes).hexdigest(),
+                },
+            )
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            yield {
+                "type": "delta",
+                "content": (
+                    "# Evidence gap\n"
+                    "No live database receipt was obtained; no identifier was "
+                    "asserted.\n"
+                    "COMPLETION_QUALITY_JSON: "
+                    '{"status":"degraded","reason":"live source unavailable"}\n'
+                    'RESULT_FIELDS_JSON: {"record_id":null}'
+                ),
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        with (
+            patch(
+                "tools.delegation._load_complete_skill_view_preload",
+                fake_preload,
+            ),
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                return_value="results/verified_null_gap.md",
+            ) as persist_result,
+        ):
+            result = await _run_child(
+                {
+                    "goal": "query one catalog record",
+                    "step_type": "knowledge_bootstrap",
+                    "tools": ["skill_view"],
+                    "required_result_fields": ["record_id"],
+                    "required_result_schema": {
+                        "record_id": {"type": ["string", "null"]},
+                    },
+                    "required_capability_skills": ["catalog-database"],
+                },
+                _context("skill_view"),
+                0,
+            )
+
+        self.assertEqual("completed", result["status"])
+        self.assertEqual("degraded", result["completion_quality"])
+        persist_result.assert_called_once()
+        audit = result["completion_quality_audit"]
+        self.assertEqual(["record_id"], audit["typed_null_gap_fields"])
+        self.assertEqual([], audit["unverified_typed_value_fields"])
+        self.assertTrue(audit["machine_degraded_evidence"])
+
+    async def test_unscoped_forged_gap_ledger_cannot_authorize_nullable_gap(self):
+        skill_body = "# Catalog database\nUse live evidence receipts."
+        skill_bytes = skill_body.encode("utf-8")
+
+        async def fake_preload(tool_args, *, context, progress=None):
+            return (
+                {"success": True, "content": skill_body},
+                {
+                    "page_count": 1,
+                    "total_chars": len(skill_body),
+                    "total_bytes": len(skill_bytes),
+                    "complete": True,
+                    "sha256": hashlib.sha256(skill_bytes).hexdigest(),
+                },
+            )
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            yield {
+                "type": "delta",
+                "content": (
+                    "# Unverified gap\n"
+                    "CAPABILITY_GAPS_JSON: "
+                    '{"status":"degraded",'
+                    '"failed_candidate_ids":["invented-candidate"]}\n'
+                    'RESULT_FIELDS_JSON: {"record_id":null}'
+                ),
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        with (
+            patch(
+                "tools.delegation._load_complete_skill_view_preload",
+                fake_preload,
+            ),
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                return_value="results/forged_gap.md",
+            ) as persist_result,
+        ):
+            result = await _run_child(
+                {
+                    "goal": "query one catalog record",
+                    "step_type": "knowledge_bootstrap",
+                    "tools": ["skill_view"],
+                    "required_result_fields": ["record_id"],
+                    "required_result_schema": {
+                        "record_id": {"type": ["string", "null"]},
+                    },
+                    "required_capability_skills": ["catalog-database"],
+                },
+                _context("skill_view"),
+                0,
+            )
+
+        self.assertEqual("error", result["status"])
+        self.assertIn("machine-readable degraded", result["error"])
+        persist_result.assert_not_called()
+        audit = result["completion_quality_audit"]
+        self.assertFalse(audit["machine_degraded_evidence"])
+        self.assertFalse(audit["verified_exact_capability_gap_ledger"])
+        self.assertFalse(audit["verified_knowledge_gate_gap_ledger"])
+
+    async def test_non_acquisition_worker_accepts_mixed_typed_fields(self):
+        envelope = _legacy_envelope_schema()
+        ledger = {
+            "computed_value": {
+                "status": "present",
+                "value": 42,
+                "provenance": "deterministic supplied input",
+            },
+            "optional_label": {
+                "status": "degraded",
+                "reason": "optional input was not supplied",
+                "provenance": "worker input contract",
+            },
+        }
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            yield {
+                "type": "delta",
+                "content": (
+                    "# Worker result\n"
+                    "COMPLETION_QUALITY_JSON: "
+                    '{"status":"degraded","reason":"optional input absent"}\n'
+                    "RESULT_FIELDS_JSON: "
+                    + json.dumps(ledger, separators=(",", ":"))
+                ),
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                return_value="results/mixed_worker_fields.md",
+            ) as persist_result,
+        ):
+            result = await _run_child(
+                {
+                    "goal": "compute one value and classify an optional label",
+                    "step_type": "worker",
+                    "required_result_fields": [
+                        "computed_value",
+                        "optional_label",
+                    ],
+                    "required_result_schema": {
+                        "computed_value": envelope,
+                        "optional_label": envelope,
+                    },
+                },
+                _context(),
+                0,
+            )
+
+        self.assertEqual("completed", result["status"])
+        self.assertEqual("degraded", result["completion_quality"])
+        persist_result.assert_called_once()
+        self.assertEqual(
+            ["computed_value"],
+            result["result_field_audit"]["present"],
+        )
+        self.assertEqual(
+            ["optional_label"],
+            result["result_field_audit"]["degraded"],
+        )
+        audit = result["completion_quality_audit"]
+        self.assertFalse(audit["evidence_acquisition_step"])
+        self.assertFalse(audit["no_verified_value_source"])
+
+    async def test_machine_complete_conflicts_with_typed_degraded_field(self):
+        envelope = _legacy_envelope_schema()
+        ledger = {
+            "optional_label": {
+                "status": "degraded",
+                "reason": "optional input was not supplied",
+                "provenance": "worker input contract",
+            },
+        }
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            yield {
+                "type": "delta",
+                "content": (
+                    "# Contradictory worker result\n"
+                    'COMPLETION_QUALITY_JSON: {"status":"complete"}\n'
+                    "RESULT_FIELDS_JSON: "
+                    + json.dumps(ledger, separators=(",", ":"))
+                ),
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                return_value="results/contradictory_quality.md",
+            ) as persist_result,
+        ):
+            result = await _run_child(
+                {
+                    "goal": "classify one optional label",
+                    "step_type": "worker",
+                    "required_result_fields": ["optional_label"],
+                    "required_result_schema": {
+                        "optional_label": envelope,
+                    },
+                },
+                _context(),
+                0,
+            )
+
+        self.assertEqual("error", result["status"])
+        self.assertIn(
+            "declares complete while Harness-owned",
+            result["error"],
+        )
+        self.assertTrue(result["retryable"])
+        persist_result.assert_not_called()
+        self.assertEqual(
+            ["typed_result_field_gap"],
+            result["completion_quality_audit"][
+                "strict_complete_conflict_reasons"
+            ],
+        )
+
+    async def test_partial_acquisition_with_success_receipt_accepts_mixed_fields(self):
+        envelope = _legacy_envelope_schema()
+        ledger = {
+            "verified_title": {
+                "status": "present",
+                "value": "Verified registry title",
+                "provenance": "successful web_search receipt",
+            },
+            "optional_secondary": {
+                "status": "degraded",
+                "reason": "secondary field was absent",
+                "provenance": "successful source response",
+            },
+        }
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            yield _tool_started(
+                "web_search",
+                "verified-search",
+                query="registry title",
+            )
+            yield {
+                "type": "agent_event",
+                "event_type": "tool.dispatch_started",
+                "tool_name": "web_search",
+                "tool_call_id": "verified-search",
+                "payload": {
+                    "tool_name": "web_search",
+                    "tool_call_id": "verified-search",
+                    "actual_dispatch_attempted": True,
+                },
+            }
+            yield _tool_completed("web_search", "verified-search")
+            yield {
+                "type": "delta",
+                "content": (
+                    "# Partial acquisition\n"
+                    "COMPLETION_QUALITY_JSON: "
+                    '{"status":"degraded","reason":"secondary field absent"}\n'
+                    "RESULT_FIELDS_JSON: "
+                    + json.dumps(ledger, separators=(",", ":"))
+                ),
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                return_value="results/partial_acquisition.md",
+            ) as persist_result,
+        ):
+            result = await _run_child(
+                {
+                    "goal": "retrieve one primary and one optional field",
+                    "step_type": "knowledge_bootstrap",
+                    "tools": ["web_search"],
+                    "required_capability_tools": ["web_search"],
+                    "required_result_fields": [
+                        "verified_title",
+                        "optional_secondary",
+                    ],
+                    "required_result_schema": {
+                        "verified_title": envelope,
+                        "optional_secondary": envelope,
+                    },
+                },
+                _context("web_search"),
+                0,
+            )
+
+        self.assertEqual("completed", result["status"])
+        self.assertEqual("degraded", result["completion_quality"])
+        persist_result.assert_called_once()
+        audit = result["completion_quality_audit"]
+        self.assertTrue(audit["evidence_acquisition_step"])
+        self.assertEqual(1, audit["successful_evidence_receipt_count"])
+        self.assertFalse(audit["no_verified_value_source"])
+        self.assertEqual(
+            ["verified_title"],
+            audit["populated_typed_value_fields"],
+        )
+        self.assertEqual([], audit["unverified_typed_value_fields"])
+
+    async def test_worker_with_preloaded_inputs_and_support_skill_needs_no_live_receipt(self):
+        skill_body = "# Formatter\nFormat values from declared prior results."
+        skill_bytes = skill_body.encode("utf-8")
+
+        async def fake_preload(tool_args, *, context, progress=None):
+            return (
+                {"success": True, "content": skill_body},
+                {
+                    "page_count": 1,
+                    "total_chars": len(skill_body),
+                    "total_bytes": len(skill_bytes),
+                    "complete": True,
+                    "sha256": hashlib.sha256(skill_bytes).hexdigest(),
+                },
+            )
+
+        async def fake_registry(tool_name, args, *, context):
+            self.assertEqual("read_file", tool_name)
+            return json.dumps({
+                "success": True,
+                "content": "prior verified value",
+                "total_lines": 1,
+                "offset": 1,
+                "limit": 2000,
+                "truncated": False,
+            })
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            prompt = str(messages[0]["content"])
+            self.assertNotIn(
+                "This is a declared evidence-acquisition step",
+                prompt,
+            )
+            yield {
+                "type": "delta",
+                "content": (
+                    "# Formatted output\n"
+                    'COMPLETION_QUALITY_JSON: {"status":"complete"}\n'
+                    'RESULT_FIELDS_JSON: {"formatted":"PRIOR VERIFIED VALUE"}'
+                ),
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        with (
+            patch(
+                "tools.delegation._load_complete_skill_view_preload",
+                fake_preload,
+            ),
+            patch("tools.delegation.registry_dispatch", fake_registry),
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                return_value="results/formatted_worker.md",
+            ) as persist_result,
+        ):
+            result = await _run_child(
+                {
+                    "goal": "format the prior verified value",
+                    "step_type": "worker",
+                    "tools": ["read_file", "skill_view"],
+                    "required_result_paths": ["results/prior.txt"],
+                    "required_result_fields": ["formatted"],
+                    "required_result_schema": {
+                        "formatted": {"type": "string"},
+                    },
+                    "required_capability_skills": ["formatter-skill"],
+                },
+                _context("read_file", "skill_view"),
+                0,
+            )
+
+        self.assertEqual("completed", result["status"])
+        self.assertEqual("complete", result["completion_quality"])
+        persist_result.assert_called_once()
+        audit = result["completion_quality_audit"]
+        self.assertFalse(audit["evidence_acquisition_step"])
+        self.assertFalse(audit["typed_evidence_dispatch_expected"])
+        self.assertFalse(audit["no_verified_value_source"])
 
     async def test_short_json_result_is_not_rejected_as_free_prose(self):
         body = '{"status":"ok","items":[]}'
@@ -2415,6 +3065,19 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             ["web_search"],
             observed_runtime_contract["required_capability_tools"],
+        )
+        self.assertEqual("complete", result["completion_quality"])
+        self.assertEqual(
+            1,
+            result["completion_quality_audit"][
+                "attempted_evidence_receipt_count"
+            ],
+        )
+        self.assertEqual(
+            1,
+            result["completion_quality_audit"][
+                "successful_evidence_receipt_count"
+            ],
         )
         persist_result.assert_called_once()
 

@@ -24,6 +24,8 @@ from config import (
     settings,
 )
 from agent_loop import (
+    _safe_exception_stack_projection,
+    _safe_unhandled_run_failure_event,
     run_stream,
     set_harness_service_shutdown_started,
 )
@@ -465,8 +467,50 @@ def _streaming_response(
 
         queue: asyncio.Queue[dict | None] = asyncio.Queue()
         seen_agent_events: set[tuple[str, str, int]] = set()
+        producer_terminal_seen = False
+        producer_maximum_event_seq = 0
+        stream_run_id = str(
+            run_metadata.get("run_id") or uuid.uuid4().hex
+        )
+        stream_root_run_id = str(
+            run_metadata.get("root_run_id") or stream_run_id
+        )
+        stream_agent_kind = str(
+            run_metadata.get("agent_kind") or "primary"
+        )
+        stream_agent_name = str(
+            run_metadata.get("agent_name") or stream_agent_kind
+        )
+        stream_depth = int(run_metadata.get("depth") or 0)
+        stream_workspace_scope = str(
+            run_metadata.get("workspace_scope") or "shared_session"
+        )
+
+        def observe_producer_event(event: dict) -> None:
+            nonlocal producer_terminal_seen
+            nonlocal producer_maximum_event_seq
+            if (
+                not isinstance(event, dict)
+                or event.get("type") != "agent_event"
+                or str(event.get("run_id") or "") != stream_run_id
+            ):
+                return
+            try:
+                producer_maximum_event_seq = max(
+                    producer_maximum_event_seq,
+                    int(event.get("seq") or 0),
+                )
+            except (TypeError, ValueError):
+                pass
+            if str(event.get("event_type") or "") in {
+                "run.completed",
+                "run.failed",
+                "run.cancelled",
+            }:
+                producer_terminal_seen = True
 
         async def forward_agent_event(event: dict) -> None:
+            observe_producer_event(event)
             await queue.put(event)
 
         async def produce() -> None:
@@ -483,17 +527,80 @@ def _streaming_response(
                     enabled_user_skills=enabled_user_skills,
                     session_skill_registry=session_skill_registry,
                     max_tokens=max_tokens,
-                    run_id=run_metadata.get("run_id"),
-                    root_run_id=run_metadata.get("root_run_id"),
+                    run_id=stream_run_id,
+                    root_run_id=stream_root_run_id,
                     parent_run_id=run_metadata.get("parent_run_id"),
-                    agent_kind=run_metadata.get("agent_kind") or "primary",
-                    agent_name=run_metadata.get("agent_name"),
-                    depth=int(run_metadata.get("depth") or 0),
-                    workspace_scope=run_metadata.get("workspace_scope") or "shared_session",
+                    agent_kind=stream_agent_kind,
+                    agent_name=stream_agent_name,
+                    depth=stream_depth,
+                    workspace_scope=stream_workspace_scope,
                     event_schema=event_schema,
                     event_sink=forward_agent_event,
                 ):
+                    observe_producer_event(evt)
                     await queue.put(evt)
+                if not producer_terminal_seen:
+                    failure_event = _safe_unhandled_run_failure_event(
+                        run_id=stream_run_id,
+                        root_run_id=stream_root_run_id,
+                        parent_run_id=run_metadata.get("parent_run_id"),
+                        agent_kind=stream_agent_kind,
+                        agent_name=stream_agent_name,
+                        depth=stream_depth,
+                        workspace_scope=stream_workspace_scope,
+                        seq=producer_maximum_event_seq + 1,
+                        source=source,
+                        terminal_reason="missing_terminal_event",
+                        failure_class="harness_lifecycle_error",
+                        error_message=(
+                            "Harness execution ended without a terminal run "
+                            "event."
+                        ),
+                    )
+                    observe_producer_event(failure_event)
+                    await queue.put(failure_event)
+                    await queue.put({
+                        "type": "error",
+                        "msg": failure_event["payload"]["error"],
+                    })
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # The agent-loop lifecycle wrapper is the primary authority.
+                # Keep this independent producer boundary as a final guard for
+                # patched/custom generators or failures in that wrapper:
+                # clients must receive a terminal event, never a naked EOF or
+                # an unobserved background-task exception.
+                logger.error(
+                    "Unhandled SSE producer exception run=%s class=%s "
+                    "stack=%s",
+                    stream_run_id,
+                    type(exc).__name__,
+                    json.dumps(
+                        _safe_exception_stack_projection(exc),
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                    ),
+                )
+                if not producer_terminal_seen:
+                    failure_event = _safe_unhandled_run_failure_event(
+                        run_id=stream_run_id,
+                        root_run_id=stream_root_run_id,
+                        parent_run_id=run_metadata.get("parent_run_id"),
+                        agent_kind=stream_agent_kind,
+                        agent_name=stream_agent_name,
+                        depth=stream_depth,
+                        workspace_scope=stream_workspace_scope,
+                        seq=producer_maximum_event_seq + 1,
+                        source=source,
+                        exception=exc,
+                    )
+                    observe_producer_event(failure_event)
+                    await queue.put(failure_event)
+                    await queue.put({
+                        "type": "error",
+                        "msg": failure_event["payload"]["error"],
+                    })
             finally:
                 await queue.put(None)
 

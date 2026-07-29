@@ -222,7 +222,7 @@ class SkillResourcePaginationTests(unittest.TestCase):
         target, error = _compiled_skill_inspection_target(
             state,
             f"inspect explicit workflow resources for session skill '{skill_name}' "
-            "(missing 1 of 1 declared files)",
+            "(pending 1 of 1 declared-resource inspection receipts)",
         )
         self.assertEqual(error, "")
         self.assertEqual(target, {
@@ -296,7 +296,7 @@ class SkillResourcePaginationTests(unittest.TestCase):
         target, error = _compiled_skill_inspection_target(
             state,
             f"inspect explicit workflow resources for session skill '{skill_name}' "
-            "(missing 1 of 1 declared files)",
+            "(pending 1 of 1 declared-resource inspection receipts)",
         )
         self.assertIsNone(target)
         self.assertIn("changed between paginated reads", error)
