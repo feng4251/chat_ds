@@ -2351,11 +2351,15 @@ class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
                 patch("agent_loop.build_system_prompt", return_value="system"),
                 patch("agent_loop.load_workspace_context", return_value=""),
                 patch("agent_loop._fetch_goal", AsyncMock(return_value=None)),
+                patch(
+                    "skills.loader.load_skill_content",
+                    wraps=load_skill_content,
+                ) as package_loader,
                 patch("skills.scanner.find_all_skills", return_value=[skill_record]),
                 patch(
                     "skills.scanner.skill_runnable_script_resources",
                     return_value=inventory,
-                ),
+                ) as script_inventory,
                 patch("skills.scanner.resolve_skill_path", return_value=main),
             ):
                 events = [event async for event in run_stream(
@@ -2370,6 +2374,11 @@ class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
                 )]
 
         self.assertFalse(responses)
+        # The post-reference amendment must reuse the run-frozen package and
+        # script inventory; it cannot reload mutable package state to mint a
+        # second authority surface.
+        self.assertEqual(1, package_loader.call_count)
+        self.assertEqual(1, script_inventory.call_count)
         self.assertEqual(1, len(script_contexts))
         self.assertEqual(
             ((

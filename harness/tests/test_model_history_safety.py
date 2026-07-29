@@ -13,6 +13,7 @@ from agent_loop import (
     _history_message_fingerprint,
     _private_origin_authorization_text,
     _reset_delegated_output_contract_history,
+    _safe_tool_argument_record,
     _safe_tool_result_record,
     _sanitize_model_history_tool_payloads,
     _tool_debug_result,
@@ -106,8 +107,38 @@ class ModelHistorySafetyTests(unittest.TestCase):
         serialized = json.dumps(conversation, ensure_ascii=False)
         self.assertNotIn("_chatds_argument_omitted", serialized)
         self.assertNotIn("code_omitted", serialized)
-        self.assertIn("large or invalid arguments withheld", serialized)
+        self.assertIn(
+            "arguments unavailable: compacted-history placeholder",
+            serialized,
+        )
         self.assertIn("compacted conversation-history placeholder", serialized)
+
+    def test_delegate_argument_record_shows_only_bounded_operational_labels(self):
+        projection = _safe_tool_argument_record(
+            json.dumps({
+                "tasks": [
+                    {
+                        "agent_name": "Evidence reviewer",
+                        "goal": "secret detailed task body",
+                    },
+                    {
+                        "worker_id": "safety-extraction",
+                        "context_text": "private source material",
+                    },
+                ],
+            }),
+            tool_name="delegate_task",
+        )
+
+        self.assertEqual(
+            (
+                "structured arguments hidden; task_count=2; "
+                "agents=Evidence reviewer, safety-extraction"
+            ),
+            projection,
+        )
+        self.assertNotIn("secret", projection)
+        self.assertNotIn("private", projection)
 
     def test_existing_polluted_history_is_cleaned_without_extra_user_turn(self):
         messages = [

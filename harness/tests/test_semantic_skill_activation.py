@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import unittest
@@ -239,6 +240,10 @@ class SemanticSkillActivationTests(unittest.IsolatedAsyncioTestCase):
                     "content",
                     "# Instructions\n\nAnswer using the selected writing guidance.",
                 ),
+                "skill_dir": record.get("skill_dir"),
+                "skill_md_sha256": hashlib.sha256(
+                    Path(str(record.get("path") or "")).read_bytes()
+                ).hexdigest(),
                 "linked_files": {},
                 "workflow_contract": (
                     {"execution_contract": record["execution_contract"]}
@@ -303,6 +308,16 @@ class SemanticSkillActivationTests(unittest.IsolatedAsyncioTestCase):
                 }
                 for record in records
             ]
+            for record in normalized_records:
+                skill_path = Path(record["path"])
+                skill_path.parent.mkdir(parents=True, exist_ok=True)
+                skill_path.write_text(
+                    str(record.get("content") or (
+                        "# Instructions\n\n"
+                        "Answer using the selected writing guidance."
+                    )),
+                    encoding="utf-8",
+                )
             by_name = {
                 str(record["name"]): record for record in normalized_records
             }
