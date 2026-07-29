@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
@@ -36,6 +37,8 @@ from workflow_ir import (
 
 CAPABILITY_PLAN_TOOL_NAME = "submit_skill_capability_plan"
 CAPABILITY_PLAN_SCHEMA_VERSION = 1
+CALLABLE_SKILL_RESULT_RECEIPT_VERSION = 1
+SKILL_PROCESS_EVIDENCE_RECEIPT_VERSION = 1
 MAX_CAPABILITY_CANDIDATES = 512
 MAX_PLAN_SELECTIONS = 256
 MAX_OPTIONAL_SELECTIONS = 32
@@ -45,6 +48,7 @@ MAX_AUTHORITY_DOCUMENTS = 16
 MAX_AUTHORITY_DOCUMENT_CHARS = 256_000
 MAX_UNSUPPORTED_ITEMS = 64
 MAX_WORKFLOW_INSTRUCTION_CATALOG_BYTES = 750_000
+MAX_SANDBOX_EGRESS_PREFIXES = 256
 
 # These public bridge schemas are never selectable without a more specific,
 # backend-issued candidate.  This keeps a model from turning the presence of a
@@ -63,6 +67,33 @@ _PLANNING_CONTROL_TOOLS = frozenset({
     "skills_list",
     "skill_view",
 })
+_CALLABLE_SKILL_RUNNER_TOOLS = frozenset({
+    "run_skill_process",
+    "run_skill_python",
+})
+_TYPED_RESULT_FAILURE_STATUSES = frozenset({
+    "blocked",
+    "error",
+    "failed",
+    "timeout",
+})
+_TYPED_RESULT_POSITIVE_STATUSES = frozenset({
+    "complete",
+    "completed",
+    "ok",
+    "pass",
+    "passed",
+    "success",
+    "succeeded",
+})
+_PROCESS_ID_RE = re.compile(r"^sp_[A-Za-z0-9_-]{24,96}$")
+_PUBLIC_PROCESS_METHOD_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
+_PROCESS_RECEIPT_COMPLETION_KINDS = frozenset({
+    "structured_call",
+    "cli_exit",
+    "artifact_sync",
+    "artifact_close",
+})
 
 
 @dataclass(frozen=True)
@@ -71,6 +102,438 @@ class CapabilityPlanResult:
 
     valid: bool
     payload: dict[str, Any]
+
+
+def _nonempty_typed_error(value: Any) -> bool:
+    if value is None or value is False:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, dict)):
+        return bool(value)
+    return bool(value)
+
+
+def build_callable_skill_result_receipt(
+    tool_name: str,
+    result_data: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Classify only a callable runner's immediate returned ``result``.
+
+    Runner transport/execution can succeed while the called Skill function
+    returns a typed failure object. Inspecting only the exact top-level
+    ``result`` prevents ordinary rows containing nested ``error`` fields from
+    being mistaken for a failed evidence acquisition.
+    """
+
+    if tool_name not in _CALLABLE_SKILL_RUNNER_TOOLS:
+        return None
+    process_receipt = normalize_skill_process_evidence_receipt(
+        (result_data or {}).get("process_evidence_receipt")
+        if isinstance(result_data, dict)
+        else None
+    )
+    if (
+        tool_name == "run_skill_process"
+        and process_receipt is not None
+        and process_receipt.get("completion_kind") == "structured_call"
+    ):
+        return dict(process_receipt["callable_result_receipt"])
+
+    returned = (
+        result_data.get("result")
+        if isinstance(result_data, dict)
+        else None
+    )
+    if not isinstance(returned, dict):
+        return {
+            "version": CALLABLE_SKILL_RESULT_RECEIPT_VERSION,
+            "result_object_observed": False,
+            "typed_failure": False,
+            "positive_success_observed": False,
+            "failure_reason_codes": [],
+        }
+
+    status = (
+        str(returned.get("status") or "").strip().casefold()
+        if isinstance(returned.get("status"), str)
+        else ""
+    )
+    positive_success = bool(
+        status in _TYPED_RESULT_POSITIVE_STATUSES
+        or returned.get("success") is True
+        or returned.get("ok") is True
+    )
+    failure_reasons: list[str] = []
+    if status in _TYPED_RESULT_FAILURE_STATUSES:
+        failure_reasons.append("typed_status_failure")
+    if returned.get("success") is False:
+        failure_reasons.append("typed_success_false")
+    if returned.get("ok") is False:
+        failure_reasons.append("typed_ok_false")
+    if (
+        _nonempty_typed_error(returned.get("error"))
+        and not positive_success
+    ):
+        failure_reasons.append("typed_error_without_positive_success")
+    return {
+        "version": CALLABLE_SKILL_RESULT_RECEIPT_VERSION,
+        "result_object_observed": True,
+        "typed_failure": bool(failure_reasons),
+        "positive_success_observed": positive_success,
+        "failure_reason_codes": failure_reasons,
+    }
+
+
+def callable_skill_result_receipt_is_failure(value: Any) -> bool:
+    """Consume only the versioned machine receipt; legacy absence is neutral."""
+
+    return bool(
+        isinstance(value, dict)
+        and value.get("version")
+        == CALLABLE_SKILL_RESULT_RECEIPT_VERSION
+        and value.get("typed_failure") is True
+    )
+
+
+def callable_skill_result_evidence_outcome(
+    tool_name: str,
+    result_data: dict[str, Any] | None,
+    transport_outcome: str,
+) -> str:
+    """Project transport success into its evidence-acquisition outcome."""
+
+    normalized_transport = str(transport_outcome or "")
+    if tool_name == "run_skill_process":
+        if normalized_transport.casefold() != "success":
+            return normalized_transport
+        process_receipt = normalize_skill_process_evidence_receipt(
+            (result_data or {}).get("process_evidence_receipt")
+            if isinstance(result_data, dict)
+            else None
+        )
+        # Opening a lease, enqueueing a method, polling incomplete output, or
+        # syncing no artifact is transport progress only. It cannot satisfy an
+        # exact evidence obligation or be downgraded into a failed attempt.
+        if process_receipt is None:
+            return "pending"
+        return str(process_receipt["outcome"])
+
+    receipt = build_callable_skill_result_receipt(tool_name, result_data)
+    if (
+        normalized_transport.casefold() == "success"
+        and callable_skill_result_receipt_is_failure(receipt)
+    ):
+        return "error"
+    return normalized_transport
+
+
+def skill_process_artifact_manifest_sha256(
+    artifacts: Iterable[dict[str, Any]],
+) -> tuple[int, str] | None:
+    """Return a canonical manifest identity for verified workspace artifacts."""
+
+    rows: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    for item in artifacts:
+        if not isinstance(item, dict):
+            return None
+        path = _safe_relative_path(item.get("path"))
+        size = item.get("size_bytes")
+        digest = item.get("sha256")
+        if (
+            path is None
+            or path in seen_paths
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
+            or not _valid_sha256(digest)
+        ):
+            return None
+        seen_paths.add(path)
+        rows.append({
+            "path": path,
+            "size_bytes": size,
+            "sha256": digest,
+        })
+    if not rows or len(rows) > 512:
+        return None
+    rows.sort(key=lambda row: row["path"])
+    encoded = json.dumps(
+        rows,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return len(rows), hashlib.sha256(encoded).hexdigest()
+
+
+def _normalized_callable_receipt(value: Any) -> dict[str, Any] | None:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {
+            "version",
+            "result_object_observed",
+            "typed_failure",
+            "positive_success_observed",
+            "failure_reason_codes",
+        }
+        or value.get("version") != CALLABLE_SKILL_RESULT_RECEIPT_VERSION
+        or not isinstance(value.get("result_object_observed"), bool)
+        or not isinstance(value.get("typed_failure"), bool)
+        or not isinstance(value.get("positive_success_observed"), bool)
+        or not isinstance(value.get("failure_reason_codes"), list)
+        or len(value["failure_reason_codes"]) > 4
+        or any(
+            item not in {
+                "typed_status_failure",
+                "typed_success_false",
+                "typed_ok_false",
+                "typed_error_without_positive_success",
+            }
+            for item in value["failure_reason_codes"]
+        )
+        or value["typed_failure"] != bool(value["failure_reason_codes"])
+    ):
+        return None
+    return {
+        "version": CALLABLE_SKILL_RESULT_RECEIPT_VERSION,
+        "result_object_observed": value["result_object_observed"],
+        "typed_failure": value["typed_failure"],
+        "positive_success_observed": value["positive_success_observed"],
+        "failure_reason_codes": list(value["failure_reason_codes"]),
+    }
+
+
+def _process_receipt_id(core: dict[str, Any]) -> str:
+    identity = {
+        "version": SKILL_PROCESS_EVIDENCE_RECEIPT_VERSION,
+        "skill_name": core["skill_name"],
+        "script_resource": core["script_resource"],
+        "script_sha256": core["script_sha256"],
+        "package_sha256": core["package_sha256"],
+        "process_id": core["process_id"],
+        # One structured method invocation is one evidence identity even when
+        # both its call_result and its artifact sync are observed. CLI exit and
+        # artifact sync likewise share the process execution identity.
+        **({"call_id": core["call_id"]} if core.get("call_id") else {}),
+        **(
+            {
+                "stdout_size_bytes": core["stdout_size_bytes"],
+                "stdout_sha256": core["stdout_sha256"],
+            }
+            if core.get("stdout_sha256") is not None
+            else {}
+        ),
+    }
+    encoded = json.dumps(
+        identity,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return "spr_" + hashlib.sha256(encoded).hexdigest()
+
+
+def build_skill_process_evidence_receipt(
+    *,
+    skill_name: str,
+    script_resource: str,
+    script_sha256: str,
+    package_sha256: str,
+    process_id: str,
+    invocation_mode: str,
+    completion_kind: str,
+    outcome: str,
+    call_id: str | None = None,
+    method_name: str | None = None,
+    call_result_status: str | None = None,
+    callable_result_receipt: dict[str, Any] | None = None,
+    returncode: int | None = None,
+    stdout_size_bytes: int | None = None,
+    stdout_sha256: str | None = None,
+    artifact_count: int | None = None,
+    artifact_manifest_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Build one bounded, content-addressed terminal process receipt."""
+
+    core: dict[str, Any] = {
+        "version": SKILL_PROCESS_EVIDENCE_RECEIPT_VERSION,
+        "skill_name": skill_name,
+        "script_resource": script_resource,
+        "script_sha256": script_sha256,
+        "package_sha256": package_sha256,
+        "process_id": process_id,
+        "invocation_mode": invocation_mode,
+        "completion_kind": completion_kind,
+        "outcome": outcome,
+    }
+    if completion_kind == "structured_call":
+        core.update({
+            "call_id": call_id,
+            "method_name": method_name,
+            "call_result_status": call_result_status,
+            "callable_result_receipt": callable_result_receipt,
+        })
+    elif completion_kind == "cli_exit":
+        core["returncode"] = returncode
+        if stdout_size_bytes is not None or stdout_sha256 is not None:
+            core.update({
+                "stdout_size_bytes": stdout_size_bytes,
+                "stdout_sha256": stdout_sha256,
+            })
+    else:
+        core.update({
+            "artifact_count": artifact_count,
+            "artifact_manifest_sha256": artifact_manifest_sha256,
+        })
+        if call_id is not None or method_name is not None:
+            core.update({
+                "call_id": call_id,
+                "method_name": method_name,
+            })
+    core["receipt_id"] = _process_receipt_id(core)
+    normalized = normalize_skill_process_evidence_receipt(core)
+    if normalized is None:
+        raise ValueError("invalid terminal Skill process evidence receipt")
+    return normalized
+
+
+def normalize_skill_process_evidence_receipt(
+    value: Any,
+) -> dict[str, Any] | None:
+    """Validate a Harness-issued terminal receipt without trusting prose."""
+
+    if not isinstance(value, dict):
+        return None
+    common_keys = {
+        "version",
+        "receipt_id",
+        "skill_name",
+        "script_resource",
+        "script_sha256",
+        "package_sha256",
+        "process_id",
+        "invocation_mode",
+        "completion_kind",
+        "outcome",
+    }
+    completion_kind = value.get("completion_kind")
+    invocation_mode = value.get("invocation_mode")
+    expected_keys = set(common_keys)
+    if completion_kind == "structured_call":
+        expected_keys.update({
+            "call_id",
+            "method_name",
+            "call_result_status",
+            "callable_result_receipt",
+        })
+    elif completion_kind == "cli_exit":
+        expected_keys.add("returncode")
+        if "stdout_size_bytes" in value or "stdout_sha256" in value:
+            expected_keys.update({"stdout_size_bytes", "stdout_sha256"})
+    elif completion_kind in {"artifact_sync", "artifact_close"}:
+        expected_keys.update({
+            "artifact_count",
+            "artifact_manifest_sha256",
+            "call_id",
+            "method_name",
+        })
+    if set(value) != expected_keys:
+        return None
+    if (
+        value.get("version") != SKILL_PROCESS_EVIDENCE_RECEIPT_VERSION
+        or not isinstance(value.get("skill_name"), str)
+        or not value["skill_name"]
+        or len(value["skill_name"]) > 160
+        or _safe_relative_path(value.get("script_resource")) is None
+        or not _valid_sha256(value.get("script_sha256"))
+        or not _valid_sha256(value.get("package_sha256"))
+        or not isinstance(value.get("process_id"), str)
+        or _PROCESS_ID_RE.fullmatch(value["process_id"]) is None
+        or invocation_mode not in {"cli", "instance", "factory"}
+        or completion_kind not in _PROCESS_RECEIPT_COMPLETION_KINDS
+        or value.get("outcome") not in {"success", "error"}
+    ):
+        return None
+
+    if completion_kind == "structured_call":
+        callable_receipt = _normalized_callable_receipt(
+            value.get("callable_result_receipt")
+        )
+        call_status = value.get("call_result_status")
+        if (
+            invocation_mode not in {"instance", "factory"}
+            or not isinstance(value.get("call_id"), str)
+            or not value["call_id"]
+            or len(value["call_id"]) > 128
+            or not isinstance(value.get("method_name"), str)
+            or _PUBLIC_PROCESS_METHOD_RE.fullmatch(value["method_name"])
+            is None
+            or call_status not in {"success", "error"}
+            or callable_receipt is None
+            or (
+                value["outcome"] == "success"
+                and (
+                    call_status != "success"
+                    or callable_receipt["typed_failure"]
+                )
+            )
+            or (
+                value["outcome"] == "error"
+                and call_status == "success"
+                and not callable_receipt["typed_failure"]
+            )
+        ):
+            return None
+    elif completion_kind == "cli_exit":
+        returncode = value.get("returncode")
+        if (
+            invocation_mode != "cli"
+            or isinstance(returncode, bool)
+            or not isinstance(returncode, int)
+            or not -(2**31) <= returncode <= 2**31 - 1
+            or (value["outcome"] == "success") != (returncode == 0)
+        ):
+            return None
+        if "stdout_size_bytes" in value or "stdout_sha256" in value:
+            stdout_size = value.get("stdout_size_bytes")
+            if (
+                isinstance(stdout_size, bool)
+                or not isinstance(stdout_size, int)
+                or not 1 <= stdout_size <= 2**63 - 1
+                or not _valid_sha256(value.get("stdout_sha256"))
+            ):
+                return None
+        callable_receipt = None
+    else:
+        artifact_count = value.get("artifact_count")
+        if (
+            value["outcome"] != "success"
+            or invocation_mode not in {"instance", "factory"}
+            or isinstance(artifact_count, bool)
+            or not isinstance(artifact_count, int)
+            or not 1 <= artifact_count <= 512
+            or not _valid_sha256(value.get("artifact_manifest_sha256"))
+            or not isinstance(value.get("call_id"), str)
+            or not value["call_id"]
+            or len(value["call_id"]) > 128
+            or not isinstance(value.get("method_name"), str)
+            or _PUBLIC_PROCESS_METHOD_RE.fullmatch(value["method_name"])
+            is None
+        ):
+            return None
+        callable_receipt = None
+
+    normalized = dict(value)
+    if callable_receipt is not None:
+        normalized["callable_result_receipt"] = callable_receipt
+    expected_receipt_id = _process_receipt_id(normalized)
+    if value.get("receipt_id") != expected_receipt_id:
+        return None
+    return normalized
 
 
 def _stable_id(kind: str, value: str) -> str:
@@ -363,6 +826,12 @@ def build_capability_catalog(
     command_grants: Iterable[dict[str, Any]] = (),
     http_prefixes: Iterable[tuple[str, str]] = (),
     http_post_prefixes: Iterable[tuple[str, str]] = (),
+    sandbox_egress_rules: Iterable[
+        tuple[str, str, tuple[str, ...]]
+    ] = (),
+    native_browser_egress_rules: Iterable[
+        tuple[str, tuple[str, ...]]
+    ] = (),
     exact_mcp_names: Iterable[str] = (),
     native_tool_metadata: dict[str, dict[str, Any]] | None = None,
     authority_documents: Iterable[dict[str, Any]] = (),
@@ -378,6 +847,14 @@ def build_capability_catalog(
     path is literally referenced by ``SKILL.md``.  Structured workflow
     closures are compiled elsewhere and do not use this standard-body path.
     """
+
+    # Deferred to avoid importing the tools package while this compiler module
+    # itself is being imported by a runner registered from ``tools.__init__``.
+    from tools.session_sandbox_policy import (
+        SessionSandboxPolicyError,
+        normalize_http_url_prefix,
+        normalize_session_sandbox_methods,
+    )
 
     body = str(loaded_package.get("content") or "")
     body_sha256 = str(loaded_package.get("skill_md_sha256") or "")
@@ -407,6 +884,89 @@ def build_capability_catalog(
         str(name) for name in available_tools if isinstance(name, str) and name
     ))
     available = set(ordered_tools)
+    http_prefix_rows = tuple(
+        (granted_skill, prefix)
+        for granted_skill, prefix in http_prefixes
+        if isinstance(granted_skill, str)
+        and isinstance(prefix, str)
+    )
+    http_post_prefix_rows = tuple(
+        (granted_skill, prefix)
+        for granted_skill, prefix in http_post_prefixes
+        if isinstance(granted_skill, str)
+        and isinstance(prefix, str)
+    )
+    sandbox_egress_url_prefixes = list(dict.fromkeys(
+        prefix
+        for granted_skill, prefix in (
+            *http_prefix_rows,
+            *http_post_prefix_rows,
+        )
+        if granted_skill == skill_name and prefix
+    ))
+    sandbox_methods_by_prefix: dict[str, set[str]] = {}
+    for granted_skill, prefix, methods in sandbox_egress_rules:
+        if granted_skill != skill_name:
+            continue
+        try:
+            canonical_prefix = normalize_http_url_prefix(prefix)
+            canonical_methods = normalize_session_sandbox_methods(methods)
+        except SessionSandboxPolicyError:
+            continue
+        if canonical_prefix != prefix:
+            continue
+        sandbox_methods_by_prefix.setdefault(
+            canonical_prefix,
+            set(),
+        ).update(canonical_methods)
+    if not sandbox_methods_by_prefix:
+        # Compatibility for callers compiled before the method-preserving
+        # ledger existed. This remains exact-prefix GET/HEAD authority; POST is
+        # added only from the separate explicit POST/GraphQL ledger.
+        post_set = {
+            prefix
+            for granted_skill, prefix in http_post_prefix_rows
+            if granted_skill == skill_name
+        }
+        for prefix in sandbox_egress_url_prefixes:
+            try:
+                canonical_prefix = normalize_http_url_prefix(prefix)
+            except SessionSandboxPolicyError:
+                continue
+            methods = {"GET", "HEAD"}
+            if prefix in post_set:
+                methods.add("POST")
+            sandbox_methods_by_prefix.setdefault(
+                canonical_prefix,
+                set(),
+            ).update(methods)
+    sandbox_egress_rule_rows = [
+        {
+            "methods": list(normalize_session_sandbox_methods(methods)),
+            "url_prefix": prefix,
+        }
+        for prefix, methods in sorted(sandbox_methods_by_prefix.items())
+    ]
+    browser_methods_by_prefix = {
+        prefix: set(methods)
+        for prefix, methods in sandbox_methods_by_prefix.items()
+    }
+    for raw_prefix, raw_methods in native_browser_egress_rules:
+        try:
+            prefix = normalize_http_url_prefix(raw_prefix)
+            methods = normalize_session_sandbox_methods(raw_methods)
+        except SessionSandboxPolicyError:
+            continue
+        if prefix != raw_prefix:
+            continue
+        browser_methods_by_prefix.setdefault(prefix, set()).update(methods)
+    native_browser_rule_rows = [
+        {
+            "methods": list(normalize_session_sandbox_methods(methods)),
+            "url_prefix": prefix,
+        }
+        for prefix, methods in sorted(browser_methods_by_prefix.items())
+    ]
     candidates: list[dict[str, Any]] = []
 
     metadata_by_tool = native_tool_metadata or {}
@@ -421,7 +981,7 @@ def build_capability_catalog(
         if native_candidate_count >= MAX_NATIVE_CAPABILITY_CANDIDATES:
             continue
         metadata = dict(metadata_by_tool.get(name) or {})
-        candidates.append({
+        candidate = {
             "id": _stable_id("tool", name),
             "kind": "native_tool",
             "tool_name": name,
@@ -437,7 +997,20 @@ def build_capability_catalog(
                 "Backend-authorized native tool. Selecting it only narrows the "
                 "existing run surface; it creates no additional authority."
             ),
-        })
+        }
+        if name == "browser_navigate" and native_browser_rule_rows:
+            candidate["browser_egress_rules"] = [
+                {
+                    "methods": list(rule["methods"]),
+                    "url_prefix": str(rule["url_prefix"]),
+                }
+                for rule in native_browser_rule_rows
+            ]
+            candidate["skill_name"] = skill_name
+            candidate["skill_md_sha256"] = body_sha256
+            if package_sha256:
+                candidate["package_sha256"] = package_sha256
+        candidates.append(candidate)
         native_candidate_count += 1
 
     linked = loaded_package.get("linked_files")
@@ -569,6 +1142,23 @@ def build_capability_catalog(
             or profile_record.get("script_sha256") != digest
         ):
             continue
+        candidate_methods_by_prefix = {
+            prefix: set(methods)
+            for prefix, methods in sandbox_methods_by_prefix.items()
+        }
+        if len(candidate_methods_by_prefix) > MAX_SANDBOX_EGRESS_PREFIXES:
+            continue
+        candidate_sandbox_egress_rule_rows = [
+            {
+                "methods": list(
+                    normalize_session_sandbox_methods(methods)
+                ),
+                "url_prefix": prefix,
+            }
+            for prefix, methods in sorted(
+                candidate_methods_by_prefix.items()
+            )
+        ]
         manifest_row = runtime_manifest_rows.get(path)
         manifest_authority: dict[str, str] | None = None
         if manifest_row is not None:
@@ -699,13 +1289,24 @@ def build_capability_catalog(
                 if isinstance(profile_record, dict) else {}
             ),
             "authority_chain": authority_chain,
+            "sandbox_egress_url_prefixes": sandbox_egress_url_prefixes,
+            "sandbox_egress_rules": (
+                candidate_sandbox_egress_rule_rows
+            ),
+            "invocation_bound_user_url_egress": bool(
+                isinstance(profile_record, dict)
+                and profile_record.get("user_url_egress_available")
+                and profile_record.get("user_url_egress_bindings")
+            ),
             "description": (
                 "Content-addressed script explicitly referenced by an exact "
                 "authorized instruction document; choose one listed runner at "
-                "invocation time. One-shot isolated script runners have no "
-                "network access. A listed persistent-process runner remains "
-                "bound to its backend-owned runtime/egress profile and opaque "
-                "lease; this candidate grants no ambient network authority."
+                "invocation time. Direct network dialing is disabled; the "
+                "selected script receives only the exact HTTP methods and URL "
+                "prefixes compiled into this candidate through the signed "
+                "policy proxy. Persistent execution remains "
+                "bound to the same runtime-owned policy and opaque lease; this "
+                "candidate grants no ambient network authority."
             ),
         })
 
@@ -733,17 +1334,23 @@ def build_capability_catalog(
                 "fixed_argv": list(prefix),
                 "additional_argv": True,
                 "shell": False,
+                "sandbox_egress_url_prefixes": (
+                    sandbox_egress_url_prefixes
+                ),
+                "sandbox_egress_rules": sandbox_egress_rule_rows,
                 "description": (
                     "Backend-compiled exact argv template. The executable and "
-                    "fixed argv cannot be model-authored."
+                    "fixed argv cannot be model-authored; direct networking is "
+                    "disabled and only the exact compiled HTTP-method and URL-"
+                    "prefix rules are available through the signed policy proxy."
                 ),
             })
 
     for http_tool, id_kind, method, granted_prefixes in (
-        ("skill_http_get", "http", "GET", http_prefixes),
+        ("skill_http_get", "http", "GET", http_prefix_rows),
         (
             "skill_http_post_json", "http-post-json", "POST JSON",
-            http_post_prefixes,
+            http_post_prefix_rows,
         ),
     ):
         if http_tool not in available:
@@ -868,7 +1475,9 @@ def build_capability_catalog(
             "amendments_require_exact_catalog_sha256": True,
             "authority_documents_require_exact_sha256": True,
             "unreferenced_package_scripts_excluded": True,
-            "script_executor_network": "disabled",
+            "script_executor_network": (
+                "direct_disabled_exact_origin_allowlist"
+            ),
             "persistent_process_runtime": "backend_profile_and_lease_owned",
             "max_optional_selections": MAX_OPTIONAL_SELECTIONS,
             "max_total_selections": MAX_TOTAL_SELECTIONS,
@@ -981,10 +1590,13 @@ def catalog_prompt_payload(catalog: dict[str, Any]) -> dict[str, Any]:
             "confirmation, or to conceal automation identity/fingerprints are outside "
             "this planner's authority: record them as unsupported and do not select a "
             "capability for them. Safe ordinary navigation and exact content-addressed "
-            "scripts remain eligible for the user's legitimate task. A one-shot script "
-            "uses a network-disabled isolated executor and cannot replace a browser or "
-            "remote-network capability; a listed persistent-process runner remains "
-            "limited to its backend-owned runtime/egress profile and opaque lease."
+            "scripts remain eligible for the user's legitimate task. Direct network "
+            "dialing is disabled inside the single session sandbox; an exact Skill "
+            "entrypoint receives only its frozen, runtime-compiled HTTP-method and "
+            "URL-prefix rules through the signed policy proxy and "
+            "cannot replace an independently required browser or remote-network "
+            "capability. A listed persistent-process runner remains limited to its "
+            "backend-owned runtime/egress policy and opaque lease."
             + workflow_guidance
         ),
     }
@@ -1079,6 +1691,7 @@ def _bind_worker_plan_capabilities(
             # share one bridge name inside a selected Skill.
             for field in (
                 "skill_name",
+                "skill_md_sha256",
                 "resource_path",
                 "sha256",
                 "package_sha256",
@@ -1102,6 +1715,39 @@ def _bind_worker_plan_capabilities(
                 binding["fixed_argv"] = list(fixed_argv)
             if isinstance(candidate.get("additional_argv"), bool):
                 binding["additional_argv"] = candidate["additional_argv"]
+            sandbox_egress = candidate.get(
+                "sandbox_egress_url_prefixes"
+            )
+            if (
+                isinstance(sandbox_egress, list)
+                and all(
+                    isinstance(prefix, str) and prefix
+                    for prefix in sandbox_egress
+                )
+            ):
+                binding["sandbox_egress_url_prefixes"] = list(
+                    sandbox_egress
+                )
+            sandbox_rules = candidate.get("sandbox_egress_rules")
+            if isinstance(sandbox_rules, list):
+                binding["sandbox_egress_rules"] = [
+                    {
+                        "methods": list(rule.get("methods") or []),
+                        "url_prefix": str(rule.get("url_prefix") or ""),
+                    }
+                    for rule in sandbox_rules
+                    if isinstance(rule, dict)
+                ]
+            browser_rules = candidate.get("browser_egress_rules")
+            if isinstance(browser_rules, list):
+                binding["browser_egress_rules"] = [
+                    {
+                        "methods": list(rule.get("methods") or []),
+                        "url_prefix": str(rule.get("url_prefix") or ""),
+                    }
+                    for rule in browser_rules
+                    if isinstance(rule, dict)
+                ]
             bindings.append(binding)
         step["tools"] = [
             {"tool": name, "required": True}
@@ -1146,6 +1792,13 @@ def validate_capability_plan(
     workflow_ir: Any = None,
 ) -> CapabilityPlanResult:
     """Validate a model selection and derive its exact effective closure."""
+
+    # See the corresponding deferred import in ``build_capability_catalog``.
+    from tools.session_sandbox_policy import (
+        SessionSandboxPolicyError,
+        normalize_http_url_prefix,
+        normalize_session_sandbox_methods,
+    )
 
     if not isinstance(catalog, dict):
         return _error(
@@ -1498,6 +2151,11 @@ def validate_capability_plan(
     commands: list[tuple[str, str, str, tuple[str, ...]]] = []
     http_prefixes: list[tuple[str, str]] = []
     http_post_prefixes: list[tuple[str, str]] = []
+    sandbox_egress_prefixes: list[tuple[str, str]] = []
+    sandbox_egress_rules: list[
+        tuple[str, str, tuple[str, ...]]
+    ] = []
+    browser_egress_rules: list[tuple[str, tuple[str, ...]]] = []
     required_groups: list[tuple[str, ...]] = []
 
     for index, candidate in enumerate(selected):
@@ -1505,6 +2163,57 @@ def validate_capability_plan(
         candidate_tools: list[str] = []
         if kind in {"native_tool", "mcp_tool"}:
             candidate_tools = [str(candidate.get("tool_name") or "")]
+            raw_browser_rules = candidate.get("browser_egress_rules")
+            if raw_browser_rules is not None:
+                if (
+                    kind != "native_tool"
+                    or candidate_tools != ["browser_navigate"]
+                    or not isinstance(raw_browser_rules, list)
+                    or len(raw_browser_rules) > MAX_SANDBOX_EGRESS_PREFIXES
+                ):
+                    return _error(
+                        "capability_catalog_browser_egress_rules_invalid",
+                        "The backend-issued native-browser egress rules are malformed.",
+                    )
+                for rule in raw_browser_rules:
+                    if (
+                        not isinstance(rule, dict)
+                        or set(rule) != {"methods", "url_prefix"}
+                        or not isinstance(rule.get("url_prefix"), str)
+                    ):
+                        return _error(
+                            "capability_catalog_browser_egress_rules_invalid",
+                            "The backend-issued native-browser egress rules are malformed.",
+                        )
+                    try:
+                        prefix = normalize_http_url_prefix(
+                            rule["url_prefix"]
+                        )
+                        methods = normalize_session_sandbox_methods(
+                            rule.get("methods")
+                        )
+                    except SessionSandboxPolicyError:
+                        return _error(
+                            "capability_catalog_browser_egress_rules_invalid",
+                            "The backend-issued native-browser egress rules are malformed.",
+                        )
+                    if (
+                        prefix != rule["url_prefix"]
+                        or list(methods) != rule.get("methods")
+                    ):
+                        return _error(
+                            "capability_catalog_browser_egress_rules_invalid",
+                            "The backend-issued native-browser egress rules are noncanonical.",
+                        )
+                    browser_egress_rules.append((prefix, methods))
+                package_sha256 = str(
+                    candidate.get("package_sha256") or ""
+                )
+                if _valid_sha256(package_sha256):
+                    package_digests.append((
+                        expected_skill,
+                        package_sha256,
+                    ))
         elif kind == "skill_resource":
             path = str(candidate.get("resource_path") or "")
             resources.append((expected_skill, path))
@@ -1563,6 +2272,84 @@ def validate_capability_plan(
                 )
             if _valid_sha256(package_sha256):
                 package_digests.append((expected_skill, package_sha256))
+            script_egress_prefixes = candidate.get(
+                "sandbox_egress_url_prefixes"
+            )
+            if (
+                not isinstance(script_egress_prefixes, list)
+                or len(script_egress_prefixes)
+                > MAX_SANDBOX_EGRESS_PREFIXES
+                or any(
+                    not isinstance(prefix, str)
+                    for prefix in script_egress_prefixes
+                )
+                or len(set(script_egress_prefixes))
+                != len(script_egress_prefixes)
+                or any(
+                    canonical_https_prefix(prefix) != prefix
+                    for prefix in script_egress_prefixes
+                )
+            ):
+                return _error(
+                    "capability_catalog_script_egress_invalid",
+                    "The backend-issued script egress closure is malformed.",
+                )
+            sandbox_egress_prefixes.extend(
+                (expected_skill, prefix)
+                for prefix in script_egress_prefixes
+            )
+            raw_script_egress_rules = candidate.get(
+                "sandbox_egress_rules"
+            )
+            if raw_script_egress_rules is None:
+                raw_script_egress_rules = [
+                    {
+                        "methods": ["GET", "HEAD"],
+                        "url_prefix": normalize_http_url_prefix(prefix),
+                    }
+                    for prefix in script_egress_prefixes
+                ]
+            if (
+                not isinstance(raw_script_egress_rules, list)
+                or len(raw_script_egress_rules)
+                > MAX_SANDBOX_EGRESS_PREFIXES
+            ):
+                return _error(
+                    "capability_catalog_script_egress_rules_invalid",
+                    "The backend-issued script egress rules are malformed.",
+                )
+            for rule in raw_script_egress_rules:
+                if (
+                    not isinstance(rule, dict)
+                    or set(rule) != {"methods", "url_prefix"}
+                    or not isinstance(rule.get("url_prefix"), str)
+                ):
+                    return _error(
+                        "capability_catalog_script_egress_rules_invalid",
+                        "The backend-issued script egress rules are malformed.",
+                    )
+                try:
+                    prefix = normalize_http_url_prefix(
+                        rule["url_prefix"]
+                    )
+                    methods = normalize_session_sandbox_methods(
+                        rule.get("methods")
+                    )
+                except SessionSandboxPolicyError:
+                    return _error(
+                        "capability_catalog_script_egress_rules_invalid",
+                        "The backend-issued script egress rules are malformed.",
+                    )
+                if prefix != rule["url_prefix"]:
+                    return _error(
+                        "capability_catalog_script_egress_rules_invalid",
+                        "The backend-issued script egress rules are malformed.",
+                    )
+                sandbox_egress_rules.append((
+                    expected_skill,
+                    prefix,
+                    methods,
+                ))
         elif kind == "declared_command":
             candidate_tools = ["run_declared_command"]
             commands.append((
@@ -1571,6 +2358,84 @@ def validate_capability_plan(
                 str(candidate.get("executable") or ""),
                 tuple(str(item) for item in candidate.get("fixed_argv") or []),
             ))
+            command_egress_prefixes = candidate.get(
+                "sandbox_egress_url_prefixes"
+            )
+            if (
+                not isinstance(command_egress_prefixes, list)
+                or len(command_egress_prefixes)
+                > MAX_SANDBOX_EGRESS_PREFIXES
+                or any(
+                    not isinstance(prefix, str)
+                    for prefix in command_egress_prefixes
+                )
+                or len(set(command_egress_prefixes))
+                != len(command_egress_prefixes)
+                or any(
+                    canonical_https_prefix(prefix) != prefix
+                    for prefix in command_egress_prefixes
+                )
+            ):
+                return _error(
+                    "capability_catalog_command_egress_invalid",
+                    "The backend-issued command egress closure is malformed.",
+                )
+            sandbox_egress_prefixes.extend(
+                (expected_skill, prefix)
+                for prefix in command_egress_prefixes
+            )
+            raw_command_egress_rules = candidate.get(
+                "sandbox_egress_rules"
+            )
+            if raw_command_egress_rules is None:
+                raw_command_egress_rules = [
+                    {
+                        "methods": ["GET", "HEAD"],
+                        "url_prefix": normalize_http_url_prefix(prefix),
+                    }
+                    for prefix in command_egress_prefixes
+                ]
+            if (
+                not isinstance(raw_command_egress_rules, list)
+                or len(raw_command_egress_rules)
+                > MAX_SANDBOX_EGRESS_PREFIXES
+            ):
+                return _error(
+                    "capability_catalog_command_egress_rules_invalid",
+                    "The backend-issued command egress rules are malformed.",
+                )
+            for rule in raw_command_egress_rules:
+                if (
+                    not isinstance(rule, dict)
+                    or set(rule) != {"methods", "url_prefix"}
+                    or not isinstance(rule.get("url_prefix"), str)
+                ):
+                    return _error(
+                        "capability_catalog_command_egress_rules_invalid",
+                        "The backend-issued command egress rules are malformed.",
+                    )
+                try:
+                    prefix = normalize_http_url_prefix(
+                        rule["url_prefix"]
+                    )
+                    methods = normalize_session_sandbox_methods(
+                        rule.get("methods")
+                    )
+                except SessionSandboxPolicyError:
+                    return _error(
+                        "capability_catalog_command_egress_rules_invalid",
+                        "The backend-issued command egress rules are malformed.",
+                    )
+                if prefix != rule["url_prefix"]:
+                    return _error(
+                        "capability_catalog_command_egress_rules_invalid",
+                        "The backend-issued command egress rules are malformed.",
+                    )
+                sandbox_egress_rules.append((
+                    expected_skill,
+                    prefix,
+                    methods,
+                ))
         elif kind == "skill_http_prefix":
             candidate_tools = [str(candidate.get("tool_name") or "")]
             target_prefixes = (
@@ -1631,6 +2496,20 @@ def validate_capability_plan(
         ],
         "allowed_skill_http_post_prefixes": [
             list(item) for item in dict.fromkeys(http_post_prefixes)
+        ],
+        "allowed_skill_sandbox_egress_prefixes": [
+            list(item)
+            for item in dict.fromkeys(sandbox_egress_prefixes)
+        ],
+        "allowed_skill_sandbox_egress_rules": [
+            [skill, prefix, list(methods)]
+            for skill, prefix, methods in dict.fromkeys(
+                sandbox_egress_rules
+            )
+        ],
+        "allowed_browser_egress_rules": [
+            [prefix, list(methods)]
+            for prefix, methods in dict.fromkeys(browser_egress_rules)
         ],
         "diagnostic": (
             "unsupported Skill instructions remain and must be reported explicitly"
@@ -1766,15 +2645,56 @@ def capability_call_satisfies_candidate(
             str(item) for item in candidate.get("tool_names") or [] if str(item)
         }:
             return False
+        path = str(candidate.get("resource_path") or "")
+        digest = str(candidate.get("sha256") or "")
+        exact_grant = (skill_name, path, digest)
+        if tool_name == "run_skill_process":
+            receipt = normalize_skill_process_evidence_receipt(
+                (result_data or {}).get("process_evidence_receipt")
+                if isinstance(result_data, dict)
+                else None
+            )
+            completion_operation = {
+                "structured_call": "read",
+                "cli_exit": "read",
+                "artifact_sync": "sync",
+                "artifact_close": "close",
+            }.get(
+                str((receipt or {}).get("completion_kind") or "")
+            )
+            if (
+                receipt is None
+                or args.get("operation") != completion_operation
+                or args.get("process_id") != receipt["process_id"]
+                or receipt["skill_name"] != skill_name
+                or receipt["script_resource"] != path
+                or receipt["script_sha256"] != digest
+                or (
+                    _valid_sha256(candidate.get("package_sha256"))
+                    and receipt["package_sha256"]
+                    != candidate["package_sha256"]
+                )
+                or outcome != receipt["outcome"]
+            ):
+                return False
+            if receipt["completion_kind"] in {
+                "artifact_sync",
+                "artifact_close",
+            }:
+                manifest = skill_process_artifact_manifest_sha256(artifacts)
+                if (
+                    manifest is None
+                    or manifest[0] != receipt["artifact_count"]
+                    or manifest[1] != receipt["artifact_manifest_sha256"]
+                ):
+                    return False
+            return exact_grant in set(allowed_skill_scripts)
         if not script_call_has_semantic_task_binding(
             tool_name,
             args,
             artifacts,
         ):
             return False
-        path = str(candidate.get("resource_path") or "")
-        digest = str(candidate.get("sha256") or "")
-        exact_grant = (skill_name, path, digest)
         return (
             exact_grant in set(allowed_skill_scripts)
             and args.get("script_path") == f"skills/{skill_name}/{path}"

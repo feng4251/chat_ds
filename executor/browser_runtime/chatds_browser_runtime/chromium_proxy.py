@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import os
 from pathlib import Path
 import sys
@@ -28,6 +30,14 @@ _FORBIDDEN_ARGUMENTS = frozenset(
         "--disable-namespace-sandbox",
         "--disable-gpu-sandbox",
         "--disable-zygote-sandbox",
+        "--ignore-certificate-errors",
+        "--ignore-certificate-errors-spki-list",
+        "--allow-insecure-localhost",
+        "--disable-certificate-transparency-enforcement",
+        "--enable-features",
+        "--disable-features",
+        "--test-type",
+        "--reduce-security-for-testing",
     }
 )
 _FORBIDDEN_PREFIXES = (
@@ -38,7 +48,40 @@ _FORBIDDEN_PREFIXES = (
     "--remote-debugging-address=",
     "--remote-debugging-port=",
     "--disable-blink-features=",
+    "--ignore-certificate-errors=",
+    "--ignore-certificate-errors-spki-list=",
+    "--allow-insecure-localhost=",
+    "--disable-certificate-transparency-enforcement=",
 )
+_FORBIDDEN_ENABLED_FEATURES = frozenset({"EncryptedClientHello"})
+
+
+def _feature_values(argument: str, *, prefix: str) -> list[str]:
+    values = argument.removeprefix(prefix).split(",")
+    if any(
+        not value
+        or len(value) > 256
+        or any(
+            not (character.isalnum() or character in "_-")
+            for character in value
+        )
+        for value in values
+    ):
+        raise ValueError(
+            "caller-controlled Chromium feature flags are malformed"
+        )
+    return values
+
+
+def _validated_leaf_spki(policy: ProxyPolicy) -> str:
+    value = policy.leaf_spki_sha256
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("runtime-owned Chromium leaf SPKI is invalid") from exc
+    if len(value) != 44 or len(decoded) != 32:
+        raise ValueError("runtime-owned Chromium leaf SPKI is invalid")
+    return value
 
 
 def controlled_arguments(
@@ -50,6 +93,7 @@ def controlled_arguments(
     """Reject caller proxy overrides and append the runtime-owned controls."""
 
     received: list[str] = []
+    disabled_features: list[str] = []
     for argument in arguments:
         # Playwright defaults chromiumSandbox to false and injects this flag
         # even when the deployment provides a working non-root namespace
@@ -67,13 +111,42 @@ def controlled_arguments(
         ):
             received.append(argument)
             continue
+        # Pinned Playwright versions use ordinary enable-features arguments
+        # (for example CDPScreenshotNewSurface). Preserve well-formed,
+        # non-security feature names, but never let a caller re-enable ECH
+        # against the runtime-owned disable below.
+        if argument.startswith("--enable-features="):
+            values = _feature_values(
+                argument,
+                prefix="--enable-features=",
+            )
+            if _FORBIDDEN_ENABLED_FEATURES.intersection(values):
+                raise ValueError(
+                    "caller-controlled Chromium proxy/security flags are forbidden"
+                )
+            received.append(argument)
+            continue
+        if argument.startswith("--disable-features="):
+            disabled_features.extend(
+                _feature_values(
+                    argument,
+                    prefix="--disable-features=",
+                )
+            )
+            continue
         if argument in _FORBIDDEN_ARGUMENTS or argument.startswith(_FORBIDDEN_PREFIXES):
             raise ValueError("caller-controlled Chromium proxy/security flags are forbidden")
         received.append(argument)
+    disabled_features.append("EncryptedClientHello")
+    merged_disabled_features = ",".join(dict.fromkeys(disabled_features))
+    leaf_spki = _validated_leaf_spki(policy)
     return [
         *received,
         f"--proxy-server={policy.proxy_url}",
         "--proxy-bypass-list=<-loopback>",
+        f"--ignore-certificate-errors-spki-list={leaf_spki}",
+        f"--disable-features={merged_disabled_features}",
+        "--disable-http2",
         "--disable-quic",
         "--disable-breakpad",
         "--disable-crash-reporter",

@@ -29,6 +29,16 @@ from tools.isolated_skill_executor import (
     IsolatedSkillExecutorError,
     SkillPackageSnapshot,
 )
+from tools.executor_slot_pool import (
+    ExecutorSlotPoolError,
+    configured_executor_socket_paths,
+    executor_pool_identity_sha256,
+)
+from tools.session_sandbox_policy import (
+    SESSION_SANDBOX_RUNTIME_PROFILE,
+    SessionSandboxPolicyError,
+    normalize_session_sandbox_methods,
+)
 
 
 BASE_RUNTIME_PROFILE = "base-v1"
@@ -45,6 +55,7 @@ MAX_PACKAGE_JSON_BYTES = 256_000
 SKILL_RUNTIME_MANIFEST_NAME = "chatds-runtime.json"
 MAX_SKILL_RUNTIME_MANIFEST_BYTES = 256_000
 MAX_SKILL_RUNTIME_MANIFEST_ENTRYPOINTS = 40
+MAX_SKILL_RUNTIME_USER_URL_BINDINGS = 8
 MAX_SHELL_HEREDOCS = 128
 MAX_SHELL_HEREDOC_BODY_BYTES = MAX_PROFILE_SOURCE_FILE_BYTES
 
@@ -296,6 +307,37 @@ _EXTERNAL_NETWORK_URL_PREFIXES = (
 
 
 @dataclass(frozen=True, slots=True)
+class SkillUserUrlEgressBinding:
+    """Manifest-bound use of an exact URL authored by the current user.
+
+    This declaration is not network authority by itself.  The capability
+    runner intersects it with canonical URLs in bounded user context and the
+    exact actual invocation only at the final content-addressed dispatch
+    boundary. Catalog compilation never turns this declaration into a rule.
+    """
+
+    source: str
+    selector: str | int
+    methods: tuple[str, ...]
+    scope: str
+    callable_name: str | None = None
+    command: str | None = None
+
+    def as_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "source": self.source,
+            "selector": self.selector,
+            "methods": list(self.methods),
+            "scope": self.scope,
+        }
+        if self.callable_name is not None:
+            payload["callable"] = self.callable_name
+        if self.command is not None:
+            payload["command"] = self.command
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
 class SkillRuntimeSelection:
     """One exact entrypoint's immutable routing/capability identity."""
 
@@ -311,6 +353,7 @@ class SkillRuntimeSelection:
     runtime_manifest_path: str | None
     runtime_manifest_sha256: str | None
     egress_only: bool
+    user_url_egress: tuple[SkillUserUrlEgressBinding, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -588,9 +631,9 @@ def assess_skill_runtime_network(
     suffix = PurePosixPath(selection.entrypoint).suffix.casefold()
     if suffix != ".py":
         # Regexes cannot prove whether Node/Shell matches are in a dead branch
-        # or unused helper.  Their fixed executor remains network-disabled;
-        # package authors can make an egress-only CLI explicit in the strict
-        # entrypoint manifest.
+        # or unused helper. Direct dialing remains disabled and controlled
+        # egress is limited to the frozen exact-origin closure; package authors
+        # can make an egress-only CLI explicit in the strict entrypoint manifest.
         return SkillRuntimeNetworkAssessment(False)
     try:
         source = snapshot.read_bytes(selection.entrypoint).decode("utf-8")
@@ -667,7 +710,9 @@ class RuntimeProfileSocketBinding:
     """Runtime-owned UDS selection; the model never supplies these fields."""
 
     runtime_profile: str
+    executor_runtime_profile: str
     socket_path: str
+    socket_paths: tuple[str, ...]
     socket_identity_sha256: str
 
 
@@ -693,8 +738,10 @@ class _EntrypointRuntimeDeclaration:
     node_packages: tuple[tuple[str, str], ...]
     runtime_commands: tuple[str, ...]
     egress_only: bool
+    user_url_egress: tuple[SkillUserUrlEgressBinding, ...]
     manifest_path: str
     manifest_sha256: str
+    manifest_schema_version: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -759,35 +806,31 @@ def runtime_profile_socket_binding(
 
     if runtime_profile not in SUPPORTED_RUNTIME_PROFILES:
         _unsupported_runtime_profile(runtime_profile)
-    if runtime_profile == BROWSER_RUNTIME_PROFILE:
-        socket_path = os.environ.get(
-            "SKILL_BROWSER_EXECUTOR_SOCKET", ""
-        ).strip()
-        if not socket_path:
-            raise IsolatedSkillExecutorError(
-                "browser_runtime_unavailable",
-                "The isolated browser runtime socket is not configured.",
-            )
-    else:
-        socket_path = os.environ.get(
-            "EXECUTOR_SOCKET", EXECUTOR_SOCKET
-        ).strip()
-        if not socket_path:
-            raise IsolatedSkillExecutorError(
-                "executor_unavailable",
-                "The isolated Skill executor socket is not configured.",
-            )
-    identity = hashlib.sha256(
-        (
-            "chatds-runtime-socket-v1\0"
-            + runtime_profile
-            + "\0"
-            + socket_path
-        ).encode("utf-8")
-    ).hexdigest()
+    socket_path = os.environ.get("EXECUTOR_SOCKET", EXECUTOR_SOCKET).strip()
+    try:
+        socket_paths = configured_executor_socket_paths(
+            primary_socket=socket_path,
+        )
+    except ExecutorSlotPoolError as exc:
+        raise IsolatedSkillExecutorError(exc.code, str(exc)) from exc
+    legacy_browser_socket = os.environ.get(
+        "SKILL_BROWSER_EXECUTOR_SOCKET", ""
+    ).strip()
+    if legacy_browser_socket and legacy_browser_socket != socket_paths[0]:
+        raise IsolatedSkillExecutorError(
+            "session_sandbox_topology_mismatch",
+            "The legacy browser socket must identify the first physical "
+            "member of the logical session-sandbox pool.",
+        )
+    identity = executor_pool_identity_sha256(
+        socket_paths,
+        runtime_profile=SESSION_SANDBOX_RUNTIME_PROFILE,
+    )
     return RuntimeProfileSocketBinding(
         runtime_profile=runtime_profile,
-        socket_path=socket_path,
+        executor_runtime_profile=SESSION_SANDBOX_RUNTIME_PROFILE,
+        socket_path=socket_paths[0],
+        socket_paths=socket_paths,
         socket_identity_sha256=identity,
     )
 
@@ -3416,6 +3459,162 @@ def _manifest_runtime_commands(value: Any) -> tuple[str, ...]:
     return tuple(sorted(dict.fromkeys(commands)))
 
 
+_USER_URL_BINDING_IDENTIFIER_RE = re.compile(
+    r"^[A-Za-z][A-Za-z0-9_]{0,127}$"
+)
+_USER_URL_BINDING_CALLABLE_RE = re.compile(
+    r"^[A-Za-z][A-Za-z0-9_]{0,127}"
+    r"(?:\.[A-Za-z][A-Za-z0-9_]{0,127})?$"
+)
+_USER_URL_BINDING_FLAG_RE = re.compile(
+    r"^--[A-Za-z0-9][A-Za-z0-9_-]{0,126}$"
+)
+
+
+def _manifest_user_url_egress(
+    value: Any,
+    *,
+    schema_version: int,
+    entrypoint: str,
+) -> tuple[SkillUserUrlEgressBinding, ...]:
+    """Parse versioned current-user URL bindings without minting a URL."""
+
+    if value is None:
+        return ()
+    if schema_version != 2:
+        _invalid_runtime_manifest(
+            f"entrypoint {entrypoint!r} user_url_egress requires "
+            "schema_version 2"
+        )
+    if (
+        not isinstance(value, list)
+        or not value
+        or len(value) > MAX_SKILL_RUNTIME_USER_URL_BINDINGS
+    ):
+        _invalid_runtime_manifest(
+            f"entrypoint {entrypoint!r} user_url_egress must contain "
+            f"between 1 and {MAX_SKILL_RUNTIME_USER_URL_BINDINGS} bindings"
+        )
+
+    result: list[SkillUserUrlEgressBinding] = []
+    seen: set[tuple[Any, ...]] = set()
+    for record in value:
+        if not isinstance(record, dict):
+            _invalid_runtime_manifest(
+                f"entrypoint {entrypoint!r} user URL bindings must be objects"
+            )
+        if set(record).difference({
+            "source",
+            "selector",
+            "methods",
+            "scope",
+            "callable",
+            "command",
+        }):
+            _invalid_runtime_manifest(
+                f"entrypoint {entrypoint!r} user URL binding has unsupported fields"
+            )
+        source = record.get("source")
+        selector = record.get("selector")
+        scope = record.get("scope")
+        callable_name = record.get("callable")
+        command = record.get("command")
+        if source not in {"argv", "python", "stdin_json"}:
+            _invalid_runtime_manifest(
+                f"entrypoint {entrypoint!r} user URL binding source is unsupported"
+            )
+        if scope not in {"url", "origin"}:
+            _invalid_runtime_manifest(
+                f"entrypoint {entrypoint!r} user URL binding scope must be "
+                "'url' or 'origin'"
+            )
+        try:
+            methods = normalize_session_sandbox_methods(
+                record.get("methods")
+            )
+        except SessionSandboxPolicyError:
+            _invalid_runtime_manifest(
+                f"entrypoint {entrypoint!r} user URL binding methods are invalid"
+            )
+
+        if source == "argv":
+            if not (
+                (
+                    type(selector) is int
+                    and 0 <= selector < 64
+                )
+                or (
+                    isinstance(selector, str)
+                    and _USER_URL_BINDING_FLAG_RE.fullmatch(selector)
+                    is not None
+                )
+            ):
+                _invalid_runtime_manifest(
+                    f"entrypoint {entrypoint!r} argv URL selector must be an "
+                    "index from 0 to 63 or one exact long flag"
+                )
+            if callable_name is not None or command is not None:
+                _invalid_runtime_manifest(
+                    f"entrypoint {entrypoint!r} argv URL binding cannot "
+                    "declare callable/command"
+                )
+        elif source == "python":
+            if (
+                not isinstance(selector, str)
+                or _USER_URL_BINDING_IDENTIFIER_RE.fullmatch(selector)
+                is None
+                or not isinstance(callable_name, str)
+                or _USER_URL_BINDING_CALLABLE_RE.fullmatch(callable_name)
+                is None
+                or command is not None
+            ):
+                _invalid_runtime_manifest(
+                    f"entrypoint {entrypoint!r} Python URL binding requires "
+                    "one public parameter selector and exact callable"
+                )
+        else:
+            if (
+                not isinstance(selector, str)
+                or _USER_URL_BINDING_IDENTIFIER_RE.fullmatch(selector)
+                is None
+                or not isinstance(command, str)
+                or _USER_URL_BINDING_IDENTIFIER_RE.fullmatch(command)
+                is None
+                or callable_name is not None
+            ):
+                _invalid_runtime_manifest(
+                    f"entrypoint {entrypoint!r} stdin_json URL binding "
+                    "requires one exact command and top-level field selector"
+                )
+
+        binding = SkillUserUrlEgressBinding(
+            source=str(source),
+            selector=selector,
+            methods=methods,
+            scope=str(scope),
+            callable_name=(
+                str(callable_name)
+                if callable_name is not None else None
+            ),
+            command=str(command) if command is not None else None,
+        )
+        identity = (
+            binding.source,
+            binding.selector,
+            binding.methods,
+            binding.scope,
+            binding.callable_name,
+            binding.command,
+        )
+        if identity in seen:
+            _invalid_runtime_manifest(
+                f"entrypoint {entrypoint!r} repeats a user URL binding"
+            )
+        seen.add(identity)
+        result.append(binding)
+    return tuple(result)
+
+
 def _declared_entrypoint_runtime_profiles(
     snapshot: SkillPackageSnapshot,
 ) -> dict[str, _EntrypointRuntimeDeclaration]:
@@ -3470,8 +3669,8 @@ def _declared_entrypoint_runtime_profiles(
     schema_version = _manifest_alias_value(
         value, "schema_version", "schemaVersion"
     )
-    if type(schema_version) is not int or schema_version != 1:
-        _invalid_runtime_manifest("schema_version must be integer 1")
+    if type(schema_version) is not int or schema_version not in {1, 2}:
+        _invalid_runtime_manifest("schema_version must be integer 1 or 2")
     entries = value.get("entrypoints")
     if not isinstance(entries, (dict, list)):
         _invalid_runtime_manifest(
@@ -3520,6 +3719,7 @@ def _declared_entrypoint_runtime_profiles(
             "python_requirements", "pythonRequirements",
             "node_packages", "nodePackages",
             "runtime_commands", "runtimeCommands", "commands",
+            "user_url_egress", "userUrlEgress",
         })
         if unknown_entrypoint_fields:
             _invalid_runtime_manifest(
@@ -3547,6 +3747,11 @@ def _declared_entrypoint_runtime_profiles(
             _invalid_runtime_manifest(
                 f"entrypoint {path!r} egress_only must be a boolean"
             )
+        user_url_egress = _manifest_alias_value(
+            record,
+            "user_url_egress",
+            "userUrlEgress",
+        )
         dependencies = record.get("dependencies")
         if dependencies is None:
             dependencies = {}
@@ -3611,8 +3816,14 @@ def _declared_entrypoint_runtime_profiles(
                 )
             ),
             egress_only=egress_only,
+            user_url_egress=_manifest_user_url_egress(
+                user_url_egress,
+                schema_version=schema_version,
+                entrypoint=path,
+            ),
             manifest_path=manifest_path,
             manifest_sha256=manifest_sha256,
+            manifest_schema_version=schema_version,
         )
     return result
 
@@ -4098,6 +4309,10 @@ def select_skill_runtime_profile(
             entrypoint_declaration is not None
             and entrypoint_declaration.egress_only
         ),
+        user_url_egress=(
+            entrypoint_declaration.user_url_egress
+            if entrypoint_declaration is not None else ()
+        ),
     )
 
 
@@ -4184,6 +4399,10 @@ def compile_skill_runtime_profile_manifest(
                 entrypoint in declared_entrypoints
             ),
             "egress_only": selection.egress_only,
+            "user_url_egress": [
+                binding.as_payload()
+                for binding in selection.user_url_egress
+            ],
             "runtime_manifest_path": (
                 selection.runtime_manifest_path
             ),
@@ -4203,6 +4422,6 @@ def compile_skill_runtime_profile_manifest(
         result["entrypoint_manifest"] = {
             "path": declaration.manifest_path,
             "sha256": declaration.manifest_sha256,
-            "schema_version": 1,
+            "schema_version": declaration.manifest_schema_version,
         }
     return result

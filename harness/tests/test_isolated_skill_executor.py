@@ -14,9 +14,28 @@ from unittest.mock import AsyncMock, patch
 
 from executor import server
 from tools import isolated_skill_executor as client
+from tools.executor_slot_pool import (
+    ExecutorSlotPoolError,
+    executor_attestation_sha256,
+)
 
 
 V2_AUTH_TOKEN = "test-only-v2-auth-token-" + "x" * 32
+TEST_RUNTIME_BUILD_SHA256 = hashlib.sha256(
+    b"test-runtime-build"
+).hexdigest()
+
+
+def _retrieval_egress_rules(
+    *origins: str,
+) -> tuple[dict[str, object], ...]:
+    return tuple(
+        {
+            "methods": ["GET", "HEAD"],
+            "url_prefix": f"{origin}/",
+        }
+        for origin in origins
+    )
 
 
 def _artifact(path: str, content: bytes, *, change: str = "created") -> dict[str, object]:
@@ -47,6 +66,57 @@ class IsolatedSkillExecutorClientTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tempdir.cleanup()
 
+    def test_snapshot_tree_bounds_directory_entries_before_sorting(self) -> None:
+        class Entry:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+        class Scanner:
+            def __init__(self) -> None:
+                self.emitted = 0
+                self.closed = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback) -> None:
+                self.closed = True
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if self.emitted > client.MAX_SNAPSHOT_ENTRIES:
+                    raise AssertionError(
+                        "snapshot walker consumed beyond remaining+1"
+                    )
+                self.emitted += 1
+                return Entry(f"entry-{self.emitted:08d}")
+
+        scanner = Scanner()
+        with (
+            patch.object(client.os, "scandir", return_value=scanner),
+            patch.object(
+                client.os,
+                "listdir",
+                side_effect=AssertionError(
+                    "snapshot walker must not allocate os.listdir"
+                ),
+            ),
+        ):
+            with self.assertRaises(client.IsolatedSkillExecutorError) as caught:
+                client._snapshot_tree(
+                    self.skill,
+                    field="fixture",
+                    max_files=client.MAX_SNAPSHOT_ENTRIES,
+                    max_file_bytes=1,
+                    max_total_bytes=1,
+                )
+
+        self.assertEqual("snapshot_limit_exceeded", caught.exception.code)
+        self.assertEqual(client.MAX_SNAPSHOT_ENTRIES + 1, scanner.emitted)
+        self.assertTrue(scanner.closed)
+
     def test_runtime_capability_response_requires_exact_identity_and_never_accepts_env_values(self) -> None:
         request, encoded = client.build_runtime_capabilities_request(
             requirements=["packaging>=20"],
@@ -68,6 +138,7 @@ class IsolatedSkillExecutorClientTests(unittest.TestCase):
                 "platform": "linux",
                 "network": "disabled",
                 "dependency_install": "disabled",
+                "runtime_build_sha256": TEST_RUNTIME_BUILD_SHA256,
             },
             "requirements": [{
                 "requirement": "packaging>=20",
@@ -91,6 +162,23 @@ class IsolatedSkillExecutorClientTests(unittest.TestCase):
             request=request,
         )
         self.assertTrue(validated["valid"])
+        heterogeneous = {
+            **response,
+            "runtime_identity": {
+                **response["runtime_identity"],
+                "runtime_build_sha256": hashlib.sha256(
+                    b"heterogeneous-runtime-build"
+                ).hexdigest(),
+            },
+        }
+        client.validate_runtime_capabilities_response(
+            heterogeneous,
+            request=request,
+        )
+        self.assertNotEqual(
+            executor_attestation_sha256(response),
+            executor_attestation_sha256(heterogeneous),
+        )
 
         response["environment_variables"][0]["value"] = "must-not-cross-boundary"
         with self.assertRaises(client.IsolatedSkillExecutorError) as caught:
@@ -98,6 +186,33 @@ class IsolatedSkillExecutorClientTests(unittest.TestCase):
         self.assertEqual("invalid_response", caught.exception.code)
 
         response["environment_variables"][0].pop("value")
+        for bad_digest in (
+            None,
+            "",
+            "0" * 63,
+            "0" * 65,
+            "g" * 64,
+            "A" * 64,
+            int("1" * 64),
+            False,
+        ):
+            if bad_digest is None:
+                response["runtime_identity"].pop("runtime_build_sha256")
+            else:
+                response["runtime_identity"]["runtime_build_sha256"] = bad_digest
+            with self.subTest(runtime_build_sha256=bad_digest):
+                with self.assertRaises(
+                    client.IsolatedSkillExecutorError
+                ) as caught:
+                    client.validate_runtime_capabilities_response(
+                        response,
+                        request=request,
+                    )
+                self.assertEqual("invalid_response", caught.exception.code)
+            response["runtime_identity"][
+                "runtime_build_sha256"
+            ] = TEST_RUNTIME_BUILD_SHA256
+
         response["request_id"] = str(uuid.uuid4())
         with self.assertRaises(client.IsolatedSkillExecutorError) as caught:
             client.validate_runtime_capabilities_response(response, request=request)
@@ -131,6 +246,318 @@ class IsolatedSkillExecutorClientTests(unittest.TestCase):
             base64.b64decode(skill_files["assets/binary.bin"]["content_b64"]),
         )
         self.assertEqual(["input.bin"], [item["path"] for item in payload["workspace_files"]])
+        self.assertEqual([], payload["egress_origins"])
+        self.assertEqual([], payload["egress_rules"])
+        self.assertEqual([], payload["private_origins"])
+
+    def test_runtime_owned_exact_egress_propagates_to_script_and_process_requests(
+        self,
+    ) -> None:
+        origins = (
+            "https://api.example.test:443",
+            "http://catalog.example.test:80",
+        )
+        rules = (
+            {
+                "methods": ["GET", "HEAD", "POST"],
+                "url_prefix": (
+                    "https://api.example.test:443/v1/?tenant=alpha"
+                ),
+            },
+            {
+                "methods": ["GET", "HEAD"],
+                "url_prefix": "http://catalog.example.test:80/lookup",
+            },
+        )
+        script_request, script_encoded = client.build_skill_script_request(
+            skill_root=self.skill,
+            workspace=self.workspace,
+            entrypoint="scripts/task.sh",
+            egress_origins=origins,
+            egress_rules=rules,
+        )
+        self.assertEqual(list(origins), script_request["egress_origins"])
+        self.assertEqual(list(rules), script_request["egress_rules"])
+        self.assertEqual(2, script_request["egress_policy_version"])
+        self.assertEqual(
+            list(origins),
+            json.loads(script_encoded)["egress_origins"],
+        )
+        self.assertEqual(
+            list(rules),
+            json.loads(script_encoded)["egress_rules"],
+        )
+
+        scope = client.create_process_owner_scope(
+            user_id="egress-user",
+            session_id="egress-session",
+            root_run_id="egress-run",
+        )
+        with patch.dict(
+            os.environ,
+            {"EXECUTOR_V2_AUTH_TOKEN": V2_AUTH_TOKEN},
+        ):
+            process_request, process_encoded = (
+                client.build_process_lease_open_request(
+                    owner_scope=scope,
+                    skill_root=self.skill,
+                    workspace=self.workspace,
+                    entrypoint="scripts/task.sh",
+                    egress_origins=origins,
+                    egress_rules=rules,
+                )
+            )
+        self.assertEqual(list(origins), process_request["egress_origins"])
+        self.assertEqual(list(rules), process_request["egress_rules"])
+        self.assertEqual(2, process_request["egress_policy_version"])
+        self.assertEqual(
+            list(origins),
+            json.loads(process_encoded)["egress_origins"],
+        )
+        self.assertEqual(
+            list(rules),
+            json.loads(process_encoded)["egress_rules"],
+        )
+
+    def test_egress_request_builder_rejects_noncanonical_or_unbounded_values(
+        self,
+    ) -> None:
+        invalid_policies: tuple[object, ...] = (
+            ("https://api.example.test",),
+            ("https://api.example.test:443/path",),
+            ("https://*.example.test:443",),
+            (
+                "https://api.example.test:443",
+                "https://api.example.test:443",
+            ),
+            ("https://api.example.test:443", 7),
+            tuple(
+                f"https://host-{index}.example.test:443"
+                for index in range(
+                    client.MAX_SESSION_SANDBOX_EGRESS_ORIGINS + 1
+                )
+            ),
+        )
+        for values in invalid_policies:
+            with self.subTest(values=values):
+                with self.assertRaises(
+                    client.IsolatedSkillExecutorError
+                ) as caught:
+                    client.build_skill_script_request(
+                        skill_root=self.skill,
+                        workspace=self.workspace,
+                        entrypoint="scripts/task.sh",
+                        egress_origins=values,  # type: ignore[arg-type]
+                    )
+                self.assertEqual(
+                    "invalid_egress_policy",
+                    caught.exception.code,
+                )
+
+    def test_egress_receipts_must_match_the_exact_request_policy(self) -> None:
+        request_id = str(uuid.uuid4())
+        response = {
+            "protocol_version": client.PROTOCOL_VERSION,
+            "kind": "skill_script_result",
+            "request_id": request_id,
+            "status": "success",
+            "invocation_mode": "cli",
+            "network": "disabled",
+            "runtime_profile": "session-sandbox-v1",
+            "network_policy": {
+                "direct": "disabled",
+                "egress": "origin_allowlist_proxy",
+            },
+            "stdout": "",
+            "stderr": "",
+            "artifacts": [],
+        }
+        self.assertEqual(
+            [],
+            client.validate_skill_script_response(
+                response,
+                request_id=request_id,
+                invocation_mode="cli",
+                expected_egress=True,
+            ),
+        )
+        response["network_policy"] = {
+            "direct": "disabled",
+            "egress": "none",
+        }
+        with self.assertRaises(
+            client.IsolatedSkillExecutorError
+        ) as caught:
+            client.validate_skill_script_response(
+                response,
+                request_id=request_id,
+                invocation_mode="cli",
+                expected_egress=True,
+            )
+        self.assertEqual("invalid_response", caught.exception.code)
+
+        scope = client.create_process_owner_scope(
+            user_id="receipt-user",
+            session_id="receipt-session",
+            root_run_id="receipt-run",
+        )
+        with patch.dict(
+            os.environ,
+            {"EXECUTOR_V2_AUTH_TOKEN": V2_AUTH_TOKEN},
+        ):
+            process_request, _ = client.build_process_lease_open_request(
+                owner_scope=scope,
+                skill_root=self.skill,
+                workspace=self.workspace,
+                entrypoint="scripts/task.sh",
+                egress_origins=("https://api.example.test:443",),
+                egress_rules=_retrieval_egress_rules(
+                    "https://api.example.test:443",
+                ),
+            )
+        process_response = {
+            "protocol_version": client.PROCESS_PROTOCOL_VERSION,
+            "kind": "process_lease_result",
+            "operation": "open",
+            "request_id": process_request["request_id"],
+            "status": "success",
+            "network": "disabled",
+            "lease_handle": "pl2_receipt_" + "a" * 32,
+            "scope_digest": "b" * 64,
+            "skill_sha256": process_request["skill_sha256"],
+            "script_sha256": process_request["script_sha256"],
+            "state": "open",
+            "runtime_profile": "session-sandbox-v1",
+            "network_policy": {
+                "direct": "disabled",
+                "egress": "origin_allowlist_proxy",
+            },
+            "artifacts": [],
+        }
+        validated, artifacts = client.validate_process_lease_response(
+            process_response,
+            request=process_request,
+        )
+        self.assertEqual([], artifacts)
+        self.assertEqual("success", validated["status"])
+
+        process_response["network_policy"] = {
+            "direct": "disabled",
+            "egress": "none",
+        }
+        with self.assertRaises(
+            client.IsolatedSkillExecutorError
+        ) as caught:
+            client.validate_process_lease_response(
+                process_response,
+                request=process_request,
+            )
+        self.assertEqual("invalid_response", caught.exception.code)
+
+    def test_typed_execution_errors_keep_strict_network_attestation(
+        self,
+    ) -> None:
+        request_id = str(uuid.uuid4())
+        skill_response = {
+            "protocol_version": client.PROTOCOL_VERSION,
+            "kind": "skill_script_result",
+            "request_id": request_id,
+            "status": "error",
+            "error_code": "worker_busy",
+            "error": "The worker is busy.",
+            "invocation_mode": "cli",
+            "network": "disabled",
+            "runtime_profile": client.SESSION_SANDBOX_RUNTIME_PROFILE,
+            "network_policy": {
+                "direct": "disabled",
+                "egress": "origin_allowlist_proxy",
+            },
+            "artifacts": [],
+        }
+        self.assertEqual(
+            [],
+            client.validate_skill_script_response(
+                skill_response,
+                request_id=request_id,
+                invocation_mode="cli",
+                expected_egress=True,
+            ),
+        )
+        self.assertEqual("worker_busy", skill_response["error_code"])
+        skill_response_without_cause = dict(skill_response)
+        skill_response_without_cause.pop("error_code")
+        with self.assertRaises(
+            client.IsolatedSkillExecutorError
+        ) as caught:
+            client.validate_skill_script_response(
+                skill_response_without_cause,
+                request_id=request_id,
+                invocation_mode="cli",
+                expected_egress=True,
+            )
+        self.assertEqual("invalid_response", caught.exception.code)
+
+        command_request, _ = client.build_declared_command_request(
+            skill_root=self.skill,
+            workspace=self.workspace,
+            executable="python",
+            argv=["-V"],
+            egress_origins=("https://api.example.test:443",),
+            egress_rules=_retrieval_egress_rules(
+                "https://api.example.test:443",
+            ),
+        )
+        command_digest = hashlib.sha256(json.dumps(
+            [
+                command_request["executable"],
+                *command_request["argv"],
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        command_response = {
+            "protocol_version": client.PROTOCOL_VERSION,
+            "kind": "declared_command_result",
+            "request_id": command_request["request_id"],
+            "status": "error",
+            "error_code": "command_spawn_failed",
+            "error": "The command could not start.",
+            "executable": command_request["executable"],
+            "cwd": command_request["cwd"],
+            "command_sha256": command_digest,
+            "shell": False,
+            "network": "disabled",
+            "runtime_profile": client.SESSION_SANDBOX_RUNTIME_PROFILE,
+            "network_policy": {
+                "direct": "disabled",
+                "egress": "origin_allowlist_proxy",
+            },
+            "artifacts": [],
+        }
+        self.assertEqual(
+            [],
+            client.validate_declared_command_response(
+                command_response,
+                request=command_request,
+            ),
+        )
+        self.assertEqual(
+            "command_spawn_failed",
+            command_response["error_code"],
+        )
+
+        command_response["network_policy"] = {
+            "direct": "disabled",
+            "egress": "none",
+        }
+        with self.assertRaises(
+            client.IsolatedSkillExecutorError
+        ) as caught:
+            client.validate_declared_command_response(
+                command_response,
+                request=command_request,
+            )
+        self.assertEqual("invalid_response", caught.exception.code)
 
     def test_expected_skill_digest_rejects_snapshot_mutation_before_exchange(self) -> None:
         expected = client.compute_skill_package_digest(self.skill)
@@ -382,6 +809,180 @@ class IsolatedSkillExecutorClientTests(unittest.TestCase):
             fixed_ack_op_id,
             execute.await_args_list[1].kwargs["op_id"],
         )
+
+    def test_cancelled_slot_release_keeps_replayable_close_result(self) -> None:
+        scope = client.create_process_owner_scope(
+            user_id="close-cancel-user",
+            session_id="close-cancel-session",
+            root_run_id="close-cancel-run",
+        )
+
+        class CancelledTerminalReservation:
+            def __init__(self) -> None:
+                self.terminal = False
+                self.release_calls = 0
+
+            async def release(self) -> None:
+                self.release_calls += 1
+                self.terminal = True
+                raise asyncio.CancelledError
+
+        reservation = CancelledTerminalReservation()
+        lease = client.IsolatedProcessLease(
+            handle="pl2_" + "1" * 32 + "_" + "2" * 32,
+            skill_sha256="3" * 64,
+            script_sha256="4" * 64,
+            entrypoint="scripts/task.sh",
+            invocation_mode="cli",
+            class_name=None,
+            factory_name=None,
+            _owner_scope=scope,
+            _workspace=self.workspace,
+            _socket_path="/unused",
+            _baseline={},
+            _slot_reservation=reservation,
+        )
+        prepared = {
+            "sync_token": "v" * 43,
+            "sync_pending": True,
+            "state": "closing",
+        }
+        acknowledged = {
+            "state": "closed",
+            "acknowledged_operation": "close",
+            "sync_acknowledged": True,
+        }
+        execute = AsyncMock(side_effect=[
+            (prepared, []),
+            (acknowledged, []),
+        ])
+
+        with patch.object(client, "_execute_process_operation", execute):
+            with self.assertRaises(asyncio.CancelledError):
+                asyncio.run(client.close_isolated_process_lease(lease))
+            replayed = asyncio.run(
+                client.close_isolated_process_lease(lease)
+            )
+
+        self.assertTrue(lease.closed)
+        self.assertIsNone(lease._slot_reservation)
+        self.assertEqual("closed", replayed["state"])
+        self.assertTrue(replayed["sync_acknowledged"])
+        self.assertEqual(1, reservation.release_calls)
+        self.assertEqual(2, execute.await_count)
+
+    def test_process_exchange_marks_post_write_cancellation_unknown(self) -> None:
+        class BlockingReader:
+            def __init__(self) -> None:
+                self.waiting = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def readline(self) -> bytes:
+                self.waiting.set()
+                await self.release.wait()
+                return b""
+
+        class Writer:
+            def __init__(self) -> None:
+                self.written = False
+                self.closed = False
+
+            def write(self, _encoded: bytes) -> None:
+                self.written = True
+
+            async def drain(self) -> None:
+                return None
+
+            def close(self) -> None:
+                self.closed = True
+
+            async def wait_closed(self) -> None:
+                return None
+
+        async def scenario() -> BaseException:
+            reader = BlockingReader()
+            writer = Writer()
+            with patch.object(
+                client.asyncio,
+                "open_unix_connection",
+                new=AsyncMock(return_value=(reader, writer)),
+            ):
+                exchange = asyncio.create_task(
+                    client._exchange_process_request(
+                        {"operation": "write"},
+                        b"{}\n",
+                        socket_path="/fixture/process.sock",
+                        timeout=30,
+                    )
+                )
+                await asyncio.wait_for(reader.waiting.wait(), timeout=0.2)
+                exchange.cancel()
+                try:
+                    await exchange
+                except asyncio.CancelledError as exc:
+                    self.assertTrue(writer.written)
+                    self.assertTrue(writer.closed)
+                    return exc
+            self.fail("post-write process exchange cancellation was swallowed")
+
+        cancellation = asyncio.run(scenario())
+        self.assertIsInstance(cancellation, asyncio.CancelledError)
+        self.assertTrue(getattr(cancellation, "dispatch_unknown", False))
+
+    def test_pool_reservation_mismatch_stays_typed_and_retained(
+        self,
+    ) -> None:
+        scope = client.create_process_owner_scope(
+            user_id="mismatch-user",
+            session_id="mismatch-session",
+            root_run_id="mismatch-run",
+        )
+
+        class MismatchedReservation:
+            terminal = False
+
+            async def release(self) -> None:
+                raise ExecutorSlotPoolError(
+                    "executor_pool_reservation_mismatch",
+                    "fixture authoritative reservation mismatch",
+                )
+
+        reservation = MismatchedReservation()
+        lease = client.IsolatedProcessLease(
+            handle="pl2_" + "5" * 32 + "_" + "6" * 32,
+            skill_sha256="7" * 64,
+            script_sha256="8" * 64,
+            entrypoint="scripts/task.sh",
+            invocation_mode="cli",
+            class_name=None,
+            factory_name=None,
+            _owner_scope=scope,
+            _workspace=self.workspace,
+            _socket_path="/unused",
+            _baseline={},
+            _slot_reservation=reservation,
+        )
+        terminal_error = client.IsolatedSkillExecutorError(
+            "lease_not_found",
+            "fixture server-proven terminal lease",
+            terminal_lease_state="closed",
+        )
+
+        with self.assertRaises(
+            client.IsolatedSkillExecutorError
+        ) as caught:
+            asyncio.run(client.finalize_terminal_process_lease_error(
+                lease,
+                terminal_error,
+            ))
+
+        self.assertEqual(
+            "executor_pool_reservation_mismatch",
+            caught.exception.code,
+        )
+        self.assertFalse(lease.closed)
+        self.assertIs(lease._slot_reservation, reservation)
+        self.assertFalse(reservation.terminal)
 
     def test_v2_client_server_commonjs_authority_and_operation_round_trip(self) -> None:
         script = self.skill / "scripts" / "session.cjs"
@@ -737,6 +1338,7 @@ class IsolatedSkillExecutorClientTests(unittest.TestCase):
         self.assertEqual("declared_command", request["kind"])
         self.assertNotIn("command", request)
         self.assertNotIn("shell", request)
+        self.assertEqual([], request["egress_origins"])
         invocation = json.dumps(
             ["python", "literal; $(touch never)"],
             ensure_ascii=False,
@@ -750,6 +1352,11 @@ class IsolatedSkillExecutorClientTests(unittest.TestCase):
             "executable": "python",
             "cwd": "skill",
             "network": "disabled",
+            "runtime_profile": "session-sandbox-v1",
+            "network_policy": {
+                "direct": "disabled",
+                "egress": "none",
+            },
             "shell": False,
             "command_sha256": hashlib.sha256(invocation).hexdigest(),
             "stdout": "literal; $(touch never)\n",
@@ -775,6 +1382,84 @@ class IsolatedSkillExecutorClientTests(unittest.TestCase):
                 executable="/bin/sh",
             )
         self.assertEqual("invalid_executable", caught.exception.code)
+
+    def test_declared_command_egress_request_and_receipt_are_exact(self) -> None:
+        origins = (
+            "https://api.example.test:443",
+            "http://catalog.example.test:80",
+        )
+        request, encoded = client.build_declared_command_request(
+            skill_root=self.skill,
+            workspace=self.workspace,
+            executable="python",
+            egress_origins=origins,
+            egress_rules=_retrieval_egress_rules(*origins),
+        )
+        self.assertEqual(list(origins), request["egress_origins"])
+        self.assertEqual(
+            list(_retrieval_egress_rules(*origins)),
+            request["egress_rules"],
+        )
+        self.assertEqual(
+            list(origins),
+            json.loads(encoded)["egress_origins"],
+        )
+        response = {
+            "protocol_version": client.PROTOCOL_VERSION,
+            "kind": "declared_command_result",
+            "request_id": request["request_id"],
+            "status": "success",
+            "executable": "python",
+            "cwd": "workspace",
+            "network": "disabled",
+            "runtime_profile": "session-sandbox-v1",
+            "network_policy": {
+                "direct": "disabled",
+                "egress": "origin_allowlist_proxy",
+            },
+            "shell": False,
+            "command_sha256": hashlib.sha256(
+                json.dumps(
+                    ["python"],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "stdout": "",
+            "stderr": "",
+            "artifacts": [],
+        }
+        self.assertEqual(
+            [],
+            client.validate_declared_command_response(
+                response,
+                request=request,
+            ),
+        )
+
+        response["network_policy"] = {
+            "direct": "disabled",
+            "egress": "none",
+        }
+        with self.assertRaises(
+            client.IsolatedSkillExecutorError
+        ) as caught:
+            client.validate_declared_command_response(
+                response,
+                request=request,
+            )
+        self.assertEqual("invalid_response", caught.exception.code)
+
+        with self.assertRaises(
+            client.IsolatedSkillExecutorError
+        ) as caught:
+            client.build_declared_command_request(
+                skill_root=self.skill,
+                workspace=self.workspace,
+                executable="python",
+                egress_origins=("https://*.example.test:443",),
+            )
+        self.assertEqual("invalid_egress_policy", caught.exception.code)
 
     def test_function_invocation_is_declarative_bounded_and_identity_checked(self) -> None:
         script = self.skill / "scripts" / "helper.py"
@@ -930,6 +1615,7 @@ class IsolatedSkillExecutorClientTests(unittest.TestCase):
         self.assertLessEqual(len(encoded), client.MAX_REQUEST_BYTES)
         self.assertEqual("session_code", payload["kind"])
         self.assertEqual(request_id, payload["request_id"])
+        self.assertNotIn("egress_origins", payload)
         self.assertEqual(["input.bin"], [item["path"] for item in payload["workspace_files"]])
         self.assertEqual(
             {"SKILL.md", "assets/binary.bin", "scripts/task.sh"},

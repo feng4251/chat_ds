@@ -27,6 +27,10 @@ from tools.delegation import (
     _strict_unconditional_capability_plan,
 )
 from tools.isolated_skill_executor import snapshot_skill_package
+from skill_capability_plan import (
+    build_callable_skill_result_receipt,
+    build_skill_process_evidence_receipt,
+)
 
 
 def _digest(value: object) -> str:
@@ -137,6 +141,50 @@ def _resource_plan(
             "skill_md_sha256": skill_md_sha256,
             "package_sha256": package_sha256,
             "tool_names": [],
+        }],
+    }
+
+
+def _process_plan(*, two_groups: bool = False) -> dict:
+    group_ids = ["gate-group-process-1"]
+    groups = [{
+        "id": "gate-group-process-1",
+        "check_id": "KG-1",
+        "outcome": "yes",
+        "mode": "one_of",
+        "candidate_ids": ["candidate-process"],
+        "selectors": ["skill:generic-skill/scripts/query.py"],
+        "unresolved_selectors": [],
+    }]
+    if two_groups:
+        group_ids.append("gate-group-process-2")
+        groups.append({
+            **groups[0],
+            "id": "gate-group-process-2",
+        })
+    return {
+        "schema_version": 1,
+        "worker_id": "worker-a",
+        "owner_skill": "generic-skill",
+        "checks": [{
+            "id": "KG-1",
+            "question": "Is the exact process evidence required?",
+            "branches": [{
+                "outcome": "yes",
+                "action": "Run the exact persistent entrypoint.",
+                "group_ids": group_ids,
+            }],
+            "legacy_ambiguous": False,
+        }],
+        "groups": groups,
+        "candidates": [{
+            "candidate_id": "candidate-process",
+            "kind": "skill_script",
+            "skill_name": "generic-skill",
+            "resource_path": "scripts/query.py",
+            "sha256": "a" * 64,
+            "package_sha256": "b" * 64,
+            "tool_names": ["run_skill_process"],
         }],
     }
 
@@ -609,6 +657,9 @@ class KnowledgeGatePlanContractTests(unittest.TestCase):
                 "executable": "tool",
                 "fixed_argv": ["--mode", "yes"],
                 "additional_argv": False,
+                "sandbox_egress_url_prefixes": [
+                    "https://yes-command.example.test/v1/",
+                ],
                 **identity,
             },
             {
@@ -629,6 +680,9 @@ class KnowledgeGatePlanContractTests(unittest.TestCase):
                 "executable": "tool",
                 "fixed_argv": ["--mode", "no"],
                 "additional_argv": False,
+                "sandbox_egress_url_prefixes": [
+                    "https://no-command.example.test/v1/",
+                ],
                 **identity,
             },
         ]
@@ -700,6 +754,16 @@ class KnowledgeGatePlanContractTests(unittest.TestCase):
                 ("generic-skill", "https://example.test/no/"),
             ],
             "http_post_grants": [],
+            "sandbox_egress_grants": [
+                (
+                    "generic-skill",
+                    "https://yes-command.example.test/v1/",
+                ),
+                (
+                    "generic-skill",
+                    "https://no-command.example.test/v1/",
+                ),
+            ],
             "tool_names": [
                 "skill_http_get",
                 "run_declared_command",
@@ -738,6 +802,13 @@ class KnowledgeGatePlanContractTests(unittest.TestCase):
                 ("--mode", "yes"),
             )],
             activated["command_grants"],
+        )
+        self.assertEqual(
+            [(
+                "generic-skill",
+                "https://yes-command.example.test/v1/",
+            )],
+            activated["sandbox_egress_grants"],
         )
         self.assertNotIn(
             "http-no",
@@ -940,6 +1011,197 @@ class KnowledgeGatePlanContractTests(unittest.TestCase):
                 content,
                 ["group:another:failed"],
             ),
+        )
+
+    def test_process_start_and_enqueue_do_not_satisfy_gate(self):
+        plan = _process_plan()
+        process_id = "sp_" + "c" * 32
+        pending_calls = [
+            {
+                "tool_name": "run_skill_process",
+                "args": {
+                    "operation": "start",
+                    "script_path": (
+                        "skills/generic-skill/scripts/query.py"
+                    ),
+                    "args": ["term"],
+                },
+                "outcome": "pending",
+                "artifacts": [],
+                "result_data": {},
+            },
+            {
+                "tool_name": "run_skill_process",
+                "args": {
+                    "operation": "call",
+                    "process_id": process_id,
+                    "method_name": "query",
+                    "method_args": ["term"],
+                },
+                "outcome": "pending",
+                "artifacts": [],
+                "result_data": {},
+            },
+        ]
+        audit, error = _knowledge_gate_receipt_audit(
+            plan,
+            _digest(plan),
+            [_decision_call(plan), *pending_calls],
+            allowed_skill_scripts=[(
+                "generic-skill",
+                "scripts/query.py",
+                "a" * 64,
+            )],
+            allowed_skill_commands=[],
+            allowed_skill_http_prefixes=[],
+            allowed_skill_http_post_prefixes=[],
+        )
+        self.assertIn("distinct actual dispatch receipt", error)
+        self.assertEqual(
+            ["gate-group-process-1"],
+            audit["missing_receipt_group_ids"],
+        )
+
+    def test_process_terminal_receipt_is_exact_and_not_replayable(self):
+        plan = _process_plan(two_groups=True)
+        process_id = "sp_" + "d" * 32
+        callable_receipt = build_callable_skill_result_receipt(
+            "run_skill_process",
+            {"result": {"status": "success", "rows": [1]}},
+        )
+        receipt = build_skill_process_evidence_receipt(
+            skill_name="generic-skill",
+            script_resource="scripts/query.py",
+            script_sha256="a" * 64,
+            package_sha256="b" * 64,
+            process_id=process_id,
+            invocation_mode="instance",
+            completion_kind="structured_call",
+            outcome="success",
+            call_id="33333333-3333-4333-8333-333333333333",
+            method_name="query",
+            call_result_status="success",
+            callable_result_receipt=callable_receipt,
+        )
+        terminal_call = {
+            "tool_name": "run_skill_process",
+            "args": {"operation": "read", "process_id": process_id},
+            "outcome": "success",
+            "artifacts": [],
+            "result_data": {"process_evidence_receipt": receipt},
+        }
+        audit, error = _knowledge_gate_receipt_audit(
+            plan,
+            _digest(plan),
+            [
+                _decision_call(plan),
+                terminal_call,
+                dict(terminal_call),
+            ],
+            allowed_skill_scripts=[(
+                "generic-skill",
+                "scripts/query.py",
+                "a" * 64,
+            )],
+            allowed_skill_commands=[],
+            allowed_skill_http_prefixes=[],
+            allowed_skill_http_post_prefixes=[],
+        )
+        self.assertIn("distinct actual dispatch receipt", error)
+        self.assertEqual(1, len(audit["successful_group_ids"]))
+        self.assertEqual(1, len(audit["missing_receipt_group_ids"]))
+
+        single_plan = _process_plan()
+        wrong_process = {
+            **terminal_call,
+            "args": {
+                "operation": "read",
+                "process_id": "sp_" + "e" * 32,
+            },
+        }
+        wrong_audit, wrong_error = _knowledge_gate_receipt_audit(
+            single_plan,
+            _digest(single_plan),
+            [_decision_call(single_plan), wrong_process],
+            allowed_skill_scripts=[(
+                "generic-skill",
+                "scripts/query.py",
+                "a" * 64,
+            )],
+            allowed_skill_commands=[],
+            allowed_skill_http_prefixes=[],
+            allowed_skill_http_post_prefixes=[],
+        )
+        self.assertIn("distinct actual dispatch receipt", wrong_error)
+        self.assertEqual(
+            ["gate-group-process-1"],
+            wrong_audit["missing_receipt_group_ids"],
+        )
+
+    def test_process_typed_failure_is_a_failed_not_successful_gate_receipt(self):
+        plan = _process_plan()
+        process_id = "sp_" + "f" * 32
+        callable_receipt = build_callable_skill_result_receipt(
+            "run_skill_process",
+            {
+                "result": {
+                    "status": "error",
+                    "error": "upstream unavailable",
+                },
+            },
+        )
+        receipt = build_skill_process_evidence_receipt(
+            skill_name="generic-skill",
+            script_resource="scripts/query.py",
+            script_sha256="a" * 64,
+            package_sha256="b" * 64,
+            process_id=process_id,
+            invocation_mode="instance",
+            completion_kind="structured_call",
+            outcome="error",
+            call_id="44444444-4444-4444-8444-444444444444",
+            method_name="query",
+            call_result_status="success",
+            callable_result_receipt=callable_receipt,
+        )
+        audit, error = _knowledge_gate_receipt_audit(
+            plan,
+            _digest(plan),
+            [
+                _decision_call(plan),
+                {
+                    "tool_name": "run_skill_process",
+                    "args": {
+                        "operation": "read",
+                        "process_id": process_id,
+                    },
+                    "outcome": "error",
+                    "transport_outcome": "success",
+                    "artifacts": [],
+                    "result_data": {
+                        "process_evidence_receipt": receipt,
+                    },
+                },
+            ],
+            allowed_skill_scripts=[(
+                "generic-skill",
+                "scripts/query.py",
+                "a" * 64,
+            )],
+            allowed_skill_commands=[],
+            allowed_skill_http_prefixes=[],
+            allowed_skill_http_post_prefixes=[],
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual([], audit["successful_group_ids"])
+        self.assertEqual(
+            ["gate-group-process-1"],
+            audit["failed_group_ids"],
+        )
+        self.assertEqual(
+            ["group:gate-group-process-1:failed"],
+            audit["gap_ids"],
         )
 
 

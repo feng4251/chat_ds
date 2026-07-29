@@ -57,6 +57,17 @@ class RunCardRehydrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(chat_router._bounded_agent_run_error(None))
 
+    def test_only_explicit_advisory_retrieval_is_quality_neutral(self):
+        helper = (
+            workspace_router
+            ._unresolved_retrieval_affects_completion_quality
+        )
+        self.assertFalse(helper(None))
+        self.assertFalse(helper({"quality_impact": "advisory"}))
+        self.assertTrue(helper({"quality_impact": "degraded"}))
+        self.assertTrue(helper({}))
+        self.assertTrue(helper(True))
+
     async def test_run_cards_restore_exact_turn_semantics_and_recovery(self):
         started_at = datetime(2026, 7, 28, 8, 0, 0, 123456)
         async with self.sessions() as session:

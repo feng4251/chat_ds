@@ -253,6 +253,7 @@ def load_exact_result_text(
         # Lazy import avoids tools.__init__ -> delegation -> this module during
         # standalone planner/runtime tests.
         from tools.path_security import validate_path
+        from tools.workspace_lock import WorkspaceMutationLockError
 
         resolved = validate_path(
             relative,
@@ -261,7 +262,12 @@ def load_exact_result_text(
             sub="results",
             must_exist=True,
         )
-    except (ValueError, FileNotFoundError, OSError) as exc:
+    except (
+        ValueError,
+        FileNotFoundError,
+        OSError,
+        WorkspaceMutationLockError,
+    ) as exc:
         raise FanInExecutionError(f"unsafe or missing persisted result {path}: {exc}") from exc
     if resolved.is_symlink() or not resolved.is_file():
         raise FanInExecutionError(f"persisted result is not a regular non-symlink file: {path}")

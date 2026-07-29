@@ -735,11 +735,9 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
                 + _result_fields_footer("catalog_evidence")
             ),
             _stop_response(
-                "Status: WARN/degraded — one catalog page was observed and "
-                "the remaining cursor was not traversed.\n"
-                + _result_fields_footer(
-                    "catalog_evidence", degraded=True
-                )
+                "One bounded catalog page was observed; another page remains "
+                "available and no exhaustive coverage is claimed.\n"
+                + _result_fields_footer("catalog_evidence")
             ),
         ]
 
@@ -775,11 +773,18 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
             event["payload"]
             for event in events
             if event.get("event_type") == "run.completed"
-            and event.get("payload", {}).get("completion_quality")
-            == "degraded"
+            and isinstance(
+                event.get("payload", {}).get("unresolved_retrieval"),
+                dict,
+            )
         ]
         self.assertEqual(1, len(completed))
+        self.assertNotEqual(
+            "degraded",
+            completed[0].get("completion_quality"),
+        )
         gap = completed[0]["unresolved_retrieval"]
+        self.assertEqual("advisory", gap["quality_impact"])
         self.assertEqual("bounded", gap["retrieval_completeness_policy"])
         self.assertEqual("partial", gap["coverage_status"])
         self.assertEqual(
@@ -806,11 +811,9 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
                 arguments={"url": root},
             ),
             _stop_response(
-                "Status: WARN/degraded — synthesis reserve closed further "
-                "catalog acquisition.\n"
-                + _result_fields_footer(
-                    "catalog_evidence", degraded=True
-                )
+                "The bounded catalog acquisition ended at the synthesis "
+                "reserve without claiming exhaustive coverage.\n"
+                + _result_fields_footer("catalog_evidence")
             ),
         ]
 
@@ -839,11 +842,18 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
             event["payload"]
             for event in events
             if event.get("event_type") == "run.completed"
-            and event.get("payload", {}).get("completion_quality")
-            == "degraded"
+            and isinstance(
+                event.get("payload", {}).get("unresolved_retrieval"),
+                dict,
+            )
         ]
         self.assertEqual(1, len(completed))
+        self.assertNotEqual(
+            "degraded",
+            completed[0].get("completion_quality"),
+        )
         gap = completed[0]["unresolved_retrieval"]
+        self.assertEqual("advisory", gap["quality_impact"])
         self.assertEqual(
             "bounded_acquisition_synthesis_reserve",
             gap["closure_reason"],
@@ -1072,6 +1082,7 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(authoritative))
         gap = authoritative[0]["payload"]["unresolved_retrieval"]
         self.assertEqual("unresolved", gap["status"])
+        self.assertEqual("degraded", gap["quality_impact"])
         self.assertEqual("pagination_page_limit", gap["terminal_reason"])
         self.assertGreaterEqual(gap["open_frontier_count"], 1)
         self.assertFalse(any(

@@ -20,6 +20,10 @@ from tools.isolated_skill_executor import (
     execute_isolated_declared_command,
 )
 from tools.path_security import sandbox_dir
+from tools.session_sandbox_policy import (
+    SessionSandboxPolicyError,
+    skill_session_sandbox_egress_policy,
+)
 
 
 DEFAULT_TIMEOUT = 120
@@ -118,6 +122,18 @@ async def run_declared_command(
     combined_argv = [*prefix, *safe_argv]
     if len(combined_argv) > MAX_ARGS:
         return _error("invalid_argv", f"Compiled prefix plus argv exceeds {MAX_ARGS} items.")
+    try:
+        egress_policy = skill_session_sandbox_egress_policy(
+            context,
+            skill_name,
+        )
+    except SessionSandboxPolicyError as exc:
+        return _error(
+            "invalid_session_sandbox_policy",
+            str(exc),
+            skill_name=skill_name,
+            command_id=command_id,
+        )
 
     dependency_preflight = preflight_declared_skill_dependencies(skill_root)
     if dependency_preflight.get("valid") is not True:
@@ -146,6 +162,13 @@ async def run_declared_command(
             timeout=DEFAULT_TIMEOUT,
             **(
                 {
+                    "egress_rules": egress_policy.rule_payload(),
+                    "private_origins": egress_policy.private_origins,
+                }
+                if egress_policy.rules else {}
+            ),
+            **(
+                {
                     "execution_authority_check": lambda: (
                         require_execution_authority(
                             context,
@@ -158,12 +181,27 @@ async def run_declared_command(
             ),
         )
     except IsolatedSkillExecutorError as exc:
-        return _error(exc.code, str(exc), skill_name=skill_name, command_id=command_id)
+        return _error(
+            exc.code,
+            str(exc),
+            skill_name=skill_name,
+            command_id=command_id,
+            network=(
+                "controlled_egress"
+                if egress_policy.rules
+                else "disabled"
+            ),
+        )
     result.update({
         "skill_name": skill_name,
         "command_id": command_id,
         "execution_runtime": "isolated_skill_executor",
         "environment_policy": "ephemeral_snapshot_no_secrets",
+        "egress_policy": (
+            "compiled_exact_url_policy"
+            if egress_policy.rules
+            else "none"
+        ),
         "fallback_attempted": False,
         "runtime_preflight": command_preflight,
     })

@@ -32,6 +32,10 @@ from config import settings
 from tools.approval import canonical_http_origin, check_url_safety
 from tools.context import ToolContext
 from tools.execution_fence import require_execution_authority
+from tools.session_sandbox_policy import (
+    browser_context_egress_rules,
+    browser_egress_request_allowed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -681,15 +685,31 @@ async def _get_browser():
 def _context_private_origins(
     context: ToolContext | None,
 ) -> tuple[str, ...]:
-    """Read the runtime-owned private-origin ledger, never model arguments."""
+    """Project only private origins also present in this run's exact rules.
 
-    if (
-        context is None
-        or context.agent_kind != "primary"
-        or context.source == "delegate"
-    ):
+    Primary and delegated runs use the same rule.  Delegates receive an
+    already-intersected child ledger from the Harness and never compile URLs
+    from their own prompt, so intersecting that ledger with the parent's
+    user/deployment private-origin grant preserves the complete capability
+    chain without a blanket delegation denial.
+    """
+
+    if context is None:
         return ()
-    return tuple(context.allowed_browser_private_origins or ())
+    exact_origins = {
+        origin
+        for prefix, _methods in browser_context_egress_rules(context)
+        if (origin := canonical_http_origin(prefix)) is not None
+    }
+    return tuple(
+        origin
+        for raw_origin in context.allowed_browser_private_origins or ()
+        if (
+            (origin := canonical_http_origin(raw_origin)) is not None
+            and origin == raw_origin
+            and origin in exact_origins
+        )
+    )
 
 
 def _bind_browser_policy(
@@ -716,10 +736,37 @@ def _bind_browser_policy(
     if state_key != expected_key:
         raise RuntimeError("Browser policy context does not own this session")
     allowed = _context_private_origins(context)
+    egress_rules = browser_context_egress_rules(context)
     session["allowed_private_origins"] = allowed
+    session["allowed_egress_rules"] = egress_rules
     session["policy_run_id"] = state_key[2]
     session["last_blocked_request"] = None
     return allowed
+
+
+def browser_navigate_args_preflight(
+    args: dict[str, Any],
+    context: ToolContext | None,
+) -> dict[str, Any] | None:
+    """Reject model URLs outside the runtime-owned exact browser ledger."""
+
+    url = args.get("url")
+    rules = browser_context_egress_rules(context)
+    if not isinstance(url, str) or not browser_egress_request_allowed(
+        url,
+        "GET",
+        rules,
+    ):
+        return {
+            "error": (
+                "Browser navigation target is outside the runtime-owned "
+                "method-and-URL egress policy."
+            ),
+            "reason": "browser_egress_policy_violation",
+            "tool_name": "browser_navigate",
+            "actual_dispatch_attempted": False,
+        }
+    return None
 
 
 def _request_is_navigation(request: Any) -> bool:
@@ -728,6 +775,15 @@ def _request_is_navigation(request: Any) -> bool:
         return bool(value() if callable(value) else value)
     except Exception:
         return False
+
+
+def _request_method(request: Any) -> str:
+    value = getattr(request, "method", "")
+    try:
+        method = value() if callable(value) else value
+    except Exception:
+        return ""
+    return str(method or "").upper()
 
 
 def _blocked_url_label(url: str) -> str:
@@ -766,20 +822,34 @@ async def _guard_browser_request(
     """
 
     url = str(getattr(request, "url", "") or "")
-    error = await _check_browser_url_safety(
+    method = _request_method(request)
+    if not browser_egress_request_allowed(
         url,
-        allowed_private_origins=tuple(
-            session.get("allowed_private_origins") or ()
-        ),
-    )
+        method,
+        tuple(session.get("allowed_egress_rules") or ()),
+    ):
+        error = (
+            "Blocked: request method/URL is outside the runtime-owned "
+            "browser egress policy"
+        )
+    else:
+        error = await _check_browser_url_safety(
+            url,
+            allowed_private_origins=tuple(
+                session.get("allowed_private_origins") or ()
+            ),
+        )
     if error:
         session["last_blocked_request"] = {
             "target": _blocked_url_label(url),
             "error": error,
             "navigation": _request_is_navigation(request),
+            "method": method or "<unavailable>",
         }
         await route.abort("blockedbyclient")
         return
+    if _request_is_navigation(request):
+        session["current_navigation_method"] = method
     await route.continue_()
 
 
@@ -819,6 +889,7 @@ async def _blank_unsafe_page(session: dict[str, Any]) -> None:
         # closing the context is too destructive for a recoverable block.
         pass
     session["current_url"] = None
+    session["current_navigation_method"] = None
 
 
 def _blocked_navigation_detail(session: dict[str, Any]) -> str | None:
@@ -845,6 +916,18 @@ async def _validate_current_page(
         current_url,
         allowed_private_origins=allowed_private_origins,
     )
+    navigation_method = str(
+        session.get("current_navigation_method") or "GET"
+    ).upper()
+    if not error and not browser_egress_request_allowed(
+        current_url,
+        navigation_method,
+        tuple(session.get("allowed_egress_rules") or ()),
+    ):
+        error = (
+            "Blocked: current page method/URL is outside the runtime-owned "
+            "browser egress policy"
+        )
     if error:
         target = _blocked_url_label(current_url)
         await _blank_unsafe_page(session)
@@ -884,8 +967,10 @@ async def _get_session(session_key: BrowserSessionKey) -> dict[str, Any]:
             "page": None,
             "current_url": None,
             "allowed_private_origins": (),
+            "allowed_egress_rules": (),
             "policy_run_id": None,
             "last_blocked_request": None,
+            "current_navigation_method": None,
         }
 
         async def request_guard(route, request):
@@ -1219,11 +1304,17 @@ async def browser_navigate(
     except RuntimeError as exc:
         return f"Browser navigation blocked: {exc}"
     allowed = _context_private_origins(context)
+    egress_rules = browser_context_egress_rules(context)
     existing = _existing_session(session_key)
     if existing is not None:
         # A new tool call must revoke any ledger left by an earlier run before
         # even validating its new model-supplied argument.
         _bind_browser_policy(existing, context)
+    if not browser_egress_request_allowed(url, "GET", egress_rules):
+        return (
+            "Browser navigation blocked: target is outside the runtime-owned "
+            "method-and-URL egress policy"
+        )
     err = await _check_browser_url_safety(
         url,
         allowed_private_origins=allowed,

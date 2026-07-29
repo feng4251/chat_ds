@@ -24,20 +24,41 @@ from chatds_browser_runtime.policy import (
     load_proxy_environment,
     proxy_environment,
 )
+from chatds_browser_runtime import policy as runtime_policy
 from chatds_browser_runtime.runtime_exec import LaunchError, command_for_script
 from chatds_browser_runtime import runtime_exec
+
+
+TEST_LEAF_SPKI = "A" * 43 + "="
+TEST_TRUST_GENERATION = "b" * 64
+
+
+def _proxy_policy() -> ProxyPolicy:
+    return ProxyPolicy(
+        "lease",
+        "http://proxy:3128",
+        "/lease/.chatds-egress-trust/ca.pem",
+        "/lease/.chatds-egress-trust/leaf.spki",
+        TEST_LEAF_SPKI,
+        "/lease/.chatds-egress-trust/generation.json",
+        TEST_TRUST_GENERATION,
+    )
 
 
 class BrowserRuntimeProfileTests(unittest.TestCase):
     def test_manifest_has_pinned_generic_runtime_contract(self):
         profile = json.loads((RUNTIME_ROOT / "profile.json").read_text())
         self.assertEqual(profile["profile_id"], "browser-automation-v1")
-        self.assertEqual(profile["interpreters"]["node"], "22.18.0")
+        self.assertEqual(profile["interpreters"]["node"], "22.23.1")
         self.assertEqual(profile["interpreters"]["python"], "3.12.11")
         self.assertEqual(profile["libraries"]["node_playwright"], "1.61.0")
         self.assertEqual(profile["libraries"]["python_playwright"], "1.61.0")
         self.assertEqual(profile["libraries"]["selenium"], "4.46.0")
         self.assertEqual(profile["libraries"]["packaging"], "25.0")
+        self.assertEqual(
+            profile["command_tools"]["curl"],
+            "debian-snapshot",
+        )
         self.assertEqual(
             profile["script_extensions"],
             [".cjs", ".js", ".mjs", ".py", ".sh", ".bash"],
@@ -72,8 +93,20 @@ class BrowserRuntimeProfileTests(unittest.TestCase):
             profile["seccomp_contract"]["required_capabilities"],
             ["SYS_CHROOT"],
         )
-        self.assertTrue(
+        self.assertFalse(
             profile["network_contract"]["production_skill_lane_public_only"]
+        )
+        self.assertIn(
+            "frozen ToolContext",
+            profile["network_contract"]["origin_authority"],
+        )
+        self.assertIn(
+            "HTTP-method",
+            profile["network_contract"]["origin_authority"],
+        )
+        self.assertIn(
+            "deployment allowlist",
+            profile["network_contract"]["private_origin_policy"],
         )
         self.assertEqual(
             profile["display_contract"],
@@ -131,10 +164,11 @@ class BrowserRuntimeProfileTests(unittest.TestCase):
 
     def test_dockerfile_has_immutable_build_and_nonroot_runtime(self):
         text = (ROOT / "Dockerfile.browser-runtime").read_text()
-        self.assertEqual(text.count("sha256:752ea8a2"), 1)
+        self.assertEqual(text.count("sha256:6c74791e"), 1)
         self.assertEqual(text.count("sha256:519591d6"), 2)
         self.assertIn("snapshot.debian.org/archive/debian/", text)
         self.assertIn("chromium-driver", text)
+        self.assertIn("\n      curl \\", text)
         self.assertIn("weston", text)
         self.assertNotIn("\n      xvfb", text)
         self.assertNotIn("\n      xauth", text)
@@ -154,9 +188,20 @@ class BrowserRuntimeProfileTests(unittest.TestCase):
         self.assertNotIn("\nRUN python -m pip install", final_stage)
 
     def test_policy_uses_fixed_runtime_environment_key(self):
-        policy = load_proxy_environment(
-            {"SKILL_EGRESS_PROXY_URL": "http://egress-proxy:3128"}
-        )
+        with mock.patch.object(
+            runtime_policy,
+            "_load_runtime_trust",
+            return_value=(
+                "/lease/.chatds-egress-trust/ca.pem",
+                "/lease/.chatds-egress-trust/leaf.spki",
+                TEST_LEAF_SPKI,
+                "/lease/.chatds-egress-trust/generation.json",
+                TEST_TRUST_GENERATION,
+            ),
+        ):
+            policy = load_proxy_environment(
+                {"SKILL_EGRESS_PROXY_URL": "http://egress-proxy:3128"}
+            )
         self.assertEqual(policy.policy_id, "runtime-egress-proxy")
         self.assertEqual(policy.proxy_url, "http://egress-proxy:3128")
         environment = proxy_environment(policy)
@@ -165,6 +210,19 @@ class BrowserRuntimeProfileTests(unittest.TestCase):
             "http://egress-proxy:3128",
         )
         self.assertEqual(environment["NO_PROXY"], "localhost,127.0.0.1,[::1]")
+        self.assertEqual(
+            environment["SSL_CERT_FILE"],
+            "/lease/.chatds-egress-trust/ca.pem",
+        )
+        self.assertEqual(
+            environment["SKILL_EGRESS_LEAF_SPKI_PATH"],
+            "/lease/.chatds-egress-trust/leaf.spki",
+        )
+        self.assertEqual(environment["NODE_USE_ENV_PROXY"], "1")
+        self.assertEqual(
+            environment["SKILL_EGRESS_TRUST_GENERATION"],
+            TEST_TRUST_GENERATION,
+        )
 
     def test_policy_rejects_credentials_path_and_missing_value(self):
         for value in (
@@ -177,7 +235,21 @@ class BrowserRuntimeProfileTests(unittest.TestCase):
             "http://proxy:3128?",
             "http://proxy:3128\n--no-proxy-server",
         ):
-            with self.subTest(value=value), self.assertRaises(PolicyError):
+            with (
+                self.subTest(value=value),
+                mock.patch.object(
+                    runtime_policy,
+                    "_load_runtime_trust",
+                    return_value=(
+                        "/lease/.chatds-egress-trust/ca.pem",
+                        "/lease/.chatds-egress-trust/leaf.spki",
+                        TEST_LEAF_SPKI,
+                        "/lease/.chatds-egress-trust/generation.json",
+                        TEST_TRUST_GENERATION,
+                    ),
+                ),
+                self.assertRaises(PolicyError),
+            ):
                 load_proxy_environment({"SKILL_EGRESS_PROXY_URL": value})
 
     def test_unrelated_proxy_environment_cannot_replace_fixed_key(self):
@@ -190,7 +262,7 @@ class BrowserRuntimeProfileTests(unittest.TestCase):
             )
 
     def test_chromium_wrapper_rejects_proxy_override(self):
-        policy = ProxyPolicy("lease", "http://proxy:3128")
+        policy = _proxy_policy()
         forbidden = (
             "--proxy-server=http://attacker:8080",
             "--proxy-bypass-list=*",
@@ -203,13 +275,19 @@ class BrowserRuntimeProfileTests(unittest.TestCase):
             "--disable-gpu-sandbox",
             "--disable-zygote-sandbox",
             "--no-proxy-server",
+            "--ignore-certificate-errors",
+            "--ignore-certificate-errors-spki-list=attacker",
+            "--allow-insecure-localhost",
+            "--disable-certificate-transparency-enforcement",
+            "--enable-features=EncryptedClientHello",
+            "--test-type",
         )
         for argument in forbidden:
             with self.subTest(argument=argument), self.assertRaises(ValueError):
                 controlled_arguments([argument], policy)
 
     def test_only_trusted_chromedriver_may_request_ephemeral_loopback_control(self):
-        policy = ProxyPolicy("lease", "http://proxy:3128")
+        policy = _proxy_policy()
         with self.assertRaises(ValueError):
             controlled_arguments(["--remote-debugging-port=0"], policy)
         arguments = controlled_arguments(
@@ -226,9 +304,13 @@ class BrowserRuntimeProfileTests(unittest.TestCase):
             )
 
     def test_chromium_wrapper_appends_runtime_owned_controls(self):
-        policy = ProxyPolicy("lease", "http://proxy:3128")
+        policy = _proxy_policy()
         arguments = controlled_arguments(
-            ["--headless=new", "--no-sandbox"],
+            [
+                "--headless=new",
+                "--no-sandbox",
+                "--disable-features=FixtureFeature",
+            ],
             policy,
         )
         self.assertEqual(arguments[0], "--headless=new")
@@ -236,6 +318,15 @@ class BrowserRuntimeProfileTests(unittest.TestCase):
         self.assertIn("--proxy-server=http://proxy:3128", arguments)
         self.assertIn("--proxy-bypass-list=<-loopback>", arguments)
         self.assertIn("--disable-quic", arguments)
+        self.assertIn("--disable-http2", arguments)
+        self.assertIn(
+            f"--ignore-certificate-errors-spki-list={TEST_LEAF_SPKI}",
+            arguments,
+        )
+        self.assertIn(
+            "--disable-features=FixtureFeature,EncryptedClientHello",
+            arguments,
+        )
         self.assertIn("--disable-breakpad", arguments)
         self.assertIn("--disable-crash-reporter", arguments)
         self.assertIn("--disable-dev-shm-usage", arguments)
@@ -244,6 +335,13 @@ class BrowserRuntimeProfileTests(unittest.TestCase):
         self.assertIn(
             "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
             arguments,
+        )
+        self.assertIn(
+            "--enable-features=CDPScreenshotNewSurface",
+            controlled_arguments(
+                ["--enable-features=CDPScreenshotNewSurface"],
+                policy,
+            ),
         )
 
     def test_launcher_selects_exact_cjs_and_python_interpreters(self):
@@ -304,7 +402,7 @@ class BrowserRuntimeProfileTests(unittest.TestCase):
                 mock.patch.dict(os.environ, environment, clear=True),
             ):
                 result = runtime_exec.worker_environment(
-                    ProxyPolicy("lease", "http://proxy:3128"),
+                    _proxy_policy(),
                     process_id=123,
                 )
             self.assertEqual(result["HOME"], str(home))
@@ -337,7 +435,7 @@ class BrowserRuntimeProfileTests(unittest.TestCase):
                 self.assertRaises(LaunchError),
             ):
                 runtime_exec.worker_environment(
-                    ProxyPolicy("lease", "http://proxy:3128"),
+                    _proxy_policy(),
                     process_id=123,
                 )
 
@@ -371,6 +469,9 @@ class BrowserRuntimeProfileTests(unittest.TestCase):
                 {
                     "HOME": "/lease/home",
                     "TMPDIR": "/lease/tmp",
+                    "SKILL_EGRESS_CA_CERT_PATH": "/lease/trust/ca.pem",
+                    "SKILL_EGRESS_LEAF_SPKI_PATH": "/lease/trust/leaf.spki",
+                    "SSL_CERT_FILE": "/lease/trust/ca.pem",
                     "DISPLAY": ":99",
                     "XAUTHORITY": "/secret",
                     "UNRELATED_SECRET": "secret",
@@ -382,6 +483,18 @@ class BrowserRuntimeProfileTests(unittest.TestCase):
             self.assertEqual(_run(["fixed"]), "ok")
         self.assertEqual(observed["HOME"], "/lease/home")
         self.assertEqual(observed["TMPDIR"], "/lease/tmp")
+        self.assertEqual(
+            observed["SKILL_EGRESS_CA_CERT_PATH"],
+            "/lease/trust/ca.pem",
+        )
+        self.assertEqual(
+            observed["SKILL_EGRESS_LEAF_SPKI_PATH"],
+            "/lease/trust/leaf.spki",
+        )
+        self.assertEqual(
+            observed["SSL_CERT_FILE"],
+            "/lease/trust/ca.pem",
+        )
         self.assertNotIn("DISPLAY", observed)
         self.assertNotIn("XAUTHORITY", observed)
         self.assertNotIn("UNRELATED_SECRET", observed)

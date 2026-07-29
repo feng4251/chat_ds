@@ -1,17 +1,17 @@
 {
   "schema_version": 1,
   "profile_id": "browser-automation-v1",
-  "description": "Prebuilt browser automation pool with a root lifecycle controller and fixed non-root Skill worker for exact .cjs/.js/.mjs/.py/.sh/.bash entrypoints.",
+  "description": "Prebuilt dependency superset used by the unified session sandbox for exact .cjs/.js/.mjs/.py/.sh/.bash entrypoints, including headed browser automation.",
   "platforms": [
     "linux/amd64",
     "linux/arm64"
   ],
   "base_images": {
-    "node_builder": "node:22.18.0-bookworm-slim@sha256:752ea8a2f758c34002a0461bd9f1cee4f9a3c36d48494586f60ffce1fc708e0e",
+    "node_builder": "node:22.23.1-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3",
     "python": "python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7"
   },
   "interpreters": {
-    "node": "22.18.0",
+    "node": "22.23.1",
     "python": "3.12.11"
   },
   "libraries": {
@@ -19,6 +19,9 @@
     "python_playwright": "1.61.0",
     "selenium": "4.46.0",
     "packaging": "25.0"
+  },
+  "command_tools": {
+    "curl": "debian-snapshot"
   },
   "common_python_manifest": "/opt/chatds-browser-runtime/common-python-requirements.in",
   "browser": {
@@ -66,10 +69,12 @@
     "proxy_environment_injected_by_runtime": true,
     "direct_egress_allowed": false,
     "worker_network_mode": "none",
-    "controller_bridge": "fixed 127.0.0.1:18080 byte relay to /run/chatds-skill-egress/proxy.sock",
+    "controller_bridge": "one ephemeral loopback relay per execution or process lease to /run/chatds-skill-egress/proxy.sock",
     "proxy_socket_peer_uid": 65531,
     "proxy_socket_bridge_gid": 65530,
-    "production_skill_lane_public_only": true,
+    "origin_authority": "executor-signed exact HTTP-method and canonical URL-prefix rules derived from the frozen ToolContext; origins are routing metadata only",
+    "private_origin_policy": "the current Skill's exact URL-rule origins intersected with the deployment allowlist and an explicit current-turn URL; literal IPs pin exactly and hostnames require configured CIDRs",
+    "production_skill_lane_public_only": false,
     "proxy_wrapper_is_defense_in_depth": true,
     "raw_cdp_exposed_to_skill": false
   },

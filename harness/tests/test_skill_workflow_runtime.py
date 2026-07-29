@@ -197,6 +197,53 @@ class SkillWorkflowRuntimeTests(unittest.TestCase):
         self.assertEqual("degraded", recorded["completion_quality"])
         self.assertEqual(gap, recorded["unresolved_retrieval"])
 
+    def test_advisory_bounded_frontier_preserves_complete_step_quality(self):
+        state = self._seven_source_state()
+        gap = {
+            "status": "unresolved",
+            "source": "harness_http_retrieval_completeness",
+            "quality_impact": "advisory",
+            "retrieval_completeness_policy": "bounded",
+            "coverage_status": "partial",
+            "open_chain_count": 1,
+            "open_reasons": {"pagination_more_available": 1},
+        }
+        update = state.record_delegate_task(
+            {
+                "tasks": [{
+                    "goal": "collect a bounded source page",
+                    "skill_name": "generic",
+                    "step_type": "knowledge_bootstrap",
+                    "step_id": "source-1",
+                }],
+            },
+            {
+                "status": "completed",
+                "results": [{
+                    "index": 0,
+                    "status": "completed",
+                    "completion_quality": "complete",
+                    "unresolved_retrieval": gap,
+                    "skill_name": "generic",
+                    "step_type": "knowledge_bootstrap",
+                    "step_id": "source-1",
+                    "result_path": "results/source-1.md",
+                    "result_chars": 500,
+                    "result_shape": {
+                        "semantic_short_result_valid": True,
+                    },
+                }],
+            },
+        )
+
+        self.assertEqual(["source-1"], update["completed_step_ids"])
+        self.assertEqual([], update["degraded_completed_step_ids"])
+        recorded = state.skill_bootstrap_results["generic"]["source-1"]
+        self.assertEqual("complete", recorded["completion_quality"])
+        self.assertEqual("advisory", (
+            recorded["unresolved_retrieval"]["quality_impact"]
+        ))
+
     def test_failed_worker_metadata_error_is_not_masked_by_completion_audit(self):
         contract = _generic_contract()
         state = HarnessRunState(

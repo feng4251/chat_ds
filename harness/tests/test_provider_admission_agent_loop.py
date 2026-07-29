@@ -263,12 +263,14 @@ class ProviderAdmissionAgentLoopTests(unittest.IsolatedAsyncioTestCase):
             *,
             timeout_seconds,
             material_progress_lease=None,
+            execution_context=None,
         ):
             timeout_wrapper_entered.set()
             async for item in original_timeout(
                 iterator,
                 timeout_seconds=timeout_seconds,
                 material_progress_lease=material_progress_lease,
+                execution_context=execution_context,
             ):
                 yield item
 
@@ -334,12 +336,14 @@ class ProviderAdmissionAgentLoopTests(unittest.IsolatedAsyncioTestCase):
             *,
             timeout_seconds,
             material_progress_lease=None,
+            execution_context=None,
         ):
             observed_timeouts.append(timeout_seconds)
             async for item in original_timeout(
                 iterator,
                 timeout_seconds=timeout_seconds,
                 material_progress_lease=material_progress_lease,
+                execution_context=execution_context,
             ):
                 yield item
 

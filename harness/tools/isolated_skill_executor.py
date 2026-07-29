@@ -1,4 +1,4 @@
-"""Client for the network-disabled session-code and Skill-execution protocol.
+"""Client for the isolated session-code and Skill-execution protocol.
 
 This module is intentionally lower level than the public Skill tools.  Its
 caller must first resolve and authorize an installed Skill root.  The client
@@ -9,6 +9,8 @@ Skill Python may run as a CLI or as one strictly data-described public
 top-level function call; neither form accepts model-authored wrapper code.
 The additive protocol-v2 API retains authenticated persistent CLI processes
 and strictly declared public class/factory objects in trusted runtime state.
+Direct networking is absent; exact Skill executions can receive only the
+runtime-compiled origin set through the policy proxy.
 """
 
 from __future__ import annotations
@@ -30,7 +32,24 @@ import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
-from tools.workspace_lock import workspace_mutation_guard
+from tools.executor_slot_pool import (
+    ExecutorSlotPoolError,
+    ExecutorSlotReservation,
+    get_executor_slot_pool,
+)
+from tools.session_sandbox_policy import (
+    MAX_SESSION_SANDBOX_EGRESS_ORIGINS,
+    MAX_SESSION_SANDBOX_EGRESS_RULES,
+    SESSION_SANDBOX_RUNTIME_PROFILE,
+    SessionSandboxEgressRule,
+    SessionSandboxPolicyError,
+    normalize_http_origin,
+    normalize_session_sandbox_egress_rules,
+)
+from tools.workspace_lock import (
+    run_sync_cancellation_safe,
+    workspace_mutation_guard,
+)
 
 
 EXECUTOR_SOCKET = os.environ.get(
@@ -77,12 +96,28 @@ MAX_PROCESS_STDIN_CHUNK_BYTES = 64 * 1024
 MAX_PROCESS_CALL_BYTES = 4 * 1024
 MAX_PROCESS_READ_BYTES = 256 * 1024
 MAX_PROCESS_READ_WAIT_MS = 60_000
+PROCESS_SYNC_ACK_GRACE_SECONDS = 300
+
+# These are the actual terminal codes emitted by the process protocol.  The
+# legacy ``lease_not_found`` alias remains accepted for a rolling Harness /
+# executor upgrade, while malformed handles are quarantined because they do
+# not prove whether the originally reserved worker is still occupied.
+TERMINAL_PROCESS_LEASE_RELEASE_ERROR_CODES = frozenset({
+    "lease_expired",
+    "lease_lost",
+    "lease_closed",
+    "lease_not_found",
+})
+TERMINAL_PROCESS_LEASE_QUARANTINE_ERROR_CODES = frozenset({
+    "invalid_lease_handle",
+})
 
 SUPPORTED_EXTENSIONS = frozenset({".py", ".sh", ".bash", ".js", ".mjs", ".cjs"})
 PUBLIC_FUNCTION_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
 RUNTIME_COMMAND_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]{0,127}$")
 RUNTIME_ENVIRONMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 RUNTIME_PLATFORM_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{0,63}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 WORKSPACE_SKIP_DIRS = frozenset({
     ".chatds",
     "debug",
@@ -93,12 +128,120 @@ WORKSPACE_SKIP_DIRS = frozenset({
 })
 
 
+def _validated_egress_origins(
+    values: tuple[str, ...] | list[str] | None,
+) -> list[str]:
+    """Validate runtime-owned origin grants before crossing the executor UDS."""
+
+    if values is None:
+        return []
+    if not isinstance(values, (tuple, list)) or len(values) > (
+        MAX_SESSION_SANDBOX_EGRESS_ORIGINS
+    ):
+        raise IsolatedSkillExecutorError(
+            "invalid_egress_policy",
+            "Session sandbox egress origins exceed the bounded policy.",
+        )
+    result: list[str] = []
+    for value in values:
+        try:
+            normalized = normalize_http_origin(value)
+        except SessionSandboxPolicyError as exc:
+            raise IsolatedSkillExecutorError(
+                "invalid_egress_policy",
+                "Session sandbox egress contains an invalid HTTP(S) origin.",
+            ) from exc
+        if normalized != value or normalized in result:
+            raise IsolatedSkillExecutorError(
+                "invalid_egress_policy",
+                "Session sandbox egress origins must be canonical and unique.",
+            )
+        result.append(normalized)
+    return result
+
+
+def _validated_exact_egress_policy(
+    *,
+    egress_rules: (
+        tuple[dict[str, Any], ...]
+        | list[dict[str, Any]]
+        | tuple[SessionSandboxEgressRule, ...]
+        | None
+    ),
+    private_origins: tuple[str, ...] | list[str] | None,
+    legacy_origins: tuple[str, ...] | list[str] | None,
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    """Validate exact policy fields before crossing the executor UDS.
+
+    ``legacy_origins`` is accepted only as a redundant equality assertion
+    when method/prefix rules are present. It can never create authority.
+    """
+
+    raw_rules = () if egress_rules is None else egress_rules
+    try:
+        rules = normalize_session_sandbox_egress_rules(raw_rules)
+    except SessionSandboxPolicyError as exc:
+        raise IsolatedSkillExecutorError(
+            "invalid_egress_policy",
+            "Session sandbox egress contains malformed exact URL rules.",
+        ) from exc
+    if len(rules) > MAX_SESSION_SANDBOX_EGRESS_RULES:
+        raise IsolatedSkillExecutorError(
+            "invalid_egress_policy",
+            "Session sandbox egress exceeds the bounded exact-rule policy.",
+        )
+    rule_payload = [rule.as_payload() for rule in rules]
+    origins = list(dict.fromkeys(
+        normalize_http_origin(rule.url_prefix)
+        for rule in rules
+    ))
+    if len(origins) > MAX_SESSION_SANDBOX_EGRESS_ORIGINS:
+        raise IsolatedSkillExecutorError(
+            "invalid_egress_policy",
+            "Session sandbox egress exceeds the bounded origin policy.",
+        )
+    asserted_origins = _validated_egress_origins(legacy_origins)
+    if asserted_origins and asserted_origins != origins:
+        raise IsolatedSkillExecutorError(
+            "invalid_egress_policy",
+            "Origin-only egress authority is forbidden; origins must equal "
+            "the exact method/prefix rule projection.",
+        )
+    raw_private = _validated_egress_origins(private_origins)
+    if any(origin not in set(origins) for origin in raw_private):
+        raise IsolatedSkillExecutorError(
+            "invalid_egress_policy",
+            "Private sandbox origins must be a subset derived from exact URL "
+            "rules.",
+        )
+    return rule_payload, origins, raw_private
+
+
 class IsolatedSkillExecutorError(ValueError):
     """A stable local snapshot, transport, or response validation failure."""
 
-    def __init__(self, code: str, message: str):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        dispatch_unknown: bool = False,
+        terminal_lease_state: str | None = None,
+    ):
         super().__init__(message)
         self.code = code
+        self.dispatch_unknown = bool(dispatch_unknown)
+        self.terminal_lease_state = (
+            terminal_lease_state
+            if terminal_lease_state in {"closed", "quarantined"}
+            else None
+        )
+
+
+class _ProcessDispatchCancelled(asyncio.CancelledError):
+    """Cancellation whose process operation may already have been accepted."""
+
+    dispatch_unknown = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +316,10 @@ class IsolatedProcessLease:
     _workspace: Path = field(repr=False)
     _socket_path: str = field(repr=False)
     _baseline: dict[str, tuple[int, str]] = field(repr=False)
+    _slot_reservation: ExecutorSlotReservation | None = field(
+        default=None,
+        repr=False,
+    )
     _pending_sync_operation: str | None = field(default=None, repr=False)
     _pending_sync_prepare_op_id: str | None = field(default=None, repr=False)
     _pending_sync_response: dict[str, Any] | None = field(default=None, repr=False)
@@ -185,7 +332,60 @@ class IsolatedProcessLease:
         default=None,
         repr=False,
     )
+    _pending_sync_apply_artifacts: bool | None = field(
+        default=None,
+        repr=False,
+    )
+    _closed_response: dict[str, Any] | None = field(default=None, repr=False)
     closed: bool = False
+
+
+def terminal_process_lease_error_action(
+    error: IsolatedSkillExecutorError,
+) -> str | None:
+    """Classify only server-proven terminal lease outcomes."""
+
+    if error.dispatch_unknown:
+        return None
+    if error.terminal_lease_state == "closed":
+        return "release"
+    if error.terminal_lease_state == "quarantined":
+        return "quarantine"
+    if error.code in TERMINAL_PROCESS_LEASE_RELEASE_ERROR_CODES:
+        return "release"
+    if error.code in TERMINAL_PROCESS_LEASE_QUARANTINE_ERROR_CODES:
+        return "quarantine"
+    return None
+
+
+async def finalize_terminal_process_lease_error(
+    lease: IsolatedProcessLease,
+    error: IsolatedSkillExecutorError,
+) -> bool:
+    """Transition the physical slot before a manager forgets a lost lease."""
+
+    action = terminal_process_lease_error_action(error)
+    if action is None:
+        return False
+    reservation = lease._slot_reservation
+    if reservation is not None:
+        try:
+            if not reservation.terminal:
+                if action == "release":
+                    await _release_executor_slot(reservation)
+                else:
+                    await _quarantine_executor_slot(
+                        reservation,
+                        error.code,
+                    )
+        finally:
+            if (
+                reservation.terminal
+                and lease._slot_reservation is reservation
+            ):
+                lease._slot_reservation = None
+    lease.closed = True
+    return True
 
 
 def create_process_owner_scope(
@@ -347,7 +547,17 @@ def _snapshot_tree(
     while stack:
         directory, prefix, depth = stack.pop()
         try:
-            children = sorted(os.scandir(directory), key=lambda entry: entry.name)
+            remaining_entries = MAX_SNAPSHOT_ENTRIES - entries
+            children: list[os.DirEntry[str]] = []
+            with os.scandir(directory) as scanner:
+                for child in scanner:
+                    children.append(child)
+                    if len(children) > remaining_entries:
+                        raise IsolatedSkillExecutorError(
+                            "snapshot_limit_exceeded",
+                            f"{field} has too many filesystem entries.",
+                        )
+            children.sort(key=lambda entry: entry.name)
         except OSError as exc:
             raise IsolatedSkillExecutorError(
                 "unsafe_snapshot_tree", f"Cannot safely scan {field}."
@@ -949,6 +1159,9 @@ def build_skill_script_request(
     method_args: list[Any] | None = None,
     method_kwargs: dict[str, Any] | None = None,
     expected_skill_sha256: str | None = None,
+    egress_origins: tuple[str, ...] | list[str] | None = None,
+    egress_rules: tuple[dict[str, Any], ...] | list[dict[str, Any]] | None = None,
+    private_origins: tuple[str, ...] | list[str] | None = None,
     request_id: str | None = None,
 ) -> tuple[dict[str, Any], bytes]:
     """Build one bounded, content-addressed protocol request."""
@@ -1034,6 +1247,15 @@ def build_skill_script_request(
         max_total_bytes=MAX_WORKSPACE_TOTAL_BYTES,
         skip_dirs=WORKSPACE_SKIP_DIRS,
     )
+    (
+        safe_egress_rules,
+        safe_egress_origins,
+        safe_private_origins,
+    ) = _validated_exact_egress_policy(
+        egress_rules=egress_rules,
+        private_origins=private_origins,
+        legacy_origins=egress_origins,
+    )
     payload: dict[str, Any] = {
         "protocol_version": PROTOCOL_VERSION,
         "kind": "skill_script",
@@ -1045,6 +1267,10 @@ def build_skill_script_request(
         "cwd": cwd,
         "skill_files": skill_files,
         "workspace_files": workspace_files,
+        "egress_origins": safe_egress_origins,
+        "egress_policy_version": 2,
+        "egress_rules": safe_egress_rules,
+        "private_origins": safe_private_origins,
     }
     encoded = json.dumps(
         payload,
@@ -1073,6 +1299,9 @@ def build_process_lease_open_request(
     factory_name: str | None = None,
     constructor_args: list[Any] | None = None,
     constructor_kwargs: dict[str, Any] | None = None,
+    egress_origins: tuple[str, ...] | list[str] | None = None,
+    egress_rules: tuple[dict[str, Any], ...] | list[dict[str, Any]] | None = None,
+    private_origins: tuple[str, ...] | list[str] | None = None,
     request_id: str | None = None,
     op_id: str | None = None,
     skill_snapshot: SkillPackageSnapshot | None = None,
@@ -1147,6 +1376,15 @@ def build_process_lease_open_request(
         max_total_bytes=MAX_WORKSPACE_TOTAL_BYTES,
         skip_dirs=WORKSPACE_SKIP_DIRS,
     )
+    (
+        safe_egress_rules,
+        safe_egress_origins,
+        safe_private_origins,
+    ) = _validated_exact_egress_policy(
+        egress_rules=egress_rules,
+        private_origins=private_origins,
+        legacy_origins=egress_origins,
+    )
     entrypoint_record = next(
         item for item in skill_files if item["path"] == safe_entrypoint
     )
@@ -1167,6 +1405,10 @@ def build_process_lease_open_request(
         "script_sha256": entrypoint_record["sha256"],
         "skill_files": skill_files,
         "workspace_files": workspace_files,
+        "egress_origins": safe_egress_origins,
+        "egress_policy_version": 2,
+        "egress_rules": safe_egress_rules,
+        "private_origins": safe_private_origins,
     }
     return payload, _encode_process_request(payload)
 
@@ -1257,6 +1499,9 @@ def build_declared_command_request(
     argv: list[str] | None = None,
     cwd: str = "workspace",
     timeout: int = 120,
+    egress_origins: tuple[str, ...] | list[str] | None = None,
+    egress_rules: tuple[dict[str, Any], ...] | list[dict[str, Any]] | None = None,
+    private_origins: tuple[str, ...] | list[str] | None = None,
     request_id: str | None = None,
 ) -> tuple[dict[str, Any], bytes]:
     """Build one no-shell command request from a trusted compiled grant."""
@@ -1302,6 +1547,15 @@ def build_declared_command_request(
         max_total_bytes=MAX_WORKSPACE_TOTAL_BYTES,
         skip_dirs=WORKSPACE_SKIP_DIRS,
     )
+    (
+        safe_egress_rules,
+        safe_egress_origins,
+        safe_private_origins,
+    ) = _validated_exact_egress_policy(
+        egress_rules=egress_rules,
+        private_origins=private_origins,
+        legacy_origins=egress_origins,
+    )
     payload: dict[str, Any] = {
         "protocol_version": PROTOCOL_VERSION,
         "kind": "declared_command",
@@ -1312,6 +1566,10 @@ def build_declared_command_request(
         "cwd": cwd,
         "skill_files": skill_files,
         "workspace_files": workspace_files,
+        "egress_origins": safe_egress_origins,
+        "egress_policy_version": 2,
+        "egress_rules": safe_egress_rules,
+        "private_origins": safe_private_origins,
     }
     encoded = json.dumps(
         payload,
@@ -1621,17 +1879,86 @@ def validate_process_lease_response(
                 "invalid_response",
                 "Executor process error is malformed.",
             )
+        terminal_state = response.get("terminal_lease_state")
+        if terminal_state is not None:
+            expected_code = (
+                "close_artifact_collection_failed"
+                if terminal_state == "closed"
+                else "worker_containment_failed"
+                if terminal_state == "quarantined"
+                else None
+            )
+            network_policy = response.get("network_policy")
+            artifact_error_code = response.get("artifact_error_code")
+            if (
+                operation != "close"
+                or expected_code is None
+                or response.get("error_code") != expected_code
+                or response.get("state") != terminal_state
+                or response.get("lease_handle")
+                != request.get("lease_handle")
+                or response.get("scope_digest") is None
+                or response.get("skill_sha256")
+                != request.get("skill_sha256")
+                or response.get("script_sha256")
+                != request.get("script_sha256")
+                or response.get("artifacts") != []
+                or response.get("artifacts_discarded") is not True
+                or not isinstance(artifact_error_code, str)
+                or not artifact_error_code
+                or len(artifact_error_code) > 160
+                or response.get("runtime_profile") not in {
+                    "base-v1",
+                    "browser-automation-v1",
+                    SESSION_SANDBOX_RUNTIME_PROFILE,
+                }
+                or not isinstance(network_policy, dict)
+                or set(network_policy) != {"direct", "egress"}
+                or network_policy.get("direct") != "disabled"
+                or network_policy.get("egress") not in {
+                    "none",
+                    "policy_proxy",
+                    "origin_allowlist_proxy",
+                }
+                or response.get("sync_token") is not None
+                or response.get("sync_pending") is not None
+            ):
+                raise IsolatedSkillExecutorError(
+                    "invalid_response",
+                    "Executor terminal close receipt is malformed.",
+                )
+            scope_digest = response.get("scope_digest")
+            if (
+                not isinstance(scope_digest, str)
+                or len(scope_digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in scope_digest
+                )
+            ):
+                raise IsolatedSkillExecutorError(
+                    "invalid_response",
+                    "Executor terminal close scope receipt is malformed.",
+                )
         return dict(response), []
 
     if operation == "reap_all":
         runtime_profile = response.get("runtime_profile")
         network_policy = response.get("network_policy")
         if (
-            runtime_profile not in {"base-v1", "browser-automation-v1"}
+            runtime_profile not in {
+                "base-v1",
+                "browser-automation-v1",
+                SESSION_SANDBOX_RUNTIME_PROFILE,
+            }
             or not isinstance(network_policy, dict)
             or set(network_policy) != {"direct", "egress"}
             or network_policy.get("direct") != "disabled"
-            or network_policy.get("egress") not in {"none", "policy_proxy"}
+            or network_policy.get("egress") not in {
+                "none",
+                "policy_proxy",
+                "origin_allowlist_proxy",
+            }
             or isinstance(response.get("reaped_leases"), bool)
             or not isinstance(response.get("reaped_leases"), int)
             or response["reaped_leases"] < 0
@@ -1688,16 +2015,36 @@ def validate_process_lease_response(
     runtime_profile = response.get("runtime_profile")
     network_policy = response.get("network_policy")
     if (
-        runtime_profile not in {"base-v1", "browser-automation-v1"}
+        runtime_profile not in {
+            "base-v1",
+            "browser-automation-v1",
+            SESSION_SANDBOX_RUNTIME_PROFILE,
+        }
         or not isinstance(network_policy, dict)
         or set(network_policy) != {"direct", "egress"}
         or network_policy.get("direct") != "disabled"
-        or network_policy.get("egress") not in {"none", "policy_proxy"}
+        or network_policy.get("egress") not in {
+            "none",
+            "policy_proxy",
+            "origin_allowlist_proxy",
+        }
     ):
         raise IsolatedSkillExecutorError(
             "invalid_response",
             "Executor process runtime/network profile receipt is invalid.",
         )
+    if operation == "open":
+        expected_egress = (
+            "origin_allowlist_proxy"
+            if request.get("egress_origins")
+            else "none"
+        )
+        if network_policy.get("egress") != expected_egress:
+            raise IsolatedSkillExecutorError(
+                "invalid_response",
+                "Executor process did not attest the requested bounded "
+                "network policy.",
+            )
     replay = response.get("idempotent_replay")
     if replay is not None and not isinstance(replay, bool):
         raise IsolatedSkillExecutorError(
@@ -1717,6 +2064,8 @@ def validate_process_lease_response(
             or not 32 <= len(sync_token) <= 128
             or re.fullmatch(r"[A-Za-z0-9_-]+", sync_token) is None
             or response.get("sync_pending") is not True
+            or response.get("sync_ack_grace_seconds")
+            != PROCESS_SYNC_ACK_GRACE_SECONDS
         ):
             raise IsolatedSkillExecutorError(
                 "invalid_response",
@@ -1786,6 +2135,7 @@ def validate_skill_script_response(
     function_name: str | None = None,
     class_name: str | None = None,
     method_name: str | None = None,
+    expected_egress: bool | None = None,
 ) -> list[tuple[str, bytes, dict[str, Any]]]:
     if not isinstance(response, dict):
         raise IsolatedSkillExecutorError("invalid_response", "Executor response must be an object.")
@@ -1797,8 +2147,43 @@ def validate_skill_script_response(
         raise IsolatedSkillExecutorError(
             "invalid_response", "Executor response protocol or request identity does not match."
         )
-    if response.get("status") not in {"success", "error", "timeout"}:
+    status = response.get("status")
+    if status not in {"success", "error", "timeout"}:
         raise IsolatedSkillExecutorError("invalid_response", "Executor response status is invalid.")
+    if expected_egress is not None:
+        expected_policy = (
+            "origin_allowlist_proxy" if expected_egress else "none"
+        )
+        network_policy = response.get("network_policy")
+        if (
+            response.get("network") != "disabled"
+            or response.get("runtime_profile")
+            not in {
+                "base-v1",
+                "browser-automation-v1",
+                SESSION_SANDBOX_RUNTIME_PROFILE,
+            }
+            or not isinstance(network_policy, dict)
+            or network_policy != {
+                "direct": "disabled",
+                "egress": expected_policy,
+            }
+        ):
+            raise IsolatedSkillExecutorError(
+                "invalid_response",
+                "Executor response did not attest the requested bounded "
+                "network policy.",
+            )
+    if status in {"error", "timeout"} and (
+        not isinstance(response.get("error_code"), str)
+        or not response["error_code"]
+        or not isinstance(response.get("error"), str)
+        or not response["error"]
+    ):
+        raise IsolatedSkillExecutorError(
+            "invalid_response",
+            "Executor Skill error receipt is missing its typed root cause.",
+        )
     if invocation_mode is not None:
         if (
             invocation_mode not in {"cli", "function", "instance_method"}
@@ -1876,9 +2261,44 @@ def validate_declared_command_response(
             "invalid_response",
             "Executor command protocol, identity, or isolation policy does not match.",
         )
-    if response.get("status") not in {"success", "error", "timeout"}:
+    status = response.get("status")
+    if status not in {"success", "error", "timeout"}:
         raise IsolatedSkillExecutorError(
             "invalid_response", "Executor command status is invalid."
+        )
+    expected_egress = (
+        "origin_allowlist_proxy"
+        if request.get("egress_origins")
+        else "none"
+    )
+    network_policy = response.get("network_policy")
+    if (
+        response.get("runtime_profile")
+        not in {
+            "base-v1",
+            "browser-automation-v1",
+            SESSION_SANDBOX_RUNTIME_PROFILE,
+        }
+        or not isinstance(network_policy, dict)
+        or network_policy != {
+            "direct": "disabled",
+            "egress": expected_egress,
+        }
+    ):
+        raise IsolatedSkillExecutorError(
+            "invalid_response",
+            "Executor command response did not attest the requested bounded "
+            "network policy.",
+        )
+    if status in {"error", "timeout"} and (
+        not isinstance(response.get("error_code"), str)
+        or not response["error_code"]
+        or not isinstance(response.get("error"), str)
+        or not response["error"]
+    ):
+        raise IsolatedSkillExecutorError(
+            "invalid_response",
+            "Executor command error receipt is missing its typed root cause.",
         )
     invocation = json.dumps(
         [request["executable"], *(request.get("argv") or [])],
@@ -1940,6 +2360,7 @@ def validate_runtime_capabilities_response(
         "platform",
         "network",
         "dependency_install",
+        "runtime_build_sha256",
     }
     allowed_identity_fields = expected_identity_fields | {
         "runtime_profile",
@@ -1957,6 +2378,8 @@ def validate_runtime_capabilities_response(
         or identity.get("execution_runtime") != "isolated_skill_executor"
         or identity.get("network") != "disabled"
         or identity.get("dependency_install") != "disabled"
+        or not isinstance(identity.get("runtime_build_sha256"), str)
+        or SHA256_RE.fullmatch(identity["runtime_build_sha256"]) is None
         or any(
             not isinstance(identity.get(field), str)
             or not identity.get(field)
@@ -1972,15 +2395,26 @@ def validate_runtime_capabilities_response(
         runtime_profile = identity.get("runtime_profile")
         expected_display = (
             ("wayland-headless", True, False)
-            if runtime_profile == "browser-automation-v1"
+            if runtime_profile in {
+                "browser-automation-v1",
+                SESSION_SANDBOX_RUNTIME_PROFILE,
+            }
             else ("none", False, False)
         )
         if (
-            runtime_profile not in {"base-v1", "browser-automation-v1"}
+            runtime_profile not in {
+                "base-v1",
+                "browser-automation-v1",
+                SESSION_SANDBOX_RUNTIME_PROFILE,
+            }
             or not isinstance(network_policy, dict)
             or set(network_policy) != {"direct", "egress"}
             or network_policy.get("direct") != "disabled"
-            or network_policy.get("egress") not in {"none", "policy_proxy"}
+            or network_policy.get("egress") not in {
+                "none",
+                "policy_proxy",
+                "origin_allowlist_proxy",
+            }
             or (
                 identity.get("display_backend"),
                 identity.get("headed_browser"),
@@ -2375,6 +2809,23 @@ def apply_artifacts_atomically(
         )
 
 
+async def apply_artifacts_atomically_async(
+    workspace: Path,
+    artifacts: list[tuple[str, bytes, dict[str, Any]]],
+    *,
+    baseline: dict[str, tuple[int, str]] | None = None,
+) -> list[dict[str, Any]]:
+    """Run the complete CAS/stage/fsync/replace section off the event loop."""
+
+    return await run_sync_cancellation_safe(
+        lambda: apply_artifacts_atomically(
+            workspace,
+            artifacts,
+            baseline=baseline,
+        )
+    )
+
+
 async def _exchange_process_request(
     payload: dict[str, Any],
     encoded: bytes,
@@ -2383,6 +2834,7 @@ async def _exchange_process_request(
     timeout: float,
 ) -> tuple[dict[str, Any], list[tuple[str, bytes, dict[str, Any]]]]:
     last_transport_error: BaseException | None = None
+    dispatch_unknown = False
     # One bounded transparent transport retry is safe because the exact same
     # signed request, request_id, and op_id bytes are replayed. The executor
     # serializes the lease and returns its cached operation result instead of
@@ -2397,6 +2849,9 @@ async def _exchange_process_request(
                 ),
                 timeout=3,
             )
+            # From the first write onward a transport failure cannot prove
+            # whether the executor accepted the authenticated operation.
+            dispatch_unknown = True
             writer.write(encoded)
             await writer.drain()
             raw = await asyncio.wait_for(reader.readline(), timeout=timeout)
@@ -2418,26 +2873,69 @@ async def _exchange_process_request(
                     "Executor process response is invalid JSON.",
                 ) from exc
             return validate_process_lease_response(response, request=payload)
+        except asyncio.CancelledError as exc:
+            if dispatch_unknown:
+                raise _ProcessDispatchCancelled(
+                    "Persistent process transport was cancelled after dispatch."
+                ) from exc
+            raise
         except IsolatedSkillExecutorError as exc:
-            if exc.code != "executor_unavailable" or attempt:
-                raise
-            last_transport_error = exc
+            projected = (
+                IsolatedSkillExecutorError(
+                    exc.code,
+                    str(exc),
+                    dispatch_unknown=True,
+                    terminal_lease_state=exc.terminal_lease_state,
+                )
+                if dispatch_unknown and not exc.dispatch_unknown
+                else exc
+            )
+            if projected.code != "executor_unavailable" or attempt:
+                if projected is exc:
+                    raise
+                raise projected from exc
+            last_transport_error = projected
         except (OSError, asyncio.TimeoutError, ValueError) as exc:
             last_transport_error = exc
             if attempt:
                 break
+        except Exception as exc:
+            if dispatch_unknown:
+                raise IsolatedSkillExecutorError(
+                    "executor_unavailable",
+                    "Persistent process transport failed after dispatch "
+                    f"({type(exc).__name__}).",
+                    dispatch_unknown=True,
+                ) from exc
+            raise
         finally:
             if writer is not None:
                 writer.close()
                 try:
                     await writer.wait_closed()
+                except asyncio.CancelledError as exc:
+                    if dispatch_unknown:
+                        raise _ProcessDispatchCancelled(
+                            "Persistent process transport was cancelled after dispatch."
+                        ) from exc
+                    raise
                 except (OSError, ConnectionError):
                     pass
+                except Exception as exc:
+                    if dispatch_unknown:
+                        raise IsolatedSkillExecutorError(
+                            "executor_unavailable",
+                            "Persistent process transport cleanup failed after "
+                            f"dispatch ({type(exc).__name__}).",
+                            dispatch_unknown=True,
+                        ) from exc
+                    raise
     exc = last_transport_error
     raise IsolatedSkillExecutorError(
         "executor_unavailable",
         "The isolated process executor remained unavailable after one "
         f"idempotent transport retry ({type(exc).__name__ if exc is not None else 'unknown'}).",
+        dispatch_unknown=dispatch_unknown,
     ) from exc
 
 
@@ -2447,7 +2945,91 @@ def _require_process_success(response: dict[str, Any]) -> dict[str, Any]:
     raise IsolatedSkillExecutorError(
         str(response.get("error_code") or "process_error"),
         str(response.get("error") or "Persistent process operation failed."),
+        terminal_lease_state=(
+            response.get("terminal_lease_state")
+            if isinstance(response.get("terminal_lease_state"), str)
+            else None
+        ),
     )
+
+
+def _executor_pool_for_socket(socket_path: str):
+    try:
+        return get_executor_slot_pool(primary_socket=socket_path)
+    except ExecutorSlotPoolError as exc:
+        raise IsolatedSkillExecutorError(exc.code, str(exc)) from exc
+
+
+async def _release_executor_slot(
+    reservation: ExecutorSlotReservation,
+) -> None:
+    """Map pool invariant failures without forgetting the reservation."""
+
+    try:
+        await reservation.release()
+    except ExecutorSlotPoolError as exc:
+        raise IsolatedSkillExecutorError(exc.code, str(exc)) from exc
+
+
+async def _quarantine_executor_slot(
+    reservation: ExecutorSlotReservation,
+    reason: str,
+) -> None:
+    """Quarantine through the stable executor-client error boundary."""
+
+    try:
+        await reservation.quarantine(reason)
+    except ExecutorSlotPoolError as exc:
+        raise IsolatedSkillExecutorError(exc.code, str(exc)) from exc
+
+
+async def _drain_one_shot_writer_close(
+    writer: asyncio.StreamWriter,
+) -> tuple[asyncio.CancelledError | None, BaseException | None]:
+    """Close a one-shot transport without abandoning cleanup on cancellation.
+
+    A validated executor receipt proves that the child reached a terminal
+    controller state, but the reservation is still owned by this coroutine
+    until its return value reaches the caller.  Cancellation while awaiting
+    ``wait_closed`` used to override that return and strand the physical slot
+    in ``reserved`` forever.  Keep the bounded close task runtime-owned and
+    report cancellation only after it has reached a terminal outcome so the
+    caller can first release or quarantine the reservation.
+    """
+
+    cancellation: asyncio.CancelledError | None = None
+    cleanup_error: BaseException | None = None
+    try:
+        writer.close()
+    except asyncio.CancelledError as exc:
+        cancellation = exc
+    except (ConnectionError, OSError):
+        return None, None
+    except BaseException as exc:
+        cleanup_error = exc
+
+    if cleanup_error is None and cancellation is None:
+        closing = asyncio.create_task(
+            asyncio.wait_for(
+                writer.wait_closed(),
+                timeout=1.0,
+            )
+        )
+        while not closing.done():
+            try:
+                await asyncio.shield(closing)
+            except asyncio.CancelledError as exc:
+                cancellation = exc
+                continue
+        try:
+            closing.result()
+        except (ConnectionError, OSError, asyncio.TimeoutError):
+            pass
+        except asyncio.CancelledError as exc:
+            cancellation = cancellation or exc
+        except BaseException as exc:
+            cleanup_error = exc
+    return cancellation, cleanup_error
 
 
 async def open_isolated_process_lease(
@@ -2464,9 +3046,13 @@ async def open_isolated_process_lease(
     factory_name: str | None = None,
     constructor_args: list[Any] | None = None,
     constructor_kwargs: dict[str, Any] | None = None,
+    egress_origins: tuple[str, ...] | list[str] | None = None,
+    egress_rules: tuple[dict[str, Any], ...] | list[dict[str, Any]] | None = None,
+    private_origins: tuple[str, ...] | list[str] | None = None,
     socket_path: str = EXECUTOR_SOCKET,
     op_id: str | None = None,
     skill_snapshot: SkillPackageSnapshot | None = None,
+    admission_cancel_event: asyncio.Event | None = None,
 ) -> tuple[IsolatedProcessLease, dict[str, Any]]:
     payload, encoded = build_process_lease_open_request(
         owner_scope=owner_scope,
@@ -2481,16 +3067,86 @@ async def open_isolated_process_lease(
         factory_name=factory_name,
         constructor_args=constructor_args,
         constructor_kwargs=constructor_kwargs,
+        egress_origins=egress_origins,
+        egress_rules=egress_rules,
+        private_origins=private_origins,
         op_id=op_id,
         skill_snapshot=skill_snapshot,
     )
-    response, _ = await _exchange_process_request(
-        payload,
-        encoded,
-        socket_path=socket_path,
-        timeout=10,
-    )
-    _require_process_success(response)
+    pool = _executor_pool_for_socket(socket_path)
+    excluded_sockets: set[str] = set()
+    response: dict[str, Any] | None = None
+    reservation: ExecutorSlotReservation | None = None
+    last_error: IsolatedSkillExecutorError | None = None
+    while len(excluded_sockets) < len(pool.socket_paths):
+        try:
+            reservation = await pool.acquire(
+                "persistent",
+                excluded_sockets=frozenset(excluded_sockets),
+                cancel_event=admission_cancel_event,
+            )
+        except ExecutorSlotPoolError as exc:
+            raise IsolatedSkillExecutorError(exc.code, str(exc)) from exc
+        try:
+            response, _ = await _exchange_process_request(
+                payload,
+                encoded,
+                socket_path=reservation.socket_path,
+                timeout=10,
+            )
+        except IsolatedSkillExecutorError as exc:
+            await _quarantine_executor_slot(
+                reservation,
+                "process_open_dispatch_unknown"
+                if exc.dispatch_unknown
+                else "process_open_transport_unavailable",
+            )
+            if exc.dispatch_unknown:
+                raise
+            excluded_sockets.add(reservation.socket_path)
+            last_error = exc
+            reservation = None
+            continue
+        except BaseException:
+            await _quarantine_executor_slot(
+                reservation,
+                "process_open_cancelled_unknown",
+            )
+            raise
+        if (
+            response.get("status") != "success"
+            and response.get("error_code") == "worker_busy"
+        ):
+            await _quarantine_executor_slot(
+                reservation,
+                "executor_reported_worker_busy",
+            )
+            excluded_sockets.add(reservation.socket_path)
+            last_error = IsolatedSkillExecutorError(
+                "worker_busy",
+                str(response.get("error") or "Executor worker is busy."),
+            )
+            reservation = None
+            response = None
+            continue
+        try:
+            _require_process_success(response)
+        except IsolatedSkillExecutorError as exc:
+            if exc.code in {
+                "worker_containment_failed",
+                "worker_admission_lost",
+                "executor_quarantined",
+            }:
+                await _quarantine_executor_slot(reservation, exc.code)
+            else:
+                await _release_executor_slot(reservation)
+            raise
+        break
+    if response is None or reservation is None:
+        raise last_error or IsolatedSkillExecutorError(
+            "executor_unavailable",
+            "No healthy executor pool slot accepted the process lease.",
+        )
     baseline = {
         item["path"]: (item["size_bytes"], item["sha256"])
         for item in payload["workspace_files"]
@@ -2506,8 +3162,9 @@ async def open_isolated_process_lease(
         factory_name=invocation.get("factory_name"),
         _owner_scope=owner_scope,
         _workspace=Path(workspace),
-        _socket_path=socket_path,
+        _socket_path=reservation.socket_path,
         _baseline=baseline,
+        _slot_reservation=reservation,
     )
     return lease, response
 
@@ -2549,7 +3206,11 @@ async def _execute_process_operation(
         socket_path=lease._socket_path,
         timeout=timeout,
     )
-    _require_process_success(response)
+    try:
+        _require_process_success(response)
+    except IsolatedSkillExecutorError as exc:
+        await finalize_terminal_process_lease_error(lease, exc)
+        raise
     return response, artifacts
 
 
@@ -2750,16 +3411,20 @@ async def read_isolated_process_output(
     return result
 
 
-def _apply_process_artifacts(
+async def _apply_process_artifacts(
     lease: IsolatedProcessLease,
     response: dict[str, Any],
     artifacts: list[tuple[str, bytes, dict[str, Any]]],
 ) -> dict[str, Any]:
-    applied = apply_artifacts_atomically(
-        lease._workspace,
-        artifacts,
-        baseline=lease._baseline,
-    ) if artifacts else []
+    applied = (
+        await apply_artifacts_atomically_async(
+            lease._workspace,
+            artifacts,
+            baseline=lease._baseline,
+        )
+        if artifacts
+        else []
+    )
     for _, _, metadata in artifacts:
         lease._baseline[metadata["path"]] = (
             metadata["size_bytes"],
@@ -2776,7 +3441,9 @@ async def _prepare_pending_process_sync(
     *,
     operation: str,
     op_id: str | None,
+    apply_artifacts: bool,
 ) -> None:
+    requested_apply = bool(apply_artifacts)
     if lease._pending_sync_operation is None:
         try:
             prepare_op_id = (
@@ -2792,10 +3459,17 @@ async def _prepare_pending_process_sync(
         lease._pending_sync_operation = operation
         lease._pending_sync_prepare_op_id = prepare_op_id
         lease._pending_sync_ack_op_id = str(uuid.uuid4())
+        lease._pending_sync_apply_artifacts = requested_apply
     elif lease._pending_sync_operation != operation:
         raise IsolatedSkillExecutorError(
             "sync_ack_required",
             "A previous artifact batch is still pending local apply/ack.",
+        )
+    elif lease._pending_sync_apply_artifacts is not requested_apply:
+        raise IsolatedSkillExecutorError(
+            "pending_sync_intent_mismatch",
+            "The pending artifact transaction is bound to a different "
+            "apply_artifacts intent.",
         )
     if lease._pending_sync_response is not None:
         return
@@ -2828,22 +3502,30 @@ async def _finish_pending_process_sync(
     response = lease._pending_sync_response
     artifacts = lease._pending_sync_artifacts
     ack_op_id = lease._pending_sync_ack_op_id
+    bound_apply_artifacts = lease._pending_sync_apply_artifacts
     if (
         operation not in {"sync", "close"}
         or response is None
         or artifacts is None
         or ack_op_id is None
+        or bound_apply_artifacts is None
     ):
         raise IsolatedSkillExecutorError(
             "invalid_lease_state",
             "The pending artifact transaction is incomplete.",
         )
+    if bound_apply_artifacts is not bool(apply_artifacts):
+        raise IsolatedSkillExecutorError(
+            "pending_sync_intent_mismatch",
+            "The pending artifact transaction is bound to a different "
+            "apply_artifacts intent.",
+        )
 
     if lease._pending_sync_applied is None:
         if execution_authority_check is not None:
             execution_authority_check()
-        if apply_artifacts:
-            applied_result = _apply_process_artifacts(
+        if bound_apply_artifacts:
+            applied_result = await _apply_process_artifacts(
                 lease,
                 response,
                 artifacts,
@@ -2863,7 +3545,7 @@ async def _finish_pending_process_sync(
     result = dict(response)
     result.pop("sync_token", None)
     result["artifacts"] = list(lease._pending_sync_applied)
-    result["workspace_applied"] = bool(apply_artifacts)
+    result["workspace_applied"] = bound_apply_artifacts
     result["sync_pending"] = False
     result["sync_acknowledged"] = True
     result["acknowledged_operation"] = ack_response["acknowledged_operation"]
@@ -2875,9 +3557,68 @@ async def _finish_pending_process_sync(
     lease._pending_sync_artifacts = None
     lease._pending_sync_ack_op_id = None
     lease._pending_sync_applied = None
+    lease._pending_sync_apply_artifacts = None
     if operation == "close":
         lease.closed = True
+        lease._closed_response = dict(result)
+        await _release_closed_process_slot(lease)
     return result
+
+
+async def _finish_pending_process_sync_for_session_cleanup(
+    lease: IsolatedProcessLease,
+    *,
+    execution_authority_check: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    """Acknowledge one prepared batch without applying still-pending bytes.
+
+    This is deliberately private and is reachable only from the trusted
+    session-runtime cleanup path.  The prepare replay and ACK still use the
+    exact lease owner capability, operation ids, and sync token.  Only the
+    Harness-local workspace apply is abandoned.  A batch that was already
+    applied before deletion linearized is merely ACKed with its original
+    intent; it is never represented as discarded retroactively.
+    """
+
+    operation = lease._pending_sync_operation
+    bound_apply_artifacts = lease._pending_sync_apply_artifacts
+    if (
+        operation not in {"sync", "close"}
+        or bound_apply_artifacts is None
+    ):
+        raise IsolatedSkillExecutorError(
+            "invalid_lease_state",
+            "Session cleanup requires one prepared sync or close transaction.",
+        )
+
+    # If prepare lost its response, replay the exact original transaction
+    # before changing the local apply decision.  The executor's idempotency
+    # cache returns the same sync token and artifact batch.
+    await _prepare_pending_process_sync(
+        lease,
+        operation=operation,
+        op_id=None,
+        apply_artifacts=bound_apply_artifacts,
+    )
+
+    if lease._pending_sync_applied is None:
+        # No workspace batch has crossed the mutation lock yet.  Session
+        # deletion owns a durable tombstone, so applying it now would both
+        # violate the fence and prevent the physical lease from closing.
+        lease._pending_sync_apply_artifacts = False
+        finish_apply_artifacts = False
+    else:
+        # The batch crossed the workspace lock before deletion published its
+        # marker.  Do not replay it, but preserve the truthful close receipt.
+        finish_apply_artifacts = bool(
+            lease._pending_sync_apply_artifacts
+        )
+
+    return await _finish_pending_process_sync(
+        lease,
+        execution_authority_check=execution_authority_check,
+        apply_artifacts=finish_apply_artifacts,
+    )
 
 
 async def sync_isolated_process_artifacts(
@@ -2895,6 +3636,7 @@ async def sync_isolated_process_artifacts(
         lease,
         operation="sync",
         op_id=op_id,
+        apply_artifacts=True,
     )
     return await _finish_pending_process_sync(
         lease,
@@ -2922,33 +3664,85 @@ async def signal_isolated_process(
     return response
 
 
+async def _release_closed_process_slot(
+    lease: IsolatedProcessLease,
+) -> None:
+    """Finish a closed lease's pool transition before forgetting affinity."""
+
+    reservation = lease._slot_reservation
+    if reservation is None:
+        return
+    try:
+        if not reservation.terminal:
+            await _release_executor_slot(reservation)
+    finally:
+        # ``ExecutorSlotReservation.release`` drains its pool transition before
+        # re-delivering cancellation.  Clear the stale affinity even on that
+        # cancellation path, but retain it after an actual internal failure so
+        # an exact close retry can finish the transition.
+        if (
+            reservation.terminal
+            and lease._slot_reservation is reservation
+        ):
+            lease._slot_reservation = None
+
+
 async def close_isolated_process_lease(
     lease: IsolatedProcessLease,
     *,
     op_id: str | None = None,
     execution_authority_check: Callable[[], None] | None = None,
     apply_artifacts: bool = True,
+    discard_pending_artifacts: bool = False,
 ) -> dict[str, Any]:
+    """Close one lease, optionally abandoning an unapplied prepared batch.
+
+    ``discard_pending_artifacts`` is an internal session-deletion capability,
+    not a model-facing option.  It still performs the authenticated executor
+    ACK, but guarantees that no new workspace apply is attempted.
+    """
+
+    if discard_pending_artifacts and apply_artifacts:
+        raise IsolatedSkillExecutorError(
+            "invalid_cleanup_intent",
+            "Discarding pending artifacts requires apply_artifacts=False.",
+        )
     if lease.closed:
+        if lease._closed_response is not None:
+            await _release_closed_process_slot(lease)
+            return dict(lease._closed_response)
         raise IsolatedSkillExecutorError(
             "lease_closed",
             "The process lease is already closed.",
         )
+    if (
+        discard_pending_artifacts
+        and lease._pending_sync_operation in {"sync", "close"}
+    ):
+        pending_operation = lease._pending_sync_operation
+        result = await _finish_pending_process_sync_for_session_cleanup(
+            lease,
+            execution_authority_check=execution_authority_check,
+        )
+        if pending_operation == "close":
+            return result
     if lease._pending_sync_operation == "sync":
         await _prepare_pending_process_sync(
             lease,
             operation="sync",
             op_id=None,
+            apply_artifacts=True,
         )
         await _finish_pending_process_sync(
             lease,
             execution_authority_check=execution_authority_check,
-            apply_artifacts=apply_artifacts,
+            apply_artifacts=True,
         )
     await _prepare_pending_process_sync(
         lease,
         operation="close",
         op_id=op_id,
+        apply_artifacts=apply_artifacts,
     )
     return await _finish_pending_process_sync(
         lease,
@@ -3019,6 +3813,228 @@ def probe_isolated_runtime_capabilities(
     return validate_runtime_capabilities_response(response, request=payload)
 
 
+async def _exchange_pooled_one_shot(
+    encoded: bytes,
+    *,
+    socket_path: str,
+    response_timeout: float,
+    validate_response: Callable[
+        [dict[str, Any]],
+        list[tuple[str, bytes, dict[str, Any]]],
+    ],
+    execution_authority_check: Callable[[], None] | None,
+) -> tuple[
+    dict[str, Any],
+    list[tuple[str, bytes, dict[str, Any]]],
+    ExecutorSlotReservation,
+]:
+    """Dispatch once, retrying only receipts that prove no child ran."""
+
+    pool = _executor_pool_for_socket(socket_path)
+    excluded_sockets: set[str] = set()
+    last_error: IsolatedSkillExecutorError | None = None
+    while len(excluded_sockets) < len(pool.socket_paths):
+        try:
+            reservation = await pool.acquire(
+                "transient",
+                excluded_sockets=frozenset(excluded_sockets),
+            )
+        except ExecutorSlotPoolError as exc:
+            raise IsolatedSkillExecutorError(exc.code, str(exc)) from exc
+        writer: asyncio.StreamWriter | None = None
+        dispatch_unknown = False
+        trusted_terminal_response = False
+        try:
+            if execution_authority_check is not None:
+                execution_authority_check()
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_unix_connection(
+                        reservation.socket_path,
+                        limit=MAX_RESPONSE_BYTES + 1,
+                    ),
+                    timeout=3,
+                )
+            except (OSError, asyncio.TimeoutError, ValueError) as exc:
+                await _quarantine_executor_slot(
+                    reservation,
+                    "executor_connect_unavailable",
+                )
+                excluded_sockets.add(reservation.socket_path)
+                last_error = IsolatedSkillExecutorError(
+                    "executor_unavailable",
+                    "An executor pool slot was unavailable before dispatch "
+                    f"({type(exc).__name__}).",
+                )
+                continue
+            # Once a write is attempted, a missing or malformed response
+            # cannot prove that the untrusted child was never dispatched.
+            dispatch_unknown = True
+            writer.write(encoded)
+            await writer.drain()
+            raw = await asyncio.wait_for(
+                reader.readline(),
+                timeout=response_timeout,
+            )
+            if not raw:
+                raise IsolatedSkillExecutorError(
+                    "executor_unavailable",
+                    "Executor closed the socket without a response.",
+                    dispatch_unknown=True,
+                )
+            if len(raw) > MAX_RESPONSE_BYTES or not raw.endswith(b"\n"):
+                raise IsolatedSkillExecutorError(
+                    "invalid_response",
+                    "Executor response exceeds the bounded line protocol.",
+                    dispatch_unknown=True,
+                )
+            try:
+                response = json.loads(raw.decode("utf-8"))
+            except (UnicodeError, json.JSONDecodeError) as exc:
+                raise IsolatedSkillExecutorError(
+                    "invalid_response",
+                    "Executor returned invalid JSON.",
+                    dispatch_unknown=True,
+                ) from exc
+            try:
+                artifacts = validate_response(response)
+            except IsolatedSkillExecutorError as exc:
+                await _quarantine_executor_slot(
+                    reservation,
+                    "executor_response_validation_failed",
+                )
+                raise IsolatedSkillExecutorError(
+                    exc.code,
+                    str(exc),
+                    dispatch_unknown=True,
+                ) from exc
+            # Validation authenticates and correlates the bounded executor
+            # receipt. From here onward the child/controller transaction is
+            # terminal even though this coroutine still owns the pool
+            # reservation until it can return it to its caller.
+            trusted_terminal_response = True
+            if (
+                response.get("status") == "error"
+                and response.get("error_code")
+                == "worker_containment_failed"
+            ):
+                # The executor has finished the child but deliberately retained
+                # admission because its controller-owned tree could not be
+                # proven absent. Never publish this slot as free: authenticated
+                # reap + homogeneous attestation is the only rejoin path.
+                await _quarantine_executor_slot(
+                    reservation,
+                    "worker_containment_failed",
+                )
+                raise IsolatedSkillExecutorError(
+                    "worker_containment_failed",
+                    str(
+                        response.get("error")
+                        or "Executor could not prove one-shot containment."
+                    ),
+                    dispatch_unknown=True,
+                )
+            if (
+                response.get("status") == "error"
+                and response.get("error_code") == "worker_busy"
+            ):
+                # The authenticated typed receipt is emitted before runner
+                # dispatch.  It is the sole post-write cross-slot retry case.
+                await _quarantine_executor_slot(
+                    reservation,
+                    "executor_reported_worker_busy",
+                )
+                excluded_sockets.add(reservation.socket_path)
+                last_error = IsolatedSkillExecutorError(
+                    "worker_busy",
+                    str(response.get("error") or "Executor worker is busy."),
+                )
+                continue
+            return response, artifacts, reservation
+        except asyncio.CancelledError:
+            if dispatch_unknown:
+                await _quarantine_executor_slot(
+                    reservation,
+                    "one_shot_cancelled_after_dispatch",
+                )
+            else:
+                await _release_executor_slot(reservation)
+            raise
+        except IsolatedSkillExecutorError:
+            if not reservation.terminal:
+                if dispatch_unknown:
+                    await _quarantine_executor_slot(
+                        reservation,
+                        "one_shot_dispatch_state_unknown",
+                    )
+                else:
+                    await _release_executor_slot(reservation)
+            raise
+        except (OSError, asyncio.TimeoutError, ValueError) as exc:
+            if dispatch_unknown:
+                await _quarantine_executor_slot(
+                    reservation,
+                    "one_shot_transport_state_unknown",
+                )
+                raise IsolatedSkillExecutorError(
+                    "executor_unavailable",
+                    "The isolated executor response was lost after dispatch "
+                    f"({type(exc).__name__}).",
+                    dispatch_unknown=True,
+                ) from exc
+            await _quarantine_executor_slot(
+                reservation,
+                "executor_connect_unavailable",
+            )
+            excluded_sockets.add(reservation.socket_path)
+            last_error = IsolatedSkillExecutorError(
+                "executor_unavailable",
+                "An executor pool slot was unavailable before dispatch "
+                f"({type(exc).__name__}).",
+            )
+        except BaseException:
+            if dispatch_unknown:
+                await _quarantine_executor_slot(
+                    reservation,
+                    "one_shot_dispatch_state_unknown",
+                )
+            else:
+                await _release_executor_slot(reservation)
+            raise
+        finally:
+            if writer is not None:
+                cleanup_cancellation, cleanup_error = (
+                    await _drain_one_shot_writer_close(writer)
+                )
+                if (
+                    (
+                        cleanup_cancellation is not None
+                        or cleanup_error is not None
+                    )
+                    and not reservation.terminal
+                ):
+                    # The response is returned together with the reservation.
+                    # If cleanup prevents that hand-off, this coroutine must
+                    # publish the terminal slot transition itself.
+                    if trusted_terminal_response:
+                        await _release_executor_slot(reservation)
+                    elif dispatch_unknown:
+                        await _quarantine_executor_slot(
+                            reservation,
+                            "one_shot_dispatch_state_unknown",
+                        )
+                    else:
+                        await _release_executor_slot(reservation)
+                if cleanup_cancellation is not None:
+                    raise cleanup_cancellation
+                if cleanup_error is not None:
+                    raise cleanup_error
+    raise last_error or IsolatedSkillExecutorError(
+        "executor_unavailable",
+        "No healthy executor pool slot accepted the one-shot execution.",
+    )
+
+
 async def execute_isolated_skill_script(
     *,
     skill_root: Path,
@@ -3037,6 +4053,9 @@ async def execute_isolated_skill_script(
     method_args: list[Any] | None = None,
     method_kwargs: dict[str, Any] | None = None,
     expected_skill_sha256: str | None = None,
+    egress_origins: tuple[str, ...] | list[str] | None = None,
+    egress_rules: tuple[dict[str, Any], ...] | list[dict[str, Any]] | None = None,
+    private_origins: tuple[str, ...] | list[str] | None = None,
     socket_path: str = EXECUTOR_SOCKET,
     apply_artifacts: bool = True,
     execution_authority_check: Callable[[], None] | None = None,
@@ -3060,42 +4079,28 @@ async def execute_isolated_skill_script(
         method_args=method_args,
         method_kwargs=method_kwargs,
         expected_skill_sha256=expected_skill_sha256,
+        egress_origins=egress_origins,
+        egress_rules=egress_rules,
+        private_origins=private_origins,
     )
-    writer: asyncio.StreamWriter | None = None
+    reservation: ExecutorSlotReservation | None = None
     try:
-        if execution_authority_check is not None:
-            execution_authority_check()
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_unix_connection(
-                socket_path,
-                limit=MAX_RESPONSE_BYTES + 1,
+        response, artifacts, reservation = await _exchange_pooled_one_shot(
+            request,
+            socket_path=socket_path,
+            response_timeout=timeout + 10,
+            validate_response=lambda candidate: (
+                validate_skill_script_response(
+                    candidate,
+                    request_id=payload["request_id"],
+                    invocation_mode=payload["invocation"]["mode"],
+                    function_name=payload["invocation"].get("name"),
+                    class_name=payload["invocation"].get("class_name"),
+                    method_name=payload["invocation"].get("method_name"),
+                    expected_egress=bool(payload["egress_origins"]),
+                )
             ),
-            timeout=3,
-        )
-        writer.write(request)
-        await writer.drain()
-        raw = await asyncio.wait_for(reader.readline(), timeout=timeout + 10)
-        if not raw:
-            raise IsolatedSkillExecutorError(
-                "executor_unavailable", "Executor closed the socket without a response."
-            )
-        if len(raw) > MAX_RESPONSE_BYTES or not raw.endswith(b"\n"):
-            raise IsolatedSkillExecutorError(
-                "invalid_response", "Executor response exceeds the bounded line protocol."
-            )
-        try:
-            response = json.loads(raw.decode("utf-8"))
-        except (UnicodeError, json.JSONDecodeError) as exc:
-            raise IsolatedSkillExecutorError(
-                "invalid_response", "Executor returned invalid JSON."
-            ) from exc
-        artifacts = validate_skill_script_response(
-            response,
-            request_id=payload["request_id"],
-            invocation_mode=payload["invocation"]["mode"],
-            function_name=payload["invocation"].get("name"),
-            class_name=payload["invocation"].get("class_name"),
-            method_name=payload["invocation"].get("method_name"),
+            execution_authority_check=execution_authority_check,
         )
         baseline = {
             item["path"]: (item["size_bytes"], item["sha256"])
@@ -3104,7 +4109,11 @@ async def execute_isolated_skill_script(
         if execution_authority_check is not None:
             execution_authority_check()
         applied = (
-            apply_artifacts_atomically(Path(workspace), artifacts, baseline=baseline)
+            await apply_artifacts_atomically_async(
+                Path(workspace),
+                artifacts,
+                baseline=baseline,
+            )
             if apply_artifacts and artifacts
             else []
         )
@@ -3130,12 +4139,8 @@ async def execute_isolated_skill_script(
             f"The isolated Skill executor is unavailable ({type(exc).__name__}).",
         ) from exc
     finally:
-        if writer is not None:
-            writer.close()
-            try:
-                await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
-            except (ConnectionError, OSError, asyncio.TimeoutError):
-                pass
+        if reservation is not None:
+            await _release_executor_slot(reservation)
 
 
 async def execute_isolated_declared_command(
@@ -3146,6 +4151,9 @@ async def execute_isolated_declared_command(
     argv: list[str] | None = None,
     cwd: str = "workspace",
     timeout: int = 120,
+    egress_origins: tuple[str, ...] | list[str] | None = None,
+    egress_rules: tuple[dict[str, Any], ...] | list[dict[str, Any]] | None = None,
+    private_origins: tuple[str, ...] | list[str] | None = None,
     socket_path: str = EXECUTOR_SOCKET,
     apply_artifacts: bool = True,
     execution_authority_check: Callable[[], None] | None = None,
@@ -3158,33 +4166,24 @@ async def execute_isolated_declared_command(
         argv=argv,
         cwd=cwd,
         timeout=timeout,
+        egress_origins=egress_origins,
+        egress_rules=egress_rules,
+        private_origins=private_origins,
     )
-    writer: asyncio.StreamWriter | None = None
+    reservation: ExecutorSlotReservation | None = None
     try:
-        if execution_authority_check is not None:
-            execution_authority_check()
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_unix_connection(socket_path, limit=MAX_RESPONSE_BYTES + 1),
-            timeout=3,
+        response, artifacts, reservation = await _exchange_pooled_one_shot(
+            request,
+            socket_path=socket_path,
+            response_timeout=timeout + 10,
+            validate_response=lambda candidate: (
+                validate_declared_command_response(
+                    candidate,
+                    request=payload,
+                )
+            ),
+            execution_authority_check=execution_authority_check,
         )
-        writer.write(request)
-        await writer.drain()
-        raw = await asyncio.wait_for(reader.readline(), timeout=timeout + 10)
-        if not raw:
-            raise IsolatedSkillExecutorError(
-                "executor_unavailable", "Executor closed the socket without a response."
-            )
-        if len(raw) > MAX_RESPONSE_BYTES or not raw.endswith(b"\n"):
-            raise IsolatedSkillExecutorError(
-                "invalid_response", "Executor response exceeds the bounded line protocol."
-            )
-        try:
-            response = json.loads(raw.decode("utf-8"))
-        except (UnicodeError, json.JSONDecodeError) as exc:
-            raise IsolatedSkillExecutorError(
-                "invalid_response", "Executor returned invalid JSON."
-            ) from exc
-        artifacts = validate_declared_command_response(response, request=payload)
         baseline = {
             item["path"]: (item["size_bytes"], item["sha256"])
             for item in payload["workspace_files"]
@@ -3193,7 +4192,11 @@ async def execute_isolated_declared_command(
         if execution_authority_check is not None:
             execution_authority_check()
         applied = (
-            apply_artifacts_atomically(Path(workspace), artifacts, baseline=baseline)
+            await apply_artifacts_atomically_async(
+                Path(workspace),
+                artifacts,
+                baseline=baseline,
+            )
             if apply_artifacts and command_succeeded and artifacts else []
         )
         result = dict(response)
@@ -3223,12 +4226,8 @@ async def execute_isolated_declared_command(
             f"The isolated declared-command executor is unavailable ({type(exc).__name__}).",
         ) from exc
     finally:
-        if writer is not None:
-            writer.close()
-            try:
-                await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
-            except (ConnectionError, OSError, asyncio.TimeoutError):
-                pass
+        if reservation is not None:
+            await _release_executor_slot(reservation)
 
 
 async def execute_isolated_session_code(
@@ -3249,37 +4248,19 @@ async def execute_isolated_session_code(
         timeout=timeout,
         skills_root=skills_root,
     )
-    writer: asyncio.StreamWriter | None = None
+    reservation: ExecutorSlotReservation | None = None
     try:
-        if execution_authority_check is not None:
-            execution_authority_check()
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_unix_connection(
-                socket_path,
-                limit=MAX_RESPONSE_BYTES + 1,
+        response, artifacts, reservation = await _exchange_pooled_one_shot(
+            request,
+            socket_path=socket_path,
+            response_timeout=timeout + 10,
+            validate_response=lambda candidate: (
+                validate_session_code_response(
+                    candidate,
+                    request_id=payload["request_id"],
+                )
             ),
-            timeout=3,
-        )
-        writer.write(request)
-        await writer.drain()
-        raw = await asyncio.wait_for(reader.readline(), timeout=timeout + 10)
-        if not raw:
-            raise IsolatedSkillExecutorError(
-                "executor_unavailable", "Executor closed the socket without a response."
-            )
-        if len(raw) > MAX_RESPONSE_BYTES or not raw.endswith(b"\n"):
-            raise IsolatedSkillExecutorError(
-                "invalid_response", "Executor response exceeds the bounded line protocol."
-            )
-        try:
-            response = json.loads(raw.decode("utf-8"))
-        except (UnicodeError, json.JSONDecodeError) as exc:
-            raise IsolatedSkillExecutorError(
-                "invalid_response", "Executor returned invalid JSON."
-            ) from exc
-        artifacts = validate_session_code_response(
-            response,
-            request_id=payload["request_id"],
+            execution_authority_check=execution_authority_check,
         )
         baseline = {
             item["path"]: (item["size_bytes"], item["sha256"])
@@ -3288,7 +4269,11 @@ async def execute_isolated_session_code(
         if execution_authority_check is not None:
             execution_authority_check()
         applied = (
-            apply_artifacts_atomically(Path(workspace), artifacts, baseline=baseline)
+            await apply_artifacts_atomically_async(
+                Path(workspace),
+                artifacts,
+                baseline=baseline,
+            )
             if apply_artifacts and artifacts
             else []
         )
@@ -3317,9 +4302,121 @@ async def execute_isolated_session_code(
             f"The isolated session-code executor is unavailable ({type(exc).__name__}).",
         ) from exc
     finally:
-        if writer is not None:
-            writer.close()
-            try:
-                await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
-            except (ConnectionError, OSError, asyncio.TimeoutError):
-                pass
+        if reservation is not None:
+            await _release_executor_slot(reservation)
+
+
+def validate_legacy_code_response(
+    response: Any,
+) -> list[tuple[str, bytes, dict[str, Any]]]:
+    """Validate the compatibility compute receipt before releasing its slot."""
+
+    if not isinstance(response, dict):
+        raise IsolatedSkillExecutorError(
+            "invalid_response",
+            "Legacy compute executor returned a non-object response.",
+        )
+    status = response.get("status")
+    if status not in {"success", "error", "timeout"}:
+        raise IsolatedSkillExecutorError(
+            "invalid_response",
+            "Legacy compute executor returned an invalid status.",
+        )
+    for field_name, maximum in (
+        ("output", MAX_STDOUT_BYTES + MAX_STDERR_BYTES + 64),
+        ("error", MAX_STDERR_BYTES + 1_024),
+        ("error_code", 128),
+    ):
+        value = response.get(field_name)
+        if value is not None and (
+            not isinstance(value, str)
+            or len(value) > maximum
+        ):
+            raise IsolatedSkillExecutorError(
+                "invalid_response",
+                f"Legacy compute executor returned an invalid {field_name}.",
+            )
+    if (
+        "network" in response
+        and response.get("network") != "disabled"
+    ):
+        raise IsolatedSkillExecutorError(
+            "invalid_response",
+            "Legacy compute executor returned an invalid network receipt.",
+        )
+    if "exit_code" in response and (
+        isinstance(response.get("exit_code"), bool)
+        or not isinstance(response.get("exit_code"), int)
+    ):
+        raise IsolatedSkillExecutorError(
+            "invalid_response",
+            "Legacy compute executor returned an invalid exit code.",
+        )
+    return []
+
+
+async def execute_isolated_legacy_code(
+    *,
+    code: str,
+    timeout: int = 30,
+    socket_path: str = EXECUTOR_SOCKET,
+    execution_authority_check: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    """Run compatibility compute through the same homogeneous slot pool."""
+
+    if not isinstance(code, str) or not code.strip():
+        raise IsolatedSkillExecutorError(
+            "invalid_code",
+            "Legacy compute code must be a non-empty string.",
+        )
+    try:
+        encoded_code = code.encode("utf-8", errors="strict")
+    except UnicodeError as exc:
+        raise IsolatedSkillExecutorError(
+            "invalid_code",
+            "Legacy compute code must be valid UTF-8.",
+        ) from exc
+    if len(encoded_code) > MAX_CODE_BYTES:
+        raise IsolatedSkillExecutorError(
+            "code_limit_exceeded",
+            f"Legacy compute code exceeds the {MAX_CODE_BYTES}-byte limit.",
+        )
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, int)
+        or not 1 <= timeout <= MAX_SKILL_TIMEOUT
+    ):
+        raise IsolatedSkillExecutorError(
+            "invalid_timeout",
+            "Legacy compute timeout is outside the bounded executor policy.",
+        )
+    request = (
+        json.dumps(
+            {"code": code, "timeout": timeout},
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+    if len(request) > MAX_REQUEST_BYTES:
+        raise IsolatedSkillExecutorError(
+            "request_limit_exceeded",
+            "Legacy compute request exceeds the bounded executor protocol.",
+        )
+
+    reservation: ExecutorSlotReservation | None = None
+    try:
+        response, _artifacts, reservation = (
+            await _exchange_pooled_one_shot(
+                request,
+                socket_path=socket_path,
+                response_timeout=timeout + 10,
+                validate_response=validate_legacy_code_response,
+                execution_authority_check=execution_authority_check,
+            )
+        )
+        return response
+    finally:
+        if reservation is not None:
+            await _release_executor_slot(reservation)

@@ -1,4 +1,4 @@
-"""Persistent class/factory acceptance fixture for the browser profile."""
+"""Persistent class/factory fixture for the unified session sandbox."""
 
 from playwright.sync_api import sync_playwright
 from selenium import webdriver

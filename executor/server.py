@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 import hashlib
 import hmac
 import importlib.metadata
+import ipaddress
 import json
 import os
 import re
@@ -38,6 +39,7 @@ import time
 import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from packaging.markers import default_environment
 from packaging.requirements import InvalidRequirement, Requirement
@@ -86,6 +88,92 @@ MAX_RUNTIME_ENVIRONMENT_VARIABLES = 80
 MAX_RUNTIME_PLATFORM_GROUPS = 32
 MAX_RUNTIME_PLATFORMS_PER_GROUP = 32
 MAX_RUNTIME_DECLARATION_CHARS = 512
+MAX_EGRESS_ORIGINS = 128
+MAX_EGRESS_RULES = 256
+EGRESS_METHOD_ORDER = (
+    "GET",
+    "HEAD",
+    "OPTIONS",
+    "POST",
+    "PUT",
+    "PATCH",
+    "DELETE",
+)
+EGRESS_METHODS = frozenset(EGRESS_METHOD_ORDER)
+SESSION_SANDBOX_RUNTIME_PROFILE = "session-sandbox-v1"
+# Linux accounts RLIMIT_NPROC against the host real UID, even across the four
+# executor PID/mount namespaces. The homogeneous pool therefore needs a
+# deployment-owned aggregate ceiling above one slot's cgroup pids_limit (512).
+# Only the unified profile may raise the rlimit this far; each container's
+# cgroup remains the actual per-slot process/thread hard bound.
+MAX_SESSION_SANDBOX_NPROC = 4_096
+RUNTIME_BUILD_IDENTITY_SCHEMA = "chatds-runtime-build-identity-v1"
+RUNTIME_BUILD_COMPONENTS: tuple[tuple[str, Path], ...] = (
+    ("executor.server", Path(__file__).resolve()),
+    (
+        "browser.profile",
+        Path("/opt/chatds-browser-runtime/profile.json"),
+    ),
+    (
+        "browser.installed_manifest",
+        Path("/opt/chatds-browser-runtime/installed-manifest.json"),
+    ),
+    (
+        "browser.module.chromium_proxy",
+        Path(
+            "/usr/local/lib/python3.12/site-packages/"
+            "chatds_browser_runtime/chromium_proxy.py"
+        ),
+    ),
+    (
+        "browser.module.healthcheck",
+        Path(
+            "/usr/local/lib/python3.12/site-packages/"
+            "chatds_browser_runtime/healthcheck.py"
+        ),
+    ),
+    (
+        "browser.module.policy",
+        Path(
+            "/usr/local/lib/python3.12/site-packages/"
+            "chatds_browser_runtime/policy.py"
+        ),
+    ),
+    (
+        "browser.module.proxy_bridge",
+        Path(
+            "/usr/local/lib/python3.12/site-packages/"
+            "chatds_browser_runtime/proxy_bridge.py"
+        ),
+    ),
+    (
+        "browser.module.runtime_exec",
+        Path(
+            "/usr/local/lib/python3.12/site-packages/"
+            "chatds_browser_runtime/runtime_exec.py"
+        ),
+    ),
+    (
+        "browser.launcher.executor_entrypoint",
+        Path("/usr/local/bin/chatds-browser-executor-entrypoint"),
+    ),
+    (
+        "browser.launcher.runtime_exec",
+        Path("/usr/local/bin/chatds-browser-runtime-exec"),
+    ),
+    (
+        "browser.launcher.health",
+        Path("/usr/local/bin/chatds-browser-runtime-health"),
+    ),
+    (
+        "browser.launcher.chromium_proxy",
+        Path("/usr/local/bin/chatds-chromium-proxy"),
+    ),
+    (
+        "browser.launcher.egress_bridge",
+        Path("/usr/local/bin/chatds-skill-egress-bridge"),
+    ),
+)
 
 # Protocol-v2 is an additive, stateful process protocol.  Protocol-v1 remains
 # unchanged for existing one-shot callers.  A lease still runs inside this
@@ -110,6 +198,12 @@ MAX_PROCESS_CLOSE_CACHE_RESERVE_BYTES = (
 )
 PROCESS_TOMBSTONE_SECONDS = 60
 PROCESS_JANITOR_INTERVAL_SECONDS = 1.0
+# A prepared artifact batch is a two-phase transaction: the Harness must first
+# apply the bounded batch under its workspace CAS and only then acknowledge the
+# executor snapshot.  Idle/max-runtime expiry must not destroy that transaction
+# while a slow local filesystem apply is still in progress, but the reservation
+# also cannot remain immortal after a dead controller.
+PROCESS_SYNC_ACK_GRACE_SECONDS = 300
 MAX_PROCESS_OWNER_ID_BYTES = 256
 TRUSTED_RESOURCE_LAUNCHER = Path("/usr/bin/prlimit")
 TRUSTED_BROWSER_RUNTIME_LAUNCHER = Path(
@@ -121,7 +215,10 @@ _ADDRESS_SPACE_LIMIT_RAW = os.environ.get(
     str(2 * 1024 * 1024 * 1024),
 ).strip()
 if _ADDRESS_SPACE_LIMIT_RAW == "unlimited":
-    if os.environ.get("EXECUTOR_RUNTIME_PROFILE") != "browser-automation-v1":
+    if os.environ.get("EXECUTOR_RUNTIME_PROFILE") not in {
+        "browser-automation-v1",
+        SESSION_SANDBOX_RUNTIME_PROFILE,
+    }:
         raise RuntimeError(
             "An unlimited address-space rlimit is valid only for the "
             "browser-automation-v1 profile."
@@ -833,6 +930,7 @@ class _ProcessLease:
     factory_name: str | None
     runtime_profile: str
     egress_policy: str
+    egress_bridge: Any | None
     interpreter: str
     command: list[str]
     workdir: Path
@@ -866,6 +964,8 @@ class _ProcessLease:
     pending_sync_token: str | None = None
     pending_sync_state: dict[str, tuple[int, str]] | None = None
     pending_sync_close: bool = False
+    pending_sync_ack_deadline: float | None = None
+    pending_sync_prepare_op_id: str | None = None
     closed_at: float | None = None
     close_reason: str | None = None
     pending_expiry_reason: str | None = None
@@ -890,6 +990,8 @@ _EXECUTION_ADMISSION_LOCK = threading.RLock()
 _V1_EXECUTION_LOCK = threading.Lock()
 _ACTIVE_PROCESS_LEASE_HANDLE: str | None = None
 _ACTIVE_V1_EXECUTION = False
+_ACTIVE_V1_EXECUTION_QUARANTINED = False
+_ACTIVE_V1_TEMP_DIR: Path | None = None
 
 
 def _canonical_snapshot_digest(files: dict[str, bytes]) -> str:
@@ -1152,6 +1254,45 @@ def _process_success(
     return response
 
 
+def _terminal_process_error(
+    request_id: str,
+    operation: str,
+    lease: _ProcessLease,
+    code: str,
+    message: str,
+    *,
+    terminal_state: str,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Return an authenticated terminal lease receipt that remains cacheable."""
+
+    if terminal_state not in {"closed", "quarantined"}:
+        raise ProtocolError(
+            "invalid_lease_state",
+            "Terminal process errors require a closed or quarantined state.",
+        )
+    return _process_error(
+        request_id,
+        operation,
+        code,
+        message,
+        handle=lease.handle,
+        scope_digest=lease.scope_digest,
+        skill_sha256=lease.skill_sha256,
+        script_sha256=lease.script_sha256,
+        state=terminal_state,
+        terminal_lease_state=terminal_state,
+        artifacts=[],
+        artifacts_discarded=True,
+        runtime_profile=lease.runtime_profile,
+        network_policy={
+            "direct": "disabled",
+            "egress": lease.egress_policy,
+        },
+        **extra,
+    )
+
+
 def _trusted_resource_launcher() -> str:
     """Return the fixed, controller-verified rlimit launcher path."""
 
@@ -1208,7 +1349,11 @@ def _resource_limited_command(
 ) -> list[str]:
     """Wrap one fixed command with native prlimit before dropping identity."""
 
-    if persistent:
+    universal_runtime = (
+        _configured_runtime_profile()
+        == SESSION_SANDBOX_RUNTIME_PROFILE
+    )
+    if persistent or universal_runtime:
         configured_cpu = _trusted_process_limit(
             "EXECUTOR_PROCESS_MAX_CPU_SECONDS",
             default=900,
@@ -1224,7 +1369,11 @@ def _resource_limited_command(
             # only the trusted profile configuration may raise this value.
             # The base lane keeps the 64-process default and each container's
             # cgroup pids_limit remains the independent hard ceiling.
-            maximum=512,
+            maximum=(
+                MAX_SESSION_SANDBOX_NPROC
+                if universal_runtime
+                else 512
+            ),
         )
         max_files = _trusted_process_limit(
             "EXECUTOR_PROCESS_MAX_NOFILE",
@@ -1237,9 +1386,13 @@ def _resource_limited_command(
         max_processes = 32
         max_files = 64
     if MAX_ADDRESS_SPACE_BYTES is None:
-        if (
-            not persistent
-            or _configured_runtime_profile() != "browser-automation-v1"
+        if not (
+            universal_runtime
+            or (
+                persistent
+                and _configured_runtime_profile()
+                == "browser-automation-v1"
+            )
         ):
             raise ProtocolError(
                 "invalid_resource_limit",
@@ -1576,12 +1729,40 @@ def _configured_execution_temp_root() -> Path:
 
 
 def _make_execution_temp_dir(prefix: str) -> Path:
-    return Path(
+    global _ACTIVE_V1_TEMP_DIR
+    path = Path(
         tempfile.mkdtemp(
             prefix=prefix,
             dir=str(_configured_execution_temp_root()),
         )
     )
+    with _EXECUTION_ADMISSION_LOCK:
+        if _ACTIVE_V1_EXECUTION:
+            if _ACTIVE_V1_TEMP_DIR is not None:
+                _remove_process_tree(path)
+                raise ProtocolError(
+                    "worker_containment_failed",
+                    "A one-shot execution already owns a controller snapshot.",
+                )
+            _ACTIVE_V1_TEMP_DIR = path
+    return path
+
+
+def _teardown_one_shot_temp_dir(path: Path) -> None:
+    """Remove one controller-owned snapshot and prove it no longer exists."""
+
+    global _ACTIVE_V1_EXECUTION_QUARANTINED, _ACTIVE_V1_TEMP_DIR
+    if not _remove_process_tree(path):
+        with _EXECUTION_ADMISSION_LOCK:
+            if _ACTIVE_V1_EXECUTION and _ACTIVE_V1_TEMP_DIR == path:
+                _ACTIVE_V1_EXECUTION_QUARANTINED = True
+        raise ProtocolError(
+            "worker_containment_failed",
+            "One-shot worker tree could not be removed safely.",
+        )
+    with _EXECUTION_ADMISSION_LOCK:
+        if _ACTIVE_V1_TEMP_DIR == path:
+            _ACTIVE_V1_TEMP_DIR = None
 
 
 def _worker_shared_state_roots() -> tuple[Path, ...]:
@@ -1590,7 +1771,10 @@ def _worker_shared_state_roots() -> tuple[Path, ...]:
         Path("/tmp"),
         Path("/dev/shm"),
     ]
-    if _configured_runtime_profile() == "browser-automation-v1":
+    if _configured_runtime_profile() in {
+        "browser-automation-v1",
+        SESSION_SANDBOX_RUNTIME_PROFILE,
+    }:
         roots.append(Path("/workspace"))
     return tuple(dict.fromkeys(roots))
 
@@ -1644,7 +1828,16 @@ def _worker_owned_shared_entries(
         while stack:
             directory = stack.pop()
             try:
-                children = list(os.scandir(directory))
+                remaining_entries = MAX_OUTPUT_ENTRIES - inspected
+                children: list[os.DirEntry[str]] = []
+                with os.scandir(directory) as scanner:
+                    for child in scanner:
+                        children.append(child)
+                        if len(children) > remaining_entries:
+                            raise ProtocolError(
+                                "worker_shared_state_unavailable",
+                                "Executor shared-state audit exceeded its entry bound.",
+                            )
             except OSError as exc:
                 raise ProtocolError(
                     "worker_shared_state_unavailable",
@@ -1792,6 +1985,78 @@ def _cancel_process_admission(reservation: str) -> None:
             _ACTIVE_PROCESS_LEASE_HANDLE = None
 
 
+def _requested_v1_egress_policy(payload: dict[str, Any]) -> str:
+    """Project a bounded client request into its receipt-only policy label."""
+
+    rules = payload.get("egress_rules", [])
+    return (
+        "origin_allowlist_proxy"
+        if isinstance(rules, list) and bool(rules)
+        else "none"
+    )
+
+
+def _skill_invocation_receipt_fields(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Preserve client-built invocation identity when admission fails early."""
+
+    raw = payload.get("invocation")
+    if raw is None:
+        return {"invocation_mode": "cli"}
+    if not isinstance(raw, dict):
+        return {"invocation_mode": "cli"}
+    mode = raw.get("mode")
+    if mode == "function":
+        name = raw.get("name")
+        return {
+            "invocation_mode": "function",
+            **({"function_name": name} if isinstance(name, str) else {}),
+        }
+    if mode == "instance_method":
+        class_name = raw.get("class_name")
+        method_name = raw.get("method_name")
+        return {
+            "invocation_mode": "instance_method",
+            **(
+                {"class_name": class_name}
+                if isinstance(class_name, str)
+                else {}
+            ),
+            **(
+                {"method_name": method_name}
+                if isinstance(method_name, str)
+                else {}
+            ),
+        }
+    return {"invocation_mode": "cli"}
+
+
+def _declared_command_request_sha256(
+    payload: dict[str, Any],
+) -> str | None:
+    """Reproduce the no-shell command identity before worker admission."""
+
+    executable = payload.get("executable")
+    argv = payload.get("argv", [])
+    if (
+        not isinstance(executable, str)
+        or not isinstance(argv, list)
+        or any(not isinstance(item, str) for item in argv)
+    ):
+        return None
+    try:
+        encoded = json.dumps(
+            [executable, *argv],
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError):
+        return None
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _v1_execution_error(
     payload: dict[str, Any],
     code: str,
@@ -1804,7 +2069,13 @@ def _v1_execution_error(
     )
     kind = payload.get("kind")
     if kind == "skill_script":
-        return _skill_error(request_id, code, message)
+        return _skill_error(
+            request_id,
+            code,
+            message,
+            egress_policy=_requested_v1_egress_policy(payload),
+            **_skill_invocation_receipt_fields(payload),
+        )
     if kind == "declared_command":
         return _declared_command_error(
             request_id,
@@ -1816,6 +2087,8 @@ def _v1_execution_error(
                 else None
             ),
             cwd=payload.get("cwd") if isinstance(payload.get("cwd"), str) else None,
+            command_sha256=_declared_command_request_sha256(payload),
+            egress_policy=_requested_v1_egress_policy(payload),
         )
     if kind == "session_code":
         return _session_code_error(request_id, code, message)
@@ -1831,10 +2104,23 @@ def _run_v1_serialized(
     payload: dict[str, Any],
     runner: Any,
 ) -> dict[str, Any]:
-    """Serialize every one-shot child with the same dedicated UID slot."""
+    """Admit at most one one-shot child to the dedicated UID slot.
 
-    global _ACTIVE_V1_EXECUTION
-    with _V1_EXECUTION_LOCK:
+    Waiting on this lock is unsafe: the caller can time out while its server
+    handler remains queued, after which the handler could execute side effects
+    without a live request fence.  A contending request therefore fails closed
+    immediately and must be retried explicitly by the caller.
+    """
+
+    global _ACTIVE_V1_EXECUTION, _ACTIVE_V1_EXECUTION_QUARANTINED
+    global _ACTIVE_V1_TEMP_DIR
+    if not _V1_EXECUTION_LOCK.acquire(blocking=False):
+        return _v1_execution_error(
+            payload,
+            "worker_busy",
+            "The dedicated worker identity is already assigned to another execution.",
+        )
+    try:
         with _EXECUTION_ADMISSION_LOCK:
             if _ACTIVE_V1_EXECUTION or _ACTIVE_PROCESS_LEASE_HANDLE is not None:
                 return _v1_execution_error(
@@ -1843,6 +2129,8 @@ def _run_v1_serialized(
                     "The dedicated worker identity is already assigned to another execution.",
                 )
             _ACTIVE_V1_EXECUTION = True
+            _ACTIVE_V1_EXECUTION_QUARANTINED = False
+            _ACTIVE_V1_TEMP_DIR = None
 
         result: dict[str, Any] | None = None
         execution_error: BaseException | None = None
@@ -1852,14 +2140,32 @@ def _run_v1_serialized(
         except BaseException as exc:
             execution_error = exc
         finally:
+            if (
+                isinstance(execution_error, ProtocolError)
+                and execution_error.code == "worker_containment_failed"
+            ):
+                containment_error = execution_error
             try:
                 _sweep_configured_worker_uid()
-                _purge_configured_worker_shared_state()
+                if containment_error is None:
+                    with _EXECUTION_ADMISSION_LOCK:
+                        active_temp_dir = _ACTIVE_V1_TEMP_DIR
+                    if active_temp_dir is not None:
+                        raise ProtocolError(
+                            "worker_containment_failed",
+                            "One-shot worker tree survived execution teardown.",
+                        )
+                    _purge_configured_worker_shared_state()
             except ProtocolError as exc:
                 containment_error = exc
-            else:
+            if containment_error is None:
                 with _EXECUTION_ADMISSION_LOCK:
                     _ACTIVE_V1_EXECUTION = False
+                    _ACTIVE_V1_EXECUTION_QUARANTINED = False
+                    _ACTIVE_V1_TEMP_DIR = None
+            else:
+                with _EXECUTION_ADMISSION_LOCK:
+                    _ACTIVE_V1_EXECUTION_QUARANTINED = True
         if containment_error is not None:
             return _v1_execution_error(
                 payload,
@@ -1871,6 +2177,8 @@ def _run_v1_serialized(
         if result is None:
             raise RuntimeError("One-shot executor returned no result.")
         return result
+    finally:
+        _V1_EXECUTION_LOCK.release()
 
 
 def _prepare_worker_tree(
@@ -1933,12 +2241,77 @@ def _prepare_worker_tree(
 
 def _configured_runtime_profile() -> str:
     profile = os.environ.get("EXECUTOR_RUNTIME_PROFILE", "base-v1")
-    if profile not in {"base-v1", "browser-automation-v1"}:
+    if profile not in {
+        "base-v1",
+        "browser-automation-v1",
+        SESSION_SANDBOX_RUNTIME_PROFILE,
+    }:
         raise ProtocolError(
             "runtime_profile_unavailable",
             "Executor runtime profile is not a supported fixed profile.",
         )
     return profile
+
+
+def _runtime_build_component_record(
+    name: str,
+    path: Path,
+) -> dict[str, Any]:
+    """Content-address one fixed image component without trusting path metadata."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(os.fspath(path), flags)
+    except FileNotFoundError:
+        # Source-tree tests intentionally lack most image-only paths.  Their
+        # absence is still part of the canonical identity instead of being
+        # replaced by a random value or silently omitted.
+        return {"component": name, "status": "missing"}
+    except OSError:
+        return {"component": name, "status": "unavailable"}
+    try:
+        item = os.fstat(descriptor)
+        if not stat.S_ISREG(item.st_mode):
+            return {"component": name, "status": "not_regular"}
+        digest = hashlib.sha256()
+        size_bytes = 0
+        while True:
+            chunk = os.read(descriptor, 256 * 1024)
+            if not chunk:
+                break
+            size_bytes += len(chunk)
+            digest.update(chunk)
+    except OSError:
+        return {"component": name, "status": "unavailable"}
+    finally:
+        os.close(descriptor)
+    return {
+        "component": name,
+        "status": "present",
+        "size_bytes": size_bytes,
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _runtime_build_sha256() -> str:
+    """Hash the immutable executor/browser control plane as one build identity."""
+
+    records = [
+        _runtime_build_component_record(name, path)
+        for name, path in sorted(RUNTIME_BUILD_COMPONENTS)
+    ]
+    encoded = json.dumps(
+        {
+            "schema": RUNTIME_BUILD_IDENTITY_SCHEMA,
+            "components": records,
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _bounded_runtime_environment_value(name: str) -> str | None:
@@ -1955,7 +2328,10 @@ def _bounded_runtime_environment_value(name: str) -> str | None:
 
 def _profile_process_environment() -> tuple[str, str, dict[str, str]]:
     profile = _configured_runtime_profile()
-    if profile != "browser-automation-v1":
+    if profile not in {
+        "browser-automation-v1",
+        SESSION_SANDBOX_RUNTIME_PROFILE,
+    }:
         return profile, "none", {}
     forwarded: dict[str, str] = {}
     for name in (
@@ -1975,25 +2351,439 @@ def _profile_process_environment() -> tuple[str, str, dict[str, str]]:
         value = _bounded_runtime_environment_value(name)
         if value is not None:
             forwarded[name] = value
-    proxy = _bounded_runtime_environment_value("SKILL_EGRESS_PROXY_URL")
-    if proxy:
-        forwarded["SKILL_EGRESS_PROXY_URL"] = proxy
-        for name in (
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "all_proxy",
-        ):
-            forwarded[name] = proxy
-        # Only loopback is exempt so Selenium can reach its local driver.
-        # Chromium's external traffic remains forced through the policy proxy.
-        loopback_only = "localhost,127.0.0.1,[::1]"
-        forwarded["NO_PROXY"] = loopback_only
-        forwarded["no_proxy"] = loopback_only
-        return profile, "policy_proxy", forwarded
     return profile, "none", forwarded
+
+
+def _canonical_egress_origin(value: str) -> str:
+    if not isinstance(value, str) or not value or len(value) > 8_192:
+        raise ProtocolError(
+            "invalid_egress_policy",
+            "Session sandbox egress contains an invalid origin.",
+        )
+    try:
+        parsed = urlsplit(value)
+        parsed_host = parsed.hostname
+        parsed_port = parsed.port
+        port = (
+            parsed_port
+            if parsed_port is not None
+            else (443 if parsed.scheme.casefold() == "https" else 80)
+        )
+    except ValueError as exc:
+        raise ProtocolError(
+            "invalid_egress_policy",
+            "Session sandbox egress contains an invalid origin.",
+        ) from exc
+    scheme = parsed.scheme.casefold()
+    if (
+        scheme not in {"http", "https"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or not parsed_host
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or not 1 <= port <= 65_535
+    ):
+        raise ProtocolError(
+            "invalid_egress_policy",
+            "Session sandbox egress contains an invalid origin.",
+        )
+    raw_host = parsed_host.rstrip(".").casefold()
+    if (
+        not raw_host
+        or "%" in raw_host
+        or any(char in raw_host for char in "*?[]")
+        or any(
+            ord(char) < 0x20 or ord(char) == 0x7F
+            for char in raw_host
+        )
+    ):
+        raise ProtocolError(
+            "invalid_egress_policy",
+            "Session sandbox egress contains an invalid host.",
+        )
+    try:
+        address = ipaddress.ip_address(raw_host)
+    except ValueError:
+        try:
+            host = raw_host.encode("idna").decode("ascii")
+        except UnicodeError as exc:
+            raise ProtocolError(
+                "invalid_egress_policy",
+                "Session sandbox egress contains an invalid host.",
+            ) from exc
+        if (
+            len(host) > 253
+            or any(
+                not label
+                or len(label) > 63
+                or label.startswith("-")
+                or label.endswith("-")
+                or any(
+                    char
+                    not in "abcdefghijklmnopqrstuvwxyz0123456789-"
+                    for char in label
+                )
+                for label in host.split(".")
+            )
+        ):
+            raise ProtocolError(
+                "invalid_egress_policy",
+                "Session sandbox egress contains an invalid host.",
+            )
+    else:
+        host = (
+            f"[{address.compressed}]"
+            if address.version == 6
+            else address.compressed
+        )
+    canonical = f"{scheme}://{host}:{port}"
+    if canonical != value:
+        raise ProtocolError(
+            "invalid_egress_policy",
+            "Session sandbox egress origins must be canonical.",
+        )
+    return canonical
+
+
+def _validated_egress_origins(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list) or len(value) > MAX_EGRESS_ORIGINS:
+        raise ProtocolError(
+            "invalid_egress_policy",
+            "Session sandbox egress exceeds its bounded origin policy.",
+        )
+    result = tuple(_canonical_egress_origin(item) for item in value)
+    if len(set(result)) != len(result):
+        raise ProtocolError(
+            "invalid_egress_policy",
+            "Session sandbox egress origins must be unique.",
+        )
+    return result
+
+
+_INVALID_EGRESS_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-F]{2})")
+_INVALID_EGRESS_ENCODED_PATH = re.compile(
+    r"%(?:2e|2f|5c|25|23|3f|0[0-9a-f]|1[0-9a-f]|7f)",
+    re.IGNORECASE,
+)
+
+
+def _canonical_egress_url_prefix(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > 8_192
+        or any(
+            character.isspace()
+            or ord(character) < 0x20
+            or ord(character) == 0x7F
+            for character in value
+        )
+    ):
+        raise ProtocolError(
+            "invalid_egress_policy",
+            "Session sandbox egress contains an invalid URL prefix.",
+        )
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        parsed_port = parsed.port
+    except (TypeError, ValueError) as exc:
+        raise ProtocolError(
+            "invalid_egress_policy",
+            "Session sandbox egress contains an invalid URL prefix.",
+        ) from exc
+    scheme = parsed.scheme.casefold()
+    if (
+        scheme not in {"http", "https"}
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+    ):
+        raise ProtocolError(
+            "invalid_egress_policy",
+            "Session sandbox egress contains an invalid URL prefix.",
+        )
+    port = (
+        parsed_port
+        if parsed_port is not None
+        else (443 if scheme == "https" else 80)
+    )
+    rendered_host = (
+        f"[{hostname}]"
+        if ":" in hostname and not hostname.startswith("[")
+        else hostname
+    )
+    origin = _canonical_egress_origin(
+        f"{scheme}://{rendered_host}:{port}"
+    )
+    path = parsed.path or "/"
+    if (
+        not path.startswith("/")
+        or "\\" in path
+        or "//" in path
+        or "{" in path
+        or "}" in path
+        or _INVALID_EGRESS_PERCENT_ESCAPE.search(path)
+        or _INVALID_EGRESS_ENCODED_PATH.search(path)
+        or any(
+            re.fullmatch(r"\.{1,2}(?:;.*)?", component) is not None
+            for component in path.split("/")
+        )
+    ):
+        raise ProtocolError(
+            "invalid_egress_policy",
+            "Session sandbox egress contains an invalid URL prefix.",
+        )
+    query = parsed.query
+    if (
+        "{" in query
+        or "}" in query
+        or ";" in query
+        or _INVALID_EGRESS_PERCENT_ESCAPE.search(query)
+        or re.search(
+            r"%(?:25|23|0[0-9A-F]|1[0-9A-F]|7F)",
+            query,
+            re.IGNORECASE,
+        )
+    ):
+        raise ProtocolError(
+            "invalid_egress_policy",
+            "Session sandbox egress contains an invalid URL prefix.",
+        )
+    canonical = urlunsplit((
+        scheme,
+        urlsplit(origin).netloc,
+        path,
+        query,
+        "",
+    ))
+    if canonical != value:
+        raise ProtocolError(
+            "invalid_egress_policy",
+            "Session sandbox egress URL prefixes must be canonical.",
+        )
+    return canonical
+
+
+def _validated_exact_egress_policy(
+    payload: dict[str, Any],
+) -> tuple[
+    tuple[dict[str, Any], ...],
+    tuple[str, ...],
+    tuple[str, ...],
+]:
+    raw_rules = payload.get("egress_rules", [])
+    if (
+        not isinstance(raw_rules, list)
+        or len(raw_rules) > MAX_EGRESS_RULES
+    ):
+        raise ProtocolError(
+            "invalid_egress_policy",
+            "Session sandbox egress exceeds its bounded exact-rule policy.",
+        )
+    rules: list[dict[str, Any]] = []
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+    for rule in raw_rules:
+        if (
+            not isinstance(rule, dict)
+            or set(rule) != {"methods", "url_prefix"}
+            or not isinstance(rule.get("methods"), list)
+        ):
+            raise ProtocolError(
+                "invalid_egress_policy",
+                "Session sandbox egress contains a malformed exact rule.",
+            )
+        prefix = _canonical_egress_url_prefix(rule.get("url_prefix"))
+        methods = rule["methods"]
+        if (
+            not methods
+            or len(methods) > len(EGRESS_METHOD_ORDER)
+            or any(method not in EGRESS_METHODS for method in methods)
+            or len(set(methods)) != len(methods)
+        ):
+            raise ProtocolError(
+                "invalid_egress_policy",
+                "Session sandbox egress contains an invalid method set.",
+            )
+        canonical_methods = tuple(
+            method for method in EGRESS_METHOD_ORDER if method in set(methods)
+        )
+        coordinate = (prefix, canonical_methods)
+        if list(canonical_methods) != methods or coordinate in seen:
+            raise ProtocolError(
+                "invalid_egress_policy",
+                "Session sandbox egress rules must be canonical and unique.",
+            )
+        seen.add(coordinate)
+        rules.append({
+            "methods": list(canonical_methods),
+            "url_prefix": prefix,
+        })
+    if raw_rules and payload.get("egress_policy_version") != 2:
+        raise ProtocolError(
+            "invalid_egress_policy",
+            "Exact sandbox egress requires policy version 2.",
+        )
+    if not raw_rules and payload.get("egress_policy_version") not in {
+        None, 2,
+    }:
+        raise ProtocolError(
+            "invalid_egress_policy",
+            "Unsupported sandbox egress policy version.",
+        )
+    origins = tuple(dict.fromkeys(
+        _canonical_egress_origin(
+            f"{urlsplit(rule['url_prefix']).scheme}://"
+            f"{urlsplit(rule['url_prefix']).netloc}"
+        )
+        for rule in rules
+    ))
+    asserted_origins = _validated_egress_origins(
+        payload.get("egress_origins", [])
+    )
+    if asserted_origins != origins:
+        raise ProtocolError(
+            "invalid_egress_policy",
+            "Origin-only sandbox egress is forbidden; origins must equal the "
+            "exact method/prefix projection.",
+        )
+    private_origins = _validated_egress_origins(
+        payload.get("private_origins", [])
+    )
+    if any(origin not in set(origins) for origin in private_origins):
+        raise ProtocolError(
+            "invalid_egress_policy",
+            "Private sandbox origins must be derived from exact URL rules.",
+        )
+    return tuple(rules), origins, private_origins
+
+
+@dataclass
+class _EgressBridgeHandle:
+    server: Any
+    thread: threading.Thread
+    environment: dict[str, str]
+    closed: bool = False
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=3)
+        if self.thread.is_alive():
+            raise ProtocolError(
+                "egress_bridge_cleanup_failed",
+                "Session sandbox egress bridge did not stop cleanly.",
+            )
+
+
+def _start_egress_bridge(
+    origins: tuple[str, ...],
+    *,
+    egress_rules: tuple[dict[str, Any], ...] = (),
+    private_origins: tuple[str, ...] = (),
+    runtime_root: Path,
+) -> _EgressBridgeHandle | None:
+    """Create one lease-scoped loopback bridge from trusted policy state."""
+
+    try:
+        from chatds_browser_runtime.proxy_bridge import (
+            EXPECTED_BRIDGE_GID,
+            EXPECTED_PROXY_UID,
+            PROXY_CA_CERTIFICATE_PATH,
+            PROXY_LEAF_SPKI_PATH,
+            PROXY_SOCKET_PATH,
+            LoopbackProxyBridge,
+            ProxySocketAuthority,
+            ProxyTrustAuthority,
+        )
+    except ImportError:
+        try:
+            from browser_runtime.chatds_browser_runtime.proxy_bridge import (
+                EXPECTED_BRIDGE_GID,
+                EXPECTED_PROXY_UID,
+                PROXY_CA_CERTIFICATE_PATH,
+                PROXY_LEAF_SPKI_PATH,
+                PROXY_SOCKET_PATH,
+                LoopbackProxyBridge,
+                ProxySocketAuthority,
+                ProxyTrustAuthority,
+            )
+        except ImportError as exc:
+            raise ProtocolError(
+                "egress_bridge_unavailable",
+                "The fixed session sandbox egress bridge is unavailable.",
+            ) from exc
+    authority = ProxySocketAuthority(
+        PROXY_SOCKET_PATH,
+        expected_uid=EXPECTED_PROXY_UID,
+        expected_gid=EXPECTED_BRIDGE_GID,
+    )
+    try:
+        authority.validate()
+        worker_uid, worker_gid = _configured_worker_identity()
+        trust_environment = ProxyTrustAuthority(
+            PROXY_CA_CERTIFICATE_PATH,
+            PROXY_LEAF_SPKI_PATH,
+            expected_uid=EXPECTED_PROXY_UID,
+            expected_gid=EXPECTED_BRIDGE_GID,
+        ).materialize(
+            runtime_root,
+            worker_uid=worker_uid,
+            worker_gid=worker_gid,
+        )
+        bridge = LoopbackProxyBridge(
+            authority,
+            ("127.0.0.1", 0),
+            origin_allowlist=origins,
+            egress_rules=egress_rules,
+            private_origins=private_origins,
+            trust_generation=trust_environment[
+                "SKILL_EGRESS_TRUST_GENERATION"
+            ],
+        )
+    except Exception as exc:
+        raise ProtocolError(
+            "egress_bridge_unavailable",
+            "The fixed session sandbox egress bridge failed closed.",
+        ) from exc
+    thread = threading.Thread(
+        target=bridge.serve_forever,
+        kwargs={"poll_interval": 0.1},
+        daemon=True,
+        name="session-sandbox-egress",
+    )
+    thread.start()
+    port = int(bridge.server_address[1])
+    proxy = f"http://127.0.0.1:{port}"
+    environment = {
+        "SKILL_EGRESS_PROXY_URL": proxy,
+        "HTTP_PROXY": proxy,
+        "HTTPS_PROXY": proxy,
+        "ALL_PROXY": proxy,
+        "http_proxy": proxy,
+        "https_proxy": proxy,
+        "all_proxy": proxy,
+        # Selenium clients need their private local driver. No non-loopback
+        # destination can bypass Docker's network_mode:none boundary.
+        "NO_PROXY": "localhost,127.0.0.1,[::1]",
+        "no_proxy": "localhost,127.0.0.1,[::1]",
+        "NODE_USE_ENV_PROXY": "1",
+        **trust_environment,
+    }
+    return _EgressBridgeHandle(
+        server=bridge,
+        thread=thread,
+        environment=environment,
+    )
 
 
 def _request_kind_allowed(kind: str) -> bool:
@@ -2183,7 +2973,7 @@ def _run_code(payload: dict[str, Any]) -> dict[str, Any]:
             "duration_seconds": round(time.monotonic() - started, 2),
         }
     finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        _teardown_one_shot_temp_dir(temp_dir)
 
 
 def _safe_relative_path(value: Any, *, field: str) -> str:
@@ -2571,7 +3361,10 @@ def _run_runtime_capabilities(payload: dict[str, Any]) -> dict[str, Any]:
         runtime_profile, egress_policy, profile_environment = _profile_process_environment()
         available_environment = set(SKILL_RUNTIME_ENVIRONMENT_VARIABLES)
         available_environment.update(profile_environment)
-        if runtime_profile == "browser-automation-v1":
+        if runtime_profile in {
+            "browser-automation-v1",
+            SESSION_SANDBOX_RUNTIME_PROFILE,
+        }:
             # The trusted launcher creates these values per lease after it
             # starts the private non-root Wayland compositor.  DISPLAY is
             # deliberately not advertised: this profile has no shared X11
@@ -2616,6 +3409,7 @@ def _run_runtime_capabilities(payload: dict[str, Any]) -> dict[str, Any]:
                 "python_version": ".".join(str(part) for part in sys.version_info[:3]),
                 "platform": current_platform,
                 "network": "disabled",
+                "runtime_build_sha256": _runtime_build_sha256(),
                 "runtime_profile": runtime_profile,
                 "network_policy": {
                     "direct": "disabled",
@@ -2623,10 +3417,16 @@ def _run_runtime_capabilities(payload: dict[str, Any]) -> dict[str, Any]:
                 },
                 "display_backend": (
                     "wayland-headless"
-                    if runtime_profile == "browser-automation-v1"
+                    if runtime_profile in {
+                        "browser-automation-v1",
+                        SESSION_SANDBOX_RUNTIME_PROFILE,
+                    }
                     else "none"
                 ),
-                "headed_browser": runtime_profile == "browser-automation-v1",
+                "headed_browser": runtime_profile in {
+                    "browser-automation-v1",
+                    SESSION_SANDBOX_RUNTIME_PROFILE,
+                },
                 "x11": False,
                 "dependency_install": "disabled",
                 "execution_identity": {
@@ -2928,7 +3728,10 @@ def _interpreter_command(
             stream.write(CLI_RUNNER_SOURCE.encode("utf-8"))
         os.chmod(runner_path, 0o400)
         arguments = [str(skill_root), str(entrypoint)]
-        if runtime_profile == "browser-automation-v1":
+        if runtime_profile in {
+            "browser-automation-v1",
+            SESSION_SANDBOX_RUNTIME_PROFILE,
+        }:
             return kind, _browser_runtime_command(runner_path, arguments)
         return kind, [
             sys.executable,
@@ -2938,14 +3741,20 @@ def _interpreter_command(
             *arguments,
         ]
     if kind == "bash":
-        if runtime_profile == "browser-automation-v1":
+        if runtime_profile in {
+            "browser-automation-v1",
+            SESSION_SANDBOX_RUNTIME_PROFILE,
+        }:
             return kind, _browser_runtime_command(entrypoint, [])
         executable = Path("/bin/bash")
         if not executable.is_file():
             raise ProtocolError("interpreter_unavailable", "The fixed bash interpreter is unavailable.")
         return kind, [str(executable), "--noprofile", "--norc", str(entrypoint)]
     if kind == "node":
-        if runtime_profile == "browser-automation-v1":
+        if runtime_profile in {
+            "browser-automation-v1",
+            SESSION_SANDBOX_RUNTIME_PROFILE,
+        }:
             return kind, _browser_runtime_command(entrypoint, [])
         executable = Path("/usr/bin/node")
         if not executable.is_file():
@@ -2989,21 +3798,269 @@ def _browser_runtime_command(
     ]
 
 
-def _read_regular_file(path: Path, *, display_path: str) -> tuple[bytes, os.stat_result]:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+def _require_safe_output_fd_api() -> None:
+    """Fail closed unless this executor can traverse output by descriptor."""
+
+    if (
+        not getattr(os, "O_NOFOLLOW", 0)
+        or not getattr(os, "O_DIRECTORY", 0)
+        or os.open not in os.supports_dir_fd
+        or os.stat not in os.supports_dir_fd
+        or os.stat not in os.supports_follow_symlinks
+        or os.scandir not in os.supports_fd
+    ):
+        raise ProtocolError(
+            "unsafe_workspace_output",
+            "This executor cannot safely traverse workspace output by descriptor.",
+        )
+
+
+def _output_object_identity(item: os.stat_result) -> tuple[int, int, int]:
+    return (
+        item.st_dev,
+        item.st_ino,
+        item.st_mode,
+    )
+
+
+def _stable_output_file_identity(
+    item: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        item.st_dev,
+        item.st_ino,
+        item.st_mode,
+        item.st_nlink,
+        item.st_size,
+        item.st_mtime_ns,
+        item.st_ctime_ns,
+    )
+
+
+def _stable_output_directory_identity(
+    item: os.stat_result,
+) -> tuple[int, int, int, int, int, int]:
+    return (
+        item.st_dev,
+        item.st_ino,
+        item.st_mode,
+        item.st_nlink,
+        item.st_mtime_ns,
+        item.st_ctime_ns,
+    )
+
+
+def _open_output_directory_at(
+    parent_fd: int,
+    name: str,
+    *,
+    display_path: str,
+    expected: os.stat_result | None = None,
+) -> tuple[int, os.stat_result]:
+    """Open one directory component without ever following a link."""
+
     try:
-        descriptor = os.open(path, flags)
+        before = expected or os.stat(
+            name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
     except OSError as exc:
-        raise ProtocolError("unsafe_workspace_output", f"Cannot safely open output: {display_path}") from exc
+        raise ProtocolError(
+            "unsafe_workspace_output",
+            f"Cannot safely inspect output directory: {display_path}",
+        ) from exc
+    if not stat.S_ISDIR(before.st_mode):
+        raise ProtocolError(
+            "unsafe_workspace_output",
+            f"Workspace output directory is unsafe: {display_path}",
+        )
+    flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        raise ProtocolError(
+            "unsafe_workspace_output",
+            f"Cannot safely open output directory: {display_path}",
+        ) from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or _output_object_identity(before)
+            != _output_object_identity(opened)
+        ):
+            raise ProtocolError(
+                "workspace_output_race",
+                f"Workspace output directory changed during collection: {display_path}",
+            )
+        try:
+            rebound = os.stat(
+                name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise ProtocolError(
+                "workspace_output_race",
+                f"Workspace output directory changed during collection: {display_path}",
+            ) from exc
+        if _output_object_identity(rebound) != _output_object_identity(opened):
+            raise ProtocolError(
+                "workspace_output_race",
+                f"Workspace output directory changed during collection: {display_path}",
+            )
+        return descriptor, opened
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_anchored_output_directory(
+    path: Path,
+    *,
+    display_path: str,
+) -> tuple[
+    list[int],
+    list[tuple[int, str, int, tuple[int, int, int]]],
+]:
+    """Open every absolute path component and retain the complete fd chain."""
+
+    _require_safe_output_fd_api()
+    if not path.is_absolute() or path.anchor != "/" or ".." in path.parts:
+        raise ProtocolError(
+            "unsafe_workspace_output",
+            f"Workspace output root is not a canonical absolute directory: {display_path}",
+        )
+    flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        root_fd = os.open("/", flags)
+    except OSError as exc:
+        raise ProtocolError(
+            "unsafe_workspace_output",
+            f"Cannot safely anchor output directory: {display_path}",
+        ) from exc
+    descriptors = [root_fd]
+    links: list[tuple[int, str, int, tuple[int, int, int]]] = []
+    try:
+        for component in path.parts[1:]:
+            child_fd, opened = _open_output_directory_at(
+                descriptors[-1],
+                component,
+                display_path=display_path,
+            )
+            links.append((
+                descriptors[-1],
+                component,
+                child_fd,
+                _output_object_identity(opened),
+            ))
+            descriptors.append(child_fd)
+        return descriptors, links
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+        raise
+
+
+def _validate_anchored_output_directory(
+    links: list[tuple[int, str, int, tuple[int, int, int]]],
+    *,
+    display_path: str,
+) -> None:
+    """Prove no component in the retained root-to-leaf chain was rebound."""
+
+    for parent_fd, name, child_fd, expected in links:
+        try:
+            linked = os.stat(
+                name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            opened = os.fstat(child_fd)
+        except OSError as exc:
+            raise ProtocolError(
+                "workspace_output_race",
+                f"Workspace output path changed during collection: {display_path}",
+            ) from exc
+        if (
+            _output_object_identity(linked) != expected
+            or _output_object_identity(opened) != expected
+        ):
+            raise ProtocolError(
+                "workspace_output_race",
+                f"Workspace output path changed during collection: {display_path}",
+            )
+
+
+def _read_regular_file_at(
+    parent_fd: int,
+    name: str,
+    *,
+    display_path: str,
+    expected: os.stat_result | None = None,
+) -> tuple[bytes, os.stat_result]:
+    """Read an unchanged regular file through its already-anchored parent."""
+
+    try:
+        linked_before = expected or os.stat(
+            name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        raise ProtocolError(
+            "unsafe_workspace_output",
+            f"Cannot safely inspect output: {display_path}",
+        ) from exc
+    if (
+        not stat.S_ISREG(linked_before.st_mode)
+        or linked_before.st_nlink != 1
+    ):
+        raise ProtocolError(
+            "unsafe_workspace_output",
+            f"Workspace output is not an independent regular file: {display_path}",
+        )
+    flags = (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        raise ProtocolError(
+            "unsafe_workspace_output",
+            f"Cannot safely open output: {display_path}",
+        ) from exc
     try:
         before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or _output_object_identity(linked_before)
+            != _output_object_identity(before)
+        ):
             raise ProtocolError(
-                "unsafe_workspace_output",
-                f"Workspace output is not an independent regular file: {display_path}",
+                "workspace_output_race",
+                f"Workspace output changed during collection: {display_path}",
             )
         if before.st_size > MAX_OUTPUT_FILE_BYTES:
-            raise ProtocolError("output_limit_exceeded", f"Workspace output is too large: {display_path}")
+            raise ProtocolError(
+                "output_limit_exceeded",
+                f"Workspace output is too large: {display_path}",
+            )
         chunks: list[bytes] = []
         remaining = before.st_size
         while remaining:
@@ -3014,13 +4071,56 @@ def _read_regular_file(path: Path, *, display_path: str) -> tuple[bytes, os.stat
             remaining -= len(chunk)
         content = b"".join(chunks)
         after = os.fstat(descriptor)
-        before_identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-        after_identity = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-        if len(content) != before.st_size or before_identity != after_identity:
-            raise ProtocolError("workspace_output_race", f"Workspace output changed during collection: {display_path}")
+        try:
+            linked_after = os.stat(
+                name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise ProtocolError(
+                "workspace_output_race",
+                f"Workspace output changed during collection: {display_path}",
+            ) from exc
+        if (
+            len(content) != before.st_size
+            or _stable_output_file_identity(before)
+            != _stable_output_file_identity(after)
+            or _stable_output_file_identity(before)
+            != _stable_output_file_identity(linked_after)
+        ):
+            raise ProtocolError(
+                "workspace_output_race",
+                f"Workspace output changed during collection: {display_path}",
+            )
         return content, after
     finally:
         os.close(descriptor)
+
+
+def _read_regular_file(
+    path: Path,
+    *,
+    display_path: str,
+) -> tuple[bytes, os.stat_result]:
+    descriptors, links = _open_anchored_output_directory(
+        path.parent,
+        display_path=display_path,
+    )
+    try:
+        result = _read_regular_file_at(
+            descriptors[-1],
+            path.name,
+            display_path=display_path,
+        )
+        _validate_anchored_output_directory(
+            links,
+            display_path=display_path,
+        )
+        return result
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
 def _collect_workspace_artifacts_with_state(
@@ -3032,19 +4132,41 @@ def _collect_workspace_artifacts_with_state(
     current: dict[str, tuple[int, str]] = {}
     output_total = 0
     entries = 0
-    stack: list[tuple[Path, str, int]] = [(workspace, "", 0)]
+    descriptors, links = _open_anchored_output_directory(
+        workspace,
+        display_path="workspace",
+    )
 
-    while stack:
-        directory, prefix, depth = stack.pop()
+    def collect_directory(directory_fd: int, prefix: str, depth: int) -> None:
+        nonlocal entries, output_total
         try:
-            children = sorted(os.scandir(directory), key=lambda entry: entry.name)
+            directory_before = os.fstat(directory_fd)
+            remaining_entries = MAX_OUTPUT_ENTRIES - entries
+            children: list[str] = []
+            with os.scandir(directory_fd) as scanner:
+                for child in scanner:
+                    children.append(child.name)
+                    if len(children) > remaining_entries:
+                        raise ProtocolError(
+                            "output_limit_exceeded",
+                            "Workspace output has too many filesystem entries.",
+                        )
+            children.sort()
         except OSError as exc:
-            raise ProtocolError("unsafe_workspace_output", "Cannot safely scan the workspace output.") from exc
-        for child in children:
+            raise ProtocolError(
+                "unsafe_workspace_output",
+                "Cannot safely scan the workspace output.",
+            ) from exc
+        if not stat.S_ISDIR(directory_before.st_mode):
+            raise ProtocolError(
+                "unsafe_workspace_output",
+                "Workspace output traversal lost its directory anchor.",
+            )
+        for child_name in children:
             entries += 1
             if entries > MAX_OUTPUT_ENTRIES:
                 raise ProtocolError("output_limit_exceeded", "Workspace output has too many filesystem entries.")
-            relative = f"{prefix}/{child.name}" if prefix else child.name
+            relative = f"{prefix}/{child_name}" if prefix else child_name
             safe_relative = _safe_relative_path(relative, field="workspace output path")
             if PurePosixPath(safe_relative).parts[0] in RESERVED_WORKSPACE_ROOTS:
                 raise ProtocolError(
@@ -3052,7 +4174,11 @@ def _collect_workspace_artifacts_with_state(
                     f"Writes to reserved workspace paths are forbidden: {safe_relative}",
                 )
             try:
-                item_stat = child.stat(follow_symlinks=False)
+                item_stat = os.stat(
+                    child_name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
             except OSError as exc:
                 raise ProtocolError("unsafe_workspace_output", f"Cannot inspect output: {safe_relative}") from exc
             mode = item_stat.st_mode
@@ -3061,7 +4187,39 @@ def _collect_workspace_artifacts_with_state(
             if stat.S_ISDIR(mode):
                 if depth + 1 >= MAX_PATH_DEPTH:
                     raise ProtocolError("output_limit_exceeded", f"Workspace output is too deeply nested: {safe_relative}")
-                stack.append((Path(child.path), safe_relative, depth + 1))
+                child_fd, child_opened = _open_output_directory_at(
+                    directory_fd,
+                    child_name,
+                    display_path=safe_relative,
+                    expected=item_stat,
+                )
+                try:
+                    collect_directory(
+                        child_fd,
+                        safe_relative,
+                        depth + 1,
+                    )
+                    try:
+                        linked_after = os.stat(
+                            child_name,
+                            dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        )
+                    except OSError as exc:
+                        raise ProtocolError(
+                            "workspace_output_race",
+                            f"Workspace output directory changed during collection: {safe_relative}",
+                        ) from exc
+                    if (
+                        _output_object_identity(linked_after)
+                        != _output_object_identity(child_opened)
+                    ):
+                        raise ProtocolError(
+                            "workspace_output_race",
+                            f"Workspace output directory changed during collection: {safe_relative}",
+                        )
+                finally:
+                    os.close(child_fd)
                 continue
             if not stat.S_ISREG(mode) or item_stat.st_nlink != 1:
                 raise ProtocolError(
@@ -3069,7 +4227,12 @@ def _collect_workspace_artifacts_with_state(
                     f"Only independent regular-file outputs are allowed: {safe_relative}",
                 )
             observed.add(safe_relative)
-            content, stable_stat = _read_regular_file(Path(child.path), display_path=safe_relative)
+            content, stable_stat = _read_regular_file_at(
+                directory_fd,
+                child_name,
+                display_path=safe_relative,
+                expected=item_stat,
+            )
             digest = hashlib.sha256(content).hexdigest()
             current[safe_relative] = (stable_stat.st_size, digest)
             previous = initial.get(safe_relative)
@@ -3085,9 +4248,33 @@ def _collect_workspace_artifacts_with_state(
                 "size_bytes": stable_stat.st_size,
                 "sha256": digest,
             })
+        try:
+            directory_after = os.fstat(directory_fd)
+        except OSError as exc:
+            raise ProtocolError(
+                "workspace_output_race",
+                "Workspace output directory changed during collection.",
+            ) from exc
+        if (
+            _stable_output_directory_identity(directory_before)
+            != _stable_output_directory_identity(directory_after)
+        ):
+            raise ProtocolError(
+                "workspace_output_race",
+                "Workspace output directory changed during collection.",
+            )
 
-    artifacts.sort(key=lambda item: item["path"])
-    return artifacts, len(set(initial) - observed), current
+    try:
+        collect_directory(descriptors[-1], "", 0)
+        _validate_anchored_output_directory(
+            links,
+            display_path="workspace",
+        )
+        artifacts.sort(key=lambda item: item["path"])
+        return artifacts, len(set(initial) - observed), current
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
 def _collect_workspace_artifacts(
@@ -3105,8 +4292,16 @@ def _skill_error(
     request_id: str | None,
     code: str,
     message: str,
+    *,
+    egress_policy: str = "none",
     **extra: Any,
 ) -> dict[str, Any]:
+    runtime_profile = _configured_runtime_profile()
+    if egress_policy not in {"none", "origin_allowlist_proxy"}:
+        raise ProtocolError(
+            "invalid_egress_policy",
+            "Executor error receipt contains an invalid egress policy.",
+        )
     response: dict[str, Any] = {
         "protocol_version": PROTOCOL_VERSION,
         "kind": "skill_script_result",
@@ -3115,6 +4310,11 @@ def _skill_error(
         "error_code": code,
         "error": message,
         "network": "disabled",
+        "runtime_profile": runtime_profile,
+        "network_policy": {
+            "direct": "disabled",
+            "egress": egress_policy,
+        },
         "artifacts": [],
     }
     response.update(extra)
@@ -3129,8 +4329,15 @@ def _declared_command_error(
     executable: str | None = None,
     cwd: str | None = None,
     command_sha256: str | None = None,
+    egress_policy: str = "none",
     **extra: Any,
 ) -> dict[str, Any]:
+    runtime_profile = _configured_runtime_profile()
+    if egress_policy not in {"none", "origin_allowlist_proxy"}:
+        raise ProtocolError(
+            "invalid_egress_policy",
+            "Executor error receipt contains an invalid egress policy.",
+        )
     response: dict[str, Any] = {
         "protocol_version": PROTOCOL_VERSION,
         "kind": "declared_command_result",
@@ -3143,6 +4350,11 @@ def _declared_command_error(
         "command_sha256": command_sha256,
         "shell": False,
         "network": "disabled",
+        "runtime_profile": runtime_profile,
+        "network_policy": {
+            "direct": "disabled",
+            "egress": egress_policy,
+        },
         "artifacts": [],
     }
     response.update(extra)
@@ -3157,11 +4369,17 @@ def _run_declared_command(payload: dict[str, Any]) -> dict[str, Any]:
     cwd_policy: str | None = None
     command_sha256: str | None = None
     temp_dir: Path | None = None
+    runtime_profile: str | None = None
+    egress_origins: tuple[str, ...] = ()
+    egress_rules: tuple[dict[str, Any], ...] = ()
+    private_origins: tuple[str, ...] = ()
+    egress_policy = "none"
     try:
         if payload.get("protocol_version") != PROTOCOL_VERSION:
             raise ProtocolError(
                 "unsupported_protocol", f"protocol_version must be {PROTOCOL_VERSION}."
             )
+        runtime_profile = _configured_runtime_profile()
         request_id = _validated_request_id(payload.get("request_id"))
         raw_executable = payload.get("executable")
         if not isinstance(raw_executable, str) or RUNTIME_COMMAND_RE.fullmatch(raw_executable) is None:
@@ -3172,6 +4390,16 @@ def _run_declared_command(payload: dict[str, Any]) -> dict[str, Any]:
         executable = raw_executable
         argv = _validated_args(payload.get("argv", []))
         timeout = _validated_timeout(payload.get("timeout", 120))
+        (
+            egress_rules,
+            egress_origins,
+            private_origins,
+        ) = _validated_exact_egress_policy(
+            payload
+        )
+        egress_policy = (
+            "origin_allowlist_proxy" if egress_origins else "none"
+        )
         raw_cwd = payload.get("cwd", "workspace")
         if raw_cwd not in {"workspace", "skill"}:
             raise ProtocolError("invalid_cwd", "cwd must be exactly 'workspace' or 'skill'.")
@@ -3248,30 +4476,56 @@ def _run_declared_command(payload: dict[str, Any]) -> dict[str, Any]:
             immutable_roots=(skill_root,),
             writable_roots=(workspace, runtime_root),
         )
-        try:
-            proc = subprocess.Popen(
-                _resource_limited_command(
-                    [resolved_executable, *argv],
-                    cpu_seconds=timeout + 5,
-                    persistent=False,
-                ),
-                shell=False,
-                cwd=workspace if cwd_policy == "workspace" else skill_root,
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                close_fds=True,
-                **_native_worker_popen_kwargs(),
+        egress_bridge = (
+            _start_egress_bridge(
+                egress_origins,
+                egress_rules=egress_rules,
+                private_origins=private_origins,
+                runtime_root=runtime_root,
             )
-        except (FileNotFoundError, PermissionError, OSError) as exc:
-            raise ProtocolError(
-                "command_spawn_failed",
-                f"Could not start the declared executable ({type(exc).__name__}).",
-            ) from exc
-        stdout, stderr, stdout_truncated, stderr_truncated, timed_out = (
-            _communicate_capped(proc, timeout=timeout)
+            if egress_origins
+            else None
         )
+        if egress_origins and egress_bridge is None:
+            raise ProtocolError(
+                "egress_bridge_unavailable",
+                "The declared-command egress bridge failed closed.",
+            )
+        if egress_bridge is not None:
+            env.update(egress_bridge.environment)
+        try:
+            try:
+                proc = subprocess.Popen(
+                    _resource_limited_command(
+                        [resolved_executable, *argv],
+                        cpu_seconds=timeout + 5,
+                        persistent=False,
+                    ),
+                    shell=False,
+                    cwd=(
+                        workspace
+                        if cwd_policy == "workspace"
+                        else skill_root
+                    ),
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    close_fds=True,
+                    **_native_worker_popen_kwargs(),
+                )
+            except (FileNotFoundError, PermissionError, OSError) as exc:
+                raise ProtocolError(
+                    "command_spawn_failed",
+                    "Could not start the declared executable "
+                    f"({type(exc).__name__}).",
+                ) from exc
+            stdout, stderr, stdout_truncated, stderr_truncated, timed_out = (
+                _communicate_capped(proc, timeout=timeout)
+            )
+        finally:
+            if egress_bridge is not None:
+                egress_bridge.close()
         artifacts, deleted_count = _collect_workspace_artifacts(workspace, initial)
         stdout_text = stdout.decode("utf-8", errors="replace")
         stderr_text = stderr.decode("utf-8", errors="replace")
@@ -3287,6 +4541,15 @@ def _run_declared_command(payload: dict[str, Any]) -> dict[str, Any]:
             "command_sha256": command_sha256,
             "shell": False,
             "network": "disabled",
+            "runtime_profile": runtime_profile,
+            "network_policy": {
+                "direct": "disabled",
+                "egress": (
+                    "origin_allowlist_proxy"
+                    if egress_origins
+                    else "none"
+                ),
+            },
             "stdout": stdout_text,
             "stderr": stderr_text,
             "stdout_truncated": stdout_truncated,
@@ -3314,6 +4577,7 @@ def _run_declared_command(payload: dict[str, Any]) -> dict[str, Any]:
             executable=executable,
             cwd=cwd_policy,
             command_sha256=command_sha256,
+            egress_policy=egress_policy,
             duration_seconds=round(time.monotonic() - started, 3),
         )
     except Exception as exc:
@@ -3324,11 +4588,12 @@ def _run_declared_command(payload: dict[str, Any]) -> dict[str, Any]:
             executable=executable,
             cwd=cwd_policy,
             command_sha256=command_sha256,
+            egress_policy=egress_policy,
             duration_seconds=round(time.monotonic() - started, 3),
         )
     finally:
         if temp_dir is not None:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            _teardown_one_shot_temp_dir(temp_dir)
 
 
 def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
@@ -3339,13 +4604,47 @@ def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
     function_name: str | None = None
     class_name: str | None = None
     method_name: str | None = None
+    egress_bridge: _EgressBridgeHandle | None = None
+    egress_origins: tuple[str, ...] = ()
+    egress_rules: tuple[dict[str, Any], ...] = ()
+    private_origins: tuple[str, ...] = ()
+    egress_policy = "none"
     try:
         if payload.get("protocol_version") != PROTOCOL_VERSION:
             raise ProtocolError("unsupported_protocol", f"protocol_version must be {PROTOCOL_VERSION}.")
         request_id = _validated_request_id(payload.get("request_id"))
+        invocation_receipt = _skill_invocation_receipt_fields(payload)
+        invocation_mode = str(
+            invocation_receipt.get("invocation_mode") or "cli"
+        )
+        function_name = (
+            invocation_receipt.get("function_name")
+            if isinstance(invocation_receipt.get("function_name"), str)
+            else None
+        )
+        class_name = (
+            invocation_receipt.get("class_name")
+            if isinstance(invocation_receipt.get("class_name"), str)
+            else None
+        )
+        method_name = (
+            invocation_receipt.get("method_name")
+            if isinstance(invocation_receipt.get("method_name"), str)
+            else None
+        )
         entrypoint_relative = _safe_relative_path(payload.get("entrypoint"), field="entrypoint")
         argv = _validated_args(payload.get("argv", []))
         timeout = _validated_timeout(payload.get("timeout", 120))
+        (
+            egress_rules,
+            egress_origins,
+            private_origins,
+        ) = _validated_exact_egress_policy(
+            payload
+        )
+        egress_policy = (
+            "origin_allowlist_proxy" if egress_origins else "none"
+        )
         cwd_policy = payload.get("cwd", "workspace")
         if cwd_policy not in {"workspace", "script", "skill"}:
             raise ProtocolError(
@@ -3413,6 +4712,11 @@ def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
             for relative, content in workspace_files.items()
         }
         entrypoint = skill_root.joinpath(*entrypoint_relative.split("/"))
+        (
+            runtime_profile,
+            _profile_egress_policy,
+            profile_environment,
+        ) = _profile_process_environment()
         function_result_path: Path | None = None
         if invocation_mode in {"function", "instance_method"}:
             interpreter = "python"
@@ -3425,11 +4729,7 @@ def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
                 stream.write(function_request or b"")
             os.chmod(runner_path, 0o400)
             os.chmod(request_path, 0o400)
-            command = [
-                sys.executable,
-                "-I",
-                "-B",
-                str(runner_path),
+            runner_arguments = [
                 str(entrypoint),
                 invocation_mode,
                 str(function_name or class_name or ""),
@@ -3441,11 +4741,26 @@ def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
                 str(MAX_STDERR_BYTES),
                 str(MAX_FUNCTION_ENVELOPE_BYTES),
             ]
+            command = (
+                _browser_runtime_command(runner_path, runner_arguments)
+                if runtime_profile in {
+                    "browser-automation-v1",
+                    SESSION_SANDBOX_RUNTIME_PROFILE,
+                }
+                else [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    str(runner_path),
+                    *runner_arguments,
+                ]
+            )
         else:
             interpreter, command = _interpreter_command(
                 entrypoint,
                 skill_root=skill_root,
                 runtime_root=runtime_root,
+                runtime_profile=runtime_profile,
             )
         if cwd_policy == "workspace":
             workdir = workspace
@@ -3469,11 +4784,24 @@ def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
             "CHATDS_OUTPUT_DIR": str(output_dir),
             **BLAS_THREAD_ENV,
         }
+        env.update(profile_environment)
         _prepare_worker_tree(
             temp_dir,
             immutable_roots=(skill_root,),
             writable_roots=(workspace, runtime_root),
         )
+        if egress_origins or runtime_profile in {
+            "browser-automation-v1",
+            SESSION_SANDBOX_RUNTIME_PROFILE,
+        }:
+            egress_bridge = _start_egress_bridge(
+                egress_origins,
+                egress_rules=egress_rules,
+                private_origins=private_origins,
+                runtime_root=runtime_root,
+            )
+        if egress_bridge is not None:
+            env.update(egress_bridge.environment)
 
         try:
             proc = subprocess.Popen(
@@ -3549,6 +4877,11 @@ def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
             "invocation_mode": invocation_mode,
             "cwd": cwd_policy,
             "network": "disabled",
+            "runtime_profile": runtime_profile,
+            "network_policy": {
+                "direct": "disabled",
+                "egress": egress_policy,
+            },
             "stdout": stdout_text,
             "stderr": stderr_text,
             "stdout_truncated": stdout_truncated,
@@ -3611,6 +4944,7 @@ def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
             request_id,
             exc.code,
             str(exc),
+            egress_policy=egress_policy,
             invocation_mode=invocation_mode,
             **({"function_name": function_name} if function_name else {}),
             **({"class_name": class_name} if class_name else {}),
@@ -3622,6 +4956,7 @@ def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
             request_id,
             "executor_internal_error",
             f"The isolated Skill executor failed safely ({type(exc).__name__}).",
+            egress_policy=egress_policy,
             invocation_mode=invocation_mode,
             **({"function_name": function_name} if function_name else {}),
             **({"class_name": class_name} if class_name else {}),
@@ -3629,8 +4964,12 @@ def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
             duration_seconds=round(time.monotonic() - started, 3),
         )
     finally:
-        if temp_dir is not None:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+        try:
+            if egress_bridge is not None:
+                egress_bridge.close()
+        finally:
+            if temp_dir is not None:
+                _teardown_one_shot_temp_dir(temp_dir)
 
 
 def _session_code_error(
@@ -3809,7 +5148,7 @@ def _run_session_code(payload: dict[str, Any]) -> dict[str, Any]:
         )
     finally:
         if temp_dir is not None:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            _teardown_one_shot_temp_dir(temp_dir)
 
 
 def _drain_process_stream(
@@ -3879,6 +5218,9 @@ def _signal_process_group(
 def _stop_process_lease_locked(lease: _ProcessLease) -> None:
     process = lease.process
     if process is None:
+        if lease.egress_bridge is not None:
+            lease.egress_bridge.close()
+            lease.egress_bridge = None
         return
     lease.stopping = True
     if process.stdin is not None:
@@ -3921,6 +5263,9 @@ def _stop_process_lease_locked(lease: _ProcessLease) -> None:
     for thread in lease.reader_threads:
         thread.join(timeout=1)
     _refresh_process_state_locked(lease)
+    if lease.egress_bridge is not None:
+        lease.egress_bridge.close()
+        lease.egress_bridge = None
 
 
 def _remove_process_tree(root: Path) -> bool:
@@ -3942,6 +5287,31 @@ def _remove_process_tree(root: Path) -> bool:
     return not root.exists()
 
 
+def _discard_pending_process_sync_locked(lease: _ProcessLease) -> None:
+    """Abort one prepared batch and invalidate its now-stale replay receipt."""
+
+    prepare_op_id = lease.pending_sync_prepare_op_id
+    if prepare_op_id is not None:
+        cached = lease.operations.pop(prepare_op_id, None)
+        if cached is not None:
+            _, cached_response = cached
+            encoded = json.dumps(
+                cached_response,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            lease.operation_cache_bytes = max(
+                0,
+                lease.operation_cache_bytes - len(encoded),
+            )
+    lease.pending_sync_token = None
+    lease.pending_sync_state = None
+    lease.pending_sync_close = False
+    lease.pending_sync_ack_deadline = None
+    lease.pending_sync_prepare_op_id = None
+
+
 def _expire_process_lease_locked(
     lease: _ProcessLease,
     *,
@@ -3950,6 +5320,11 @@ def _expire_process_lease_locked(
 ) -> None:
     if lease.state in {"closed", "expired"}:
         return
+    if lease.pending_sync_token is not None:
+        # Once the bounded ACK grace expires, the prepared filesystem
+        # transaction no longer exists.  Its exact-op replay must therefore
+        # not return an otherwise valid-looking stale token/artifact batch.
+        _discard_pending_process_sync_locked(lease)
     _stop_process_lease_locked(lease)
     try:
         _sweep_configured_worker_uid()
@@ -4015,7 +5390,29 @@ def _cleanup_expired_process_leases(*, now: float | None = None) -> int:
                     else:
                         continue
                 if lease.state not in {"closed", "expired"}:
-                    if current >= lease.absolute_expires_at:
+                    if (
+                        lease.pending_sync_token is not None
+                        and lease.pending_sync_ack_deadline is not None
+                        and current < lease.pending_sync_ack_deadline
+                    ):
+                        # A local artifact apply may legitimately outlive the
+                        # process idle/max-runtime deadline.  The immutable
+                        # prepared batch remains recoverable until its own
+                        # bounded ACK grace expires.
+                        continue
+                    if lease.pending_sync_token is not None:
+                        _expire_process_lease_locked(
+                            lease,
+                            now=current,
+                            reason=(
+                                "close_ack_timeout"
+                                if lease.pending_sync_close
+                                else "sync_ack_timeout"
+                            ),
+                        )
+                        if lease.state == "expired":
+                            cleaned += 1
+                    elif current >= lease.absolute_expires_at:
                         _expire_process_lease_locked(
                             lease,
                             now=current,
@@ -4053,6 +5450,7 @@ def _shutdown_all_process_leases() -> None:
     """Best-effort daemon/test cleanup; no process survives server shutdown."""
 
     global _ACTIVE_PROCESS_LEASE_HANDLE, _ACTIVE_V1_EXECUTION
+    global _ACTIVE_V1_EXECUTION_QUARANTINED, _ACTIVE_V1_TEMP_DIR
     with _PROCESS_LEASES_LOCK:
         leases = list(_PROCESS_LEASES.values())
         for lease in leases:
@@ -4072,8 +5470,19 @@ def _shutdown_all_process_leases() -> None:
         _PROCESS_LEASES.clear()
         _PROCESS_OPEN_OPERATIONS.clear()
     with _EXECUTION_ADMISSION_LOCK:
+        v1_temp_dir = _ACTIVE_V1_TEMP_DIR
+    v1_tree_removed = (
+        v1_temp_dir is None or _remove_process_tree(v1_temp_dir)
+    )
+    with _EXECUTION_ADMISSION_LOCK:
         _ACTIVE_PROCESS_LEASE_HANDLE = None
-        _ACTIVE_V1_EXECUTION = False
+        if v1_tree_removed:
+            _ACTIVE_V1_EXECUTION = False
+            _ACTIVE_V1_EXECUTION_QUARANTINED = False
+            _ACTIVE_V1_TEMP_DIR = None
+        else:
+            _ACTIVE_V1_EXECUTION = True
+            _ACTIVE_V1_EXECUTION_QUARANTINED = True
 
 
 def _controller_reap_process_leases() -> int:
@@ -4085,13 +5494,33 @@ def _controller_reap_process_leases() -> int:
     an orphan lease's idle timeout.
     """
 
-    global _ACTIVE_PROCESS_LEASE_HANDLE
+    global _ACTIVE_PROCESS_LEASE_HANDLE, _ACTIVE_V1_EXECUTION
+    global _ACTIVE_V1_EXECUTION_QUARANTINED, _ACTIVE_V1_TEMP_DIR
     with _EXECUTION_ADMISSION_LOCK:
-        if _ACTIVE_V1_EXECUTION:
+        if (
+            _ACTIVE_V1_EXECUTION
+            and not _ACTIVE_V1_EXECUTION_QUARANTINED
+        ):
             raise ProtocolError(
                 "worker_busy",
                 "A one-shot worker is active; controller startup reap was refused.",
             )
+        if (
+            not _ACTIVE_V1_EXECUTION
+            and (
+                _ACTIVE_V1_EXECUTION_QUARANTINED
+                or _ACTIVE_V1_TEMP_DIR is not None
+            )
+        ):
+            raise ProtocolError(
+                "worker_containment_failed",
+                "One-shot executor quarantine state is inconsistent.",
+            )
+        reaping_v1 = bool(
+            _ACTIVE_V1_EXECUTION
+            and _ACTIVE_V1_EXECUTION_QUARANTINED
+        )
+        v1_temp_dir = _ACTIVE_V1_TEMP_DIR
         active_handle = _ACTIVE_PROCESS_LEASE_HANDLE
     with _PROCESS_LEASES_LOCK:
         leases = list(_PROCESS_LEASES.values())
@@ -4118,6 +5547,11 @@ def _controller_reap_process_leases() -> int:
                     lease.closed_at = None
                     lease.condition.notify_all()
                     failed.append(lease)
+        if v1_temp_dir is not None and not _remove_process_tree(v1_temp_dir):
+            raise ProtocolError(
+                "worker_containment_failed",
+                "Controller reap could not remove a quarantined one-shot tree.",
+            )
         if failed:
             raise ProtocolError(
                 "worker_containment_failed",
@@ -4132,7 +5566,12 @@ def _controller_reap_process_leases() -> int:
     # no child appeared during cleanup.
     _sweep_configured_worker_uid()
     _purge_configured_worker_shared_state()
-    return len(leases)
+    if reaping_v1:
+        with _EXECUTION_ADMISSION_LOCK:
+            _ACTIVE_V1_EXECUTION = False
+            _ACTIVE_V1_EXECUTION_QUARANTINED = False
+            _ACTIVE_V1_TEMP_DIR = None
+    return len(leases) + int(reaping_v1)
 
 
 def _process_lease_janitor(stop_event: threading.Event) -> None:
@@ -4505,6 +5944,7 @@ def _open_process_lease(
     admission_reservation: str | None = None
     admission_handle: str | None = None
     lease_published = False
+    egress_bridge: _EgressBridgeHandle | None = None
     with _PROCESS_LEASES_LOCK:
         previous = _PROCESS_OPEN_OPERATIONS.get((scope_digest, op_id))
         if previous is not None:
@@ -4575,6 +6015,13 @@ def _open_process_lease(
             field="entrypoint",
         )
         argv = _validated_args(payload.get("argv", []))
+        (
+            egress_rules,
+            egress_origins,
+            private_origins,
+        ) = _validated_exact_egress_policy(
+            payload
+        )
         cwd_policy = payload.get("cwd", "workspace")
         if cwd_policy not in {"workspace", "script", "skill"}:
             raise ProtocolError(
@@ -4690,7 +6137,10 @@ def _open_process_lease(
                 ]
                 command = (
                     _browser_runtime_command(runner_path, runner_arguments)
-                    if runtime_profile == "browser-automation-v1"
+                    if runtime_profile in {
+                        "browser-automation-v1",
+                        SESSION_SANDBOX_RUNTIME_PROFILE,
+                    }
                     else [
                         sys.executable,
                         "-I",
@@ -4735,6 +6185,20 @@ def _open_process_lease(
                 immutable_roots=(skill_root,),
                 writable_roots=(workspace, runtime_root),
             )
+            if egress_origins or runtime_profile in {
+                "browser-automation-v1",
+                SESSION_SANDBOX_RUNTIME_PROFILE,
+            }:
+                egress_bridge = _start_egress_bridge(
+                    egress_origins,
+                    egress_rules=egress_rules,
+                    private_origins=private_origins,
+                    runtime_root=runtime_root,
+                )
+            if egress_bridge is not None:
+                environment.update(egress_bridge.environment)
+                if egress_origins:
+                    egress_policy = "origin_allowlist_proxy"
             initial = {
                 relative: (len(content), hashlib.sha256(content).hexdigest())
                 for relative, content in workspace_files.items()
@@ -4761,6 +6225,7 @@ def _open_process_lease(
                 factory_name=factory_name,
                 runtime_profile=runtime_profile,
                 egress_policy=egress_policy,
+                egress_bridge=egress_bridge,
                 interpreter=interpreter,
                 command=[*command, *argv],
                 workdir=workdir,
@@ -4798,6 +6263,8 @@ def _open_process_lease(
             if temp_dir is not None:
                 _remove_process_tree(temp_dir)
             if not lease_published:
+                if egress_bridge is not None:
+                    egress_bridge.close()
                 if admission_handle is not None:
                     _cancel_process_admission(admission_handle)
                 elif admission_reservation is not None:
@@ -5092,6 +6559,7 @@ def _sync_process_lease(
     lease: _ProcessLease,
     *,
     request_id: str,
+    op_id: str,
     operation: str = "sync",
 ) -> dict[str, Any]:
     if lease.pending_sync_token is not None:
@@ -5107,6 +6575,10 @@ def _sync_process_lease(
     lease.pending_sync_token = sync_token
     lease.pending_sync_state = current
     lease.pending_sync_close = operation == "close"
+    lease.pending_sync_ack_deadline = (
+        time.monotonic() + PROCESS_SYNC_ACK_GRACE_SECONDS
+    )
+    lease.pending_sync_prepare_op_id = op_id
     return _process_success(
         request_id,
         operation,
@@ -5114,6 +6586,7 @@ def _sync_process_lease(
         artifacts=artifacts,
         sync_token=sync_token,
         sync_pending=True,
+        sync_ack_grace_seconds=PROCESS_SYNC_ACK_GRACE_SECONDS,
         deleted_workspace_files_ignored=deleted_count,
     )
 
@@ -5152,19 +6625,100 @@ def _signal_process_lease(
     )
 
 
+def _terminalize_failed_process_close(
+    lease: _ProcessLease,
+    *,
+    request_id: str,
+    artifact_error_code: str,
+) -> dict[str, Any]:
+    """Discard an unsafe batch and release only after containment is proven."""
+
+    _discard_pending_process_sync_locked(lease)
+    try:
+        _sweep_configured_worker_uid()
+        if not _remove_process_tree(lease.temp_dir):
+            raise ProtocolError(
+                "worker_containment_failed",
+                "Closed worker tree could not be removed safely.",
+            )
+        _release_process_admission(lease.handle)
+    except ProtocolError:
+        # The process is stopped, but either shared-state cleanup or tree
+        # removal was not proven.  Retain both the executor admission and the
+        # Harness slot quarantine instead of ever overlapping another lease.
+        lease.state = "quarantined"
+        lease.close_reason = "worker_containment_failed"
+        lease.pending_expiry_reason = "close_artifact_collection_failed"
+        lease.closed_at = None
+        lease.condition.notify_all()
+        return _terminal_process_error(
+            request_id,
+            "close",
+            lease,
+            "worker_containment_failed",
+            "The close batch was discarded and the executor slot was quarantined.",
+            terminal_state="quarantined",
+            artifact_error_code=artifact_error_code,
+        )
+
+    lease.state = "closed"
+    lease.close_reason = "close_artifact_collection_failed"
+    lease.pending_expiry_reason = None
+    lease.closed_at = time.monotonic()
+    lease.condition.notify_all()
+    return _terminal_process_error(
+        request_id,
+        "close",
+        lease,
+        "close_artifact_collection_failed",
+        "The process closed safely, but its unsafe artifact batch was discarded.",
+        terminal_state="closed",
+        artifact_error_code=artifact_error_code,
+    )
+
+
 def _close_process_lease(
     lease: _ProcessLease,
     *,
     request_id: str,
+    op_id: str,
 ) -> dict[str, Any]:
     _stop_process_lease_locked(lease)
-    _sweep_configured_worker_uid()
+    try:
+        _sweep_configured_worker_uid()
+    except ProtocolError:
+        lease.state = "quarantined"
+        lease.close_reason = "worker_containment_failed"
+        lease.pending_expiry_reason = "close_worker_sweep_failed"
+        lease.closed_at = None
+        lease.condition.notify_all()
+        return _terminal_process_error(
+            request_id,
+            "close",
+            lease,
+            "worker_containment_failed",
+            "The stopped process could not be proven contained; its slot was quarantined.",
+            terminal_state="quarantined",
+            artifact_error_code="worker_containment_failed",
+        )
     lease.state = "closing"
-    response = _sync_process_lease(
-        lease,
-        request_id=request_id,
-        operation="close",
-    )
+    try:
+        response = _sync_process_lease(
+            lease,
+            request_id=request_id,
+            op_id=op_id,
+            operation="close",
+        )
+    except Exception as exc:
+        return _terminalize_failed_process_close(
+            lease,
+            request_id=request_id,
+            artifact_error_code=(
+                exc.code
+                if isinstance(exc, ProtocolError)
+                else "process_internal_error"
+            ),
+        )
     response["returncode"] = (
         lease.process.poll()
         if lease.process is not None
@@ -5206,6 +6760,8 @@ def _ack_process_sync(
     lease.pending_sync_token = None
     lease.pending_sync_state = None
     lease.pending_sync_close = False
+    lease.pending_sync_ack_deadline = None
+    lease.pending_sync_prepare_op_id = None
     if acknowledged_close:
         lease.state = "closed"
         lease.close_reason = "client_close"
@@ -5394,7 +6950,11 @@ def _run_process_lease(payload: dict[str, Any]) -> dict[str, Any]:
             elif operation == "read":
                 response = _read_process_lease(payload, lease, request_id=request_id)
             elif operation == "sync":
-                response = _sync_process_lease(lease, request_id=request_id)
+                response = _sync_process_lease(
+                    lease,
+                    request_id=request_id,
+                    op_id=op_id,
+                )
             elif operation == "ack":
                 response = _ack_process_sync(
                     payload,
@@ -5404,7 +6964,11 @@ def _run_process_lease(payload: dict[str, Any]) -> dict[str, Any]:
             elif operation == "signal":
                 response = _signal_process_lease(payload, lease, request_id=request_id)
             else:
-                response = _close_process_lease(lease, request_id=request_id)
+                response = _close_process_lease(
+                    lease,
+                    request_id=request_id,
+                    op_id=op_id,
+                )
             _cache_process_response(
                 lease,
                 op_id=op_id,
@@ -5453,6 +7017,40 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                 "request_kind_disabled",
                 "This executor profile does not accept capability probes.",
             )
+        if request_kind == "skill_script":
+            return _skill_error(
+                (
+                    payload.get("request_id")
+                    if isinstance(payload.get("request_id"), str)
+                    else None
+                ),
+                "request_kind_disabled",
+                "This executor profile does not accept Skill scripts.",
+                egress_policy=_requested_v1_egress_policy(payload),
+                **_skill_invocation_receipt_fields(payload),
+            )
+        if request_kind == "declared_command":
+            return _declared_command_error(
+                (
+                    payload.get("request_id")
+                    if isinstance(payload.get("request_id"), str)
+                    else None
+                ),
+                "request_kind_disabled",
+                "This executor profile does not accept declared commands.",
+                executable=(
+                    payload.get("executable")
+                    if isinstance(payload.get("executable"), str)
+                    else None
+                ),
+                cwd=(
+                    payload.get("cwd")
+                    if isinstance(payload.get("cwd"), str)
+                    else None
+                ),
+                command_sha256=_declared_command_request_sha256(payload),
+                egress_policy=_requested_v1_egress_policy(payload),
+            )
         return {
             "status": "error",
             "error_code": "request_kind_disabled",
@@ -5485,6 +7083,15 @@ def _encode_response(response: dict[str, Any]) -> bytes:
         return encoded
     request_id = response.get("request_id") if isinstance(response, dict) else None
     response_kind = response.get("kind") if isinstance(response, dict) else None
+    response_network_policy = (
+        response.get("network_policy")
+        if isinstance(response, dict)
+        and isinstance(response.get("network_policy"), dict)
+        else {}
+    )
+    response_egress_policy = str(
+        response_network_policy.get("egress") or "none"
+    )
     if response_kind == "session_code_result":
         fallback = _session_code_error(
             request_id,
@@ -5492,10 +7099,34 @@ def _encode_response(response: dict[str, Any]) -> bytes:
             "Executor response exceeded the bounded protocol limit.",
         )
     elif response_kind == "skill_script_result":
+        invocation_mode = (
+            response.get("invocation_mode")
+            if response.get("invocation_mode")
+            in {"cli", "function", "instance_method"}
+            else "cli"
+        )
         fallback = _skill_error(
             request_id,
             "response_limit_exceeded",
             "Executor response exceeded the bounded protocol limit.",
+            egress_policy=response_egress_policy,
+            invocation_mode=invocation_mode,
+            **(
+                {"function_name": response.get("function_name")}
+                if invocation_mode == "function"
+                and isinstance(response.get("function_name"), str)
+                else {}
+            ),
+            **(
+                {
+                    "class_name": response.get("class_name"),
+                    "method_name": response.get("method_name"),
+                }
+                if invocation_mode == "instance_method"
+                and isinstance(response.get("class_name"), str)
+                and isinstance(response.get("method_name"), str)
+                else {}
+            ),
         )
     elif response_kind == "declared_command_result":
         fallback = _declared_command_error(
@@ -5507,6 +7138,7 @@ def _encode_response(response: dict[str, Any]) -> bytes:
             command_sha256=(
                 response.get("command_sha256") if isinstance(response, dict) else None
             ),
+            egress_policy=response_egress_policy,
         )
     elif response_kind == "runtime_capabilities_result":
         fallback = _runtime_capability_error(
@@ -5631,13 +7263,29 @@ def healthcheck() -> int:
         and isinstance(identity, dict)
         and identity.get("execution_runtime") == "isolated_skill_executor"
         and identity.get("network") == "disabled"
-        and identity.get("runtime_profile") in {"base-v1", "browser-automation-v1"}
+        and isinstance(identity.get("runtime_build_sha256"), str)
+        and re.fullmatch(
+            r"[0-9a-f]{64}",
+            identity["runtime_build_sha256"],
+        ) is not None
+        and identity.get("runtime_profile") in {
+            "base-v1",
+            "browser-automation-v1",
+            SESSION_SANDBOX_RUNTIME_PROFILE,
+        }
         and isinstance(identity.get("network_policy"), dict)
         and identity["network_policy"].get("direct") == "disabled"
-        and identity["network_policy"].get("egress") in {"none", "policy_proxy"}
+        and identity["network_policy"].get("egress") in {
+            "none",
+            "policy_proxy",
+            "origin_allowlist_proxy",
+        }
         and (
             (
-                identity.get("runtime_profile") == "browser-automation-v1"
+                identity.get("runtime_profile") in {
+                    "browser-automation-v1",
+                    SESSION_SANDBOX_RUNTIME_PROFILE,
+                }
                 and identity.get("display_backend") == "wayland-headless"
                 and identity.get("headed_browser") is True
                 and identity.get("x11") is False

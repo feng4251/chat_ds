@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import re
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -30,7 +31,8 @@ from models import (
     ScheduledJob,
     ScheduledJobRun,
 )
-from workspace import ensure_workspace, serialize_json_list
+from workspace import ensure_workspace_async, serialize_json_list
+from workspace_lock import WorkspaceMutationLockError
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +55,18 @@ _CRON_INVISIBLE = {
     "\u200b", "\u200c", "\u2060", "\ufeff",
     "\u202a", "\u202b", "\u202c", "\u202d", "\u202e",
 }
+
+
+@dataclass
+class _JobExecutionFlight:
+    """One runtime-owned execution claim for an exact scheduled job."""
+
+    force_requested: bool
+    task: asyncio.Task[None] | None = None
+    run_id: str | None = None
+
+
+_JOB_EXECUTION_FLIGHTS: dict[str, _JobExecutionFlight] = {}
 
 
 def _utcnow() -> datetime:
@@ -218,12 +232,230 @@ def _harness_client() -> httpx.AsyncClient:
     )
 
 
+def enqueue_job_execution(
+    job_id: str,
+    *,
+    force: bool = False,
+) -> tuple[asyncio.Task[None], bool]:
+    """Start or join one per-job flight without ever queuing a duplicate.
+
+    A force request upgrades an existing automatic flight in place. It never
+    schedules a second run behind an active one.
+    """
+
+    key = str(job_id)
+    existing = _JOB_EXECUTION_FLIGHTS.get(key)
+    if (
+        existing is not None
+        and existing.task is not None
+        and not existing.task.done()
+    ):
+        if force:
+            existing.force_requested = True
+        return existing.task, False
+
+    flight = _JobExecutionFlight(force_requested=bool(force))
+    task = asyncio.create_task(
+        _execute_job_once(key, flight),
+        name=f"scheduled-job:{key}",
+    )
+    flight.task = task
+    _JOB_EXECUTION_FLIGHTS[key] = flight
+
+    def finish(completed: asyncio.Task[None]) -> None:
+        if _JOB_EXECUTION_FLIGHTS.get(key) is flight:
+            _JOB_EXECUTION_FLIGHTS.pop(key, None)
+        try:
+            error = completed.exception()
+        except asyncio.CancelledError:
+            error = None
+        if error is not None:
+            logger.error(
+                "Scheduled job execution failed job=%s",
+                key,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    task.add_done_callback(finish)
+    return task, True
+
+
 async def execute_job(job_id: str, *, force: bool = False) -> None:
+    """Start or join the exact per-job flight and wait without owning it."""
+
+    task, _started = enqueue_job_execution(job_id, force=force)
+    await asyncio.shield(task)
+
+
+def _job_may_run(job: ScheduledJob | None, flight: _JobExecutionFlight) -> bool:
+    if job is None:
+        return False
+    if flight.force_requested:
+        return True
+    return bool(
+        job.enabled
+        and job.next_run_at is not None
+        and job.next_run_at <= _utcnow()
+    )
+
+
+async def _persist_job_run_terminal(
+    job_id: str,
+    run_id: str | None,
+    *,
+    status: str,
+    error: str | None,
+) -> bool:
+    """Idempotently terminalize one exact running row in a fresh session."""
+
+    if not run_id:
+        return False
+    if status not in {"failed", "cancelled"}:
+        raise ValueError("Scheduled terminal status must be failed/cancelled.")
+    async with async_session() as db:
+        run = (await db.execute(
+            select(ScheduledJobRun).where(
+                ScheduledJobRun.id == str(run_id),
+                ScheduledJobRun.job_id == str(job_id),
+            )
+        )).scalar_one_or_none()
+        if run is None or str(run.status) != "running":
+            return False
+        job = await db.get(ScheduledJob, str(job_id))
+        run.status = status
+        run.error = error if status == "failed" else None
+        run.ended_at = _utcnow()
+        if job is not None:
+            job.last_status = status
+            if status == "failed":
+                job.consecutive_errors += 1
+            if job.schedule_kind == "once":
+                job.enabled = False
+        await db.commit()
+    return True
+
+
+def _outer_job_failure_terminal(
+    exc: Exception,
+) -> tuple[str, str | None]:
+    if (
+        isinstance(exc, WorkspaceMutationLockError)
+        and exc.code == "workspace_session_deleted"
+    ):
+        return "cancelled", None
+    message = f"{type(exc).__name__}: {exc}"
+    return "failed", message[:1000]
+
+
+async def _execute_job_once(
+    job_id: str,
+    flight: _JobExecutionFlight,
+) -> None:
+    """Bind a session, then run under the shared delete/turn authority."""
+
+    try:
+        async with async_session() as db:
+            job = (await db.execute(
+                select(ScheduledJob).where(ScheduledJob.id == job_id)
+            )).scalar_one_or_none()
+            if not _job_may_run(job, flight):
+                return
+            if not job.conversation_id:
+                conv = Conversation(
+                    user_id=job.user_id,
+                    title=f"定时任务 · {job.name}",
+                    model_id=job.model_id or "deepseek_v4_pro",
+                )
+                db.add(conv)
+                await db.flush()
+                job.conversation_id = conv.id
+                await db.commit()
+            user_id = str(job.user_id)
+            conversation_id = str(job.conversation_id)
+
+        from routers.chat_router import registered_conversation_execution
+        async with registered_conversation_execution(
+            user_id,
+            conversation_id,
+        ):
+            await _execute_job_bound(job_id, flight=flight)
+    except asyncio.CancelledError:
+        try:
+            await _persist_job_run_terminal(
+                job_id,
+                flight.run_id,
+                status="cancelled",
+                error=None,
+            )
+        except BaseException:
+            logger.exception(
+                "Could not persist scheduled cancellation job=%s run=%s",
+                job_id,
+                flight.run_id,
+            )
+        raise
+    except Exception as exc:
+        status, error = _outer_job_failure_terminal(exc)
+        try:
+            await _persist_job_run_terminal(
+                job_id,
+                flight.run_id,
+                status=status,
+                error=error,
+            )
+        except BaseException:
+            logger.exception(
+                "Could not persist scheduled failure job=%s run=%s",
+                job_id,
+                flight.run_id,
+            )
+        raise
+
+
+async def _commit_scheduled_session_state(
+    db,
+    *,
+    user_id: str,
+    conversation_id: str,
+) -> None:
+    """Commit only while the durable session fence and DB owner are live."""
+
+    from workspace import require_session_workspace_active
+
+    require_session_workspace_active(user_id, conversation_id)
+    owner = (await db.execute(
+        select(Conversation.id).where(
+            Conversation.id == conversation_id,
+            Conversation.user_id == user_id,
+        )
+    )).scalar_one_or_none()
+    if owner is None:
+        raise asyncio.CancelledError(
+            "Scheduled session authority no longer exists."
+        )
+    await db.commit()
+
+
+async def _execute_job_bound(
+    job_id: str,
+    *,
+    flight: _JobExecutionFlight,
+) -> None:
     async with async_session() as db:
         job = (await db.execute(
             select(ScheduledJob).where(ScheduledJob.id == job_id)
         )).scalar_one_or_none()
-        if job is None or (not job.enabled and not force):
+        if not _job_may_run(job, flight):
+            return
+        if not job.conversation_id:
+            return
+        conv = (await db.execute(
+            select(Conversation).where(
+                Conversation.id == job.conversation_id,
+                Conversation.user_id == job.user_id,
+            )
+        )).scalar_one_or_none()
+        if conv is None:
             return
         run = ScheduledJobRun(
             job_id=job.id,
@@ -234,7 +466,13 @@ async def execute_job(job_id: str, *, force: bool = False) -> None:
         job.last_run_at = _utcnow()
         job.next_run_at = next_run_for(job, job.last_run_at)
         db.add(run)
-        await db.commit()
+        await db.flush()
+        flight.run_id = str(run.id)
+        await _commit_scheduled_session_state(
+            db,
+            user_id=str(job.user_id),
+            conversation_id=str(conv.id),
+        )
         await db.refresh(run)
         await emit_event(job.user_id, "cron.started", {"job_id": job.id, "run_id": run.id}, job.conversation_id)
         threat = scan_cron_prompt(job.prompt)
@@ -247,7 +485,11 @@ async def execute_job(job_id: str, *, force: bool = False) -> None:
             job.consecutive_errors += 1
             if job.schedule_kind == "once":
                 job.enabled = False
-            await db.commit()
+            await _commit_scheduled_session_state(
+                db,
+                user_id=str(job.user_id),
+                conversation_id=str(conv.id),
+            )
             await emit_event(
                 job.user_id,
                 "cron.failed",
@@ -256,28 +498,7 @@ async def execute_job(job_id: str, *, force: bool = False) -> None:
             )
             return
 
-        conv = None
-        if job.conversation_id:
-            conv = (await db.execute(
-                select(Conversation).where(
-                    Conversation.id == job.conversation_id,
-                    Conversation.user_id == job.user_id,
-                )
-            )).scalar_one_or_none()
-        if conv is None:
-            conv = Conversation(
-                user_id=job.user_id,
-                title=f"定时任务 · {job.name}",
-                model_id=job.model_id or "deepseek_v4_pro",
-            )
-            db.add(conv)
-            await db.commit()
-            await db.refresh(conv)
-            job.conversation_id = conv.id
-            run.conversation_id = conv.id
-            await db.commit()
-
-        ensure_workspace(job.user_id, conv.id)
+        await ensure_workspace_async(job.user_id, conv.id)
         model_id = canonical_agent_model_id(
             job.model_id or conv.model_id or "deepseek_v4_pro"
         )
@@ -319,7 +540,11 @@ async def execute_job(job_id: str, *, force: bool = False) -> None:
             source="cron",
         )
         db.add(user_message)
-        await db.commit()
+        await _commit_scheduled_session_state(
+            db,
+            user_id=str(job.user_id),
+            conversation_id=str(conv.id),
+        )
         await emit_event(
             job.user_id,
             "message.created",
@@ -409,7 +634,11 @@ async def execute_job(job_id: str, *, force: bool = False) -> None:
 
         if job.schedule_kind == "once":
             job.enabled = False
-        await db.commit()
+        await _commit_scheduled_session_state(
+            db,
+            user_id=str(job.user_id),
+            conversation_id=str(conv.id),
+        )
         await emit_event(
             job.user_id,
             "cron.failed" if error else "cron.completed",
@@ -436,20 +665,67 @@ async def execute_job(job_id: str, *, force: bool = False) -> None:
             )
 
 
+async def enqueue_due_jobs_once() -> dict[str, int]:
+    """Snapshot due ids and coalesce them into runtime-owned job flights."""
+
+    async with async_session() as db:
+        due = (await db.execute(
+            select(ScheduledJob.id).where(
+                ScheduledJob.enabled.is_(True),
+                ScheduledJob.next_run_at.is_not(None),
+                ScheduledJob.next_run_at <= _utcnow(),
+            ).limit(20)
+        )).scalars().all()
+    started = 0
+    for job_id in due:
+        _task, created = enqueue_job_execution(str(job_id))
+        if created:
+            started += 1
+    return {
+        "due": len(due),
+        "started": started,
+        "coalesced": len(due) - started,
+    }
+
+
+async def shutdown_scheduled_job_executions(
+    *,
+    timeout_seconds: float = 15.0,
+) -> dict[str, int | bool]:
+    """Cancel and drain every runtime-owned scheduled flight."""
+
+    tasks = {
+        flight.task
+        for flight in _JOB_EXECUTION_FLIGHTS.values()
+        if flight.task is not None and not flight.task.done()
+    }
+    for task in tasks:
+        task.cancel()
+    residual: set[asyncio.Task] = set()
+    done: set[asyncio.Task] = set()
+    if tasks:
+        done, residual = await asyncio.wait(
+            tasks,
+            timeout=max(0.1, min(float(timeout_seconds), 60.0)),
+            return_when=asyncio.ALL_COMPLETED,
+        )
+    for task in done:
+        try:
+            task.exception()
+        except BaseException:
+            pass
+    return {
+        "success": not residual,
+        "cancelled_count": len(done),
+        "residual_count": len(residual),
+    }
+
+
 async def scheduler_loop() -> None:
     """Claim and execute due jobs. A single backend process owns this loop."""
     while True:
         try:
-            async with async_session() as db:
-                due = (await db.execute(
-                    select(ScheduledJob.id).where(
-                        ScheduledJob.enabled.is_(True),
-                        ScheduledJob.next_run_at.is_not(None),
-                        ScheduledJob.next_run_at <= _utcnow(),
-                    ).limit(20)
-                )).scalars().all()
-            for job_id in due:
-                asyncio.create_task(execute_job(job_id))
+            await enqueue_due_jobs_once()
         except asyncio.CancelledError:
             raise
         except Exception:

@@ -86,7 +86,10 @@ async def sessions_fork(
     return await _request(
         "POST",
         f"/internal/sessions/{session_id}/fork",
-        params={"user_id": user_id},
+        params={
+            "user_id": user_id,
+            "source_session_id": session_id,
+        },
         json={"title": title or None, "include_messages": include_messages},
     )
 
@@ -194,7 +197,10 @@ async def cronjob(
         return await _request(
             "POST",
             "/internal/schedules",
-            params={"user_id": user_id},
+            params={
+                "user_id": user_id,
+                "source_session_id": session_id,
+            },
             json={
                 "name": name,
                 "prompt": prompt,
@@ -211,17 +217,26 @@ async def cronjob(
     if action == "remove":
         return await _request(
             "DELETE", f"/internal/schedules/{job_id}",
-            params={"user_id": user_id},
+            params={
+                "user_id": user_id,
+                "source_session_id": session_id,
+            },
         )
     if action == "trigger":
         return await _request(
             "POST", f"/internal/schedules/{job_id}/run",
-            params={"user_id": user_id},
+            params={
+                "user_id": user_id,
+                "source_session_id": session_id,
+            },
         )
     if action in {"pause", "resume"}:
         return await _request(
             "PATCH", f"/internal/schedules/{job_id}",
-            params={"user_id": user_id},
+            params={
+                "user_id": user_id,
+                "source_session_id": session_id,
+            },
             json={"enabled": action == "resume"},
         )
     if action == "update":
@@ -239,7 +254,10 @@ async def cronjob(
         }
         return await _request(
             "PATCH", f"/internal/schedules/{job_id}",
-            params={"user_id": user_id},
+            params={
+                "user_id": user_id,
+                "source_session_id": session_id,
+            },
             json=payload,
         )
     return json.dumps({"error": f"Unknown action: {action}"})

@@ -1077,10 +1077,10 @@ def delegated_resource_boundary_error(
                             ):
                                 return (
                                     "This exact Skill entrypoint is bound to "
-                                    "the browser-automation runtime and may be "
+                                    "persistent browser automation and may be "
                                     "executed only through run_skill_process; "
-                                    "the one-shot/base executor is not an "
-                                    "authorized fallback."
+                                    "one-shot invocation is not an authorized "
+                                    "fallback."
                                 )
                             package_grants = {
                                 package_digest

@@ -13,12 +13,18 @@ import json
 import logging
 import os
 import re
+import stat
 from datetime import datetime, timezone
 
 from fastapi.responses import StreamingResponse
 from starlette.requests import ClientDisconnect
 
-from workspace import ensure_workspace
+from workspace import (
+    require_open_workspace_directory_current,
+    session_workspace_mutation_guard,
+    workspace_parent_directory_fd,
+)
+from workspace_lock import run_sync_cancellation_safe
 
 
 logger = logging.getLogger(__name__)
@@ -634,7 +640,7 @@ def _append_backend_stream_termination_event(
     return event
 
 
-def _append_backend_stream_debug_file(
+def _append_backend_stream_debug_file_sync(
     *,
     user_id: str,
     session_id: str,
@@ -651,12 +657,6 @@ def _append_backend_stream_debug_file(
                 run_id.encode("utf-8", "replace")
             ).hexdigest()
         )
-        debug_dir = (
-            ensure_workspace(user_id, session_id)
-            / "debug"
-            / "backend_streams"
-        )
-        debug_dir.mkdir(parents=True, exist_ok=True)
         line = (
             json.dumps(
                 event,
@@ -666,21 +666,87 @@ def _append_backend_stream_debug_file(
             )
             + "\n"
         ).encode("utf-8")
-        fd = os.open(
-            debug_dir / f"{safe_run_id}.jsonl",
-            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-            0o600,
-        )
-        try:
-            os.write(fd, line)
-        finally:
-            os.close(fd)
+        with session_workspace_mutation_guard(
+            user_id,
+            session_id,
+        ) as workspace:
+            relative_path = (
+                f"debug/backend_streams/{safe_run_id}.jsonl"
+            )
+            with workspace_parent_directory_fd(
+                workspace,
+                relative_path,
+                create_parents=True,
+            ) as (parent_fd, parent_path, leaf_name):
+                flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+                if hasattr(os, "O_CLOEXEC"):
+                    flags |= os.O_CLOEXEC
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                fd = os.open(
+                    leaf_name,
+                    flags,
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+                try:
+                    descriptor_stat = os.fstat(fd)
+                    path_stat = (
+                        parent_path / leaf_name
+                    ).lstat()
+                    if (
+                        not stat.S_ISREG(descriptor_stat.st_mode)
+                        or descriptor_stat.st_nlink != 1
+                        or not stat.S_ISREG(path_stat.st_mode)
+                        or stat.S_ISLNK(path_stat.st_mode)
+                        or (descriptor_stat.st_dev, descriptor_stat.st_ino)
+                        != (path_stat.st_dev, path_stat.st_ino)
+                    ):
+                        raise ValueError(
+                            "Backend stream debug trace must be a stable "
+                            "regular file."
+                        )
+                    require_open_workspace_directory_current(
+                        parent_fd,
+                        parent_path,
+                        workspace,
+                    )
+                    os.fchmod(fd, 0o600)
+                    remaining = memoryview(line)
+                    while remaining:
+                        written = os.write(fd, remaining)
+                        if written <= 0:
+                            raise OSError(
+                                "Backend stream debug append made no "
+                                "progress."
+                            )
+                        remaining = remaining[written:]
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
     except Exception:
         logger.exception(
             "Backend stream debug mirror failed conv=%s run=%s",
             session_id,
             run_id,
         )
+
+
+async def _append_backend_stream_debug_file(
+    *,
+    user_id: str,
+    session_id: str,
+    run_id: str,
+    event: dict,
+) -> None:
+    await run_sync_cancellation_safe(
+        lambda: _append_backend_stream_debug_file_sync(
+            user_id=user_id,
+            session_id=session_id,
+            run_id=run_id,
+            event=event,
+        )
+    )
 
 
 def _local_abort_source(

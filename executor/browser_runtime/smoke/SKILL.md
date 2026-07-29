@@ -1,17 +1,19 @@
 ---
 name: browser-runtime-smoke
-description: Immutable acceptance fixtures for the generic browser executor profile.
+description: Immutable acceptance fixtures for the unified session sandbox.
 ---
 
 # Browser runtime smoke
 
-These scripts validate the prebuilt browser profile. They use only local
-in-memory pages and never install dependencies or access a remote origin.
+These scripts validate the unified dependency-superset sandbox. They never
+install dependencies. Most use only local in-memory pages; the network identity
+probe receives one exact acceptance origin from the deployment test.
 
 Use the exact package-relative entrypoints below for the corresponding
 acceptance checks:
 
-- `base_identity_probe.py` validates the networkless base worker identity.
+- `base_identity_probe.py` validates the common worker identity and direct
+  network boundary.
 - `bash_direct_helper.sh` directly executes the declared
   `bash_direct_helper_child.sh` through `$SKILL_DIR` to validate
   immutable executable helpers.

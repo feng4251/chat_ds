@@ -33,6 +33,12 @@ import tools  # noqa: F401 — triggers tool registration
 
 logger = logging.getLogger(__name__)
 
+_SESSION_CLEANUP_FLIGHTS: dict[
+    tuple[str, str],
+    asyncio.Task[dict],
+] = {}
+_SESSION_CLEANUP_FLIGHTS_LOCK = asyncio.Lock()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -43,36 +49,119 @@ async def lifespan(app: FastAPI):
     # therefore leave an executor-side lease alive. Before serving any request,
     # the replacement Harness authenticates to every configured executor and
     # proves the fixed worker slot empty.
-    from tools.isolated_skill_executor import reap_isolated_executor_leases
+    from tools.executor_slot_pool import (
+        executor_attestation_sha256,
+        get_executor_slot_pool,
+    )
+    from tools.isolated_skill_executor import (
+        probe_isolated_runtime_capabilities,
+        reap_isolated_executor_leases,
+    )
     from tools.skill_runtime_profile import (
         BASE_RUNTIME_PROFILE,
-        BROWSER_RUNTIME_PROFILE,
         runtime_profile_socket_binding,
     )
 
-    startup_profiles = [BASE_RUNTIME_PROFILE]
-    if os.environ.get("SKILL_BROWSER_EXECUTOR_SOCKET", "").strip():
-        startup_profiles.append(BROWSER_RUNTIME_PROFILE)
-    seen_sockets: set[str] = set()
-    for runtime_profile in startup_profiles:
-        binding = runtime_profile_socket_binding(runtime_profile)
-        if binding.socket_path in seen_sockets:
-            raise RuntimeError(
-                "Distinct executor profiles must not share one process socket."
+    binding = runtime_profile_socket_binding(BASE_RUNTIME_PROFILE)
+    pool = get_executor_slot_pool(primary_socket=binding.socket_path)
+    attestations: dict[str, str] = {}
+    failures: dict[str, str] = {}
+    reaped_total = 0
+    for slot_index, socket_path in enumerate(binding.socket_paths, start=1):
+        try:
+            receipt = await reap_isolated_executor_leases(
+                socket_path=socket_path,
             )
-        seen_sockets.add(binding.socket_path)
+            if (
+                receipt.get("runtime_profile")
+                != binding.executor_runtime_profile
+            ):
+                raise RuntimeError(
+                    "Executor startup reap returned the wrong runtime profile."
+                )
+            capabilities = await asyncio.to_thread(
+                probe_isolated_runtime_capabilities,
+                socket_path=socket_path,
+            )
+            runtime_identity = capabilities.get("runtime_identity")
+            if (
+                not isinstance(runtime_identity, dict)
+                or runtime_identity.get("runtime_profile")
+                != binding.executor_runtime_profile
+            ):
+                raise RuntimeError(
+                    "Executor startup attestation returned the wrong "
+                    "runtime profile."
+                )
+            attestations[socket_path] = executor_attestation_sha256(
+                capabilities,
+            )
+            reaped_total += int(receipt.get("reaped_leases") or 0)
+        except Exception as exc:
+            failures[socket_path] = (
+                "startup_reap_or_attestation_failed:"
+                + type(exc).__name__
+            )
+            logger.error(
+                "Executor pool startup slot failed slot=%s error_type=%s",
+                slot_index,
+                type(exc).__name__,
+            )
+    startup_pool = await pool.apply_startup_attestations(
+        attestations,
+        failures=failures,
+    )
+    minimum_healthy = 2 if len(binding.socket_paths) > 1 else 1
+    if int(startup_pool["healthy_count"]) < minimum_healthy:
+        raise RuntimeError(
+            "Executor pool startup did not establish sufficient homogeneous "
+            "healthy capacity."
+        )
+
+    async def _reprobe_quarantined_executor_slot(
+        socket_path: str,
+    ) -> str:
+        """Prove one worker empty and unchanged before pool re-admission."""
+
         receipt = await reap_isolated_executor_leases(
-            socket_path=binding.socket_path,
+            socket_path=socket_path,
         )
-        if receipt.get("runtime_profile") != runtime_profile:
+        if (
+            receipt.get("worker_processes_empty") is not True
+            or receipt.get("runtime_profile")
+            != binding.executor_runtime_profile
+        ):
             raise RuntimeError(
-                "Executor startup reap returned the wrong runtime profile."
+                "Executor recovery reap did not prove the expected empty "
+                "runtime profile."
             )
-        logger.info(
-            "Executor startup reap complete profile=%s leases=%s",
-            runtime_profile,
-            receipt.get("reaped_leases"),
+        capabilities = await asyncio.to_thread(
+            probe_isolated_runtime_capabilities,
+            socket_path=socket_path,
         )
+        runtime_identity = capabilities.get("runtime_identity")
+        if (
+            not isinstance(runtime_identity, dict)
+            or runtime_identity.get("runtime_profile")
+            != binding.executor_runtime_profile
+        ):
+            raise RuntimeError(
+                "Executor recovery attestation returned the wrong runtime "
+                "profile."
+            )
+        return executor_attestation_sha256(capabilities)
+
+    pool.configure_reprobe_handler(
+        _reprobe_quarantined_executor_slot,
+    )
+    logger.info(
+        "Executor pool startup complete configured=%s healthy=%s "
+        "quarantined=%s reaped_leases=%s",
+        startup_pool["configured_count"],
+        startup_pool["healthy_count"],
+        startup_pool["quarantined_count"],
+        reaped_total,
+    )
 
     yield
 
@@ -226,44 +315,142 @@ async def internal_session_cleanup(
     user_id: str,
     session_id: str,
 ):
-    """Tear down every session-owned runtime without masking either result."""
+    """Join one cancellation-drained teardown transaction per session."""
+
+    key = (str(user_id), str(session_id))
+    async with _SESSION_CLEANUP_FLIGHTS_LOCK:
+        cleanup_task = _SESSION_CLEANUP_FLIGHTS.get(key)
+        if cleanup_task is None or cleanup_task.done():
+            cleanup_task = asyncio.create_task(
+                _run_internal_session_cleanup(*key)
+            )
+            _SESSION_CLEANUP_FLIGHTS[key] = cleanup_task
+
+    cancellation: asyncio.CancelledError | None = None
+    try:
+        while True:
+            try:
+                result = await asyncio.shield(cleanup_task)
+                break
+            except asyncio.CancelledError as exc:
+                if cancellation is None:
+                    cancellation = exc
+                if cleanup_task.done():
+                    result = cleanup_task.result()
+                    break
+                # The cleanup transaction owns executor/MCP/runtime teardown.
+                # Drain it before propagating cancellation to the HTTP caller.
+                continue
+    finally:
+        async with _SESSION_CLEANUP_FLIGHTS_LOCK:
+            if (
+                cleanup_task.done()
+                and _SESSION_CLEANUP_FLIGHTS.get(key) is cleanup_task
+            ):
+                _SESSION_CLEANUP_FLIGHTS.pop(key, None)
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
+async def _run_internal_session_cleanup(
+    user_id: str,
+    session_id: str,
+) -> dict:
+    """Tear down every session-owned runtime without masking any receipt."""
+
     from tools.mcp_client import cleanup_session_runtime
+    from tools.session_execution_registry import revoke_session_executions
     from tools.skill_process import cleanup_skill_process_session
+    from runtime.python_env import clean_session_runtime
 
     try:
-        process_result = await cleanup_skill_process_session(
+        execution_result = await revoke_session_executions(
             user_id,
             session_id,
         )
     except Exception as exc:
         logger.exception(
-            "Session persistent Skill process cleanup failed user=%s session=%s",
+            "Session execution revocation failed user=%s session=%s",
             user_id,
             session_id,
         )
-        process_result = {
+        execution_result = {
             "success": False,
             "error_code": type(exc).__name__,
         }
-    try:
-        mcp_result = await cleanup_session_runtime(user_id, session_id)
-    except Exception as exc:
-        logger.exception(
-            "Session MCP cleanup failed user=%s session=%s",
-            user_id,
-            session_id,
-        )
-        mcp_result = {
-            "success": False,
-            "error_code": type(exc).__name__,
-        }
+
+    async def _cleanup_processes() -> dict:
+        try:
+            return await cleanup_skill_process_session(
+                user_id,
+                session_id,
+            )
+        except Exception as exc:
+            logger.exception(
+                "Session persistent Skill process cleanup failed "
+                "user=%s session=%s",
+                user_id,
+                session_id,
+            )
+            return {
+                "success": False,
+                "error_code": type(exc).__name__,
+            }
+
+    async def _cleanup_mcp() -> dict:
+        try:
+            return await cleanup_session_runtime(user_id, session_id)
+        except Exception as exc:
+            logger.exception(
+                "Session MCP cleanup failed user=%s session=%s",
+                user_id,
+                session_id,
+            )
+            return {
+                "success": False,
+                "error_code": type(exc).__name__,
+            }
+
+    async def _cleanup_python_runtime() -> dict:
+        try:
+            removed = await asyncio.to_thread(
+                clean_session_runtime,
+                user_id,
+                session_id,
+            )
+            return {
+                "success": True,
+                "removed": bool(removed),
+            }
+        except Exception as exc:
+            logger.exception(
+                "Session Python runtime cleanup failed user=%s session=%s",
+                user_id,
+                session_id,
+            )
+            return {
+                "success": False,
+                "error_code": type(exc).__name__,
+            }
+
+    process_result, mcp_result, python_runtime_result = await asyncio.gather(
+        _cleanup_processes(),
+        _cleanup_mcp(),
+        _cleanup_python_runtime(),
+    )
     return {
         **mcp_result,
         "success": bool(
+            execution_result.get("success") is True
+            and
             mcp_result.get("success") is True
             and process_result.get("success") is True
+            and python_runtime_result.get("success") is True
         ),
+        "execution_revocation": execution_result,
         "skill_processes": process_result,
+        "python_runtime": python_runtime_result,
     }
 
 

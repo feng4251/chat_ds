@@ -134,6 +134,7 @@ class DependencyScopeTests(PythonRuntimeFixture):
             commands=["python"],
             environment_variables=["DATA_VENDOR_KEY"],
             platform_groups=[["linux"]],
+            socket_path="/run/chat-ds-executor/executor.sock",
         )
 
     def test_target_skill_dependencies_do_not_include_session_siblings(self) -> None:
@@ -390,6 +391,42 @@ class RuntimeCancellationTests(PythonRuntimeFixture, unittest.IsolatedAsyncioTes
 
 
 class AtomicStatusTests(PythonRuntimeFixture):
+    def test_session_runtime_cleanup_is_nofollow_and_session_scoped(self) -> None:
+        session_runtime = (
+            self.runtimes / self.user_id / self.session_id
+        )
+        session_runtime.mkdir(parents=True)
+        (session_runtime / "state.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+        sibling = self.runtimes / self.user_id / "other-session"
+        sibling.mkdir()
+
+        self.assertTrue(
+            python_env.clean_session_runtime(
+                self.user_id,
+                self.session_id,
+            )
+        )
+        self.assertFalse(session_runtime.exists())
+        self.assertTrue(sibling.is_dir())
+
+    def test_session_runtime_cleanup_rejects_user_symlink(self) -> None:
+        self.runtimes.mkdir()
+        outside = self.root / "outside-runtime"
+        (outside / self.session_id).mkdir(parents=True)
+        (self.runtimes / self.user_id).symlink_to(
+            outside,
+            target_is_directory=True,
+        )
+        with self.assertRaises(OSError):
+            python_env.clean_session_runtime(
+                self.user_id,
+                self.session_id,
+            )
+        self.assertTrue((outside / self.session_id).is_dir())
+
     def test_concurrent_status_writes_use_distinct_atomic_temp_files(self) -> None:
         status_path = self.root / "shared" / "status.json"
         barrier = threading.Barrier(2)

@@ -1,4 +1,4 @@
-"""Run installed Skill Python only through the network-disabled sidecar."""
+"""Run installed Skill Python only through the controlled session sandbox."""
 
 from __future__ import annotations
 
@@ -27,12 +27,21 @@ from tools.isolated_skill_executor import (
     IsolatedSkillExecutorError,
     execute_isolated_session_code,
     execute_isolated_skill_script,
+    snapshot_skill_package,
 )
 from tools.omission_guard import (
     compacted_history_omission_error,
     contains_compacted_history_omission,
 )
 from tools.path_security import sandbox_dir, validate_path
+from tools.session_sandbox_policy import (
+    SessionSandboxPolicyError,
+)
+from tools.skill_invocation_egress import (
+    bind_python_invocation_parameters,
+    invocation_bound_skill_egress_policy_for_invocations,
+)
+from tools.skill_runtime_profile import select_skill_runtime_profile
 from tools.skill_script import (
     SkillScriptError,
     _expected_skill_package_sha256,
@@ -303,7 +312,7 @@ async def run_skill_python(
                 enabled_user_skills,
             ),
         }, ensure_ascii=False)
-    except (ValueError, FileNotFoundError) as exc:
+    except (ValueError, FileNotFoundError, SessionSandboxPolicyError) as exc:
         return json.dumps({
             "status": "error",
             "error": str(exc),
@@ -321,7 +330,7 @@ async def run_skill_python(
             "status": "error",
             "error": (
                 "The installed Skill's declared runtime dependencies are not "
-                "available in the network-disabled isolated executor."
+                "available in the controlled isolated session sandbox."
             ),
             "error_code": "skill_runtime_prerequisites_unsatisfied",
             "invocation_mode": invocation_mode,
@@ -429,6 +438,110 @@ async def run_skill_python(
                 "available_classes": _public_class_inventory(script),
             }, ensure_ascii=False)
     try:
+        snapshot = snapshot_skill_package(skill_root)
+        profile_selection = select_skill_runtime_profile(
+            snapshot,
+            entrypoint,
+        )
+        if (
+            expected_skill_sha256 is not None
+            and profile_selection.package_sha256
+            != expected_skill_sha256
+        ):
+            raise IsolatedSkillExecutorError(
+                "skill_package_authority_mismatch",
+                "The exact Skill package changed after capability "
+                "compilation. Recompile before executing it.",
+            )
+        source = snapshot.read_bytes(entrypoint).decode(
+            "utf-8",
+            errors="replace",
+        )
+        proven_invocations: tuple[dict[str, Any], ...]
+        if function_payload is not None and function_name is not None:
+            parameters = bind_python_invocation_parameters(
+                source,
+                callable_name=function_name,
+                positional=function_payload.get("args"),
+                keywords=function_payload.get("kwargs"),
+            )
+            proven_invocations = (
+                ({
+                    "source": "python",
+                    "callable": function_name,
+                    "parameters": parameters,
+                },)
+                if parameters is not None
+                else ()
+            )
+        elif (
+            instance_payload is not None
+            and class_name is not None
+            and method_name is not None
+        ):
+            constructor_parameters = bind_python_invocation_parameters(
+                source,
+                callable_name=class_name,
+                positional=instance_payload.get("constructor_args"),
+                keywords=instance_payload.get("constructor_kwargs"),
+            )
+            method_callable = f"{class_name}.{method_name}"
+            method_parameters = bind_python_invocation_parameters(
+                source,
+                callable_name=method_callable,
+                positional=instance_payload.get("method_args"),
+                keywords=instance_payload.get("method_kwargs"),
+            )
+            proven_invocations = (
+                (
+                    {
+                        "source": "python",
+                        "callable": class_name,
+                        "parameters": constructor_parameters,
+                    },
+                    {
+                        "source": "python",
+                        "callable": method_callable,
+                        "parameters": method_parameters,
+                    },
+                )
+                if (
+                    constructor_parameters is not None
+                    and method_parameters is not None
+                )
+                else ()
+            )
+        else:
+            proven_invocations = ({
+                "source": "argv",
+                "args": safe_cli_args,
+            },)
+        egress_policy = (
+            invocation_bound_skill_egress_policy_for_invocations(
+                context,
+                skill_name,
+                profile_selection,
+                invocations=proven_invocations,
+            )
+        )
+    except (
+        IsolatedSkillExecutorError,
+        KeyError,
+        SessionSandboxPolicyError,
+        UnicodeError,
+    ) as exc:
+        return json.dumps({
+            "status": "error",
+            "error": str(exc),
+            "error_code": str(
+                getattr(exc, "code", "skill_invocation_policy_invalid")
+            ),
+            "invocation_mode": invocation_mode,
+            "script_path": display_path,
+            "isolated_execution": True,
+            "managed_fallback": False,
+        }, ensure_ascii=False)
+    try:
         isolated = await execute_isolated_skill_script(
             skill_root=skill_root,
             workspace=sandbox_dir(user_id, session_id, sub="workspace"),
@@ -449,6 +562,13 @@ async def run_skill_python(
                 {"expected_skill_sha256": expected_skill_sha256}
                 if expected_skill_sha256 is not None
                 else {}
+            ),
+            **(
+                {
+                    "egress_rules": egress_policy.rule_payload(),
+                    "private_origins": egress_policy.private_origins,
+                }
+                if egress_policy.rules else {}
             ),
             **(
                 {
@@ -477,7 +597,9 @@ async def run_skill_python(
             "method_name": method_name,
             "script_path": display_path,
             "cwd": cwd,
-            "network": "disabled",
+            "network": (
+                "controlled_egress" if egress_policy.rules else "disabled"
+            ),
             "isolated_execution": True,
             "managed_fallback": False,
             "artifacts": [],
@@ -1964,7 +2086,7 @@ def _display_path(path: Path, user_id: str, session_id: str) -> str:
 RUN_SKILL_PYTHON_SCHEMA = {
     "name": "run_skill_python",
     "description": (
-        "Run a Python entrypoint from the exact installed Skill selected for this run, only in the network-disabled isolated executor. "
+        "Run a Python entrypoint from the exact installed Skill selected for this run in the controlled isolated session sandbox. "
         "The Skill and workspace are transferred as bounded content-addressed snapshots; host paths and harness "
         "secrets are not mounted. For importable Skill helpers, prefer the declarative function mode: provide "
         "function_name plus JSON "

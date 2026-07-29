@@ -91,7 +91,11 @@ from run_contract import (
 )
 from run_contract_adapter import apply_agent_event
 from prompt.builder import build_system_prompt
-from retrieval_completeness import RetrievalCompletenessTracker
+from retrieval_completeness import (
+    RETRIEVAL_QUALITY_IMPACT_ADVISORY,
+    RetrievalCompletenessTracker,
+    retrieval_receipt_affects_completion_quality,
+)
 from retrieval_policy import (
     RETRIEVAL_COMPLETENESS_POLICY_BOUNDED,
     RETRIEVAL_COMPLETENESS_POLICY_EXHAUSTIVE,
@@ -101,8 +105,11 @@ from skill_capability_plan import (
     CAPABILITY_PLAN_TOOL_NAME,
     MAX_AUTHORITY_DOCUMENT_CHARS,
     build_capability_catalog,
+    build_callable_skill_result_receipt,
+    callable_skill_result_evidence_outcome,
     capability_call_satisfies_candidate,
     capability_catalog_json,
+    normalize_skill_process_evidence_receipt,
     validate_capability_plan,
 )
 from workflow_ir import (
@@ -158,6 +165,14 @@ from tools.registry import (
     preflight as preflight_tool,
 )
 from tools.tool_result_storage import persist_result_for_history, wrap_result
+from tools.session_execution_registry import (
+    register_session_execution,
+    unregister_session_execution,
+)
+from tools.workspace_lock import (
+    run_sync_cancellation_safe,
+    workspace_mutation_guard,
+)
 from transports.base import build_tool_call
 from workspace_context import get_workspace, load_workspace_context, SubdirectoryHintTracker
 
@@ -1476,6 +1491,7 @@ def _safe_delegated_result_records(value: Any) -> list[dict[str, Any]]:
                 key: unresolved.get(key)
                 for key in (
                     "status",
+                    "quality_impact",
                     "terminal_reason",
                     "open_chain_count",
                     "open_frontier_count",
@@ -1901,10 +1917,246 @@ _PRIVATE_ORIGIN_CONTEXT_REFERENCE_RE = re.compile(
     """,
     re.IGNORECASE | re.VERBOSE,
 )
+_BARE_USER_CONTEXT_CONTINUATION_RE = re.compile(
+    r"""
+    ^\s*
+    (?:
+        (?:请\s*)?
+        (?:
+            继续|接着|往下继续|继续执行|继续操作|继续处理|继续完成
+        )
+        (?:\s*(?:一下|吧|该任务|这个任务))?
+        |
+        (?:please\s+)?
+        (?:
+            continue|resume|go\s+on|proceed
+        )
+        (?:\s+(?:please|the\s+task|this\s+task))?
+    )
+    \s*[。.!！]?\s*$
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+_NETWORK_URL_TOKEN_RE = r"https?://[^\s<>\"'，。；;！？!?、]+"
+_CN_NETWORK_TARGET_RE = (
+    rf"(?:{_NETWORK_URL_TOKEN_RE}|"
+    r"(?:(?:该|这个|那个|任何|外部|上述|前述|目标)\s*)?"
+    r"(?:网址|网站|网页|页面|链接|网络|互联网|外网|站点|服务|接口|API)|"
+    r"(?:它|那里|那儿|该处|那边))"
+)
+_CN_NETWORK_ACTION_RE = (
+    r"(?:去(?:\s*(?:访问|打开|点开|浏览|获取))?|"
+    r"前往|进入|跳转|访问|获取|打开|点开|浏览|连接|请求|调用|使用)"
+)
+_CN_NETWORK_NEGATION_RE = (
+    r"(?:不要|别|不得|禁止|切勿|请勿|勿|不可|不能|不应|"
+    r"避免|无需|无须|不用|不必|不再)"
+)
+_CN_DENIED_NETWORK_ACTION_RE = re.compile(
+    rf"""
+    (?:
+        {_CN_NETWORK_NEGATION_RE}
+        \s*(?:再|继续)?\s*
+        {_CN_NETWORK_ACTION_RE}
+        [\s:：,，、—–-]*
+        {_CN_NETWORK_TARGET_RE}
+    )
+    |
+    (?:
+        {_CN_NETWORK_NEGATION_RE}
+        \s*(?:再|继续)?\s*
+        (?:联网|上网)
+    )
+    |
+    (?:
+        {_CN_NETWORK_NEGATION_RE}
+        \s*
+        (?:网络|互联网|外网|网站|网页|网址|链接|API|接口)
+        \s*(?:访问|连接|请求|调用|获取)
+    )
+    |
+    (?:
+        {_CN_NETWORK_TARGET_RE}
+        [\s:：,，、—–-]{{0,16}}
+        {_CN_NETWORK_NEGATION_RE}
+        \s*(?:再|继续)?\s*
+        {_CN_NETWORK_ACTION_RE}
+        (?:\s*(?:它|那里|该处))?
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+_EN_NETWORK_TARGET_RE = (
+    rf"(?:{_NETWORK_URL_TOKEN_RE}|"
+    r"(?:(?:the|this|that|any)\s+)?"
+    r"(?:(?:external|previous|same)\s+)?"
+    r"(?:url|site|website|web|page|link|network|internet|api|endpoint)|"
+    r"(?:it|there))"
+)
+_EN_NETWORK_ACTION_RE = (
+    r"(?:go(?:\s+to)?|navigat(?:e|ing)(?:\s+to)?|"
+    r"fetch(?:ing)?|open(?:ing)?|visit(?:ing)?|access(?:ing)?|"
+    r"click(?:ing)?(?:\s+on)?|follow(?:ing)?|"
+    r"brows(?:e|ing)|connect(?:ing)?\s+to|request(?:ing)?|"
+    r"call(?:ing)?|use|using)"
+)
+_EN_NETWORK_NEGATION_RE = (
+    r"(?:do\s+not|don['’]?t|never|must\s+not|mustn['’]?t|"
+    r"should\s+not|shouldn['’]?t|cannot|can\s+not|can['’]?t|"
+    r"no\s+need\s+to)"
+)
+_EN_DENIED_NETWORK_ACTION_RE = re.compile(
+    rf"""
+    (?:
+        \b{_EN_NETWORK_NEGATION_RE}
+        \s+(?:continue\s+to\s+)?
+        {_EN_NETWORK_ACTION_RE}
+        [\s:：,，、—–-]*
+        {_EN_NETWORK_TARGET_RE}
+        \b
+    )
+    |
+    (?:
+        \b(?:avoid|refrain\s+from|without)
+        \s+{_EN_NETWORK_ACTION_RE}
+        [\s:：,，、—–-]*
+        {_EN_NETWORK_TARGET_RE}
+        \b
+    )
+    |
+    (?:
+        {_EN_NETWORK_TARGET_RE}
+        [\s:：,，、—–-]{{0,16}}
+        \b{_EN_NETWORK_NEGATION_RE}
+        \s+{_EN_NETWORK_ACTION_RE}
+        (?:\s+(?:it|there))?
+        \b
+    )
+    |
+    (?:
+        \b{_EN_NETWORK_NEGATION_RE}
+        \s+(?:go\s+online|use\s+the\s+internet)
+        \b
+    )
+    |
+    (?:
+        \bno\s+
+        (?:url|site|website|web|network|internet|api|endpoint)
+        \s+access\b
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+_CN_NETWORK_DOUBLE_NEGATION_RE = re.compile(
+    r"(?:不要|别|不得|禁止|切勿|请勿|勿|不可|不能|不应)\s*避免",
+    re.IGNORECASE,
+)
+_EN_NETWORK_DOUBLE_NEGATION_RE = re.compile(
+    r"""
+    \b(?:
+        do\s+not|don['’]?t|never|
+        must\s+not|mustn['’]?t|
+        should\s+not|shouldn['’]?t|
+        cannot|can\s+not|can['’]?t
+    )\s+(?:(?:be\s+)?avoid(?:ed|ing)?|refrain\s+from)\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+_CONSERVATIVE_NETWORK_DENIAL_MARKER_RE = re.compile(
+    r"""
+    (?:
+        不要|别|不得|禁止|切勿|请勿|勿|不可|不能|不应|
+        避免|无需|无须|不用|不必|不再
+    )
+    |
+    \b(?:
+        do\s+not|don['’]?t|not|never|
+        must\s+not|mustn['’]?t|
+        should\s+not|shouldn['’]?t|
+        cannot|can\s+not|can['’]?t|
+        no|without|avoid|refrain\s+from
+    )\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+_CONSERVATIVE_NETWORK_TARGET_RE = re.compile(
+    rf"""
+    (?:
+        {_NETWORK_URL_TOKEN_RE}
+        |
+        (?:网址|网站|网页|页面|链接|网络|互联网|外网|站点|接口|API)
+        |
+        \b(?:url|site|website|web|page|link|network|internet|api|endpoint)\b
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+_NETWORK_DENIAL_CLAUSE_BOUNDARY_RE = re.compile(
+    r"(?:[\r\n。！？；]+|[.!?;]+(?=\s|$))"
+)
+_NETWORK_DENIAL_MAX_TOKEN_DISTANCE = 192
 _HTTP_URL_IN_TEXT_RE = re.compile(
     r"https?://[^\s<>\"']+",
     re.IGNORECASE,
 )
+
+
+def _bounded_network_denial_cooccurs(text: str) -> bool:
+    """Conservatively deny when a network target and denial share a clause.
+
+    Exact syntax is intentionally unnecessary in this fallback. Provider
+    paraphrases and passive voice are open-ended; keeping the two tokens in
+    the same punctuation-bounded clause and within a small character window
+    avoids granting network authority merely because a verb form was novel.
+    """
+
+    for clause in _NETWORK_DENIAL_CLAUSE_BOUNDARY_RE.split(text):
+        if not clause:
+            continue
+        targets = list(_CONSERVATIVE_NETWORK_TARGET_RE.finditer(clause))
+        if not targets:
+            continue
+        target_index = 0
+        for denial in _CONSERVATIVE_NETWORK_DENIAL_MARKER_RE.finditer(clause):
+            while (
+                target_index < len(targets)
+                and targets[target_index].end()
+                < denial.start() - _NETWORK_DENIAL_MAX_TOKEN_DISTANCE
+            ):
+                target_index += 1
+            probe = target_index
+            while (
+                probe < len(targets)
+                and targets[probe].start()
+                <= denial.end() + _NETWORK_DENIAL_MAX_TOKEN_DISTANCE
+            ):
+                return True
+    return False
+
+
+def _user_context_denies_network_access(text: str) -> bool:
+    """Recognize an explicit denial of a structured network action.
+
+    This is intentionally compositional: denial prefix, navigation/retrieval
+    verb, and network target are independent bounded vocabularies. Explicit
+    double negatives are masked first so ``do not avoid visiting`` and
+    ``不要避免访问`` retain their positive meaning, while another denial in
+    the same sentence remains visible.
+    """
+
+    if not isinstance(text, str) or not text:
+        return False
+
+    def mask(match: re.Match[str]) -> str:
+        return " " * len(match.group(0))
+
+    semantic = _CN_NETWORK_DOUBLE_NEGATION_RE.sub(mask, text)
+    semantic = _EN_NETWORK_DOUBLE_NEGATION_RE.sub(mask, semantic)
+    return bool(
+        _CN_DENIED_NETWORK_ACTION_RE.search(semantic)
+        or _EN_DENIED_NETWORK_ACTION_RE.search(semantic)
+        or _bounded_network_denial_cooccurs(semantic)
+    )
 
 
 def _redacted_debug_url(match: re.Match[str]) -> str:
@@ -1980,9 +2232,22 @@ def _private_origin_authorization_text(messages: list[dict]) -> str:
     if not user_texts:
         return ""
     latest = user_texts[-1]
+    # An explicit current-user denial is stronger than both a URL in the same
+    # sentence and any continuation reference. Returning no text prevents the
+    # browser and Skill URL compilers from recovering an older/user-mentioned
+    # destination against the current instruction.
+    if _user_context_denies_network_access(latest):
+        return ""
     if _HTTP_URL_IN_TEXT_RE.search(latest):
         return latest
-    if not _PRIVATE_ORIGIN_CONTEXT_REFERENCE_RE.search(latest):
+    explicit_reference = bool(
+        _PRIVATE_ORIGIN_CONTEXT_REFERENCE_RE.search(latest)
+    )
+    bare_continuation = bool(
+        len(latest) <= 96
+        and _BARE_USER_CONTEXT_CONTINUATION_RE.fullmatch(latest)
+    )
+    if not explicit_reference and not bare_continuation:
         return latest
     for prior in reversed(user_texts[-4:-1]):
         if _HTTP_URL_IN_TEXT_RE.search(prior):
@@ -2145,18 +2410,75 @@ def _append_workspace_debug_event(user_id: str, session_id: str, event: dict[str
         "payload": event.get("payload") or {},
     }
     try:
-        debug_dir = get_workspace(user_id, session_id) / "debug" / "agent_runs"
-        debug_dir.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
-        with (debug_dir / f"{safe_run_id}.jsonl").open("a", encoding="utf-8") as fh:
-            fh.write(line)
-        with (debug_dir / "latest.jsonl").open("a", encoding="utf-8") as fh:
-            fh.write(line)
+        workspace = get_workspace(user_id, session_id)
+        with workspace_mutation_guard(workspace):
+            debug_dir = workspace
+            for component in ("debug", "agent_runs"):
+                debug_dir = debug_dir / component
+                if debug_dir.is_symlink():
+                    raise ValueError(
+                        "Workspace debug directory cannot be a symlink."
+                    )
+                debug_dir.mkdir(mode=0o700, exist_ok=True)
+                if not debug_dir.is_dir():
+                    raise ValueError(
+                        "Workspace debug path must be a directory."
+                    )
+            line = (
+                json.dumps(record, ensure_ascii=False, default=str) + "\n"
+            ).encode("utf-8")
+            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            for target in (
+                debug_dir / f"{safe_run_id}.jsonl",
+                debug_dir / "latest.jsonl",
+            ):
+                descriptor = os.open(target, flags, 0o600)
+                try:
+                    descriptor_stat = os.fstat(descriptor)
+                    if (
+                        not stat.S_ISREG(descriptor_stat.st_mode)
+                        or descriptor_stat.st_nlink != 1
+                    ):
+                        raise ValueError(
+                            "Workspace debug trace must be a regular file."
+                        )
+                    os.fchmod(descriptor, 0o600)
+                    remaining = memoryview(line)
+                    while remaining:
+                        written = os.write(descriptor, remaining)
+                        if written <= 0:
+                            raise OSError(
+                                "Workspace debug trace append made no progress."
+                            )
+                        remaining = remaining[written:]
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
     except Exception:
         logger.debug(
             "Failed to append workspace debug trace user=%s session=%s run=%s",
             user_id, session_id, run_id, exc_info=True,
         )
+
+
+async def _append_workspace_debug_event_async(
+    user_id: str,
+    session_id: str,
+    event: dict[str, Any],
+) -> None:
+    """Persist one debug record without blocking the asyncio event loop."""
+
+    await run_sync_cancellation_safe(
+        lambda: _append_workspace_debug_event(
+            user_id,
+            session_id,
+            event,
+        )
+    )
 
 
 def _tool_debug_result(raw: str) -> dict[str, Any]:
@@ -2590,7 +2912,7 @@ def _skill_activation_preflight(
     """Check a compiled Skill's activation requirements before dispatch.
 
     Secret values are never copied into this result. Runtime declarations are
-    checked by the exact network-disabled Skill executor sidecar; the harness
+    checked by the exact immutable session-sandbox sidecar; the harness
     interpreter, PATH, process environment, and site-packages are deliberately
     not treated as evidence that a Skill subprocess can use a capability.
     """
@@ -5601,7 +5923,9 @@ class HarnessRunState:
                 if isinstance(result.get("unresolved_retrieval"), dict)
                 else None
             )
-            if unresolved_retrieval is not None:
+            if retrieval_receipt_affects_completion_quality(
+                unresolved_retrieval
+            ):
                 completion_quality = "degraded"
             result_path = result.get("result_path")
             envelope_validation_error: str | None = None
@@ -11290,6 +11614,19 @@ def _emit_run_cancelled_on_cancellation(func):
         cancellation_attribution = arguments.get(
             "_cancellation_attribution"
         )
+        execution_fence = arguments.get("_execution_fence")
+        owns_execution_fence = execution_fence is None
+        if execution_fence is None:
+            execution_fence = ChildExecutionFence()
+            arguments["_execution_fence"] = execution_fence
+            arguments["_execution_fence_generation"] = (
+                execution_fence.generation
+            )
+        execution_registration = register_session_execution(
+            user_id,
+            session_id,
+            execution_fence,
+        )
 
         terminal_seen = False
         run_started_seen = False
@@ -11402,7 +11739,7 @@ def _emit_run_cancelled_on_cancellation(func):
                     ),
                 )
                 if bool(getattr(settings, "agent_debug_trace", False)):
-                    _append_workspace_debug_event(
+                    await _append_workspace_debug_event_async(
                         user_id,
                         session_id,
                         failure_event,
@@ -11498,7 +11835,7 @@ def _emit_run_cancelled_on_cancellation(func):
                 # Fail-safe observability comes first. The sink may belong to
                 # the already-disconnected SSE consumer.
                 if bool(getattr(settings, "agent_debug_trace", False)):
-                    _append_workspace_debug_event(
+                    await _append_workspace_debug_event_async(
                         user_id,
                         session_id,
                         cancellation_event,
@@ -11559,7 +11896,7 @@ def _emit_run_cancelled_on_cancellation(func):
                 # Persist before notifying a possibly failing/disconnected
                 # sink so the authoritative reason survives transport loss.
                 if bool(getattr(settings, "agent_debug_trace", False)):
-                    _append_workspace_debug_event(
+                    await _append_workspace_debug_event_async(
                         user_id,
                         session_id,
                         failure_event,
@@ -11634,6 +11971,18 @@ def _emit_run_cancelled_on_cancellation(func):
                         "synchronously",
                         exc_info=True,
                     )
+            if owns_execution_fence:
+                execution_fence.revoke("run_finished")
+                try:
+                    await execution_fence.close_registered_resources(
+                        grace_seconds=2.0,
+                    )
+                except BaseException:
+                    logger.debug(
+                        "Root execution resource cleanup did not finish",
+                        exc_info=True,
+                    )
+            unregister_session_execution(execution_registration)
 
     return wrapped
 
@@ -11680,6 +12029,12 @@ async def run_stream(
     ] | None = None,
     allowed_skill_http_prefixes: list[tuple[str, str]] | None = None,
     allowed_skill_http_post_prefixes: list[tuple[str, str]] | None = None,
+    allowed_skill_sandbox_egress_prefixes: (
+        list[tuple[str, str]] | None
+    ) = None,
+    allowed_skill_sandbox_egress_rules: (
+        list[tuple[str, str, tuple[str, ...]]] | None
+    ) = None,
     allowed_read_paths: list[str] | None = None,
     required_result_fields: list[str] | None = None,
     required_result_schema: dict[str, dict[str, Any]] | None = None,
@@ -11698,6 +12053,15 @@ async def run_stream(
     _runtime_progress_sink: Any | None = None,
     _execution_fence: ChildExecutionFence | None = None,
     _execution_fence_generation: int | None = None,
+    _inherited_browser_private_origins: (
+        tuple[str, ...] | None
+    ) = None,
+    _inherited_browser_egress_rules: (
+        tuple[tuple[str, tuple[str, ...]], ...] | None
+    ) = None,
+    _inherited_user_url_authorization_urls: (
+        tuple[str, ...] | None
+    ) = None,
 ) -> AsyncIterator[dict]:
     """Async generator yielding SSE-style dicts for a full agent conversation turn.
 
@@ -11901,19 +12265,74 @@ async def run_stream(
         for pattern in (declared_artifact_patterns or [])
         if isinstance(pattern, str) and pattern.strip()
     ])
-    from tools.approval import compile_user_private_origin_grants
-
-    allowed_browser_private_origins = (
-        compile_user_private_origin_grants(
-            _private_origin_authorization_text(messages),
-            str(
-                getattr(settings, "browser_private_origin_allowlist", "")
-                or ""
-            ),
-        )
-        if agent_kind == "primary" and source != "delegate"
-        else ()
+    from tools.approval import (
+        compile_user_browser_egress_rules,
+        compile_user_private_origin_grants,
     )
+    from tools.session_sandbox_policy import (
+        SessionSandboxPolicyError,
+        browser_context_egress_rules,
+        browser_egress_rule_tuples,
+        normalize_http_url_prefix,
+    )
+    from skills.http_grants import compile_user_sandbox_egress_urls
+
+    browser_authorization_text = (
+        _private_origin_authorization_text(messages)
+        if agent_kind == "primary" and source != "delegate"
+        else ""
+    )
+    if agent_kind == "primary" and source != "delegate":
+        user_url_authorization_urls = (
+            compile_user_sandbox_egress_urls(
+                browser_authorization_text
+            )
+        )
+        allowed_browser_egress_rules = compile_user_browser_egress_rules(
+            browser_authorization_text
+        )
+        allowed_browser_private_origins = (
+            compile_user_private_origin_grants(
+                browser_authorization_text,
+                str(
+                    getattr(
+                        settings,
+                        "browser_private_origin_allowlist",
+                        "",
+                    )
+                    or ""
+                ),
+            )
+        )
+    else:
+        # Delegates may inherit only the already compiled parent intersection.
+        # They never reinterpret prompt URLs or deployment configuration.
+        from tools.session_sandbox_policy import normalize_http_origin
+
+        try:
+            inherited_user_urls = tuple(
+                _inherited_user_url_authorization_urls or ()
+            )
+            user_url_authorization_urls = tuple(
+                normalize_http_url_prefix(value)
+                for value in inherited_user_urls
+            )
+            if (
+                len(user_url_authorization_urls) != len(
+                    set(user_url_authorization_urls)
+                )
+                or user_url_authorization_urls != inherited_user_urls
+            ):
+                user_url_authorization_urls = ()
+        except (TypeError, SessionSandboxPolicyError):
+            user_url_authorization_urls = ()
+        allowed_browser_egress_rules = browser_egress_rule_tuples(
+            _inherited_browser_egress_rules or ()
+        )
+        allowed_browser_private_origins = tuple(dict.fromkeys(
+            normalize_http_origin(origin)
+            for origin in (_inherited_browser_private_origins or ())
+        ))
     tool_context = ToolContext(
         user_id=user_id,
         session_id=session_id,
@@ -11951,6 +12370,14 @@ async def run_stream(
         allowed_skill_http_post_prefixes=tuple(
             allowed_skill_http_post_prefixes or ()
         ),
+        allowed_skill_sandbox_egress_prefixes=tuple(
+            allowed_skill_sandbox_egress_prefixes or ()
+        ),
+        allowed_skill_sandbox_egress_rules=tuple(
+            allowed_skill_sandbox_egress_rules or ()
+        ),
+        user_url_authorization_urls=user_url_authorization_urls,
+        allowed_browser_egress_rules=allowed_browser_egress_rules,
         allowed_browser_private_origins=allowed_browser_private_origins,
         knowledge_gate_plan=copy.deepcopy(
             delegated_knowledge_gate_plan
@@ -12090,7 +12517,11 @@ async def run_stream(
             and event_type in _WORKSPACE_LIFECYCLE_EVENT_TYPES
             and not suppress_workspace_lifecycle_debug
         ):
-            _append_workspace_debug_event(user_id, session_id, event)
+            await _append_workspace_debug_event_async(
+                user_id,
+                session_id,
+                event,
+            )
         return event
 
     async def emit_agent_event(
@@ -12323,7 +12754,11 @@ async def run_stream(
             _debug_payload(payload or {}),
             **extra,
         )
-        _append_workspace_debug_event(user_id, session_id, event)
+        await _append_workspace_debug_event_async(
+            user_id,
+            session_id,
+            event,
+        )
         return event
 
     async def debug_stream_event(event_type: str, payload: dict[str, Any] | None = None, **extra: Any) -> list[dict]:
@@ -12605,6 +13040,8 @@ async def run_stream(
     def pending_knowledge_gate_resource_coordinate_matches(
         tool_name: str,
         args: dict[str, Any] | None,
+        result_data: dict[str, Any] | None = None,
+        outcome: str = "",
     ) -> bool:
         """Distinguish a valid partial resource page from branch drift.
 
@@ -12616,7 +13053,14 @@ async def run_stream(
         get the same exact-frontier correction as any other shared bridge.
         """
 
-        return _knowledge_gate_pending_resource_coordinate_matches(
+        return (
+            tool_name == "run_skill_process"
+            and callable_skill_result_evidence_outcome(
+                tool_name,
+                result_data,
+                outcome,
+            ) == "pending"
+        ) or _knowledge_gate_pending_resource_coordinate_matches(
             delegated_knowledge_gate_plan,
             pending_knowledge_gate_group_ids(),
             tool_name=tool_name,
@@ -12659,6 +13103,15 @@ async def run_stream(
         if not activated_group_ids:
             return None
 
+        evidence_outcome = callable_skill_result_evidence_outcome(
+            tool_name,
+            result_data,
+            outcome,
+        )
+        callable_result_receipt = build_callable_skill_result_receipt(
+            tool_name,
+            result_data,
+        )
         dispatch = {
             "index": len(knowledge_gate_dispatch_ledger),
             "tool_name": tool_name,
@@ -12671,10 +13124,13 @@ async def run_stream(
                     "request_sent",
                     "matched_skill",
                     "matched_prefix_sha256",
+                    "process_evidence_receipt",
                 )
                 if result_data.get(key) is not None
             },
-            "outcome": outcome,
+            "outcome": evidence_outcome,
+            "transport_outcome": outcome,
+            "callable_result_receipt": callable_result_receipt,
             "skill_resource_complete": skill_resource_complete,
             "artifacts": [
                 dict(item)
@@ -12735,6 +13191,27 @@ async def run_stream(
         if not any(
             matching_candidate_id(group_id, dispatch)
             for group_id in activated_group_ids
+        ):
+            return None
+        process_receipt = normalize_skill_process_evidence_receipt(
+            dispatch["result_data"].get("process_evidence_receipt")
+        )
+        if (
+            process_receipt is not None
+            and any(
+                (
+                    normalize_skill_process_evidence_receipt(
+                        (
+                            row.get("result_data")
+                            if isinstance(row.get("result_data"), dict)
+                            else {}
+                        ).get("process_evidence_receipt")
+                    )
+                    or {}
+                ).get("receipt_id")
+                == process_receipt["receipt_id"]
+                for row in knowledge_gate_dispatch_ledger
+            )
         ):
             return None
         knowledge_gate_dispatch_ledger.append(dispatch)
@@ -13008,6 +13485,41 @@ async def run_stream(
                 *tool_context.allowed_skill_http_post_prefixes,
                 *(active.get("http_post_grants") or []),
             ])),
+            allowed_skill_sandbox_egress_prefixes=tuple(dict.fromkeys([
+                *tool_context.allowed_skill_sandbox_egress_prefixes,
+                *(active.get("sandbox_egress_grants") or []),
+            ])),
+            allowed_skill_sandbox_egress_rules=tuple(dict.fromkeys([
+                *tool_context.allowed_skill_sandbox_egress_rules,
+                *(
+                    (
+                        str(row[0]),
+                        str(row[1]),
+                        tuple(str(method) for method in row[2]),
+                    )
+                    for row in (
+                        active.get("sandbox_egress_rule_grants") or []
+                    )
+                    if isinstance(row, (list, tuple))
+                    and len(row) == 3
+                    and isinstance(row[2], (list, tuple))
+                ),
+            ])),
+            allowed_browser_egress_rules=browser_egress_rule_tuples([
+                *tool_context.allowed_browser_egress_rules,
+                *(
+                    (
+                        str(row[0]),
+                        tuple(str(method) for method in row[1]),
+                    )
+                    for row in (
+                        active.get("browser_egress_rule_grants") or []
+                    )
+                    if isinstance(row, (list, tuple))
+                    and len(row) == 2
+                    and isinstance(row[1], (list, tuple))
+                ),
+            ]),
         )
         run_state.available_tools = set(tools)
         return active, None
@@ -13787,6 +14299,19 @@ async def run_stream(
                                         tool_context
                                         .allowed_skill_http_post_prefixes
                                     ),
+                                    allowed_sandbox_egress=(
+                                        tool_context
+                                        .allowed_skill_sandbox_egress_prefixes
+                                    ),
+                                    allowed_sandbox_egress_rules=(
+                                        tool_context
+                                        .allowed_skill_sandbox_egress_rules
+                                    ),
+                                    allowed_browser_egress_rules=(
+                                        browser_context_egress_rules(
+                                            tool_context
+                                        )
+                                    ),
                                     frozen_mcp_catalog=(
                                         tool_context.frozen_mcp_catalog
                                     ),
@@ -13916,6 +14441,19 @@ async def run_stream(
                                 allowed_http_post=(
                                     tool_context
                                     .allowed_skill_http_post_prefixes
+                                ),
+                                allowed_sandbox_egress=(
+                                    tool_context
+                                    .allowed_skill_sandbox_egress_prefixes
+                                ),
+                                allowed_sandbox_egress_rules=(
+                                    tool_context
+                                    .allowed_skill_sandbox_egress_rules
+                                ),
+                                allowed_browser_egress_rules=(
+                                    browser_context_egress_rules(
+                                        tool_context
+                                    )
                                 ),
                                 frozen_mcp_catalog=(
                                     tool_context.frozen_mcp_catalog
@@ -15504,6 +16042,9 @@ async def run_stream(
             allowed_skill_commands=(),
             allowed_skill_http_prefixes=(),
             allowed_skill_http_post_prefixes=(),
+            allowed_skill_sandbox_egress_prefixes=(),
+            allowed_skill_sandbox_egress_rules=(),
+            allowed_browser_egress_rules=allowed_browser_egress_rules,
             skill_capability_catalog=None,
         )
         forced_workflow_policy = None
@@ -15588,6 +16129,9 @@ async def run_stream(
             allowed_skill_commands=(),
             allowed_skill_http_prefixes=(),
             allowed_skill_http_post_prefixes=(),
+            allowed_skill_sandbox_egress_prefixes=(),
+            allowed_skill_sandbox_egress_rules=(),
+            allowed_browser_egress_rules=allowed_browser_egress_rules,
             skill_capability_catalog=None,
         )
         forced_workflow_policy = None
@@ -15652,6 +16196,9 @@ async def run_stream(
                         skill_compiler_tool_universe,
                         tuple(runnable_scripts.get(standard_name) or ()),
                         request_text=run_state.original_user_text,
+                        request_authorization_text=(
+                            browser_authorization_text
+                        ),
                         phase="initial",
                     )
                 )
@@ -15855,6 +16402,16 @@ async def run_stream(
             bounded_skill_exposure.allowed_skill_http_post_prefixes
             if bounded_skill_exposure is not None
             else tool_context.allowed_skill_http_post_prefixes
+        ),
+        allowed_skill_sandbox_egress_prefixes=(
+            bounded_skill_exposure.allowed_skill_sandbox_egress_prefixes
+            if bounded_skill_exposure is not None
+            else tool_context.allowed_skill_sandbox_egress_prefixes
+        ),
+        allowed_skill_sandbox_egress_rules=(
+            bounded_skill_exposure.allowed_skill_sandbox_egress_rules
+            if bounded_skill_exposure is not None
+            else tool_context.allowed_skill_sandbox_egress_rules
         ),
     )
     # Runner schemas are not authority. Keep them out of every model surface
@@ -16707,10 +17264,13 @@ async def run_stream(
             },
             **snapshot,
         }
-        runtime_machine_annotations.update({
-            "completion_quality": "degraded",
-            "unresolved_retrieval": machine_gap,
-        })
+        quality_impact = delegate_retrieval_tracker.closure_quality_impact(
+            delegated_retrieval_completeness_policy
+        )
+        machine_gap["quality_impact"] = quality_impact
+        runtime_machine_annotations["unresolved_retrieval"] = machine_gap
+        if quality_impact != RETRIEVAL_QUALITY_IMPACT_ADVISORY:
+            runtime_machine_annotations["completion_quality"] = "degraded"
         # Even a degraded closure may contain usable page responses.  Put their
         # machine counts immediately before the tools-closed synthesis so the
         # unresolved coverage gap cannot be converted into an invented total.
@@ -16734,7 +17294,13 @@ async def run_stream(
         conversation.append({
             "role": "user",
             "content": (
-                "[Harness machine-owned unresolved HTTP evidence receipt] "
+                (
+                    "[Harness machine-owned bounded HTTP evidence receipt] "
+                    if quality_impact
+                    == RETRIEVAL_QUALITY_IMPACT_ADVISORY
+                    else
+                    "[Harness machine-owned unresolved HTTP evidence receipt] "
+                )
                 + (
                     "The Skill explicitly required exhaustive HTTP traversal, "
                     "but the declared all-pages requirement was not met within "
@@ -16744,12 +17310,24 @@ async def run_stream(
                     "The default bounded evidence-acquisition phase stopped with "
                     "a machine-observed pagination frontier still available. "
                 )
-                + "This is the single tools-closed degraded synthesis turn. "
-                "Continue the task using only evidence already returned. "
-                "Explicitly mark affected claims and fields WARN/degraded with "
-                "provenance and the unresolved coverage gap; never claim complete "
-                "retrieval or invent missing records. The harness will persist its "
-                "own unresolved-retrieval receipt independently of your wording."
+                + (
+                    "This is the single tools-closed bounded-coverage synthesis "
+                    "turn. Continue the task using only evidence already returned. "
+                    "State that acquisition was bounded/partial and do not claim "
+                    "exhaustive retrieval, all records, or invent missing records. "
+                    "This optional frontier is advisory and does not by itself "
+                    "require WARN/degraded output fields or degraded completion. "
+                    if quality_impact
+                    == RETRIEVAL_QUALITY_IMPACT_ADVISORY
+                    else
+                    "This is the single tools-closed degraded synthesis turn. "
+                    "Continue the task using only evidence already returned. "
+                    "Explicitly mark affected claims and fields WARN/degraded with "
+                    "provenance and the unresolved coverage gap; never claim "
+                    "complete retrieval or invent missing records. "
+                )
+                + "The harness will persist its own unresolved-retrieval receipt "
+                "independently of your wording."
                 + footer_instruction
             ),
         })
@@ -17465,6 +18043,9 @@ async def run_stream(
                 allowed_skill_commands=(),
                 allowed_skill_http_prefixes=(),
                 allowed_skill_http_post_prefixes=(),
+                allowed_skill_sandbox_egress_prefixes=(),
+                allowed_skill_sandbox_egress_rules=(),
+                allowed_browser_egress_rules=allowed_browser_egress_rules,
                 skill_capability_catalog=None,
             )
             run_state.available_tools = set(tools)
@@ -17528,6 +18109,9 @@ async def run_stream(
                         compiler_tools,
                         tuple(current_scripts.get(standard_name) or ()),
                         request_text=run_state.original_user_text,
+                        request_authorization_text=(
+                            browser_authorization_text
+                        ),
                         phase="dynamic",
                     )
                 )
@@ -17573,6 +18157,9 @@ async def run_stream(
                     allowed_skill_commands=(),
                     allowed_skill_http_prefixes=(),
                     allowed_skill_http_post_prefixes=(),
+                    allowed_skill_sandbox_egress_prefixes=(),
+                    allowed_skill_sandbox_egress_rules=(),
+                    allowed_browser_egress_rules=allowed_browser_egress_rules,
                     skill_capability_catalog=None,
                 )
                 run_state.available_tools = set(tools)
@@ -17640,6 +18227,9 @@ async def run_stream(
                     allowed_skill_commands=(),
                     allowed_skill_http_prefixes=(),
                     allowed_skill_http_post_prefixes=(),
+                    allowed_skill_sandbox_egress_prefixes=(),
+                    allowed_skill_sandbox_egress_rules=(),
+                    allowed_browser_egress_rules=allowed_browser_egress_rules,
                     skill_capability_catalog=None,
                 )
                 run_state.available_tools = set(tools)
@@ -17666,6 +18256,9 @@ async def run_stream(
                 allowed_skill_commands=(),
                 allowed_skill_http_prefixes=(),
                 allowed_skill_http_post_prefixes=(),
+                allowed_skill_sandbox_egress_prefixes=(),
+                allowed_skill_sandbox_egress_rules=(),
+                allowed_browser_egress_rules=allowed_browser_egress_rules,
                 skill_capability_catalog=catalog,
             )
             run_state.available_tools = set(tools)
@@ -17735,6 +18328,12 @@ async def run_stream(
             allowed_skill_http_prefixes=exposure.allowed_skill_http_prefixes,
             allowed_skill_http_post_prefixes=(
                 exposure.allowed_skill_http_post_prefixes
+            ),
+            allowed_skill_sandbox_egress_prefixes=(
+                exposure.allowed_skill_sandbox_egress_prefixes
+            ),
+            allowed_skill_sandbox_egress_rules=(
+                exposure.allowed_skill_sandbox_egress_rules
             ),
         )
         run_state.available_tools = set(tools)
@@ -17812,6 +18411,29 @@ async def run_stream(
     ) -> list[str]:
         """Resolve only exact dispatch attempts, never a shared bridge name."""
 
+        evidence_outcome = callable_skill_result_evidence_outcome(
+            tool_name,
+            result_data,
+            outcome,
+        )
+        callable_result_receipt = build_callable_skill_result_receipt(
+            tool_name,
+            result_data,
+        )
+        process_receipt = normalize_skill_process_evidence_receipt(
+            (result_data or {}).get("process_evidence_receipt")
+            if isinstance(result_data, dict)
+            else None
+        )
+        if (
+            process_receipt is not None
+            and any(
+                receipt.get("process_receipt_id")
+                == process_receipt["receipt_id"]
+                for receipt in standard_required_candidate_receipts.values()
+            )
+        ):
+            return []
         newly_completed: list[str] = []
         for candidate_id, candidate in standard_required_candidates.items():
             if candidate_id in standard_completed_required_candidate_ids:
@@ -17821,7 +18443,7 @@ async def run_stream(
                 tool_name=tool_name,
                 args=args,
                 result_data=result_data,
-                outcome=outcome,
+                outcome=evidence_outcome,
                 skill_resource_complete=skill_resource_complete,
                 artifacts=artifacts or [],
                 allowed_skill_scripts=tool_context.allowed_skill_scripts,
@@ -17837,10 +18459,37 @@ async def run_stream(
                 standard_required_candidate_receipts[candidate_id] = {
                     "candidate_id": candidate_id,
                     "tool_name": tool_name,
-                    "outcome": outcome,
+                    "outcome": evidence_outcome,
+                    "transport_outcome": outcome,
+                    **(
+                        {
+                            "process_receipt_id": (
+                                process_receipt["receipt_id"]
+                            ),
+                            "process_completion_kind": (
+                                process_receipt["completion_kind"]
+                            ),
+                        }
+                        if process_receipt is not None
+                        else {}
+                    ),
+                    **(
+                        {
+                            "callable_result_receipt": (
+                                callable_result_receipt
+                            ),
+                        }
+                        if callable_result_receipt is not None
+                        else {}
+                    ),
                     "error_code": str(
                         (result_data or {}).get("error_code")
                         or (result_data or {}).get("reason")
+                        or (
+                            "callable_skill_result_typed_failure"
+                            if evidence_outcome != outcome
+                            else ""
+                        )
                         or ""
                     ),
                 }
@@ -18013,6 +18662,58 @@ async def run_stream(
         allowed_http_post = pair_rows(
             plan.get("allowed_skill_http_post_prefixes")
         )
+        allowed_sandbox_egress = pair_rows(
+            plan.get("allowed_skill_sandbox_egress_prefixes")
+        )
+        allowed_sandbox_egress_rules: list[
+            tuple[str, str, tuple[str, ...]]
+        ] = []
+        for row in plan.get("allowed_skill_sandbox_egress_rules") or []:
+            if (
+                isinstance(row, list)
+                and len(row) == 3
+                and isinstance(row[0], str)
+                and row[0]
+                and isinstance(row[1], str)
+                and row[1]
+                and isinstance(row[2], list)
+                and row[2]
+                and all(
+                    isinstance(method, str) and method
+                    for method in row[2]
+                )
+            ):
+                allowed_sandbox_egress_rules.append((
+                    row[0],
+                    row[1],
+                    tuple(row[2]),
+                ))
+        from tools.session_sandbox_policy import (
+            SessionSandboxPolicyError,
+            browser_egress_rule_tuples,
+        )
+
+        raw_browser_egress_rules = plan.get(
+            "allowed_browser_egress_rules"
+        ) or []
+        try:
+            selected_browser_egress_rules = (
+                browser_egress_rule_tuples(
+                    (
+                        str(row[0]),
+                        tuple(str(method) for method in row[1]),
+                    )
+                    for row in raw_browser_egress_rules
+                    if (
+                        isinstance(row, list)
+                        and len(row) == 2
+                        and isinstance(row[0], str)
+                        and isinstance(row[1], list)
+                    )
+                )
+            )
+        except SessionSandboxPolicyError:
+            selected_browser_egress_rules = ()
 
         tools = selected_tools
         tool_context = replace(
@@ -18030,6 +18731,16 @@ async def run_stream(
             allowed_skill_commands=allowed_commands,
             allowed_skill_http_prefixes=allowed_http,
             allowed_skill_http_post_prefixes=allowed_http_post,
+            allowed_skill_sandbox_egress_prefixes=(
+                allowed_sandbox_egress
+            ),
+            allowed_skill_sandbox_egress_rules=tuple(dict.fromkeys(
+                allowed_sandbox_egress_rules
+            )),
+            allowed_browser_egress_rules=browser_egress_rule_tuples([
+                *tool_context.allowed_browser_egress_rules,
+                *selected_browser_egress_rules,
+            ]),
             # Keep the backend-issued finite catalog as runtime-only parent
             # authority. The planning tool is no longer exposed, but delegated
             # Workflow IR nodes must still prove each exact binding ID and
@@ -18334,6 +19045,7 @@ async def run_stream(
                 tuple(runnable_scripts.get(skill_name) or ()),
                 tuple(current_authority_documents),
                 request_text=run_state.original_user_text,
+                request_authorization_text=browser_authorization_text,
                 phase="amendment",
             )
         )
@@ -18545,6 +19257,12 @@ async def run_stream(
             allowed_skill_http_post_prefixes=(
                 exposure.allowed_skill_http_post_prefixes
             ),
+            allowed_skill_sandbox_egress_prefixes=(
+                exposure.allowed_skill_sandbox_egress_prefixes
+            ),
+            allowed_skill_sandbox_egress_rules=(
+                exposure.allowed_skill_sandbox_egress_rules
+            ),
         )
         boundary_changed = bool(
             tuple(tools) != tuple(selected_tools)
@@ -18558,6 +19276,10 @@ async def run_stream(
             != exposure.allowed_skill_http_prefixes
             or tool_context.allowed_skill_http_post_prefixes
             != exposure.allowed_skill_http_post_prefixes
+            or tool_context.allowed_skill_sandbox_egress_prefixes
+            != exposure.allowed_skill_sandbox_egress_prefixes
+            or tool_context.allowed_skill_sandbox_egress_rules
+            != exposure.allowed_skill_sandbox_egress_rules
         )
         # No await occurs across these assignments: all model/dispatch surfaces
         # observe either the old complete closure or the new complete closure.
@@ -18704,8 +19426,14 @@ async def run_stream(
             }
             if re.fullmatch(r"[0-9a-f]{64}", digest):
                 receipt["result_receipt_sha256"] = digest
-            if isinstance(item.get("unresolved_retrieval"), dict):
-                receipt["unresolved_retrieval"] = True
+            unresolved = item.get("unresolved_retrieval")
+            if isinstance(unresolved, dict):
+                quality_impact = unresolved.get("quality_impact")
+                receipt["unresolved_retrieval"] = (
+                    {"quality_impact": quality_impact}
+                    if isinstance(quality_impact, str)
+                    else True
+                )
             receipts.append(receipt)
         return receipts
 
@@ -18951,6 +19679,19 @@ async def run_stream(
             )
             auto_completed = _tool_outcome_is_completed(auto_outcome)
             auto_result_data = _json_object(str(auto_result))
+            auto_callable_result_receipt = (
+                build_callable_skill_result_receipt(
+                    auto_tool_name,
+                    auto_result_data,
+                )
+            )
+            auto_evidence_outcome = (
+                callable_skill_result_evidence_outcome(
+                    auto_tool_name,
+                    auto_result_data,
+                    auto_outcome,
+                )
+            )
             delegate_update: dict[str, Any] | None = None
             if not auto_completed:
                 run_state.tool_error_count += 1
@@ -19072,6 +19813,14 @@ async def run_stream(
                         run_state.successful_write_sizes.append(size)
 
             if not deterministic_skill_inspection:
+                auto_wrapped_result = await run_sync_cancellation_safe(
+                    lambda: wrap_result(
+                        str(auto_result),
+                        auto_tool_name,
+                        user_id=user_id,
+                        session_id=session_id,
+                    )
+                )
                 auto_history_index = len(conversation)
                 conversation.append({
                     "role": "assistant",
@@ -19088,12 +19837,7 @@ async def run_stream(
                 conversation.append({
                     "role": "tool",
                     "tool_call_id": auto_call_id,
-                    "content": wrap_result(
-                        str(auto_result),
-                        auto_tool_name,
-                        user_id=user_id,
-                        session_id=session_id,
-                    ),
+                    "content": auto_wrapped_result,
                 })
                 if delegated_subtask and auto_actual_dispatch_attempted:
                     delegate_dispatched_tool_result_count += 1
@@ -19140,6 +19884,43 @@ async def run_stream(
                     "actual_dispatch_attempted": (
                         auto_actual_dispatch_attempted
                     ),
+                    "exact_capability_receipt": (
+                        {
+                            "result_data": {
+                                key: (auto_result_data or {}).get(key)
+                                for key in (
+                                    "sha256",
+                                    "error_code",
+                                    "request_sent",
+                                    "matched_skill",
+                                    "matched_prefix_sha256",
+                                    "status",
+                                    "plan_sha256",
+                                    "activated_group_ids",
+                                    "unresolved_group_ids",
+                                    "unknown_check_ids",
+                                    "process_evidence_receipt",
+                                )
+                                if (auto_result_data or {}).get(key)
+                                is not None
+                            },
+                            "skill_resource_complete": (
+                                auto_skill_resource_complete
+                            ),
+                            "evidence_outcome": auto_evidence_outcome,
+                            **(
+                                {
+                                    "callable_result_receipt": (
+                                        auto_callable_result_receipt
+                                    ),
+                                }
+                                if auto_callable_result_receipt is not None
+                                else {}
+                            ),
+                        }
+                        if auto_actual_dispatch_attempted
+                        else None
+                    ),
                     "artifacts": [
                         {
                             key: item.get(key)
@@ -19159,6 +19940,7 @@ async def run_stream(
                     "tool_name": auto_tool_name,
                     "tool_call_id": auto_call_id,
                     "outcome": auto_outcome,
+                    "evidence_outcome": auto_evidence_outcome,
                     "detail": safe_auto_detail[:1000],
                     "result": _tool_debug_result(str(auto_result)),
                     "workflow_auto_dispatch": True,
@@ -19505,6 +20287,19 @@ async def run_stream(
                 iteration_delegated_retrieval_followup = False
                 iteration_delegated_retrieval_optional_frontier = False
                 iteration_delegated_retrieval_degraded_synthesis = True
+        iteration_delegated_retrieval_advisory_synthesis = bool(
+            iteration_delegated_retrieval_degraded_synthesis
+            and isinstance(
+                runtime_machine_annotations.get("unresolved_retrieval"),
+                dict,
+            )
+            and (
+                runtime_machine_annotations["unresolved_retrieval"].get(
+                    "quality_impact"
+                )
+                == RETRIEVAL_QUALITY_IMPACT_ADVISORY
+            )
+        )
         iteration_workflow_policy = forced_workflow_policy
         forced_workflow_policy = None
         standard_unsatisfied_required = (
@@ -19757,7 +20552,16 @@ async def run_stream(
                         or iteration_post_dispatch_synthesis_continuation
                     )
                     else (
-                        "delegated unresolved-retrieval degraded synthesis"
+                        (
+                            "delegated bounded-retrieval advisory synthesis"
+                            if (
+                                iteration_delegated_retrieval_advisory_synthesis
+                            )
+                            else (
+                                "delegated unresolved-retrieval degraded "
+                                "synthesis"
+                            )
+                        )
                         if iteration_delegated_retrieval_degraded_synthesis
                         else (
                             "delegated cross-tool failure-budget synthesis"
@@ -19873,11 +20677,14 @@ async def run_stream(
                 if machine_gap is not None:
                     iteration_delegated_retrieval_optional_frontier = False
                     iteration_delegated_retrieval_degraded_synthesis = True
+                    iteration_delegated_retrieval_advisory_synthesis = True
                     delegate_forced_synthesis = True
                     iteration_workflow_policy = {
                         "tools": [],
                         "max_calls": 0,
-                        "reason": "delegated unresolved-retrieval degraded synthesis",
+                        "reason": (
+                            "delegated bounded-retrieval advisory synthesis"
+                        ),
                     }
         if iteration_visible_length_recovery:
             # The partial body was already emitted and retained before this
@@ -19963,6 +20770,13 @@ async def run_stream(
                 delegate_synthesis_turn_reserve
             ),
             "delegate_http_retrieval_degraded_synthesis": (
+                iteration_delegated_retrieval_degraded_synthesis
+                and not iteration_delegated_retrieval_advisory_synthesis
+            ),
+            "delegate_http_retrieval_advisory_synthesis": (
+                iteration_delegated_retrieval_advisory_synthesis
+            ),
+            "delegate_http_retrieval_closure_synthesis": (
                 iteration_delegated_retrieval_degraded_synthesis
             ),
             "delegate_http_retrieval": (
@@ -27711,6 +28525,11 @@ async def run_stream(
                             allowed_skill_commands=(),
                             allowed_skill_http_prefixes=(),
                             allowed_skill_http_post_prefixes=(),
+                            allowed_skill_sandbox_egress_prefixes=(),
+                            allowed_skill_sandbox_egress_rules=(),
+                            allowed_browser_egress_rules=(
+                                allowed_browser_egress_rules
+                            ),
                         )
                         run_state.available_tools = set(tools)
                         relevance_skill_view_args = {
@@ -28176,6 +28995,18 @@ async def run_stream(
                     tool_name=display_tool_name,
                 )
                 tool_completed = _tool_outcome_is_completed(outcome)
+                exact_result_data = _json_object(str(result)) or {}
+                callable_result_receipt = (
+                    build_callable_skill_result_receipt(
+                        display_tool_name,
+                        exact_result_data,
+                    )
+                )
+                evidence_outcome = callable_skill_result_evidence_outcome(
+                    display_tool_name,
+                    exact_result_data,
+                    outcome,
+                )
                 safe_outcome_detail = _redact_debug_text(outcome_detail)
                 if (
                     actual_dispatch_attempted
@@ -28618,7 +29449,7 @@ async def run_stream(
                                 if isinstance(receipt_args, dict)
                                 else {}
                             ),
-                            _json_object(str(result)),
+                            exact_result_data,
                             outcome,
                             artifacts=artifact_payloads,
                         )
@@ -28630,7 +29461,7 @@ async def run_stream(
                             if isinstance(receipt_args, dict)
                             else {}
                         ),
-                        _json_object(str(result)),
+                        exact_result_data,
                         outcome,
                         artifacts=artifact_payloads,
                     )
@@ -28843,6 +29674,8 @@ async def run_stream(
                                 if isinstance(receipt_args, dict)
                                 else {}
                             ),
+                            exact_result_data,
+                            outcome,
                         )
                     )
                 ):
@@ -29110,7 +29943,6 @@ async def run_stream(
                     "Tool completed user=%s session=%s tool=%s outcome=%s detail=%s",
                     user_id, session_id, display_tool_name, outcome, safe_outcome_detail[:300],
                 )
-                exact_result_data = _json_object(str(result)) or {}
                 yield await emit_agent_event(
                     "tool.completed" if tool_completed else "tool.failed",
                     {
@@ -29136,11 +29968,22 @@ async def run_stream(
                                         "activated_group_ids",
                                         "unresolved_group_ids",
                                         "unknown_check_ids",
+                                        "process_evidence_receipt",
                                     )
                                     if exact_result_data.get(key) is not None
                                 },
                                 "skill_resource_complete": (
                                     exact_skill_resource_complete
+                                ),
+                                "evidence_outcome": evidence_outcome,
+                                **(
+                                    {
+                                        "callable_result_receipt": (
+                                            callable_result_receipt
+                                        ),
+                                    }
+                                    if callable_result_receipt is not None
+                                    else {}
                                 ),
                                 **(
                                     {
@@ -29167,7 +30010,7 @@ async def run_stream(
                                 for key in ("path", "size_bytes", "sha256", "source_tool")
                                 if item.get(key) is not None
                             }
-                            for item in artifact_payloads[:100]
+                            for item in artifact_payloads[:512]
                             if isinstance(item, dict)
                         ],
                     },
@@ -29181,6 +30024,7 @@ async def run_stream(
                         "original_tool_name": tc.name,
                         "tool_call_id": tool_call_id,
                         "outcome": outcome,
+                        "evidence_outcome": evidence_outcome,
                         "detail": safe_outcome_detail[:1000],
                         "result": _tool_debug_result(str(result)),
                         "actual_dispatch_attempted": (
@@ -29286,13 +30130,22 @@ async def run_stream(
                     history_will_collapse
                     and display_tool_name == "execute_code"
                 ):
-                    history_result_path = persist_result_for_history(
+                    history_result_path = await run_sync_cancellation_safe(
+                        lambda: persist_result_for_history(
+                            str(result),
+                            display_tool_name,
+                            user_id=user_id,
+                            session_id=session_id,
+                        )
+                    )
+                wrapped = await run_sync_cancellation_safe(
+                    lambda: wrap_result(
                         str(result),
                         display_tool_name,
                         user_id=user_id,
                         session_id=session_id,
                     )
-                wrapped = wrap_result(str(result), display_tool_name, user_id=user_id, session_id=session_id)
+                )
                 if history_result_path:
                     wrapped_data = _json_object(wrapped)
                     history_metadata = {
@@ -29673,9 +30526,10 @@ async def run_stream(
                             "next turn you may make at most one exact authorized "
                             "HTTP continuation, or stop acquisition and synthesize "
                             "honestly from observed pages. If you stop, the harness "
-                            "will require one tools-closed partial/degraded result. "
-                            "Never claim full-source or all-pages coverage while the "
-                            "frontier remains open."
+                            "will require one tools-closed bounded-coverage result. "
+                            "The optional frontier is advisory rather than a "
+                            "quality failure, but never claim full-source or "
+                            "all-pages coverage while it remains open."
                             + exact_action_instruction
                         ),
                     })
@@ -34757,6 +35611,12 @@ class SkillExecutionExposure:
     ]
     allowed_skill_http_prefixes: tuple[tuple[str, str], ...] = ()
     allowed_skill_http_post_prefixes: tuple[tuple[str, str], ...] = ()
+    allowed_skill_sandbox_egress_prefixes: tuple[
+        tuple[str, str], ...
+    ] = ()
+    allowed_skill_sandbox_egress_rules: tuple[
+        tuple[str, str, tuple[str, ...]], ...
+    ] = ()
     mcp_exact_names: tuple[str, ...] = ()
 
 
@@ -34782,7 +35642,6 @@ def _profiled_skill_script_grants(
 
     from tools.isolated_skill_executor import snapshot_skill_package
     from tools.skill_runtime_profile import (
-        BASE_RUNTIME_PROFILE,
         BROWSER_RUNTIME_PROFILE,
         assess_skill_runtime_network,
         select_skill_runtime_profile,
@@ -34878,22 +35737,6 @@ def _profiled_skill_script_grants(
         ):
             errors.append(
                 f"{path}:{network_assessment.reason_code}"
-            )
-            continue
-        if (
-            selection.runtime_profile == BASE_RUNTIME_PROFILE
-            and network_assessment.suppresses_entrypoint
-        ):
-            # base-v1 deliberately has no DNS or external network route.  Do
-            # not advertise an exact entrypoint proven egress-only. Potential
-            # network helpers and dead branches remain callable so unrelated
-            # local functions in the same module are not hidden.
-            errors.append(
-                f"{path}:"
-                + (
-                    network_assessment.reason_code
-                    or "skill_runtime_entrypoint_requires_external_network"
-                )
             )
             continue
         manifest_row = manifest_rows.get(path)
@@ -35750,6 +36593,7 @@ def _safe_build_standard_skill_capability_catalog(
     authority_documents: tuple[dict[str, Any], ...] = (),
     *,
     request_text: str = "",
+    request_authorization_text: str | None = None,
     phase: str,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Compile one catalog behind a typed, exception-safe boundary.
@@ -35770,6 +36614,7 @@ def _safe_build_standard_skill_capability_catalog(
             runnable_scripts,
             authority_documents,
             request_text=request_text,
+            request_authorization_text=request_authorization_text,
         )
         if not isinstance(catalog, dict):
             raise TypeError("catalog compiler returned a non-object")
@@ -35830,21 +36675,32 @@ def _build_standard_skill_capability_catalog(
     authority_documents: tuple[dict[str, Any], ...] = (),
     *,
     request_text: str = "",
+    request_authorization_text: str | None = None,
 ) -> dict[str, Any]:
     """Compile current exact candidates with runtime-owned policy metadata."""
 
     from skills.command_grants import all_compiled_command_grants
+    from tools.approval import compile_user_browser_egress_rules
     from skills.http_grants import (
+        compile_user_sandbox_egress_urls,
         compile_loaded_skill_http_grants,
         compile_loaded_skill_http_post_grants,
+        compile_loaded_skill_sandbox_egress_rules,
     )
     from tools.isolated_skill_executor import snapshot_skill_package
     from tools.skill_runtime_profile import (
-        BASE_RUNTIME_PROFILE,
         assess_skill_runtime_network,
         select_skill_runtime_profile,
     )
 
+    browser_authorization_text = (
+        request_text
+        if request_authorization_text is None
+        else str(request_authorization_text or "")
+    )
+    user_url_authorization_urls = compile_user_sandbox_egress_urls(
+        browser_authorization_text
+    )
     skill_package_sha256 = ""
     skill_snapshot = None
     package_root_value = loaded_package.get("skill_dir")
@@ -36050,29 +36906,10 @@ def _build_standard_skill_capability_catalog(
                 ),
             })
             continue
-        if (
-            selection.runtime_profile == BASE_RUNTIME_PROFILE
-            and network_assessment.suppresses_entrypoint
-        ):
-            profile_unavailable.append({
-                "kind": "skill_script",
-                "resource_path": path,
-                "reason_code": (
-                    network_assessment.reason_code
-                    or "skill_runtime_entrypoint_requires_external_network"
-                ),
-                "evidence_kind": (
-                    network_assessment.evidence_kind or "unknown"
-                ),
-                "reason": (
-                    "The exact entrypoint is proven to require external "
-                    "network access, "
-                    "but the selected isolated base runtime is network-"
-                    "disabled. Use a separately compiled HTTP, browser, or "
-                    "MCP capability."
-                ),
-            })
-            continue
+        user_url_bindings = [
+            binding.as_payload()
+            for binding in selection.user_url_egress
+        ]
         script_runtime_profiles[path] = {
             "runtime_profile": selection.runtime_profile,
             "package_sha256": selection.package_sha256,
@@ -36087,6 +36924,15 @@ def _build_standard_skill_capability_catalog(
             "reachable_sources": list(selection.reachable_sources),
             "required_cwd": selection.required_cwd,
             "egress_only": selection.egress_only,
+            "requires_external_network": (
+                network_assessment.suppresses_entrypoint
+            ),
+            "network_reason_code": network_assessment.reason_code,
+            "network_evidence_kind": network_assessment.evidence_kind,
+            "user_url_egress_bindings": user_url_bindings,
+            "user_url_egress_available": bool(
+                user_url_bindings and user_url_authorization_urls
+            ),
         }
         profiled_runnable_scripts.append((path, digest))
     filtered_runnable_scripts = profiled_runnable_scripts
@@ -36150,6 +36996,9 @@ def _build_standard_skill_capability_catalog(
         if str(selector).strip().casefold().startswith("mcp_")
     ]
     commands = all_compiled_command_grants(loaded_package)
+    native_browser_egress_rules = compile_user_browser_egress_rules(
+        browser_authorization_text
+    )
     if not explicitly_empty:
         candidate_tools = list(dict.fromkeys([
             *candidate_tools,
@@ -36170,6 +37019,7 @@ def _build_standard_skill_capability_catalog(
         skill_package_sha256=skill_package_sha256,
         runnable_scripts=filtered_runnable_scripts,
         command_grants=commands,
+        native_browser_egress_rules=native_browser_egress_rules,
         exact_mcp_names=exact_mcp_names,
         native_tool_metadata=native_tool_metadata,
         authority_documents=authority_documents,
@@ -36195,6 +37045,64 @@ def _build_standard_skill_capability_catalog(
         loaded_package,
         ["SKILL.md", *referenced_paths],
     )
+    sandbox_egress_rules = compile_loaded_skill_sandbox_egress_rules(
+        skill_name,
+        loaded_package,
+        ["SKILL.md", *referenced_paths],
+    )
+    sandbox_egress_closure = {
+        prefix
+        for granted_skill, prefix, _methods in sandbox_egress_rules
+        if granted_skill == skill_name and prefix
+    }
+    if not sandbox_egress_closure:
+        unresolved_network_scripts = {
+            path
+            for path, _digest in filtered_runnable_scripts
+            if (
+                script_runtime_profiles.get(path, {}).get(
+                    "requires_external_network"
+                )
+                is True
+                and not script_runtime_profiles.get(path, {}).get(
+                    "user_url_egress_available"
+                )
+            )
+        }
+        if unresolved_network_scripts:
+            filtered_runnable_scripts = [
+                (path, digest)
+                for path, digest in filtered_runnable_scripts
+                if path not in unresolved_network_scripts
+            ]
+            for path in sorted(unresolved_network_scripts):
+                profile = script_runtime_profiles.get(path, {})
+                unavailable_script_capabilities.append({
+                    "kind": "skill_script",
+                    "resource_path": path,
+                    "reason_code": (
+                        "skill_runtime_entrypoint_egress_unresolved"
+                    ),
+                    "evidence_kind": (
+                        profile.get("network_evidence_kind")
+                        or "exact_origin_closure"
+                    ),
+                    "reason": (
+                        "The exact entrypoint is proven to require external "
+                        "network access, but its content-addressed Skill "
+                        "authority closure contains neither a canonical "
+                        "package URL rule nor a schema-v2 current-user URL "
+                        "binding from which exact sandbox egress authority "
+                        "can be compiled."
+                    ),
+                })
+            # Preserve the most precise reason per path after the late
+            # authority-closure check.
+            unavailable_script_capabilities = list({
+                str(item.get("resource_path") or ""): item
+                for item in unavailable_script_capabilities
+                if str(item.get("resource_path") or "")
+            }.values())[:64]
     if not explicitly_empty:
         candidate_tools = list(dict.fromkeys([
             *candidate_tools,
@@ -36221,6 +37129,8 @@ def _build_standard_skill_capability_catalog(
         command_grants=commands,
         http_prefixes=http_prefixes,
         http_post_prefixes=http_post_prefixes,
+        sandbox_egress_rules=sandbox_egress_rules,
+        native_browser_egress_rules=native_browser_egress_rules,
         exact_mcp_names=exact_mcp_names,
         native_tool_metadata=native_tool_metadata,
         authority_documents=authority_documents,
@@ -37468,6 +38378,10 @@ def _bounded_skill_execution_exposure(
     allowed_commands: set[tuple[str, str, str, tuple[str, ...]]] = set()
     allowed_http_prefixes: set[tuple[str, str]] = set()
     allowed_http_post_prefixes: set[tuple[str, str]] = set()
+    allowed_sandbox_egress_prefixes: set[tuple[str, str]] = set()
+    allowed_sandbox_egress_rules: set[
+        tuple[str, str, tuple[str, ...]]
+    ] = set()
     execution_capabilities: set[str] = set()
     has_compiled_orchestration = False
     declared_capability_skills: set[str] = set()
@@ -37951,62 +38865,10 @@ def _bounded_skill_execution_exposure(
     if not capability_resource_error:
         allowed_resources.update(capability_resource_closure)
 
-    # An instruction-only REST Skill can receive network authority only from
-    # literal HTTPS URLs in its exact package/resource closure.  Compile this
-    # separately from ambient web tools so neither a capability name nor the
-    # user's prose can mint arbitrary egress.
-    from skills.http_grants import (
-        compile_loaded_skill_http_grants,
-        compile_loaded_skill_http_post_grants,
-    )
-
-    # A package declaration can narrow an already-authorized capability, but
-    # cannot create one.  Do not even retain dormant endpoint grants when the
-    # backend/session tool catalog omitted this bridge: a hallucinated tool
-    # name must never find latent dispatch authority in ToolContext.
-    available_http_bridges = {
-        "skill_http_get", "skill_http_post_json",
-    }.intersection(available)
-    if available_http_bridges:
-        http_grant_skills = set(selected) | eligible_capability_skills
-        for http_skill in sorted(http_grant_skills):
-            loaded_http_skill = loaded_packages.get(http_skill)
-            if not isinstance(loaded_http_skill, dict):
-                continue
-            http_resource_paths = [
-                path for granted_skill, path in allowed_resources
-                if granted_skill == http_skill
-            ]
-            http_resource_paths.extend(
-                capability_http_resource_inventory.get(http_skill, ())
-            )
-            allowed_http_prefixes.update(
-                compile_loaded_skill_http_grants(
-                    http_skill,
-                    loaded_http_skill,
-                    list(dict.fromkeys(http_resource_paths)),
-                )
-            )
-            allowed_http_post_prefixes.update(
-                compile_loaded_skill_http_post_grants(
-                    http_skill,
-                    loaded_http_skill,
-                    list(dict.fromkeys(http_resource_paths)),
-                )
-            )
-        if allowed_http_prefixes and "skill_http_get" in available_http_bridges:
-            requested.add("skill_http_get")
-            execution_capabilities.add("skill_http_get")
-        if (
-            allowed_http_post_prefixes
-            and "skill_http_post_json" in available_http_bridges
-        ):
-            requested.add("skill_http_post_json")
-            execution_capabilities.add("skill_http_post_json")
-
     # A worker that explicitly declares a capability Skill may need its exact
-    # package runner. Make the runner schema available to that child only when
-    # at least one such package has a content-addressed executable resource.
+    # package runner. Compile these before the URL closure so a selected
+    # capability script can receive its own exact origins even when the direct
+    # HTTP bridge is not exposed.
     capability_scripts: list[tuple[str, str, str]] = []
     capability_process_only: set[tuple[str, str, str]] = set()
     for capability_skill in sorted(eligible_capability_skills):
@@ -38046,6 +38908,65 @@ def _bounded_skill_execution_exposure(
         and "run_skill_python" in available
     ):
         requested.add("run_skill_python")
+
+    # Network authority comes only from literal HTTP(S) URLs in the exact
+    # package/resource closure. Compile it independently of whether a direct
+    # HTTP bridge is exposed: a selected exact script/command uses the same
+    # frozen prefix set through the session-sandbox policy proxy.
+    from skills.http_grants import (
+        compile_loaded_skill_http_grants,
+        compile_loaded_skill_http_post_grants,
+        compile_loaded_skill_sandbox_egress_rules,
+    )
+
+    available_http_bridges = {
+        "skill_http_get", "skill_http_post_json",
+    }.intersection(available)
+    http_grant_skills = set(selected) | eligible_capability_skills
+    for http_skill in sorted(http_grant_skills):
+        loaded_http_skill = loaded_packages.get(http_skill)
+        if not isinstance(loaded_http_skill, dict):
+            continue
+        http_resource_paths = [
+            path for granted_skill, path in allowed_resources
+            if granted_skill == http_skill
+        ]
+        http_resource_paths.extend(
+            capability_http_resource_inventory.get(http_skill, ())
+        )
+        compiled_get = compile_loaded_skill_http_grants(
+            http_skill,
+            loaded_http_skill,
+            list(dict.fromkeys(http_resource_paths)),
+        )
+        compiled_post = compile_loaded_skill_http_post_grants(
+            http_skill,
+            loaded_http_skill,
+            list(dict.fromkeys(http_resource_paths)),
+        )
+        compiled_sandbox_rules = (
+            compile_loaded_skill_sandbox_egress_rules(
+                http_skill,
+                loaded_http_skill,
+                list(dict.fromkeys(http_resource_paths)),
+            )
+        )
+        allowed_sandbox_egress_prefixes.update(compiled_get)
+        allowed_sandbox_egress_prefixes.update(compiled_post)
+        allowed_sandbox_egress_rules.update(compiled_sandbox_rules)
+        if "skill_http_get" in available_http_bridges:
+            allowed_http_prefixes.update(compiled_get)
+        if "skill_http_post_json" in available_http_bridges:
+            allowed_http_post_prefixes.update(compiled_post)
+    if allowed_http_prefixes and "skill_http_get" in available_http_bridges:
+        requested.add("skill_http_get")
+        execution_capabilities.add("skill_http_get")
+    if (
+        allowed_http_post_prefixes
+        and "skill_http_post_json" in available_http_bridges
+    ):
+        requested.add("skill_http_post_json")
+        execution_capabilities.add("skill_http_post_json")
 
     # A selected plan may name another session Skill as a capability.  Its
     # package-level exact selectors are reusable by that capability's child;
@@ -38091,6 +39012,8 @@ def _bounded_skill_execution_exposure(
         allowed_commands.clear()
         allowed_http_prefixes.clear()
         allowed_http_post_prefixes.clear()
+        allowed_sandbox_egress_prefixes.clear()
+        allowed_sandbox_egress_rules.clear()
         execution_capabilities.clear()
         mcp_exact_names.clear()
 
@@ -38234,6 +39157,12 @@ def _bounded_skill_execution_exposure(
         allowed_skill_http_post_prefixes=tuple(
             sorted(allowed_http_post_prefixes)
         ),
+        allowed_skill_sandbox_egress_prefixes=tuple(sorted(
+            allowed_sandbox_egress_prefixes
+        )),
+        allowed_skill_sandbox_egress_rules=tuple(sorted(
+            allowed_sandbox_egress_rules
+        )),
         mcp_exact_names=tuple(sorted(mcp_exact_names, key=str.casefold)),
     )
 

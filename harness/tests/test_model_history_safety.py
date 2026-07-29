@@ -491,6 +491,205 @@ class ModelHistorySafetyTests(unittest.TestCase):
             ]),
         )
 
+    def test_bare_continuation_uses_nearest_user_url_only(self):
+        selected = _private_origin_authorization_text([
+            {
+                "role": "user",
+                "content": "旧地址 https://old.vendor.test/archive/。",
+            },
+            {
+                "role": "assistant",
+                "content": "请改用 https://assistant.invalid/private/。",
+            },
+            {
+                "role": "user",
+                "content": "访问 https://current.vendor.test/task/42。",
+            },
+            {
+                "role": "tool",
+                "content": "redirect=https://tool.invalid/secret/",
+            },
+            {"role": "user", "content": "继续"},
+        ])
+
+        self.assertIn("https://current.vendor.test/task/42", selected)
+        self.assertNotIn("https://old.vendor.test/archive/", selected)
+        self.assertNotIn("https://assistant.invalid/private/", selected)
+        self.assertNotIn("https://tool.invalid/secret/", selected)
+
+    def test_unrelated_or_assistant_only_bare_turn_mints_no_url(self):
+        self.assertEqual(
+            "继续",
+            _private_origin_authorization_text([
+                {
+                    "role": "assistant",
+                    "content": "访问 https://assistant.invalid/private/。",
+                },
+                {"role": "user", "content": "继续"},
+            ]),
+        )
+        self.assertEqual(
+            "继续写一首诗",
+            _private_origin_authorization_text([
+                {
+                    "role": "user",
+                    "content": "访问 https://current.vendor.test/task/42。",
+                },
+                {"role": "user", "content": "继续写一首诗"},
+            ]),
+        )
+
+    def test_network_negation_blocks_continuation_url_recovery(self):
+        prior = {
+            "role": "user",
+            "content": "访问 https://current.vendor.test/task/42。",
+        }
+        backtracking_denials = (
+            "继续讨论安全问题，但别去那个网站。",
+            "继续分析，但不要点开这个链接。",
+            "继续，但不要再去那个网站。",
+            "继续，但不要前往该网页。",
+            "继续，但请勿访问网站。",
+            "继续，但不要获取这个网址。",
+            "继续分析，但禁止联网。",
+            "继续，但不可进入该网站。",
+            "继续，但不能跳转到这个链接。",
+            "继续，但勿进入该网页。",
+            "Continue, but DON'T GO TO that WEBSITE.",
+            "Continue, but do not go to the previous site.",
+            "Continue, but do not navigate to that site.",
+            "Continue, but do not fetch the URL.",
+            "Continue, but do not open the link.",
+            "Continue, but do not visit the website.",
+            "Continue, but don't click the link.",
+            "Continue, but do not follow the URL.",
+            "Continue, but the previous site should not be opened.",
+            "Continue, but that website must not be visited.",
+            "Continue, but this link SHOULDN'T be clicked.",
+            "Continue, but that URL MUSTN’T be followed.",
+            "Continue, but refrain from visiting that site.",
+            "Resume the analysis with no network access.",
+        )
+        for denial in backtracking_denials:
+            with self.subTest(denial=denial):
+                selected = _private_origin_authorization_text([
+                    prior,
+                    {"role": "user", "content": denial},
+                ])
+                self.assertEqual("", selected)
+
+        # Same-turn URL authority is denied with the URL before or after the
+        # structured action, across punctuation and case variants.
+        same_turn_denials = (
+            "别去：https://current.vendor.test/task/42。",
+            "不要点开 https://current.vendor.test/task/42。",
+            "不要获取这个网址：https://current.vendor.test/task/42。",
+            "https://current.vendor.test/task/42，不要访问。",
+            "DO NOT NAVIGATE TO: HTTPS://CURRENT.VENDOR.TEST/task/42.",
+            "Do not fetch https://current.vendor.test/task/42.",
+            "HTTPS://CURRENT.VENDOR.TEST/task/42 — DON'T VISIT IT.",
+            "HTTPS://CURRENT.VENDOR.TEST/task/42 should not be opened.",
+            "https://current.vendor.test/task/42 不可进入。",
+        )
+        for denial in same_turn_denials:
+            with self.subTest(same_turn_denial=denial):
+                self.assertEqual(
+                    "",
+                    _private_origin_authorization_text([{
+                        "role": "user",
+                        "content": denial,
+                    }]),
+                )
+
+        # Explicit double negatives retain positive navigation meaning. The
+        # masking is local: a second real denial in the same sentence wins.
+        double_negative_continuations = (
+            "继续前往这个网站，不要避免访问它。",
+            (
+                "Continue to the previous site; "
+                "do not avoid visiting it."
+            ),
+            "不能避免访问这个网站，请继续。",
+            "Continue to the previous site; it shouldn't be avoided.",
+        )
+        for continuation in double_negative_continuations:
+            with self.subTest(double_negative=continuation):
+                self.assertIn(
+                    "https://current.vendor.test/task/42",
+                    _private_origin_authorization_text([
+                        prior,
+                        {"role": "user", "content": continuation},
+                    ]),
+                )
+        for same_turn_positive in (
+            (
+                "不要避免访问 "
+                "https://current.vendor.test/task/42。"
+            ),
+            (
+                "Do not avoid visiting "
+                "HTTPS://CURRENT.VENDOR.TEST/task/42."
+            ),
+        ):
+            with self.subTest(
+                same_turn_double_negative=same_turn_positive
+            ):
+                self.assertIn(
+                    "HTTP",
+                    _private_origin_authorization_text([{
+                        "role": "user",
+                        "content": same_turn_positive,
+                    }]).upper(),
+                )
+        for localized_denial in (
+            "不要避免访问它，但别去那个网站。",
+            (
+                "Do not avoid visiting it, but "
+                "do not open the website."
+            ),
+            (
+                "The site shouldn't be avoided, but "
+                "that URL mustn't be followed."
+            ),
+        ):
+            with self.subTest(localized_denial=localized_denial):
+                self.assertEqual(
+                    "",
+                    _private_origin_authorization_text([
+                        prior,
+                        {"role": "user", "content": localized_denial},
+                    ]),
+                )
+
+        # A conservative co-occurrence fallback still needs an explicit
+        # network target. Ordinary negative instructions do not revoke URL
+        # inheritance merely because they contain a negation marker.
+        for ordinary_denial in (
+            "继续，但不要修改报告。",
+            "Continue, but do not rewrite the report.",
+            "The local file mustn't be deleted.",
+            "这个文件不可删除。",
+        ):
+            with self.subTest(ordinary_denial=ordinary_denial):
+                self.assertEqual(
+                    ordinary_denial,
+                    _private_origin_authorization_text([
+                        prior,
+                        {"role": "user", "content": ordinary_denial},
+                    ]),
+                )
+
+        # The narrow denial gate must not consume a genuine bare continuation.
+        for continuation in ("继续", "Continue.", "请继续一下"):
+            with self.subTest(bare_continuation=continuation):
+                self.assertIn(
+                    "https://current.vendor.test/task/42",
+                    _private_origin_authorization_text([
+                        prior,
+                        {"role": "user", "content": continuation},
+                    ]),
+                )
+
     def test_malformed_tool_arguments_never_enter_observability_trace(self):
         malformed = '{"content":"PRIVATE_LITERAL_THAT_NEVER_CLOSES'
 

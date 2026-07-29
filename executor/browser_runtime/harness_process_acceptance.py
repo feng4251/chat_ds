@@ -2,8 +2,9 @@
 
 Unlike ``process_lease_acceptance.py``, this runner enters through the public
 ``run_skill_process`` adapter.  It proves that one immutable Skill snapshot is
-authorized, classified, routed to the correct executor socket, and operated
-through the same opaque process capability exposed to a model.
+authorized, classified into the correct logical dependency profile, routed to
+the single session sandbox, and operated through the same opaque process
+capability exposed to a model.
 """
 
 from __future__ import annotations
@@ -211,7 +212,7 @@ async def _run_cli(
     digests: dict[str, str],
     *,
     resource: str,
-    expected_profile: str,
+    expected_logical_profile: str,
     expected_stdout: str,
 ) -> dict[str, Any]:
     process_id: str | None = None
@@ -226,10 +227,10 @@ async def _run_cli(
             )
         )
         process_id = started["process_id"]
-        assert started["runtime_profile"] == expected_profile, started
+        assert started["runtime_profile"] == "session-sandbox-v1", started
         _assert_snapshot_record(
             process_id,
-            expected_profile=expected_profile,
+            expected_profile=expected_logical_profile,
             expected_package_sha256=digests["package_sha256"],
             expected_script_sha256=digests[f"{resource}_sha256"],
         )
@@ -254,7 +255,8 @@ async def _run_cli(
         assert expected_stdout in stdout, stdout
         return {
             "resource": resource,
-            "runtime_profile": started["runtime_profile"],
+            "executor_runtime_profile": started["runtime_profile"],
+            "logical_runtime_profile": expected_logical_profile,
             "stdout": stdout.strip(),
             "stderr": stderr.strip(),
             "returncode": final["returncode"],
@@ -295,7 +297,7 @@ async def _run_persistent_browser(
             )
         )
         process_id = started["process_id"]
-        assert started["runtime_profile"] == "browser-automation-v1", started
+        assert started["runtime_profile"] == "session-sandbox-v1", started
         assert started["invocation_mode"] == "instance", started
         _assert_snapshot_record(
             process_id,
@@ -346,7 +348,8 @@ async def _run_persistent_browser(
         assert result["result"] == "harness-persistent-browser-ok", result
         return {
             "resource": resource,
-            "runtime_profile": started["runtime_profile"],
+            "executor_runtime_profile": started["runtime_profile"],
+            "logical_runtime_profile": "browser-automation-v1",
             "invocation_mode": started["invocation_mode"],
             "ready_event": any(
                 event.get("event") == "ready"
@@ -380,21 +383,21 @@ async def _main(arguments: argparse.Namespace) -> dict[str, Any]:
                     context,
                     digests,
                     resource="base_identity_probe.py",
-                    expected_profile="base-v1",
+                    expected_logical_profile="base-v1",
                     expected_stdout="base-identity-ok",
                 ),
                 "bash_direct_helper": await _run_cli(
                     context,
                     digests,
                     resource="bash_direct_helper.sh",
-                    expected_profile="base-v1",
+                    expected_logical_profile="base-v1",
                     expected_stdout="bash-direct-helper-ok",
                 ),
                 "browser_cli": await _run_cli(
                     context,
                     digests,
                     resource="node_playwright.cjs",
-                    expected_profile="browser-automation-v1",
+                    expected_logical_profile="browser-automation-v1",
                     expected_stdout="node-playwright-ok",
                 ),
                 "persistent_browser": await _run_persistent_browser(

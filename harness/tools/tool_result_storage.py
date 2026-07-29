@@ -20,10 +20,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 import time
 from pathlib import Path
 
 from tools.path_security import sandbox_dir
+from tools.workspace_lock import workspace_mutation_guard
 
 logger = logging.getLogger(__name__)
 
@@ -54,22 +57,78 @@ def _persist(
     session_id: str,
 ) -> str:
     """Write the full tool result to disk and return a relative path."""
-    results_dir = sandbox_dir(user_id, session_id, sub="results")
-    ts = int(time.time() * 1_000_000)
-    safe_name = "".join(c if c.isalnum() or c in "_-." else "_" for c in tool_name)
-    filename = f"{safe_name}_{ts}.txt"
-    filepath = results_dir / filename
+    # ``results`` is outside the model-visible workspace, but it belongs to
+    # the same session transaction.  Use the exact sibling workspace lock so
+    # Backend deletion/tombstone publication and every Harness commit have one
+    # linearization point.  Keep lock and deletion-fence failures outside the
+    # best-effort I/O handler: a detached run must stop rather than silently
+    # continue after its session has been deleted.
+    workspace = sandbox_dir(user_id, session_id, sub="workspace")
+    with workspace_mutation_guard(workspace):
+        results_dir = sandbox_dir(user_id, session_id, sub="results")
+        ts = time.time_ns()
+        safe_name = "".join(
+            c if c.isalnum() or c in "_-." else "_"
+            for c in tool_name
+        )
+        filename = f"{safe_name}_{ts}.txt"
+        filepath = results_dir / filename
+        temporary: Path | None = None
 
-    try:
-        # Truncate to max persist size
-        data = full_result
-        if len(data) > _MAX_PERSIST_BYTES:
-            data = data[:_MAX_PERSIST_BYTES] + "\n\n[... truncated at 5 MB safety limit]"
-        filepath.write_text(data, encoding="utf-8")
-        logger.info("Persisted %s result (%d chars) → %s", tool_name, len(full_result), filename)
-    except Exception as exc:
-        logger.exception("Failed to persist tool result for %s: %s", tool_name, exc)
-        return f"[Result too large to persist — {exc}]"
+        try:
+            # Truncate to max persist size
+            data = full_result
+            if len(data) > _MAX_PERSIST_BYTES:
+                data = (
+                    data[:_MAX_PERSIST_BYTES]
+                    + "\n\n[... truncated at 5 MB safety limit]"
+                )
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{filename}.",
+                suffix=".tmp",
+                dir=results_dir,
+            )
+            temporary = Path(temporary_name)
+            try:
+                os.fchmod(descriptor, 0o600)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    stream.write(data)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            except BaseException:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                raise
+            os.replace(temporary, filepath)
+            temporary = None
+            directory_fd = os.open(
+                results_dir,
+                os.O_RDONLY | os.O_DIRECTORY,
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            logger.info(
+                "Persisted %s result (%d chars) → %s",
+                tool_name,
+                len(full_result),
+                filename,
+            )
+        except Exception as exc:
+            if temporary is not None:
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
+            logger.exception(
+                "Failed to persist tool result for %s: %s",
+                tool_name,
+                exc,
+            )
+            return f"[Result too large to persist — {exc}]"
 
     # Return a path relative to the sandbox root so read_file can find it
     return f"results/{filename}"

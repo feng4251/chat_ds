@@ -29,6 +29,15 @@ class ExecutionAuthorityRevoked(RuntimeError):
 ResourceCloser = Callable[[], Awaitable[Any]]
 
 
+@dataclass(slots=True)
+class _RegisteredResource:
+    """One retained closer and its at-most-one runtime-owned attempt."""
+
+    label: str
+    closer: ResourceCloser
+    close_task: asyncio.Task[Any] | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class FenceTeardownReport:
     fence_id: str
@@ -115,7 +124,7 @@ class ChildExecutionFence:
         self._revoked = False
         self._reason = ""
         self._lock = threading.Lock()
-        self._resources: dict[str, tuple[str, ResourceCloser]] = {}
+        self._resources: dict[str, _RegisteredResource] = {}
 
     @property
     def fence_id(self) -> str:
@@ -184,9 +193,9 @@ class ChildExecutionFence:
                     "delegated execution authority was revoked before "
                     "resource registration"
                 )
-            self._resources[token] = (
-                str(label or "resource")[:120],
-                closer,
+            self._resources[token] = _RegisteredResource(
+                label=str(label or "resource")[:120],
+                closer=closer,
             )
         return token
 
@@ -211,61 +220,125 @@ class ChildExecutionFence:
         *,
         grace_seconds: float,
     ) -> FenceTeardownReport:
-        """Close registered resources within one fixed aggregate grace."""
+        """Close resources once, retaining every unacknowledged closer.
+
+        Concurrent callers join the same runtime-owned task for each token.
+        Only an acknowledged successful return removes a token.  Exceptions,
+        acknowledged cancellation after a timeout, and synchronous invocation
+        failures clear the attempt but retain the exact closer for retry.
+        An uncooperative timed-out attempt remains the single in-flight task,
+        preventing a retry from running two closers concurrently.
+        """
 
         with self._lock:
-            resources = list(self._resources.values())
-            self._resources.clear()
+            resources = list(self._resources.items())
             generation = self._generation
             revoked = self._revoked
+            for _token, resource in resources:
+                previous = resource.close_task
+                if (
+                    previous is not None
+                    and previous.done()
+                    and (
+                        previous.cancelled()
+                        or (
+                            previous.exception()
+                            is not None
+                        )
+                    )
+                ):
+                    # A prior caller may itself have been cancelled before it
+                    # could release a terminal failed attempt. Retry it here
+                    # without requiring an otherwise spurious third close.
+                    resource.close_task = None
+                if resource.close_task is None:
+                    async def invoke(
+                        closer: ResourceCloser = resource.closer,
+                    ) -> Any:
+                        value = closer()
+                        if not inspect.isawaitable(value):
+                            raise TypeError(
+                                "resource closer returned a non-awaitable"
+                            )
+                        return await value
 
-        close_tasks: set[asyncio.Task[Any]] = set()
-        synchronous_failures = 0
-        for _label, closer in resources:
-            try:
-                value = closer()
-                if not inspect.isawaitable(value):
-                    synchronous_failures += 1
-                    continue
-                close_tasks.add(asyncio.create_task(value))
-            except BaseException:
-                synchronous_failures += 1
+                    resource.close_task = asyncio.create_task(invoke())
+                    resource.close_task.add_done_callback(
+                        lambda done: (
+                            done.exception()
+                            if not done.cancelled()
+                            else None
+                        )
+                    )
+            task_rows = [
+                (token, resource, resource.close_task)
+                for token, resource in resources
+                if resource.close_task is not None
+            ]
 
-        residual: set[asyncio.Task[Any]] = set()
-        asynchronous_failures = 0
-        if close_tasks:
+        tasks = {
+            task
+            for _token, _resource, task in task_rows
+        }
+        done: set[asyncio.Task[Any]] = set()
+        pending: set[asyncio.Task[Any]] = set()
+        if tasks:
             done, pending = await asyncio.wait(
-                close_tasks,
+                tasks,
                 timeout=max(0.001, float(grace_seconds)),
                 return_when=asyncio.ALL_COMPLETED,
             )
-            for task in done:
-                try:
-                    if task.exception() is not None:
-                        asynchronous_failures += 1
-                except BaseException:
-                    asynchronous_failures += 1
-            residual = await bounded_cancel_tasks(
-                set(pending),
-                # Cancellation has already consumed the aggregate close grace.
-                # Give callbacks only one scheduler turn before isolation.
-                grace_seconds=0.001,
-            )
 
-        unacknowledged = (
-            synchronous_failures
-            + asynchronous_failures
-            + len(residual)
-        )
+        # Timeout is not acknowledgement. Request cancellation so a
+        # cooperative closer can be retried, but never overlap a closer that
+        # ignores cancellation.
+        for task in pending:
+            task.cancel()
+        residual: set[asyncio.Task[Any]] = set()
+        if pending:
+            cancelled_done, residual = await asyncio.wait(
+                pending,
+                timeout=0.001,
+                return_when=asyncio.ALL_COMPLETED,
+            )
+            done.update(cancelled_done)
+            for task in residual:
+                supervise_residual_task(task)
+
+        acknowledged = 0
+        for token, resource, task in task_rows:
+            successful = False
+            if task.done() and not task.cancelled():
+                try:
+                    successful = task.exception() is None
+                except BaseException:
+                    successful = False
+            with self._lock:
+                current = self._resources.get(token)
+                if current is not resource:
+                    # Explicit unregistration is an independent acknowledgement
+                    # owned by the adapter. It must not let this close call
+                    # delete or mutate a newly registered token.
+                    acknowledged += 1
+                    continue
+                if successful:
+                    self._resources.pop(token, None)
+                    acknowledged += 1
+                elif (
+                    task.done()
+                    and resource.close_task is task
+                ):
+                    # Failed/cooperatively cancelled attempts are retryable.
+                    # Preserve the exact closer but release this terminal task.
+                    resource.close_task = None
+
+        unacknowledged = max(0, len(resources) - acknowledged)
         return FenceTeardownReport(
             fence_id=self._fence_id,
             revoked=revoked,
             generation=generation,
             resource_count=len(resources),
-            acknowledged_resource_count=max(
-                0,
-                len(resources) - unacknowledged,
-            ),
+            acknowledged_resource_count=acknowledged,
             unacknowledged_resource_count=unacknowledged,
             cancellation_unacknowledged=bool(unacknowledged),
             fence_coverage_proven=revoked,

@@ -4,7 +4,7 @@
   "private": true,
   "description": "Pinned Node dependencies for the ChatDS browser automation worker.",
   "engines": {
-    "node": "22.18.0"
+    "node": "22.23.1"
   },
   "dependencies": {
     "playwright": "1.61.0"

@@ -4,8 +4,11 @@ import json
 import unittest
 
 from retrieval_completeness import (
+    RETRIEVAL_QUALITY_IMPACT_ADVISORY,
+    RETRIEVAL_QUALITY_IMPACT_DEGRADED,
     RetrievalCompletenessTracker,
     build_http_retrieval_receipt,
+    retrieval_receipt_affects_completion_quality,
 )
 from delegated_result_contract import audit_result_fields
 from tools.delegation import (
@@ -159,8 +162,16 @@ class RetrievalCompletenessReceiptTests(unittest.TestCase):
 
         self.assertFalse(tracker.requires_mandatory_continuation("bounded"))
         self.assertTrue(tracker.has_optional_pagination_frontier("bounded"))
+        self.assertEqual(
+            RETRIEVAL_QUALITY_IMPACT_ADVISORY,
+            tracker.closure_quality_impact("bounded"),
+        )
         self.assertTrue(
             tracker.requires_mandatory_continuation("exhaustive")
+        )
+        self.assertEqual(
+            RETRIEVAL_QUALITY_IMPACT_DEGRADED,
+            tracker.closure_quality_impact("exhaustive"),
         )
         frontier = tracker.frontier_receipt()
         self.assertFalse(frontier["raw_cursor_or_url_persisted"])
@@ -182,6 +193,23 @@ class RetrievalCompletenessReceiptTests(unittest.TestCase):
 
         self.assertTrue(tracker.requires_mandatory_continuation("bounded"))
         self.assertFalse(tracker.has_optional_pagination_frontier("bounded"))
+        self.assertEqual(
+            RETRIEVAL_QUALITY_IMPACT_DEGRADED,
+            tracker.closure_quality_impact("bounded"),
+        )
+
+    def test_only_explicit_advisory_receipt_is_quality_neutral(self):
+        self.assertFalse(retrieval_receipt_affects_completion_quality(None))
+        self.assertFalse(retrieval_receipt_affects_completion_quality({
+            "quality_impact": "advisory",
+        }))
+        self.assertTrue(retrieval_receipt_affects_completion_quality({
+            "quality_impact": "degraded",
+        }))
+        self.assertTrue(retrieval_receipt_affects_completion_quality({}))
+        self.assertTrue(retrieval_receipt_affects_completion_quality({
+            "quality_impact": "future-value",
+        }))
 
     def test_multiple_cursor_frontier_does_not_close_after_one_branch(self):
         tracker = RetrievalCompletenessTracker()
@@ -922,6 +950,27 @@ class RetrievalCompletenessReceiptTests(unittest.TestCase):
         )
         self.assertTrue(audit["footer_valid"])
         self.assertEqual(["evidence"], audit["degraded"])
+
+    def test_advisory_frontier_is_persisted_without_degraded_status(self):
+        raw = {
+            "status": "unresolved",
+            "source": "harness_http_retrieval_completeness",
+            "quality_impact": "advisory",
+            "retrieval_completeness_policy": "bounded",
+            "coverage_status": "partial",
+            "open_chain_count": 1,
+            "open_reasons": {"pagination_more_available": 1},
+        }
+        normalized = _normalized_unresolved_retrieval(raw)
+        self.assertEqual("advisory", normalized["quality_impact"])
+        persisted = _inject_unresolved_retrieval_gap(
+            "Observed-page synthesis.",
+            normalized,
+        )
+
+        self.assertIn("Coverage: bounded HTTP acquisition", persisted)
+        self.assertIn("[HARNESS_UNRESOLVED_HTTP_RETRIEVAL]", persisted)
+        self.assertNotIn("WARN/degraded", persisted)
 
 
 if __name__ == "__main__":

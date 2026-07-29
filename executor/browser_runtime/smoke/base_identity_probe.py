@@ -1,15 +1,19 @@
-"""Assert the generic networkless base executor identity boundary."""
+"""Assert the unified sandbox worker identity and direct-network boundary."""
 
 import os
 from pathlib import Path
 import socket
+from urllib.parse import urlsplit
 
 
-assert os.geteuid() == 65528
-assert os.getegid() == 65528
+assert os.geteuid() == 65529
+assert os.getegid() == 65529
 assert os.getgroups() == []
 assert "EXECUTOR_V2_AUTH_TOKEN" not in os.environ
-assert "SKILL_EGRESS_PROXY_URL" not in os.environ
+proxy_url = urlsplit(os.environ["SKILL_EGRESS_PROXY_URL"])
+assert proxy_url.scheme == "http"
+assert proxy_url.hostname in {"127.0.0.1", "localhost"}
+assert proxy_url.port is not None
 assert sorted(path.name for path in Path("/sys/class/net").iterdir()) == ["lo"]
 assert len(Path("/proc/net/route").read_text().splitlines()) == 1
 for root in ("/tmp", "/dev/shm"):
@@ -32,7 +36,7 @@ for address in (("1.1.1.1", 443), ("10.0.0.1", 443), ("169.254.169.254", 80)):
     except OSError:
         pass
     else:
-        raise AssertionError(f"base worker reached direct destination {address}")
+        raise AssertionError(f"sandbox worker reached direct destination {address}")
     finally:
         probe.close()
 

@@ -48,6 +48,7 @@ from tools.skill_manage import skill_manage, SKILL_MANAGE_SCHEMA
 from tools.browser import (
     browser_navigate, browser_snapshot, browser_click,
     browser_type, browser_scroll, browser_back,
+    browser_navigate_args_preflight,
     BROWSER_NAVIGATE_SCHEMA, BROWSER_SNAPSHOT_SCHEMA, BROWSER_CLICK_SCHEMA,
     BROWSER_TYPE_SCHEMA, BROWSER_SCROLL_SCHEMA, BROWSER_BACK_SCHEMA,
 )
@@ -366,6 +367,7 @@ register(
     "browser_navigate",
     BROWSER_NAVIGATE_SCHEMA,
     browser_navigate,
+    args_preflight_fn=browser_navigate_args_preflight,
     is_read_only=True,
     parallel_safe=False,
     external_interaction=True,

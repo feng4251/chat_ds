@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import tempfile
 import unittest
@@ -340,6 +341,106 @@ class DeclaredCommandBoundaryTests(unittest.IsolatedAsyncioTestCase):
             execute.await_args.kwargs["argv"],
         )
         self.assertNotIn("command", execute.await_args.kwargs)
+        self.assertNotIn("egress_origins", execute.await_args.kwargs)
+        self.assertEqual("none", result["egress_policy"])
+
+    async def test_tool_forwards_only_runtime_owned_exact_skill_egress(
+        self,
+    ) -> None:
+        context = replace(
+            self.context,
+            allowed_skill_sandbox_egress_prefixes=(
+                (
+                    "portable-finance",
+                    "HTTPS://API.Example.TEST/v1/prices",
+                ),
+                (
+                    "other-skill",
+                    "https://other.example.test/private",
+                ),
+                (
+                    "portable-finance",
+                    "http://submit.example.test/jobs",
+                ),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            execute = AsyncMock(return_value={
+                "status": "success",
+                "shell": False,
+                "network": "disabled",
+                "runtime_profile": "session-sandbox-v1",
+                "network_policy": {
+                    "direct": "disabled",
+                    "egress": "origin_allowlist_proxy",
+                },
+                "stdout": "ok",
+                "stderr": "",
+                "artifacts": [],
+            })
+            with (
+                patch(
+                    "tools.declared_command.load_current_skill_command_grants",
+                    return_value=(root, {}, [self.grant]),
+                ),
+                patch(
+                    "tools.declared_command.preflight_declared_skill_dependencies",
+                    return_value={"valid": True},
+                ),
+                patch(
+                    "tools.declared_command.preflight_isolated_skill_runtime",
+                    return_value={"valid": True},
+                ),
+                patch(
+                    "tools.declared_command.sandbox_dir",
+                    return_value=workspace,
+                ),
+                patch(
+                    "tools.declared_command.execute_isolated_declared_command",
+                    execute,
+                ),
+            ):
+                result = json.loads(await run_declared_command(
+                    "portable-finance",
+                    self.grant["id"],
+                    ["--short"],
+                    "workspace",
+                    context=context,
+                ))
+
+        self.assertEqual("success", result["status"])
+        self.assertEqual(
+            (
+                {
+                    "methods": ["GET", "HEAD"],
+                    "url_prefix": (
+                        "https://api.example.test:443/v1/prices"
+                    ),
+                },
+                {
+                    "methods": ["GET", "HEAD"],
+                    "url_prefix": (
+                        "http://submit.example.test:80/jobs"
+                    ),
+                },
+            ),
+            execute.await_args.kwargs["egress_rules"],
+        )
+        self.assertEqual(
+            (),
+            execute.await_args.kwargs["private_origins"],
+        )
+        self.assertEqual(
+            "compiled_exact_url_policy",
+            result["egress_policy"],
+        )
+        self.assertNotIn(
+            "egress_origins",
+            RUN_DECLARED_COMMAND_SCHEMA["parameters"]["properties"],
+        )
 
     async def test_promoted_user_command_requires_enabled_whitelist_and_exact_grant(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

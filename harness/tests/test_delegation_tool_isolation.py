@@ -8,10 +8,12 @@ from pathlib import Path
 from unittest.mock import AsyncMock, call, patch
 
 from tools.context import ToolContext
+from tools.isolated_skill_executor import compute_skill_package_digest
 from tools.delegation import (
     DELEGATE_TASK_SCHEMA,
     _MAX_PRELOADED_PREREQUISITE_CHARS,
     _extract_intent_selections,
+    _exact_node_capability_grants,
     _render_preloaded_prerequisites,
     _required_output_has_status,
     _run_child,
@@ -72,18 +74,24 @@ def _tool_finished(
     outcome: str = "success",
     event_type: str = "tool.completed",
     result_data: dict | None = None,
+    callable_result_receipt: dict | None = None,
 ) -> dict:
     payload = {
         "tool_name": tool_name,
         "tool_call_id": tool_call_id,
         "outcome": outcome,
     }
-    if result_data is not None:
+    if result_data is not None or callable_result_receipt is not None:
+        exact_receipt = {
+            "result_data": dict(result_data or {}),
+        }
+        if callable_result_receipt is not None:
+            exact_receipt["callable_result_receipt"] = dict(
+                callable_result_receipt
+            )
         payload.update({
             "actual_dispatch_attempted": True,
-            "exact_capability_receipt": {
-                "result_data": dict(result_data),
-            },
+            "exact_capability_receipt": exact_receipt,
         })
     return {
         "type": "agent_event",
@@ -148,6 +156,146 @@ def _catalog_for_bindings(
 
 
 class DelegationToolPolicyTests(unittest.TestCase):
+    def test_native_browser_package_mutation_fails_closed_before_child(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "frozen-browser"
+            root.mkdir()
+            main = root / "SKILL.md"
+            main.write_text(
+                "---\nname: frozen-browser\n---\n"
+                "Browse https://allowed.example/news/.\n",
+                encoding="utf-8",
+            )
+            main_digest = hashlib.sha256(main.read_bytes()).hexdigest()
+            package_digest = compute_skill_package_digest(root)
+            candidate = {
+                "id": "tool-browser-frozen",
+                "kind": "native_tool",
+                "tool_name": "browser_navigate",
+                "skill_name": "frozen-browser",
+                "skill_md_sha256": main_digest,
+                "package_sha256": package_digest,
+                "browser_egress_rules": [{
+                    "methods": ["GET", "HEAD"],
+                    "url_prefix": "https://allowed.example:443/news/",
+                }],
+            }
+            binding = {
+                "candidate_id": candidate["id"],
+                "kind": "native_tool",
+                "tool_name": "browser_navigate",
+                "tool_names": ["browser_navigate"],
+                "skill_name": "frozen-browser",
+                "skill_md_sha256": main_digest,
+                "package_sha256": package_digest,
+                "browser_egress_rules": candidate[
+                    "browser_egress_rules"
+                ],
+            }
+            context = ToolContext(
+                user_id="u",
+                session_id="s",
+                enabled_tools=("browser_navigate",),
+                enabled_user_skills=("frozen-browser",),
+                skill_execution_resource_boundary=True,
+                allowed_skill_resources=((
+                    "frozen-browser",
+                    "SKILL.md",
+                ),),
+                allowed_skill_package_digests=((
+                    "frozen-browser",
+                    package_digest,
+                ),),
+                allowed_browser_egress_rules=((
+                    "https://allowed.example:443/news/",
+                    ("GET", "HEAD"),
+                ),),
+                skill_capability_catalog={"candidates": [candidate]},
+            )
+            main.write_text(
+                main.read_text(encoding="utf-8") + "changed\n",
+                encoding="utf-8",
+            )
+            with patch(
+                "skills.scanner.resolve_skill_path",
+                return_value=main,
+            ):
+                grants, error = _exact_node_capability_grants(
+                    [binding],
+                    required_capability_skills=[],
+                    context=context,
+                )
+        self.assertIn("changed after", error or "")
+        self.assertEqual([], grants["browser_egress_rule_grants"])
+
+    def test_native_browser_child_rules_are_intersected_with_parent(self):
+        parent_rule = (
+            "https://allowed.example:443/",
+            ("GET", "HEAD", "OPTIONS", "POST"),
+        )
+        child_rule = (
+            "https://allowed.example:443/news/",
+            ("GET", "HEAD"),
+        )
+        candidate = {
+            "id": "tool-browser-candidate",
+            "kind": "native_tool",
+            "tool_name": "browser_navigate",
+            "browser_egress_rules": [{
+                "methods": list(child_rule[1]),
+                "url_prefix": child_rule[0],
+            }],
+        }
+        binding = {
+            "candidate_id": candidate["id"],
+            "kind": "native_tool",
+            "tool_name": "browser_navigate",
+            "tool_names": ["browser_navigate"],
+            "browser_egress_rules": candidate["browser_egress_rules"],
+        }
+        context = ToolContext(
+            enabled_tools=("browser_navigate",),
+            skill_execution_resource_boundary=True,
+            allowed_browser_egress_rules=(parent_rule,),
+            skill_capability_catalog={"candidates": [candidate]},
+        )
+        grants, error = _exact_node_capability_grants(
+            [binding],
+            required_capability_skills=[],
+            context=context,
+        )
+        self.assertIsNone(error)
+        self.assertEqual(
+            [child_rule],
+            grants["browser_egress_rule_grants"],
+        )
+
+        outside_candidate = {
+            **candidate,
+            "browser_egress_rules": [{
+                "methods": ["GET"],
+                "url_prefix": "https://other.example:443/",
+            }],
+        }
+        outside_binding = {
+            **binding,
+            "browser_egress_rules": outside_candidate[
+                "browser_egress_rules"
+            ],
+        }
+        denied, denied_error = _exact_node_capability_grants(
+            [outside_binding],
+            required_capability_skills=[],
+            context=replace(
+                context,
+                skill_capability_catalog={
+                    "candidates": [outside_candidate],
+                },
+            ),
+        )
+        self.assertIn("outside the parent grant", denied_error or "")
+        self.assertEqual([], denied["browser_egress_rule_grants"])
+
     def test_required_output_id_needs_nearby_explicit_status(self):
         self.assertTrue(
             _required_output_has_status(
@@ -271,7 +419,10 @@ class DelegationBatchModeTests(unittest.IsolatedAsyncioTestCase):
             patch("tools.delegation._run_child", side_effect=fake_run_child),
             patch(
                 "tools.delegation.settings.delegation_batch_timeout_seconds",
-                0.01,
+                # Keep this a short bounded deadline while leaving enough
+                # scheduler margin for instrumented/loaded CI hosts to run
+                # the already-complete sibling before timeout arbitration.
+                0.25,
             ),
         ):
             payload = json.loads(await delegate_task(
@@ -3158,6 +3309,179 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "completed")
         self.assertIsNone(result["error"])
+
+    async def test_callable_typed_failure_is_not_successful_exact_evidence(self):
+        skill = "catalog-database"
+        path = "scripts/query_catalog.py"
+        digest = "a" * 64
+        own_egress = "https://catalog.example.test/v1/"
+        sibling_egress = "https://sibling.example.test/v1/"
+        own_egress_rule = (
+            skill,
+            "https://catalog.example.test:443/v1/",
+            ("GET", "HEAD", "POST"),
+        )
+        sibling_egress_rule = (
+            skill,
+            "https://sibling.example.test:443/v1/",
+            ("GET", "HEAD"),
+        )
+        bindings = [{
+            "candidate_id": "catalog-query",
+            "kind": "skill_script",
+            "tool_names": ["run_skill_python"],
+            "skill_name": skill,
+            "resource_path": path,
+            "sha256": digest,
+            "sandbox_egress_url_prefixes": [own_egress],
+            "sandbox_egress_rules": [{
+                "methods": list(own_egress_rule[2]),
+                "url_prefix": own_egress_rule[1],
+            }],
+        }]
+        observed: dict[str, object] = {}
+
+        async def fake_preload(*args, **kwargs):
+            return _complete_skill_preload(
+                "Use query_catalog.py for exact catalog evidence."
+            )
+
+        async def fake_run_stream(*args, **kwargs):
+            observed["sandbox_egress"] = kwargs.get(
+                "allowed_skill_sandbox_egress_prefixes"
+            )
+            observed["sandbox_egress_rules"] = kwargs.get(
+                "allowed_skill_sandbox_egress_rules"
+            )
+            observed["http_get"] = kwargs.get(
+                "allowed_skill_http_prefixes"
+            )
+            observed["http_post"] = kwargs.get(
+                "allowed_skill_http_post_prefixes"
+            )
+            observed["private_origins"] = kwargs.get(
+                "_inherited_browser_private_origins"
+            )
+            observed["user_url_authorization_urls"] = kwargs.get(
+                "_inherited_user_url_authorization_urls"
+            )
+            yield _tool_started(
+                "run_skill_python",
+                "python-typed-failure",
+                script_path=f"skills/{skill}/{path}",
+                function_name="query_catalog",
+                function_kwargs={"sku": "SKU-42"},
+            )
+            yield _tool_finished(
+                "run_skill_python",
+                "python-typed-failure",
+                callable_result_receipt={
+                    "version": 1,
+                    "result_object_observed": True,
+                    "typed_failure": True,
+                    "positive_success_observed": False,
+                    "failure_reason_codes": [
+                        "typed_status_failure",
+                    ],
+                },
+            )
+            yield {
+                "type": "delta",
+                "content": (
+                    "Catalog evidence is complete and fully verified. " * 20
+                ),
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        context = replace(
+            _context("skill_view", "run_skill_python"),
+            skill_execution_resource_boundary=True,
+            skill_capability_catalog=_catalog_for_bindings(
+                skill,
+                bindings,
+            ),
+            allowed_skill_resources=((skill, "SKILL.md"),),
+            allowed_skill_scripts=((skill, path, digest),),
+            allowed_skill_sandbox_egress_prefixes=(
+                (skill, own_egress),
+                (skill, sibling_egress),
+            ),
+            allowed_skill_sandbox_egress_rules=(
+                own_egress_rule,
+                sibling_egress_rule,
+            ),
+            allowed_browser_private_origins=(
+                "https://10.10.132.126:18443",
+            ),
+            user_url_authorization_urls=(
+                "https://catalog.example.test:443/v1/item?id=42",
+            ),
+        )
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation._load_complete_skill_view_preload",
+                fake_preload,
+            ),
+            patch(
+                "tools.delegation.persist_result_for_history"
+            ) as persist,
+        ):
+            result = await _run_child(
+                {
+                    "goal": "retrieve exact catalog evidence",
+                    "skill_name": skill,
+                    "step_type": "aggregation",
+                    "step_id": "catalog-query",
+                    "workflow_stage": "aggregation",
+                    "tools": ["skill_view", "run_skill_python"],
+                    "required_capability_tools": ["run_skill_python"],
+                    "required_capability_skills": [skill],
+                    "capability_bindings": bindings,
+                    "capability_bindings_sha256": _binding_digest(
+                        bindings
+                    ),
+                },
+                context,
+                0,
+            )
+
+        self.assertEqual("error", result["status"])
+        audit = result["capability_receipt_audit"]
+        self.assertEqual(["catalog-query"], audit["satisfied_candidate_ids"])
+        self.assertEqual([], audit["successful_candidate_ids"])
+        self.assertEqual(["catalog-query"], audit["failed_candidate_ids"])
+        receipt = audit["receipts"][0]
+        self.assertEqual("success", receipt["transport_outcome"])
+        self.assertEqual(
+            ["typed_status_failure"],
+            receipt["callable_result_failure_reason_codes"],
+        )
+        self.assertEqual(
+            0,
+            result["completion_quality_audit"][
+                "successful_evidence_receipt_count"
+            ],
+        )
+        self.assertEqual(
+            [(skill, own_egress)],
+            observed["sandbox_egress"],
+        )
+        self.assertEqual(
+            [own_egress_rule],
+            observed["sandbox_egress_rules"],
+        )
+        self.assertEqual([], observed["http_get"])
+        self.assertEqual([], observed["http_post"])
+        self.assertEqual(
+            ("https://10.10.132.126:18443",),
+            observed["private_origins"],
+        )
+        self.assertEqual(
+            ("https://catalog.example.test:443/v1/item?id=42",),
+            observed["user_url_authorization_urls"],
+        )
+        persist.assert_not_called()
 
     async def test_argument_free_demo_main_is_execution_not_query_evidence(self):
         async def fake_dispatch(name, args, *, context):

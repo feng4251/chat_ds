@@ -1,7 +1,9 @@
 import asyncio
+import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from config import settings
 from database import init_db
 
@@ -18,26 +20,94 @@ from routers.workspace_router import router as workspace_router
 from routers.hook_router import router as hook_router
 from routers.schedule_router import router as schedule_router, internal_router
 from routers.internal_session_router import router as internal_session_router
-from scheduler import scheduler_loop
+from scheduler import (
+    scheduler_loop,
+    shutdown_scheduled_job_executions,
+)
 from stream_observability import set_service_shutdown_started
+from workspace_lock import WorkspaceMutationLockError
+from workspace_reconciler import (
+    periodic_workspace_reconciler,
+    reconcile_orphan_session_workspaces,
+)
+
+
+logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     set_service_shutdown_started(False)
     await init_db()
+    workspace_reconcile = await reconcile_orphan_session_workspaces(
+        clear_live_tombstones=True,
+    )
+    logger.info("Startup workspace reconcile: %s", workspace_reconcile)
+    workspace_reconcile_stop = asyncio.Event()
+    workspace_reconcile_task = asyncio.create_task(
+        periodic_workspace_reconciler(workspace_reconcile_stop)
+    )
     scheduler_task = asyncio.create_task(scheduler_loop())
     try:
         yield
     finally:
         set_service_shutdown_started(True)
-        await shutdown_chat_background_tasks()
+        # Stop the producer loop before taking any execution snapshot. This
+        # prevents a final scheduler tick from creating a flight after the
+        # shutdown drain has begun.
         scheduler_task.cancel()
         try:
             await scheduler_task
         except asyncio.CancelledError:
             pass
+        except Exception:
+            logger.exception("Scheduler loop failed during shutdown")
+        scheduler_shutdown = await shutdown_scheduled_job_executions()
+        if not scheduler_shutdown["success"]:
+            logger.error(
+                "Scheduled execution shutdown left %s residual flight(s)",
+                scheduler_shutdown["residual_count"],
+            )
+        await shutdown_chat_background_tasks()
+        workspace_reconcile_stop.set()
+        try:
+            await asyncio.wait_for(
+                workspace_reconcile_task,
+                timeout=2.0,
+            )
+        except asyncio.TimeoutError:
+            workspace_reconcile_task.cancel()
+            try:
+                await workspace_reconcile_task
+            except asyncio.CancelledError:
+                pass
 
 app = FastAPI(title=settings.app_title, lifespan=lifespan)
+
+
+@app.exception_handler(WorkspaceMutationLockError)
+async def workspace_mutation_lock_error_handler(
+    _request: Request,
+    exc: WorkspaceMutationLockError,
+) -> JSONResponse:
+    """Expose bounded contention without leaking filesystem details."""
+
+    headers = (
+        {"Retry-After": "1"}
+        if exc.code in {
+            "workspace_lock_timeout",
+            "workspace_session_pending",
+        }
+        else None
+    )
+    return JSONResponse(
+        status_code=exc.http_status_code,
+        content={
+            "detail": exc.public_message,
+            "code": exc.code,
+        },
+        headers=headers,
+    )
+
 
 app.add_middleware(
     CORSMiddleware,

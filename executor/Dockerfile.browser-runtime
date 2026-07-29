@@ -2,7 +2,7 @@
 
 # Builders are digest-pinned. npm and pip exist only in these stages and are
 # deliberately absent from the final worker.
-FROM node:22.18.0-bookworm-slim@sha256:752ea8a2f758c34002a0461bd9f1cee4f9a3c36d48494586f60ffce1fc708e0e AS node-deps
+FROM node:22.23.1-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS node-deps
 WORKDIR /build
 COPY browser_runtime/node/package.json browser_runtime/node/package-lock.json ./
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
@@ -26,8 +26,8 @@ ARG DAEMON_GID=65531
 ARG WORKER_UID=65529
 ARG WORKER_GID=65529
 
-LABEL org.opencontainers.image.title="ChatDS browser automation runtime" \
-      org.opencontainers.image.description="Prebuilt Playwright and Selenium worker; no runtime package installation" \
+LABEL org.opencontainers.image.title="ChatDS session sandbox dependency profile" \
+      org.opencontainers.image.description="Prebuilt Python, Node, Bash, Playwright and Selenium worker dependencies; no runtime package installation" \
       org.opencontainers.image.chatds.profile="browser-automation-v1" \
       org.opencontainers.image.chatds.debian-snapshot="${DEBIAN_SNAPSHOT}"
 
@@ -45,6 +45,7 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources \
       bash \
       chromium \
       chromium-driver \
+      curl \
       dumb-init \
       fonts-noto-cjk \
       libstdc++6 \
@@ -117,11 +118,15 @@ HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
 ENTRYPOINT ["/usr/bin/dumb-init", "--"]
 CMD ["/usr/local/bin/chatds-browser-runtime-health"]
 
-# Fixed-size production pool target. The process protocol implementation is
-# copied from the same executor source tree; Compose restricts this instance to
-# process leases and one active lease. No application-network attachment or
-# shared CDP transport is present.
-FROM browser-runtime AS browser-executor
+# Single fixed-size production sandbox target. The process protocol
+# implementation serves one serialized worker identity across one-shot code,
+# declared commands, exact Skill scripts, and persistent leases. No
+# application-network attachment or shared CDP transport is present.
+FROM browser-runtime AS session-sandbox
+
+LABEL org.opencontainers.image.title="ChatDS unified session sandbox" \
+      org.opencontainers.image.description="Single immutable Python/Node/Bash/Playwright/Selenium executor with signed origin egress policy" \
+      org.opencontainers.image.chatds.executor-profile="session-sandbox-v1"
 
 USER 0:0
 COPY server.py /app/server.py
@@ -130,8 +135,8 @@ RUN chmod 0555 /usr/local/bin/chatds-browser-executor-entrypoint \
     && chown root:root /workspace \
     && chmod 0755 /workspace
 
-ENV EXECUTOR_RUNTIME_PROFILE=browser-automation-v1 \
-    EXECUTOR_ALLOWED_REQUEST_KINDS=runtime_capabilities,process_lease \
+ENV EXECUTOR_RUNTIME_PROFILE=session-sandbox-v1 \
+    EXECUTOR_ALLOWED_REQUEST_KINDS=runtime_capabilities,process_lease,skill_script,declared_command,session_code,legacy_code \
     EXECUTOR_MAX_PROCESS_LEASES=1 \
     EXECUTOR_MAX_PROCESS_LEASES_PER_SCOPE=1
 

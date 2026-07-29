@@ -11,10 +11,15 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from skills.http_grants import (
+    canonical_sandbox_http_prefix,
     canonical_https_prefix,
     canonical_https_request_url,
     compile_loaded_skill_http_grants,
+    compile_loaded_skill_sandbox_egress_rules,
+    compile_user_sandbox_egress_rules,
+    compile_user_sandbox_egress_urls,
     extract_literal_https_prefixes,
+    extract_literal_sandbox_egress_rules,
 )
 from tools.context import ToolContext
 from tools import skill_http
@@ -22,6 +27,361 @@ from agent_loop import _bounded_skill_execution_exposure, _declared_child_tools
 
 
 class SkillHttpGrantTests(unittest.TestCase):
+    def test_current_user_urls_intersect_only_manifest_bound_methods(
+        self,
+    ) -> None:
+        urls = compile_user_sandbox_egress_urls(
+            (
+                "请打开 https://News.Example.test/story?id=42#comments，"
+                "并检查 http://10.10.132.126:18443/dashboard。"
+            )
+        )
+        rules = compile_user_sandbox_egress_rules(
+            urls,
+            [{
+                "source": "argv",
+                "selector": "--url",
+                "methods": ["GET", "HEAD"],
+                "scope": "url",
+            }],
+            invocation={
+                "source": "argv",
+                "args": [
+                    "--url",
+                    "https://News.Example.test/story?id=42#comments",
+                ],
+            },
+        )
+
+        self.assertEqual(
+            ((
+                "https://news.example.test:443/story?id=42",
+                ("GET", "HEAD"),
+            ),),
+            rules,
+        )
+
+    def test_origin_scope_is_explicit_and_model_text_is_not_a_source(
+        self,
+    ) -> None:
+        binding = [{
+            "source": "stdin_json",
+            "selector": "url",
+            "command": "goto",
+            "methods": ["GET"],
+            "scope": "origin",
+        }]
+
+        self.assertEqual(
+            ((
+                "https://portal.vendor.test:443/",
+                ("GET",),
+            ),),
+            compile_user_sandbox_egress_rules(
+                compile_user_sandbox_egress_urls(
+                    "浏览 https://portal.vendor.test/path/page"
+                ),
+                binding,
+                invocation={
+                    "source": "stdin_json",
+                    "command": "goto",
+                    "payload": {
+                        "url": "https://portal.vendor.test/path/page",
+                    },
+                },
+            ),
+        )
+        self.assertEqual(
+            (),
+            compile_user_sandbox_egress_rules(
+                (),
+                binding,
+                invocation={
+                    "source": "stdin_json",
+                    "command": "goto",
+                    "payload": {
+                        "url": "https://portal.vendor.test/path/page",
+                    },
+                },
+            ),
+        )
+        self.assertEqual(
+            (),
+            compile_user_sandbox_egress_rules(
+                compile_user_sandbox_egress_urls(
+                    "浏览 https://portal.vendor.test/path/page"
+                ),
+                [{
+                    **binding[0],
+                    "methods": ["CONNECT"],
+                }],
+                invocation={
+                    "source": "stdin_json",
+                    "command": "goto",
+                    "payload": {
+                        "url": "https://portal.vendor.test/path/page",
+                    },
+                },
+            ),
+        )
+
+    def test_user_url_bindings_match_only_actual_selector_and_invocation(
+        self,
+    ) -> None:
+        urls = compile_user_sandbox_egress_urls(
+            "use https://one.example.test/a and "
+            "https://two.example.test/b"
+        )
+        bindings = [
+            {
+                "source": "argv",
+                "selector": 0,
+                "methods": ["GET"],
+                "scope": "url",
+            },
+            {
+                "source": "argv",
+                "selector": "--target",
+                "methods": ["POST"],
+                "scope": "origin",
+            },
+            {
+                "source": "python",
+                "selector": "url",
+                "callable": "fetch",
+                "methods": ["HEAD"],
+                "scope": "url",
+            },
+        ]
+
+        self.assertEqual(
+            ((
+                "https://one.example.test:443/a",
+                ("GET",),
+            ),),
+            compile_user_sandbox_egress_rules(
+                urls,
+                bindings,
+                invocation={
+                    "source": "argv",
+                    "args": ["https://one.example.test/a"],
+                },
+            ),
+        )
+        self.assertEqual(
+            ((
+                "https://two.example.test:443/",
+                ("POST",),
+            ),),
+            compile_user_sandbox_egress_rules(
+                urls,
+                bindings,
+                invocation={
+                    "source": "argv",
+                    "args": [
+                        "--target=https://two.example.test/b",
+                    ],
+                },
+            ),
+        )
+        self.assertEqual(
+            ((
+                "https://two.example.test:443/b",
+                ("HEAD",),
+            ),),
+            compile_user_sandbox_egress_rules(
+                urls,
+                bindings,
+                invocation={
+                    "source": "python",
+                    "callable": "fetch",
+                    "parameters": {
+                        "url": "https://two.example.test/b",
+                    },
+                },
+            ),
+        )
+        # A different callable/path or an ambiguous repeated flag cannot
+        # borrow either binding's method or scope.
+        for invocation in (
+            {
+                "source": "python",
+                "callable": "other",
+                "parameters": {
+                    "url": "https://two.example.test/b",
+                },
+            },
+            {
+                "source": "argv",
+                "args": [
+                    "--target",
+                    "https://one.example.test/a",
+                    "--target",
+                    "https://two.example.test/b",
+                ],
+            },
+            {
+                "source": "argv",
+                "args": ["https://one.example.test/changed"],
+            },
+        ):
+            self.assertEqual(
+                (),
+                compile_user_sandbox_egress_rules(
+                    urls,
+                    bindings,
+                    invocation=invocation,
+                ),
+            )
+        self.assertEqual(
+            (),
+            compile_user_sandbox_egress_rules(
+                urls,
+                [{
+                    "source": "argv",
+                    "selector": -1,
+                    "methods": ["GET"],
+                    "scope": "url",
+                }],
+                invocation={
+                    "source": "argv",
+                    "args": ["https://one.example.test/a"],
+                },
+            ),
+        )
+
+    def test_sandbox_compiler_retains_exact_scheme_query_and_methods(
+        self,
+    ) -> None:
+        rules = extract_literal_sandbox_egress_rules([
+            "curl -X PUT "
+            "http://api.vendor.test:8080/v1/items?tenant=alpha\n"
+            "requests.patch("
+            "\"https://api.vendor.test/v1/items/42?mode=strict\", "
+            "json=payload)\n"
+            "Use DELETE request at "
+            "https://api.vendor.test/v1/items/42\n"
+            "OPTIONS https://api.vendor.test/v1/capabilities\n"
+            "POST JSON to https://api.vendor.test/v1/graphql\n"
+        ])
+
+        self.assertEqual(
+            (
+                (
+                    "http://api.vendor.test:8080/v1/items?tenant=alpha",
+                    ("GET", "HEAD", "PUT"),
+                ),
+                (
+                    "https://api.vendor.test:443/v1/capabilities",
+                    ("GET", "HEAD", "OPTIONS"),
+                ),
+                (
+                    "https://api.vendor.test:443/v1/graphql",
+                    ("GET", "HEAD", "POST"),
+                ),
+                (
+                    "https://api.vendor.test:443/v1/items/42",
+                    ("GET", "HEAD", "DELETE"),
+                ),
+                (
+                    "https://api.vendor.test:443/v1/items/42?mode=strict",
+                    ("GET", "HEAD", "PATCH"),
+                ),
+            ),
+            rules,
+        )
+        self.assertEqual(
+            "http://api.vendor.test:8080/v1/items?tenant=alpha",
+            canonical_sandbox_http_prefix(
+                "HTTP://API.VENDOR.TEST:8080/v1/items?tenant=alpha"
+            ),
+        )
+
+    def test_sandbox_method_compiler_rejects_negated_or_ambiguous_prose(
+        self,
+    ) -> None:
+        rules = extract_literal_sandbox_egress_rules([
+            "Do not DELETE "
+            "https://api.vendor.test/v1/items/42\n"
+            "PATCH may refer to either "
+            "https://api.vendor.test/v1/a or "
+            "https://api.vendor.test/v1/b\n"
+            "Never use OPTIONS at "
+            "http://api.vendor.test:8080/v1/private\n"
+        ])
+
+        self.assertEqual(
+            (
+                (
+                    "http://api.vendor.test:8080/v1/private",
+                    ("GET", "HEAD"),
+                ),
+                (
+                    "https://api.vendor.test:443/v1/a",
+                    ("GET", "HEAD"),
+                ),
+                (
+                    "https://api.vendor.test:443/v1/b",
+                    ("GET", "HEAD"),
+                ),
+                (
+                    "https://api.vendor.test:443/v1/items/42",
+                    ("GET", "HEAD"),
+                ),
+            ),
+            rules,
+        )
+
+    def test_sandbox_default_retrieval_drops_explicitly_negated_methods(
+        self,
+    ) -> None:
+        rules = extract_literal_sandbox_egress_rules([
+            "Never GET https://api.vendor.test/v1/head-only\n"
+            "Never HEAD https://api.vendor.test/v1/get-only\n"
+            "Do not GET or HEAD "
+            "https://api.vendor.test/v1/negative-example\n"
+        ])
+
+        self.assertEqual(
+            (
+                (
+                    "https://api.vendor.test:443/v1/get-only",
+                    ("GET",),
+                ),
+                (
+                    "https://api.vendor.test:443/v1/head-only",
+                    ("HEAD",),
+                ),
+            ),
+            rules,
+        )
+
+    def test_loaded_session_skill_compiles_method_rules_not_catalog_text(
+        self,
+    ) -> None:
+        package = {
+            "_chatds_scope": "session",
+            "content": (
+                "curl --request=DELETE "
+                "https://api.vendor.test/v2/jobs/42?confirm=true"
+            ),
+            "description": (
+                "curl -X PUT https://ambient.vendor.test/admin"
+            ),
+        }
+
+        self.assertEqual(
+            ((
+                "maintenance-api",
+                "https://api.vendor.test:443/v2/jobs/42?confirm=true",
+                ("GET", "HEAD", "DELETE"),
+            ),),
+            compile_loaded_skill_sandbox_egress_rules(
+                "maintenance-api",
+                package,
+            ),
+        )
+
     def test_literal_https_compiler_is_bounded_and_drops_examples(self) -> None:
         prefixes = extract_literal_https_prefixes([
             "API https://api.vendor.test/v1/ and "

@@ -434,6 +434,85 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
             persisted_terminal["payload"]["provisional_terminal"]
         )
 
+    async def test_advisory_retrieval_frontier_does_not_degrade_outer_child(self):
+        body = json.dumps({
+            "status": "ok",
+            "evidence": "observed bounded page " * 20,
+        })
+        observed_events: list[dict] = []
+        persisted: dict[str, str] = {}
+        gap = {
+            "status": "unresolved",
+            "source": "harness_http_retrieval_completeness",
+            "quality_impact": "advisory",
+            "retrieval_completeness_policy": "bounded",
+            "coverage_status": "partial",
+            "open_chain_count": 1,
+            "open_frontier_count": 1,
+            "open_reasons": {"pagination_more_available": 1},
+        }
+
+        async def capture(event):
+            observed_events.append(dict(event))
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            sink = kwargs["event_sink"]
+            terminal = {
+                "type": "agent_event",
+                "event_type": "run.completed",
+                "run_id": kwargs["run_id"],
+                "payload": {
+                    "finish_reason": "stop",
+                    "unresolved_retrieval": gap,
+                },
+            }
+            yield {"type": "delta", "content": body}
+            await sink(terminal)
+            yield terminal
+            yield {"type": "done", "finish_reason": "stop"}
+
+        def persist(content, *args, **kwargs):
+            persisted["content"] = content
+            return "results/delegate_advisory_frontier.json"
+
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                side_effect=persist,
+            ),
+        ):
+            result = await _run_child(
+                {"goal": "summarize the bounded evidence page"},
+                _context(event_sink=capture),
+                0,
+            )
+
+        self.assertEqual("completed", result["status"])
+        self.assertEqual("complete", result["completion_quality"])
+        self.assertEqual(
+            "advisory",
+            result["unresolved_retrieval"]["quality_impact"],
+        )
+        audit = result["completion_quality_audit"]
+        self.assertNotIn(
+            "runtime_unresolved_retrieval",
+            audit["receipt_degraded_reasons"],
+        )
+        self.assertFalse(audit["machine_degraded_evidence"])
+        self.assertIn(
+            "Coverage: bounded HTTP acquisition",
+            persisted["content"],
+        )
+        self.assertNotIn("WARN/degraded", persisted["content"])
+        terminal = observed_events[-1]
+        self.assertEqual("run.completed", terminal["event_type"])
+        self.assertEqual("complete", terminal["payload"]["completion_quality"])
+        self.assertEqual(
+            "advisory",
+            terminal["payload"]["unresolved_retrieval"]["quality_impact"],
+        )
+
     async def test_outer_validation_failure_discards_provisional_output(self):
         observed_events: list[dict] = []
 

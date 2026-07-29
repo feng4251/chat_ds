@@ -18,19 +18,34 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
     def setUpClass(cls):
         cls.compose = yaml.safe_load(COMPOSE_PATH.read_text(encoding="utf-8"))
         cls.services = cls.compose["services"]
-
-    def test_worker_has_no_docker_network_or_direct_route_inputs(self):
-        worker = self.services["skill-browser-executor"]
-        self.assertEqual(worker["network_mode"], "none")
-        for forbidden in ("networks", "dns", "dns_search", "extra_hosts", "ports"):
-            self.assertNotIn(forbidden, worker)
-        self.assertNotIn("skill_browser_internal", self.compose["networks"])
-        self.assertEqual(
-            worker["environment"]["SKILL_EGRESS_PROXY_URL"],
-            "http://127.0.0.1:18080",
+        cls.executor_names = (
+            "executor",
+            "executor-2",
+            "executor-3",
+            "executor-4",
         )
 
-    def test_proxy_is_the_only_networked_skill_browser_component(self):
+    def test_session_sandbox_has_no_docker_network_or_direct_route_inputs(self):
+        for name in self.executor_names:
+            sandbox = self.services[name]
+            self.assertEqual(sandbox["network_mode"], "none")
+            for forbidden in (
+                "networks",
+                "dns",
+                "dns_search",
+                "extra_hosts",
+                "ports",
+                "pid",
+            ):
+                self.assertNotIn(forbidden, sandbox)
+        self.assertNotIn("skill_browser_internal", self.compose["networks"])
+        self.assertTrue(all(
+            "SKILL_EGRESS_PROXY_URL"
+            not in self.services[name]["environment"]
+            for name in self.executor_names
+        ))
+
+    def test_proxy_is_the_only_networked_session_sandbox_component(self):
         proxy = self.services["skill-egress-proxy"]
         self.assertEqual(proxy["networks"], ["browser_egress"])
         self.assertEqual(proxy["group_add"], ["65530"])
@@ -38,59 +53,149 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
             proxy["environment"]["SKILL_EGRESS_SOCKET_PATH"],
             "/run/chatds-skill-egress/proxy.sock",
         )
-        self.assertNotIn(
-            "SKILL_EGRESS_PRIVATE_ORIGIN_ALLOWLIST",
-            proxy["environment"],
+        self.assertEqual(
+            proxy["environment"][
+                "SKILL_EGRESS_PRIVATE_ORIGIN_ALLOWLIST"
+            ],
+            "${BROWSER_PRIVATE_ORIGIN_ALLOWLIST:-}",
         )
-        self.assertNotIn(
-            "SKILL_EGRESS_PRIVATE_CIDR_ALLOWLIST",
-            proxy["environment"],
+        self.assertEqual(
+            proxy["environment"][
+                "SKILL_EGRESS_PRIVATE_CIDR_ALLOWLIST"
+            ],
+            "${SKILL_EGRESS_PRIVATE_CIDR_ALLOWLIST:-}",
         )
         self.assertIn(
             "skill_egress_proxy_socket:/run/chatds-skill-egress",
+            proxy["volumes"],
+        )
+        self.assertIn(
+            (
+                "skill_egress_proxy_private:"
+                "/var/lib/chatds-skill-egress-private"
+            ),
             proxy["volumes"],
         )
         self.assertTrue(proxy["read_only"])
         self.assertEqual(proxy["cap_drop"], ["ALL"])
         self.assertIn("no-new-privileges:true", proxy["security_opt"])
         self.assertNotIn("ports", proxy)
-        for name in (
-            "skill-browser-executor",
-            "skill-browser-executor-socket-init",
-            "skill-egress-proxy-socket-init",
-        ):
-            self.assertEqual(self.services[name]["network_mode"], "none")
+        self.assertEqual(self.services["executor"]["network_mode"], "none")
+        self.assertEqual(
+            self.services["skill-egress-proxy-socket-init"]["network_mode"],
+            "none",
+        )
+        proxy_socket_consumers = {
+            name
+            for name, service in self.services.items()
+            if any(
+                str(volume).startswith("skill_egress_proxy_socket:")
+                for volume in service.get("volumes", [])
+            )
+        }
+        self.assertEqual(
+            proxy_socket_consumers,
+            {
+                "executor",
+                "executor-2",
+                "executor-3",
+                "executor-4",
+                "skill-egress-proxy",
+                "skill-egress-proxy-socket-init",
+            },
+        )
+        private_trust_consumers = {
+            name
+            for name, service in self.services.items()
+            if any(
+                str(volume).startswith(
+                    "skill_egress_proxy_private:"
+                )
+                for volume in service.get("volumes", [])
+            )
+        }
+        self.assertEqual(
+            private_trust_consumers,
+            {
+                "skill-egress-proxy",
+                "skill-egress-proxy-socket-init",
+            },
+        )
+        for name in self.executor_names:
+            mounts = self.services[name]["volumes"]
+            self.assertIn(
+                (
+                    "skill_egress_proxy_socket:"
+                    "/run/chatds-skill-egress:ro"
+                ),
+                mounts,
+            )
+            self.assertFalse(any(
+                str(volume).startswith(
+                    "skill_egress_proxy_private:"
+                )
+                for volume in mounts
+            ))
 
-    def test_harness_reaches_controller_only_through_readonly_uds(self):
+    def test_harness_reaches_only_the_unified_controller_uds(self):
         harness = self.services["harness"]
-        self.assertIn(
-            "skill_browser_executor_socket:/run/chat-ds-skill-browser-executor:ro",
-            harness["volumes"],
+        expected_mounts = {
+            "executor_socket:/run/chat-ds-executor:ro",
+            "executor_socket_2:/run/chat-ds-executor-2:ro",
+            "executor_socket_3:/run/chat-ds-executor-3:ro",
+            "executor_socket_4:/run/chat-ds-executor-4:ro",
+        }
+        self.assertTrue(
+            expected_mounts.issubset(set(harness["volumes"])),
         )
         self.assertIn("65533", harness["group_add"])
         self.assertNotIn("skill_egress_proxy_socket", "\n".join(harness["volumes"]))
+        self.assertNotIn(
+            "SKILL_EGRESS_POLICY_TOKEN",
+            harness["environment"],
+        )
         self.assertEqual(
             harness["environment"]["SKILL_BROWSER_EXECUTOR_SOCKET"],
-            "/run/chat-ds-skill-browser-executor/executor.sock",
+            self.services["executor"]["environment"]["EXECUTOR_SOCKET"],
+        )
+        self.assertEqual(
+            harness["environment"]["SKILL_BROWSER_EXECUTOR_SOCKET"],
+            "/run/chat-ds-executor/executor.sock",
+        )
+        self.assertEqual(
+            harness["environment"]["EXECUTOR_SOCKET"],
+            "/run/chat-ds-executor/executor.sock",
+        )
+        self.assertEqual(
+            harness["environment"]["EXECUTOR_POOL_SOCKETS"].split(","),
+            [
+                "/run/chat-ds-executor/executor.sock",
+                "/run/chat-ds-executor-2/executor.sock",
+                "/run/chat-ds-executor-3/executor.sock",
+                "/run/chat-ds-executor-4/executor.sock",
+            ],
         )
         self.assertEqual(
             harness["environment"]["EXECUTOR_V2_AUTH_TOKEN"],
             "${EXECUTOR_V2_AUTH_TOKEN:-}",
         )
-
-    def test_base_executor_has_distinct_root_controller_and_worker(self):
-        executor = self.services["executor"]
-        environment = executor["environment"]
-        self.assertEqual(executor["network_mode"], "none")
-        self.assertEqual(executor["user"], "0:0")
-        self.assertEqual(environment["EXECUTOR_WORKER_UID"], "65528")
-        self.assertEqual(environment["EXECUTOR_WORKER_GID"], "65528")
-        self.assertNotEqual(
-            environment["EXECUTOR_WORKER_UID"],
-            self.services["skill-browser-executor"]["environment"][
-                "EXECUTOR_WORKER_UID"
-            ],
+        self.assertTrue(
+            set(self.executor_names).issubset(
+                set(harness["depends_on"])
+            )
         )
+
+    def test_unified_sandbox_has_root_controller_and_fixed_nonroot_worker(self):
+        sandbox = self.services["executor"]
+        environment = sandbox["environment"]
+        self.assertEqual(sandbox["build"]["target"], "session-sandbox")
+        self.assertEqual(sandbox["network_mode"], "none")
+        self.assertEqual(sandbox["user"], "0:0")
+        self.assertEqual(sandbox["group_add"], ["65530"])
+        self.assertEqual(environment["EXECUTOR_SOCKET_MODE"], "0660")
+        self.assertEqual(environment["EXECUTOR_SOCKET_GID"], "65533")
+        self.assertEqual(environment["EXECUTOR_WORKER_UID"], "65529")
+        self.assertEqual(environment["EXECUTOR_WORKER_GID"], "65529")
         self.assertNotEqual(
             environment["EXECUTOR_WORKER_UID"],
             self.services["browser"]["user"].split(":", 1)[0],
@@ -99,12 +204,28 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
             environment["EXECUTOR_V2_AUTH_TOKEN"],
             "${EXECUTOR_V2_AUTH_TOKEN:-}",
         )
-        self.assertEqual(environment["EXECUTOR_RUNTIME_PROFILE"], "base-v1")
+        self.assertEqual(
+            environment["SKILL_EGRESS_POLICY_TOKEN"],
+            "${EXECUTOR_V2_AUTH_TOKEN:-}",
+        )
+        self.assertEqual(
+            self.services["skill-egress-proxy"]["environment"][
+                "SKILL_EGRESS_POLICY_TOKEN"
+            ],
+            environment["SKILL_EGRESS_POLICY_TOKEN"],
+        )
+        self.assertEqual(
+            environment["EXECUTOR_RUNTIME_PROFILE"],
+            "session-sandbox-v1",
+        )
         self.assertEqual(environment["EXECUTOR_MAX_PROCESS_LEASES"], "1")
         self.assertEqual(environment["EXECUTOR_MAX_PROCESS_LEASES_PER_SCOPE"], "1")
-        self.assertNotIn("EXECUTOR_MAX_ADDRESS_SPACE_BYTES", environment)
-        self.assertNotIn("EXECUTOR_PROCESS_MAX_NPROC", environment)
-        self.assertEqual(executor["pids_limit"], 64)
+        self.assertEqual(
+            environment["EXECUTOR_MAX_ADDRESS_SPACE_BYTES"],
+            "unlimited",
+        )
+        self.assertEqual(environment["EXECUTOR_PROCESS_MAX_NPROC"], "4096")
+        self.assertEqual(sandbox["pids_limit"], 512)
         self.assertEqual(
             set(environment["EXECUTOR_ALLOWED_REQUEST_KINDS"].split(",")),
             {
@@ -116,117 +237,26 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
                 "legacy_code",
             },
         )
-        self.assertEqual(executor["cap_drop"], ["ALL"])
-        self.assertNotIn("SYS_ADMIN", executor["cap_add"])
-        self.assertTrue(
-            {"SETUID", "SETGID", "KILL", "CHOWN", "FOWNER", "DAC_OVERRIDE"}
-            .issubset(set(executor["cap_add"]))
-        )
-        self.assertIn(
-            "seccomp:./executor/runtime/seccomp_profile.json",
-            executor["security_opt"],
-        )
-        self.assertNotIn("seccomp:unconfined", executor["security_opt"])
-
-    def test_exact_skill_snapshots_use_private_executable_tmpfs(self):
-        for service_name in ("executor", "skill-browser-executor"):
-            service = self.services[service_name]
-            self.assertEqual(
-                service["environment"]["EXECUTOR_EXECUTION_TEMP_ROOT"],
-                "/run/chatds-executor-work",
-            )
-            self.assertTrue(
-                any(
-                    item.startswith("/run/chatds-executor-work:")
-                    and "mode=0755" in item
-                    and item.endswith(",exec")
-                    for item in service["tmpfs"]
-                ),
-                service["tmpfs"],
-            )
-            self.assertTrue(
-                all(
-                    ",exec" not in item
-                    for item in service["tmpfs"]
-                    if item.startswith("/tmp:")
-                ),
-                service["tmpfs"],
-            )
-
-    def test_control_and_proxy_socket_initializers_are_networkless(self):
-        control = self.services["skill-browser-executor-socket-init"]
-        self.assertEqual(control["network_mode"], "none")
-        self.assertTrue(control["read_only"])
-        self.assertEqual(control["cap_drop"], ["ALL"])
-        control_command = " ".join(control["command"])
-        self.assertIn("test ! -L", control_command)
-        self.assertIn("chown 0:65533", control_command)
-        self.assertIn("chmod 0750", control_command)
-
-        proxy = self.services["skill-egress-proxy-socket-init"]
-        self.assertEqual(proxy["network_mode"], "none")
-        self.assertEqual(proxy["group_add"], ["65530"])
-        self.assertTrue(proxy["read_only"])
-        self.assertEqual(proxy["cap_drop"], ["ALL"])
-        proxy_command = " ".join(proxy["command"])
-        self.assertIn("test ! -L", proxy_command)
-        self.assertIn("chown 65531:65530", proxy_command)
-        self.assertIn("chmod 2710", proxy_command)
-        self.assertEqual(
-            proxy["volumes"],
-            ["skill_egress_proxy_socket:/run/chatds-skill-egress"],
-        )
-
-    def test_worker_is_root_controller_with_fixed_nonroot_skill_identity(self):
-        worker = self.services["skill-browser-executor"]
-        self.assertEqual(worker["build"]["target"], "browser-executor")
-        self.assertEqual(worker["user"], "0:0")
-        self.assertEqual(worker["group_add"], ["65530"])
-        self.assertTrue(worker["read_only"])
-        self.assertEqual(worker["cap_drop"], ["ALL"])
-        self.assertNotIn("SYS_ADMIN", worker["cap_add"])
-        self.assertIn("SYS_CHROOT", worker["cap_add"])
-        self.assertTrue(
-            {"SETUID", "SETGID", "KILL", "CHOWN", "FOWNER", "DAC_OVERRIDE"}
-            .issubset(set(worker["cap_add"]))
-        )
-        security = worker["security_opt"]
-        self.assertIn("no-new-privileges:true", security)
-        self.assertIn(
-            "seccomp:./executor/browser_runtime/seccomp_profile.json",
-            security,
-        )
-        self.assertNotIn("seccomp:unconfined", security)
-        environment = worker["environment"]
-        self.assertEqual(environment["EXECUTOR_SOCKET_MODE"], "0660")
-        self.assertEqual(environment["EXECUTOR_SOCKET_GID"], "65533")
-        self.assertEqual(environment["EXECUTOR_WORKER_UID"], "65529")
-        self.assertEqual(environment["EXECUTOR_WORKER_GID"], "65529")
-        self.assertNotEqual(
-            environment["EXECUTOR_WORKER_UID"],
-            self.services["browser"]["user"].split(":", 1)[0],
-        )
-        self.assertEqual(environment["EXECUTOR_RUNTIME_PROFILE"], "browser-automation-v1")
-        self.assertEqual(
-            environment["EXECUTOR_ALLOWED_REQUEST_KINDS"],
-            "runtime_capabilities,process_lease",
-        )
-        self.assertEqual(environment["EXECUTOR_MAX_PROCESS_LEASES"], "1")
-        self.assertEqual(environment["EXECUTOR_MAX_PROCESS_LEASES_PER_SCOPE"], "1")
-        self.assertEqual(
-            environment["EXECUTOR_MAX_ADDRESS_SPACE_BYTES"],
-            "unlimited",
-        )
-        self.assertEqual(environment["EXECUTOR_PROCESS_MAX_NPROC"], "448")
-        self.assertEqual(worker["pids_limit"], 512)
         self.assertEqual(environment["SE_OFFLINE"], "true")
         self.assertEqual(environment["SE_AVOID_STATS"], "true")
         self.assertEqual(environment["SE_AVOID_BROWSER_DOWNLOAD"], "true")
-        self.assertEqual(
-            environment["EXECUTOR_V2_AUTH_TOKEN"],
-            "${EXECUTOR_V2_AUTH_TOKEN:-}",
+        self.assertEqual(sandbox["cap_drop"], ["ALL"])
+        self.assertNotIn("SYS_ADMIN", sandbox["cap_add"])
+        self.assertIn("SYS_CHROOT", sandbox["cap_add"])
+        self.assertTrue(
+            {"SETUID", "SETGID", "KILL", "CHOWN", "FOWNER", "DAC_OVERRIDE"}
+            .issubset(set(sandbox["cap_add"]))
         )
-        mounts = "\n".join(worker["volumes"])
+        self.assertIn(
+            "no-new-privileges:true",
+            sandbox["security_opt"],
+        )
+        self.assertIn(
+            "seccomp:./executor/browser_runtime/seccomp_profile.json",
+            sandbox["security_opt"],
+        )
+        self.assertNotIn("seccomp:unconfined", sandbox["security_opt"])
+        mounts = "\n".join(sandbox["volumes"])
         self.assertIn(
             "skill_egress_proxy_socket:/run/chatds-skill-egress:ro",
             mounts,
@@ -234,6 +264,77 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
         self.assertNotIn("browser_cdp_socket", mounts)
         self.assertNotIn("docker.sock", mounts)
 
+    def test_exact_skill_snapshots_use_private_executable_tmpfs(self):
+        sandbox = self.services["executor"]
+        self.assertEqual(
+            sandbox["environment"]["EXECUTOR_EXECUTION_TEMP_ROOT"],
+            "/run/chatds-executor-work",
+        )
+        self.assertTrue(
+            any(
+                item.startswith("/run/chatds-executor-work:")
+                and "mode=0755" in item
+                and item.endswith(",exec")
+                for item in sandbox["tmpfs"]
+            ),
+            sandbox["tmpfs"],
+        )
+        self.assertTrue(
+            all(
+                ",exec" not in item
+                for item in sandbox["tmpfs"]
+                if item.startswith("/tmp:")
+            ),
+            sandbox["tmpfs"],
+        )
+
+    def test_proxy_socket_initializer_is_networkless(self):
+        proxy = self.services["skill-egress-proxy-socket-init"]
+        self.assertEqual(proxy["network_mode"], "none")
+        self.assertEqual(proxy["group_add"], ["65530"])
+        self.assertTrue(proxy["read_only"])
+        self.assertEqual(proxy["cap_drop"], ["ALL"])
+        self.assertEqual(
+            proxy["cap_add"],
+            ["CHOWN", "DAC_OVERRIDE", "FOWNER"],
+        )
+        proxy_command = " ".join(proxy["command"])
+        self.assertIn("test ! -L", proxy_command)
+        self.assertIn("chown 65531:65530", proxy_command)
+        self.assertIn("chmod 2710", proxy_command)
+        self.assertIn("chown 65531:65531", proxy_command)
+        self.assertIn("chmod 0700", proxy_command)
+        self.assertIn("private_count", proxy_command)
+        self.assertIn(
+            "SKILL_EGRESS_ALLOW_LEGACY_TRUST_MIGRATION",
+            proxy_command,
+        )
+        self.assertIn(
+            "test ! -e /run/chatds-skill-egress/generation.json",
+            proxy_command,
+        )
+        self.assertNotIn(
+            "rm -f /var/lib/chatds-skill-egress-private",
+            proxy_command,
+        )
+        self.assertEqual(
+            proxy["environment"][
+                "SKILL_EGRESS_ALLOW_LEGACY_TRUST_MIGRATION"
+            ],
+            "${SKILL_EGRESS_ALLOW_LEGACY_TRUST_MIGRATION:-0}",
+        )
+        self.assertEqual(
+            proxy["volumes"],
+            [
+                "skill_egress_proxy_socket:/run/chatds-skill-egress",
+                (
+                    "skill_egress_proxy_private:"
+                    "/var/lib/chatds-skill-egress-private"
+                ),
+            ],
+        )
+
+    def test_legacy_browser_keeps_browser_sandbox_security(self):
         legacy = self.services["browser"]
         self.assertEqual(legacy["cap_drop"], ["ALL"])
         self.assertEqual(legacy["cap_add"], ["SYS_CHROOT"])
@@ -243,6 +344,63 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
             legacy["security_opt"],
         )
         self.assertNotIn("seccomp:unconfined", legacy["security_opt"])
+
+    def test_four_homogeneous_executor_slots_have_private_socket_volumes(self):
+        self.assertNotIn("skill-browser-executor", self.services)
+        self.assertNotIn("skill-browser-executor-socket-init", self.services)
+        self.assertNotIn("skill_browser_executor_socket", self.compose["volumes"])
+        self.assertEqual(
+            {
+                name
+                for name, service in self.services.items()
+                if service.get("environment", {}).get(
+                    "EXECUTOR_RUNTIME_PROFILE"
+                )
+                == "session-sandbox-v1"
+            },
+            set(self.executor_names),
+        )
+        first = self.services["executor"]
+        for name in self.executor_names:
+            slot = self.services[name]
+            for field in (
+                "image",
+                "build",
+                "network_mode",
+                "user",
+                "group_add",
+                "read_only",
+                "pids_limit",
+                "mem_limit",
+                "cpus",
+                "environment",
+                "cap_drop",
+                "cap_add",
+                "security_opt",
+                "tmpfs",
+            ):
+                self.assertEqual(first[field], slot[field])
+        socket_mounts = {
+            name: next(
+                volume
+                for volume in self.services[name]["volumes"]
+                if volume.endswith(":/run/chat-ds-executor")
+            )
+            for name in self.executor_names
+        }
+        self.assertEqual(4, len(set(socket_mounts.values())))
+        self.assertEqual(
+            {
+                "executor_socket",
+                "executor_socket_2",
+                "executor_socket_3",
+                "executor_socket_4",
+            },
+            {
+                mount.split(":", 1)[0]
+                for mount in socket_mounts.values()
+            },
+        )
 
     def test_pinned_seccomp_is_default_deny_plus_chromium_namespace_calls(self):
         profile = json.loads(SECCOMP_PATH.read_text(encoding="utf-8"))
@@ -306,23 +464,41 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
             )
         )
 
-    def test_dockerfile_target_starts_controller_dependencies_and_prlimit(self):
+    def test_dockerfile_target_builds_unified_browser_dependency_superset(self):
         dockerfile = (
             PROJECT_ROOT / "executor/Dockerfile.browser-runtime"
         ).read_text(encoding="utf-8")
-        self.assertIn("FROM browser-runtime AS browser-executor", dockerfile)
+        self.assertIn("FROM browser-runtime AS session-sandbox", dockerfile)
+        self.assertNotIn("FROM browser-runtime AS browser-executor", dockerfile)
         self.assertIn("COPY server.py /app/server.py", dockerfile)
         self.assertIn("util-linux", dockerfile)
         self.assertIn(
             "runtime/common-python-requirements.in",
             dockerfile,
         )
+        self.assertIn("chromium-driver", dockerfile)
         self.assertIn("chatds-browser-executor-entrypoint", dockerfile)
         self.assertIn("chown root:root /workspace", dockerfile)
         self.assertIn("USER 0:0", dockerfile.rsplit("FROM browser-runtime", 1)[1])
-        self.assertIn("packaging", (
+        self.assertIn(
+            "EXECUTOR_RUNTIME_PROFILE=session-sandbox-v1",
+            dockerfile,
+        )
+        self.assertIn(
+            "runtime_capabilities,process_lease,skill_script,"
+            "declared_command,session_code,legacy_code",
+            dockerfile,
+        )
+        python_requirements = (
             PROJECT_ROOT / "executor/browser_runtime/python/requirements.lock"
-        ).read_text(encoding="utf-8"))
+        ).read_text(encoding="utf-8")
+        self.assertIn("packaging", python_requirements)
+        self.assertIn("playwright==", python_requirements)
+        self.assertIn("selenium==", python_requirements)
+        node_package = (
+            PROJECT_ROOT / "executor/browser_runtime/node/package.json"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"playwright"', node_package)
         large_smoke = (
             PROJECT_ROOT
             / "executor/browser_runtime/smoke/large_visual_artifact.py"
@@ -332,19 +508,38 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
             PROJECT_ROOT
             / "executor/browser_runtime/bin/chatds-browser-executor-entrypoint"
         ).read_text(encoding="utf-8")
-        self.assertIn("chatds-skill-egress-bridge", entrypoint)
+        self.assertEqual(
+            entrypoint.count(
+                "/usr/local/bin/chatds-skill-egress-bridge &"
+            ),
+            1,
+        )
+        self.assertIn(
+            'SKILL_EGRESS_PROXY_URL="http://127.0.0.1:18080"',
+            entrypoint,
+        )
         self.assertNotIn('Xvfb "${display}"', entrypoint)
         self.assertIn("short-lived Weston compositor", entrypoint)
+        self.assertIn("/usr/bin/env -i", entrypoint)
         self.assertIn("--clear-groups", entrypoint)
         self.assertIn("chatds-browser-readiness.XXXXXX", entrypoint)
         self.assertIn("chatds-browser-runtime-health --browser-smoke", entrypoint)
-        self.assertLess(
-            entrypoint.index("chatds-browser-runtime-health --browser-smoke"),
-            entrypoint.index("/usr/local/bin/python -I /app/server.py"),
+        bridge_stop = entrypoint.index(
+            'kill -TERM "${readiness_bridge_pid}"'
         )
-        self.assertIn("/usr/local/bin/python -I /app/server.py", entrypoint)
+        smoke = entrypoint.index(
+            "chatds-browser-runtime-health --browser-smoke"
+        )
+        server = entrypoint.index(
+            "/usr/local/bin/python -I /app/server.py"
+        )
+        self.assertLess(
+            smoke,
+            bridge_stop,
+        )
+        self.assertLess(bridge_stop, server)
 
-    def test_proxy_image_is_digest_pinned_and_dependency_free(self):
+    def test_proxy_image_uses_pinned_base_and_snapshot_crypto_runtime(self):
         dockerfile = (
             PROJECT_ROOT / "skill_egress_proxy/Dockerfile"
         ).read_text(encoding="utf-8")
@@ -353,16 +548,26 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
             dockerfile,
         )
         self.assertNotIn("pip install", dockerfile)
-        self.assertNotIn("apt-get install", dockerfile)
+        self.assertIn(
+            "snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/",
+            dockerfile,
+        )
+        self.assertIn("apt-get install -y --no-install-recommends", dockerfile)
+        self.assertIn("openssl", dockerfile)
+        self.assertIn("test -x /usr/bin/openssl", dockerfile)
         self.assertIn("USER 65531:65531", dockerfile)
 
     def test_example_environment_documents_authority_and_proxy_policy(self):
         example = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
         self.assertIn("EXECUTOR_V2_AUTH_TOKEN=", example)
+        self.assertIn("SKILL_EGRESS_PRIVATE_CIDR_ALLOWLIST=", example)
         self.assertIn("SKILL_EGRESS_PUBLIC_PORTS=80,443", example)
         self.assertNotIn("SKILL_EGRESS_PRIVATE_ORIGIN_ALLOWLIST=", example)
-        self.assertNotIn("SKILL_EGRESS_PRIVATE_CIDR_ALLOWLIST=", example)
-        self.assertIn("production Skill lane is intentionally public-only", example)
+        self.assertIn(
+            "deployment/user-turn origin",
+            example,
+        )
+        self.assertIn("Exact literal-IP", example)
 
 
 if __name__ == "__main__":

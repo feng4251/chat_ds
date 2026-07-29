@@ -41,7 +41,16 @@ from skill_bundles import (
     resolved_bundle_metadata,
 )
 from skill_frontmatter import SkillFrontmatterError, parse_skill_frontmatter
-from workspace import safe_workspace_path
+from workspace import (
+    require_session_workspace_active,
+    safe_workspace_path,
+    safe_workspace_path_in_root,
+    session_workspace_mutation_guard,
+)
+from workspace_lock import (
+    run_sync_cancellation_safe,
+    workspace_mutation_guard,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -385,6 +394,7 @@ async def _require_session_conversation(
     )).scalar_one_or_none()
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
+    require_session_workspace_active(user.id, session_id)
     return conversation
 
 
@@ -427,38 +437,42 @@ def _persist_session_skill_archive(
     session_id: str,
 ) -> tuple[dict, Path]:
     """Persist the byte-identical source ZIP as a visible workspace attachment."""
+    archive_sha256 = hashlib.sha256(contents).hexdigest()
     try:
-        destination = safe_workspace_path(user_id, session_id, filename)
+        with session_workspace_mutation_guard(
+            user_id,
+            session_id,
+        ) as workspace:
+            destination = safe_workspace_path_in_root(workspace, filename)
+            created = _atomic_create_bytes(destination, contents)
+            if not created:
+                try:
+                    existing_stat = destination.lstat()
+                except FileNotFoundError:
+                    # Retain one bounded no-clobber retry for legacy writers
+                    # that do not yet participate in the shared lock.
+                    created = _atomic_create_bytes(destination, contents)
+                    if created:
+                        existing_stat = None
+                    else:
+                        existing_stat = destination.lstat()
+                if not created:
+                    if (
+                        existing_stat is None
+                        or not stat.S_ISREG(existing_stat.st_mode)
+                        or existing_stat.st_size != len(contents)
+                        or _sha256_file(destination) != archive_sha256
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"Workspace attachment '{filename}' already "
+                                "exists with different content. Rename the "
+                                "archive or remove the existing file."
+                            ),
+                        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    archive_sha256 = hashlib.sha256(contents).hexdigest()
-    created = _atomic_create_bytes(destination, contents)
-    if not created:
-        try:
-            existing_stat = destination.lstat()
-        except FileNotFoundError:
-            # A concurrent delete won the race. One bounded retry retains the
-            # same no-clobber semantics without hiding a genuine conflict.
-            created = _atomic_create_bytes(destination, contents)
-            if created:
-                existing_stat = None
-            else:
-                existing_stat = destination.lstat()
-        if not created:
-            if (
-                existing_stat is None
-                or not stat.S_ISREG(existing_stat.st_mode)
-                or existing_stat.st_size != len(contents)
-                or _sha256_file(destination) != archive_sha256
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"Workspace attachment '{filename}' already exists with "
-                        "different content. Rename the archive or remove the existing file."
-                    ),
-                )
 
     attachment = {
         "kind": "skill_archive",
@@ -479,17 +493,47 @@ def _rollback_created_skill_archive(
     if attachment.get("status") != "created":
         return False
     try:
-        current_stat = destination.lstat()
-        if (
-            not stat.S_ISREG(current_stat.st_mode)
-            or current_stat.st_size != int(attachment["size"])
-            or _sha256_file(destination) != attachment["sha256"]
-        ):
-            return False
-        destination.unlink()
-        return True
+        with workspace_mutation_guard(destination.parent):
+            current_stat = destination.lstat()
+            if (
+                not stat.S_ISREG(current_stat.st_mode)
+                or current_stat.st_size != int(attachment["size"])
+                or _sha256_file(destination) != attachment["sha256"]
+            ):
+                return False
+            destination.unlink()
+            return True
     except (FileNotFoundError, OSError):
         return False
+
+
+async def _persist_session_skill_archive_async(
+    *,
+    contents: bytes,
+    filename: str,
+    user_id: str,
+    session_id: str,
+) -> tuple[dict, Path]:
+    return await run_sync_cancellation_safe(
+        lambda: _persist_session_skill_archive(
+            contents=contents,
+            filename=filename,
+            user_id=user_id,
+            session_id=session_id,
+        )
+    )
+
+
+async def _rollback_created_skill_archive_async(
+    attachment: dict,
+    destination: Path,
+) -> bool:
+    return await run_sync_cancellation_safe(
+        lambda: _rollback_created_skill_archive(
+            attachment,
+            destination,
+        )
+    )
 
 
 def _zip_file_entries(zf: zipfile.ZipFile) -> list[tuple[zipfile.ZipInfo, str]]:
@@ -1220,7 +1264,8 @@ async def _process_skill_zip(
         created_runtime_files: list[tuple[Path, int, str]] = []
         try:
             if session_id is not None:
-                attachment, archive_destination = _persist_session_skill_archive(
+                require_session_workspace_active(user.id, session_id)
+                attachment, archive_destination = await _persist_session_skill_archive_async(
                     contents=contents,
                     filename=filename,
                     user_id=user.id,
@@ -1400,7 +1445,7 @@ async def _process_skill_zip(
                 for ownership in reversed(created_runtime_files):
                     _remove_request_owned_file(ownership)
                 if attachment is not None and archive_destination is not None:
-                    _rollback_created_skill_archive(
+                    await _rollback_created_skill_archive_async(
                         attachment,
                         archive_destination,
                     )
@@ -1503,6 +1548,8 @@ async def list_skills(
     skills are filtered to only those in enabled_user_skills (opt-in behavior).
     Session-specific skills for session_id are always returned.
     """
+    if session_id:
+        require_session_workspace_active(user.id, session_id)
     query = select(SkillPackage).where(SkillPackage.user_id == user.id)
     if session_id:
         if enabled_user_skills is not None:
@@ -1519,6 +1566,8 @@ async def list_skills(
                 | SkillPackage.session_id.is_(None)
             )
     result = await db.execute(query.order_by(SkillPackage.created_at.desc()))
+    if session_id:
+        require_session_workspace_active(user.id, session_id)
     skills = result.scalars().all()
 
     # Legacy rows created before session_id existed may be duplicated. Expose
@@ -1659,6 +1708,8 @@ async def delete_skill(
     _validate_skill_name(name)
 
     async with _skill_install_lock(user.id, session_id):
+        if session_id is not None:
+            require_session_workspace_active(user.id, session_id)
         scope_root = _scope_skills_dir(user.id, session_id)
         operation_dir = _skill_operation_dir(
             user_id=user.id,
@@ -1958,6 +2009,7 @@ async def promote_skill(
     # concurrent installs cannot deadlock or observe an intermediate registry.
     async with _skill_install_lock(user.id, None):
         async with _skill_install_lock(user.id, session_id):
+            require_session_workspace_active(user.id, session_id)
             conv = (await db.execute(
                 select(Conversation).where(
                     Conversation.id == session_id,
