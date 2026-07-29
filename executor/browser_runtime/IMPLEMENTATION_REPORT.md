@@ -1,6 +1,64 @@
-# Browser runtime profile implementation report
+# Unified session-sandbox implementation report
 
-## Delivered scope
+> Current production state as of 2026-07-30 is defined by `c62a4a69`,
+> `304781c8`, and the Backend safety amendment `b4e8dc18`. The detailed body
+> below records the earlier independent-browser
+> implementation and remains useful as dependency/seccomp/Weston provenance,
+> but its two-lane topology is historical and must not be used as current
+> deployment guidance. `SESSION_HANDOFF.md` is the canonical operational state.
+
+## Current unified scope
+
+Production now runs four homogeneous `session-sandbox-v1` slots. Every slot
+contains the immutable Bash/Python/Node, Playwright, Selenium, Chromium,
+ChromeDriver and Weston closure described below. Harness reserves a healthy
+slot from one content-bound UDS pool; it no longer asks the model or Skill to
+choose between a base executor and a browser executor. A persistent lease keeps
+slot affinity until close, while admission, abandon, quarantine, restart and
+startup reap are runtime-owned.
+
+Each slot has `network_mode:none`, a fixed UID/GID 65529 worker, a private
+run/lease snapshot, HOME, TMP, workspace and process tree, and a 3 GiB cgroup
+memory boundary. The fixed pool is not one container per chat. Runtime package
+installation remains disabled; missing dependencies fail during capability
+preflight.
+
+The only networked Skill-code component is `skill-egress-proxy`. Public access
+requires a frozen, execution-signed exact origin/method/path-prefix rule.
+Private access additionally requires the current user URL authorization and
+the deployment private-origin/CIDR allowlist. DNS answers remain pinned and
+validated; loopback, metadata and off-policy addresses are rejected. Private
+CA/key material exists only in the proxy-private volume and is never mounted
+into an executor.
+
+Backend and Harness share a separate host-local Docker volume only for
+workspace mutation locks. `304781c8` moved those locks off the NFS workspace
+after a real NFSv3 NLM hang proved that `flock(LOCK_NB)` does not bound lockd
+RPC waits. Executors, proxy, browser, frontend and search cannot see this lock
+volume. Missing/unsafe mounts fail closed.
+
+`b4e8dc18` does not change the unified slot or egress topology. It hardens the
+Backend reconciler around that lifecycle boundary: DB absence alone retains an
+unfenced tree, pending journals retain/defer, and only an already present,
+strictly validated durable deletion tombstone authorizes cleanup. Marker
+metadata, bounded exact payload, inode/path stability and the destructive
+boundary are revalidated fail closed. Production currently preserves the
+single-Backend/no-overlapping-rollout invariant; full validation and rollback
+evidence remain in `SESSION_HANDOFF.md`.
+
+Current real-image acceptance covers four-slot Bash/Python/Node execution,
+CommonJS/ESM and Python Playwright, Selenium, persistent object calls,
+12,589,062-byte artifact transfer, signed public/private egress and direct,
+loopback, private and metadata deny paths. The exact current test/image evidence
+is recorded in `SESSION_HANDOFF.md`.
+
+Current limitations are deliberate: the pool is single-host rather than
+per-session containers; dependencies cannot be installed at runtime; private
+egress is whitelist- and run-policy-scoped; CAPTCHA, stealth/anti-evasion and
+unconfirmed important actions are unsupported; and the local lock volume is
+not a multi-host active-active coordination service.
+
+## Historical delivered scope (pre-c62)
 
 This change adds an independent `browser-automation-v1` worker image and
 integrates it with the executor process protocol and Compose topology. Harness
@@ -47,7 +105,7 @@ UID/GID credentials to run the exact Skill entrypoint as 65529:65529 with no
 supplementary groups. npm, npx, pip, ensurepip, apt, and apt-get remain
 unavailable in the final image.
 
-## Egress controls
+## Historical egress baseline
 
 The launcher requires the runtime-owned `SKILL_EGRESS_PROXY_URL`, exports it
 through the standard proxy variables, and selects the controlled Chromium
@@ -67,7 +125,7 @@ must never be published or shared.
 
 No shared CDP socket is part of this profile.
 
-## Production topology
+## Historical production topology (superseded)
 
 Compose includes:
 
@@ -137,7 +195,7 @@ removing unused SysV IPC and POSIX message-queue syscall families. Both browser
 services receive only the additional `SYS_CHROOT` capability required by
 Chromium's namespace sandbox. Neither uses `seccomp:unconfined` or `SYS_ADMIN`.
 
-## Verification performed
+## Historical verification performed
 
 The complete amd64 browser-executor image was built. The pinned dependency
 build produced image `a7a5671b694f`; a source-only validation layer containing
@@ -217,7 +275,7 @@ matched the same immutable snapshot. Explicit close left no live manager
 records or retained cleanup retries. This separate high-level acceptance keeps
 a low-level client test from being mistaken for the full Harness routing path.
 
-## Security limitations
+## Historical security limitations
 
 The proxy environment and Chromium wrapper are application-layer defense in
 depth. Arbitrary untrusted code may create its own socket, but the
