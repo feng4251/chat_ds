@@ -866,6 +866,90 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(gap["terminal_failure"])
         self.assertEqual(events[-1], {"type": "done", "finish_reason": "stop"})
 
+    async def test_retrieval_closure_never_reopens_during_output_repair(self):
+        url = "https://api.vendor.test/search?q=closure"
+        raw_protocol = (
+            "<tool_call><name>skill_http_get</name>"
+            "<arguments>{}</arguments></tool_call>"
+        )
+        responses = [
+            _tool_call_response(
+                "call-http-before-closure",
+                tool_name="skill_http_get",
+                arguments={"url": url, "max_chars": 10},
+            ),
+            _stop_response(
+                "Bounded evidence draft with invalid raw protocol.\n"
+                + raw_protocol
+            ),
+            _visible_length_response(
+                "Status: WARN/degraded\n"
+                "Evidence: retained bounded response; coverage remains partial."
+            ),
+            _stop_response(
+                "\nConclusion: no complete-coverage claim was made.\n"
+                + _result_fields_footer("evidence", degraded=True)
+            ),
+        ]
+
+        request_bodies, dispatch_mock, events, _persisted = await self._run(
+            responses,
+            max_iterations=4,
+            dispatch_result=_http_success_result(
+                url,
+                '{"items":[1,2,3]}',
+                request_number=1,
+                body_truncated=True,
+                max_chars=10,
+            ),
+            tools=["skill_http_get"],
+            schemas=self.http_schema,
+            required_result_fields=["evidence"],
+            required_capability_tools=["skill_http_get"],
+            allowed_skill_http_prefixes=[(
+                "evidence-api", "https://api.vendor.test/search"
+            )],
+        )
+
+        self.assertFalse(responses)
+        self.assertEqual(1, dispatch_mock.await_count)
+        self.assertEqual(4, len(request_bodies))
+        for request in request_bodies[1:]:
+            exposed = [
+                item["function"]["name"]
+                for item in request.get("tools") or []
+            ]
+            self.assertNotIn("skill_http_get", exposed)
+        self.assertGreater(request_bodies[2]["max_tokens"], 2_048)
+        self.assertFalse(any(
+            event.get("event_type") == "run.failed"
+            for event in events
+        ))
+        iteration_starts = [
+            event["payload"]
+            for event in events
+            if event.get("event_type") == "debug.iteration.started"
+        ]
+        self.assertTrue(iteration_starts)
+        self.assertTrue(all(
+            item.get("delegate_http_retrieval_phase") == "closing"
+            for item in iteration_starts[1:]
+        ))
+        self.assertFalse(any(
+            item.get("delegate_http_retrieval_followup") is True
+            and (
+                item.get("delegate_output_contract_repair") is True
+                or item.get("delegate_visible_length_recovery") is True
+            )
+            for item in iteration_starts
+        ))
+        self.assertTrue(any(
+            event.get("event_type")
+            == "debug.delegate.output_contract_repair.requested"
+            for event in events
+        ))
+        self.assertEqual(events[-1], {"type": "done", "finish_reason": "stop"})
+
     async def test_non_paginated_http_response_keeps_normal_completion(self):
         url = "https://api.vendor.test/search?q=one"
         responses = [

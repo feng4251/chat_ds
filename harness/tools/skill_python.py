@@ -22,6 +22,9 @@ from runtime.python_env import (
 )
 from skills.scanner import USER_SKILLS_BASE
 from tools.context import ToolContext
+from tools.effect_receipt import (
+    build_isolated_execution_effect_receipt,
+)
 from tools.execution_fence import require_execution_authority
 from tools.isolated_skill_executor import (
     IsolatedSkillExecutorError,
@@ -618,6 +621,13 @@ async def run_skill_python(
         "artifact_total": len(isolated.get("artifacts", []))
         if isinstance(isolated.get("artifacts"), list) else 0,
     })
+    result["effect_receipt"] = build_isolated_execution_effect_receipt(
+        result=isolated,
+        egress_rules=egress_policy.rule_payload(),
+        tool_operation_id=(
+            context.tool_operation_id if context is not None else None
+        ),
+    )
     if function_name is not None:
         result["function_name"] = function_name
     if class_name is not None and method_name is not None:

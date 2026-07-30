@@ -142,6 +142,7 @@ from workspace_patterns import (
     workspace_pattern_matches,
 )
 from tools.context import ToolContext
+from tools.effect_receipt import bind_effect_receipt_to_call
 from tools.execution_fence import (
     ChildExecutionFence,
     ExecutionAuthorityRevoked,
@@ -2532,6 +2533,43 @@ def _tool_debug_result(raw: str) -> dict[str, Any]:
             payload["matched_prefix_sha256"] = (
                 matched_prefix_sha256
             )
+        network_policy = parsed.get("network_policy")
+        if isinstance(network_policy, dict):
+            direct = str(network_policy.get("direct") or "")
+            egress = str(network_policy.get("egress") or "")
+            if (
+                direct in {"disabled", "enabled"}
+                and egress in {
+                    "none",
+                    "origin_allowlist_proxy",
+                    "controlled_egress",
+                }
+            ):
+                payload["network_policy"] = {
+                    "direct": direct,
+                    "egress": egress,
+                }
+        effect_receipt = parsed.get("effect_receipt")
+        if isinstance(effect_receipt, dict):
+            payload["effect_receipt"] = {
+                key: effect_receipt.get(key)
+                for key in (
+                    "version",
+                    "effect_known",
+                    "terminal_response_present",
+                    "process_teardown_complete",
+                    "artifact_commit_count",
+                    "workspace_mutation_count",
+                    "authorized_external_methods",
+                    "external_effect_class",
+                    "controlled_egress",
+                    "egress_rule_set_sha256",
+                    "operation_id_sha256",
+                    "replay_safe",
+                    "receipt_sha256",
+                )
+                if effect_receipt.get(key) is not None
+            }
         for source_key, debug_key in (
             ("url", "request_url_sha256"),
             ("matched_prefix", "matched_prefix_sha256"),
@@ -6418,7 +6456,10 @@ class HarnessRunState:
                         else {}
                     )
                     mutating_dispatch_count = dispatch_receipt_audit.get(
-                        "mutating_dispatch_count"
+                        "unsafe_mutating_dispatch_count",
+                        dispatch_receipt_audit.get(
+                            "mutating_dispatch_count"
+                        ),
                     )
                     workflow_ir_degraded_retry_safe = (
                         isinstance(mutating_dispatch_count, int)
@@ -12849,6 +12890,12 @@ async def run_stream(
         if delegated_subtask and delegated_required_result_fields
         else None
     )
+    # Retrieval is a monotonic child phase. Once synthesis or any terminal
+    # repair starts, the still-open tracker remains available for audit only;
+    # it must never re-expose network tools on a later turn.
+    delegate_retrieval_phase = (
+        "acquiring" if delegate_retrieval_tracker is not None else "inactive"
+    )
     delegate_retrieval_no_call_turns = 0
     delegate_retrieval_last_snapshot: dict[str, Any] | None = None
     delegate_retrieval_ledger_prompt_sha: str | None = None
@@ -17211,6 +17258,7 @@ async def run_stream(
 
         nonlocal pending_delegate_retrieval_degraded_synthesis
         nonlocal delegate_retrieval_degraded_synthesis_attempted
+        nonlocal delegate_retrieval_phase
         nonlocal forced_workflow_policy
         if (
             delegate_retrieval_tracker is None
@@ -17219,6 +17267,7 @@ async def run_stream(
         ):
             return None
         snapshot = delegate_retrieval_tracker.snapshot()
+        delegate_retrieval_phase = "closing"
         declared_exhaustive = bool(
             delegated_retrieval_completeness_policy
             == RETRIEVAL_COMPLETENESS_POLICY_EXHAUSTIVE
@@ -19679,6 +19728,15 @@ async def run_stream(
             )
             auto_completed = _tool_outcome_is_completed(auto_outcome)
             auto_result_data = _json_object(str(auto_result))
+            auto_effect_receipt = bind_effect_receipt_to_call(
+                (
+                    auto_result_data.get("effect_receipt")
+                    if isinstance(auto_result_data, dict)
+                    else None
+                ),
+                tool_name=auto_tool_name,
+                tool_call_id=auto_call_id,
+            )
             auto_callable_result_receipt = (
                 build_callable_skill_result_receipt(
                     auto_tool_name,
@@ -19883,6 +19941,11 @@ async def run_stream(
                     "workflow_auto_dispatch": True,
                     "actual_dispatch_attempted": (
                         auto_actual_dispatch_attempted
+                    ),
+                    "effect_receipt": (
+                        auto_effect_receipt
+                        if auto_actual_dispatch_attempted
+                        else None
                     ),
                     "exact_capability_receipt": (
                         {
@@ -20241,8 +20304,26 @@ async def run_stream(
             pending_delegate_retrieval_degraded_synthesis
         )
         pending_delegate_retrieval_degraded_synthesis = False
+        terminal_retrieval_phase_requested = bool(
+            iteration_tool_stream_evidence_synthesis
+            or iteration_post_dispatch_stream_synthesis
+            or iteration_post_dispatch_synthesis_continuation
+            or iteration_result_footer_repair
+            or iteration_output_contract_repair
+            or iteration_visible_length_recovery
+            or iteration_preflight_denial_synthesis
+            or iteration_cross_tool_failure_synthesis
+            or iteration_delegated_retrieval_degraded_synthesis
+        )
+        if (
+            delegate_retrieval_tracker is not None
+            and delegate_retrieval_phase == "acquiring"
+            and terminal_retrieval_phase_requested
+        ):
+            delegate_retrieval_phase = "closing"
         iteration_delegated_retrieval_followup = bool(
             delegate_retrieval_tracker is not None
+            and delegate_retrieval_phase == "acquiring"
             and delegate_retrieval_tracker.requires_mandatory_continuation(
                 delegated_retrieval_completeness_policy
             )
@@ -20251,13 +20332,17 @@ async def run_stream(
         )
         iteration_delegated_retrieval_optional_frontier = bool(
             delegate_retrieval_tracker is not None
+            and delegate_retrieval_phase == "acquiring"
             and delegate_retrieval_tracker.has_optional_pagination_frontier(
                 delegated_retrieval_completeness_policy
             )
             and not iteration_delegated_retrieval_degraded_synthesis
         )
         iteration_delegated_retrieval_action = (
-            delegate_retrieval_tracker.next_continuation_action()
+            delegate_retrieval_tracker.next_continuation_action(
+                delegated_retrieval_completeness_policy,
+                mandatory_only=iteration_delegated_retrieval_followup,
+            )
             if (
                 iteration_delegated_retrieval_followup
                 or iteration_delegated_retrieval_optional_frontier
@@ -20536,6 +20621,11 @@ async def run_stream(
             )
         )
         if delegate_forced_synthesis:
+            if (
+                delegate_retrieval_tracker is not None
+                and delegate_retrieval_phase == "acquiring"
+            ):
+                delegate_retrieval_phase = "closing"
             # Reserve the final bounded child turns for the actual typed result.
             # Without this hard phase boundary, tool-oriented models can use
             # every iteration gathering more evidence and leave only process
@@ -20760,6 +20850,7 @@ async def run_stream(
             "delegate_http_retrieval_followup": (
                 iteration_delegated_retrieval_followup
             ),
+            "delegate_http_retrieval_phase": delegate_retrieval_phase,
             "delegate_http_retrieval_optional_frontier": (
                 iteration_delegated_retrieval_optional_frontier
             ),
@@ -21437,6 +21528,9 @@ async def run_stream(
                 iteration_stream_deadline_plan.configured_hard_cap_seconds
             ),
             "effective_stream_deadline_seconds": (
+                iteration_stream_deadline_plan.hard_cap_seconds
+            ),
+            "planned_stream_deadline_seconds": (
                 iteration_stream_deadline_plan.planned_deadline_seconds
             ),
             "stream_deadline_plan": (
@@ -22475,7 +22569,7 @@ async def run_stream(
 
                 # Queue locally before opening the provider request. Admission
                 # wait therefore remains outside both the initial material-
-                # progress lease and the planned hard deadline, while ordinary
+                # progress lease and the effective hard cap, while ordinary
                 # run/batch cancellation still cancels this acquire and removes
                 # its FIFO waiter.
                 admission_lease = await provider_admission.acquire(
@@ -22504,7 +22598,7 @@ async def run_stream(
                     async for stream_event in _aiter_with_timeout(
                         consume_provider_stream(),
                         timeout_seconds=(
-                            attempt_stream_deadline_plan.planned_deadline_seconds
+                            attempt_stream_deadline_plan.hard_cap_seconds
                         ),
                         material_progress_lease=stream_deadline_lease,
                         **(
@@ -28996,6 +29090,11 @@ async def run_stream(
                 )
                 tool_completed = _tool_outcome_is_completed(outcome)
                 exact_result_data = _json_object(str(result)) or {}
+                effect_receipt = bind_effect_receipt_to_call(
+                    exact_result_data.get("effect_receipt"),
+                    tool_name=display_tool_name,
+                    tool_call_id=tool_call_id,
+                )
                 callable_result_receipt = (
                     build_callable_skill_result_receipt(
                         display_tool_name,
@@ -29953,6 +30052,11 @@ async def run_stream(
                         "actual_dispatch_attempted": (
                             actual_dispatch_attempted
                         ),
+                        "effect_receipt": (
+                            effect_receipt
+                            if actual_dispatch_attempted
+                            else None
+                        ),
                         "exact_capability_receipt": (
                             {
                                 "result_data": {
@@ -30379,11 +30483,14 @@ async def run_stream(
             if (
                 not retrieval_degraded_queued
                 and delegate_retrieval_tracker is not None
+                and delegate_retrieval_phase == "acquiring"
                 and delegate_retrieval_tracker.has_open_chains
             ):
                 retrieval_snapshot = delegate_retrieval_tracker.snapshot()
                 retrieval_action = (
-                    delegate_retrieval_tracker.next_continuation_action()
+                    delegate_retrieval_tracker.next_continuation_action(
+                        delegated_retrieval_completeness_policy,
+                    )
                 )
                 retrieval_continuation_required = (
                     delegate_retrieval_tracker.requires_mandatory_continuation(
@@ -32624,7 +32731,11 @@ async def _aiter_with_timeout(
     def effective_deadline() -> float:
         if material_progress_lease is None:
             return fixed_deadline
-        return min(fixed_deadline, material_progress_lease.deadline)
+        # The lease already owns both the renewable soft deadline and the
+        # immutable configured/caller hard cap.  Applying ``timeout_seconds``
+        # as a second absolute deadline would turn the request's planned
+        # duration estimate back into a hard cap and kill healthy streams.
+        return material_progress_lease.deadline
 
     def deadline_error(*, now: float) -> asyncio.TimeoutError:
         if material_progress_lease is None:
@@ -32632,6 +32743,7 @@ async def _aiter_with_timeout(
         metrics = material_progress_lease.debug_payload(now=now)
         metrics.update({
             "fixed_timeout_seconds": normalized_timeout,
+            "fixed_timeout_applied": False,
             "effective_deadline_elapsed_seconds": max(
                 0.0,
                 effective_deadline() - material_progress_lease.started_at,

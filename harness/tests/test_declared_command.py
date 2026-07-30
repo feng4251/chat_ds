@@ -343,6 +343,11 @@ class DeclaredCommandBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("command", execute.await_args.kwargs)
         self.assertNotIn("egress_origins", execute.await_args.kwargs)
         self.assertEqual("none", result["egress_policy"])
+        self.assertFalse(result["effect_receipt"]["replay_safe"])
+        self.assertEqual(
+            1,
+            result["effect_receipt"]["workspace_mutation_count"],
+        )
 
     async def test_tool_forwards_only_runtime_owned_exact_skill_egress(
         self,
@@ -436,6 +441,12 @@ class DeclaredCommandBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             "compiled_exact_url_policy",
             result["egress_policy"],
+        )
+        self.assertTrue(result["effect_receipt"]["effect_known"])
+        self.assertTrue(result["effect_receipt"]["replay_safe"])
+        self.assertEqual(
+            ["GET", "HEAD"],
+            result["effect_receipt"]["authorized_external_methods"],
         )
         self.assertNotIn(
             "egress_origins",

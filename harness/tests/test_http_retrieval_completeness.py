@@ -169,6 +169,19 @@ class RetrievalCompletenessReceiptTests(unittest.TestCase):
         self.assertTrue(
             tracker.requires_mandatory_continuation("exhaustive")
         )
+        exhaustive_action = tracker.next_continuation_action(
+            "exhaustive",
+            mandatory_only=True,
+        )
+        self.assertIsNotNone(exhaustive_action)
+        self.assertEqual(
+            "follow_pagination_cursor",
+            exhaustive_action["kind"],
+        )
+        self.assertIsNone(tracker.next_continuation_action(
+            "bounded",
+            mandatory_only=True,
+        ))
         self.assertEqual(
             RETRIEVAL_QUALITY_IMPACT_DEGRADED,
             tracker.closure_quality_impact("exhaustive"),
@@ -197,6 +210,134 @@ class RetrievalCompletenessReceiptTests(unittest.TestCase):
             RETRIEVAL_QUALITY_IMPACT_DEGRADED,
             tracker.closure_quality_impact("bounded"),
         )
+
+    def test_bounded_mandatory_repair_preempts_older_optional_cursor(self):
+        tracker = RetrievalCompletenessTracker()
+        optional_url = "https://api.museum.test/catalog?q=bronze"
+        mandatory_url = "https://api.museum.test/catalog?q=ceramic"
+        tracker.observe(_receipt(
+            optional_url,
+            '{"items":[1],"nextPageToken":"A"}',
+            number=1,
+        ))
+        tracker.observe(_receipt(
+            mandatory_url,
+            '{"items":[1',
+            number=2,
+            truncated=True,
+            max_chars=10,
+            full_body='{"items":[1,2,3,4,5]}',
+            wire_complete=True,
+            hard_max_chars=100,
+        ))
+
+        bounded_action = tracker.next_continuation_action("bounded")
+        self.assertIsNotNone(bounded_action)
+        self.assertEqual(
+            "retry_with_larger_visible_limit",
+            bounded_action["kind"],
+        )
+        self.assertEqual(mandatory_url, bounded_action["args"]["url"])
+        self.assertEqual(
+            bounded_action,
+            tracker.next_continuation_action(),
+        )
+        self.assertEqual(
+            bounded_action,
+            tracker.next_continuation_action(
+                "bounded",
+                mandatory_only=True,
+            ),
+        )
+
+        # Exhaustive policy promotes the older clean cursor to mandatory, so
+        # the deterministic ready order still begins with that family.
+        exhaustive_action = tracker.next_continuation_action("exhaustive")
+        self.assertIsNotNone(exhaustive_action)
+        self.assertEqual(
+            "follow_pagination_cursor",
+            exhaustive_action["kind"],
+        )
+        self.assertIn("pageToken=A", exhaustive_action["args"]["url"])
+
+    def test_mandatory_frontiers_rotate_after_linked_progress(self):
+        tracker = RetrievalCompletenessTracker()
+        first_url = "https://api.archive.test/search?q=alpha"
+        second_url = "https://api.archive.test/search?q=beta"
+        complete_wire_body = (
+            '{"items":[' + ",".join(str(i) for i in range(40)) + "]}"
+        )
+        for number, url in enumerate((first_url, second_url), start=1):
+            tracker.observe(_receipt(
+                url,
+                complete_wire_body[:12],
+                number=number,
+                truncated=True,
+                max_chars=10,
+                full_body=complete_wire_body,
+                wire_complete=True,
+                hard_max_chars=200,
+            ))
+
+        first_action = tracker.next_continuation_action("bounded")
+        self.assertEqual(first_url, first_action["args"]["url"])
+        # Inspection is pure; retries in the caller cannot silently rotate
+        # the scheduler until a linked receipt actually advances this family.
+        self.assertEqual(
+            first_action,
+            tracker.next_continuation_action("bounded"),
+        )
+
+        tracker.observe(_receipt(
+            first_url,
+            complete_wire_body[:30],
+            number=3,
+            truncated=True,
+            max_chars=first_action["args"]["max_chars"],
+            full_body=complete_wire_body,
+            wire_complete=True,
+            hard_max_chars=200,
+        ))
+        second_action = tracker.next_continuation_action("bounded")
+        self.assertEqual(second_url, second_action["args"]["url"])
+
+        tracker.observe(_receipt(
+            second_url,
+            complete_wire_body[:30],
+            number=4,
+            truncated=True,
+            max_chars=second_action["args"]["max_chars"],
+            full_body=complete_wire_body,
+            wire_complete=True,
+            hard_max_chars=200,
+        ))
+        rotated_action = tracker.next_continuation_action("bounded")
+        self.assertEqual(first_url, rotated_action["args"]["url"])
+
+    def test_unactionable_mandatory_chain_blocks_optional_fallback(self):
+        tracker = RetrievalCompletenessTracker()
+        tracker.observe(_receipt(
+            "https://api.library.test/books?q=history",
+            '{"items":[1],"nextPageToken":"A"}',
+            number=1,
+        ))
+        # A legacy receipt without a proven schema ceiling has no safe
+        # machine-generated repair action. It remains mandatory and must not
+        # be bypassed by an unrelated advisory cursor.
+        tracker.observe(_receipt(
+            "https://api.library.test/books?q=science",
+            '{"items":[1',
+            number=2,
+            truncated=True,
+            max_chars=10,
+        ))
+
+        self.assertTrue(tracker.requires_mandatory_continuation("bounded"))
+        self.assertIsNone(tracker.next_continuation_action("bounded"))
+        self.assertIsNone(tracker.next_continuation_action(
+            "bounded",
+            mandatory_only=True,
+        ))
 
     def test_only_explicit_advisory_receipt_is_quality_neutral(self):
         self.assertFalse(retrieval_receipt_affects_completion_quality(None))

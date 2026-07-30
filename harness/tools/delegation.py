@@ -32,6 +32,9 @@ from delegated_result_contract import (
     strip_result_fields_candidate_tail,
 )
 from tools.context import ToolContext
+from tools.effect_receipt import (
+    bound_effect_receipt_is_replay_safe,
+)
 from tools.execution_fence import (
     ChildExecutionFence,
     FenceTeardownReport,
@@ -436,7 +439,11 @@ def _legacy_completion_quality_status(content: str) -> str | None:
     return None
 
 
-def _completion_quality_declaration(content: str) -> dict[str, Any]:
+def _completion_quality_declaration(
+    content: str,
+    *,
+    allow_legacy_status: bool = True,
+) -> dict[str, Any]:
     """Resolve child-declared quality with machine ledgers taking priority."""
 
     value = _mask_markdown_code_for_protocol_audit(str(content or ""))
@@ -528,7 +535,11 @@ def _completion_quality_declaration(content: str) -> dict[str, Any]:
             "error": None,
         }
 
-    legacy_status = _legacy_completion_quality_status(value)
+    legacy_status = (
+        _legacy_completion_quality_status(value)
+        if allow_legacy_status
+        else None
+    )
     return {
         "status": legacy_status,
         "source": "legacy_status" if legacy_status else "none",
@@ -1045,6 +1056,9 @@ class _ChildDispatchReceiptTracker:
         self._tool_names: set[str] = set()
         self._mutating_tool_names: set[str] = set()
         self._read_only_tool_names: set[str] = set()
+        self._replay_safe_mutating_boundaries: set[
+            tuple[str, int, str]
+        ] = set()
         self._terminal_events_by_run: dict[str, str] = {}
         self._maximum_event_seq_by_run: dict[str, int] = {}
         self._last_progress_monotonic = time.monotonic()
@@ -1262,12 +1276,26 @@ class _ChildDispatchReceiptTracker:
                 tool_call_id=tool_call_id,
                 generation=generation,
             )
+        boundary_key = (tool_call_id, generation, tool_name)
+        if (
+            boundary_key in self._recorded_boundaries
+            and _dispatch_can_mutate(tool_name)
+            and bound_effect_receipt_is_replay_safe(
+                payload.get("effect_receipt"),
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+            )
+        ):
+            self._replay_safe_mutating_boundaries.add(boundary_key)
         if tool_call_id:
             self._active_calls.pop(tool_call_id, None)
 
     @property
     def mutating_dispatch_observed(self) -> bool:
-        return self._mutating_dispatch_count > 0
+        return (
+            self._mutating_dispatch_count
+            > len(self._replay_safe_mutating_boundaries)
+        )
 
     def terminal_event(self, run_id: str) -> str | None:
         return self._terminal_events_by_run.get(str(run_id or ""))
@@ -1285,9 +1313,20 @@ class _ChildDispatchReceiptTracker:
 
     def snapshot(self) -> dict[str, Any]:
         """Return bounded, secret-free receipt metadata for result envelopes."""
+        replay_safe_mutating_count = len(
+            self._replay_safe_mutating_boundaries
+        )
         return {
             "dispatch_count": self._dispatch_count,
             "mutating_dispatch_count": self._mutating_dispatch_count,
+            "replay_safe_mutating_dispatch_count": (
+                replay_safe_mutating_count
+            ),
+            "unsafe_mutating_dispatch_count": max(
+                0,
+                self._mutating_dispatch_count
+                - replay_safe_mutating_count,
+            ),
             "read_only_dispatch_count": self._read_only_dispatch_count,
             "tool_names": sorted(self._tool_names),
             "mutating_tool_names": sorted(self._mutating_tool_names),
@@ -4800,6 +4839,8 @@ def _verified_artifact_receipts(
     non-empty, non-symlink regular file in the current tenant/session workspace
     after the child stops.
     """
+    if not successful_calls:
+        return []
     try:
         workspace = get_workspace(context.user_id, context.session_id).resolve()
     except OSError:
@@ -5496,6 +5537,135 @@ def _required_output_has_status(content: str, output_id: str) -> bool:
         if status_pattern.search(window):
             return True
         start = position + len(needle)
+
+
+def _intent_dimension_status_error(
+    content: str,
+    classifier_context: str,
+    intent_selections: dict[str, Any],
+    required_output_ids: list[str],
+) -> str | None:
+    """Validate exact per-dimension intent status without global WARN leakage.
+
+    The bounded classifier prompt reserves ``WARN: null`` for an optional
+    dimension whose value is genuinely absent. Required ambiguity, FAIL, and
+    a WARN paired with a non-null selection cannot be promoted to a completed
+    classifier result merely because a syntactically valid footer follows it.
+    """
+
+    try:
+        compiled = json.loads(classifier_context)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        # Compatibility-only direct delegates may supply an unstructured
+        # context string. The runtime-owned classifier path always carries the
+        # explicit schema below; enforce dimension semantics only when that
+        # signed compiler projection is present.
+        return None
+    if (
+        not isinstance(compiled, dict)
+        or compiled.get("schema") != "chatds.intent-classifier.v1"
+    ):
+        return None
+    dimensions = (
+        compiled.get("dimensions")
+        if isinstance(compiled, dict)
+        else None
+    )
+    if not isinstance(dimensions, list):
+        return "compiled intent-classifier input has no dimensions array"
+    declared: dict[str, dict[str, Any]] = {}
+    for row in dimensions:
+        if not isinstance(row, dict):
+            return "compiled intent-classifier dimension is not an object"
+        dimension_id = row.get("id")
+        required = row.get("required")
+        nullable = row.get("nullable", False)
+        if (
+            not isinstance(dimension_id, str)
+            or not dimension_id
+            or dimension_id in declared
+            or not isinstance(required, bool)
+            or not isinstance(nullable, bool)
+        ):
+            return "compiled intent-classifier dimension metadata is invalid"
+        declared[dimension_id] = {
+            "required": required,
+            "nullable": nullable,
+            "default": row.get("default"),
+            "on_missing": str(row.get("on_missing") or "").casefold(),
+        }
+
+    for dimension_id in required_output_ids:
+        declaration = declared.get(dimension_id)
+        if declaration is None:
+            return (
+                "required intent dimension is absent from the compiled "
+                f"classifier input: {dimension_id}"
+            )
+        pattern = re.compile(
+            r"^[ \t]*"
+            + re.escape(dimension_id)
+            + r"[ \t]*[—–-][ \t]*(PASS|WARN|FAIL)[ \t]*:"
+            + r"[ \t]*(.*?)[ \t]*[—–-][ \t]*evidence[ \t]*:",
+            re.IGNORECASE | re.MULTILINE,
+        )
+        matches = pattern.findall(content)
+        if len(matches) != 1:
+            return (
+                "intent dimension requires exactly one exact PASS/WARN/FAIL "
+                f"status line: {dimension_id}"
+            )
+        status, rendered_value = matches[0]
+        selected_value = intent_selections.get(dimension_id)
+        selection_missing = (
+            dimension_id not in intent_selections
+            or selected_value is None
+            or (
+                isinstance(selected_value, str)
+                and not selected_value.strip()
+            )
+        )
+        default_value = declaration["default"]
+        default_valid = (
+            default_value is not None
+            and not isinstance(
+                default_value,
+                (dict, list, tuple, set),
+            )
+        )
+        effective_value = (
+            default_value
+            if selection_missing and default_valid
+            else selected_value
+        )
+        normalized_status = status.upper()
+        if normalized_status == "PASS":
+            if (
+                effective_value is None
+                or rendered_value.strip() != str(effective_value).strip()
+            ):
+                return (
+                    "PASS intent dimension must name the exact non-null footer "
+                    f"selection or declared default: {dimension_id}"
+                )
+            continue
+        missing_allowed = bool(
+            declaration["required"] is False
+            and not default_valid
+        )
+        if (
+            normalized_status == "WARN"
+            and missing_allowed
+            and selection_missing
+            and rendered_value.strip().casefold() == "null"
+        ):
+            continue
+        return (
+            "Only an optional declaration with no default may use WARN:null; "
+            "required WARN, FAIL, defaulted WARN, and non-null WARN "
+            f"selections fail closed for intent dimension: {dimension_id}"
+        )
+    return None
 
 
 def _script_call_targets_declared_skill(
@@ -8164,6 +8334,124 @@ async def _run_child(
             if "browser_navigate" in set(model_tools)
             else ()
         )
+    authority_manifest = {
+        "version": 1,
+        "authority_phase": "initial_child_static",
+        "resource_grants": sorted(allowed_skill_resources),
+        "script_grants": sorted(allowed_skill_scripts),
+        "script_authorities": sorted(
+            allowed_skill_script_authorities
+        ),
+        "package_grants": sorted(allowed_skill_package_digests),
+        "command_grants": sorted(allowed_skill_commands),
+        "http_get_grants": sorted(allowed_skill_http_prefixes),
+        "http_post_grants": sorted(
+            allowed_skill_http_post_prefixes
+        ),
+        "sandbox_egress_grants": sorted(
+            allowed_skill_sandbox_egress_prefixes
+        ),
+        "sandbox_egress_rule_grants": sorted(
+            allowed_skill_sandbox_egress_rules
+        ),
+        "browser_egress_rule_grants": sorted(
+            child_browser_egress_rules
+        ),
+        "effective_tools": sorted(model_tools),
+        "capability_bindings_sha256": (
+            capability_bindings_sha256 or None
+        ),
+        "unconditional_capability_plan_sha256": (
+            unconditional_capability_plan_sha256 or None
+        ),
+        "knowledge_gate_plan_sha256": (
+            knowledge_gate_plan_sha256 or None
+        ),
+    }
+    authority_snapshot_sha256 = hashlib.sha256(
+        json.dumps(
+            authority_manifest,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+    def hashed_rules(rows: list[Any] | tuple[Any, ...]) -> list[str]:
+        return [
+            hashlib.sha256(
+                json.dumps(
+                    row,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            for row in rows
+        ]
+
+    authority_snapshot = {
+        "version": 1,
+        "authority_phase": "initial_child_static",
+        "authority_snapshot_sha256": authority_snapshot_sha256,
+        "resource_grant_count": len(allowed_skill_resources),
+        "resource_grant_sha256s": hashed_rules(
+            allowed_skill_resources
+        ),
+        "script_grants": [
+            {
+                "skill_name": skill,
+                "resource_path": path,
+                "sha256": digest,
+            }
+            for skill, path, digest in allowed_skill_scripts
+        ],
+        "script_authority_count": len(
+            allowed_skill_script_authorities
+        ),
+        "script_authority_sha256s": hashed_rules(
+            allowed_skill_script_authorities
+        ),
+        "package_grants": [
+            {"skill_name": skill, "sha256": digest}
+            for skill, digest in allowed_skill_package_digests
+        ],
+        "command_grant_count": len(allowed_skill_commands),
+        "command_grant_sha256s": hashed_rules(
+            allowed_skill_commands
+        ),
+        # URLs and argv remain absent from durable lifecycle logs. Their exact
+        # frozen values are represented by stable full-row hashes.
+        "http_get_grant_sha256s": hashed_rules(
+            allowed_skill_http_prefixes
+        ),
+        "http_post_grant_sha256s": hashed_rules(
+            allowed_skill_http_post_prefixes
+        ),
+        "sandbox_egress_rule_sha256s": hashed_rules(
+            allowed_skill_sandbox_egress_rules
+        ),
+        "legacy_sandbox_egress_grant_sha256s": hashed_rules(
+            allowed_skill_sandbox_egress_prefixes
+        ),
+        "browser_egress_rule_sha256s": hashed_rules(
+            child_browser_egress_rules
+        ),
+        "effective_tools": sorted(model_tools),
+        "capability_bindings_sha256": (
+            capability_bindings_sha256 or None
+        ),
+        "unconditional_capability_plan_sha256": (
+            unconditional_capability_plan_sha256 or None
+        ),
+        "knowledge_gate_plan_sha256": (
+            knowledge_gate_plan_sha256 or None
+        ),
+    }
+    await forward_event(child_event(
+        "debug.delegate.authority_snapshot",
+        authority_snapshot,
+    ))
     preloaded_reader_tools = sorted(
         set(runtime_base_tools) - set(model_tools)
     )
@@ -8190,6 +8478,10 @@ async def _run_child(
                 "preloaded_reader_tools": preloaded_reader_tools,
                 "max_iterations": 0,
                 "prerequisite_preload": True,
+                "authority_snapshot_sha256": (
+                    authority_snapshot_sha256
+                ),
+                "authority_snapshot": authority_snapshot,
             },
         })
         await forward_event({
@@ -8366,6 +8658,10 @@ async def _run_child(
                     if isinstance(context.provider_config, dict)
                     else None
                 ),
+                "authority_snapshot_sha256": (
+                    authority_snapshot_sha256
+                ),
+                "authority_snapshot": authority_snapshot,
             },
         })
         for preload_index, (tool_name, path, tool_args) in (
@@ -9330,6 +9626,19 @@ async def _run_child(
         dispatch_receipts.observe_event(event)
         event_type = str(event.get("event_type") or "")
         raw_event_type = str(event.get("type") or "")
+        if event_type == "run.started":
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                payload = {}
+                event["payload"] = payload
+            payload.setdefault(
+                "authority_snapshot_sha256",
+                authority_snapshot_sha256,
+            )
+            payload.setdefault(
+                "authority_snapshot",
+                authority_snapshot,
+            )
         if event_type in {"run.completed", "run.failed"}:
             # emit_agent_event awaits this sink before writing lifecycle events
             # to the per-child debug JSONL. Mutate the shared event object so
@@ -9869,7 +10178,14 @@ async def _run_child(
         required_result_fields,
         required_result_schema,
     )
-    completion_quality_declaration = _completion_quality_declaration(content)
+    completion_quality_declaration = _completion_quality_declaration(
+        content,
+        # Intent dimensions use PASS/WARN as per-dimension classification
+        # states. An optional WARN:null is not a result-level quality
+        # declaration; only the explicit machine ledger may degrade the whole
+        # classifier child.
+        allow_legacy_status=not is_model_intent_classifier,
+    )
     output_protocol_audit = audit_raw_tool_protocol(
         content,
         successful_tools,
@@ -9894,6 +10210,22 @@ async def _run_child(
             "Delegated intent classification did not return a valid final "
             "INTENT_SELECTIONS_JSON object."
         )
+    if (
+        validation_error is None
+        and is_model_intent_classifier
+        and intent_selections is not None
+    ):
+        intent_status_error = _intent_dimension_status_error(
+            content,
+            extra,
+            intent_selections,
+            required_output_ids,
+        )
+        if intent_status_error is not None:
+            validation_error = (
+                "Delegated intent classification status is invalid: "
+                + intent_status_error
+            )
     unsupported_protocol_tools = list(
         output_protocol_audit["unsupported_tool_names"]
     )
@@ -10966,6 +11298,7 @@ async def _run_child(
                 "content_chars": len(content),
                 "content_sha256": content_sha256,
             },
+            "authority_snapshot_sha256": authority_snapshot_sha256,
         }
         if terminal_reason:
             completed_payload["terminal_reason"] = terminal_reason
@@ -11000,6 +11333,7 @@ async def _run_child(
                 "content_chars": len(content),
                 "reasoning_chars": len(reasoning),
             },
+            "authority_snapshot_sha256": authority_snapshot_sha256,
         }
         await forward_event(child_event("run.failed", failed_payload))
     return {
@@ -11030,6 +11364,8 @@ async def _run_child(
         "knowledge_gate_receipt_audit": (
             knowledge_gate_receipt_audit
         ),
+        "authority_snapshot_sha256": authority_snapshot_sha256,
+        "authority_snapshot": authority_snapshot,
         "required_skill_files_to_inspect": required_skill_files_to_inspect,
         "required_instruction_source_bindings": (
             required_instruction_source_bindings
@@ -11748,7 +12084,8 @@ async def delegate_task(
             }
         elif isinstance(raw_result, BaseException):
             raw_exception_mutation_count = dispatch_receipt_audit.get(
-                "mutating_dispatch_count"
+                "unsafe_mutating_dispatch_count",
+                dispatch_receipt_audit.get("mutating_dispatch_count"),
             )
             raw_exception_retry_safe = bool(
                 isinstance(raw_exception_mutation_count, int)

@@ -5,7 +5,8 @@ long a slow but healthy decoder needs to reach its terminal frame.  This
 module therefore separates three limits:
 
 * an initial lease that catches streams which make no useful progress;
-* a request-specific planned deadline derived from the input/output budgets;
+* a request-specific planning checkpoint derived from input/output budgets
+  for observability and capacity diagnostics;
 * an absolute configured/caller hard cap which progress can never extend.
 
 Only callers that have observed material provider output may renew the soft
@@ -21,7 +22,7 @@ import math
 
 
 class ProviderStreamDeadlineExceeded(asyncio.TimeoutError):
-    """A material-progress lease or its immutable planned cap expired."""
+    """A material-progress lease or its immutable hard cap expired."""
 
     def __init__(self, metrics: dict[str, int | float | None | str]) -> None:
         super().__init__(
@@ -155,8 +156,12 @@ def build_provider_stream_deadline_plan(
     return ProviderStreamDeadlinePlan(
         estimated_input_tokens=input_tokens,
         max_output_tokens=output_tokens,
-        initial_lease_seconds=min(initial, planned),
-        progress_grace_seconds=min(progress_grace, planned),
+        # ``planned`` is an estimate/checkpoint for observability.  It must
+        # never shorten either of the independently configured soft-lease
+        # inputs: a healthy stream may continue past that estimate while
+        # remaining bounded by the effective configured/caller hard cap.
+        initial_lease_seconds=min(initial, hard_cap),
+        progress_grace_seconds=min(progress_grace, hard_cap),
         planned_deadline_seconds=planned,
         hard_cap_seconds=hard_cap,
         configured_hard_cap_seconds=configured_hard,
@@ -189,7 +194,7 @@ class MaterialProgressLease:
         normalized_now = float(now)
         if not math.isfinite(normalized_now):
             raise ValueError("now must be a finite number")
-        hard_deadline = normalized_now + plan.planned_deadline_seconds
+        hard_deadline = normalized_now + plan.hard_cap_seconds
         return cls(
             plan=plan,
             started_at=normalized_now,
@@ -235,18 +240,14 @@ class MaterialProgressLease:
     def debug_payload(self, *, now: float) -> dict[str, int | float | None | str]:
         normalized_now = float(now)
         if self.hard_deadline <= self.soft_deadline:
-            reason = (
-                "configured_or_caller_hard_cap"
-                if math.isclose(
-                    self.plan.planned_deadline_seconds,
-                    self.plan.hard_cap_seconds,
-                )
-                else "planned_budget_cap"
-            )
+            reason = "configured_or_caller_hard_cap"
         elif self.last_material_progress_at is None:
             reason = "initial_lease"
         else:
             reason = "progress_lease"
+        planned_deadline = (
+            self.started_at + self.plan.planned_deadline_seconds
+        )
         return {
             **self.plan.debug_payload(),
             "elapsed_seconds": max(0.0, normalized_now - self.started_at),
@@ -262,6 +263,7 @@ class MaterialProgressLease:
             ),
             "renewal_count": self.renewal_count,
             "deadline_kind": reason,
+            "planned_budget_crossed": normalized_now >= planned_deadline,
         }
 
 

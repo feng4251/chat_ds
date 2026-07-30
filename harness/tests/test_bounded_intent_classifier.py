@@ -141,6 +141,18 @@ class BoundedIntentClassifierTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(child["status"], "completed")
         self.assertEqual(child["intent_selections"], {"request_kind": "deep"})
+        self.assertEqual(
+            64,
+            len(str(child.get("authority_snapshot_sha256") or "")),
+        )
+        self.assertEqual(
+            [],
+            child["authority_snapshot"]["script_grants"],
+        )
+        self.assertEqual(
+            [],
+            child["authority_snapshot"]["package_grants"],
+        )
         self.assertEqual(observed["tools"], [])
         self.assertEqual(observed["kwargs"]["max_iterations"], 2)
         self.assertEqual(observed["kwargs"]["max_tokens"], 4096)
@@ -227,6 +239,274 @@ class BoundedIntentClassifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["retryable"])
         self.assertIn("INTENT_SELECTIONS_JSON", result["error"])
         self.assertEqual(result["tool_audit"]["attempted_tools"], [])
+
+    async def test_optional_warn_null_does_not_degrade_intent_child(self):
+        classifier_input = {
+            "schema": "chatds.intent-classifier.v1",
+            "original_user_request": "Perform a deep review.",
+            "dimensions": [
+                {
+                    "id": "request_kind",
+                    "required": True,
+                    "values": ["brief", "deep"],
+                },
+                {
+                    "id": "design_type",
+                    "required": False,
+                    "nullable": True,
+                    "values": ["parallel", "adaptive"],
+                },
+            ],
+        }
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            yield {
+                "type": "delta",
+                "content": (
+                    "request_kind — PASS: deep — evidence: explicit request\n"
+                    "design_type — WARN: null — evidence: not specified\n"
+                    "INTENT_SELECTIONS_JSON: "
+                    '{"request_kind":"deep","design_type":null}'
+                ),
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                return_value="results/intent.md",
+            ),
+        ):
+            result = await _run_child(
+                {
+                    "goal": "classify every compiled dimension",
+                    "skill_name": SKILL,
+                    "step_type": "intent_classification",
+                    "step_id": "intent-classification",
+                    "required_output_ids": [
+                        "request_kind",
+                        "design_type",
+                    ],
+                    "context_text": json.dumps(classifier_input),
+                    "tools": [],
+                },
+                _context(),
+                0,
+            )
+
+        self.assertEqual("completed", result["status"])
+        self.assertEqual("complete", result["completion_quality"])
+        self.assertEqual({
+            "request_kind": "deep",
+            "design_type": None,
+        }, result["intent_selections"])
+        self.assertEqual(
+            "none",
+            result["completion_quality_audit"]["declaration_source"],
+        )
+
+    async def test_required_or_non_null_warn_intent_fails_closed(self):
+        classifier_input = {
+            "schema": "chatds.intent-classifier.v1",
+            "original_user_request": "Perform a deep parallel review.",
+            "dimensions": [
+                {
+                    "id": "request_kind",
+                    "required": True,
+                    "values": ["brief", "deep"],
+                },
+                {
+                    "id": "design_type",
+                    "required": False,
+                    "nullable": True,
+                    "values": ["parallel", "adaptive"],
+                },
+            ],
+        }
+        cases = {
+            "required_warn": (
+                "request_kind — WARN: deep — evidence: ambiguous depth\n"
+                "design_type — PASS: parallel — evidence: explicit request\n"
+                "INTENT_SELECTIONS_JSON: "
+                '{"request_kind":"deep","design_type":"parallel"}'
+            ),
+            "optional_non_null_warn": (
+                "request_kind — PASS: deep — evidence: explicit request\n"
+                "design_type — WARN: parallel — evidence: ambiguous design\n"
+                "INTENT_SELECTIONS_JSON: "
+                '{"request_kind":"deep","design_type":"parallel"}'
+            ),
+        }
+
+        for label, model_content in cases.items():
+            async def fake_run_stream(
+                model_id,
+                messages,
+                tools,
+                *,
+                _model_content=model_content,
+                **kwargs,
+            ):
+                yield {"type": "delta", "content": _model_content}
+                yield {"type": "done", "finish_reason": "stop"}
+
+            with self.subTest(label=label):
+                with (
+                    patch("agent_loop.run_stream", fake_run_stream),
+                    patch(
+                        "tools.delegation.persist_result_for_history",
+                    ) as persist,
+                ):
+                    result = await _run_child(
+                        {
+                            "goal": "classify every compiled dimension",
+                            "skill_name": SKILL,
+                            "step_type": "intent_classification",
+                            "step_id": "intent-classification",
+                            "required_output_ids": [
+                                "request_kind",
+                                "design_type",
+                            ],
+                            "context_text": json.dumps(classifier_input),
+                            "tools": [],
+                        },
+                        _context(),
+                        0,
+                    )
+
+            self.assertEqual("error", result["status"])
+            self.assertTrue(result["retryable"])
+            self.assertIn(
+                "may use WARN:null",
+                result["error"],
+            )
+            persist.assert_not_called()
+
+    async def test_optional_missing_policies_and_defaults_are_exact(self):
+        cases = (
+            {
+                "label": "optional_plain_omitted",
+                "dimension": {
+                    "id": "style",
+                    "required": False,
+                    "values": ["compact", "detailed"],
+                },
+                "line": "style — WARN: null — evidence: omitted",
+                "footer": '{"request_kind":"deep"}',
+                "completed": True,
+            },
+            {
+                "label": "nullable_omitted",
+                "dimension": {
+                    "id": "style",
+                    "required": False,
+                    "nullable": True,
+                    "values": ["compact", "detailed"],
+                },
+                "line": "style — WARN: null — evidence: omitted",
+                "footer": '{"request_kind":"deep"}',
+                "completed": True,
+            },
+            {
+                "label": "skip_policy_omitted",
+                "dimension": {
+                    "id": "style",
+                    "required": False,
+                    "on_missing": "skip",
+                    "values": ["compact", "detailed"],
+                },
+                "line": "style — WARN: null — evidence: skipped",
+                "footer": '{"request_kind":"deep"}',
+                "completed": True,
+            },
+            {
+                "label": "default_warn_rejected",
+                "dimension": {
+                    "id": "style",
+                    "required": False,
+                    "nullable": True,
+                    "default": "compact",
+                    "values": ["compact", "detailed"],
+                },
+                "line": "style — WARN: null — evidence: omitted",
+                "footer": '{"request_kind":"deep","style":null}',
+                "completed": False,
+            },
+            {
+                "label": "default_pass_accepted",
+                "dimension": {
+                    "id": "style",
+                    "required": False,
+                    "nullable": True,
+                    "default": "compact",
+                    "values": ["compact", "detailed"],
+                },
+                "line": "style — PASS: compact — evidence: declared default",
+                "footer": '{"request_kind":"deep","style":null}',
+                "completed": True,
+            },
+        )
+        for case in cases:
+            classifier_input = {
+                "schema": "chatds.intent-classifier.v1",
+                "original_user_request": "Perform a deep review.",
+                "dimensions": [
+                    {
+                        "id": "request_kind",
+                        "required": True,
+                        "values": ["brief", "deep"],
+                    },
+                    case["dimension"],
+                ],
+            }
+            model_content = (
+                "request_kind — PASS: deep — evidence: explicit request\n"
+                + str(case["line"])
+                + "\nINTENT_SELECTIONS_JSON: "
+                + str(case["footer"])
+            )
+
+            async def fake_run_stream(
+                model_id,
+                messages,
+                tools,
+                *,
+                _model_content=model_content,
+                **kwargs,
+            ):
+                yield {"type": "delta", "content": _model_content}
+                yield {"type": "done", "finish_reason": "stop"}
+
+            with self.subTest(label=case["label"]):
+                with (
+                    patch("agent_loop.run_stream", fake_run_stream),
+                    patch(
+                        "tools.delegation.persist_result_for_history",
+                        return_value="results/intent.md",
+                    ),
+                ):
+                    result = await _run_child(
+                        {
+                            "goal": "classify every compiled dimension",
+                            "skill_name": SKILL,
+                            "step_type": "intent_classification",
+                            "step_id": "intent-classification",
+                            "required_output_ids": [
+                                "request_kind",
+                                "style",
+                            ],
+                            "context_text": json.dumps(classifier_input),
+                            "tools": [],
+                        },
+                        _context(),
+                        0,
+                    )
+
+            self.assertEqual(
+                "completed" if case["completed"] else "error",
+                result["status"],
+            )
 
 
 class IntentClassifierSessionIsolationTests(unittest.IsolatedAsyncioTestCase):
