@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -28,6 +29,38 @@ tools_package.__path__ = [str(HARNESS_ROOT / "tools")]
 sys.modules["tools"] = tools_package
 
 from tools import isolated_skill_executor as client  # noqa: E402
+
+
+def _egress_v3_binding(
+    scope: client.ProcessOwnerScope,
+    *,
+    call_identity: str,
+) -> dict[str, str]:
+    """Derive opaque deployment-test bindings without model authority."""
+
+    scope_payload = json.dumps(
+        {
+            "domain": "chatds-process-acceptance-egress-v1",
+            "user_id": scope.user_id,
+            "session_id": scope.session_id,
+            "root_run_id": scope.root_run_id,
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    budget_scope_sha256 = hashlib.sha256(scope_payload).hexdigest()
+    call_payload = (
+        "chatds-process-acceptance-call-v1\x00"
+        + budget_scope_sha256
+        + "\x00"
+        + call_identity
+    ).encode("utf-8")
+    return {
+        "budget_scope_sha256": budget_scope_sha256,
+        "call_id_sha256": hashlib.sha256(call_payload).hexdigest(),
+    }
 
 
 def _workspace(parent: Path, name: str) -> Path:
@@ -90,6 +123,14 @@ async def _run_cli(
         max_runtime_seconds=300,
         egress_rules=egress_rules,
         private_origins=private_origins,
+        **(
+            _egress_v3_binding(
+                scope,
+                call_identity=f"cli:{workspace.name}:{entrypoint}",
+            )
+            if egress_rules
+            else {}
+        ),
     )
     assert opened["runtime_profile"] == "session-sandbox-v1", opened
     await client.start_isolated_process_lease(lease)
@@ -322,6 +363,14 @@ async def _run_exact_visual_skill(
         max_runtime_seconds=300,
         egress_rules=egress_rules,
         private_origins=(),
+        **(
+            _egress_v3_binding(
+                scope,
+                call_identity=f"visual:{workspace.name}",
+            )
+            if egress_rules
+            else {}
+        ),
     )
     await client.start_isolated_process_lease(lease)
     observed, stdout_offset, stderr_offset = await _call_and_read(

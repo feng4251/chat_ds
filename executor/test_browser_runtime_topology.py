@@ -65,6 +65,59 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
             ],
             "${SKILL_EGRESS_PRIVATE_CIDR_ALLOWLIST:-}",
         )
+        expected_budget_environment = {
+            "SKILL_EGRESS_MAX_REQUESTS": (
+                "${SKILL_EGRESS_MAX_REQUESTS:-2048}"
+            ),
+            "SKILL_EGRESS_MAX_OUTBOUND_BYTES": (
+                "${SKILL_EGRESS_MAX_OUTBOUND_BYTES:-16777216}"
+            ),
+            "SKILL_EGRESS_MAX_RESPONSE_WIRE_BYTES": (
+                "${SKILL_EGRESS_MAX_RESPONSE_WIRE_BYTES:-536870912}"
+            ),
+            "SKILL_EGRESS_MAX_POLICY_SCOPE_ENTRIES": (
+                "${SKILL_EGRESS_MAX_POLICY_SCOPE_ENTRIES:-65536}"
+            ),
+            "SKILL_EGRESS_POLICY_SCOPE_TTL_SECONDS": (
+                "${SKILL_EGRESS_POLICY_SCOPE_TTL_SECONDS:-86400}"
+            ),
+        }
+        for name, expected in expected_budget_environment.items():
+            self.assertEqual(proxy["environment"][name], expected)
+        for name in self.executor_names:
+            environment = self.services[name]["environment"]
+            self.assertEqual(
+                environment[
+                    "EXECUTOR_EGRESS_MAX_REQUESTS_PER_SCOPE"
+                ],
+                expected_budget_environment[
+                    "SKILL_EGRESS_MAX_REQUESTS"
+                ],
+            )
+            self.assertEqual(
+                environment[
+                    "EXECUTOR_EGRESS_MAX_OUTBOUND_BYTES_PER_SCOPE"
+                ],
+                expected_budget_environment[
+                    "SKILL_EGRESS_MAX_OUTBOUND_BYTES"
+                ],
+            )
+            self.assertEqual(
+                environment[
+                    "EXECUTOR_EGRESS_MAX_RESPONSE_WIRE_BYTES_PER_SCOPE"
+                ],
+                expected_budget_environment[
+                    "SKILL_EGRESS_MAX_RESPONSE_WIRE_BYTES"
+                ],
+            )
+            self.assertEqual(
+                "1",
+                environment["EXECUTOR_REQUIRE_EGRESS_POLICY_V3"],
+            )
+        self.assertEqual(
+            "1",
+            proxy["environment"]["SKILL_EGRESS_REQUIRE_POLICY_V3"],
+        )
         self.assertIn(
             "skill_egress_proxy_socket:/run/chatds-skill-egress",
             proxy["volumes"],

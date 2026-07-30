@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import json
 import tempfile
 import unittest
@@ -24,6 +25,37 @@ from tools.context import ToolContext
 from tools.declared_command import RUN_DECLARED_COMMAND_SCHEMA, run_declared_command
 from tools.delegation import _exact_declared_skill_command_grants
 from tools.registry import ToolRegistry
+
+
+def _clean_egress_audit_receipt() -> dict[str, object]:
+    receipt: dict[str, object] = {
+        "profile": "bounded_controlled_exchange",
+        "version": 1,
+        "budget_scope_sha256": "a" * 64,
+        "call_id_sha256": "b" * 64,
+        "rules_sha256": "c" * 64,
+        "counts": {
+            "accepted_connections": 0,
+            "client_to_proxy_wire_bytes": 0,
+            "proxy_to_client_wire_bytes": 0,
+            "budget_rejections": 0,
+            "clean_closes": 0,
+        },
+        "limits": {
+            "max_outbound_bytes": 1024,
+            "max_requests": 8,
+            "max_response_wire_bytes": 4096,
+        },
+        "exhausted": False,
+    }
+    receipt["receipt_sha256"] = hashlib.sha256(json.dumps(
+        receipt,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    return receipt
 
 
 class CommandGrantCompilerTests(unittest.TestCase):
@@ -385,6 +417,8 @@ class DeclaredCommandBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 "stdout": "ok",
                 "stderr": "",
                 "artifacts": [],
+                "egress_policy_version": 3,
+                "egress_audit_receipt": _clean_egress_audit_receipt(),
             })
             with (
                 patch(
@@ -438,12 +472,21 @@ class DeclaredCommandBoundaryTests(unittest.IsolatedAsyncioTestCase):
             (),
             execute.await_args.kwargs["private_origins"],
         )
+        self.assertRegex(
+            execute.await_args.kwargs["budget_scope_sha256"],
+            r"^[0-9a-f]{64}$",
+        )
+        self.assertRegex(
+            execute.await_args.kwargs["call_id_sha256"],
+            r"^[0-9a-f]{64}$",
+        )
         self.assertEqual(
             "compiled_exact_url_policy",
             result["egress_policy"],
         )
-        self.assertTrue(result["effect_receipt"]["effect_known"])
-        self.assertTrue(result["effect_receipt"]["replay_safe"])
+        self.assertFalse(result["effect_receipt"]["effect_known"])
+        self.assertFalse(result["effect_receipt"]["replay_safe"])
+        self.assertNotIn("egress_audit_receipt", result)
         self.assertEqual(
             ["GET", "HEAD"],
             result["effect_receipt"]["authorized_external_methods"],

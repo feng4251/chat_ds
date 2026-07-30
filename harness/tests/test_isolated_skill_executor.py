@@ -319,6 +319,219 @@ class IsolatedSkillExecutorClientTests(unittest.TestCase):
             json.loads(process_encoded)["egress_rules"],
         )
 
+    def test_v3_egress_budget_binding_propagates_to_all_execution_requests(
+        self,
+    ) -> None:
+        rules = ({
+            "methods": ["GET", "HEAD"],
+            "url_prefix": "https://api.example.test:443/v1/",
+        },)
+        binding = {
+            "budget_scope_sha256": "a" * 64,
+            "call_id_sha256": "b" * 64,
+        }
+
+        script_request, script_encoded = client.build_skill_script_request(
+            skill_root=self.skill,
+            workspace=self.workspace,
+            entrypoint="scripts/task.sh",
+            egress_rules=rules,
+            **binding,
+        )
+        command_request, command_encoded = client.build_declared_command_request(
+            skill_root=self.skill,
+            workspace=self.workspace,
+            executable="python",
+            egress_rules=rules,
+            **binding,
+        )
+        scope = client.create_process_owner_scope(
+            user_id="egress-user",
+            session_id="egress-session",
+            root_run_id="egress-run",
+        )
+        with patch.dict(
+            os.environ,
+            {"EXECUTOR_V2_AUTH_TOKEN": V2_AUTH_TOKEN},
+        ):
+            process_request, process_encoded = (
+                client.build_process_lease_open_request(
+                    owner_scope=scope,
+                    skill_root=self.skill,
+                    workspace=self.workspace,
+                    entrypoint="scripts/task.sh",
+                    egress_rules=rules,
+                    **binding,
+                )
+            )
+
+        for payload, encoded in (
+            (script_request, script_encoded),
+            (command_request, command_encoded),
+            (process_request, process_encoded),
+        ):
+            with self.subTest(kind=payload["kind"]):
+                self.assertEqual(3, payload["egress_policy_version"])
+                self.assertEqual(
+                    binding["budget_scope_sha256"],
+                    payload["budget_scope_sha256"],
+                )
+                self.assertEqual(
+                    binding["call_id_sha256"],
+                    payload["call_id_sha256"],
+                )
+                decoded = json.loads(encoded)
+                self.assertEqual(
+                    binding["budget_scope_sha256"],
+                    decoded["budget_scope_sha256"],
+                )
+
+    def test_v3_egress_budget_binding_is_atomic_and_requires_rules(
+        self,
+    ) -> None:
+        rule = [{
+            "methods": ["GET"],
+            "url_prefix": "https://api.example.test:443/v1/",
+        }]
+        for kwargs in (
+            {
+                "egress_rules": rule,
+                "budget_scope_sha256": "a" * 64,
+            },
+            {
+                "egress_rules": rule,
+                "budget_scope_sha256": "A" * 64,
+                "call_id_sha256": "b" * 64,
+            },
+            {
+                "budget_scope_sha256": "a" * 64,
+                "call_id_sha256": "b" * 64,
+            },
+        ):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(client.IsolatedSkillExecutorError):
+                    client.build_skill_script_request(
+                        skill_root=self.skill,
+                        workspace=self.workspace,
+                        entrypoint="scripts/task.sh",
+                        **kwargs,
+                    )
+
+    def test_v3_terminal_audit_is_bound_to_request_authority(self) -> None:
+        request, _ = client.build_skill_script_request(
+            skill_root=self.skill,
+            workspace=self.workspace,
+            entrypoint="scripts/task.sh",
+            egress_rules=({
+                "methods": ["GET", "HEAD"],
+                "url_prefix": "https://api.example.test:443/v1/",
+            },),
+            budget_scope_sha256="a" * 64,
+            call_id_sha256="b" * 64,
+        )
+        authority = {
+            "origins": request["egress_origins"],
+            "egress_rules": request["egress_rules"],
+            "private_origins": request["private_origins"],
+        }
+        audit = {
+            "profile": "bounded_controlled_exchange",
+            "version": 1,
+            "budget_scope_sha256": "a" * 64,
+            "call_id_sha256": "b" * 64,
+            "rules_sha256": hashlib.sha256(json.dumps(
+                authority,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")).hexdigest(),
+            "counts": {
+                "accepted_connections": 1,
+                "client_to_proxy_wire_bytes": 128,
+                "proxy_to_client_wire_bytes": 512,
+                "budget_rejections": 0,
+                "clean_closes": 1,
+            },
+            "limits": {
+                "max_outbound_bytes": 1024,
+                "max_requests": 8,
+                "max_response_wire_bytes": 4096,
+            },
+            "exhausted": False,
+        }
+        audit["receipt_sha256"] = hashlib.sha256(json.dumps(
+            audit,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        response = {
+            "protocol_version": client.PROTOCOL_VERSION,
+            "kind": "skill_script_result",
+            "request_id": request["request_id"],
+            "status": "success",
+            "returncode": 0,
+            "runtime_profile": client.SESSION_SANDBOX_RUNTIME_PROFILE,
+            "network": "disabled",
+            "network_policy": {
+                "direct": "disabled",
+                "egress": "origin_allowlist_proxy",
+            },
+            "invocation_mode": "cli",
+            "artifacts": [],
+            "egress_policy_version": 3,
+            "egress_audit_receipt": audit,
+        }
+
+        self.assertEqual(
+            [],
+            client.validate_skill_script_response(
+                response,
+                request_id=request["request_id"],
+                request=request,
+                invocation_mode="cli",
+                expected_egress=True,
+            ),
+        )
+        tampered = dict(response)
+        tampered["egress_audit_receipt"] = {
+            **audit,
+            "call_id_sha256": "c" * 64,
+        }
+        with self.assertRaises(client.IsolatedSkillExecutorError):
+            client.validate_skill_script_response(
+                tampered,
+                request_id=request["request_id"],
+                request=request,
+                invocation_mode="cli",
+                expected_egress=True,
+            )
+        missing_execution_evidence = dict(response)
+        missing_execution_evidence.pop("returncode")
+        missing_execution_evidence.pop("egress_audit_receipt")
+        with self.assertRaises(client.IsolatedSkillExecutorError):
+            client.validate_skill_script_response(
+                missing_execution_evidence,
+                request_id=request["request_id"],
+                request=request,
+                invocation_mode="cli",
+                expected_egress=True,
+            )
+        malformed_returncode = {
+            **response,
+            "returncode": False,
+        }
+        with self.assertRaises(client.IsolatedSkillExecutorError):
+            client.validate_skill_script_response(
+                malformed_returncode,
+                request_id=request["request_id"],
+                request=request,
+                invocation_mode="cli",
+                expected_egress=True,
+            )
+
     def test_egress_request_builder_rejects_noncanonical_or_unbounded_values(
         self,
     ) -> None:
@@ -702,6 +915,229 @@ class IsolatedSkillExecutorClientTests(unittest.TestCase):
             execute.await_args_list[1].kwargs["op_id"],
         )
         self.assertEqual("ack", execute.await_args_list[2].args[1])
+
+    def test_persistent_v3_bound_error_without_audit_stays_typed_and_live(
+        self,
+    ) -> None:
+        scope = client.create_process_owner_scope(
+            user_id="bound-error-user",
+            session_id="bound-error-session",
+            root_run_id="bound-error-run",
+        )
+
+        class RecordingReservation:
+            def __init__(self) -> None:
+                self.terminal = False
+                self.quarantine_reasons: list[str] = []
+
+            async def quarantine(self, reason: str) -> None:
+                self.quarantine_reasons.append(reason)
+                self.terminal = True
+
+            async def release(self) -> None:
+                self.terminal = True
+
+        reservation = RecordingReservation()
+        lease = client.IsolatedProcessLease(
+            handle="pl2_" + "7" * 32 + "_" + "8" * 32,
+            skill_sha256="9" * 64,
+            script_sha256="a" * 64,
+            entrypoint="scripts/task.sh",
+            invocation_mode="cli",
+            class_name=None,
+            factory_name=None,
+            _owner_scope=scope,
+            _workspace=self.workspace,
+            _socket_path="/unused",
+            _baseline={},
+            _egress_policy_version=3,
+            _budget_scope_sha256="b" * 64,
+            _call_id_sha256="c" * 64,
+            _egress_authority_sha256="d" * 64,
+            _slot_reservation=reservation,
+        )
+
+        async def exchange(
+            payload: dict[str, object],
+            _encoded: bytes,
+            **_kwargs: object,
+        ):
+            response = {
+                "protocol_version": client.PROCESS_PROTOCOL_VERSION,
+                "kind": "process_lease_result",
+                "operation": payload["operation"],
+                "request_id": payload["request_id"],
+                "status": "error",
+                "error_code": "process_already_started",
+                "error": "The exact lease entrypoint can only be started once.",
+                "network": "disabled",
+                "lease_handle": lease.handle,
+                "scope_digest": "e" * 64,
+                "skill_sha256": lease.skill_sha256,
+                "script_sha256": lease.script_sha256,
+                "state": "running",
+                "artifacts": [],
+                "runtime_profile": client.SESSION_SANDBOX_RUNTIME_PROFILE,
+                "network_policy": {
+                    "direct": "disabled",
+                    "egress": "origin_allowlist_proxy",
+                },
+                "egress_policy_version": 3,
+            }
+            return client.validate_process_lease_response(
+                response,
+                request=payload,
+            )
+
+        with patch.dict(
+            os.environ,
+            {"EXECUTOR_V2_AUTH_TOKEN": V2_AUTH_TOKEN},
+        ), patch.object(
+            client,
+            "_exchange_process_request",
+            side_effect=exchange,
+        ):
+            with self.assertRaises(
+                client.IsolatedSkillExecutorError
+            ) as caught:
+                asyncio.run(
+                    client.start_isolated_process_lease(lease)
+                )
+
+        self.assertEqual(
+            "process_already_started",
+            caught.exception.code,
+        )
+        self.assertFalse(caught.exception.dispatch_unknown)
+        self.assertIsNone(caught.exception.terminal_lease_state)
+        self.assertFalse(lease.closed)
+        self.assertIs(lease._slot_reservation, reservation)
+        self.assertFalse(reservation.terminal)
+        self.assertEqual([], reservation.quarantine_reasons)
+
+    def test_mismatched_pending_ack_quarantines_without_clearing_transaction(
+        self,
+    ) -> None:
+        scope = client.create_process_owner_scope(
+            user_id="ack-mismatch-user",
+            session_id="ack-mismatch-session",
+            root_run_id="ack-mismatch-run",
+        )
+
+        class RecordingReservation:
+            def __init__(self) -> None:
+                self.terminal = False
+                self.quarantine_reasons: list[str] = []
+
+            async def quarantine(self, reason: str) -> None:
+                self.quarantine_reasons.append(reason)
+                self.terminal = True
+
+            async def release(self) -> None:
+                self.terminal = True
+
+        reservation = RecordingReservation()
+        prepare_op_id = str(uuid.uuid4())
+        ack_op_id = str(uuid.uuid4())
+        prepared = {
+            "sync_token": "q" * 43,
+            "sync_pending": True,
+            "state": "running",
+        }
+        lease = client.IsolatedProcessLease(
+            handle="pl2_" + "1" * 32 + "_" + "2" * 32,
+            skill_sha256="3" * 64,
+            script_sha256="4" * 64,
+            entrypoint="scripts/task.sh",
+            invocation_mode="cli",
+            class_name=None,
+            factory_name=None,
+            _owner_scope=scope,
+            _workspace=self.workspace,
+            _socket_path="/unused",
+            _baseline={},
+            _egress_policy_version=3,
+            _budget_scope_sha256="5" * 64,
+            _call_id_sha256="6" * 64,
+            _egress_authority_sha256="7" * 64,
+            _slot_reservation=reservation,
+            _pending_sync_operation="sync",
+            _pending_sync_prepare_op_id=prepare_op_id,
+            _pending_sync_response=dict(prepared),
+            _pending_sync_artifacts=[],
+            _pending_sync_ack_op_id=ack_op_id,
+            _pending_sync_applied=[],
+            _pending_sync_apply_artifacts=True,
+        )
+
+        async def exchange(
+            payload: dict[str, object],
+            _encoded: bytes,
+            **_kwargs: object,
+        ):
+            response = {
+                "protocol_version": client.PROCESS_PROTOCOL_VERSION,
+                "kind": "process_lease_result",
+                "operation": "ack",
+                "request_id": payload["request_id"],
+                "status": "success",
+                "network": "disabled",
+                "lease_handle": lease.handle,
+                "scope_digest": "8" * 64,
+                "skill_sha256": lease.skill_sha256,
+                "script_sha256": lease.script_sha256,
+                "state": "closed",
+                "runtime_profile": client.SESSION_SANDBOX_RUNTIME_PROFILE,
+                "network_policy": {
+                    "direct": "disabled",
+                    "egress": "origin_allowlist_proxy",
+                },
+                "egress_policy_version": 3,
+                "sync_acknowledged": True,
+                "acknowledged_operation": "close",
+            }
+            return client.validate_process_lease_response(
+                response,
+                request=payload,
+            )
+
+        with patch.dict(
+            os.environ,
+            {"EXECUTOR_V2_AUTH_TOKEN": V2_AUTH_TOKEN},
+        ), patch.object(
+            client,
+            "_exchange_process_request",
+            side_effect=exchange,
+        ):
+            with self.assertRaises(
+                client.IsolatedSkillExecutorError
+            ) as caught:
+                asyncio.run(
+                    client._finish_pending_process_sync(lease)
+                )
+
+        self.assertEqual("invalid_response", caught.exception.code)
+        self.assertEqual(
+            "quarantined",
+            caught.exception.terminal_lease_state,
+        )
+        self.assertTrue(lease.closed)
+        self.assertTrue(reservation.terminal)
+        self.assertEqual(
+            ["invalid_egress_audit_response"],
+            reservation.quarantine_reasons,
+        )
+        self.assertIsNone(lease._slot_reservation)
+        self.assertEqual("sync", lease._pending_sync_operation)
+        self.assertEqual(
+            prepare_op_id,
+            lease._pending_sync_prepare_op_id,
+        )
+        self.assertEqual(prepared, lease._pending_sync_response)
+        self.assertEqual([], lease._pending_sync_artifacts)
+        self.assertEqual(ack_op_id, lease._pending_sync_ack_op_id)
+        self.assertEqual([], lease._pending_sync_applied)
+        self.assertIs(lease._pending_sync_apply_artifacts, True)
 
     def test_cli_stdin_close_api_and_sixty_second_read_wait_bound(self) -> None:
         scope = client.create_process_owner_scope(
@@ -1460,6 +1896,50 @@ class IsolatedSkillExecutorClientTests(unittest.TestCase):
                 egress_origins=("https://*.example.test:443",),
             )
         self.assertEqual("invalid_egress_policy", caught.exception.code)
+
+    def test_declared_command_v3_success_cannot_omit_execution_evidence(self) -> None:
+        request, _ = client.build_declared_command_request(
+            skill_root=self.skill,
+            workspace=self.workspace,
+            executable="python",
+            egress_rules=_retrieval_egress_rules(
+                "https://api.example.test:443",
+            ),
+            budget_scope_sha256="a" * 64,
+            call_id_sha256="b" * 64,
+        )
+        response = {
+            "protocol_version": client.PROTOCOL_VERSION,
+            "kind": "declared_command_result",
+            "request_id": request["request_id"],
+            "status": "success",
+            "executable": request["executable"],
+            "cwd": request["cwd"],
+            "network": "disabled",
+            "runtime_profile": client.SESSION_SANDBOX_RUNTIME_PROFILE,
+            "network_policy": {
+                "direct": "disabled",
+                "egress": "origin_allowlist_proxy",
+            },
+            "shell": False,
+            "command_sha256": hashlib.sha256(json.dumps(
+                [request["executable"], *request["argv"]],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")).hexdigest(),
+            "stdout": "",
+            "stderr": "",
+            "artifacts": [],
+            "egress_policy_version": 3,
+        }
+        with self.assertRaises(
+            client.IsolatedSkillExecutorError
+        ) as caught:
+            client.validate_declared_command_response(
+                response,
+                request=request,
+            )
+        self.assertEqual("invalid_response", caught.exception.code)
 
     def test_function_invocation_is_declarative_bounded_and_identity_checked(self) -> None:
         script = self.skill / "scripts" / "helper.py"

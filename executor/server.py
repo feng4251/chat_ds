@@ -90,6 +90,19 @@ MAX_RUNTIME_PLATFORMS_PER_GROUP = 32
 MAX_RUNTIME_DECLARATION_CHARS = 512
 MAX_EGRESS_ORIGINS = 128
 MAX_EGRESS_RULES = 256
+DEFAULT_EGRESS_MAX_REQUESTS_PER_SCOPE = 2_048
+DEFAULT_EGRESS_MAX_OUTBOUND_BYTES_PER_SCOPE = 16 * 1024 * 1024
+DEFAULT_EGRESS_MAX_RESPONSE_WIRE_BYTES_PER_SCOPE = 512 * 1024 * 1024
+MAX_EGRESS_MAX_REQUESTS_PER_SCOPE = 65_536
+MAX_EGRESS_MAX_OUTBOUND_BYTES_PER_SCOPE = 1024 * 1024 * 1024
+MAX_EGRESS_MAX_RESPONSE_WIRE_BYTES_PER_SCOPE = 16 * 1024 * 1024 * 1024
+_REQUIRE_EGRESS_POLICY_V3_RAW = os.environ.get(
+    "EXECUTOR_REQUIRE_EGRESS_POLICY_V3",
+    "0",
+).strip()
+if _REQUIRE_EGRESS_POLICY_V3_RAW not in {"0", "1"}:
+    raise RuntimeError("invalid_executor_require_egress_policy_v3")
+REQUIRE_EGRESS_POLICY_V3 = _REQUIRE_EGRESS_POLICY_V3_RAW == "1"
 EGRESS_METHOD_ORDER = (
     "GET",
     "HEAD",
@@ -930,7 +943,9 @@ class _ProcessLease:
     factory_name: str | None
     runtime_profile: str
     egress_policy: str
+    egress_policy_version: int
     egress_bridge: Any | None
+    egress_audit_receipt: dict[str, Any] | None
     interpreter: str
     command: list[str]
     workdir: Path
@@ -992,6 +1007,8 @@ _ACTIVE_PROCESS_LEASE_HANDLE: str | None = None
 _ACTIVE_V1_EXECUTION = False
 _ACTIVE_V1_EXECUTION_QUARANTINED = False
 _ACTIVE_V1_TEMP_DIR: Path | None = None
+_ORPHANED_V1_EGRESS_BRIDGES: OrderedDict[str, Any] = OrderedDict()
+_V1_EGRESS_BRIDGE_CLEANUP_LOCK = threading.Lock()
 
 
 def _canonical_snapshot_digest(files: dict[str, bytes]) -> str:
@@ -1226,6 +1243,62 @@ def _process_error(
     return response
 
 
+def _bound_process_error(
+    request_id: str | None,
+    operation: str | None,
+    code: str,
+    message: str,
+    *,
+    lease: _ProcessLease,
+) -> dict[str, Any]:
+    """Return an error bound to an already-authorized lease.
+
+    Persistent v3 operations keep their bridge open until close. Ordinary
+    lifecycle errors therefore cannot carry a terminal audit, but they must
+    still attest the exact lease and egress policy so the Harness can
+    distinguish a typed operation failure from a corrupt/downgraded response.
+    Errors observed after expiry/close/quarantine are terminal receipts.
+    """
+
+    terminal_state = {
+        "expired": "closed",
+        "closed": "closed",
+        "quarantined": "quarantined",
+    }.get(lease.state)
+    return _process_error(
+        request_id,
+        operation,
+        code,
+        message,
+        handle=lease.handle,
+        scope_digest=lease.scope_digest,
+        skill_sha256=lease.skill_sha256,
+        script_sha256=lease.script_sha256,
+        state=lease.state,
+        artifacts=[],
+        runtime_profile=lease.runtime_profile,
+        network_policy={
+            "direct": "disabled",
+            "egress": lease.egress_policy,
+        },
+        egress_policy_version=lease.egress_policy_version,
+        **(
+            {
+                "egress_audit_receipt": dict(
+                    lease.egress_audit_receipt
+                ),
+            }
+            if lease.egress_audit_receipt is not None
+            else {}
+        ),
+        **(
+            {"terminal_lease_state": terminal_state}
+            if terminal_state is not None
+            else {}
+        ),
+    )
+
+
 def _process_success(
     request_id: str,
     operation: str,
@@ -1249,7 +1322,12 @@ def _process_success(
             "direct": "disabled",
             "egress": lease.egress_policy,
         },
+        "egress_policy_version": lease.egress_policy_version,
     }
+    if lease.egress_audit_receipt is not None:
+        response["egress_audit_receipt"] = dict(
+            lease.egress_audit_receipt
+        )
     response.update(extra)
     return response
 
@@ -1289,6 +1367,16 @@ def _terminal_process_error(
             "direct": "disabled",
             "egress": lease.egress_policy,
         },
+        egress_policy_version=lease.egress_policy_version,
+        **(
+            {
+                "egress_audit_receipt": dict(
+                    lease.egress_audit_receipt
+                ),
+            }
+            if lease.egress_audit_receipt is not None
+            else {}
+        ),
         **extra,
     )
 
@@ -2158,13 +2246,22 @@ def _run_v1_serialized(
                     _purge_configured_worker_shared_state()
             except ProtocolError as exc:
                 containment_error = exc
-            if containment_error is None:
-                with _EXECUTION_ADMISSION_LOCK:
+            with _EXECUTION_ADMISSION_LOCK:
+                orphaned_bridge_count = len(
+                    _ORPHANED_V1_EGRESS_BRIDGES
+                )
+                if (
+                    containment_error is None
+                    and orphaned_bridge_count == 0
+                ):
                     _ACTIVE_V1_EXECUTION = False
                     _ACTIVE_V1_EXECUTION_QUARANTINED = False
                     _ACTIVE_V1_TEMP_DIR = None
-            else:
-                with _EXECUTION_ADMISSION_LOCK:
+                else:
+                    # A typed runner result may already preserve post-spawn
+                    # returncode/output evidence. Quarantine admission without
+                    # replacing that result with a pre-spawn-shaped error.
+                    _ACTIVE_V1_EXECUTION = True
                     _ACTIVE_V1_EXECUTION_QUARANTINED = True
         if containment_error is not None:
             return _v1_execution_error(
@@ -2625,10 +2722,10 @@ def _validated_exact_egress_policy(
             "methods": list(canonical_methods),
             "url_prefix": prefix,
         })
-    if raw_rules and payload.get("egress_policy_version") != 2:
+    if raw_rules and payload.get("egress_policy_version") not in {2, 3}:
         raise ProtocolError(
             "invalid_egress_policy",
-            "Exact sandbox egress requires policy version 2.",
+            "Exact sandbox egress requires policy version 2 or 3.",
         )
     if not raw_rules and payload.get("egress_policy_version") not in {
         None, 2,
@@ -2664,25 +2761,251 @@ def _validated_exact_egress_policy(
     return tuple(rules), origins, private_origins
 
 
+def _validated_egress_budget_binding(
+    payload: dict[str, Any],
+    *,
+    has_rules: bool,
+) -> tuple[int, str | None, str | None]:
+    """Validate the additive v3 proxy budget/audit binding."""
+
+    version = payload.get("egress_policy_version")
+    has_scope_field = "budget_scope_sha256" in payload
+    has_call_field = "call_id_sha256" in payload
+    if version == 3:
+        if not has_rules or not has_scope_field or not has_call_field:
+            raise ProtocolError(
+                "invalid_egress_policy",
+                "Egress policy v3 requires exact rules and both runtime-owned "
+                "budget bindings.",
+            )
+        scope = payload.get("budget_scope_sha256")
+        call = payload.get("call_id_sha256")
+        if (
+            not isinstance(scope, str)
+            or not isinstance(call, str)
+            or re.fullmatch(r"[0-9a-f]{64}", scope) is None
+            or re.fullmatch(r"[0-9a-f]{64}", call) is None
+        ):
+            raise ProtocolError(
+                "invalid_egress_policy",
+                "Egress policy v3 budget bindings must be lowercase SHA-256 "
+                "digests.",
+            )
+        return 3, scope, call
+    if has_scope_field or has_call_field:
+        raise ProtocolError(
+            "invalid_egress_policy",
+            "Legacy egress policies cannot carry v3 budget bindings.",
+        )
+    if (
+        has_rules
+        and REQUIRE_EGRESS_POLICY_V3
+    ):
+        raise ProtocolError(
+            "egress_policy_upgrade_required",
+            "This deployment requires aggregate-budgeted egress policy v3.",
+        )
+    return 2, None, None
+
+
+def _configured_egress_limits() -> dict[str, int]:
+    """Return deployment-owned v3 aggregate limits within code hard bounds."""
+
+    def configured(
+        name: str,
+        *,
+        default: int,
+        maximum: int,
+    ) -> int:
+        raw = os.environ.get(name, str(default)).strip()
+        try:
+            value = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"invalid_{name.lower()}") from exc
+        if not 1 <= value <= maximum:
+            raise RuntimeError(f"invalid_{name.lower()}")
+        return value
+
+    return {
+        "max_outbound_bytes": configured(
+            "EXECUTOR_EGRESS_MAX_OUTBOUND_BYTES_PER_SCOPE",
+            default=DEFAULT_EGRESS_MAX_OUTBOUND_BYTES_PER_SCOPE,
+            maximum=MAX_EGRESS_MAX_OUTBOUND_BYTES_PER_SCOPE,
+        ),
+        "max_requests": configured(
+            "EXECUTOR_EGRESS_MAX_REQUESTS_PER_SCOPE",
+            default=DEFAULT_EGRESS_MAX_REQUESTS_PER_SCOPE,
+            maximum=MAX_EGRESS_MAX_REQUESTS_PER_SCOPE,
+        ),
+        "max_response_wire_bytes": configured(
+            "EXECUTOR_EGRESS_MAX_RESPONSE_WIRE_BYTES_PER_SCOPE",
+            default=DEFAULT_EGRESS_MAX_RESPONSE_WIRE_BYTES_PER_SCOPE,
+            maximum=MAX_EGRESS_MAX_RESPONSE_WIRE_BYTES_PER_SCOPE,
+        ),
+    }
+
+
 @dataclass
 class _EgressBridgeHandle:
     server: Any
     thread: threading.Thread
     environment: dict[str, str]
+    policy_version: int
+    audit_receipt: dict[str, Any] | None = None
     closed: bool = False
 
-    def close(self) -> None:
+    def close(self) -> dict[str, Any] | None:
         if self.closed:
-            return
-        self.closed = True
-        self.server.shutdown()
-        self.server.server_close()
+            return (
+                None
+                if self.audit_receipt is None
+                else json.loads(json.dumps(self.audit_receipt))
+            )
+        terminal_receipt: dict[str, Any] | None = None
+        shutdown_and_seal = getattr(
+            self.server,
+            "shutdown_and_seal",
+            None,
+        )
+        try:
+            if callable(shutdown_and_seal):
+                receipt = shutdown_and_seal()
+                terminal_receipt = (
+                    dict(receipt)
+                    if isinstance(receipt, dict)
+                    else None
+                )
+            else:
+                self.server.shutdown()
+                self.server.server_close()
+        except Exception as exc:
+            # Do not mark the handle closed: active handlers may finish after
+            # the bounded wait, and a later cleanup attempt must be able to
+            # retry sealing rather than returning a stale partial receipt.
+            raise ProtocolError(
+                "egress_bridge_cleanup_failed",
+                "Session sandbox egress bridge did not drain and seal cleanly.",
+            ) from exc
         self.thread.join(timeout=3)
         if self.thread.is_alive():
             raise ProtocolError(
                 "egress_bridge_cleanup_failed",
                 "Session sandbox egress bridge did not stop cleanly.",
             )
+        if terminal_receipt is None:
+            receipt_builder = getattr(
+                self.server,
+                "audit_receipt",
+                None,
+            )
+            receipt = (
+                receipt_builder()
+                if callable(receipt_builder)
+                else None
+            )
+            terminal_receipt = (
+                dict(receipt)
+                if isinstance(receipt, dict)
+                else None
+            )
+        if self.policy_version == 3 and terminal_receipt is None:
+            raise ProtocolError(
+                "egress_audit_unavailable",
+                "Bounded egress ended without its required audit receipt.",
+            )
+        self.audit_receipt = (
+            None
+            if terminal_receipt is None
+            else json.loads(json.dumps(terminal_receipt))
+        )
+        self.closed = True
+        return (
+            None
+            if self.audit_receipt is None
+            else json.loads(json.dumps(self.audit_receipt))
+        )
+
+
+def _seal_egress_bridge(
+    bridge: Any,
+) -> dict[str, Any] | None:
+    """Seal one bridge and normalize every implementation failure."""
+
+    try:
+        receipt = bridge.close()
+    except ProtocolError:
+        raise
+    except Exception as exc:
+        raise ProtocolError(
+            "egress_bridge_cleanup_failed",
+            "Session sandbox egress bridge did not drain and seal cleanly.",
+        ) from exc
+    if receipt is not None and not isinstance(receipt, dict):
+        raise ProtocolError(
+            "egress_audit_unavailable",
+            "Session sandbox egress bridge returned an invalid audit receipt.",
+        )
+    return receipt
+
+
+def _register_orphaned_v1_egress_bridge(bridge: Any) -> str:
+    """Transfer an unsealed one-shot bridge to controller-owned quarantine."""
+
+    global _ACTIVE_V1_EXECUTION, _ACTIVE_V1_EXECUTION_QUARANTINED
+    with _EXECUTION_ADMISSION_LOCK:
+        for token, retained in _ORPHANED_V1_EGRESS_BRIDGES.items():
+            if retained is bridge:
+                return token
+        token = uuid.uuid4().hex
+        _ORPHANED_V1_EGRESS_BRIDGES[token] = bridge
+        # A bridge can retain accepted sockets and incomplete audit state even
+        # after the worker process/tree is gone. Keep the unified execution
+        # admission closed until a controller cleanup pass seals it.
+        _ACTIVE_V1_EXECUTION = True
+        _ACTIVE_V1_EXECUTION_QUARANTINED = True
+        return token
+
+
+def _v1_orphaned_egress_bridge_count() -> int:
+    with _EXECUTION_ADMISSION_LOCK:
+        return len(_ORPHANED_V1_EGRESS_BRIDGES)
+
+
+def _seal_or_quarantine_one_shot_egress_bridge(
+    bridge: Any,
+) -> tuple[dict[str, Any] | None, ProtocolError | None]:
+    """Bounded seal attempts, then transfer ownership without losing reachability."""
+
+    last_error: ProtocolError | None = None
+    for _ in range(2):
+        try:
+            return _seal_egress_bridge(bridge), None
+        except ProtocolError as exc:
+            last_error = exc
+    _register_orphaned_v1_egress_bridge(bridge)
+    return None, last_error
+
+
+def _retry_orphaned_v1_egress_bridges(
+) -> tuple[int, list[ProtocolError]]:
+    """Retry every quarantined bridge independently and retain failed entries."""
+
+    sealed = 0
+    failures: list[ProtocolError] = []
+    with _V1_EGRESS_BRIDGE_CLEANUP_LOCK:
+        with _EXECUTION_ADMISSION_LOCK:
+            retained = list(_ORPHANED_V1_EGRESS_BRIDGES.items())
+        for token, bridge in retained:
+            try:
+                _seal_egress_bridge(bridge)
+            except ProtocolError as exc:
+                failures.append(exc)
+                continue
+            with _EXECUTION_ADMISSION_LOCK:
+                if _ORPHANED_V1_EGRESS_BRIDGES.get(token) is bridge:
+                    _ORPHANED_V1_EGRESS_BRIDGES.pop(token, None)
+                    sealed += 1
+    return sealed, failures
 
 
 def _start_egress_bridge(
@@ -2690,10 +3013,34 @@ def _start_egress_bridge(
     *,
     egress_rules: tuple[dict[str, Any], ...] = (),
     private_origins: tuple[str, ...] = (),
+    policy_version: int = 2,
+    budget_scope_sha256: str | None = None,
+    call_id_sha256: str | None = None,
     runtime_root: Path,
 ) -> _EgressBridgeHandle | None:
     """Create one lease-scoped loopback bridge from trusted policy state."""
 
+    if (
+        policy_version not in {2, 3}
+        or (
+            policy_version == 3
+            and (
+                not isinstance(budget_scope_sha256, str)
+                or not isinstance(call_id_sha256, str)
+            )
+        )
+        or (
+            policy_version == 2
+            and (
+                budget_scope_sha256 is not None
+                or call_id_sha256 is not None
+            )
+        )
+    ):
+        raise ProtocolError(
+            "invalid_egress_policy",
+            "Session sandbox bridge received an inconsistent policy binding.",
+        )
     try:
         from chatds_browser_runtime.proxy_bridge import (
             EXPECTED_BRIDGE_GID,
@@ -2749,6 +3096,15 @@ def _start_egress_bridge(
             trust_generation=trust_environment[
                 "SKILL_EGRESS_TRUST_GENERATION"
             ],
+            **(
+                {
+                    "budget_scope_sha256": budget_scope_sha256,
+                    "call_id_sha256": call_id_sha256,
+                    "limits": _configured_egress_limits(),
+                }
+                if policy_version == 3
+                else {}
+            ),
         )
     except Exception as exc:
         raise ProtocolError(
@@ -2783,6 +3139,7 @@ def _start_egress_bridge(
         server=bridge,
         thread=thread,
         environment=environment,
+        policy_version=policy_version,
     )
 
 
@@ -3296,6 +3653,17 @@ def _run_runtime_capabilities(payload: dict[str, Any]) -> dict[str, Any]:
                 f"protocol_version must be {PROTOCOL_VERSION}.",
             )
         request_id = _validated_request_id(payload.get("request_id"))
+        with _EXECUTION_ADMISSION_LOCK:
+            one_shot_quarantined = _ACTIVE_V1_EXECUTION_QUARANTINED
+            orphaned_bridge_count = len(
+                _ORPHANED_V1_EGRESS_BRIDGES
+            )
+        if one_shot_quarantined or orphaned_bridge_count:
+            raise ProtocolError(
+                "worker_containment_failed",
+                "Executor one-shot admission remains quarantined pending "
+                "controller cleanup.",
+            )
         requirements = _validated_runtime_strings(
             payload.get("requirements", []),
             field="requirements",
@@ -4374,6 +4742,12 @@ def _run_declared_command(payload: dict[str, Any]) -> dict[str, Any]:
     egress_rules: tuple[dict[str, Any], ...] = ()
     private_origins: tuple[str, ...] = ()
     egress_policy = "none"
+    egress_policy_version = 2
+    budget_scope_sha256: str | None = None
+    call_id_sha256: str | None = None
+    egress_audit_receipt: dict[str, Any] | None = None
+    egress_bridge: _EgressBridgeHandle | None = None
+    proc: subprocess.Popen[bytes] | None = None
     try:
         if payload.get("protocol_version") != PROTOCOL_VERSION:
             raise ProtocolError(
@@ -4396,6 +4770,14 @@ def _run_declared_command(payload: dict[str, Any]) -> dict[str, Any]:
             private_origins,
         ) = _validated_exact_egress_policy(
             payload
+        )
+        (
+            egress_policy_version,
+            budget_scope_sha256,
+            call_id_sha256,
+        ) = _validated_egress_budget_binding(
+            payload,
+            has_rules=bool(egress_rules),
         )
         egress_policy = (
             "origin_allowlist_proxy" if egress_origins else "none"
@@ -4481,6 +4863,9 @@ def _run_declared_command(payload: dict[str, Any]) -> dict[str, Any]:
                 egress_origins,
                 egress_rules=egress_rules,
                 private_origins=private_origins,
+                policy_version=egress_policy_version,
+                budget_scope_sha256=budget_scope_sha256,
+                call_id_sha256=call_id_sha256,
                 runtime_root=runtime_root,
             )
             if egress_origins
@@ -4494,42 +4879,65 @@ def _run_declared_command(payload: dict[str, Any]) -> dict[str, Any]:
         if egress_bridge is not None:
             env.update(egress_bridge.environment)
         try:
-            try:
-                proc = subprocess.Popen(
-                    _resource_limited_command(
-                        [resolved_executable, *argv],
-                        cpu_seconds=timeout + 5,
-                        persistent=False,
-                    ),
-                    shell=False,
-                    cwd=(
-                        workspace
-                        if cwd_policy == "workspace"
-                        else skill_root
-                    ),
-                    env=env,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    close_fds=True,
-                    **_native_worker_popen_kwargs(),
-                )
-            except (FileNotFoundError, PermissionError, OSError) as exc:
-                raise ProtocolError(
-                    "command_spawn_failed",
-                    "Could not start the declared executable "
-                    f"({type(exc).__name__}).",
-                ) from exc
-            stdout, stderr, stdout_truncated, stderr_truncated, timed_out = (
-                _communicate_capped(proc, timeout=timeout)
+            proc = subprocess.Popen(
+                _resource_limited_command(
+                    [resolved_executable, *argv],
+                    cpu_seconds=timeout + 5,
+                    persistent=False,
+                ),
+                shell=False,
+                cwd=(
+                    workspace
+                    if cwd_policy == "workspace"
+                    else skill_root
+                ),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                close_fds=True,
+                **_native_worker_popen_kwargs(),
             )
-        finally:
-            if egress_bridge is not None:
-                egress_bridge.close()
-        artifacts, deleted_count = _collect_workspace_artifacts(workspace, initial)
+        except (FileNotFoundError, PermissionError, OSError) as exc:
+            raise ProtocolError(
+                "command_spawn_failed",
+                "Could not start the declared executable "
+                f"({type(exc).__name__}).",
+            ) from exc
+        stdout, stderr, stdout_truncated, stderr_truncated, timed_out = (
+            _communicate_capped(proc, timeout=timeout)
+        )
+        bridge_cleanup_error: ProtocolError | None = None
+        if egress_bridge is not None:
+            (
+                egress_audit_receipt,
+                bridge_cleanup_error,
+            ) = _seal_or_quarantine_one_shot_egress_bridge(
+                egress_bridge
+            )
+            egress_bridge = None
+        if bridge_cleanup_error is None:
+            artifacts, deleted_count = _collect_workspace_artifacts(
+                workspace,
+                initial,
+            )
+        else:
+            # A failed terminal seal makes post-execution filesystem output
+            # untrusted. Preserve process evidence, but never publish artifacts
+            # or pretend this was a pre-spawn validation failure.
+            artifacts, deleted_count = [], 0
         stdout_text = stdout.decode("utf-8", errors="replace")
         stderr_text = stderr.decode("utf-8", errors="replace")
-        status = "timeout" if timed_out else ("success" if proc.returncode == 0 else "error")
+        execution_status = (
+            "timeout"
+            if timed_out
+            else ("success" if proc.returncode == 0 else "error")
+        )
+        status = (
+            "error"
+            if bridge_cleanup_error is not None
+            else execution_status
+        )
         response: dict[str, Any] = {
             "protocol_version": PROTOCOL_VERSION,
             "kind": "declared_command_result",
@@ -4550,6 +4958,7 @@ def _run_declared_command(payload: dict[str, Any]) -> dict[str, Any]:
                     else "none"
                 ),
             },
+            "egress_policy_version": egress_policy_version,
             "stdout": stdout_text,
             "stderr": stderr_text,
             "stdout_truncated": stdout_truncated,
@@ -4558,7 +4967,16 @@ def _run_declared_command(payload: dict[str, Any]) -> dict[str, Any]:
             "deleted_workspace_files_ignored": deleted_count,
             "duration_seconds": round(time.monotonic() - started, 3),
         }
-        if timed_out:
+        if bridge_cleanup_error is not None:
+            response.update(
+                error_code=bridge_cleanup_error.code,
+                error=str(bridge_cleanup_error),
+                cleanup_phase="egress_bridge_seal",
+                execution_completed=True,
+                execution_status=execution_status,
+                artifacts_discarded=True,
+            )
+        elif timed_out:
             response.update(
                 error_code="command_timeout",
                 error=f"Declared command timed out after {timeout}s.",
@@ -4568,9 +4986,21 @@ def _run_declared_command(payload: dict[str, Any]) -> dict[str, Any]:
                 error_code="command_exit_nonzero",
                 error=stderr_text or f"Declared command exited with return code {proc.returncode}.",
             )
+        if egress_audit_receipt is not None:
+            response["egress_audit_receipt"] = egress_audit_receipt
         return response
     except ProtocolError as exc:
-        return _declared_command_error(
+        if egress_bridge is not None:
+            (
+                egress_audit_receipt,
+                cleanup_error,
+            ) = _seal_or_quarantine_one_shot_egress_bridge(
+                egress_bridge
+            )
+            egress_bridge = None
+            if cleanup_error is not None:
+                exc = cleanup_error
+        response = _declared_command_error(
             request_id,
             exc.code,
             str(exc),
@@ -4580,20 +5010,52 @@ def _run_declared_command(payload: dict[str, Any]) -> dict[str, Any]:
             egress_policy=egress_policy,
             duration_seconds=round(time.monotonic() - started, 3),
         )
+        response["egress_policy_version"] = egress_policy_version
+        if egress_audit_receipt is not None:
+            response["egress_audit_receipt"] = egress_audit_receipt
+        return response
     except Exception as exc:
-        return _declared_command_error(
+        cleanup_error: ProtocolError | None = None
+        if egress_bridge is not None:
+            (
+                egress_audit_receipt,
+                cleanup_error,
+            ) = _seal_or_quarantine_one_shot_egress_bridge(
+                egress_bridge
+            )
+            egress_bridge = None
+        response = _declared_command_error(
             request_id,
-            "executor_internal_error",
-            f"The declared-command executor failed safely ({type(exc).__name__}).",
+            (
+                cleanup_error.code
+                if cleanup_error is not None
+                else "executor_internal_error"
+            ),
+            (
+                str(cleanup_error)
+                if cleanup_error is not None
+                else "The declared-command executor failed safely "
+                f"({type(exc).__name__})."
+            ),
             executable=executable,
             cwd=cwd_policy,
             command_sha256=command_sha256,
             egress_policy=egress_policy,
             duration_seconds=round(time.monotonic() - started, 3),
         )
+        response["egress_policy_version"] = egress_policy_version
+        if egress_audit_receipt is not None:
+            response["egress_audit_receipt"] = egress_audit_receipt
+        return response
     finally:
-        if temp_dir is not None:
-            _teardown_one_shot_temp_dir(temp_dir)
+        try:
+            if egress_bridge is not None:
+                _seal_or_quarantine_one_shot_egress_bridge(
+                    egress_bridge
+                )
+        finally:
+            if temp_dir is not None:
+                _teardown_one_shot_temp_dir(temp_dir)
 
 
 def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
@@ -4609,6 +5071,11 @@ def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
     egress_rules: tuple[dict[str, Any], ...] = ()
     private_origins: tuple[str, ...] = ()
     egress_policy = "none"
+    egress_policy_version = 2
+    budget_scope_sha256: str | None = None
+    call_id_sha256: str | None = None
+    egress_audit_receipt: dict[str, Any] | None = None
+    proc: subprocess.Popen[bytes] | None = None
     try:
         if payload.get("protocol_version") != PROTOCOL_VERSION:
             raise ProtocolError("unsupported_protocol", f"protocol_version must be {PROTOCOL_VERSION}.")
@@ -4641,6 +5108,14 @@ def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
             private_origins,
         ) = _validated_exact_egress_policy(
             payload
+        )
+        (
+            egress_policy_version,
+            budget_scope_sha256,
+            call_id_sha256,
+        ) = _validated_egress_budget_binding(
+            payload,
+            has_rules=bool(egress_rules),
         )
         egress_policy = (
             "origin_allowlist_proxy" if egress_origins else "none"
@@ -4798,6 +5273,9 @@ def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
                 egress_origins,
                 egress_rules=egress_rules,
                 private_origins=private_origins,
+                policy_version=egress_policy_version,
+                budget_scope_sha256=budget_scope_sha256,
+                call_id_sha256=call_id_sha256,
                 runtime_root=runtime_root,
             )
         if egress_bridge is not None:
@@ -4827,9 +5305,30 @@ def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
         stdout, stderr, stdout_truncated, stderr_truncated, timed_out = (
             _communicate_capped(proc, timeout=timeout)
         )
-        artifacts, deleted_count = _collect_workspace_artifacts(workspace, initial)
+        bridge_cleanup_error: ProtocolError | None = None
+        if egress_bridge is not None:
+            (
+                egress_audit_receipt,
+                bridge_cleanup_error,
+            ) = _seal_or_quarantine_one_shot_egress_bridge(
+                egress_bridge
+            )
+            egress_bridge = None
+        if bridge_cleanup_error is None:
+            artifacts, deleted_count = _collect_workspace_artifacts(
+                workspace,
+                initial,
+            )
+        else:
+            # Preserve the completed child evidence, but fail closed around
+            # outputs when the terminal egress receipt cannot be sealed.
+            artifacts, deleted_count = [], 0
         envelope: dict[str, Any] | None = None
-        if invocation_mode in {"function", "instance_method"} and not timed_out:
+        if (
+            bridge_cleanup_error is None
+            and invocation_mode in {"function", "instance_method"}
+            and not timed_out
+        ):
             if function_result_path is None or not function_result_path.is_file():
                 raise ProtocolError(
                     "invalid_function_result",
@@ -4849,9 +5348,14 @@ def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
                     "invalid_function_result",
                     "Instance-method result identity does not match the validated request.",
                 )
-        status = "timeout" if timed_out else (
+        execution_status = "timeout" if timed_out else (
             str(envelope.get("status")) if envelope is not None
             else ("success" if proc.returncode == 0 else "error")
+        )
+        status = (
+            "error"
+            if bridge_cleanup_error is not None
+            else execution_status
         )
         stdout_text = stdout.decode("utf-8", errors="replace")
         stderr_text = stderr.decode("utf-8", errors="replace")
@@ -4882,6 +5386,7 @@ def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
                 "direct": "disabled",
                 "egress": egress_policy,
             },
+            "egress_policy_version": egress_policy_version,
             "stdout": stdout_text,
             "stderr": stderr_text,
             "stdout_truncated": stdout_truncated,
@@ -4897,7 +5402,16 @@ def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
             response["method_name"] = method_name
         if envelope is not None:
             response.update(envelope)
-        if timed_out:
+        if bridge_cleanup_error is not None:
+            response.update(
+                error_code=bridge_cleanup_error.code,
+                error=str(bridge_cleanup_error),
+                cleanup_phase="egress_bridge_seal",
+                execution_completed=True,
+                execution_status=execution_status,
+                artifacts_discarded=True,
+            )
+        elif timed_out:
             response.update(
                 error_code=(
                     "function_timeout"
@@ -4938,9 +5452,21 @@ def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
                 error_code="script_exit_nonzero",
                 error=f"Skill script exited with return code {proc.returncode}.",
             )
+        if egress_audit_receipt is not None:
+            response["egress_audit_receipt"] = egress_audit_receipt
         return response
     except ProtocolError as exc:
-        return _skill_error(
+        if egress_bridge is not None:
+            (
+                egress_audit_receipt,
+                cleanup_error,
+            ) = _seal_or_quarantine_one_shot_egress_bridge(
+                egress_bridge
+            )
+            egress_bridge = None
+            if cleanup_error is not None:
+                exc = cleanup_error
+        response = _skill_error(
             request_id,
             exc.code,
             str(exc),
@@ -4951,11 +5477,33 @@ def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
             **({"method_name": method_name} if method_name else {}),
             duration_seconds=round(time.monotonic() - started, 3),
         )
+        response["egress_policy_version"] = egress_policy_version
+        if egress_audit_receipt is not None:
+            response["egress_audit_receipt"] = egress_audit_receipt
+        return response
     except Exception as exc:
-        return _skill_error(
+        cleanup_error: ProtocolError | None = None
+        if egress_bridge is not None:
+            (
+                egress_audit_receipt,
+                cleanup_error,
+            ) = _seal_or_quarantine_one_shot_egress_bridge(
+                egress_bridge
+            )
+            egress_bridge = None
+        response = _skill_error(
             request_id,
-            "executor_internal_error",
-            f"The isolated Skill executor failed safely ({type(exc).__name__}).",
+            (
+                cleanup_error.code
+                if cleanup_error is not None
+                else "executor_internal_error"
+            ),
+            (
+                str(cleanup_error)
+                if cleanup_error is not None
+                else "The isolated Skill executor failed safely "
+                f"({type(exc).__name__})."
+            ),
             egress_policy=egress_policy,
             invocation_mode=invocation_mode,
             **({"function_name": function_name} if function_name else {}),
@@ -4963,10 +5511,16 @@ def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
             **({"method_name": method_name} if method_name else {}),
             duration_seconds=round(time.monotonic() - started, 3),
         )
+        response["egress_policy_version"] = egress_policy_version
+        if egress_audit_receipt is not None:
+            response["egress_audit_receipt"] = egress_audit_receipt
+        return response
     finally:
         try:
             if egress_bridge is not None:
-                egress_bridge.close()
+                _seal_or_quarantine_one_shot_egress_bridge(
+                    egress_bridge
+                )
         finally:
             if temp_dir is not None:
                 _teardown_one_shot_temp_dir(temp_dir)
@@ -5215,12 +5769,20 @@ def _signal_process_group(
     return True
 
 
+def _seal_process_egress_bridge_locked(lease: _ProcessLease) -> None:
+    """Seal a lease bridge exactly once, retaining it on retryable failure."""
+
+    if lease.egress_bridge is None:
+        return
+    receipt = _seal_egress_bridge(lease.egress_bridge)
+    lease.egress_audit_receipt = receipt
+    lease.egress_bridge = None
+
+
 def _stop_process_lease_locked(lease: _ProcessLease) -> None:
     process = lease.process
     if process is None:
-        if lease.egress_bridge is not None:
-            lease.egress_bridge.close()
-            lease.egress_bridge = None
+        _seal_process_egress_bridge_locked(lease)
         return
     lease.stopping = True
     if process.stdin is not None:
@@ -5263,9 +5825,7 @@ def _stop_process_lease_locked(lease: _ProcessLease) -> None:
     for thread in lease.reader_threads:
         thread.join(timeout=1)
     _refresh_process_state_locked(lease)
-    if lease.egress_bridge is not None:
-        lease.egress_bridge.close()
-        lease.egress_bridge = None
+    _seal_process_egress_bridge_locked(lease)
 
 
 def _remove_process_tree(root: Path) -> bool:
@@ -5312,6 +5872,21 @@ def _discard_pending_process_sync_locked(lease: _ProcessLease) -> None:
     lease.pending_sync_prepare_op_id = None
 
 
+def _quarantine_process_cleanup_locked(
+    lease: _ProcessLease,
+    *,
+    error_code: str,
+    retry_reason: str,
+) -> None:
+    """Retain the lease and admission until every cleanup proof succeeds."""
+
+    lease.state = "quarantined"
+    lease.close_reason = error_code
+    lease.pending_expiry_reason = retry_reason
+    lease.closed_at = None
+    lease.condition.notify_all()
+
+
 def _expire_process_lease_locked(
     lease: _ProcessLease,
     *,
@@ -5325,8 +5900,8 @@ def _expire_process_lease_locked(
         # transaction no longer exists.  Its exact-op replay must therefore
         # not return an otherwise valid-looking stale token/artifact batch.
         _discard_pending_process_sync_locked(lease)
-    _stop_process_lease_locked(lease)
     try:
+        _stop_process_lease_locked(lease)
         _sweep_configured_worker_uid()
         if not _remove_process_tree(lease.temp_dir):
             raise ProtocolError(
@@ -5334,14 +5909,15 @@ def _expire_process_lease_locked(
                 "Expired worker tree could not be removed safely.",
             )
         _release_process_admission(lease.handle)
-    except ProtocolError:
+    except ProtocolError as exc:
         # Keep the unique worker slot permanently reserved if containment
         # cannot be proven. This is safer than overlapping another same-UID
         # execution; shutdown/operator intervention can then recover it.
-        lease.state = "quarantined"
-        lease.close_reason = "worker_containment_failed"
-        lease.pending_expiry_reason = reason
-        lease.closed_at = None
+        _quarantine_process_cleanup_locked(
+            lease,
+            error_code=exc.code,
+            retry_reason=reason,
+        )
     else:
         lease.state = "expired"
         lease.close_reason = reason
@@ -5358,6 +5934,7 @@ def _retry_quarantined_process_lease_locked(
     if lease.state != "quarantined":
         return False
     try:
+        _stop_process_lease_locked(lease)
         _sweep_configured_worker_uid()
         if not _remove_process_tree(lease.temp_dir):
             raise ProtocolError(
@@ -5365,7 +5942,10 @@ def _retry_quarantined_process_lease_locked(
                 "Quarantined worker tree could not be removed safely.",
             )
         _release_process_admission(lease.handle)
-    except ProtocolError:
+    except ProtocolError as exc:
+        lease.close_reason = exc.code
+        lease.closed_at = None
+        lease.condition.notify_all()
         return False
     lease.state = "expired"
     lease.close_reason = lease.pending_expiry_reason or "worker_containment_recovered"
@@ -5446,37 +6026,72 @@ def _cleanup_expired_process_leases(*, now: float | None = None) -> int:
     return cleaned
 
 
+def _reap_process_lease_locked(
+    lease: _ProcessLease,
+    *,
+    now: float,
+    reason: str,
+) -> bool:
+    """Best-effort one lease without releasing admission on any failed proof."""
+
+    if lease.pending_sync_token is not None:
+        _discard_pending_process_sync_locked(lease)
+    try:
+        _stop_process_lease_locked(lease)
+        _sweep_configured_worker_uid()
+        if not _remove_process_tree(lease.temp_dir):
+            raise ProtocolError(
+                "worker_containment_failed",
+                "Worker tree could not be removed safely during reap.",
+            )
+        _release_process_admission(lease.handle)
+    except ProtocolError as exc:
+        _quarantine_process_cleanup_locked(
+            lease,
+            error_code=exc.code,
+            retry_reason=reason,
+        )
+        return False
+    lease.state = "closed"
+    lease.close_reason = reason
+    lease.pending_expiry_reason = None
+    lease.closed_at = now
+    lease.condition.notify_all()
+    return True
+
+
 def _shutdown_all_process_leases() -> None:
     """Best-effort daemon/test cleanup; no process survives server shutdown."""
 
-    global _ACTIVE_PROCESS_LEASE_HANDLE, _ACTIVE_V1_EXECUTION
+    global _ACTIVE_V1_EXECUTION
     global _ACTIVE_V1_EXECUTION_QUARANTINED, _ACTIVE_V1_TEMP_DIR
     with _PROCESS_LEASES_LOCK:
-        leases = list(_PROCESS_LEASES.values())
-        for lease in leases:
+        for handle, lease in list(_PROCESS_LEASES.items()):
             with lease.lock:
-                _stop_process_lease_locked(lease)
-        try:
-            _sweep_configured_worker_uid()
-        except ProtocolError:
-            pass
-        for lease in leases:
-            with lease.lock:
-                _remove_process_tree(lease.temp_dir)
-                lease.state = "closed"
-                lease.close_reason = "executor_shutdown"
-                lease.closed_at = time.monotonic()
-                lease.condition.notify_all()
-        _PROCESS_LEASES.clear()
-        _PROCESS_OPEN_OPERATIONS.clear()
+                if not _reap_process_lease_locked(
+                    lease,
+                    now=time.monotonic(),
+                    reason="executor_shutdown",
+                ):
+                    # Keep the exact bridge, lease, and admission reachable so
+                    # a later shutdown/janitor/controller pass can retry.
+                    continue
+                _PROCESS_LEASES.pop(handle, None)
+                _PROCESS_OPEN_OPERATIONS.pop(
+                    (lease.scope_digest, lease.open_op_id),
+                    None,
+                )
+    _retry_orphaned_v1_egress_bridges()
     with _EXECUTION_ADMISSION_LOCK:
         v1_temp_dir = _ACTIVE_V1_TEMP_DIR
     v1_tree_removed = (
         v1_temp_dir is None or _remove_process_tree(v1_temp_dir)
     )
     with _EXECUTION_ADMISSION_LOCK:
-        _ACTIVE_PROCESS_LEASE_HANDLE = None
-        if v1_tree_removed:
+        if (
+            v1_tree_removed
+            and not _ORPHANED_V1_EGRESS_BRIDGES
+        ):
             _ACTIVE_V1_EXECUTION = False
             _ACTIVE_V1_EXECUTION_QUARANTINED = False
             _ACTIVE_V1_TEMP_DIR = None
@@ -5521,10 +6136,24 @@ def _controller_reap_process_leases() -> int:
             and _ACTIVE_V1_EXECUTION_QUARANTINED
         )
         v1_temp_dir = _ACTIVE_V1_TEMP_DIR
+        orphaned_bridge_count = len(
+            _ORPHANED_V1_EGRESS_BRIDGES
+        )
         active_handle = _ACTIVE_PROCESS_LEASE_HANDLE
+        if (
+            orphaned_bridge_count
+            and not reaping_v1
+        ):
+            raise ProtocolError(
+                "worker_containment_failed",
+                "Orphaned one-shot egress bridges are not bound to a "
+                "quarantined admission.",
+            )
+    reaped_leases = 0
+    failures: list[ProtocolError] = []
     with _PROCESS_LEASES_LOCK:
-        leases = list(_PROCESS_LEASES.values())
-        known_handles = {lease.handle for lease in leases}
+        leases = list(_PROCESS_LEASES.items())
+        known_handles = {lease.handle for _, lease in leases}
         if (
             active_handle is not None
             and active_handle not in known_handles
@@ -5533,50 +6162,62 @@ def _controller_reap_process_leases() -> int:
                 "worker_busy",
                 "A lease-open reservation is active; controller startup reap was refused.",
             )
-        for lease in leases:
+        for handle, lease in leases:
             with lease.lock:
-                _stop_process_lease_locked(lease)
-        _sweep_configured_worker_uid()
-        failed: list[_ProcessLease] = []
-        for lease in leases:
-            with lease.lock:
-                if not _remove_process_tree(lease.temp_dir):
-                    lease.state = "quarantined"
-                    lease.close_reason = "worker_containment_failed"
-                    lease.pending_expiry_reason = "controller_startup_reap"
-                    lease.closed_at = None
-                    lease.condition.notify_all()
-                    failed.append(lease)
-        if v1_temp_dir is not None and not _remove_process_tree(v1_temp_dir):
-            raise ProtocolError(
-                "worker_containment_failed",
-                "Controller reap could not remove a quarantined one-shot tree.",
-            )
-        if failed:
-            raise ProtocolError(
-                "worker_containment_failed",
-                "Controller startup reap could not remove every orphan worker tree.",
-            )
-        _purge_configured_worker_shared_state()
-        _PROCESS_LEASES.clear()
-        _PROCESS_OPEN_OPERATIONS.clear()
+                if not _reap_process_lease_locked(
+                    lease,
+                    now=time.monotonic(),
+                    reason="controller_startup_reap",
+                ):
+                    failures.append(ProtocolError(
+                        lease.close_reason
+                        or "worker_containment_failed",
+                        "Controller startup reap could not seal and contain "
+                        "one process lease.",
+                    ))
+                    continue
+                _PROCESS_LEASES.pop(handle, None)
+                _PROCESS_OPEN_OPERATIONS.pop(
+                    (lease.scope_digest, lease.open_op_id),
+                    None,
+                )
+                reaped_leases += 1
+    _, bridge_failures = _retry_orphaned_v1_egress_bridges()
+    failures.extend(bridge_failures)
+    if v1_temp_dir is not None and not _remove_process_tree(v1_temp_dir):
+        failures.append(ProtocolError(
+            "worker_containment_failed",
+            "Controller reap could not remove a quarantined one-shot tree.",
+        ))
+    elif reaping_v1 and not bridge_failures:
         with _EXECUTION_ADMISSION_LOCK:
-            _ACTIVE_PROCESS_LEASE_HANDLE = None
+            if not _ORPHANED_V1_EGRESS_BRIDGES:
+                _ACTIVE_V1_EXECUTION = False
+                _ACTIVE_V1_EXECUTION_QUARANTINED = False
+                _ACTIVE_V1_TEMP_DIR = None
+    if failures:
+        first = failures[0]
+        raise ProtocolError(
+            first.code,
+            "Controller startup reap completed all independent cleanup but "
+            f"{len(failures)} quarantined worker allocation(s) remain.",
+        )
     # A second bounded sweep after releasing all tree references proves that
     # no child appeared during cleanup.
     _sweep_configured_worker_uid()
     _purge_configured_worker_shared_state()
-    if reaping_v1:
-        with _EXECUTION_ADMISSION_LOCK:
-            _ACTIVE_V1_EXECUTION = False
-            _ACTIVE_V1_EXECUTION_QUARANTINED = False
-            _ACTIVE_V1_TEMP_DIR = None
-    return len(leases) + int(reaping_v1)
+    return reaped_leases + int(reaping_v1)
 
 
 def _process_lease_janitor(stop_event: threading.Event) -> None:
     while not stop_event.wait(PROCESS_JANITOR_INTERVAL_SECONDS):
-        _cleanup_expired_process_leases()
+        try:
+            _cleanup_expired_process_leases()
+        except Exception:
+            # One unexpected cleanup defect must not permanently kill expiry
+            # enforcement. Lease-specific expected failures are quarantined by
+            # the cleanup path and retried on the next pass.
+            continue
 
 
 def _cached_process_response(
@@ -5945,6 +6586,9 @@ def _open_process_lease(
     admission_handle: str | None = None
     lease_published = False
     egress_bridge: _EgressBridgeHandle | None = None
+    egress_policy_version = 2
+    budget_scope_sha256: str | None = None
+    call_id_sha256: str | None = None
     with _PROCESS_LEASES_LOCK:
         previous = _PROCESS_OPEN_OPERATIONS.get((scope_digest, op_id))
         if previous is not None:
@@ -6021,6 +6665,14 @@ def _open_process_lease(
             private_origins,
         ) = _validated_exact_egress_policy(
             payload
+        )
+        (
+            egress_policy_version,
+            budget_scope_sha256,
+            call_id_sha256,
+        ) = _validated_egress_budget_binding(
+            payload,
+            has_rules=bool(egress_rules),
         )
         cwd_policy = payload.get("cwd", "workspace")
         if cwd_policy not in {"workspace", "script", "skill"}:
@@ -6193,6 +6845,9 @@ def _open_process_lease(
                     egress_origins,
                     egress_rules=egress_rules,
                     private_origins=private_origins,
+                    policy_version=egress_policy_version,
+                    budget_scope_sha256=budget_scope_sha256,
+                    call_id_sha256=call_id_sha256,
                     runtime_root=runtime_root,
                 )
             if egress_bridge is not None:
@@ -6225,7 +6880,9 @@ def _open_process_lease(
                 factory_name=factory_name,
                 runtime_profile=runtime_profile,
                 egress_policy=egress_policy,
+                egress_policy_version=egress_policy_version,
                 egress_bridge=egress_bridge,
+                egress_audit_receipt=None,
                 interpreter=interpreter,
                 command=[*command, *argv],
                 workdir=workdir,
@@ -6260,15 +6917,24 @@ def _open_process_lease(
                 **({"factory_name": factory_name} if factory_name is not None else {}),
             )
         finally:
-            if temp_dir is not None:
-                _remove_process_tree(temp_dir)
             if not lease_published:
-                if egress_bridge is not None:
-                    egress_bridge.close()
-                if admission_handle is not None:
-                    _cancel_process_admission(admission_handle)
-                elif admission_reservation is not None:
-                    _cancel_process_admission(admission_reservation)
+                try:
+                    if egress_bridge is not None:
+                        _seal_egress_bridge(egress_bridge)
+                finally:
+                    try:
+                        if temp_dir is not None:
+                            _remove_process_tree(temp_dir)
+                    finally:
+                        # No worker process was published or started. Releasing
+                        # this exact reservation is safe and must not be skipped
+                        # merely because bridge sealing itself failed.
+                        if admission_handle is not None:
+                            _cancel_process_admission(admission_handle)
+                        elif admission_reservation is not None:
+                            _cancel_process_admission(admission_reservation)
+            elif temp_dir is not None:
+                _remove_process_tree(temp_dir)
 
 
 def _start_process_lease(
@@ -6683,7 +7349,30 @@ def _close_process_lease(
     request_id: str,
     op_id: str,
 ) -> dict[str, Any]:
-    _stop_process_lease_locked(lease)
+    try:
+        _stop_process_lease_locked(lease)
+    except ProtocolError as exc:
+        _discard_pending_process_sync_locked(lease)
+        _quarantine_process_cleanup_locked(
+            lease,
+            error_code=exc.code,
+            retry_reason="close_egress_cleanup_failed",
+        )
+        return _terminal_process_error(
+            request_id,
+            "close",
+            lease,
+            exc.code,
+            "The process stopped, but its egress bridge did not seal; the "
+            "executor slot remains quarantined for cleanup retry.",
+            terminal_state="quarantined",
+            artifact_error_code=exc.code,
+            returncode=(
+                lease.process.poll()
+                if lease.process is not None
+                else None
+            ),
+        )
     try:
         _sweep_configured_worker_uid()
     except ProtocolError:
@@ -6780,6 +7469,7 @@ def _run_process_lease(payload: dict[str, Any]) -> dict[str, Any]:
     request_id: str | None = None
     operation = payload.get("operation") if isinstance(payload, dict) else None
     handle = payload.get("lease_handle") if isinstance(payload, dict) else None
+    bound_lease: _ProcessLease | None = None
     try:
         if payload.get("protocol_version") != PROCESS_PROTOCOL_VERSION:
             raise ProtocolError(
@@ -6863,6 +7553,7 @@ def _run_process_lease(payload: dict[str, Any]) -> dict[str, Any]:
 
         with lease.lock:
             _validated_process_binding(payload, lease)
+            bound_lease = lease
             cached = _cached_process_response(
                 lease,
                 op_id=op_id,
@@ -6977,6 +7668,14 @@ def _run_process_lease(payload: dict[str, Any]) -> dict[str, Any]:
             )
             return response
     except ProtocolError as exc:
+        if bound_lease is not None:
+            return _bound_process_error(
+                request_id,
+                operation if isinstance(operation, str) else None,
+                exc.code,
+                str(exc),
+                lease=bound_lease,
+            )
         return _process_error(
             request_id,
             operation if isinstance(operation, str) else None,
@@ -6985,6 +7684,15 @@ def _run_process_lease(payload: dict[str, Any]) -> dict[str, Any]:
             handle=handle if isinstance(handle, str) else None,
         )
     except Exception as exc:
+        if bound_lease is not None:
+            return _bound_process_error(
+                request_id,
+                operation if isinstance(operation, str) else None,
+                "process_internal_error",
+                "Persistent process operation failed safely "
+                f"({type(exc).__name__}).",
+                lease=bound_lease,
+            )
         return _process_error(
             request_id,
             operation if isinstance(operation, str) else None,
@@ -7197,7 +7905,8 @@ def healthcheck() -> int:
 
     try:
         _trusted_resource_launcher()
-    except ProtocolError:
+        _configured_egress_limits()
+    except (ProtocolError, RuntimeError):
         return 1
     if _untrusted_execution_enabled():
         try:
@@ -7383,6 +8092,7 @@ def main() -> None:
     global DAEMON_DUMPABILITY_HARDENED
     DAEMON_DUMPABILITY_HARDENED = _harden_daemon_dumpability()
     _trusted_resource_launcher()
+    _configured_egress_limits()
     if _untrusted_execution_enabled():
         _validate_worker_controller_security(require_root=True)
         _sweep_configured_worker_uid()

@@ -39,6 +39,7 @@ from tools.omission_guard import (
 from tools.path_security import sandbox_dir, validate_path
 from tools.session_sandbox_policy import (
     SessionSandboxPolicyError,
+    session_sandbox_egress_budget_binding,
 )
 from tools.skill_invocation_egress import (
     bind_python_invocation_parameters,
@@ -527,6 +528,14 @@ async def run_skill_python(
                 invocations=proven_invocations,
             )
         )
+        egress_budget_binding = (
+            session_sandbox_egress_budget_binding(
+                context,
+                operation="skill_python",
+            )
+            if egress_policy.rules
+            else None
+        )
     except (
         IsolatedSkillExecutorError,
         KeyError,
@@ -570,6 +579,10 @@ async def run_skill_python(
                 {
                     "egress_rules": egress_policy.rule_payload(),
                     "private_origins": egress_policy.private_origins,
+                    "budget_scope_sha256": (
+                        egress_budget_binding.budget_scope_sha256
+                    ),
+                    "call_id_sha256": egress_budget_binding.call_id_sha256,
                 }
                 if egress_policy.rules else {}
             ),
@@ -628,6 +641,7 @@ async def run_skill_python(
             context.tool_operation_id if context is not None else None
         ),
     )
+    result.pop("egress_audit_receipt", None)
     if function_name is not None:
         result["function_name"] = function_name
     if class_name is not None and method_name is not None:

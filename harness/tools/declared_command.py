@@ -23,6 +23,7 @@ from tools.isolated_skill_executor import (
 from tools.path_security import sandbox_dir
 from tools.session_sandbox_policy import (
     SessionSandboxPolicyError,
+    session_sandbox_egress_budget_binding,
     skill_session_sandbox_egress_policy,
 )
 
@@ -128,6 +129,14 @@ async def run_declared_command(
             context,
             skill_name,
         )
+        egress_budget_binding = (
+            session_sandbox_egress_budget_binding(
+                context,
+                operation="declared_command",
+            )
+            if egress_policy.rules
+            else None
+        )
     except SessionSandboxPolicyError as exc:
         return _error(
             "invalid_session_sandbox_policy",
@@ -165,6 +174,10 @@ async def run_declared_command(
                 {
                     "egress_rules": egress_policy.rule_payload(),
                     "private_origins": egress_policy.private_origins,
+                    "budget_scope_sha256": (
+                        egress_budget_binding.budget_scope_sha256
+                    ),
+                    "call_id_sha256": egress_budget_binding.call_id_sha256,
                 }
                 if egress_policy.rules else {}
             ),
@@ -211,6 +224,10 @@ async def run_declared_command(
         egress_rules=egress_policy.rule_payload(),
         tool_operation_id=context.tool_operation_id,
     )
+    # The raw bridge receipt contains stable opaque run/call digests useful
+    # only to trusted validation. Return the secret-free projection above to
+    # the model, not a cross-call correlation handle.
+    result.pop("egress_audit_receipt", None)
     return json.dumps(result, ensure_ascii=False)
 
 

@@ -217,6 +217,39 @@ def _validated_exact_egress_policy(
     return rule_payload, origins, raw_private
 
 
+def _validated_egress_budget_binding(
+    *,
+    has_rules: bool,
+    budget_scope_sha256: str | None,
+    call_id_sha256: str | None,
+) -> tuple[int, dict[str, str]]:
+    """Validate the additive v3 aggregate-budget/audit binding.
+
+    Omitting both fields preserves the legacy v2 wire contract for old
+    internal callers.  New runtime-owned tool dispatches provide both fields
+    and therefore fail closed unless the executor understands v3.
+    """
+
+    if budget_scope_sha256 is None and call_id_sha256 is None:
+        return 2, {}
+    if (
+        not has_rules
+        or not isinstance(budget_scope_sha256, str)
+        or not isinstance(call_id_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", budget_scope_sha256) is None
+        or re.fullmatch(r"[0-9a-f]{64}", call_id_sha256) is None
+    ):
+        raise IsolatedSkillExecutorError(
+            "invalid_egress_policy",
+            "Bounded egress requires matching lowercase SHA-256 scope and "
+            "call bindings derived from runtime state.",
+        )
+    return 3, {
+        "budget_scope_sha256": budget_scope_sha256,
+        "call_id_sha256": call_id_sha256,
+    }
+
+
 class IsolatedSkillExecutorError(ValueError):
     """A stable local snapshot, transport, or response validation failure."""
 
@@ -316,6 +349,10 @@ class IsolatedProcessLease:
     _workspace: Path = field(repr=False)
     _socket_path: str = field(repr=False)
     _baseline: dict[str, tuple[int, str]] = field(repr=False)
+    _egress_policy_version: int = field(default=2, repr=False)
+    _budget_scope_sha256: str | None = field(default=None, repr=False)
+    _call_id_sha256: str | None = field(default=None, repr=False)
+    _egress_authority_sha256: str | None = field(default=None, repr=False)
     _slot_reservation: ExecutorSlotReservation | None = field(
         default=None,
         repr=False,
@@ -1162,6 +1199,8 @@ def build_skill_script_request(
     egress_origins: tuple[str, ...] | list[str] | None = None,
     egress_rules: tuple[dict[str, Any], ...] | list[dict[str, Any]] | None = None,
     private_origins: tuple[str, ...] | list[str] | None = None,
+    budget_scope_sha256: str | None = None,
+    call_id_sha256: str | None = None,
     request_id: str | None = None,
 ) -> tuple[dict[str, Any], bytes]:
     """Build one bounded, content-addressed protocol request."""
@@ -1256,6 +1295,13 @@ def build_skill_script_request(
         private_origins=private_origins,
         legacy_origins=egress_origins,
     )
+    egress_policy_version, egress_budget_binding = (
+        _validated_egress_budget_binding(
+            has_rules=bool(safe_egress_rules),
+            budget_scope_sha256=budget_scope_sha256,
+            call_id_sha256=call_id_sha256,
+        )
+    )
     payload: dict[str, Any] = {
         "protocol_version": PROTOCOL_VERSION,
         "kind": "skill_script",
@@ -1268,9 +1314,10 @@ def build_skill_script_request(
         "skill_files": skill_files,
         "workspace_files": workspace_files,
         "egress_origins": safe_egress_origins,
-        "egress_policy_version": 2,
+        "egress_policy_version": egress_policy_version,
         "egress_rules": safe_egress_rules,
         "private_origins": safe_private_origins,
+        **egress_budget_binding,
     }
     encoded = json.dumps(
         payload,
@@ -1302,6 +1349,8 @@ def build_process_lease_open_request(
     egress_origins: tuple[str, ...] | list[str] | None = None,
     egress_rules: tuple[dict[str, Any], ...] | list[dict[str, Any]] | None = None,
     private_origins: tuple[str, ...] | list[str] | None = None,
+    budget_scope_sha256: str | None = None,
+    call_id_sha256: str | None = None,
     request_id: str | None = None,
     op_id: str | None = None,
     skill_snapshot: SkillPackageSnapshot | None = None,
@@ -1385,6 +1434,13 @@ def build_process_lease_open_request(
         private_origins=private_origins,
         legacy_origins=egress_origins,
     )
+    egress_policy_version, egress_budget_binding = (
+        _validated_egress_budget_binding(
+            has_rules=bool(safe_egress_rules),
+            budget_scope_sha256=budget_scope_sha256,
+            call_id_sha256=call_id_sha256,
+        )
+    )
     entrypoint_record = next(
         item for item in skill_files if item["path"] == safe_entrypoint
     )
@@ -1406,9 +1462,10 @@ def build_process_lease_open_request(
         "skill_files": skill_files,
         "workspace_files": workspace_files,
         "egress_origins": safe_egress_origins,
-        "egress_policy_version": 2,
+        "egress_policy_version": egress_policy_version,
         "egress_rules": safe_egress_rules,
         "private_origins": safe_private_origins,
+        **egress_budget_binding,
     }
     return payload, _encode_process_request(payload)
 
@@ -1502,6 +1559,8 @@ def build_declared_command_request(
     egress_origins: tuple[str, ...] | list[str] | None = None,
     egress_rules: tuple[dict[str, Any], ...] | list[dict[str, Any]] | None = None,
     private_origins: tuple[str, ...] | list[str] | None = None,
+    budget_scope_sha256: str | None = None,
+    call_id_sha256: str | None = None,
     request_id: str | None = None,
 ) -> tuple[dict[str, Any], bytes]:
     """Build one no-shell command request from a trusted compiled grant."""
@@ -1556,6 +1615,13 @@ def build_declared_command_request(
         private_origins=private_origins,
         legacy_origins=egress_origins,
     )
+    egress_policy_version, egress_budget_binding = (
+        _validated_egress_budget_binding(
+            has_rules=bool(safe_egress_rules),
+            budget_scope_sha256=budget_scope_sha256,
+            call_id_sha256=call_id_sha256,
+        )
+    )
     payload: dict[str, Any] = {
         "protocol_version": PROTOCOL_VERSION,
         "kind": "declared_command",
@@ -1567,9 +1633,10 @@ def build_declared_command_request(
         "skill_files": skill_files,
         "workspace_files": workspace_files,
         "egress_origins": safe_egress_origins,
-        "egress_policy_version": 2,
+        "egress_policy_version": egress_policy_version,
         "egress_rules": safe_egress_rules,
         "private_origins": safe_private_origins,
+        **egress_budget_binding,
     }
     encoded = json.dumps(
         payload,
@@ -1841,6 +1908,195 @@ def _decode_artifacts(response: dict[str, Any]) -> list[tuple[str, bytes, dict[s
     return decoded
 
 
+_EGRESS_AUDIT_FIELDS = {
+    "profile",
+    "version",
+    "budget_scope_sha256",
+    "call_id_sha256",
+    "rules_sha256",
+    "counts",
+    "limits",
+    "exhausted",
+    "receipt_sha256",
+}
+_EGRESS_AUDIT_COUNT_FIELDS = {
+    "accepted_connections",
+    "client_to_proxy_wire_bytes",
+    "proxy_to_client_wire_bytes",
+    "budget_rejections",
+    "clean_closes",
+}
+_EGRESS_AUDIT_LIMIT_FIELDS = {
+    "max_outbound_bytes",
+    "max_requests",
+    "max_response_wire_bytes",
+}
+
+
+def _canonical_json_sha256(value: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8", errors="strict")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _egress_authority_sha256(request: dict[str, Any]) -> str:
+    return _canonical_json_sha256({
+        "origins": list(request.get("egress_origins") or []),
+        "egress_rules": list(request.get("egress_rules") or []),
+        "private_origins": list(request.get("private_origins") or []),
+    })
+
+
+def _validate_egress_audit_receipt(
+    receipt: Any,
+    *,
+    expected_budget_scope_sha256: str,
+    expected_call_id_sha256: str,
+    expected_rules_sha256: str,
+) -> dict[str, Any]:
+    if not isinstance(receipt, dict) or set(receipt) != _EGRESS_AUDIT_FIELDS:
+        raise IsolatedSkillExecutorError(
+            "invalid_response",
+            "Executor bounded-egress audit receipt is malformed.",
+        )
+    counts = receipt.get("counts")
+    limits = receipt.get("limits")
+    claimed_sha256 = receipt.get("receipt_sha256")
+    if (
+        receipt.get("profile") != "bounded_controlled_exchange"
+        or receipt.get("version") != 1
+        or isinstance(receipt.get("version"), bool)
+        or receipt.get("budget_scope_sha256")
+        != expected_budget_scope_sha256
+        or receipt.get("call_id_sha256") != expected_call_id_sha256
+        or receipt.get("rules_sha256") != expected_rules_sha256
+        or not isinstance(receipt.get("exhausted"), bool)
+        or not isinstance(counts, dict)
+        or set(counts) != _EGRESS_AUDIT_COUNT_FIELDS
+        or not isinstance(limits, dict)
+        or set(limits) != _EGRESS_AUDIT_LIMIT_FIELDS
+        or not isinstance(claimed_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", claimed_sha256) is None
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            for value in counts.values()
+        )
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 1
+            for value in limits.values()
+        )
+        or counts["accepted_connections"] > limits["max_requests"]
+        or counts["client_to_proxy_wire_bytes"]
+        > limits["max_outbound_bytes"]
+        or counts["proxy_to_client_wire_bytes"]
+        > limits["max_response_wire_bytes"]
+        or counts["clean_closes"] > counts["accepted_connections"]
+    ):
+        raise IsolatedSkillExecutorError(
+            "invalid_response",
+            "Executor bounded-egress audit receipt is inconsistent.",
+        )
+    unsigned = dict(receipt)
+    unsigned.pop("receipt_sha256")
+    if not hmac.compare_digest(
+        claimed_sha256,
+        _canonical_json_sha256(unsigned),
+    ):
+        raise IsolatedSkillExecutorError(
+            "invalid_response",
+            "Executor bounded-egress audit receipt digest is invalid.",
+        )
+    return dict(receipt)
+
+
+def _validate_terminal_egress_response(
+    response: dict[str, Any],
+    *,
+    policy_version: int,
+    budget_scope_sha256: str | None,
+    call_id_sha256: str | None,
+    authority_sha256: str | None,
+    require_audit: bool,
+) -> None:
+    observed_version = response.get("egress_policy_version")
+    if (
+        observed_version != policy_version
+        and not (
+            policy_version == 2
+            and observed_version is None
+        )
+    ):
+        raise IsolatedSkillExecutorError(
+            "invalid_response",
+            "Executor egress policy version does not match the request.",
+        )
+    receipt = response.get("egress_audit_receipt")
+    if policy_version == 2:
+        if receipt is not None:
+            raise IsolatedSkillExecutorError(
+                "invalid_response",
+                "Legacy executor response unexpectedly carried a v3 audit.",
+            )
+        return
+    if (
+        budget_scope_sha256 is None
+        or call_id_sha256 is None
+        or authority_sha256 is None
+    ):
+        raise IsolatedSkillExecutorError(
+            "invalid_response",
+            "Harness lost the bounded-egress audit binding.",
+        )
+    if receipt is None and not require_audit:
+        return
+    _validate_egress_audit_receipt(
+        receipt,
+        expected_budget_scope_sha256=budget_scope_sha256,
+        expected_call_id_sha256=call_id_sha256,
+        expected_rules_sha256=authority_sha256,
+    )
+
+
+def _one_shot_execution_requires_egress_audit(
+    response: dict[str, Any],
+) -> bool:
+    """Validate execution evidence and identify post-spawn responses.
+
+    A successful or timed-out one-shot invocation necessarily crossed the
+    process-spawn boundary and therefore must carry an exact integer exit
+    status. Error responses may be emitted before spawn, but once they carry a
+    return code they are likewise post-spawn. Keeping this decision independent
+    of the presence of the audit receipt prevents a corrupt response from
+    deleting both ``returncode`` and the receipt to bypass v3 validation.
+    """
+
+    status = response.get("status")
+    has_returncode = "returncode" in response
+    if has_returncode and (
+        isinstance(response.get("returncode"), bool)
+        or not isinstance(response.get("returncode"), int)
+    ):
+        raise IsolatedSkillExecutorError(
+            "invalid_response",
+            "Executor one-shot return code is malformed.",
+        )
+    if status in {"success", "timeout"} and not has_returncode:
+        raise IsolatedSkillExecutorError(
+            "invalid_response",
+            "Executor one-shot terminal response lacks execution evidence.",
+        )
+    return status in {"success", "timeout"} or has_returncode
+
+
 def validate_process_lease_response(
     response: Any,
     *,
@@ -1881,32 +2137,62 @@ def validate_process_lease_response(
             )
         terminal_state = response.get("terminal_lease_state")
         if terminal_state is not None:
-            expected_code = (
-                "close_artifact_collection_failed"
-                if terminal_state == "closed"
-                else "worker_containment_failed"
-                if terminal_state == "quarantined"
-                else None
+            error_code = response.get("error_code")
+            artifact_terminal = bool(
+                operation == "close"
+                and (
+                    (
+                        terminal_state == "closed"
+                        and error_code
+                        == "close_artifact_collection_failed"
+                    )
+                    or (
+                        terminal_state == "quarantined"
+                        and error_code == "worker_containment_failed"
+                    )
+                )
+                and response.get("artifacts_discarded") is True
+                and isinstance(
+                    response.get("artifact_error_code"),
+                    str,
+                )
+                and bool(response.get("artifact_error_code"))
+                and len(response["artifact_error_code"]) <= 160
+            )
+            lifecycle_terminal = bool(
+                (
+                    terminal_state == "closed"
+                    and error_code in {
+                        "lease_expired",
+                        "lease_closed",
+                    }
+                )
+                or (
+                    terminal_state == "quarantined"
+                    and error_code == "worker_containment_failed"
+                )
+            )
+            expected_response_state = (
+                "expired"
+                if lifecycle_terminal
+                and error_code == "lease_expired"
+                else terminal_state
             )
             network_policy = response.get("network_policy")
-            artifact_error_code = response.get("artifact_error_code")
+            scope_digest = response.get("scope_digest")
             if (
-                operation != "close"
-                or expected_code is None
-                or response.get("error_code") != expected_code
-                or response.get("state") != terminal_state
+                terminal_state not in {"closed", "quarantined"}
+                or not (artifact_terminal or lifecycle_terminal)
+                or response.get("state") != expected_response_state
                 or response.get("lease_handle")
                 != request.get("lease_handle")
-                or response.get("scope_digest") is None
+                or not isinstance(scope_digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", scope_digest) is None
                 or response.get("skill_sha256")
                 != request.get("skill_sha256")
                 or response.get("script_sha256")
                 != request.get("script_sha256")
                 or response.get("artifacts") != []
-                or response.get("artifacts_discarded") is not True
-                or not isinstance(artifact_error_code, str)
-                or not artifact_error_code
-                or len(artifact_error_code) > 160
                 or response.get("runtime_profile") not in {
                     "base-v1",
                     "browser-automation-v1",
@@ -1922,23 +2208,55 @@ def validate_process_lease_response(
                 }
                 or response.get("sync_token") is not None
                 or response.get("sync_pending") is not None
+                or (
+                    not artifact_terminal
+                    and (
+                        response.get("artifacts_discarded")
+                        is not None
+                        or response.get("artifact_error_code")
+                        is not None
+                    )
+                )
             ):
                 raise IsolatedSkillExecutorError(
                     "invalid_response",
-                    "Executor terminal close receipt is malformed.",
+                    "Executor terminal process receipt is malformed.",
                 )
+        elif (
+            "egress_policy_version" in response
+            or "scope_digest" in response
+        ):
+            network_policy = response.get("network_policy")
             scope_digest = response.get("scope_digest")
             if (
-                not isinstance(scope_digest, str)
-                or len(scope_digest) != 64
-                or any(
-                    character not in "0123456789abcdef"
-                    for character in scope_digest
-                )
+                response.get("lease_handle")
+                != request.get("lease_handle")
+                or not isinstance(scope_digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", scope_digest) is None
+                or response.get("skill_sha256")
+                != request.get("skill_sha256")
+                or response.get("script_sha256")
+                != request.get("script_sha256")
+                or response.get("state")
+                not in {"open", "running", "exited", "closing"}
+                or response.get("artifacts") != []
+                or response.get("runtime_profile") not in {
+                    "base-v1",
+                    "browser-automation-v1",
+                    SESSION_SANDBOX_RUNTIME_PROFILE,
+                }
+                or not isinstance(network_policy, dict)
+                or set(network_policy) != {"direct", "egress"}
+                or network_policy.get("direct") != "disabled"
+                or network_policy.get("egress") not in {
+                    "none",
+                    "policy_proxy",
+                    "origin_allowlist_proxy",
+                }
             ):
                 raise IsolatedSkillExecutorError(
                     "invalid_response",
-                    "Executor terminal close scope receipt is malformed.",
+                    "Executor bound process error receipt is malformed.",
                 )
         return dict(response), []
 
@@ -2131,6 +2449,7 @@ def validate_skill_script_response(
     response: Any,
     *,
     request_id: str,
+    request: dict[str, Any] | None = None,
     invocation_mode: str | None = None,
     function_name: str | None = None,
     class_name: str | None = None,
@@ -2204,6 +2523,28 @@ def validate_skill_script_response(
                 "invalid_response",
                 "Executor response instance-method identity does not match the request.",
             )
+    if request is not None:
+        policy_version = int(request.get("egress_policy_version") or 2)
+        post_spawn = (
+            _one_shot_execution_requires_egress_audit(response)
+            if policy_version == 3
+            else False
+        )
+        _validate_terminal_egress_response(
+            response,
+            policy_version=policy_version,
+            budget_scope_sha256=request.get("budget_scope_sha256"),
+            call_id_sha256=request.get("call_id_sha256"),
+            authority_sha256=(
+                _egress_authority_sha256(request)
+                if policy_version == 3
+                else None
+            ),
+            require_audit=bool(
+                policy_version == 3
+                and post_spawn
+            ),
+        )
     for field, limit in (("stdout", MAX_STDOUT_BYTES), ("stderr", MAX_STDERR_BYTES)):
         value = response.get(field)
         if value is not None and (not isinstance(value, str) or len(value) > limit):
@@ -2290,6 +2631,27 @@ def validate_declared_command_response(
             "Executor command response did not attest the requested bounded "
             "network policy.",
         )
+    policy_version = int(request.get("egress_policy_version") or 2)
+    post_spawn = (
+        _one_shot_execution_requires_egress_audit(response)
+        if policy_version == 3
+        else False
+    )
+    _validate_terminal_egress_response(
+        response,
+        policy_version=policy_version,
+        budget_scope_sha256=request.get("budget_scope_sha256"),
+        call_id_sha256=request.get("call_id_sha256"),
+        authority_sha256=(
+            _egress_authority_sha256(request)
+            if policy_version == 3
+            else None
+        ),
+        require_audit=bool(
+            policy_version == 3
+            and post_spawn
+        ),
+    )
     if status in {"error", "timeout"} and (
         not isinstance(response.get("error_code"), str)
         or not response["error_code"]
@@ -3049,6 +3411,8 @@ async def open_isolated_process_lease(
     egress_origins: tuple[str, ...] | list[str] | None = None,
     egress_rules: tuple[dict[str, Any], ...] | list[dict[str, Any]] | None = None,
     private_origins: tuple[str, ...] | list[str] | None = None,
+    budget_scope_sha256: str | None = None,
+    call_id_sha256: str | None = None,
     socket_path: str = EXECUTOR_SOCKET,
     op_id: str | None = None,
     skill_snapshot: SkillPackageSnapshot | None = None,
@@ -3070,6 +3434,8 @@ async def open_isolated_process_lease(
         egress_origins=egress_origins,
         egress_rules=egress_rules,
         private_origins=private_origins,
+        budget_scope_sha256=budget_scope_sha256,
+        call_id_sha256=call_id_sha256,
         op_id=op_id,
         skill_snapshot=skill_snapshot,
     )
@@ -3147,6 +3513,29 @@ async def open_isolated_process_lease(
             "executor_unavailable",
             "No healthy executor pool slot accepted the process lease.",
         )
+    egress_policy_version = int(
+        payload.get("egress_policy_version") or 2
+    )
+    egress_authority_sha256 = (
+        _egress_authority_sha256(payload)
+        if egress_policy_version == 3
+        else None
+    )
+    try:
+        _validate_terminal_egress_response(
+            response,
+            policy_version=egress_policy_version,
+            budget_scope_sha256=payload.get("budget_scope_sha256"),
+            call_id_sha256=payload.get("call_id_sha256"),
+            authority_sha256=egress_authority_sha256,
+            require_audit=False,
+        )
+    except IsolatedSkillExecutorError:
+        await _quarantine_executor_slot(
+            reservation,
+            "invalid_egress_audit_response",
+        )
+        raise
     baseline = {
         item["path"]: (item["size_bytes"], item["sha256"])
         for item in payload["workspace_files"]
@@ -3164,6 +3553,10 @@ async def open_isolated_process_lease(
         _workspace=Path(workspace),
         _socket_path=reservation.socket_path,
         _baseline=baseline,
+        _egress_policy_version=egress_policy_version,
+        _budget_scope_sha256=payload.get("budget_scope_sha256"),
+        _call_id_sha256=payload.get("call_id_sha256"),
+        _egress_authority_sha256=egress_authority_sha256,
         _slot_reservation=reservation,
     )
     return lease, response
@@ -3200,16 +3593,86 @@ async def _execute_process_operation(
         op_id=op_id,
         extra=extra,
     )
-    response, artifacts = await _exchange_process_request(
-        payload,
-        encoded,
-        socket_path=lease._socket_path,
-        timeout=timeout,
-    )
     try:
+        response, artifacts = await _exchange_process_request(
+            payload,
+            encoded,
+            socket_path=lease._socket_path,
+            timeout=timeout,
+        )
+        if operation == "ack" and response.get("status") == "success":
+            pending_operation = lease._pending_sync_operation
+            acknowledged_operation = response.get(
+                "acknowledged_operation"
+            )
+            acknowledged_state = response.get("state")
+            if (
+                acknowledged_operation != pending_operation
+                or (
+                    pending_operation == "close"
+                    and acknowledged_state != "closed"
+                )
+                or (
+                    pending_operation == "sync"
+                    and acknowledged_state
+                    not in {"open", "running", "exited"}
+                )
+            ):
+                raise IsolatedSkillExecutorError(
+                    "invalid_response",
+                    "Executor artifact acknowledgement does not match the "
+                    "pending operation and lifecycle state.",
+                )
+        terminal_audit_required = bool(
+            lease._egress_policy_version == 3
+            and (
+                response.get("terminal_lease_state")
+                in {"closed", "quarantined"}
+                or (
+                    operation == "close"
+                    and (
+                        response.get("status") == "success"
+                        or response.get("terminal_lease_state")
+                        in {"closed", "quarantined"}
+                        or response.get("state")
+                        in {"closing", "closed", "quarantined"}
+                    )
+                )
+                or (
+                    operation == "ack"
+                    and lease._pending_sync_operation == "close"
+                )
+            )
+        )
+        _validate_terminal_egress_response(
+            response,
+            policy_version=lease._egress_policy_version,
+            budget_scope_sha256=lease._budget_scope_sha256,
+            call_id_sha256=lease._call_id_sha256,
+            authority_sha256=lease._egress_authority_sha256,
+            require_audit=terminal_audit_required,
+        )
         _require_process_success(response)
     except IsolatedSkillExecutorError as exc:
-        await finalize_terminal_process_lease_error(lease, exc)
+        if (
+            exc.code == "invalid_response"
+            and lease._slot_reservation is not None
+        ):
+            reservation = lease._slot_reservation
+            await _quarantine_executor_slot(
+                reservation,
+                "invalid_egress_audit_response",
+            )
+            if reservation.terminal:
+                lease._slot_reservation = None
+            lease.closed = True
+            raise IsolatedSkillExecutorError(
+                exc.code,
+                str(exc),
+                terminal_lease_state="quarantined",
+            ) from exc
+        else:
+            await finalize_terminal_process_lease_error(lease, exc)
         raise
     return response, artifacts
 
@@ -4056,6 +4519,8 @@ async def execute_isolated_skill_script(
     egress_origins: tuple[str, ...] | list[str] | None = None,
     egress_rules: tuple[dict[str, Any], ...] | list[dict[str, Any]] | None = None,
     private_origins: tuple[str, ...] | list[str] | None = None,
+    budget_scope_sha256: str | None = None,
+    call_id_sha256: str | None = None,
     socket_path: str = EXECUTOR_SOCKET,
     apply_artifacts: bool = True,
     execution_authority_check: Callable[[], None] | None = None,
@@ -4082,6 +4547,8 @@ async def execute_isolated_skill_script(
         egress_origins=egress_origins,
         egress_rules=egress_rules,
         private_origins=private_origins,
+        budget_scope_sha256=budget_scope_sha256,
+        call_id_sha256=call_id_sha256,
     )
     reservation: ExecutorSlotReservation | None = None
     try:
@@ -4093,6 +4560,7 @@ async def execute_isolated_skill_script(
                 validate_skill_script_response(
                     candidate,
                     request_id=payload["request_id"],
+                    request=payload,
                     invocation_mode=payload["invocation"]["mode"],
                     function_name=payload["invocation"].get("name"),
                     class_name=payload["invocation"].get("class_name"),
@@ -4154,6 +4622,8 @@ async def execute_isolated_declared_command(
     egress_origins: tuple[str, ...] | list[str] | None = None,
     egress_rules: tuple[dict[str, Any], ...] | list[dict[str, Any]] | None = None,
     private_origins: tuple[str, ...] | list[str] | None = None,
+    budget_scope_sha256: str | None = None,
+    call_id_sha256: str | None = None,
     socket_path: str = EXECUTOR_SOCKET,
     apply_artifacts: bool = True,
     execution_authority_check: Callable[[], None] | None = None,
@@ -4169,6 +4639,8 @@ async def execute_isolated_declared_command(
         egress_origins=egress_origins,
         egress_rules=egress_rules,
         private_origins=private_origins,
+        budget_scope_sha256=budget_scope_sha256,
+        call_id_sha256=call_id_sha256,
     )
     reservation: ExecutorSlotReservation | None = None
     try:
