@@ -6,6 +6,18 @@
 
 - 工作目录：`/nfs/yangbb/codes/chat_ds`。
 - 分支：`fix/generic-skill-harness-20260717`。
+- 2026-07-30 最新功能提交：
+  `2486f008 fix: harden generic skill execution convergence`。该提交系统性修复了
+  mandatory retrieval 调度/收敛、provider 长流 deadline、TLS 1.3 上游兼容、
+  intent typed-result 验证、只读 Skill 调用的 effect receipt/retry 判定和静态
+  authority 可观测性；没有加入 V2.3、疾病、文件名或 session 特判。
+- `2486f008` 已从 clean Git archive 构建并只替换生产 Harness 与
+  `skill-egress-proxy`。当前两者 revision 都是完整提交
+  `2486f008b19f760d0fe63111137feb9d103a1a45`，健康且 restart 0；三个 Frontend
+  `/api/health` 入口均为 200。Backend、Frontend、四个 session-sandbox 和 legacy
+  browser 未重建。
+- 本地 HEAD 是位于该功能提交之上的交接文档提交；生产功能 revision 仍以
+  `2486f008b19f760d0fe63111137feb9d103a1a45` 为准。
 - 2026-07-30 当前功能提交：
   - `b4e8dc18 fix: require durable delete intent for orphan cleanup`
   - `c62a4a69 feat: unify session sandbox and harden session lifecycle`
@@ -475,10 +487,55 @@ reconciler 把“DB 中没有 conversation row”直接视为删除授权。若�
   syscall；跨进程 flock、deferred-next-tick、重启收敛、真实 SQLite 快照、marker
   元数据/payload 矩阵和 TOCTOU 均有回归。
 
+### 4.15 Retrieval、deadline、intent 与调用级 effect receipt
+
+`b81829a6d09447989851cbb208bcdbed` 及相邻诊断暴露的不是单一“容器不能联网”，而是
+多个通用控制面问题叠加。本轮按 exact Skill、持久化对话和 debug/tool/AgentRun
+三方交叉检查后完成以下闭环：
+
+- retrieval completeness 改为 policy-aware、有界且公平的调度器。未完成的 mandatory
+  source chain 优先于 clean optional cursor；同优先级按最近推进时间稳定轮转。
+  mandatory-only 模式不再退回 optional source，进入 closing 后也不会被 terminal/output
+  repair 重新打开联网工具。
+- provider 的 planned duration 只用于观测 checkpoint，不再被误当成绝对超时。
+  initial/progress lease 均只受调用方配置的 hard cap 约束，并记录
+  `planned_budget_crossed`；长思考不会仅因预测偏小而提前终止。
+- public-CA 与 SPKI TLS lane 在保持证书校验、SNI、TLS >= 1.2 和 HTTP/1.1 的同时，
+  补齐 TLS 1.3 post-handshake-auth client capability，修复部分上游在 TLS 1.3 下
+  返回 403/断链而宿主 `curl` 正常的差异。
+- runtime compiler 的 `chatds.intent-classifier.v1` typed result 现在精确区分
+  required、optional、nullable、default 和 `on_missing`：required WARN/FAIL、
+  non-null WARN 均 fail closed；optional/nullable 无默认缺失可 `WARN:null`；
+  defaulted 缺失必须以 `PASS` 返回 effective default。legacy 非结构化直接委派保持兼容。
+- `run_skill_python`、`run_skill_script` 和 `run_declared_command` 由 handler 生成并绑定
+  tool name/call ID 的 invocation-level effect receipt，记录 terminal/teardown、
+  artifact mutation 数、实际 HTTP method、rule/operation/binding hash。只有执行器已
+  返回、产物精确为零且实际方法全为 GET/HEAD 的调用才可标记 replay-safe；POST、产物、
+  缺失/损坏/canceled/wrong-call receipt 均不可自动重放。父层 retry 使用实际 unsafe
+  invocation 数，不再只看工具的静态 mutating 标签。
+- run start/final/result/debug 都携带 secret-free、内容寻址的初始 child static
+  authority snapshot，包括工具与 plan SHA，以及资源、脚本、命令、URL/egress 的
+  安全摘要，便于之后从 debug 还原当时真正授予的执行权限。
+- GET/HEAD 带 request body 现已在 egress proxy 拒绝。当前网络仍是无直连
+  session-sandbox + 签名 exact method/origin/path policy + 独立代理；这显著降低上传
+  面，但不能声称“绝对零外传”：任何检索都必须向外发送目标域名、路径/查询词、DNS/TLS
+  元数据，且少数 Skill 可显式声明 POST/read-query API。若威胁模型要求严格数据防泄漏，
+  仍需独立 read-query lane、查询/header schema、敏感信息检测与速率/字节配额，不能
+  只用 HTTP method 名称证明单向数据流。
+
 ## 5. 当前验证证据
 
 2026-07-30 当前生产 cohort 已通过：
 
+- `2486f008` 最终验证：
+  - Harness 全量：`1775 passed, 1 skipped, 3 warnings, 717 subtests passed`；
+    warnings 仅为既有 multiprocessing/fork deprecation；
+  - Executor 全量：`108 tests OK, 1 skipped`；Egress proxy 全量：`60 tests OK`；
+  - intent/workflow 聚焦：`46 passed, 9 subtests passed`；关键综合回归：
+    `103 passed, 30 subtests passed`；
+  - `py_compile`、`git diff --check`、staged secret/genericity scan、clean-image
+    `compileall`/import、proxy source compile 和临时 live health 均通过；
+  - 独立 release audit 最终无 P0/P1 blocker。
 - `b4e8dc18` 最终验证：
   - Backend 全量：`223 passed, 101 warnings`；warnings 仅为既有 `crypt` 与
     `datetime.utcnow()` deprecation；
@@ -626,6 +683,14 @@ reconciler 把“DB 中没有 conversation row”直接视为删除授权。若�
     且 `quick_check=ok`、foreign-key violation 为 0；
   - 生产 Backend 保持单 Uvicorn process、无 active-active/overlapping rollout，
     满足当前 reconciler 的部署不变量。
+- 2026-07-30 随后完成 `2486f008` Harness/egress proxy 收敛更新：
+  - 部署前确认 active AgentRun、scheduled running 和 5173 established connection
+    均为 0；短暂停止 Frontend 后再次确认，再按 proxy → Harness → Frontend 顺序切换；
+  - 两个候选都来自 clean archive `/tmp/chat_ds_build_2486f008.U6nu4S`，revision
+    label 为完整 Git SHA；Backend、数据库、四槽、browser 和搜索服务均未替换；
+  - 部署后 Harness/proxy healthy、restart 0，Harness `/health` 与 `/v1/models`
+    为 200，SQLite `quick_check=ok`、foreign-key violation 为 0，active/scheduled
+    run 为 0。
 - 2026-07-29（Asia/Shanghai）完成 `7bbc0809` 完整生产迁移：
   - 先确认旧生产 active run、未结束 run 和 5173 established connection 全为 0；
   - 停止旧 Frontend 后再次确认，再停止旧 Backend/Harness/所有执行器和 Browser；
@@ -649,9 +714,9 @@ reconciler 把“DB 中没有 conversation row”直接视为删除授权。若�
 | 服务 | Image ID | 状态 |
 |---|---|---|
 | `chat_acits_executor` ～ `_4` | `sha256:f993157d9861219d88725b44b0275d03533dc46be8068b9c6e541aaa24d2055e` | 4 个同质槽 / healthy / restart 0 / revision `c62a4a69` |
-| `chat_acits_skill_egress_proxy` | `sha256:ae54079001d96884b876466c0543201b46d6f909a738c821fcb52ade91b1791b` | healthy / restart 0 / revision `c62a4a69` |
+| `chat_acits_skill_egress_proxy` | `sha256:21f5bbe08ff31204be28efd42a83ab4ddafafafcf24c0e05ca8222196b3cc34f` | healthy / restart 0 / revision `2486f008` |
 | `chat_acits_browser` | `sha256:08bcf8860c10ba8fcd647b6d1a96c2c12e13e46db800c812acea82e17007240c` | healthy / restart 0 / revision `7bbc0809` |
-| `chat_acits_harness` | `sha256:38db91420b6da5e7d87df81313ac3df364210d09eb466c79892859f76e14f56c` | healthy / restart 0 / revision `304781c8` |
+| `chat_acits_harness` | `sha256:9722827a2a254a406456f3d75c2cfc89f32256d652302d0679549a1e3b9f267e` | healthy / restart 0 / revision `2486f008` |
 | `chat_acits_backend` | `sha256:42c62055effbece0a6c3aedb5011baf7f1ed226dc6db9fbd2df3d5794688be2a` | running / restart 0 / revision `b4e8dc18` / `/api/health` 200 |
 | `chat_acits_frontend` | `sha256:907c5abb41a5288c852ae55d2bbc3258196e4fc03fe0305ce072366f9255cb24` | running / restart 0 / revision `c62a4a69` / `/` 200 |
 
@@ -671,8 +736,8 @@ reconciler 把“DB 中没有 conversation row”直接视为删除授权。若�
   SearXNG/Valkey 均 healthy。免费上游仍可能动态出现 unresponsive engine，不属于
   Harness 执行环境缺失。
 - Backend revision label 为完整提交
-  `b4e8dc18f315995354798910edb4c77f6da2b252`，Harness 为
-  `304781c8789a7183441610074e1a94b40c81af47`；四槽/proxy/Frontend 为
+  `b4e8dc18f315995354798910edb4c77f6da2b252`；Harness/proxy 为
+  `2486f008b19f760d0fe63111137feb9d103a1a45`；四槽/Frontend 为
   `c62a4a69cfbbfb46404cfa1eb51b5f8e0498dce2`；legacy Browser 保持兼容基线。
   所有长期容器 restart 均为 0。
 - executor/proxy/browser/Harness/Backend/Frontend 日志未发现 traceback、
@@ -681,6 +746,11 @@ reconciler 把“DB 中没有 conversation row”直接视为删除授权。若�
 
 回滚点：
 
+- `2486f008` 切换前 Harness/proxy 分别保留
+  `chat_ds-harness:rollback-pre-2486f008` 与
+  `chat_ds-skill-egress-proxy:rollback-pre-2486f008`；当前候选/部署 tag 分别为
+  `candidate-2486f008`、`deploy-2486f008` 和 `latest`。clean archive 为
+  `/tmp/chat_ds_build_2486f008.U6nu4S`。
 - `c62a4a69` 全套切换前的 7 个应用镜像均保留
   `rollback-pre-c62a4a69` tag；当前候选 tag 为
   `chat_ds-session-sandbox:deploy-c62a4a69`、
@@ -813,6 +883,10 @@ checkout 分离或完成一次审计后的 untrack/migration。
 - 依赖 profile 固定且不可运行时安装；复杂动态 Bash/Node/Python 需 exact marker/manifest。
 - Skill sandbox 的公网与显式白名单私网 HTTP(S) 都必须经过签名 egress policy；
   不支持 CAPTCHA、stealth、反爬绕过或未确认的重要操作。
+- “只允许下载、禁止上传”能显著缩小风险，但 HTTP retrieval 本身仍会发送
+  域名、路径、查询词和协议元数据；GET 也可把数据编码进 query/header。当前已拒绝
+  GET/HEAD body 并精确限制 method/origin/path，严格 DLP 仍需查询/header schema、
+  内容检查和出站字节/速率预算，不能把 GET/HEAD 等同于数学意义上的单向通道。
 - stdio MCP 已降权和隔离 ambient secret，但不是完整 mount/network namespace；仍只注册可信配置。
 - 免费搜索引擎健康度、CAPTCHA、协议变化和上游站点 4xx/5xx 是动态外部条件，不能误归因为 Harness 回归。
 - Workflow IR 当前能机器证明结构、source digest、required-node 与结果路径覆盖，但结构覆盖不等于业务语义质量证明；长期可增加逐 instruction evidence ledger。
