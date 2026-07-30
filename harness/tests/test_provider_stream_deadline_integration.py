@@ -41,29 +41,74 @@ def _short_plan(
 class ProviderStreamDeadlineIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_buffered_material_progress_renews_without_outer_yields(self):
         loop = asyncio.get_running_loop()
-        plan = _short_plan()
+        plan = _short_plan(
+            initial=0.10,
+            grace=0.20,
+            hard=1.0,
+            output_tokens=1,
+        )
         lease = MaterialProgressLease.start(plan, now=loop.time())
+        provider_entered = asyncio.Event()
+        release_provider = asyncio.Event()
 
         async def buffered_provider():
             # Model a delegated transactional turn: provider fragments arrive,
             # but no content crosses the outer iterator until the turn closes.
-            for _ in range(6):
-                await asyncio.sleep(0.015)
-                lease.observe_material_progress(4, now=loop.time())
+            provider_entered.set()
+            await release_provider.wait()
+            lease.observe_material_progress(
+                4,
+                now=(
+                    lease.started_at
+                    + plan.planned_deadline_seconds
+                    + 0.01
+                ),
+            )
             yield {"terminal": True}
 
-        values = [
-            value
-            async for value in _aiter_with_timeout(
-                buffered_provider(),
-                timeout_seconds=plan.planned_deadline_seconds,
-                material_progress_lease=lease,
-            )
-        ]
+        async def collect():
+            return [
+                value
+                async for value in _aiter_with_timeout(
+                    buffered_provider(),
+                    # With a material-progress lease this is only the
+                    # compatibility fallback.  A second fixed deadline must
+                    # not cap the renewable lease.
+                    timeout_seconds=0.000_001,
+                    material_progress_lease=lease,
+                )
+            ]
+
+        collect_task = asyncio.create_task(collect())
+        await asyncio.wait_for(provider_entered.wait(), timeout=1)
+        release_provider.set()
+        values = await asyncio.wait_for(collect_task, timeout=1)
 
         self.assertEqual([{"terminal": True}], values)
         self.assertGreater(lease.renewal_count, 0)
-        self.assertGreater(loop.time() - lease.started_at, plan.initial_lease_seconds)
+        self.assertGreater(
+            lease.deadline,
+            lease.started_at + plan.planned_deadline_seconds,
+        )
+
+    async def test_without_a_lease_fixed_timeout_remains_authoritative(self):
+        provider_closed = asyncio.Event()
+
+        async def blocked_provider():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                provider_closed.set()
+            yield {"unreachable": True}
+
+        with self.assertRaises(asyncio.TimeoutError):
+            async for _ in _aiter_with_timeout(
+                blocked_provider(),
+                timeout_seconds=0.01,
+            ):
+                pass
+
+        self.assertTrue(provider_closed.is_set())
 
     async def test_empty_frames_do_not_renew_initial_lease(self):
         loop = asyncio.get_running_loop()

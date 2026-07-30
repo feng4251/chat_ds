@@ -1776,6 +1776,11 @@ class UpstreamTlsPolicy:
             )
             context.check_hostname = True
             context.verify_mode = ssl.CERT_REQUIRED
+        # Some TLS 1.3 origins require the RFC 8446 PHA extension in the
+        # ClientHello.  No client certificate is loaded here, so advertising
+        # support neither grants client identity nor relaxes peer validation.
+        if hasattr(context, "post_handshake_auth"):
+            context.post_handshake_auth = True
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.set_alpn_protocols(["http/1.1"])
         raw_socket.settimeout(TLS_HANDSHAKE_TIMEOUT_SECONDS)
@@ -2497,6 +2502,11 @@ def _validated_request_body_framing(
     forwarded: bytes,
 ) -> _RequestBodyFraming:
     header, body = forwarded.split(b"\r\n\r\n", 1)
+    request_line = header.split(b"\r\n", 1)[0]
+    try:
+        method = request_line.split(b" ", 1)[0].decode("ascii").upper()
+    except UnicodeError as exc:
+        raise ProxyPolicyError("invalid_request_method") from exc
     content_lengths: list[bytes] = []
     transfer_encodings: list[bytes] = []
     for line in header.split(b"\r\n")[1:]:
@@ -2538,6 +2548,14 @@ def _validated_request_body_framing(
                 "http_request_pipelining_not_allowed"
             )
         expected = 0
+    # Retrieval methods may transmit only their authorized target and bounded
+    # headers. A request body on GET/HEAD is non-portable and creates an
+    # unnecessary upload/exfiltration channel, so it is rejected even when an
+    # exact URL rule otherwise matches.
+    if method in {"GET", "HEAD"} and expected:
+        raise ProxyPolicyError(
+            "read_only_http_method_body_not_allowed"
+        )
     return _RequestBodyFraming(
         header=header,
         initial_body=body,

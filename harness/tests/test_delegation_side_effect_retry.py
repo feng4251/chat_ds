@@ -5,6 +5,11 @@ from unittest.mock import patch
 
 from tools.context import ToolContext
 from tools.delegation import _dispatch_can_mutate, _run_child, delegate_task
+from tools.effect_receipt import (
+    bind_effect_receipt_to_call,
+    bound_effect_receipt_is_replay_safe,
+    build_isolated_execution_effect_receipt,
+)
 
 
 def _context(*tools: str) -> ToolContext:
@@ -52,7 +57,12 @@ def _dispatch_started(tool_name: str, call_id: str) -> dict:
     }
 
 
-def _completed(tool_name: str, call_id: str) -> dict:
+def _completed(
+    tool_name: str,
+    call_id: str,
+    *,
+    effect_receipt: dict | None = None,
+) -> dict:
     return {
         "type": "agent_event",
         "event_type": "tool.completed",
@@ -63,8 +73,39 @@ def _completed(tool_name: str, call_id: str) -> dict:
             "tool_call_id": call_id,
             "outcome": "success",
             "actual_dispatch_attempted": True,
+            "effect_receipt": effect_receipt,
         },
     }
+
+
+def _bound_effect_receipt(
+    tool_name: str,
+    call_id: str,
+    *,
+    methods: tuple[str, ...] = ("GET", "HEAD"),
+    artifact_count: int = 0,
+) -> dict:
+    receipt = build_isolated_execution_effect_receipt(
+        result={
+            "status": "success",
+            "artifacts": [
+                {"path": f"artifact-{index}.txt"}
+                for index in range(artifact_count)
+            ],
+        },
+        egress_rules=[{
+            "url_prefix": "https://api.example.test/data",
+            "methods": list(methods),
+        }],
+        tool_operation_id="operation-id",
+    )
+    bound = bind_effect_receipt_to_call(
+        receipt,
+        tool_name=tool_name,
+        tool_call_id=call_id,
+    )
+    assert bound is not None
+    return bound
 
 
 class DelegationSideEffectRetryTests(unittest.IsolatedAsyncioTestCase):
@@ -140,6 +181,8 @@ class DelegationSideEffectRetryTests(unittest.IsolatedAsyncioTestCase):
                     {
                         "dispatch_count": 1,
                         "mutating_dispatch_count": 1,
+                        "replay_safe_mutating_dispatch_count": 0,
+                        "unsafe_mutating_dispatch_count": 1,
                         "read_only_dispatch_count": 0,
                         "tool_names": [tool_name],
                         "mutating_tool_names": [tool_name],
@@ -181,6 +224,194 @@ class DelegationSideEffectRetryTests(unittest.IsolatedAsyncioTestCase):
             0,
         )
         persist_result.assert_not_called()
+
+    async def test_completed_read_only_script_receipt_is_retryable(self):
+        call_id = "python-read-only-effect"
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            yield _started("run_skill_python", call_id)
+            yield _dispatch_started("run_skill_python", call_id)
+            yield _completed(
+                "run_skill_python",
+                call_id,
+                effect_receipt=_bound_effect_receipt(
+                    "run_skill_python",
+                    call_id,
+                ),
+            )
+            yield {"type": "delta", "content": "done"}
+            yield {"type": "done", "finish_reason": "stop"}
+
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch("tools.delegation.persist_result_for_history"),
+        ):
+            result = await _run_child(
+                {
+                    "goal": "query one declared public evidence endpoint",
+                    "tools": ["run_skill_python"],
+                },
+                _context("run_skill_python"),
+                0,
+            )
+
+        self.assertEqual("error", result["status"])
+        self.assertTrue(result["retryable"])
+        receipt = result["dispatch_receipt_audit"]
+        self.assertEqual(1, receipt["mutating_dispatch_count"])
+        self.assertEqual(1, receipt["replay_safe_mutating_dispatch_count"])
+        self.assertEqual(0, receipt["unsafe_mutating_dispatch_count"])
+
+    async def test_wrapper_exception_honors_completed_read_only_receipt(self):
+        call_id = "python-read-only-before-wrapper-exception"
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            yield _started("run_skill_python", call_id)
+            yield _dispatch_started("run_skill_python", call_id)
+            yield _completed(
+                "run_skill_python",
+                call_id,
+                effect_receipt=_bound_effect_receipt(
+                    "run_skill_python",
+                    call_id,
+                ),
+            )
+            raise RuntimeError("synthetic wrapper failure")
+
+        with patch("agent_loop.run_stream", fake_run_stream):
+            payload = json.loads(await delegate_task(
+                tasks=[{
+                    "goal": "query one declared read-only endpoint",
+                    "step_id": "read-query",
+                    "tools": ["run_skill_python"],
+                }],
+                context=_context("run_skill_python"),
+            ))
+
+        self.assertEqual("error", payload["status"])
+        result = payload["results"][0]
+        self.assertTrue(result["retryable"])
+        self.assertEqual(
+            "delegated_child_exception",
+            result["terminal_reason"],
+        )
+        self.assertEqual(
+            1,
+            result["dispatch_receipt_audit"][
+                "replay_safe_mutating_dispatch_count"
+            ],
+        )
+        self.assertEqual(
+            0,
+            result["dispatch_receipt_audit"][
+                "unsafe_mutating_dispatch_count"
+            ],
+        )
+
+    async def test_script_effect_receipt_fails_closed_for_write_or_post(self):
+        cases = {
+            "artifact": {
+                "methods": ("GET",),
+                "artifact_count": 1,
+                "bound_call_id": "effect-artifact",
+            },
+            "post": {
+                "methods": ("POST",),
+                "artifact_count": 0,
+                "bound_call_id": "effect-post",
+            },
+            "wrong_call": {
+                "methods": ("GET",),
+                "artifact_count": 0,
+                "bound_call_id": "different-call",
+            },
+        }
+        for label, case in cases.items():
+            call_id = "effect-" + label
+
+            async def fake_run_stream(
+                model_id,
+                messages,
+                tools,
+                *,
+                _call_id=call_id,
+                _case=case,
+                **kwargs,
+            ):
+                yield _started("run_skill_python", _call_id)
+                yield _dispatch_started("run_skill_python", _call_id)
+                yield _completed(
+                    "run_skill_python",
+                    _call_id,
+                    effect_receipt=_bound_effect_receipt(
+                        "run_skill_python",
+                        _case["bound_call_id"],
+                        methods=_case["methods"],
+                        artifact_count=_case["artifact_count"],
+                    ),
+                )
+                yield {"type": "delta", "content": "done"}
+                yield {"type": "done", "finish_reason": "stop"}
+
+            with self.subTest(label=label):
+                with (
+                    patch("agent_loop.run_stream", fake_run_stream),
+                    patch("tools.delegation.persist_result_for_history"),
+                ):
+                    result = await _run_child(
+                        {
+                            "goal": "run one bounded declared script",
+                            "tools": ["run_skill_python"],
+                        },
+                        _context("run_skill_python"),
+                        0,
+                    )
+
+            self.assertFalse(result["retryable"])
+            receipt = result["dispatch_receipt_audit"]
+            self.assertEqual(0, receipt[
+                "replay_safe_mutating_dispatch_count"
+            ])
+            self.assertEqual(1, receipt["unsafe_mutating_dispatch_count"])
+
+    def test_malformed_or_unknown_egress_methods_fail_closed(self):
+        malformed_rules = (
+            [{"url_prefix": "https://example.test", "methods": []}],
+            [{"url_prefix": "https://example.test", "methods": ["TRACE"]}],
+            [{"url_prefix": "https://example.test"}],
+        )
+        for index, rules in enumerate(malformed_rules):
+            with self.subTest(rules=rules):
+                receipt = build_isolated_execution_effect_receipt(
+                    result={"status": "success", "artifacts": []},
+                    egress_rules=rules,
+                    tool_operation_id="operation-id",
+                )
+                self.assertFalse(receipt["effect_known"])
+                self.assertFalse(receipt["replay_safe"])
+                bound = bind_effect_receipt_to_call(
+                    receipt,
+                    tool_name="run_skill_python",
+                    tool_call_id=f"malformed-{index}",
+                )
+                self.assertIsNotNone(bound)
+                self.assertFalse(bound_effect_receipt_is_replay_safe(
+                    bound,
+                    tool_name="run_skill_python",
+                    tool_call_id=f"malformed-{index}",
+                ))
+
+    def test_bound_effect_receipt_tampering_fails_closed(self):
+        bound = _bound_effect_receipt(
+            "run_skill_python",
+            "tamper-boundary",
+        )
+        bound["artifact_commit_count"] = 1
+        self.assertFalse(bound_effect_receipt_is_replay_safe(
+            bound,
+            tool_name="run_skill_python",
+            tool_call_id="tamper-boundary",
+        ))
 
     async def test_read_only_dispatch_then_plain_output_limit_is_retryable(self):
         async def fake_run_stream(model_id, messages, tools, **kwargs):

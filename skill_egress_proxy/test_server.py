@@ -262,6 +262,23 @@ class HttpSingleRequestFramingTests(unittest.TestCase):
         )
         self.assertTrue(upstream.payload.endswith(b"\r\n\r\nhello"))
 
+    def test_get_and_head_request_bodies_are_rejected(self):
+        for method in ("GET", "HEAD"):
+            _scheme, _host, _port, forwarded = (
+                server._request_destination(
+                    (
+                        f"{method} http://example.com/data HTTP/1.1\r\n"
+                        "Host: example.com\r\n"
+                        "Content-Length: 4\r\n\r\ndata"
+                    ).encode("ascii")
+                )
+            )
+            with self.subTest(method=method), self.assertRaisesRegex(
+                server.ProxyPolicyError,
+                "read_only_http_method_body_not_allowed",
+            ):
+                server._validated_request_body_framing(forwarded)
+
     def test_chunked_body_is_rejected_before_upstream_write(self):
         _scheme, _host, _port, forwarded = server._request_destination(
             b"POST http://example.com/upload HTTP/1.1\r\n"
@@ -2553,6 +2570,169 @@ class ProxyRelayIntegrationTests(unittest.TestCase):
             proxy.server_close()
             origin.server_close()
             proxy_thread.join(timeout=3)
+            origin_thread.join(timeout=3)
+
+    @unittest.skipUnless(
+        ssl.HAS_TLSv1_3
+        and hasattr(ssl.SSLContext, "post_handshake_auth"),
+        "TLS 1.3 post-handshake authentication is unavailable",
+    )
+    def test_upstream_tls_clienthello_advertises_post_handshake_auth(
+        self,
+    ):
+        host = "pha-required.example"
+        statuses: list[int] = []
+
+        class OriginHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                try:
+                    self.request.verify_client_post_handshake()
+                except ssl.SSLError:
+                    status = 403
+                    body = b"post-handshake-auth-extension-required"
+                else:
+                    status = 200
+                    body = b"post-handshake-auth-extension-present"
+                statuses.append(status)
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format, *_args):
+                return
+
+        class TlsOrigin(ThreadingHTTPServer):
+            def get_request(self):
+                raw, address = super().get_request()
+                return (
+                    self.tls_context.wrap_socket(
+                        raw,
+                        server_side=True,
+                    ),
+                    address,
+                )
+
+        origin = TlsOrigin(("127.0.0.1", 0), OriginHandler)
+        origin_context = self.certificate_authority.server_context(
+            host
+        )
+        origin_context.minimum_version = ssl.TLSVersion.TLSv1_3
+        origin_context.maximum_version = ssl.TLSVersion.TLSv1_3
+        origin_context.post_handshake_auth = True
+        origin_context.verify_mode = ssl.CERT_OPTIONAL
+        origin.tls_context = origin_context
+        origin_port = int(origin.server_address[1])
+        exact_origin = server.Origin("https", host, origin_port)
+        destination = server.Destination(
+            "https",
+            host,
+            origin_port,
+            "127.0.0.1",
+            socket.AF_INET,
+            False,
+        )
+        origin_thread = threading.Thread(
+            target=origin.serve_forever,
+            daemon=True,
+        )
+        origin_thread.start()
+
+        def trusted_default_context(*, purpose):
+            self.assertEqual(ssl.Purpose.SERVER_AUTH, purpose)
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.load_verify_locations(
+                cafile=str(
+                    self.certificate_authority.public_ca_path
+                )
+            )
+            return context
+
+        try:
+            policies = (
+                (
+                    "public-ca",
+                    server.UpstreamTlsPolicy({}),
+                    patch.object(
+                        server.ssl,
+                        "create_default_context",
+                        side_effect=trusted_default_context,
+                    ),
+                    ssl.CERT_REQUIRED,
+                    True,
+                ),
+                (
+                    "exact-spki-pin",
+                    server.UpstreamTlsPolicy({
+                        exact_origin: frozenset({
+                            self.certificate_authority.leaf_spki,
+                        }),
+                    }),
+                    patch.object(
+                        server.ssl,
+                        "create_default_context",
+                    ),
+                    ssl.CERT_NONE,
+                    False,
+                ),
+            )
+            for (
+                lane,
+                policy,
+                context_factory_patch,
+                expected_verify_mode,
+                expected_check_hostname,
+            ) in policies:
+                with self.subTest(lane=lane), context_factory_patch:
+                    raw = socket.create_connection(
+                        origin.server_address,
+                        timeout=3,
+                    )
+                    raw.settimeout(3)
+                    with policy.wrap(raw, destination) as upstream:
+                        self.assertTrue(
+                            upstream.context.post_handshake_auth
+                        )
+                        self.assertEqual(
+                            expected_verify_mode,
+                            upstream.context.verify_mode,
+                        )
+                        self.assertEqual(
+                            expected_check_hostname,
+                            upstream.context.check_hostname,
+                        )
+                        self.assertEqual(
+                            ssl.TLSVersion.TLSv1_2,
+                            upstream.context.minimum_version,
+                        )
+                        self.assertEqual(
+                            "http/1.1",
+                            upstream.selected_alpn_protocol(),
+                        )
+                        upstream.sendall(
+                            (
+                                "GET /proof HTTP/1.1\r\n"
+                                f"Host: {host}:{origin_port}\r\n"
+                                "Connection: close\r\n\r\n"
+                            ).encode("ascii")
+                        )
+                        response = bytearray()
+                        while True:
+                            chunk = upstream.recv(4096)
+                            if not chunk:
+                                break
+                            response.extend(chunk)
+                    self.assertTrue(
+                        response.startswith(b"HTTP/1.0 200 OK")
+                    )
+                    self.assertTrue(response.endswith(
+                        b"post-handshake-auth-extension-present"
+                    ))
+            self.assertEqual([200, 200], statuses)
+        finally:
+            origin.shutdown()
+            origin.server_close()
             origin_thread.join(timeout=3)
 
     def test_https_domain_fronting_is_rejected_before_upstream(self):

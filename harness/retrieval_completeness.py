@@ -1525,6 +1525,10 @@ class _OpenChain:
     carried_url_sha256s: tuple[str, ...] = ()
     pages_observed: int = 1
     unlinked_attempts: int = 0
+    # Monotonic receipt sequence at which this frontier last became ready.
+    # Selection is a pure read: advancing a linked chain moves it behind other
+    # ready chains, while repeated action inspection cannot perturb ordering.
+    ready_sequence: int = 0
 
 
 @dataclass
@@ -1999,6 +2003,7 @@ class RetrievalCompletenessTracker:
                         if current_body_truncated else ()
                     ),
                     pages_observed=pages,
+                    ready_sequence=self.total_requests,
                 )
                 if "pagination_frontier_truncated" in reasons:
                     self._set_terminal("pagination_frontier_limit")
@@ -2073,6 +2078,7 @@ class RetrievalCompletenessTracker:
                         if truncation_retry
                         else prior.pages_observed + 1
                     ),
+                    ready_sequence=self.total_requests,
                 )
             else:
                 self._open.pop(family, None)
@@ -2109,11 +2115,10 @@ class RetrievalCompletenessTracker:
         normalized = normalize_retrieval_completeness_policy(policy)
         if self.terminal_failure is not None or not self._open:
             return False
-        if normalized == RETRIEVAL_COMPLETENESS_POLICY_EXHAUSTIVE:
-            return True
-        optional_reasons = {"pagination_more_available"}
         return any(
-            not set(chain.incomplete_reasons).issubset(optional_reasons)
+            self._chain_requires_mandatory_continuation(
+                chain, normalized
+            )
             for chain in self._open.values()
         )
 
@@ -2133,18 +2138,70 @@ class RetrievalCompletenessTracker:
             return RETRIEVAL_QUALITY_IMPACT_ADVISORY
         return RETRIEVAL_QUALITY_IMPACT_DEGRADED
 
-    def next_continuation_action(self) -> dict[str, Any] | None:
+    @staticmethod
+    def _chain_requires_mandatory_continuation(
+        chain: _OpenChain,
+        normalized_policy: str,
+    ) -> bool:
+        if (
+            normalized_policy
+            == RETRIEVAL_COMPLETENESS_POLICY_EXHAUSTIVE
+        ):
+            return True
+        return not set(chain.incomplete_reasons).issubset({
+            "pagination_more_available",
+        })
+
+    def next_continuation_action(
+        self,
+        policy: str = RETRIEVAL_COMPLETENESS_POLICY_BOUNDED,
+        *,
+        mandatory_only: bool = False,
+    ) -> dict[str, Any] | None:
         """Return the exact harness-generated action for the next open chain.
 
         The action is kept outside ``snapshot`` so ordinary lifecycle/debug
         records do not persist raw query values or POST bodies. Agent-loop may
         inject this bounded copy into the immediate correction turn; the
         normal bridge grant and preflight remain authoritative.
+
+        Selection is policy-aware and stable. Under bounded acquisition, any
+        non-pagination-only obligation is selected before a clean optional
+        cursor. Under exhaustive acquisition every open chain is mandatory.
+        Mandatory chains use a deterministic least-recently-advanced order, so
+        one productive multi-page family cannot starve another unresolved
+        family. Merely reading this method never advances the order.
+
+        ``mandatory_only`` lets a forced-correction caller refuse an advisory
+        cursor when no mandatory action remains.
         """
 
+        normalized = normalize_retrieval_completeness_policy(policy)
         if self.terminal_failure is not None:
             return None
-        for chain in self._open.values():
+
+        ordered = sorted(
+            self._open.values(),
+            key=lambda chain: (
+                max(0, int(chain.ready_sequence)),
+                chain.family_sha256,
+            ),
+        )
+        mandatory = [
+            chain
+            for chain in ordered
+            if self._chain_requires_mandatory_continuation(
+                chain, normalized
+            )
+        ]
+        if mandatory:
+            candidates = mandatory
+        elif mandatory_only:
+            return None
+        else:
+            candidates = ordered
+
+        for chain in candidates:
             action = chain.continuation_action
             if isinstance(action, dict) and action.get("kind") != "degrade":
                 return copy.deepcopy(action)

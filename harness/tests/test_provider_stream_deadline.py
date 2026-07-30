@@ -23,6 +23,15 @@ def _plan(**overrides):
     return build_provider_stream_deadline_plan(**values)
 
 
+class _FakeClock:
+    def __init__(self, now: float = 0.0) -> None:
+        self.now = now
+
+    def advance(self, seconds: float) -> float:
+        self.now += seconds
+        return self.now
+
+
 class ProviderStreamDeadlinePlanTests(unittest.TestCase):
     def test_large_request_gets_budgeted_time_without_exceeding_hard_cap(self):
         plan = _plan()
@@ -45,6 +54,23 @@ class ProviderStreamDeadlinePlanTests(unittest.TestCase):
         )
 
         self.assertEqual(600.0, plan.planned_deadline_seconds)
+
+    def test_planned_estimate_does_not_shrink_progress_grace(self):
+        plan = _plan(
+            estimated_input_tokens=0,
+            max_output_tokens=1,
+            initial_lease_seconds=20.0,
+            progress_grace_seconds=40.0,
+            configured_hard_cap_seconds=200.0,
+            input_planning_tokens_per_second=1_000_000.0,
+            output_planning_tokens_per_second=1_000_000.0,
+            planning_safety_factor=1.0,
+            fixed_overhead_seconds=1.0,
+        )
+
+        self.assertEqual(20.0, plan.planned_deadline_seconds)
+        self.assertEqual(40.0, plan.progress_grace_seconds)
+        self.assertEqual(200.0, plan.hard_cap_seconds)
 
     def test_invalid_config_fails_closed(self):
         invalid = {
@@ -79,7 +105,40 @@ class MaterialProgressLeaseTests(unittest.TestCase):
         for now in (1_000.0, 1_175.0, 1_350.0, 1_525.0):
             lease.observe_material_progress(1, now=now)
         self.assertLessEqual(lease.deadline, lease.hard_deadline)
-        self.assertEqual(lease.started_at + lease.plan.planned_deadline_seconds, lease.hard_deadline)
+        self.assertEqual(
+            lease.started_at + lease.plan.hard_cap_seconds,
+            lease.hard_deadline,
+        )
+
+    def test_planned_checkpoint_is_observed_not_enforced(self):
+        plan = _plan(
+            estimated_input_tokens=0,
+            max_output_tokens=1,
+            initial_lease_seconds=120.0,
+            progress_grace_seconds=45.0,
+            configured_hard_cap_seconds=240.0,
+            input_planning_tokens_per_second=1_000_000.0,
+            output_planning_tokens_per_second=1_000_000.0,
+            planning_safety_factor=1.0,
+            fixed_overhead_seconds=1.0,
+        )
+        clock = _FakeClock(1_000.0)
+        lease = MaterialProgressLease.start(plan, now=clock.now)
+
+        self.assertEqual(120.0, plan.planned_deadline_seconds)
+        self.assertEqual(1_120.0, lease.deadline)
+        self.assertEqual(1_240.0, lease.hard_deadline)
+
+        self.assertTrue(
+            lease.observe_material_progress(
+                1,
+                now=clock.advance(119.0),
+            )
+        )
+        self.assertEqual(1_164.0, lease.deadline)
+        metrics = lease.debug_payload(now=clock.advance(2.0))
+        self.assertTrue(metrics["planned_budget_crossed"])
+        self.assertEqual("progress_lease", metrics["deadline_kind"])
 
     def test_empty_transport_frames_do_not_renew(self):
         lease = MaterialProgressLease.start(_plan(), now=0.0)

@@ -5081,6 +5081,7 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("agent_loop.run_stream", fake_run_stream),
+            patch("tools.delegation.get_workspace") as get_workspace,
             patch(
                 "tools.delegation.persist_result_for_history",
                 return_value="results/delegate_artifacts.md",
@@ -5100,6 +5101,7 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "error")
         self.assertIn("no verified successful", result["error"])
         self.assertEqual(result["artifact_receipts"], [])
+        get_workspace.assert_not_called()
 
     async def test_artifact_receipts_must_match_real_declared_workspace_files(self):
         with tempfile.TemporaryDirectory() as tmp:

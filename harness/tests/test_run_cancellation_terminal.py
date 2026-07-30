@@ -1,6 +1,8 @@
 import asyncio
 import inspect
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import agent_loop
@@ -26,6 +28,14 @@ def _event(event_type: str, run_id: str, seq: int, payload=None) -> dict:
 
 class RunCancellationTerminalTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self._sandbox_temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._sandbox_temp_dir.cleanup)
+        self._sandbox_root_patch = patch(
+            "tools.path_security.SANDBOX_ROOT",
+            Path(self._sandbox_temp_dir.name),
+        )
+        self._sandbox_root_patch.start()
+        self.addCleanup(self._sandbox_root_patch.stop)
         agent_loop.set_harness_service_shutdown_started(False)
 
     async def test_cancel_writes_terminal_before_sink_and_reraises(self):

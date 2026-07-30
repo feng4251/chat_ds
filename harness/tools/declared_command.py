@@ -11,6 +11,7 @@ from runtime.python_env import (
 )
 from skills.command_grants import grant_tuple, load_current_skill_command_grants
 from tools.context import ToolContext
+from tools.effect_receipt import build_isolated_execution_effect_receipt
 from tools.execution_fence import require_execution_authority
 from tools.isolated_skill_executor import (
     IsolatedSkillExecutorError,
@@ -205,6 +206,11 @@ async def run_declared_command(
         "fallback_attempted": False,
         "runtime_preflight": command_preflight,
     })
+    result["effect_receipt"] = build_isolated_execution_effect_receipt(
+        result=result,
+        egress_rules=egress_policy.rule_payload(),
+        tool_operation_id=context.tool_operation_id,
+    )
     return json.dumps(result, ensure_ascii=False)
 
 

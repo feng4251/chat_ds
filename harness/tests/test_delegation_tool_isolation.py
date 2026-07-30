@@ -1284,8 +1284,24 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
             ["workers/research.yaml"],
         )
         self.assertEqual(
-            [event["event_type"] for event in events[:4]],
-            ["agent.spawned", "run.started", "tool.started", "tool.completed"],
+            [event["event_type"] for event in events[:5]],
+            [
+                "agent.spawned",
+                "debug.delegate.authority_snapshot",
+                "run.started",
+                "tool.started",
+                "tool.completed",
+            ],
+        )
+        authority_event = events[1]
+        run_started = events[2]
+        self.assertEqual(
+            authority_event["payload"]["authority_snapshot_sha256"],
+            run_started["payload"]["authority_snapshot_sha256"],
+        )
+        self.assertEqual(
+            authority_event["payload"],
+            run_started["payload"]["authority_snapshot"],
         )
         self.assertEqual(
             [event["seq"] for event in events],
@@ -1631,7 +1647,14 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             [event["seq"] for event in persisted_lifecycle],
-            [events[0]["seq"], events[1]["seq"], events[-1]["seq"]],
+            [
+                events[0]["seq"],
+                next(
+                    event["seq"] for event in events
+                    if event["event_type"] == "run.started"
+                ),
+                events[-1]["seq"],
+            ],
         )
 
     async def test_missing_capability_skill_fails_closed_without_model(self):
@@ -1716,6 +1739,7 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
             [event["event_type"] for event in events],
             [
                 "agent.spawned",
+                "debug.delegate.authority_snapshot",
                 "run.started",
                 "tool.started",
                 "tool.failed",

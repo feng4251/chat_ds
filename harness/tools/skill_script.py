@@ -21,6 +21,9 @@ from runtime.python_env import preflight_declared_skill_dependencies
 from skills.path_safety import validate_skill_resource, validate_skill_root
 from skills import scanner as skill_scanner
 from tools.context import ToolContext
+from tools.effect_receipt import (
+    build_isolated_execution_effect_receipt,
+)
 from tools.execution_fence import require_execution_authority
 from tools.omission_guard import (
     compacted_history_omission_error,
@@ -279,6 +282,13 @@ async def run_skill_script(
     payload["runtime_preflight"] = runtime_preflight
     payload["fallback_attempted"] = False
     payload["workspace_output_dir"] = "workspace/output_result"
+    payload["effect_receipt"] = build_isolated_execution_effect_receipt(
+        result=payload,
+        egress_rules=egress_policy.rule_payload(),
+        tool_operation_id=(
+            context.tool_operation_id if context is not None else None
+        ),
+    )
     if resolved_path != display_path:
         payload["resolved_skill_script_path"] = resolved_path
     return json.dumps(payload, ensure_ascii=False)
