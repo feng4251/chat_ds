@@ -290,9 +290,36 @@ class SkillWorkflowRuntimeTests(unittest.TestCase):
 
         recorded = state.skill_worker_results["generic"]["research"]
         self.assertEqual(original_error, recorded["error"])
-        self.assertEqual("delegation_contract_error", recorded["terminal_reason"])
+        self.assertEqual(
+            "delegation_contract_error",
+            recorded["terminal_reason"],
+        )
         self.assertIsNone(recorded["child_run_id"])
         self.assertEqual("failed", recorded["completion_quality"])
+
+    def test_delegate_preflight_rejection_is_not_parsed_as_result_envelope(self):
+        state = HarnessRunState(
+            available_tools={"delegate_task"},
+            original_user_text="Perform bounded delegated work.",
+        )
+
+        update = state.record_delegate_task(
+            {"goal": "bounded delegated work"},
+            {
+                "error": "schema rejected the call",
+                "reason": "tool_schema_validation_failed",
+                "tool_name": "delegate_task",
+                "actual_dispatch_attempted": False,
+                "dispatch_state": "not_dispatched",
+            },
+        )
+
+        self.assertEqual([], update["protocol_errors"])
+        self.assertEqual({
+            "actual_dispatch_attempted": False,
+            "reason": "tool_schema_validation_failed",
+            "tool_name": "delegate_task",
+        }, update["preflight_rejection"])
 
     @staticmethod
     def _failed_bootstrap_result(

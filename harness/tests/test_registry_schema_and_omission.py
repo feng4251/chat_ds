@@ -513,6 +513,26 @@ class RegistryPurePreflightTests(unittest.TestCase):
         )
         return registry, calls
 
+    def test_rejection_is_a_canonical_non_dispatch_receipt(self):
+        registry = ToolRegistry()
+
+        rejected = registry.preflight("missing_tool", {"value": "ignored"})
+
+        self.assertFalse(rejected.ok)
+        self.assertEqual("unknown_tool", rejected.reason)
+        self.assertEqual("missing_tool", rejected.error_payload["tool_name"])
+        self.assertFalse(
+            rejected.error_payload["actual_dispatch_attempted"]
+        )
+        self.assertEqual(
+            "not_dispatched",
+            rejected.error_payload["dispatch_state"],
+        )
+        self.assertEqual(
+            rejected.error_payload,
+            json.loads(rejected.error_json()),
+        )
+
     def test_preflight_is_pure_and_returns_exact_normalized_dispatch_args(self):
         registry, calls = self._registry()
 

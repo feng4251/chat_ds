@@ -5,8 +5,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from tools.path_security import safe_sandbox_dir
-
 WORKSPACE_ROOT = Path("/nfs/temp/chat_ds")
 MAX_CHARS = 20_000
 FILES = (
@@ -25,6 +23,12 @@ INVISIBLE = {"\u200b", "\u200c", "\u2060", "\ufeff", "\u202a", "\u202b", "\u202d
 
 
 def get_workspace(user_id: str, session_id: str) -> Path:
+    # Import lazily so this leaf context module can be imported before the
+    # tool-package registration side effects. Importing ``tools.path_security``
+    # at module load initializes ``tools.__init__``, which imports delegation,
+    # which imports this module again.
+    from tools.path_security import safe_sandbox_dir
+
     return safe_sandbox_dir(
         WORKSPACE_ROOT,
         user_id,

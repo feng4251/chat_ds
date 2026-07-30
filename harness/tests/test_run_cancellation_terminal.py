@@ -38,6 +38,80 @@ class RunCancellationTerminalTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self._sandbox_root_patch.stop)
         agent_loop.set_harness_service_shutdown_started(False)
 
+    async def test_pre_spawn_validation_failure_has_durable_semantic_card(self):
+        sink_events: list[dict] = []
+
+        async def event_sink(event: dict) -> None:
+            sink_events.append(event)
+
+        async def rejected_child(*_args, **_kwargs):
+            return {
+                "index": 0,
+                "status": "error",
+                "error": "compiled child metadata was invalid",
+                "terminal_reason": "delegation_contract_error",
+                "failure_class": "contract_validation",
+                "retryable": False,
+            }
+
+        context = ToolContext(
+            user_id="user",
+            session_id="session",
+            model_id="model",
+            provider_config={
+                "base_url": "http://example",
+                "api_model": "model",
+                "context_length": 303_872,
+            },
+            enabled_tools=("delegate_task",),
+            run_id="root-run",
+            root_run_id="root-run",
+            event_sink=event_sink,
+        )
+        tracker = delegation._ChildDispatchReceiptTracker()
+        with (
+            patch.object(delegation, "_run_child", rejected_child),
+            patch.object(delegation.settings, "agent_debug_trace", False),
+        ):
+            result = await delegation._run_child_with_dispatch_receipts(
+                {
+                    "goal": "review the declared evidence",
+                    "worker_id": "evidence-reviewer",
+                    "step_type": "worker",
+                    "step_id": "evidence",
+                },
+                context,
+                0,
+                tracker,
+            )
+
+        self.assertEqual("error", result["status"])
+        self.assertEqual(
+            sink_events[-1]["run_id"],
+            result["child_run_id"],
+        )
+        self.assertEqual("evidence-reviewer", result["agent_name"])
+        self.assertEqual(
+            ["agent.spawned", "run.failed"],
+            [event["event_type"] for event in sink_events],
+        )
+        self.assertEqual(
+            {"evidence-reviewer"},
+            {event["agent_name"] for event in sink_events},
+        )
+        failed = sink_events[-1]["payload"]
+        self.assertTrue(failed["authoritative"])
+        self.assertFalse(failed["actual_dispatch_attempted"])
+        self.assertTrue(failed["pre_spawn_validation"])
+        self.assertEqual(
+            "delegation_contract_error",
+            failed["terminal_reason"],
+        )
+        self.assertEqual(
+            "run.failed",
+            tracker.terminal_event(sink_events[-1]["run_id"]),
+        )
+
     async def test_cancel_writes_terminal_before_sink_and_reraises(self):
         entered = asyncio.Event()
         release = asyncio.Event()

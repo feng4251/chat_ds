@@ -616,7 +616,9 @@ class AgentEventPersistenceTests(unittest.IsolatedAsyncioTestCase):
                 select(TaskItem).where(TaskItem.run_id == "root")
             )).scalar_one()
             self.assertEqual(root.status, "failed")
+            self.assertEqual("fixture_failure", root.finish_reason)
             self.assertEqual(root_task.status, "failed")
+            self.assertEqual("fixture_failure", root_task.summary)
 
     async def test_terminal_projection_reconciles_root_usage_only(self):
         child_completed = _event("run.completed", 1)

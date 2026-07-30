@@ -20,6 +20,7 @@ from tools.delegation import (
     _tool_allowed_in_child,
     delegate_task,
 )
+from tools.registry import json_schema_value_error
 
 
 def _context(
@@ -156,6 +157,123 @@ def _catalog_for_bindings(
 
 
 class DelegationToolPolicyTests(unittest.TestCase):
+    def test_public_schema_accepts_exact_egress_in_all_candidate_locations(self):
+        parameters = DELEGATE_TASK_SCHEMA["parameters"]
+        rule = {
+            "methods": ["GET", "HEAD"],
+            "url_prefix": "https://allowed.example:443/data/",
+        }
+
+        def candidate(field: str) -> dict:
+            if field == "browser_egress_rules":
+                return {
+                    "candidate_id": "browser-candidate",
+                    "kind": "native_tool",
+                    "tool_name": "browser_navigate",
+                    "tool_names": ["browser_navigate"],
+                    field: [rule],
+                }
+            value = (
+                ["https://allowed.example/data/"]
+                if field == "sandbox_egress_url_prefixes"
+                else [rule]
+            )
+            return {
+                "candidate_id": "script-candidate",
+                "kind": "skill_script",
+                "tool_names": ["run_skill_python"],
+                field: value,
+            }
+
+        def decorate(
+            node: dict,
+            location: str,
+            field: str,
+        ) -> None:
+            row = candidate(field)
+            if location == "direct":
+                node["capability_bindings"] = [row]
+            elif location == "static":
+                node["unconditional_capability_plan"] = {
+                    "schema_version": 1,
+                    "worker_id": "worker",
+                    "owner_skill": "portable-skill",
+                    "selectors": ["declared-selector"],
+                    "candidates": [row],
+                }
+            else:
+                node["knowledge_gate_plan"] = {
+                    "schema_version": 1,
+                    "worker_id": "worker",
+                    "owner_skill": "portable-skill",
+                    "checks": [{
+                        "id": "check-1",
+                        "question": "Is evidence needed?",
+                        "legacy_ambiguous": False,
+                        "branches": [{
+                            "outcome": "yes",
+                            "action": "retrieve",
+                            "group_ids": ["group-1"],
+                        }],
+                    }],
+                    "groups": [{
+                        "id": "group-1",
+                        "check_id": "check-1",
+                        "outcome": "yes",
+                        "mode": "one_of",
+                        "candidate_ids": [row["candidate_id"]],
+                        "selectors": ["declared-selector"],
+                        "unresolved_selectors": [],
+                    }],
+                    "candidates": [row],
+                }
+
+        for batch in (False, True):
+            for location in ("direct", "static", "knowledge_gate"):
+                for field in (
+                    "sandbox_egress_url_prefixes",
+                    "sandbox_egress_rules",
+                    "browser_egress_rules",
+                ):
+                    with self.subTest(
+                        batch=batch,
+                        location=location,
+                        field=field,
+                    ):
+                        task = {"goal": "bounded delegated work"}
+                        decorate(task, location, field)
+                        args = {"tasks": [task]} if batch else task
+                        error = json_schema_value_error(
+                            args,
+                            parameters,
+                            value_path="args",
+                            schema_path="schema",
+                        )
+                        self.assertIsNone(error)
+
+    def test_public_schema_rejects_malformed_exact_egress_rule(self):
+        error = json_schema_value_error(
+            {
+                "goal": "bounded delegated work",
+                "capability_bindings": [{
+                    "candidate_id": "script-candidate",
+                    "kind": "skill_script",
+                    "tool_names": ["run_skill_python"],
+                    "sandbox_egress_rules": [{
+                        "methods": ["GET"],
+                        "url_prefix": "https://allowed.example/data/",
+                        "undeclared": True,
+                    }],
+                }],
+            },
+            DELEGATE_TASK_SCHEMA["parameters"],
+            value_path="args",
+            schema_path="schema",
+        )
+
+        self.assertIn("undeclared", error or "")
+        self.assertIn("unexpected property", error or "")
+
     def test_native_browser_package_mutation_fails_closed_before_child(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "frozen-browser"

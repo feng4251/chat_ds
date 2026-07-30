@@ -434,9 +434,48 @@ description: A generic instruction-only workflow.
             "# Workflow\n\nYou must orchestrate independent agents.",
             "# Steps\n\n- Delegate the review to two workers.",
             "# 流程\n\n让子代理分别执行并复核结果。",
+            """# Workflow
+
+| Agent | Responsibilities | Output |
+| --- | --- | --- |
+| Evidence Agent | Review sources | Evidence table |
+| Safety Agent | Review risks | Risk register |
+| Coordinator Agent | Aggregate conclusions | Final report |
+
+- Round 1: all Agents independently assess the inputs.
+- Round 2: the Coordinator aggregates a consensus report.
+""",
+            """# 工作流
+
+| Agent | 职责 | 核心输出 |
+| --- | --- | --- |
+| 证据 Agent | 复核资料 | 证据表 |
+| 安全 Agent | 复核风险 | 风险清单 |
+| Coordinator Agent | 汇总意见 | 最终报告 |
+
+- 第一轮：各 Agent 独立评估。
+- 第二轮：Coordinator Agent 汇总并生成最终报告。
+""",
         ):
             with self.subTest(content=content):
                 self.assertTrue(
+                    _standard_skill_declares_delegated_workflow(content)
+                )
+
+        for content in (
+            """# Workflow
+
+This section explains that agents and coordinators exist in some systems.
+It mentions Round 1 and Round 2 only as historical examples.
+""",
+            """# Steps
+
+- Ask whether an Agent table or a second review round would be useful.
+- Do not delegate any work.
+""",
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(
                     _standard_skill_declares_delegated_workflow(content)
                 )
 

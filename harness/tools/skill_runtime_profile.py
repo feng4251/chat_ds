@@ -2562,6 +2562,166 @@ def _python_import_aliases(tree: ast.AST) -> dict[str, str]:
     return aliases
 
 
+_PYTHON_PATH_VALUE_NAME_RE = re.compile(
+    r"(?:^|_)(?:path|file|filename|database|db|directory|dir)$",
+    re.IGNORECASE,
+)
+_PYTHON_LITERAL_FILE_CALLS = frozenset({
+    "builtins.open",
+    "io.open",
+    "open",
+    "os.open",
+    "pathlib.Path",
+    "Path",
+    "sqlite3.connect",
+})
+
+
+def _normalize_package_relative_path(
+    base: PurePosixPath,
+    raw_path: str,
+) -> str | None:
+    """Resolve one relative path lexically without touching the host FS."""
+
+    value = str(raw_path or "").strip()
+    if (
+        not value
+        or value.startswith(("/", "~"))
+        or "\x00" in value
+        or "://" in value
+        or value == ":memory:"
+    ):
+        return None
+    parts: list[str] = []
+    for part in (*base.parts, *PurePosixPath(value).parts):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if not parts:
+                return None
+            parts.pop()
+            continue
+        parts.append(part)
+    return "/".join(parts) or None
+
+
+def _python_relative_resource_cwds(
+    source: str,
+    *,
+    package_paths: frozenset[str],
+    runtime_script_base: PurePosixPath,
+) -> frozenset[str]:
+    """Infer cwd only from exact package-backed Python resource literals.
+
+    A common portable Skill pattern passes ``../data/file.db`` as a constructor
+    default and later opens that value. The previous runtime compiler analyzed
+    code-dispatch paths but not package data paths, so such entrypoints were
+    launched from the Skill root and failed despite the file being present.
+    This pass is deliberately narrow: the value must be attached to a path-like
+    name or a known file-opening call *and* resolve to an immutable file in the
+    same package snapshot.
+    """
+
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return frozenset()
+    aliases = _python_import_aliases(tree)
+    literals: set[str] = set()
+
+    def add_named_literal(name: str, value_node: ast.AST | None) -> None:
+        if _PYTHON_PATH_VALUE_NAME_RE.search(str(name or "")) is None:
+            return
+        value = _ast_literal_string(value_node)
+        if value is not None:
+            literals.add(value)
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            positional = [
+                *node.args.posonlyargs,
+                *node.args.args,
+            ]
+            first_default = len(positional) - len(node.args.defaults)
+            for index, default in enumerate(node.args.defaults):
+                add_named_literal(
+                    positional[first_default + index].arg,
+                    default,
+                )
+            for argument, default in zip(
+                node.args.kwonlyargs,
+                node.args.kw_defaults,
+            ):
+                add_named_literal(argument.arg, default)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    add_named_literal(target.id, node.value)
+                elif isinstance(target, ast.Attribute):
+                    add_named_literal(target.attr, node.value)
+        elif isinstance(node, ast.AnnAssign):
+            target = node.target
+            if isinstance(target, ast.Name):
+                add_named_literal(target.id, node.value)
+            elif isinstance(target, ast.Attribute):
+                add_named_literal(target.attr, node.value)
+        elif isinstance(node, ast.Call):
+            call_name = _python_call_name(node.func, aliases)
+            if call_name not in _PYTHON_LITERAL_FILE_CALLS:
+                continue
+            value_node = node.args[0] if node.args else next(
+                (
+                    keyword.value
+                    for keyword in node.keywords
+                    if keyword.arg in {
+                        "database",
+                        "file",
+                        "filename",
+                        "path",
+                    }
+                ),
+                None,
+            )
+            value = _ast_literal_string(value_node)
+            if value is not None:
+                literals.add(value)
+
+    required: set[str] = set()
+    for value in literals:
+        script_candidate = _normalize_package_relative_path(
+            runtime_script_base,
+            value,
+        )
+        skill_candidate = _normalize_package_relative_path(
+            PurePosixPath("."),
+            value,
+        )
+        script_exists = bool(
+            script_candidate and script_candidate in package_paths
+        )
+        skill_exists = bool(
+            skill_candidate and skill_candidate in package_paths
+        )
+        if (
+            script_exists
+            and skill_exists
+            and script_candidate != skill_candidate
+        ):
+            raise IsolatedSkillExecutorError(
+                "skill_runtime_cwd_ambiguous",
+                f"Python resource path {value!r} resolves to different exact "
+                "package files under script and skill cwd policies. Anchor "
+                "the path with __file__ or CHATDS_SKILL_DIR.",
+            )
+        if script_exists and (
+            not skill_exists or runtime_script_base != PurePosixPath(".")
+        ):
+            required.add("script")
+        elif skill_exists:
+            required.add("skill")
+    return frozenset(required)
+
+
 def _python_subprocess_analysis(
     path: str,
     call: ast.Call,
@@ -4002,6 +4162,7 @@ def select_skill_runtime_profile(
     dynamic_python_or_shell = False
     inspected_bytes = 0
     runtime_script_base = PurePosixPath(entrypoint).parent
+    package_paths = frozenset(snapshot.paths)
     while queue:
         path = queue.pop()
         if path in seen:
@@ -4043,6 +4204,11 @@ def select_skill_runtime_profile(
                 analysis.runtime_commands
             )
             required_cwds.update(analysis.required_cwds)
+            required_cwds.update(_python_relative_resource_cwds(
+                source,
+                package_paths=package_paths,
+                runtime_script_base=runtime_script_base,
+            ))
             cwd_mutated = cwd_mutated or analysis.cwd_mutated
             if analysis.dynamic_dependency:
                 dynamic_dependency_sources.add(path)

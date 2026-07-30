@@ -5839,6 +5839,21 @@ class HarnessRunState:
                 "delegate arguments/result envelope must both be objects"
             )
             return update
+        if (
+            result_data.get("actual_dispatch_attempted") is False
+            or result_data.get("dispatch_state") == "not_dispatched"
+        ):
+            update["preflight_rejection"] = {
+                "actual_dispatch_attempted": False,
+                "reason": str(
+                    result_data.get("reason")
+                    or "delegate_task_preflight_rejected"
+                ),
+                "tool_name": str(
+                    result_data.get("tool_name") or "delegate_task"
+                ),
+            }
+            return update
         submitted: list[dict[str, Any]] = []
         if args.get("goal"):
             submitted.append({
@@ -19694,6 +19709,9 @@ async def run_stream(
                 auto_result = json.dumps({
                     "error": auto_error,
                     "reason": "workflow_auto_dispatch_invalid",
+                    "tool_name": auto_tool_name,
+                    "actual_dispatch_attempted": False,
+                    "dispatch_state": "not_dispatched",
                 }, ensure_ascii=False)
             else:
                 auto_preflight = preflight_native_tool_call(
@@ -19772,7 +19790,10 @@ async def run_stream(
                 )
             auto_boundary_guidance: list[str] = []
             auto_skill_resource_complete = True
-            if auto_tool_name == "delegate_task":
+            if (
+                auto_tool_name == "delegate_task"
+                and auto_actual_dispatch_attempted
+            ):
                 # A delegate envelope may legitimately have status=error while
                 # still carrying a complete per-child ledger. Record those
                 # facts before deciding whether any step may be retried.
@@ -36422,7 +36443,96 @@ def _standard_skill_declares_delegated_workflow(content: Any) -> bool:
         ):
             continue
         return True
-    return False
+
+    # Some portable Skills declare the same procedure structurally instead of
+    # repeating an imperative verb on every row: a role table, multiple
+    # numbered rounds, and a coordinator/fan-in step together are an executable
+    # workflow declaration.  Require multiple independent structural signals
+    # so incidental prose about "agents" or "rounds" does not activate
+    # delegation.  This remains an activation classifier only; Workflow IR and
+    # exact capability receipts are still the authority boundary.
+    structural_lines = [
+        line.strip()
+        for line in directives.splitlines()
+        if line.strip()
+    ]
+    agent_term = re.compile(
+        r"(?:\b(?:agents?|subagents?|workers?|coordinator)\b|"
+        r"(?:子代理|代理|智能体|工作者|协调者)|"
+        r"[A-Za-z0-9_\u4e00-\u9fff-]{1,64}\s*Agent\b)",
+        re.IGNORECASE,
+    )
+    role_signal = re.compile(
+        r"(?:\b(?:role|responsibilit(?:y|ies)|owner|output|deliverable)\b|"
+        r"(?:角色|职责|负责|核心输出|交付物))",
+        re.IGNORECASE,
+    )
+    role_lines = {
+        line
+        for line in structural_lines
+        if (
+            agent_term.search(line)
+            and (
+                "|" in line
+                or role_signal.search(line)
+                or re.search(r"(?:[:：]|->|→)", line)
+            )
+            and not re.fullmatch(r"[\s|:—-]+", line)
+        )
+    }
+    round_pattern = re.compile(
+        r"(?:"
+        r"\b(?:round|wave)\s*[-_:]?\s*"
+        r"(?:[1-9][0-9]?|one|two|three|first|second|third)\b|"
+        r"(?:第\s*(?:[一二三四五六七八九十0-9]{1,4})\s*轮)|"
+        r"(?:轮次\s*[-_:：]?\s*[一二三四五六七八九十0-9]{1,4})"
+        r")",
+        re.IGNORECASE,
+    )
+    round_markers = {
+        match.group(0).casefold().replace(" ", "")
+        for line in structural_lines
+        for match in round_pattern.finditer(line)
+    }
+    parallel_signal = any(
+        agent_term.search(line)
+        and re.search(
+            r"(?:\b(?:all|each)\b.{0,48}"
+            r"\b(?:independently|separately|concurrently|in\s+parallel)\b|"
+            r"\b(?:independently|separately|concurrently|in\s+parallel)\b"
+            r".{0,48}\b(?:agents?|subagents?|workers?)\b|"
+            r"(?:所有|各|每个).{0,24}(?:代理|Agent|智能体|工作者)"
+            r".{0,24}(?:独立|分别|同时|并行)|"
+            r"(?:独立|分别|同时|并行).{0,24}"
+            r"(?:代理|Agent|智能体|工作者))",
+            line,
+            re.IGNORECASE,
+        )
+        is not None
+        for line in structural_lines
+    )
+    fan_in_signal = any(
+        re.search(
+            r"(?:\b(?:coordinator|orchestrator|lead\s+agent)\b|"
+            r"\b(?:aggregate|synthesi[sz]e|consensus|final\s+report)\b|"
+            r"(?:协调者|协调Agent|汇总|聚合|整合|共识|最终.{0,16}报告))",
+            line,
+            re.IGNORECASE,
+        )
+        is not None
+        for line in structural_lines
+    )
+    return bool(
+        (
+            len(role_lines) >= 3
+            and (fan_in_signal or len(round_markers) >= 2)
+        )
+        or (
+            len(round_markers) >= 2
+            and parallel_signal
+            and fan_in_signal
+        )
+    )
 
 
 def _standard_skill_uses_semantic_capability_plan(

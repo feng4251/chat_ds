@@ -1384,6 +1384,11 @@ def _project_task_event(
     elif event_type == "run.failed":
         task.status = "failed"
         task.error = str(payload.get("error") or "Unknown error")
+        task.summary = str(
+            payload.get("finish_reason")
+            or payload.get("terminal_reason")
+            or "agent_run_failed"
+        )[:4000]
         task.ended_at = now
     elif event_type == "run.cancelled":
         task.status = "cancelled"
@@ -1669,6 +1674,11 @@ async def _persist_agent_events(
             run.error = _bounded_agent_run_error(
                 payload.get("error") or "Unknown error"
             )
+            run.finish_reason = str(
+                payload.get("finish_reason")
+                or payload.get("terminal_reason")
+                or "agent_run_failed"
+            )[:256]
             usage_payload = (
                 payload.get("usage")
                 if isinstance(payload.get("usage"), dict)
