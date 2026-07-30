@@ -65,6 +65,7 @@ from tools.isolated_skill_executor import (
 from tools.path_security import sandbox_dir
 from tools.session_sandbox_policy import (
     SessionSandboxPolicyError,
+    session_sandbox_egress_budget_binding,
 )
 from tools.skill_invocation_egress import (
     bind_python_invocation_parameters,
@@ -729,6 +730,14 @@ class SkillProcessManager:
         socket_path: str,
     ) -> tuple[_ManagedProcess, dict[str, Any]]:
         owner = _owner_key(context)
+        egress_budget_binding = (
+            session_sandbox_egress_budget_binding(
+                context,
+                operation="skill_process",
+            )
+            if egress_rules
+            else None
+        )
         workspace = sandbox_dir(
             context.user_id,
             context.session_id,
@@ -823,6 +832,12 @@ class SkillProcessManager:
                         {
                             "egress_rules": egress_rules,
                             "private_origins": private_origins,
+                            "budget_scope_sha256": (
+                                egress_budget_binding.budget_scope_sha256
+                            ),
+                            "call_id_sha256": (
+                                egress_budget_binding.call_id_sha256
+                            ),
                         }
                         if egress_rules else {}
                     ),

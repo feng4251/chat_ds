@@ -20,6 +20,7 @@ class ProcessLeaseAcceptancePolicyTests(unittest.TestCase):
             import asyncio
             import json
             from pathlib import Path
+            from types import SimpleNamespace
 
             import executor.browser_runtime.process_lease_acceptance as target
 
@@ -35,6 +36,11 @@ class ProcessLeaseAcceptancePolicyTests(unittest.TestCase):
                     target._retrieval_rule(public),
                     target._retrieval_rule(private),
                 )
+                scope = SimpleNamespace(
+                    user_id="acceptance-user",
+                    session_id="acceptance-session",
+                    root_run_id="acceptance-root",
+                )
                 captured = {"open_calls": []}
 
                 async def fake_open(**kwargs):
@@ -42,6 +48,10 @@ class ProcessLeaseAcceptancePolicyTests(unittest.TestCase):
                         "egress_rules": kwargs.get("egress_rules"),
                         "private_origins": kwargs.get("private_origins"),
                         "has_egress_origins": "egress_origins" in kwargs,
+                        "budget_scope_sha256": kwargs.get(
+                            "budget_scope_sha256"
+                        ),
+                        "call_id_sha256": kwargs.get("call_id_sha256"),
                     })
                     raise StopAfterOpen
 
@@ -50,7 +60,7 @@ class ProcessLeaseAcceptancePolicyTests(unittest.TestCase):
                 try:
                     try:
                         await target._run_cli(
-                            object(),
+                            scope,
                             skill_root=Path("/unused/skill"),
                             workspace=Path("/unused/workspace"),
                             entrypoint="network_identity_probe.py",
@@ -64,7 +74,7 @@ class ProcessLeaseAcceptancePolicyTests(unittest.TestCase):
 
                     try:
                         await target._run_exact_visual_skill(
-                            object(),
+                            scope,
                             skill_root=Path("/unused/visual-skill"),
                             workspace=Path("/unused/visual-workspace"),
                             socket_path="/unused/executor.sock",
@@ -90,7 +100,9 @@ class ProcessLeaseAcceptancePolicyTests(unittest.TestCase):
                 original_scope = target.client.create_process_owner_scope
                 original_run_cli = target._run_cli
                 target.client.reap_isolated_executor_leases = fake_reap
-                target.client.create_process_owner_scope = lambda **_kwargs: object()
+                target.client.create_process_owner_scope = (
+                    lambda **_kwargs: scope
+                )
                 target._run_cli = fake_run_cli
                 try:
                     await target._main(argparse.Namespace(
@@ -161,6 +173,18 @@ class ProcessLeaseAcceptancePolicyTests(unittest.TestCase):
             visual["egress_rules"],
         )
         self.assertEqual([], visual["private_origins"])
+        self.assertRegex(
+            run_cli["budget_scope_sha256"],
+            r"^[0-9a-f]{64}$",
+        )
+        self.assertEqual(
+            run_cli["budget_scope_sha256"],
+            visual["budget_scope_sha256"],
+        )
+        self.assertNotEqual(
+            run_cli["call_id_sha256"],
+            visual["call_id_sha256"],
+        )
 
         compiled = captured["compiled_network_case"]
         self.assertEqual(

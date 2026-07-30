@@ -10,7 +10,9 @@ request-authority boundary.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import ipaddress
+import json
 import re
 from typing import Any, Iterable
 from urllib.parse import urlsplit, urlunsplit
@@ -74,6 +76,96 @@ class SessionSandboxEgressPolicy:
 
     def rule_payload(self) -> tuple[dict[str, Any], ...]:
         return tuple(rule.as_payload() for rule in self.rules)
+
+
+@dataclass(frozen=True, slots=True)
+class SessionSandboxEgressBudgetBinding:
+    """Opaque proxy binding derived only from runtime-owned run identity.
+
+    The raw tenant, session, and run identifiers never cross the executor
+    boundary.  A root-run digest lets the proxy enforce one aggregate budget
+    across every one-shot and persistent Skill invocation in that run; the
+    call digest keeps individual audit receipts attributable without exposing
+    those identifiers.
+    """
+
+    budget_scope_sha256: str
+    call_id_sha256: str
+
+
+def _runtime_scope_component(value: Any, *, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 4_096
+        or "\x00" in value
+    ):
+        raise SessionSandboxPolicyError(
+            f"invalid_session_sandbox_{field}"
+        )
+    return value
+
+
+def _scope_digest(payload: list[str]) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8", errors="strict")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def session_sandbox_egress_budget_binding(
+    context: ToolContext | None,
+    *,
+    operation: str,
+) -> SessionSandboxEgressBudgetBinding:
+    """Derive stable, opaque budget and call ids for one sandbox operation."""
+
+    if context is None:
+        raise SessionSandboxPolicyError(
+            "missing_session_sandbox_budget_context"
+        )
+    safe_operation = _runtime_scope_component(
+        operation,
+        field="budget_operation",
+    )
+    user_id = _runtime_scope_component(
+        context.user_id,
+        field="budget_user_id",
+    )
+    session_id = _runtime_scope_component(
+        context.session_id,
+        field="budget_session_id",
+    )
+    root_run_id = _runtime_scope_component(
+        context.root_run_id
+        or context.run_id
+        or context.browser_run_scope_id,
+        field="budget_root_run_id",
+    )
+    call_id = _runtime_scope_component(
+        context.tool_operation_id
+        or context.run_id
+        or context.browser_run_scope_id,
+        field="budget_call_id",
+    )
+    budget_scope_sha256 = _scope_digest([
+        "chatds.session-sandbox.egress-budget.v1",
+        user_id,
+        session_id,
+        root_run_id,
+    ])
+    return SessionSandboxEgressBudgetBinding(
+        budget_scope_sha256=budget_scope_sha256,
+        call_id_sha256=_scope_digest([
+            "chatds.session-sandbox.egress-call.v1",
+            budget_scope_sha256,
+            call_id,
+            safe_operation,
+        ]),
+    )
 
 
 def browser_egress_rule_tuples(

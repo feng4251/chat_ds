@@ -51,6 +51,7 @@ MAX_CONNECTIONS: Final[int] = 8
 MAX_DIRECTION_BUFFER_BYTES: Final[int] = 1024 * 1024
 IDLE_TIMEOUT_SECONDS: Final[float] = 660.0
 CONNECT_TIMEOUT_SECONDS: Final[float] = 5.0
+HANDLER_DRAIN_TIMEOUT_SECONDS: Final[float] = 10.0
 POLICY_PREFACE_PREFIX: Final[bytes] = b"CHATDS-EGRESS-POLICY-V1 "
 MAX_POLICY_PREFACE_BYTES: Final[int] = 64 * 1024
 POLICY_TTL_SECONDS: Final[int] = 60
@@ -59,6 +60,21 @@ POLICY_KEY_DERIVATION_LABEL: Final[bytes] = (
 )
 MAX_POLICY_ORIGINS: Final[int] = 128
 MAX_POLICY_RULES: Final[int] = 256
+BOUNDED_EXCHANGE_PROFILE: Final[str] = "bounded_controlled_exchange"
+AUDIT_RECEIPT_VERSION: Final[int] = 1
+DEFAULT_MAX_OUTBOUND_BYTES: Final[int] = 16 * 1024 * 1024
+DEFAULT_MAX_REQUESTS: Final[int] = 2_048
+DEFAULT_MAX_RESPONSE_WIRE_BYTES: Final[int] = 512 * 1024 * 1024
+ABSOLUTE_MAX_OUTBOUND_BYTES: Final[int] = 1024 * 1024 * 1024
+ABSOLUTE_MAX_REQUESTS: Final[int] = 65_536
+ABSOLUTE_MAX_RESPONSE_WIRE_BYTES: Final[int] = (
+    16 * 1024 * 1024 * 1024
+)
+_LIMIT_KEYS: Final[frozenset[str]] = frozenset({
+    "max_outbound_bytes",
+    "max_requests",
+    "max_response_wire_bytes",
+})
 EGRESS_METHOD_ORDER: Final[tuple[str, ...]] = (
     "GET",
     "HEAD",
@@ -91,6 +107,66 @@ _SHA256_HEX_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
 
 class BridgeConfigurationError(RuntimeError):
     """The deployment-owned proxy socket boundary is not trustworthy."""
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    """Encode one deterministic, bounded-control-plane JSON value."""
+
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _canonical_json_sha256(value: object) -> str:
+    return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+
+
+def _validated_v3_limits(
+    value: dict[str, object] | None,
+) -> dict[str, int]:
+    """Return exact, locally bounded per-call exchange limits."""
+
+    if value is None:
+        return {
+            "max_outbound_bytes": DEFAULT_MAX_OUTBOUND_BYTES,
+            "max_requests": DEFAULT_MAX_REQUESTS,
+            "max_response_wire_bytes": (
+                DEFAULT_MAX_RESPONSE_WIRE_BYTES
+            ),
+        }
+    if not isinstance(value, dict) or set(value) != _LIMIT_KEYS:
+        raise BridgeConfigurationError(
+            "invalid bounded exchange limits"
+        )
+    hard_limits = {
+        "max_outbound_bytes": ABSOLUTE_MAX_OUTBOUND_BYTES,
+        "max_requests": ABSOLUTE_MAX_REQUESTS,
+        "max_response_wire_bytes": (
+            ABSOLUTE_MAX_RESPONSE_WIRE_BYTES
+        ),
+    }
+    normalized: dict[str, int] = {}
+    for key in (
+        "max_outbound_bytes",
+        "max_requests",
+        "max_response_wire_bytes",
+    ):
+        raw = value.get(key)
+        if (
+            isinstance(raw, bool)
+            or not isinstance(raw, int)
+            or raw < 1
+            or raw > hard_limits[key]
+        ):
+            raise BridgeConfigurationError(
+                "invalid bounded exchange limits"
+            )
+        normalized[key] = raw
+    return normalized
 
 
 def _policy_auth_key(value: str | None = None) -> bytes:
@@ -386,6 +462,20 @@ def _validated_exact_policy(
     )
 
 
+def _authority_projection_sha256(
+    origins: tuple[str, ...],
+    rules: tuple[dict[str, object], ...],
+    private_origins: tuple[str, ...],
+) -> str:
+    """Bind every authority-bearing policy coordinate without exposing it."""
+
+    return _canonical_json_sha256({
+        "origins": list(origins),
+        "egress_rules": list(rules),
+        "private_origins": list(private_origins),
+    })
+
+
 def _policy_preface(
     origins: tuple[str, ...],
     *,
@@ -393,13 +483,38 @@ def _policy_preface(
     private_origins: tuple[str, ...],
     auth_key: bytes,
     trust_generation: str,
+    budget_scope_sha256: str | None = None,
+    call_id_sha256: str | None = None,
+    limits: dict[str, object] | None = None,
 ) -> bytes:
     if _SHA256_HEX_RE.fullmatch(trust_generation) is None:
         raise BridgeConfigurationError(
             "proxy trust generation is unavailable"
         )
+    v3_requested = any(
+        value is not None
+        for value in (
+            budget_scope_sha256,
+            call_id_sha256,
+            limits,
+        )
+    )
+    normalized_limits: dict[str, int] | None = None
+    if v3_requested:
+        if (
+            not isinstance(budget_scope_sha256, str)
+            or _SHA256_HEX_RE.fullmatch(
+                budget_scope_sha256
+            ) is None
+            or not isinstance(call_id_sha256, str)
+            or _SHA256_HEX_RE.fullmatch(call_id_sha256) is None
+        ):
+            raise BridgeConfigurationError(
+                "invalid bounded exchange identity"
+            )
+        normalized_limits = _validated_v3_limits(limits)
     unsigned = {
-        "version": 2,
+        "version": 3 if v3_requested else 2,
         "expires_unix": int(time.time()) + POLICY_TTL_SECONDS,
         "nonce": secrets.token_hex(16),
         "origins": list(origins),
@@ -407,13 +522,14 @@ def _policy_preface(
         "private_origins": list(private_origins),
         "trust_generation": trust_generation,
     }
-    canonical = json.dumps(
-        unsigned,
-        ensure_ascii=False,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    if v3_requested:
+        assert normalized_limits is not None
+        unsigned.update({
+            "budget_scope_sha256": budget_scope_sha256,
+            "call_id_sha256": call_id_sha256,
+            "limits": normalized_limits,
+        })
+    canonical = _canonical_json_bytes(unsigned)
     payload = {
         **unsigned,
         "auth_hmac": hmac.new(
@@ -866,7 +982,248 @@ class ProxyTrustAuthority:
         }
 
 
-def _relay(client: socket.socket, upstream: socket.socket) -> None:
+@dataclass(frozen=True, slots=True)
+class _RelayOutcome:
+    clean_close: bool
+    budget_rejected: bool
+
+
+class _InvocationAudit:
+    """Thread-safe local budget and disclosure-free audit accumulator."""
+
+    def __init__(
+        self,
+        *,
+        budget_scope_sha256: str,
+        call_id_sha256: str,
+        rules_sha256: str,
+        limits: dict[str, int],
+    ) -> None:
+        self.budget_scope_sha256 = budget_scope_sha256
+        self.call_id_sha256 = call_id_sha256
+        self.rules_sha256 = rules_sha256
+        self.limits = dict(limits)
+        self._lock = threading.Lock()
+        self._accepted_connections = 0
+        self._client_to_proxy_wire_bytes = 0
+        self._proxy_to_client_wire_bytes = 0
+        self._reserved_outbound_bytes = 0
+        self._reserved_response_bytes = 0
+        self._budget_rejections = 0
+        self._clean_closes = 0
+        self._exhausted = False
+        self._sealed_receipt: dict[str, object] | None = None
+
+    def _require_mutable(self) -> None:
+        if self._sealed_receipt is not None:
+            raise BridgeConfigurationError(
+                "bounded exchange audit is already sealed"
+            )
+
+    def try_accept_connection(self) -> bool:
+        with self._lock:
+            self._require_mutable()
+            if (
+                self._accepted_connections
+                >= self.limits["max_requests"]
+            ):
+                self._budget_rejections += 1
+                self._exhausted = True
+                return False
+            self._accepted_connections += 1
+            if (
+                self._accepted_connections
+                >= self.limits["max_requests"]
+            ):
+                self._exhausted = True
+            return True
+
+    def reserve_wire_bytes(
+        self,
+        direction: str,
+        amount: int,
+    ) -> bool:
+        if amount < 0:
+            raise BridgeConfigurationError(
+                "invalid bounded exchange byte reservation"
+            )
+        if amount == 0:
+            return True
+        with self._lock:
+            self._require_mutable()
+            if direction == "client_to_proxy":
+                current = (
+                    self._client_to_proxy_wire_bytes
+                    + self._reserved_outbound_bytes
+                )
+                limit = self.limits["max_outbound_bytes"]
+                if amount > limit - current:
+                    self._budget_rejections += 1
+                    self._exhausted = True
+                    return False
+                self._reserved_outbound_bytes += amount
+                return True
+            if direction == "proxy_to_client":
+                current = (
+                    self._proxy_to_client_wire_bytes
+                    + self._reserved_response_bytes
+                )
+                limit = self.limits[
+                    "max_response_wire_bytes"
+                ]
+                if amount > limit - current:
+                    self._budget_rejections += 1
+                    self._exhausted = True
+                    return False
+                self._reserved_response_bytes += amount
+                return True
+            raise BridgeConfigurationError(
+                "invalid bounded exchange byte direction"
+            )
+
+    def commit_wire_bytes(
+        self,
+        direction: str,
+        amount: int,
+    ) -> None:
+        if amount <= 0:
+            return
+        with self._lock:
+            self._require_mutable()
+            if direction == "client_to_proxy":
+                if amount > self._reserved_outbound_bytes:
+                    raise BridgeConfigurationError(
+                        "bounded exchange outbound accounting drift"
+                    )
+                self._reserved_outbound_bytes -= amount
+                self._client_to_proxy_wire_bytes += amount
+                return
+            if direction == "proxy_to_client":
+                if amount > self._reserved_response_bytes:
+                    raise BridgeConfigurationError(
+                        "bounded exchange response accounting drift"
+                    )
+                self._reserved_response_bytes -= amount
+                self._proxy_to_client_wire_bytes += amount
+                return
+            raise BridgeConfigurationError(
+                "invalid bounded exchange byte direction"
+            )
+
+    def release_wire_bytes(
+        self,
+        direction: str,
+        amount: int,
+    ) -> None:
+        if amount <= 0:
+            return
+        with self._lock:
+            self._require_mutable()
+            if direction == "client_to_proxy":
+                if amount > self._reserved_outbound_bytes:
+                    raise BridgeConfigurationError(
+                        "bounded exchange outbound accounting drift"
+                    )
+                self._reserved_outbound_bytes -= amount
+                return
+            if direction == "proxy_to_client":
+                if amount > self._reserved_response_bytes:
+                    raise BridgeConfigurationError(
+                        "bounded exchange response accounting drift"
+                    )
+                self._reserved_response_bytes -= amount
+                return
+            raise BridgeConfigurationError(
+                "invalid bounded exchange byte direction"
+            )
+
+    def record_clean_close(self) -> None:
+        with self._lock:
+            self._require_mutable()
+            self._clean_closes += 1
+
+    @staticmethod
+    def _copy_receipt(
+        receipt: dict[str, object],
+    ) -> dict[str, object]:
+        return json.loads(
+            _canonical_json_bytes(receipt).decode("utf-8")
+        )
+
+    def seal(self) -> dict[str, object]:
+        with self._lock:
+            if self._sealed_receipt is not None:
+                return self._copy_receipt(self._sealed_receipt)
+            if (
+                self._reserved_outbound_bytes
+                or self._reserved_response_bytes
+            ):
+                raise BridgeConfigurationError(
+                    "bounded exchange audit has unsettled byte reservations"
+                )
+            counts: dict[str, object] = {
+                "accepted_connections": (
+                    self._accepted_connections
+                ),
+                "client_to_proxy_wire_bytes": (
+                    self._client_to_proxy_wire_bytes
+                ),
+                "proxy_to_client_wire_bytes": (
+                    self._proxy_to_client_wire_bytes
+                ),
+                "budget_rejections": self._budget_rejections,
+                "clean_closes": self._clean_closes,
+            }
+            limits = dict(self.limits)
+            exhausted = bool(
+                self._exhausted
+                or (
+                    self._accepted_connections
+                    >= limits["max_requests"]
+                )
+                or (
+                    self._client_to_proxy_wire_bytes
+                    + self._reserved_outbound_bytes
+                    >= limits["max_outbound_bytes"]
+                )
+                or (
+                    self._proxy_to_client_wire_bytes
+                    + self._reserved_response_bytes
+                    >= limits["max_response_wire_bytes"]
+                )
+            )
+            receipt: dict[str, object] = {
+                "profile": BOUNDED_EXCHANGE_PROFILE,
+                "version": AUDIT_RECEIPT_VERSION,
+                "budget_scope_sha256": self.budget_scope_sha256,
+                "call_id_sha256": self.call_id_sha256,
+                "rules_sha256": self.rules_sha256,
+                "counts": counts,
+                "limits": limits,
+                "exhausted": exhausted,
+            }
+            receipt["receipt_sha256"] = _canonical_json_sha256(
+                receipt
+            )
+            self._sealed_receipt = receipt
+            return self._copy_receipt(receipt)
+
+    def receipt(self) -> dict[str, object]:
+        with self._lock:
+            if self._sealed_receipt is None:
+                raise BridgeConfigurationError(
+                    "bounded exchange audit is not sealed"
+                )
+            return self._copy_receipt(self._sealed_receipt)
+
+
+def _relay(
+    client: socket.socket,
+    upstream: socket.socket,
+    *,
+    audit: _InvocationAudit | None = None,
+    stop_event: threading.Event | None = None,
+) -> _RelayOutcome:
     """Relay bounded byte streams in both directions without parsing targets."""
 
     peers = {client: upstream, upstream: client}
@@ -907,27 +1264,49 @@ def _relay(client: socket.socket, upstream: socket.socket) -> None:
                 pass
             write_shutdown[peer] = True
 
+    def direction_for_destination(endpoint: socket.socket) -> str:
+        return (
+            "client_to_proxy"
+            if endpoint is upstream
+            else "proxy_to_client"
+        )
+
+    def release_pending(endpoint: socket.socket) -> None:
+        amount = len(pending[endpoint])
+        if amount and audit is not None:
+            audit.release_wire_bytes(
+                direction_for_destination(endpoint),
+                amount,
+            )
+        pending[endpoint].clear()
+
     def finish_write(endpoint: socket.socket) -> None:
         """Abandon one failed write without discarding reverse traffic."""
 
-        pending[endpoint].clear()
+        release_pending(endpoint)
         write_shutdown[endpoint] = True
         source = peers[endpoint]
         finish_read(source)
         refresh(endpoint)
 
+    transport_error = False
     try:
         while selector.get_map():
+            if stop_event is not None and stop_event.is_set():
+                return _RelayOutcome(False, False)
             remaining = IDLE_TIMEOUT_SECONDS - (time.monotonic() - last_activity)
             if remaining <= 0:
-                return
-            events = selector.select(timeout=min(1.0, remaining))
+                return _RelayOutcome(False, False)
+            events = selector.select(timeout=min(
+                0.1 if stop_event is not None else 1.0,
+                remaining,
+            ))
             if not events:
                 continue
             for key, mask in events:
                 endpoint = key.fileobj
                 if not isinstance(endpoint, socket.socket):
-                    return
+                    return _RelayOutcome(False, False)
                 peer = peers[endpoint]
                 if mask & selectors.EVENT_READ:
                     try:
@@ -940,14 +1319,29 @@ def _relay(client: socket.socket, upstream: socket.socket) -> None:
                         # race a browser request already queued in the other
                         # direction; preserve and flush any typed response
                         # already received from the proxy.
+                        transport_error = True
                         finish_read(endpoint)
                         chunk = None
                     if chunk:
+                        direction = direction_for_destination(peer)
+                        if (
+                            audit is not None
+                            and not audit.reserve_wire_bytes(
+                                direction,
+                                len(chunk),
+                            )
+                        ):
+                            return _RelayOutcome(False, True)
                         if (
                             len(pending[peer]) + len(chunk)
                             > MAX_DIRECTION_BUFFER_BYTES
                         ):
-                            return
+                            if audit is not None:
+                                audit.release_wire_bytes(
+                                    direction,
+                                    len(chunk),
+                                )
+                            return _RelayOutcome(False, False)
                         pending[peer].extend(chunk)
                         last_activity = time.monotonic()
                         refresh(peer)
@@ -965,9 +1359,15 @@ def _relay(client: socket.socket, upstream: socket.socket) -> None:
                         # typed HTTP error may already be pending in the
                         # opposite direction. Preserve and flush that error
                         # instead of returning on the expected broken pipe.
+                        transport_error = True
                         finish_write(endpoint)
                         continue
                     if sent:
+                        if audit is not None:
+                            audit.commit_wire_bytes(
+                                direction_for_destination(endpoint),
+                                sent,
+                            )
                         del pending[endpoint][:sent]
                         last_activity = time.monotonic()
                         refresh(endpoint)
@@ -987,13 +1387,19 @@ def _relay(client: socket.socket, upstream: socket.socket) -> None:
                         # to return zero. Treat it as a terminal condition for
                         # this direction so a permanently writable descriptor
                         # cannot spin while reverse traffic remains pending.
+                        transport_error = True
                         finish_write(endpoint)
             if (
                 not any(read_open.values())
                 and not any(pending.values())
             ):
-                return
+                return _RelayOutcome(
+                    not transport_error,
+                    False,
+                )
     finally:
+        for endpoint in tuple(pending):
+            release_pending(endpoint)
         selector.close()
 
 
@@ -1007,15 +1413,29 @@ class _BridgeHandler(socketserver.BaseRequestHandler):
         except (BridgeConfigurationError, OSError):
             return
         try:
+            server._register_upstream(self.request, upstream)
+            server._require_stable_authority_projection()
             preface = _policy_preface(
                 server.origin_allowlist,
                 egress_rules=server.egress_rules,
                 private_origins=server.private_origins,
                 auth_key=server.policy_auth_key,
                 trust_generation=server.trust_generation,
+                budget_scope_sha256=(
+                    server.budget_scope_sha256
+                ),
+                call_id_sha256=server.call_id_sha256,
+                limits=server._policy_limits_payload(),
             )
             upstream.sendall(preface)
-            _relay(self.request, upstream)
+            outcome = _relay(
+                self.request,
+                upstream,
+                audit=server._invocation_audit,
+                stop_event=server._handler_stop_event,
+            )
+            if outcome.clean_close:
+                server._record_clean_close()
         except (BridgeConfigurationError, OSError):
             return
         finally:
@@ -1044,6 +1464,9 @@ class LoopbackProxyBridge(
         private_origins: tuple[str, ...] = (),
         policy_token: str | None = None,
         trust_generation: str,
+        budget_scope_sha256: str | None = None,
+        call_id_sha256: str | None = None,
+        limits: dict[str, object] | None = None,
     ):
         if server_address[0] != LISTEN_HOST:
             raise BridgeConfigurationError(
@@ -1062,7 +1485,55 @@ class LoopbackProxyBridge(
         self.origin_allowlist = normalized
         self.egress_rules = normalized_rules
         self.private_origins = normalized_private_origins
+        self._rules_sha256 = _authority_projection_sha256(
+            self.origin_allowlist,
+            self.egress_rules,
+            self.private_origins,
+        )
         self.policy_auth_key = _policy_auth_key(policy_token)
+        v3_requested = any(
+            value is not None
+            for value in (
+                budget_scope_sha256,
+                call_id_sha256,
+                limits,
+            )
+        )
+        if v3_requested:
+            if (
+                not isinstance(budget_scope_sha256, str)
+                or _SHA256_HEX_RE.fullmatch(
+                    budget_scope_sha256
+                ) is None
+                or not isinstance(call_id_sha256, str)
+                or _SHA256_HEX_RE.fullmatch(
+                    call_id_sha256
+                ) is None
+            ):
+                raise BridgeConfigurationError(
+                    "invalid bounded exchange identity"
+                )
+            normalized_limits = _validated_v3_limits(limits)
+            self.budget_scope_sha256 = budget_scope_sha256
+            self.call_id_sha256 = call_id_sha256
+            self._limits: dict[str, int] | None = dict(
+                normalized_limits
+            )
+            self.policy_version = 3
+            self._invocation_audit: _InvocationAudit | None = (
+                _InvocationAudit(
+                    budget_scope_sha256=budget_scope_sha256,
+                    call_id_sha256=call_id_sha256,
+                    rules_sha256=self._rules_sha256,
+                    limits=normalized_limits,
+                )
+            )
+        else:
+            self.budget_scope_sha256 = None
+            self.call_id_sha256 = None
+            self._limits = None
+            self.policy_version = 2
+            self._invocation_audit = None
         if _SHA256_HEX_RE.fullmatch(trust_generation) is None:
             raise BridgeConfigurationError(
                 "proxy trust generation is unavailable"
@@ -1076,8 +1547,20 @@ class LoopbackProxyBridge(
             private_origins=self.private_origins,
             auth_key=self.policy_auth_key,
             trust_generation=self.trust_generation,
+            budget_scope_sha256=self.budget_scope_sha256,
+            call_id_sha256=self.call_id_sha256,
+            limits=self._policy_limits_payload(),
         )
         self._admission = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        self._lifecycle_condition = threading.Condition(
+            threading.RLock()
+        )
+        self._active_connections: dict[
+            socket.socket, set[socket.socket]
+        ] = {}
+        self._handler_stop_event = threading.Event()
+        self._closing = False
+        self._sealed = False
         super().__init__(server_address, _BridgeHandler)
 
     def verify_request(
@@ -1085,10 +1568,140 @@ class LoopbackProxyBridge(
         request: socket.socket,
         client_address: tuple[str, int],
     ) -> bool:
-        del request
         if client_address[0] != LISTEN_HOST:
             return False
-        return self._admission.acquire(blocking=False)
+        with self._lifecycle_condition:
+            if self._closing:
+                return False
+            if not self._admission.acquire(blocking=False):
+                return False
+            audit = self._invocation_audit
+            try:
+                if (
+                    audit is not None
+                    and not audit.try_accept_connection()
+                ):
+                    self._admission.release()
+                    return False
+                self._active_connections[request] = {request}
+                return True
+            except BaseException:
+                self._admission.release()
+                raise
+
+    def _register_upstream(
+        self,
+        request: socket.socket,
+        upstream: socket.socket,
+    ) -> None:
+        with self._lifecycle_condition:
+            sockets = self._active_connections.get(request)
+            if self._closing or sockets is None:
+                try:
+                    upstream.close()
+                finally:
+                    raise BridgeConfigurationError(
+                        "bounded exchange is closing"
+                    )
+            sockets.add(upstream)
+
+    def _unregister_connection(
+        self,
+        request: socket.socket,
+    ) -> None:
+        with self._lifecycle_condition:
+            self._active_connections.pop(request, None)
+            self._lifecycle_condition.notify_all()
+
+    @staticmethod
+    def _close_connection_socket(connection: socket.socket) -> None:
+        try:
+            connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            connection.close()
+        except OSError:
+            pass
+
+    def shutdown_and_seal(
+        self,
+        *,
+        timeout_seconds: float = HANDLER_DRAIN_TIMEOUT_SECONDS,
+    ) -> dict[str, object] | None:
+        """Stop admission, drain every handler, then freeze the v3 receipt."""
+
+        if timeout_seconds <= 0:
+            raise BridgeConfigurationError(
+                "invalid bridge handler drain timeout"
+            )
+        with self._lifecycle_condition:
+            if self._sealed:
+                return self.audit_receipt()
+            self._closing = True
+            self._handler_stop_event.set()
+
+        # Wake and stop the accept loop before taking the final active-socket
+        # snapshot. BaseServer.shutdown waits until serve_forever has exited,
+        # so no verified request can be handed to process_request afterward.
+        self.shutdown()
+        self.server_close()
+        with self._lifecycle_condition:
+            active = {
+                connection
+                for sockets in self._active_connections.values()
+                for connection in sockets
+            }
+        for connection in active:
+            self._close_connection_socket(connection)
+
+        deadline = time.monotonic() + timeout_seconds
+        with self._lifecycle_condition:
+            while self._active_connections:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise BridgeConfigurationError(
+                        "bounded exchange handlers did not drain"
+                    )
+                self._lifecycle_condition.wait(remaining)
+
+        audit = self._invocation_audit
+        receipt = None if audit is None else audit.seal()
+        with self._lifecycle_condition:
+            self._sealed = True
+        return receipt
+
+    def _record_clean_close(self) -> None:
+        audit = self._invocation_audit
+        if audit is not None:
+            audit.record_clean_close()
+
+    def _policy_limits_payload(self) -> dict[str, object] | None:
+        limits = self._limits
+        return None if limits is None else dict(limits)
+
+    def _require_stable_authority_projection(self) -> None:
+        if not hmac.compare_digest(
+            self._rules_sha256,
+            _authority_projection_sha256(
+                self.origin_allowlist,
+                self.egress_rules,
+                self.private_origins,
+            ),
+        ):
+            raise BridgeConfigurationError(
+                "bounded exchange authority changed after admission"
+            )
+
+    def audit_receipt(self) -> dict[str, object] | None:
+        """Return the immutable content-only v3 terminal receipt.
+
+        Legacy version-2 bridges intentionally return ``None``: they have no
+        stable call identity or per-call budget to bind an audit receipt.
+        """
+
+        audit = self._invocation_audit
+        return None if audit is None else audit.receipt()
 
     def process_request(
         self,
@@ -1099,6 +1712,7 @@ class LoopbackProxyBridge(
             super().process_request(request, client_address)
         except BaseException:
             self._admission.release()
+            self._unregister_connection(request)
             raise
 
     def process_request_thread(
@@ -1109,6 +1723,7 @@ class LoopbackProxyBridge(
         try:
             super().process_request_thread(request, client_address)
         finally:
+            self._unregister_connection(request)
             self._admission.release()
 
 

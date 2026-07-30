@@ -37,6 +37,7 @@ from tools.isolated_skill_executor import (
 from tools.path_security import sandbox_dir
 from tools.session_sandbox_policy import (
     SessionSandboxPolicyError,
+    session_sandbox_egress_budget_binding,
 )
 from tools.skill_invocation_egress import (
     invocation_bound_skill_egress_policy,
@@ -194,6 +195,14 @@ async def run_skill_script(
             profile_selection,
             invocation={"source": "argv", "args": safe_args},
         )
+        egress_budget_binding = (
+            session_sandbox_egress_budget_binding(
+                context,
+                operation="skill_script",
+            )
+            if egress_policy.rules
+            else None
+        )
     except (
         IsolatedSkillExecutorError,
         SkillScriptError,
@@ -239,6 +248,10 @@ async def run_skill_script(
                 {
                     "egress_rules": egress_policy.rule_payload(),
                     "private_origins": egress_policy.private_origins,
+                    "budget_scope_sha256": (
+                        egress_budget_binding.budget_scope_sha256
+                    ),
+                    "call_id_sha256": egress_budget_binding.call_id_sha256,
                 }
                 if egress_policy.rules else {}
             ),
@@ -289,6 +302,7 @@ async def run_skill_script(
             context.tool_operation_id if context is not None else None
         ),
     )
+    payload.pop("egress_audit_receipt", None)
     if resolved_path != display_path:
         payload["resolved_skill_script_path"] = resolved_path
     return json.dumps(payload, ensure_ascii=False)

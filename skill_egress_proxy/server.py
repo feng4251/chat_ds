@@ -59,6 +59,13 @@ MAX_HEADER_BYTES: Final[int] = 64 * 1024
 MAX_BUFFER_BYTES: Final[int] = 256 * 1024
 COPY_CHUNK_BYTES: Final[int] = 64 * 1024
 MAX_HTTP_REQUEST_BODY_BYTES: Final[int] = 8 * 1024 * 1024
+MAX_HTTP_REQUEST_TARGET_BYTES: Final[int] = 8 * 1024
+MAX_HTTP_REQUEST_HEADER_FIELDS: Final[int] = 128
+MAX_HTTP_REQUEST_HEADER_NAME_BYTES: Final[int] = 256
+MAX_HTTP_REQUEST_HEADER_VALUE_BYTES: Final[int] = 16 * 1024
+MAX_HTTP_QUERY_FIELDS: Final[int] = 128
+MAX_HTTP_QUERY_KEY_BYTES: Final[int] = 512
+MAX_HTTP_QUERY_VALUE_BYTES: Final[int] = 4 * 1024
 TLS_HANDSHAKE_TIMEOUT_SECONDS: Final[float] = 15.0
 POLICY_PREFACE_ABSOLUTE_READ_TIMEOUT_SECONDS: Final[float] = 5.0
 HTTP_HEADER_ABSOLUTE_READ_TIMEOUT_SECONDS: Final[float] = 15.0
@@ -135,6 +142,59 @@ MAX_TRUST_GENERATION_MANIFEST_BYTES: Final[int] = 4 * 1024
 MAX_CA_CERTIFICATE_BYTES: Final[int] = 64 * 1024
 MAX_SPKI_FILE_BYTES: Final[int] = 256
 _SHA256_HEX_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
+_ABSOLUTE_MAX_REQUESTS_PER_SCOPE: Final[int] = 65_536
+_ABSOLUTE_MAX_OUTBOUND_BYTES_PER_SCOPE: Final[int] = 1024 * 1024 * 1024
+_ABSOLUTE_MAX_RESPONSE_WIRE_BYTES_PER_SCOPE: Final[int] = 16 * 1024 * 1024 * 1024
+_ABSOLUTE_MAX_POLICY_SCOPE_ENTRIES: Final[int] = 65_536
+_ABSOLUTE_MAX_POLICY_SCOPE_TTL_SECONDS: Final[int] = 24 * 60 * 60
+_REQUIRE_POLICY_V3_RAW: Final[str] = os.environ.get(
+    "SKILL_EGRESS_REQUIRE_POLICY_V3",
+    "0",
+).strip()
+if _REQUIRE_POLICY_V3_RAW not in {"0", "1"}:
+    raise RuntimeError("invalid_skill_egress_require_policy_v3")
+REQUIRE_POLICY_V3: Final[bool] = _REQUIRE_POLICY_V3_RAW == "1"
+
+
+def _bounded_positive_env_int(
+    name: str,
+    default: int,
+    absolute_maximum: int,
+) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError as exc:
+        raise RuntimeError(f"invalid_{name.lower()}") from exc
+    if not 1 <= value <= absolute_maximum:
+        raise RuntimeError(f"invalid_{name.lower()}")
+    return value
+
+
+MAX_REQUESTS_PER_SCOPE: Final[int] = _bounded_positive_env_int(
+    "SKILL_EGRESS_MAX_REQUESTS",
+    2_048,
+    _ABSOLUTE_MAX_REQUESTS_PER_SCOPE,
+)
+MAX_OUTBOUND_BYTES_PER_SCOPE: Final[int] = _bounded_positive_env_int(
+    "SKILL_EGRESS_MAX_OUTBOUND_BYTES",
+    16 * 1024 * 1024,
+    _ABSOLUTE_MAX_OUTBOUND_BYTES_PER_SCOPE,
+)
+MAX_RESPONSE_WIRE_BYTES_PER_SCOPE: Final[int] = _bounded_positive_env_int(
+    "SKILL_EGRESS_MAX_RESPONSE_WIRE_BYTES",
+    512 * 1024 * 1024,
+    _ABSOLUTE_MAX_RESPONSE_WIRE_BYTES_PER_SCOPE,
+)
+MAX_POLICY_SCOPE_ENTRIES: Final[int] = _bounded_positive_env_int(
+    "SKILL_EGRESS_MAX_POLICY_SCOPE_ENTRIES",
+    65_536,
+    _ABSOLUTE_MAX_POLICY_SCOPE_ENTRIES,
+)
+POLICY_SCOPE_TTL_SECONDS: Final[int] = _bounded_positive_env_int(
+    "SKILL_EGRESS_POLICY_SCOPE_TTL_SECONDS",
+    24 * 60 * 60,
+    _ABSOLUTE_MAX_POLICY_SCOPE_TTL_SECONDS,
+)
 MAX_UPSTREAM_TLS_PIN_ENTRIES: Final[int] = 128
 MAX_UPSTREAM_TLS_PINS_PER_ORIGIN: Final[int] = 8
 _SPKI_SHA256_RE: Final[re.Pattern[str]] = re.compile(
@@ -178,12 +238,25 @@ class ExactEgressRule:
 
 
 @dataclass(frozen=True, slots=True)
+class PolicyBudgetLimits:
+    """Authenticated cumulative limits shared by one execution scope."""
+
+    max_requests: int
+    max_outbound_bytes: int
+    max_response_wire_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
 class SignedEgressPolicy:
     """Authenticated per-connection policy, independent of deployment policy."""
 
     origins: frozenset[Origin]
     rules: tuple[ExactEgressRule, ...]
     private_origins: frozenset[Origin]
+    version: int = 2
+    budget_scope_sha256: str | None = None
+    call_id_sha256: str | None = None
+    limits: PolicyBudgetLimits | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -455,8 +528,58 @@ def _validated_signed_egress_policy(
     origins_raw: object,
     rules_raw: object,
     private_origins_raw: object,
+    *,
+    version: int = 2,
+    budget_scope_sha256: object = None,
+    call_id_sha256: object = None,
+    limits_raw: object = None,
 ) -> SignedEgressPolicy:
-    """Compile and cross-check one authenticated version-2 policy."""
+    """Compile and cross-check one authenticated version-2/3 policy."""
+
+    limits: PolicyBudgetLimits | None = None
+    if version == 2:
+        if any(
+            value is not None
+            for value in (
+                budget_scope_sha256,
+                call_id_sha256,
+                limits_raw,
+            )
+        ):
+            raise ProxyPolicyError("invalid_policy_preface")
+    elif version == 3:
+        if (
+            not isinstance(budget_scope_sha256, str)
+            or _SHA256_HEX_RE.fullmatch(budget_scope_sha256) is None
+            or not isinstance(call_id_sha256, str)
+            or _SHA256_HEX_RE.fullmatch(call_id_sha256) is None
+            or not isinstance(limits_raw, dict)
+            or set(limits_raw) != {
+                "max_requests",
+                "max_outbound_bytes",
+                "max_response_wire_bytes",
+            }
+        ):
+            raise ProxyPolicyError("invalid_policy_preface")
+        request_limit = limits_raw.get("max_requests")
+        outbound_limit = limits_raw.get("max_outbound_bytes")
+        response_limit = limits_raw.get("max_response_wire_bytes")
+        if (
+            type(request_limit) is not int
+            or not 1 <= request_limit <= MAX_REQUESTS_PER_SCOPE
+            or type(outbound_limit) is not int
+            or not 1 <= outbound_limit <= MAX_OUTBOUND_BYTES_PER_SCOPE
+            or type(response_limit) is not int
+            or not 1 <= response_limit <= MAX_RESPONSE_WIRE_BYTES_PER_SCOPE
+        ):
+            raise ProxyPolicyError("invalid_policy_preface")
+        limits = PolicyBudgetLimits(
+            max_requests=request_limit,
+            max_outbound_bytes=outbound_limit,
+            max_response_wire_bytes=response_limit,
+        )
+    else:
+        raise ProxyPolicyError("invalid_policy_preface")
 
     if (
         not isinstance(origins_raw, list)
@@ -546,7 +669,174 @@ def _validated_signed_egress_policy(
         origins=frozenset(ordered_origins),
         rules=tuple(compiled_rules),
         private_origins=frozenset(ordered_private),
+        version=version,
+        budget_scope_sha256=(
+            budget_scope_sha256 if version == 3 else None
+        ),
+        call_id_sha256=call_id_sha256 if version == 3 else None,
+        limits=limits,
     )
+
+
+@dataclass(slots=True)
+class _PolicyScopeState:
+    limits: PolicyBudgetLimits
+    requests: int
+    outbound_bytes: int
+    response_wire_bytes: int
+    active: int
+    last_activity: float
+
+
+class PolicyScopeLedger:
+    """Thread-safe, bounded cumulative accounting for signed v3 scopes."""
+
+    def __init__(
+        self,
+        *,
+        capacity: int = MAX_POLICY_SCOPE_ENTRIES,
+        ttl_seconds: float = POLICY_SCOPE_TTL_SECONDS,
+        clock=time.monotonic,
+    ) -> None:
+        if (
+            not 1 <= capacity <= _ABSOLUTE_MAX_POLICY_SCOPE_ENTRIES
+            or not 0 < ttl_seconds
+            <= _ABSOLUTE_MAX_POLICY_SCOPE_TTL_SECONDS
+        ):
+            raise ProxyPolicyError("invalid_policy_scope_ledger")
+        self._capacity = capacity
+        self._ttl_seconds = ttl_seconds
+        self._clock = clock
+        self._lock = threading.RLock()
+        self._states: OrderedDict[str, _PolicyScopeState] = OrderedDict()
+        # Active scopes must never block collection of an older inactive
+        # scope.  Keep the reclaimable population in its own activity-ordered
+        # index instead of scanning the full deployment ledger.
+        self._inactive: OrderedDict[str, None] = OrderedDict()
+
+    def _prune(self, now: float) -> None:
+        # Inactive entries are ordered by the moment their final reservation
+        # was released.  Reclaiming the expired prefix is proportional to the
+        # entries removed and cannot be obstructed by a long-lived active
+        # connection.
+        while self._inactive:
+            scope = next(iter(self._inactive))
+            state = self._states.get(scope)
+            if state is None:
+                self._inactive.pop(scope, None)
+                continue
+            if state.active != 0:
+                # Repair a stale secondary-index row defensively instead of
+                # allowing it to obstruct every later reclaimable scope.
+                self._inactive.pop(scope, None)
+                continue
+            if now - state.last_activity < self._ttl_seconds:
+                break
+            self._inactive.pop(scope, None)
+            self._states.pop(scope, None)
+
+    def admit(
+        self,
+        policy: SignedEgressPolicy,
+    ) -> "PolicyBudgetReservation | None":
+        if policy.version == 2:
+            return None
+        scope = policy.budget_scope_sha256
+        limits = policy.limits
+        if scope is None or limits is None:
+            raise ProxyPolicyError("invalid_policy_preface")
+        with self._lock:
+            now = self._clock()
+            self._prune(now)
+            state = self._states.get(scope)
+            if state is None:
+                if len(self._states) >= self._capacity:
+                    raise ProxyPolicyError(
+                        "policy_scope_ledger_capacity_exceeded"
+                    )
+                state = _PolicyScopeState(
+                    limits=limits,
+                    requests=0,
+                    outbound_bytes=0,
+                    response_wire_bytes=0,
+                    active=0,
+                    last_activity=now,
+                )
+                self._states[scope] = state
+            elif state.limits != limits:
+                raise ProxyPolicyError("policy_scope_limits_mismatch")
+            if state.requests >= state.limits.max_requests:
+                raise ProxyPolicyError("policy_request_budget_exceeded")
+            if state.active == 0:
+                self._inactive.pop(scope, None)
+            state.requests += 1
+            state.active += 1
+            state.last_activity = now
+            self._states.move_to_end(scope)
+        return PolicyBudgetReservation(self, scope)
+
+    def _consume(
+        self,
+        scope: str,
+        field: str,
+        amount: int,
+        error_code: str,
+    ) -> None:
+        if amount < 0:
+            raise ProxyPolicyError("invalid_policy_budget_amount")
+        with self._lock:
+            state = self._states.get(scope)
+            if state is None or state.active <= 0:
+                raise ProxyPolicyError("policy_scope_reservation_lost")
+            maximum = getattr(state.limits, f"max_{field}")
+            current = getattr(state, field)
+            if amount > maximum - current:
+                raise ProxyPolicyError(error_code)
+            setattr(state, field, current + amount)
+            state.last_activity = self._clock()
+            self._states.move_to_end(scope)
+
+    def _release(self, scope: str) -> None:
+        with self._lock:
+            state = self._states.get(scope)
+            if state is None or state.active <= 0:
+                return
+            state.active -= 1
+            state.last_activity = self._clock()
+            self._states.move_to_end(scope)
+            if state.active == 0:
+                self._inactive[scope] = None
+                self._inactive.move_to_end(scope)
+
+
+class PolicyBudgetReservation:
+    """One admitted v3 connection's handle into its shared scope ledger."""
+
+    def __init__(self, ledger: PolicyScopeLedger, scope: str) -> None:
+        self._ledger = ledger
+        self._scope = scope
+        self._released = False
+
+    def consume_outbound(self, amount: int) -> None:
+        self._ledger._consume(
+            self._scope,
+            "outbound_bytes",
+            amount,
+            "policy_outbound_budget_exceeded",
+        )
+
+    def consume_response_wire(self, amount: int) -> None:
+        self._ledger._consume(
+            self._scope,
+            "response_wire_bytes",
+            amount,
+            "policy_response_wire_budget_exceeded",
+        )
+
+    def release(self) -> None:
+        if not self._released:
+            self._released = True
+            self._ledger._release(self._scope)
 
 
 def _request_policy_coordinate(
@@ -572,7 +862,8 @@ def _request_policy_coordinate(
     ):
         raise ProxyPolicyError("request_method_not_allowed")
     if (
-        not target.startswith("/")
+        len(target_raw) > MAX_HTTP_REQUEST_TARGET_BYTES
+        or not target.startswith("/")
         or target.startswith("//")
         or "#" in target
     ):
@@ -582,6 +873,21 @@ def _request_policy_coordinate(
         error_code="request_url_not_allowed",
     )
     parsed = urlsplit(canonical)
+    if parsed.query:
+        fields = parsed.query.split("&")
+        if len(fields) > MAX_HTTP_QUERY_FIELDS:
+            raise ProxyPolicyError("request_query_too_large")
+        for field in fields:
+            key, separator, value = field.partition("=")
+            if (
+                len(key.encode("ascii")) > MAX_HTTP_QUERY_KEY_BYTES
+                or (
+                    separator
+                    and len(value.encode("ascii"))
+                    > MAX_HTTP_QUERY_VALUE_BYTES
+                )
+            ):
+                raise ProxyPolicyError("request_query_too_large")
     return method, parsed.path or "/", parsed.query
 
 
@@ -1922,7 +2228,7 @@ def _read_policy_preface(
         )
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise ProxyPolicyError("invalid_policy_preface") from exc
-    expected_fields = {
+    base_fields = {
         "version",
         "expires_unix",
         "nonce",
@@ -1932,7 +2238,20 @@ def _read_policy_preface(
         "trust_generation",
         "auth_hmac",
     }
-    if not isinstance(payload, dict) or set(payload) != expected_fields:
+    if not isinstance(payload, dict):
+        raise ProxyPolicyError("invalid_policy_preface")
+    version = payload.get("version")
+    if type(version) is not int or version not in {2, 3}:
+        raise ProxyPolicyError("invalid_policy_preface")
+    v3_fields = {
+        "budget_scope_sha256",
+        "call_id_sha256",
+        "limits",
+    }
+    expected_fields = (
+        base_fields | v3_fields if version == 3 else base_fields
+    )
+    if set(payload) != expected_fields:
         raise ProxyPolicyError("invalid_policy_preface")
     expires = payload.get("expires_unix")
     nonce = payload.get("nonce")
@@ -1941,13 +2260,9 @@ def _read_policy_preface(
     egress_rules_raw = payload.get("egress_rules")
     private_origins_raw = payload.get("private_origins")
     trust_generation = payload.get("trust_generation")
-    version = payload.get("version")
     now = int(time.time())
     if (
-        isinstance(version, bool)
-        or not isinstance(version, int)
-        or version != 2
-        or isinstance(expires, bool)
+        isinstance(expires, bool)
         or not isinstance(expires, int)
         or expires < now - POLICY_CLOCK_SKEW_SECONDS
         or expires > now + MAX_POLICY_TTL_SECONDS + POLICY_CLOCK_SKEW_SECONDS
@@ -1975,6 +2290,12 @@ def _read_policy_preface(
         "private_origins": private_origins_raw,
         "trust_generation": trust_generation,
     }
+    if version == 3:
+        unsigned.update({
+            "budget_scope_sha256": payload["budget_scope_sha256"],
+            "call_id_sha256": payload["call_id_sha256"],
+            "limits": payload["limits"],
+        })
     canonical = json.dumps(
         unsigned,
         ensure_ascii=False,
@@ -1994,11 +2315,23 @@ def _read_policy_preface(
         expected_trust_generation,
     ):
         raise ProxyPolicyError("policy_trust_generation_mismatch")
+    if (
+        REQUIRE_POLICY_V3
+        and version == 2
+        and bool(egress_rules_raw)
+    ):
+        raise ProxyPolicyError("egress_policy_upgrade_required")
     return (
         _validated_signed_egress_policy(
             origins_raw,
             egress_rules_raw,
             private_origins_raw,
+            version=version,
+            budget_scope_sha256=payload.get(
+                "budget_scope_sha256"
+            ),
+            call_id_sha256=payload.get("call_id_sha256"),
+            limits_raw=payload.get("limits"),
         ),
         remainder,
     )
@@ -2285,6 +2618,8 @@ def _validated_header_parts(line: bytes) -> tuple[bytes, bytes]:
     name, separator, value = line.partition(b":")
     if (
         not separator
+        or len(name) > MAX_HTTP_REQUEST_HEADER_NAME_BYTES
+        or len(value) > MAX_HTTP_REQUEST_HEADER_VALUE_BYTES
         or _HTTP_HEADER_NAME_RE.fullmatch(name) is None
         or any(
             (byte < 0x20 and byte != 0x09) or byte == 0x7F
@@ -2293,6 +2628,13 @@ def _validated_header_parts(line: bytes) -> tuple[bytes, bytes]:
     ):
         raise ProxyPolicyError("invalid_request_header")
     return name.lower(), value
+
+
+def _is_forwarding_identity_header(name: bytes) -> bool:
+    return (
+        name in {b"forwarded", b"x-real-ip", b"via"}
+        or name.startswith(b"x-forwarded")
+    )
 
 
 def _request_destination(
@@ -2307,6 +2649,11 @@ def _request_destination(
         version = version_raw.decode("ascii")
     except (ValueError, UnicodeError) as exc:
         raise ProxyPolicyError("invalid_request_line") from exc
+    if (
+        len(target_raw) > MAX_HTTP_REQUEST_TARGET_BYTES
+        or len(lines) - 1 > MAX_HTTP_REQUEST_HEADER_FIELDS
+    ):
+        raise ProxyPolicyError("http_request_metadata_too_large")
     if _HTTP_METHOD_RE.fullmatch(method_raw) is None:
         raise ProxyPolicyError("invalid_request_method")
     if version not in {"HTTP/1.0", "HTTP/1.1"}:
@@ -2351,7 +2698,7 @@ def _request_destination(
         if name in {
             b"proxy-authorization",
             b"proxy-connection",
-        }:
+        } or _is_forwarding_identity_header(name):
             continue
         if name == b"host":
             if host_seen:
@@ -2410,6 +2757,11 @@ def _tunneled_origin_request(
         version = version_raw.decode("ascii")
     except (ValueError, UnicodeError) as exc:
         raise ProxyPolicyError("invalid_request_line") from exc
+    if (
+        len(target_raw) > MAX_HTTP_REQUEST_TARGET_BYTES
+        or len(lines) - 1 > MAX_HTTP_REQUEST_HEADER_FIELDS
+    ):
+        raise ProxyPolicyError("http_request_metadata_too_large")
     if _HTTP_METHOD_RE.fullmatch(method_raw) is None:
         raise ProxyPolicyError("invalid_request_method")
     if method == "CONNECT":
@@ -2438,7 +2790,7 @@ def _tunneled_origin_request(
         if name in {
             b"proxy-authorization",
             b"proxy-connection",
-        }:
+        } or _is_forwarding_identity_header(name):
             continue
         if name == b"host":
             if host_seen:
@@ -2498,18 +2850,27 @@ class _RequestBodyFraming:
     content_length: int
 
 
+def _normalized_outbound_wire_bytes(
+    framing: _RequestBodyFraming,
+) -> int:
+    return len(framing.header) + 4 + framing.content_length
+
+
 def _validated_request_body_framing(
     forwarded: bytes,
 ) -> _RequestBodyFraming:
     header, body = forwarded.split(b"\r\n\r\n", 1)
-    request_line = header.split(b"\r\n", 1)[0]
+    lines = header.split(b"\r\n")
+    if len(lines) - 1 > MAX_HTTP_REQUEST_HEADER_FIELDS:
+        raise ProxyPolicyError("http_request_metadata_too_large")
+    request_line = lines[0]
     try:
         method = request_line.split(b" ", 1)[0].decode("ascii").upper()
     except UnicodeError as exc:
         raise ProxyPolicyError("invalid_request_method") from exc
     content_lengths: list[bytes] = []
     transfer_encodings: list[bytes] = []
-    for line in header.split(b"\r\n")[1:]:
+    for line in lines[1:]:
         name, value = _validated_header_parts(line)
         if name == b"content-length":
             content_lengths.append(value.strip(b" \t"))
@@ -2717,6 +3078,7 @@ def _relay(left: socket.socket, right: socket.socket) -> None:
 def _relay_response_only(
     client: socket.socket,
     upstream: socket.socket,
+    budget: PolicyBudgetReservation | None = None,
 ) -> None:
     """Relay one HTTP response without accepting a second client request."""
 
@@ -2737,6 +3099,14 @@ def _relay_response_only(
             return
         if not chunk:
             return
+        if budget is not None:
+            try:
+                budget.consume_response_wire(len(chunk))
+            except ProxyPolicyError:
+                # A local error response cannot be appended safely after an
+                # upstream response has begun. Closing both sides is the
+                # unambiguous fail-closed framing boundary.
+                return
         client.settimeout(min(idle_remaining, 1.0))
         try:
             client.sendall(chunk)
@@ -2803,6 +3173,7 @@ class ProxyHandler(socketserver.BaseRequestHandler):
     certificate_authority: CertificateAuthority | None = None
     upstream_tls_policy = UpstreamTlsPolicy()
     trust_generation: str | None = None
+    scope_ledger = PolicyScopeLedger()
 
     def origin_allowlist_for_request(
         self,
@@ -2821,6 +3192,7 @@ class ProxyHandler(socketserver.BaseRequestHandler):
         upstream: socket.socket | None = None
         tunnel_established = False
         client_tls: ssl.SSLSocket | None = None
+        budget: PolicyBudgetReservation | None = None
         try:
             trust_generation = self.trust_generation
             if (
@@ -2845,6 +3217,7 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                 self.request,
                 expected_trust_generation=trust_generation,
             )
+            budget = self.scope_ledger.admit(signed_policy)
             request = _read_headers(self.request, initial=buffered)
             scheme, host, port, forwarded = _request_destination(request)
             trusted_origins = normalize_origin_allowlist(
@@ -2852,17 +3225,6 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                     signed_policy.origins
                 )
             )
-            requested_origin = _normalized_origin(
-                scheme,
-                host,
-                port,
-            )
-            if forwarded:
-                _authorize_exact_request(
-                    signed_policy,
-                    requested_origin,
-                    forwarded,
-                )
             if not forwarded:
                 # CONNECT has no scheme on the wire. Prefer the one and only
                 # exact signed origin for this authority. This permits Node's
@@ -2885,19 +3247,47 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                     scheme = next(
                         iter(matching_connect_origins)
                     ).scheme
-            destination = self.policy.resolve(
+            requested_origin = _normalized_origin(
                 scheme,
                 host,
                 port,
-                origin_allowlist=trusted_origins,
-                signed_private_origins=(
-                    signed_policy.private_origins
-                ),
             )
+            framing: _RequestBodyFraming | None = None
             if forwarded:
+                _authorize_exact_request(
+                    signed_policy,
+                    requested_origin,
+                    forwarded,
+                )
+            if forwarded and signed_policy.version == 3:
                 framing = _validated_request_body_framing(
                     forwarded
                 )
+                if budget is not None:
+                    budget.consume_outbound(
+                        _normalized_outbound_wire_bytes(framing)
+                    )
+            destination: Destination | None = None
+            # Version 3 delays all DNS and upstream connection activity until
+            # the inspected inner CONNECT request has consumed its signed
+            # outbound budget. Version 2 retains its historical ordering.
+            if forwarded or signed_policy.version == 2:
+                destination = self.policy.resolve(
+                    scheme,
+                    host,
+                    port,
+                    origin_allowlist=trusted_origins,
+                    signed_private_origins=(
+                        signed_policy.private_origins
+                    ),
+                )
+            if forwarded:
+                assert destination is not None
+                if framing is None:
+                    framing = _validated_request_body_framing(
+                        forwarded
+                    )
+                assert framing is not None
                 try:
                     upstream = _connect_pinned(destination)
                     _forward_single_http_request(
@@ -2940,9 +3330,9 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                     upstream.shutdown(socket.SHUT_WR)
                 except OSError:
                     pass
-                _relay_response_only(self.request, upstream)
+                _relay_response_only(self.request, upstream, budget)
                 return
-            if destination.scheme == "http":
+            if requested_origin.scheme == "http":
                 self.request.sendall(
                     b"HTTP/1.1 200 Connection Established\r\n"
                     b"Proxy-Agent: chatds-skill-egress\r\n\r\n"
@@ -2952,28 +3342,35 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                     tunneled_request = _read_headers(self.request)
                     forwarded_http = _tunneled_origin_request(
                         tunneled_request,
-                        Origin(
-                            "http",
-                            destination.host,
-                            destination.port,
-                        ),
+                        requested_origin,
                     )
                     framing = _validated_request_body_framing(
                         forwarded_http
                     )
                     _authorize_exact_request(
                         signed_policy,
-                        Origin(
-                            "http",
-                            destination.host,
-                            destination.port,
-                        ),
+                        requested_origin,
                         forwarded_http,
                     )
+                    if budget is not None:
+                        budget.consume_outbound(
+                            _normalized_outbound_wire_bytes(framing)
+                        )
+                    if destination is None:
+                        destination = self.policy.resolve(
+                            scheme,
+                            host,
+                            port,
+                            origin_allowlist=trusted_origins,
+                            signed_private_origins=(
+                                signed_policy.private_origins
+                            ),
+                        )
                 except ProxyPolicyError as exc:
                     _safe_error(self.request, 403, str(exc))
                     return
                 try:
+                    assert destination is not None
                     upstream = _connect_pinned(destination)
                     _forward_single_http_request(
                         self.request,
@@ -3015,14 +3412,15 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                     upstream.shutdown(socket.SHUT_WR)
                 except OSError:
                     pass
-                _relay_response_only(self.request, upstream)
+                _relay_response_only(self.request, upstream, budget)
                 return
             authority = self.certificate_authority
             if authority is None:
                 raise ProxyPolicyError(
                     "interception_certificate_authority_unavailable"
                 )
-            self.upstream_tls_policy.authorize(destination)
+            if destination is not None:
+                self.upstream_tls_policy.authorize(destination)
             self.request.sendall(
                 b"HTTP/1.1 200 Connection Established\r\n"
                 b"Proxy-Agent: chatds-skill-egress\r\n\r\n"
@@ -3030,7 +3428,7 @@ class ProxyHandler(socketserver.BaseRequestHandler):
             tunnel_established = True
             try:
                 client_context = authority.server_context(
-                    destination.host
+                    requested_origin.host
                 )
                 self.request.settimeout(
                     TLS_HANDSHAKE_TIMEOUT_SECONDS
@@ -3047,11 +3445,7 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                         "client_http2_not_allowed"
                     )
                 encrypted_request = _read_headers(client_tls)
-                exact_origin = Origin(
-                    "https",
-                    destination.host,
-                    destination.port,
-                )
+                exact_origin = requested_origin
                 forwarded_https = _tunneled_https_request(
                     encrypted_request,
                     exact_origin,
@@ -3064,6 +3458,23 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                     exact_origin,
                     forwarded_https,
                 )
+                if budget is not None:
+                    budget.consume_outbound(
+                        _normalized_outbound_wire_bytes(framing)
+                    )
+                if destination is None:
+                    destination = self.policy.resolve(
+                        scheme,
+                        host,
+                        port,
+                        origin_allowlist=trusted_origins,
+                        signed_private_origins=(
+                            signed_policy.private_origins
+                        ),
+                    )
+                    self.upstream_tls_policy.authorize(
+                        destination
+                    )
             except ProxyPolicyError as exc:
                 if client_tls is not None:
                     _safe_error(client_tls, 403, str(exc))
@@ -3072,6 +3483,7 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                 return
 
             try:
+                assert destination is not None
                 raw_upstream = _connect_pinned(destination)
                 try:
                     upstream = self.upstream_tls_policy.wrap(
@@ -3091,7 +3503,7 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                 # bypasses TLS close semantics and can expose encrypted records
                 # through subsequent recv calls. Connection: close and the
                 # one-request response-only relay provide the framing boundary.
-                _relay_response_only(client_tls, upstream)
+                _relay_response_only(client_tls, upstream, budget)
             except ProxyTransportError as exc:
                 _safe_error(
                     client_tls,
@@ -3137,6 +3549,8 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                     "destination_connection_failed",
                 )
         finally:
+            if budget is not None:
+                budget.release()
             if upstream is not None:
                 upstream.close()
             if client_tls is not None:

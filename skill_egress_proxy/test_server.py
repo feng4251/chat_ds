@@ -34,6 +34,9 @@ def _policy_preface(
     token: str = TEST_POLICY_TOKEN,
     trust_generation: str | None = None,
     auth_hmac: str | None = None,
+    budget_scope_sha256: str = "b" * 64,
+    call_id_sha256: str = "c" * 64,
+    limits: dict[str, object] | None = None,
 ) -> bytes:
     if trust_generation is None:
         trust_generation = (
@@ -63,6 +66,20 @@ def _policy_preface(
         "private_origins": private_origins,
         "trust_generation": trust_generation,
     }
+    if version == 3:
+        unsigned.update({
+            "budget_scope_sha256": budget_scope_sha256,
+            "call_id_sha256": call_id_sha256,
+            "limits": (
+                {
+                    "max_requests": 2_048,
+                    "max_outbound_bytes": 16 * 1024 * 1024,
+                    "max_response_wire_bytes": 512 * 1024 * 1024,
+                }
+                if limits is None
+                else limits
+            ),
+        })
     canonical = json.dumps(
         unsigned,
         ensure_ascii=False,
@@ -245,6 +262,131 @@ class DestinationParsingTests(unittest.TestCase):
                 server._request_destination(request)
         with self.assertRaises(server.ProxyPolicyError):
             server._origin_tuple("https://example.com:0")
+
+    def test_forwarding_identity_headers_are_stripped_in_both_lanes(self):
+        headers = (
+            b"Forwarded: for=192.0.2.1\r\n"
+            b"X-Forwarded-For: 192.0.2.1\r\n"
+            b"X-Forwarded-Proto: https\r\n"
+            b"X-Real-IP: 192.0.2.1\r\n"
+            b"Via: 1.1 attacker\r\n"
+            b"X-Benign: retained\r\n"
+        )
+        _scheme, _host, _port, absolute = server._request_destination(
+            b"GET http://example.com/a HTTP/1.1\r\n"
+            b"Host: example.com\r\n" + headers + b"\r\n"
+        )
+        tunneled = server._tunneled_origin_request(
+            b"GET /a HTTP/1.1\r\n"
+            b"Host: example.com\r\n" + headers + b"\r\n",
+            server.Origin("https", "example.com", 443),
+        )
+        for forwarded in (absolute, tunneled):
+            self.assertNotIn(b"Forwarded:", forwarded)
+            self.assertNotIn(b"X-Forwarded", forwarded)
+            self.assertNotIn(b"X-Real-IP:", forwarded)
+            self.assertNotIn(b"Via:", forwarded)
+            self.assertIn(b"X-Benign: retained", forwarded)
+
+    def test_request_target_and_header_metadata_limits(self):
+        allowed_headers = (
+            b"GET http://example.com/ HTTP/1.1\r\n"
+            b"Host: example.com\r\n"
+            + b"".join(
+                b"X-A: x\r\n"
+                for _ in range(
+                    server.MAX_HTTP_REQUEST_HEADER_FIELDS - 1
+                )
+            )
+            + b"\r\n"
+        )
+        server._request_destination(allowed_headers)
+        target = b"/" + b"a" * server.MAX_HTTP_REQUEST_TARGET_BYTES
+        with self.assertRaisesRegex(
+            server.ProxyPolicyError,
+            "http_request_metadata_too_large",
+        ):
+            server._tunneled_origin_request(
+                b"GET " + target + b" HTTP/1.1\r\n"
+                b"Host: example.com\r\n\r\n",
+                server.Origin("https", "example.com", 443),
+            )
+        excessive_headers = (
+            b"GET http://example.com/ HTTP/1.1\r\n"
+            b"Host: example.com\r\n"
+            + b"".join(
+                b"X-A: x\r\n"
+                for _ in range(server.MAX_HTTP_REQUEST_HEADER_FIELDS)
+            )
+            + b"\r\n"
+        )
+        with self.assertRaisesRegex(
+            server.ProxyPolicyError,
+            "http_request_metadata_too_large",
+        ):
+            server._request_destination(excessive_headers)
+
+    def test_header_name_and_value_limits(self):
+        with self.assertRaisesRegex(
+            server.ProxyPolicyError,
+            "invalid_request_header",
+        ):
+            server._validated_header_parts(
+                b"a" * (server.MAX_HTTP_REQUEST_HEADER_NAME_BYTES + 1)
+                + b": x"
+            )
+        with self.assertRaisesRegex(
+            server.ProxyPolicyError,
+            "invalid_request_header",
+        ):
+            server._validated_header_parts(
+                b"X-A:"
+                + b"x"
+                * (server.MAX_HTTP_REQUEST_HEADER_VALUE_BYTES + 1)
+            )
+
+
+class RequestQueryBoundaryTests(unittest.TestCase):
+    def test_query_count_key_and_value_boundaries(self):
+        origin = server.Origin("https", "example.com", 443)
+        exact_count = "&".join(
+            f"k{i}=v"
+            for i in range(server.MAX_HTTP_QUERY_FIELDS)
+        )
+        self.assertEqual(
+            exact_count,
+            server._request_policy_coordinate(
+                (
+                    f"GET /?{exact_count} HTTP/1.1\r\n"
+                    "Host: example.com\r\n\r\n"
+                ).encode(),
+                origin,
+            )[2],
+        )
+        too_many = "&".join(
+            f"k{i}=v"
+            for i in range(server.MAX_HTTP_QUERY_FIELDS + 1)
+        )
+        too_long_key = "k" * (server.MAX_HTTP_QUERY_KEY_BYTES + 1)
+        too_long_value = "v" * (
+            server.MAX_HTTP_QUERY_VALUE_BYTES + 1
+        )
+        for query in (
+            too_many,
+            f"{too_long_key}=v",
+            f"k={too_long_value}",
+        ):
+            forwarded = (
+                f"GET /?{query} HTTP/1.1\r\n"
+                "Host: example.com\r\n\r\n"
+            ).encode()
+            with self.subTest(query_length=len(query)), (
+                self.assertRaises(server.ProxyPolicyError)
+            ):
+                server._request_policy_coordinate(
+                    forwarded,
+                    origin,
+                )
 
 
 class HttpSingleRequestFramingTests(unittest.TestCase):
@@ -447,6 +589,30 @@ class PolicyPrefaceAuthenticationTests(unittest.TestCase):
             remainder,
         )
 
+    def test_deployment_can_require_v3_for_nonempty_egress_authority(self):
+        with (
+            patch.object(server, "REQUIRE_POLICY_V3", True),
+            self.assertRaisesRegex(
+                server.ProxyPolicyError,
+                "egress_policy_upgrade_required",
+            ),
+        ):
+            self._read_preface(
+                _policy_preface(["https://example.com:443"])
+            )
+
+        with patch.object(server, "REQUIRE_POLICY_V3", True):
+            policy, remainder = self._read_preface(
+                _policy_preface(
+                    [],
+                    egress_rules=[],
+                    private_origins=[],
+                )
+            )
+        self.assertEqual(2, policy.version)
+        self.assertEqual((), policy.rules)
+        self.assertEqual(b"", remainder)
+
     def test_bad_hmac_is_rejected(self):
         with self.assertRaisesRegex(
             server.ProxyPolicyError,
@@ -605,6 +771,107 @@ class PolicyPrefaceAuthenticationTests(unittest.TestCase):
                     )
                 )
 
+    def test_valid_v3_preface_authenticates_budget_metadata(self):
+        policy, remainder = self._read_preface(
+            _policy_preface(
+                ["https://example.com:443"],
+                version=3,
+                limits={
+                    "max_requests": 7,
+                    "max_outbound_bytes": 8_000,
+                    "max_response_wire_bytes": 90_000,
+                },
+            )
+        )
+        self.assertEqual(b"", remainder)
+        self.assertEqual(3, policy.version)
+        self.assertEqual("b" * 64, policy.budget_scope_sha256)
+        self.assertEqual("c" * 64, policy.call_id_sha256)
+        self.assertEqual(
+            server.PolicyBudgetLimits(7, 8_000, 90_000),
+            policy.limits,
+        )
+
+    def test_v3_requires_exact_bounded_budget_fields(self):
+        cases = (
+            {"budget_scope_sha256": "B" * 64},
+            {"call_id_sha256": "short"},
+            {"limits": {"max_requests": 1}},
+            {
+                "limits": {
+                    "max_requests": server.MAX_REQUESTS_PER_SCOPE + 1,
+                    "max_outbound_bytes": 1,
+                    "max_response_wire_bytes": 1,
+                },
+            },
+            {
+                "limits": {
+                    "max_requests": True,
+                    "max_outbound_bytes": 1,
+                    "max_response_wire_bytes": 1,
+                },
+            },
+        )
+        for override in cases:
+            kwargs = {
+                "budget_scope_sha256": "b" * 64,
+                "call_id_sha256": "c" * 64,
+                "limits": {
+                    "max_requests": 1,
+                    "max_outbound_bytes": 1,
+                    "max_response_wire_bytes": 1,
+                },
+                **override,
+            }
+            with self.subTest(override=override), self.assertRaisesRegex(
+                server.ProxyPolicyError,
+                "invalid_policy_preface",
+            ):
+                self._read_preface(
+                    _policy_preface(
+                        ["https://example.com:443"],
+                        version=3,
+                        **kwargs,
+                    )
+                )
+
+    def test_v3_budget_metadata_is_hmac_covered(self):
+        valid = _policy_preface(
+            ["https://example.com:443"],
+            version=3,
+            limits={
+                "max_requests": 3,
+                "max_outbound_bytes": 100,
+                "max_response_wire_bytes": 200,
+            },
+        )
+        encoded = valid[len(server.POLICY_PREFACE_PREFIX):].strip()
+        original = json.loads(encoded)
+        mutations = (
+            ("budget_scope_sha256", "d" * 64),
+            ("call_id_sha256", "e" * 64),
+            (
+                "limits",
+                {
+                    "max_requests": 2,
+                    "max_outbound_bytes": 100,
+                    "max_response_wire_bytes": 200,
+                },
+            ),
+        )
+        for field, value in mutations:
+            payload = {**original, field: value}
+            tampered = (
+                server.POLICY_PREFACE_PREFIX
+                + json.dumps(payload, separators=(",", ":")).encode()
+                + b"\n"
+            )
+            with self.subTest(field=field), self.assertRaisesRegex(
+                server.ProxyPolicyError,
+                "policy_authentication_failed",
+            ):
+                self._read_preface(tampered)
+
     def test_raw_unsigned_request_is_rejected(self):
         with self.assertRaisesRegex(
             server.ProxyPolicyError,
@@ -623,6 +890,153 @@ class PolicyPrefaceAuthenticationTests(unittest.TestCase):
                 server.ProxyPolicyError,
             ):
                 self._read_preface(_policy_preface([origin]))
+
+
+class PolicyScopeLedgerTests(unittest.TestCase):
+    @staticmethod
+    def _policy(
+        scope: str,
+        *,
+        requests: int = 2,
+        outbound: int = 10,
+        response: int = 10,
+    ) -> server.SignedEgressPolicy:
+        return server._validated_signed_egress_policy(
+            [],
+            [],
+            [],
+            version=3,
+            budget_scope_sha256=scope,
+            call_id_sha256="c" * 64,
+            limits_raw={
+                "max_requests": requests,
+                "max_outbound_bytes": outbound,
+                "max_response_wire_bytes": response,
+            },
+        )
+
+    def test_shared_scope_enforces_all_three_cumulative_limits(self):
+        ledger = server.PolicyScopeLedger(capacity=2, ttl_seconds=60)
+        policy = self._policy("a" * 64, requests=2)
+        first = ledger.admit(policy)
+        second = ledger.admit(policy)
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        first.consume_outbound(6)
+        second.consume_outbound(4)
+        first.consume_response_wire(10)
+        with self.assertRaisesRegex(
+            server.ProxyPolicyError,
+            "policy_outbound_budget_exceeded",
+        ):
+            second.consume_outbound(1)
+        with self.assertRaisesRegex(
+            server.ProxyPolicyError,
+            "policy_response_wire_budget_exceeded",
+        ):
+            second.consume_response_wire(1)
+        with self.assertRaisesRegex(
+            server.ProxyPolicyError,
+            "policy_request_budget_exceeded",
+        ):
+            ledger.admit(policy)
+        first.release()
+        second.release()
+
+    def test_scope_limit_drift_and_capacity_fail_closed(self):
+        ledger = server.PolicyScopeLedger(capacity=1, ttl_seconds=60)
+        reservation = ledger.admit(self._policy("a" * 64))
+        with self.assertRaisesRegex(
+            server.ProxyPolicyError,
+            "policy_scope_limits_mismatch",
+        ):
+            ledger.admit(self._policy("a" * 64, outbound=9))
+        with self.assertRaisesRegex(
+            server.ProxyPolicyError,
+            "policy_scope_ledger_capacity_exceeded",
+        ):
+            ledger.admit(self._policy("b" * 64))
+        reservation.release()
+
+    def test_inactive_scope_expires_but_active_scope_does_not(self):
+        now = [0.0]
+        ledger = server.PolicyScopeLedger(
+            capacity=1,
+            ttl_seconds=5,
+            clock=lambda: now[0],
+        )
+        active = ledger.admit(self._policy("a" * 64))
+        now[0] = 10.0
+        with self.assertRaisesRegex(
+            server.ProxyPolicyError,
+            "policy_scope_ledger_capacity_exceeded",
+        ):
+            ledger.admit(self._policy("b" * 64))
+        active.release()
+        now[0] = 16.0
+        replacement = ledger.admit(self._policy("b" * 64))
+        replacement.release()
+
+    def test_active_oldest_scope_does_not_block_expired_inactive_reclaim(self):
+        now = [0.0]
+        ledger = server.PolicyScopeLedger(
+            capacity=2,
+            ttl_seconds=5,
+            clock=lambda: now[0],
+        )
+        active = ledger.admit(self._policy("a" * 64))
+        inactive = ledger.admit(self._policy("b" * 64))
+        inactive.release()
+        now[0] = 10.0
+
+        replacement = ledger.admit(self._policy("c" * 64))
+
+        self.assertEqual(2, len(ledger._states))
+        self.assertIn("a" * 64, ledger._states)
+        self.assertIn("c" * 64, ledger._states)
+        active.release()
+        replacement.release()
+
+    def test_concurrent_request_admission_is_atomic(self):
+        ledger = server.PolicyScopeLedger(capacity=1, ttl_seconds=60)
+        policy = self._policy("a" * 64, requests=8)
+        barrier = threading.Barrier(16)
+        outcomes: list[str] = []
+        lock = threading.Lock()
+
+        def admit() -> None:
+            barrier.wait()
+            try:
+                reservation = ledger.admit(policy)
+            except server.ProxyPolicyError as exc:
+                result = str(exc)
+            else:
+                result = "admitted"
+                reservation.release()
+            with lock:
+                outcomes.append(result)
+
+        threads = [threading.Thread(target=admit) for _ in range(16)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(8, outcomes.count("admitted"))
+        self.assertEqual(
+            8,
+            outcomes.count("policy_request_budget_exceeded"),
+        )
+
+    def test_response_relay_stops_before_over_budget_chunk(self):
+        ledger = server.PolicyScopeLedger(capacity=1, ttl_seconds=60)
+        reservation = ledger.admit(
+            self._policy("a" * 64, response=5)
+        )
+        client = _CollectingWriter()
+        upstream = _FragmentedReader(b"abcdef", max_chunk=1)
+        server._relay_response_only(client, upstream, reservation)
+        self.assertEqual(b"abcde", bytes(client.payload))
+        reservation.release()
 
 
 class ExactEgressPolicyTests(unittest.TestCase):
@@ -1795,6 +2209,8 @@ class ProxyRelayIntegrationTests(unittest.TestCase):
         server.ProxyHandler.trust_generation = (
             self.certificate_authority.generation_id
         )
+        self.previous_scope_ledger = server.ProxyHandler.scope_ledger
+        server.ProxyHandler.scope_ledger = server.PolicyScopeLedger()
 
     def tearDown(self):
         server.ProxyHandler.certificate_authority = None
@@ -1802,6 +2218,7 @@ class ProxyRelayIntegrationTests(unittest.TestCase):
         server.ProxyHandler.upstream_tls_policy = (
             server.UpstreamTlsPolicy({})
         )
+        server.ProxyHandler.scope_ledger = self.previous_scope_ledger
         self.certificate_authority.close()
         self.ca_temporary.cleanup()
         self.environment.stop()
@@ -2175,6 +2592,116 @@ class ProxyRelayIntegrationTests(unittest.TestCase):
             self.assertTrue(response.startswith(b"HTTP/1.1 403 "))
             self.assertIn(
                 b"authenticated_policy_preface_required",
+                response,
+            )
+        finally:
+            proxy.shutdown()
+            proxy.server_close()
+            proxy_thread.join(timeout=3)
+
+    def test_v3_outbound_budget_is_rejected_before_dns(self):
+        proxy = server.ThreadingProxyServer(
+            ("127.0.0.1", 0),
+            server.ProxyHandler,
+        )
+        proxy_thread = threading.Thread(
+            target=proxy.serve_forever,
+            daemon=True,
+        )
+        proxy_thread.start()
+        try:
+            client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                client.settimeout(3)
+                client.connect(proxy.server_address)
+                with patch.object(server.socket, "getaddrinfo") as resolver:
+                    client.sendall(
+                        _policy_preface(
+                            ["http://allowed.example:80"],
+                            version=3,
+                            limits={
+                                "max_requests": 1,
+                                "max_outbound_bytes": 1,
+                                "max_response_wire_bytes": 1,
+                            },
+                        )
+                        + (
+                            b"GET http://allowed.example/proof HTTP/1.1\r\n"
+                            b"Host: allowed.example\r\n\r\n"
+                        )
+                    )
+                    response = bytearray()
+                    while True:
+                        chunk = client.recv(4096)
+                        if not chunk:
+                            break
+                        response.extend(chunk)
+                resolver.assert_not_called()
+            finally:
+                client.close()
+            self.assertTrue(response.startswith(b"HTTP/1.1 403 "))
+            self.assertIn(
+                b"policy_outbound_budget_exceeded",
+                response,
+            )
+        finally:
+            proxy.shutdown()
+            proxy.server_close()
+            proxy_thread.join(timeout=3)
+
+    def test_v3_connect_inner_budget_is_rejected_before_dns(self):
+        proxy = server.ThreadingProxyServer(
+            ("127.0.0.1", 0),
+            server.ProxyHandler,
+        )
+        proxy_thread = threading.Thread(
+            target=proxy.serve_forever,
+            daemon=True,
+        )
+        proxy_thread.start()
+        try:
+            client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                client.settimeout(3)
+                client.connect(proxy.server_address)
+                with patch.object(server.socket, "getaddrinfo") as resolver:
+                    client.sendall(
+                        _policy_preface(
+                            ["http://allowed.example:80"],
+                            version=3,
+                            limits={
+                                "max_requests": 1,
+                                "max_outbound_bytes": 1,
+                                "max_response_wire_bytes": 1,
+                            },
+                        )
+                        + (
+                            b"CONNECT allowed.example:80 HTTP/1.1\r\n"
+                            b"Host: allowed.example:80\r\n\r\n"
+                        )
+                    )
+                    established = bytearray()
+                    while b"\r\n\r\n" not in established:
+                        established.extend(client.recv(4096))
+                    self.assertTrue(
+                        established.startswith(b"HTTP/1.1 200 ")
+                    )
+                    client.sendall(
+                        b"GET /proof HTTP/1.1\r\n"
+                        b"Host: allowed.example\r\n\r\n"
+                    )
+                    response = bytearray()
+                    while True:
+                        chunk = client.recv(4096)
+                        if not chunk:
+                            break
+                        response.extend(chunk)
+                resolver.assert_not_called()
+            finally:
+                client.close()
+            self.assertTrue(response.startswith(b"HTTP/1.1 403 "))
+            self.assertIn(
+                b"policy_outbound_budget_exceeded",
                 response,
             )
         finally:

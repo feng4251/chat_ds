@@ -10,6 +10,7 @@ from tools.session_sandbox_policy import (
     normalize_http_origin,
     normalize_http_url_prefix,
     normalize_session_sandbox_egress_rules,
+    session_sandbox_egress_budget_binding,
     skill_session_sandbox_egress_policy,
     skill_session_sandbox_egress_origins,
 )
@@ -20,6 +21,70 @@ from tools.skill_script import RUN_SKILL_SCRIPT_SCHEMA
 
 
 class SessionSandboxPolicyTests(unittest.TestCase):
+    def test_egress_budget_binding_is_root_scoped_and_call_attributable(
+        self,
+    ) -> None:
+        parent = ToolContext(
+            user_id="tenant-a",
+            session_id="session-a",
+            run_id="run-parent",
+            root_run_id="root-run",
+            tool_operation_id="operation-parent",
+        )
+        child = ToolContext(
+            user_id="tenant-a",
+            session_id="session-a",
+            run_id="run-child",
+            root_run_id="root-run",
+            tool_operation_id="operation-child",
+        )
+
+        parent_binding = session_sandbox_egress_budget_binding(
+            parent,
+            operation="skill_python",
+        )
+        repeated_binding = session_sandbox_egress_budget_binding(
+            parent,
+            operation="skill_python",
+        )
+        child_binding = session_sandbox_egress_budget_binding(
+            child,
+            operation="skill_python",
+        )
+        other_operation = session_sandbox_egress_budget_binding(
+            parent,
+            operation="skill_script",
+        )
+
+        self.assertEqual(parent_binding, repeated_binding)
+        self.assertEqual(
+            parent_binding.budget_scope_sha256,
+            child_binding.budget_scope_sha256,
+        )
+        self.assertNotEqual(
+            parent_binding.call_id_sha256,
+            child_binding.call_id_sha256,
+        )
+        self.assertNotEqual(
+            parent_binding.call_id_sha256,
+            other_operation.call_id_sha256,
+        )
+        self.assertRegex(
+            parent_binding.budget_scope_sha256,
+            r"^[0-9a-f]{64}$",
+        )
+        self.assertNotIn(
+            "tenant-a",
+            parent_binding.budget_scope_sha256,
+        )
+
+    def test_egress_budget_binding_requires_runtime_context(self) -> None:
+        with self.assertRaises(SessionSandboxPolicyError):
+            session_sandbox_egress_budget_binding(
+                None,
+                operation="skill_python",
+            )
+
     def test_http_origins_are_canonicalized_from_exact_url_prefixes(self) -> None:
         cases = {
             "HTTPS://Example.COM./v1/items?q=one#fragment": (

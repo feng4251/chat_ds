@@ -21,7 +21,12 @@ V2_AUTH_TOKEN = "test-only-v2-auth-token-" + "x" * 32
 
 
 class _FakeEgressBridge:
-    def __init__(self, port: int = 19081) -> None:
+    def __init__(
+        self,
+        port: int = 19081,
+        *,
+        audit_receipt: dict[str, object] | None = None,
+    ) -> None:
         proxy = f"http://127.0.0.1:{port}"
         self.environment = {
             "SKILL_EGRESS_PROXY_URL": proxy,
@@ -35,9 +40,32 @@ class _FakeEgressBridge:
             "no_proxy": "localhost,127.0.0.1,[::1]",
         }
         self.close_count = 0
+        self.audit_receipt = audit_receipt
 
-    def close(self) -> None:
+    def close(self) -> dict[str, object] | None:
         self.close_count += 1
+        return self.audit_receipt
+
+
+class _FlakyEgressBridge(_FakeEgressBridge):
+    def __init__(
+        self,
+        *,
+        failures: int,
+        port: int = 19089,
+        audit_receipt: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(port=port, audit_receipt=audit_receipt)
+        self.failures = failures
+
+    def close(self) -> dict[str, object] | None:
+        self.close_count += 1
+        if self.close_count <= self.failures:
+            raise server.ProtocolError(
+                "egress_bridge_cleanup_failed",
+                "injected bridge seal failure",
+            )
+        return self.audit_receipt
 
 
 def _file(path: str, content: bytes) -> dict[str, object]:
@@ -118,6 +146,50 @@ def _set_exact_egress_policy(
         "egress_origins": list(origins),
         "private_origins": [],
     })
+
+
+def _v3_audit_receipt(
+    payload: dict[str, object],
+) -> dict[str, object]:
+    authority = {
+        "origins": payload["egress_origins"],
+        "egress_rules": payload["egress_rules"],
+        "private_origins": payload["private_origins"],
+    }
+    receipt: dict[str, object] = {
+        "profile": "bounded_controlled_exchange",
+        "version": 1,
+        "budget_scope_sha256": payload["budget_scope_sha256"],
+        "call_id_sha256": payload["call_id_sha256"],
+        "rules_sha256": hashlib.sha256(json.dumps(
+            authority,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest(),
+        "counts": {
+            "accepted_connections": 1,
+            "client_to_proxy_wire_bytes": 128,
+            "proxy_to_client_wire_bytes": 512,
+            "budget_rejections": 0,
+            "clean_closes": 1,
+        },
+        "limits": {
+            "max_outbound_bytes": 1024,
+            "max_requests": 8,
+            "max_response_wire_bytes": 4096,
+        },
+        "exhausted": False,
+    }
+    receipt["receipt_sha256"] = hashlib.sha256(json.dumps(
+        receipt,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    return receipt
 
 
 def _process_open_request(
@@ -239,6 +311,60 @@ def _command_request(
 
 
 class SkillScriptServerTests(unittest.TestCase):
+    def test_egress_bridge_close_failure_is_retryable_and_receipt_is_copied(
+        self,
+    ) -> None:
+        terminal = {
+            "counts": {"accepted_connections": 1},
+            "receipt_sha256": "a" * 64,
+        }
+
+        class RetryableServer:
+            def __init__(self) -> None:
+                self.attempts = 0
+
+            def shutdown_and_seal(self):
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise RuntimeError("handler still draining")
+                return terminal
+
+            def audit_receipt(self):
+                return terminal
+
+        class StoppedThread:
+            def join(self, timeout=None):
+                del timeout
+
+            @staticmethod
+            def is_alive():
+                return False
+
+        lifecycle = RetryableServer()
+        handle = server._EgressBridgeHandle(
+            server=lifecycle,
+            thread=StoppedThread(),
+            environment={},
+            policy_version=3,
+        )
+        with self.assertRaisesRegex(
+            server.ProtocolError,
+            "did not drain and seal",
+        ):
+            handle.close()
+        self.assertFalse(handle.closed)
+        self.assertIsNone(handle.audit_receipt)
+
+        receipt = handle.close()
+        self.assertTrue(handle.closed)
+        self.assertEqual(2, lifecycle.attempts)
+        self.assertEqual(terminal, receipt)
+        receipt["counts"]["accepted_connections"] = 999
+        self.assertEqual(
+            1,
+            handle.close()["counts"]["accepted_connections"],
+        )
+
     def test_serialized_worker_contention_fails_immediately_and_never_runs_later(
         self,
     ) -> None:
@@ -509,6 +635,9 @@ print(json.dumps({
             (),
             egress_rules=(),
             private_origins=(),
+            policy_version=2,
+            budget_scope_sha256=None,
+            call_id_sha256=None,
             runtime_root=ANY,
         )
         observed = json.loads(response["stdout"])
@@ -556,6 +685,9 @@ print(json.dumps({
                 _egress_rules(("https://example.com:443",))
             ),
             private_origins=(),
+            policy_version=2,
+            budget_scope_sha256=None,
+            call_id_sha256=None,
             runtime_root=ANY,
         )
         self.assertEqual(
@@ -563,6 +695,237 @@ print(json.dumps({
             response["stdout"].strip(),
         )
         self.assertEqual(1, bridge.close_count)
+
+    def test_one_shot_v3_binding_and_audit_are_preserved(self) -> None:
+        request = _request(b"print('bounded')\n")
+        _set_exact_egress_policy(
+            request,
+            ("https://example.com:443",),
+        )
+        request.update({
+            "egress_policy_version": 3,
+            "budget_scope_sha256": "a" * 64,
+            "call_id_sha256": "b" * 64,
+        })
+        audit = _v3_audit_receipt(request)
+        bridge = _FakeEgressBridge(
+            port=19085,
+            audit_receipt=audit,
+        )
+
+        with patch.object(
+            server,
+            "_start_egress_bridge",
+            return_value=bridge,
+        ) as start_bridge:
+            response = server._run_skill_script(request)
+
+        self.assertEqual("success", response["status"])
+        self.assertEqual(3, response["egress_policy_version"])
+        self.assertEqual(audit, response["egress_audit_receipt"])
+        start_bridge.assert_called_once_with(
+            ("https://example.com:443",),
+            egress_rules=tuple(
+                _egress_rules(("https://example.com:443",))
+            ),
+            private_origins=(),
+            policy_version=3,
+            budget_scope_sha256="a" * 64,
+            call_id_sha256="b" * 64,
+            runtime_root=ANY,
+        )
+
+    def test_post_spawn_bridge_seal_failure_preserves_execution_evidence(
+        self,
+    ) -> None:
+        class CapabilitySocket:
+            def __init__(self) -> None:
+                self.response = b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def settimeout(self, _timeout):
+                return None
+
+            def connect(self, _path):
+                return None
+
+            def sendall(self, request: bytes):
+                payload = json.loads(request.decode("utf-8"))
+                response = server._run_runtime_capabilities(payload)
+                self.response = (
+                    json.dumps(response, separators=(",", ":")).encode(
+                        "utf-8"
+                    )
+                    + b"\n"
+                )
+
+            def recv(self, _size: int) -> bytes:
+                response, self.response = self.response, b""
+                return response
+
+        skill_request = _request(b"print('skill-ran')\n")
+        _set_exact_egress_policy(
+            skill_request,
+            ("https://example.com:443",),
+        )
+        skill_request.update({
+            "egress_policy_version": 3,
+            "budget_scope_sha256": "c" * 64,
+            "call_id_sha256": "d" * 64,
+        })
+        command_request = _command_request(
+            executable="python3",
+            egress_origins=("https://example.com:443",),
+        )
+        command_request.update({
+            "egress_policy_version": 3,
+            "budget_scope_sha256": "e" * 64,
+            "call_id_sha256": "f" * 64,
+        })
+
+        cases = (
+            (
+                "skill_script",
+                skill_request,
+                "skill-ran",
+            ),
+            (
+                "declared_command",
+                command_request,
+                "literal; $(touch never) | ignored",
+            ),
+        )
+        for label, request, stdout_fragment in cases:
+            with self.subTest(kind=label):
+                server._shutdown_all_process_leases()
+                bridge = _FlakyEgressBridge(failures=3)
+                try:
+                    with patch.object(
+                        server,
+                        "_start_egress_bridge",
+                        return_value=bridge,
+                    ):
+                        response = server._run(request)
+
+                    self.assertEqual("error", response["status"])
+                    self.assertEqual(
+                        "egress_bridge_cleanup_failed",
+                        response["error_code"],
+                    )
+                    self.assertEqual(0, response["returncode"])
+                    self.assertIn(stdout_fragment, response["stdout"])
+                    self.assertEqual("success", response["execution_status"])
+                    self.assertTrue(response["execution_completed"])
+                    self.assertTrue(response["artifacts_discarded"])
+                    self.assertEqual([], response["artifacts"])
+                    self.assertEqual(
+                        "egress_bridge_seal",
+                        response["cleanup_phase"],
+                    )
+                    self.assertNotIn("egress_audit_receipt", response)
+                    self.assertEqual(2, bridge.close_count)
+                    self.assertEqual(
+                        1,
+                        server._v1_orphaned_egress_bridge_count(),
+                    )
+                    self.assertTrue(server._ACTIVE_V1_EXECUTION)
+                    self.assertTrue(
+                        server._ACTIVE_V1_EXECUTION_QUARANTINED
+                    )
+
+                    blocked = server._run(_request(b"print('blocked')\n"))
+                    self.assertEqual("worker_busy", blocked["error_code"])
+                    capabilities = server._run_runtime_capabilities({
+                        "protocol_version": server.PROTOCOL_VERSION,
+                        "kind": "runtime_capabilities",
+                        "request_id": str(uuid.uuid4()),
+                        "requirements": [],
+                        "commands": [],
+                        "environment_variables": [],
+                        "platform_groups": [],
+                    })
+                    self.assertEqual("error", capabilities["status"])
+                    self.assertEqual(
+                        "worker_containment_failed",
+                        capabilities["error_code"],
+                    )
+                    with (
+                        patch.object(
+                            server,
+                            "_trusted_resource_launcher",
+                            return_value="/usr/bin/prlimit",
+                        ),
+                        patch.object(
+                            server,
+                            "_untrusted_execution_enabled",
+                            return_value=False,
+                        ),
+                        patch.object(
+                            server,
+                            "_process_protocol_enabled",
+                            return_value=False,
+                        ),
+                        patch.object(
+                            server.socket,
+                            "socket",
+                            return_value=CapabilitySocket(),
+                        ),
+                    ):
+                        self.assertEqual(1, server.healthcheck())
+
+                    with self.assertRaises(server.ProtocolError) as caught:
+                        server._controller_reap_process_leases()
+                    self.assertEqual(
+                        "egress_bridge_cleanup_failed",
+                        caught.exception.code,
+                    )
+                    self.assertEqual(3, bridge.close_count)
+                    self.assertEqual(
+                        1,
+                        server._v1_orphaned_egress_bridge_count(),
+                    )
+                    self.assertTrue(server._ACTIVE_V1_EXECUTION)
+
+                    self.assertEqual(
+                        1,
+                        server._controller_reap_process_leases(),
+                    )
+                    self.assertEqual(4, bridge.close_count)
+                    self.assertEqual(
+                        0,
+                        server._v1_orphaned_egress_bridge_count(),
+                    )
+                    self.assertFalse(server._ACTIVE_V1_EXECUTION)
+                    self.assertFalse(
+                        server._ACTIVE_V1_EXECUTION_QUARANTINED
+                    )
+                finally:
+                    # Leave global admission deterministic even if an
+                    # assertion aborts before the successful retry.
+                    server._shutdown_all_process_leases()
+                    server._shutdown_all_process_leases()
+
+    def test_shutdown_retries_controller_owned_orphan_bridge(self) -> None:
+        server._shutdown_all_process_leases()
+        bridge = _FlakyEgressBridge(failures=1)
+        server._register_orphaned_v1_egress_bridge(bridge)
+
+        server._shutdown_all_process_leases()
+        self.assertEqual(1, bridge.close_count)
+        self.assertEqual(1, server._v1_orphaned_egress_bridge_count())
+        self.assertTrue(server._ACTIVE_V1_EXECUTION)
+        self.assertTrue(server._ACTIVE_V1_EXECUTION_QUARANTINED)
+
+        server._shutdown_all_process_leases()
+        self.assertEqual(2, bridge.close_count)
+        self.assertEqual(0, server._v1_orphaned_egress_bridge_count())
+        self.assertFalse(server._ACTIVE_V1_EXECUTION)
+        self.assertFalse(server._ACTIVE_V1_EXECUTION_QUARANTINED)
 
     def test_executor_rejects_invalid_egress_before_bridge_start(
         self,
@@ -585,6 +948,23 @@ print(json.dumps({
                     response["error_code"],
                 )
                 start_bridge.assert_not_called()
+
+    def test_deployment_can_require_v3_before_bridge_start(self) -> None:
+        request = _request(b"print('must not execute')\n")
+        _set_exact_egress_policy(
+            request,
+            ("https://api.example.test:443",),
+        )
+        with (
+            patch.object(server, "REQUIRE_EGRESS_POLICY_V3", True),
+            patch.object(server, "_start_egress_bridge") as start_bridge,
+        ):
+            response = server._run_skill_script(request)
+        self.assertEqual(
+            "egress_policy_upgrade_required",
+            response["error_code"],
+        )
+        start_bridge.assert_not_called()
 
     def test_skill_errors_preserve_runtime_and_requested_egress_receipt(
         self,
@@ -704,6 +1084,9 @@ print(json.dumps({
             origins,
             egress_rules=tuple(_egress_rules(origins)),
             private_origins=(),
+            policy_version=2,
+            budget_scope_sha256=None,
+            call_id_sha256=None,
             runtime_root=ANY,
         )
         self.assertEqual(1, bridge.close_count)
@@ -1228,6 +1611,47 @@ class QueryClient:
 
 
 class ResourceLimitConfigurationTests(unittest.TestCase):
+    def test_egress_limits_are_strict_and_healthcheck_prevalidates(self) -> None:
+        names = {
+            "EXECUTOR_EGRESS_MAX_REQUESTS_PER_SCOPE": "7",
+            "EXECUTOR_EGRESS_MAX_OUTBOUND_BYTES_PER_SCOPE": "8000",
+            "EXECUTOR_EGRESS_MAX_RESPONSE_WIRE_BYTES_PER_SCOPE": "90000",
+        }
+        with patch.dict(os.environ, names):
+            self.assertEqual(
+                {
+                    "max_outbound_bytes": 8000,
+                    "max_requests": 7,
+                    "max_response_wire_bytes": 90000,
+                },
+                server._configured_egress_limits(),
+            )
+        for value in (
+            "invalid",
+            "0",
+            str(server.MAX_EGRESS_MAX_REQUESTS_PER_SCOPE + 1),
+        ):
+            with (
+                self.subTest(value=value),
+                patch.dict(
+                    os.environ,
+                    {
+                        **names,
+                        "EXECUTOR_EGRESS_MAX_REQUESTS_PER_SCOPE": value,
+                    },
+                ),
+                self.assertRaises(RuntimeError),
+            ):
+                server._configured_egress_limits()
+            with patch.dict(
+                os.environ,
+                {
+                    **names,
+                    "EXECUTOR_EGRESS_MAX_REQUESTS_PER_SCOPE": value,
+                },
+            ):
+                self.assertEqual(1, server.healthcheck())
+
     def test_unified_pool_preserves_host_uid_aggregate_nproc_ceiling(
         self,
     ) -> None:
@@ -1411,6 +1835,42 @@ class PersistentProcessServerTests(unittest.TestCase):
         fake_libc = type("FakeLibC", (), {"prctl": staticmethod(lambda *args: 0)})()
         with patch.object(server.ctypes, "CDLL", return_value=fake_libc):
             self.assertTrue(server._harden_daemon_dumpability())
+
+    def test_unpublished_open_cancels_admission_when_bridge_seal_fails(
+        self,
+    ) -> None:
+        request = _process_open_request(
+            b"print('must not publish')\n",
+            egress_origins=["https://example.com:443"],
+        )
+        bridge = _FlakyEgressBridge(failures=1)
+        with (
+            patch.object(
+                server,
+                "_start_egress_bridge",
+                return_value=bridge,
+            ),
+            patch.object(
+                server,
+                "_new_process_handle",
+                side_effect=RuntimeError("injected open construction failure"),
+            ),
+        ):
+            failed = server._run(request)
+
+        self.assertEqual("error", failed["status"])
+        self.assertEqual(
+            "egress_bridge_cleanup_failed",
+            failed["error_code"],
+        )
+        self.assertEqual({}, server._PROCESS_LEASES)
+        self.assertIsNone(server._ACTIVE_PROCESS_LEASE_HANDLE)
+        self.assertEqual(0, server._controller_reap_process_leases())
+
+        reopened = server._run(_process_open_request(b"print('next')\n"))
+        self.assertEqual("success", reopened["status"])
+        prepared = server._run(_process_operation(reopened, "close"))
+        self.assertEqual("closed", _ack_process_batch(reopened, prepared)["state"])
 
     def test_authenticated_startup_reap_removes_orphan_lease_and_is_idempotent(self) -> None:
         opened = server._run(
@@ -2406,6 +2866,212 @@ async def open_counter(start=0):
         finally:
             self.worker_sweep_mock.side_effect = None
 
+    def test_failed_expiry_bridge_seal_retains_lease_and_retries_audit(
+        self,
+    ) -> None:
+        request = _process_open_request(
+            b"print('never started')\n",
+            idle_ttl_seconds=1,
+            egress_origins=["https://example.com:443"],
+        )
+        request.update({
+            "egress_policy_version": 3,
+            "budget_scope_sha256": "1" * 64,
+            "call_id_sha256": "2" * 64,
+        })
+        request = _sign_v2(request)
+        audit = _v3_audit_receipt(request)
+        bridge = _FlakyEgressBridge(
+            failures=1,
+            audit_receipt=audit,
+        )
+        with patch.object(
+            server,
+            "_start_egress_bridge",
+            return_value=bridge,
+        ):
+            opened = server._run(request)
+
+        handle = str(opened["lease_handle"])
+        lease = server._PROCESS_LEASES[handle]
+        lease.last_activity = time.monotonic() - 5
+
+        self.assertEqual(0, server._cleanup_expired_process_leases())
+        self.assertEqual("quarantined", lease.state)
+        self.assertEqual(
+            "egress_bridge_cleanup_failed",
+            lease.close_reason,
+        )
+        self.assertIs(bridge, lease.egress_bridge)
+        self.assertEqual(handle, server._ACTIVE_PROCESS_LEASE_HANDLE)
+        quarantined = server._bound_process_error(
+            str(uuid.uuid4()),
+            "read",
+            "worker_containment_failed",
+            "lease remains quarantined",
+            lease=lease,
+        )
+        self.assertEqual(
+            "quarantined",
+            quarantined["terminal_lease_state"],
+        )
+
+        self.assertEqual(1, server._cleanup_expired_process_leases())
+        self.assertEqual("expired", lease.state)
+        self.assertIsNone(lease.egress_bridge)
+        self.assertEqual(audit, lease.egress_audit_receipt)
+        self.assertIsNone(server._ACTIVE_PROCESS_LEASE_HANDLE)
+        expired = server._bound_process_error(
+            str(uuid.uuid4()),
+            "read",
+            "lease_expired",
+            "lease expired",
+            lease=lease,
+        )
+        self.assertEqual("closed", expired["terminal_lease_state"])
+        self.assertEqual(audit, expired["egress_audit_receipt"])
+        self.assertEqual(2, bridge.close_count)
+
+    def test_explicit_close_bridge_failure_returns_terminal_quarantine(
+        self,
+    ) -> None:
+        bridge = _FlakyEgressBridge(failures=1)
+        request = _process_open_request(
+            b"print('never started')\n",
+            egress_origins=["https://example.com:443"],
+        )
+        with patch.object(
+            server,
+            "_start_egress_bridge",
+            return_value=bridge,
+        ):
+            opened = server._run(request)
+
+        failed = server._run(_process_operation(opened, "close"))
+        handle = str(opened["lease_handle"])
+        lease = server._PROCESS_LEASES[handle]
+        self.assertEqual("error", failed["status"])
+        self.assertEqual(
+            "egress_bridge_cleanup_failed",
+            failed["error_code"],
+        )
+        self.assertEqual("quarantined", failed["terminal_lease_state"])
+        self.assertEqual("quarantined", lease.state)
+        self.assertEqual(handle, server._ACTIVE_PROCESS_LEASE_HANDLE)
+        self.assertIs(bridge, lease.egress_bridge)
+
+        self.assertEqual(1, server._cleanup_expired_process_leases())
+        self.assertEqual("expired", lease.state)
+        self.assertIsNone(server._ACTIVE_PROCESS_LEASE_HANDLE)
+
+    def test_shutdown_retains_failed_bridge_lease_until_retry(self) -> None:
+        bridge = _FlakyEgressBridge(failures=1)
+        request = _process_open_request(
+            b"print('never started')\n",
+            egress_origins=["https://example.com:443"],
+        )
+        with patch.object(
+            server,
+            "_start_egress_bridge",
+            return_value=bridge,
+        ):
+            opened = server._run(request)
+
+        handle = str(opened["lease_handle"])
+        temp_dir = server._PROCESS_LEASES[handle].temp_dir
+        server._shutdown_all_process_leases()
+        lease = server._PROCESS_LEASES[handle]
+        self.assertEqual("quarantined", lease.state)
+        self.assertEqual(
+            "egress_bridge_cleanup_failed",
+            lease.close_reason,
+        )
+        self.assertTrue(temp_dir.exists())
+        self.assertEqual(handle, server._ACTIVE_PROCESS_LEASE_HANDLE)
+
+        server._shutdown_all_process_leases()
+        self.assertNotIn(handle, server._PROCESS_LEASES)
+        self.assertFalse(temp_dir.exists())
+        self.assertIsNone(server._ACTIVE_PROCESS_LEASE_HANDLE)
+        self.assertEqual(2, bridge.close_count)
+
+    def test_controller_reap_continues_after_one_bridge_seal_failure(
+        self,
+    ) -> None:
+        first_bridge = _FlakyEgressBridge(failures=1, port=19090)
+        second_bridge = _FakeEgressBridge(port=19091)
+        limits = {
+            "EXECUTOR_MAX_PROCESS_LEASES": "2",
+            "EXECUTOR_MAX_PROCESS_LEASES_PER_SCOPE": "2",
+        }
+        with (
+            patch.object(server, "MAX_PROCESS_LEASES", 2),
+            patch.object(server, "MAX_PROCESS_LEASES_PER_SCOPE", 2),
+            patch.dict(os.environ, limits),
+            patch.object(
+                server,
+                "_start_egress_bridge",
+                side_effect=[first_bridge, second_bridge],
+            ),
+        ):
+            first = server._run(_process_open_request(
+                b"print('first')\n",
+                egress_origins=["https://example.com:443"],
+            ))
+            first_handle = str(first["lease_handle"])
+            with server._EXECUTION_ADMISSION_LOCK:
+                server._ACTIVE_PROCESS_LEASE_HANDLE = None
+            second = server._run(_process_open_request(
+                b"print('second')\n",
+                egress_origins=["https://example.org:443"],
+            ))
+            second_handle = str(second["lease_handle"])
+            second_temp_dir = server._PROCESS_LEASES[second_handle].temp_dir
+            with server._EXECUTION_ADMISSION_LOCK:
+                server._ACTIVE_PROCESS_LEASE_HANDLE = first_handle
+
+            with self.assertRaises(server.ProtocolError) as caught:
+                server._controller_reap_process_leases()
+            self.assertEqual(
+                "egress_bridge_cleanup_failed",
+                caught.exception.code,
+            )
+            self.assertIn(first_handle, server._PROCESS_LEASES)
+            self.assertEqual(
+                "quarantined",
+                server._PROCESS_LEASES[first_handle].state,
+            )
+            self.assertNotIn(second_handle, server._PROCESS_LEASES)
+            self.assertFalse(second_temp_dir.exists())
+            self.assertEqual(
+                first_handle,
+                server._ACTIVE_PROCESS_LEASE_HANDLE,
+            )
+
+            self.assertEqual(1, server._controller_reap_process_leases())
+            self.assertEqual({}, server._PROCESS_LEASES)
+            self.assertIsNone(server._ACTIVE_PROCESS_LEASE_HANDLE)
+
+    def test_janitor_survives_one_unexpected_cleanup_exception(self) -> None:
+        class BoundedStopEvent:
+            def __init__(self) -> None:
+                self.wait_count = 0
+
+            def wait(self, _timeout: float) -> bool:
+                self.wait_count += 1
+                return self.wait_count >= 3
+
+        stop_event = BoundedStopEvent()
+        with patch.object(
+            server,
+            "_cleanup_expired_process_leases",
+            side_effect=[RuntimeError("injected cleanup fault"), 0],
+        ) as cleanup:
+            server._process_lease_janitor(stop_event)
+
+        self.assertEqual(2, cleanup.call_count)
+        self.assertEqual(3, stop_event.wait_count)
+
     def test_close_ack_retries_same_batch_when_tree_cleanup_initially_fails(self) -> None:
         opened = server._run(_process_open_request(b"print('never started')\n"))
         handle = str(opened["lease_handle"])
@@ -2523,6 +3189,9 @@ print(child.pid, flush=True)
                 (),
                 egress_rules=(),
                 private_origins=(),
+                policy_version=2,
+                budget_scope_sha256=None,
+                call_id_sha256=None,
                 runtime_root=ANY,
             )
             lease = server._PROCESS_LEASES[
@@ -2574,6 +3243,9 @@ print(child.pid, flush=True)
                 tuple(origins),
                 egress_rules=tuple(_egress_rules(origins)),
                 private_origins=(),
+                policy_version=2,
+                budget_scope_sha256=None,
+                call_id_sha256=None,
                 runtime_root=ANY,
             )
             lease = server._PROCESS_LEASES[
@@ -2593,6 +3265,163 @@ print(child.pid, flush=True)
             )
             _ack_process_batch(opened, prepared)
 
+        self.assertEqual(1, bridge.close_count)
+
+    def test_persistent_v3_bound_error_keeps_exact_policy_without_audit(
+        self,
+    ) -> None:
+        origins = ["https://example.com:443"]
+        request = _process_open_request(
+            b"import time\ntime.sleep(60)\n",
+            egress_origins=origins,
+        )
+        request.update({
+            "egress_policy_version": 3,
+            "budget_scope_sha256": "a" * 64,
+            "call_id_sha256": "b" * 64,
+        })
+        request = _sign_v2(request)
+        audit = _v3_audit_receipt(request)
+        bridge = _FakeEgressBridge(
+            port=19087,
+            audit_receipt=audit,
+        )
+
+        with patch.object(
+            server,
+            "_start_egress_bridge",
+            return_value=bridge,
+        ):
+            opened = server._run(request)
+            started = server._run(
+                _process_operation(opened, "start")
+            )
+            duplicate = server._run(
+                _process_operation(opened, "start")
+            )
+
+            self.assertEqual("success", started["status"])
+            self.assertNotIn("egress_audit_receipt", started)
+            self.assertEqual("error", duplicate["status"])
+            self.assertEqual(
+                "process_already_started",
+                duplicate["error_code"],
+            )
+            for field in (
+                "lease_handle",
+                "scope_digest",
+                "skill_sha256",
+                "script_sha256",
+                "runtime_profile",
+                "network_policy",
+                "egress_policy_version",
+            ):
+                with self.subTest(field=field):
+                    self.assertEqual(opened[field], duplicate[field])
+            self.assertEqual([], duplicate["artifacts"])
+            self.assertNotIn("egress_audit_receipt", duplicate)
+            self.assertNotIn("terminal_lease_state", duplicate)
+            self.assertEqual(0, bridge.close_count)
+
+            prepared_close = server._run(
+                _process_operation(opened, "close")
+            )
+            _ack_process_batch(opened, prepared_close)
+            lease = server._PROCESS_LEASES[str(opened["lease_handle"])]
+            closed_error = server._bound_process_error(
+                str(uuid.uuid4()),
+                "read",
+                "lease_closed",
+                "lease is closed",
+                lease=lease,
+            )
+
+        self.assertEqual(1, bridge.close_count)
+        self.assertEqual("closed", closed_error["terminal_lease_state"])
+        self.assertEqual(audit, closed_error["egress_audit_receipt"])
+
+    def test_persistent_v3_live_sync_has_no_audit_and_close_reuses_sealed_audit(
+        self,
+    ) -> None:
+        origins = ["https://example.com:443"]
+        request = _process_open_request(
+            b"print('not started')\n",
+            egress_origins=origins,
+        )
+        request.update({
+            "egress_policy_version": 3,
+            "budget_scope_sha256": "c" * 64,
+            "call_id_sha256": "d" * 64,
+        })
+        request = _sign_v2(request)
+        audit = _v3_audit_receipt(request)
+        bridge = _FakeEgressBridge(
+            port=19088,
+            audit_receipt=audit,
+        )
+
+        with patch.object(
+            server,
+            "_start_egress_bridge",
+            return_value=bridge,
+        ):
+            opened = server._run(request)
+            self.assertEqual(3, opened["egress_policy_version"])
+            self.assertNotIn("egress_audit_receipt", opened)
+
+            prepared_sync = server._run(
+                _process_operation(opened, "sync")
+            )
+            self.assertEqual("success", prepared_sync["status"])
+            self.assertEqual("open", prepared_sync["state"])
+            self.assertNotIn("egress_audit_receipt", prepared_sync)
+            self.assertEqual(0, bridge.close_count)
+
+            acknowledged_sync = _ack_process_batch(
+                opened,
+                prepared_sync,
+            )
+            self.assertEqual(
+                "sync",
+                acknowledged_sync["acknowledged_operation"],
+            )
+            self.assertEqual("open", acknowledged_sync["state"])
+            self.assertNotIn(
+                "egress_audit_receipt",
+                acknowledged_sync,
+            )
+            self.assertEqual(0, bridge.close_count)
+
+            prepared_close = server._run(
+                _process_operation(opened, "close")
+            )
+            self.assertEqual("closing", prepared_close["state"])
+            self.assertEqual(
+                audit,
+                prepared_close["egress_audit_receipt"],
+            )
+            self.assertEqual(1, bridge.close_count)
+
+            acknowledged_close = _ack_process_batch(
+                opened,
+                prepared_close,
+            )
+
+        self.assertEqual(
+            "close",
+            acknowledged_close["acknowledged_operation"],
+        )
+        self.assertEqual("closed", acknowledged_close["state"])
+        self.assertEqual(
+            prepared_close["egress_audit_receipt"],
+            acknowledged_close["egress_audit_receipt"],
+        )
+        self.assertEqual(
+            audit["receipt_sha256"],
+            acknowledged_close["egress_audit_receipt"][
+                "receipt_sha256"
+            ],
+        )
         self.assertEqual(1, bridge.close_count)
 
     def test_browser_profile_does_not_forward_ambient_proxy_authority(self) -> None:
