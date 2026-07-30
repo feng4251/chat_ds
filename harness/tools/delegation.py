@@ -1061,6 +1061,7 @@ class _ChildDispatchReceiptTracker:
         ] = set()
         self._terminal_events_by_run: dict[str, str] = {}
         self._maximum_event_seq_by_run: dict[str, int] = {}
+        self._event_types_by_run: dict[str, set[str]] = {}
         self._last_progress_monotonic = time.monotonic()
         self._provider_admission_waiting = False
         self._progress_notifier = progress_notifier
@@ -1187,6 +1188,9 @@ class _ChildDispatchReceiptTracker:
             self.record_runtime_progress(event_type)
         event_run_id = str(event.get("run_id") or "")
         if event_run_id:
+            self._event_types_by_run.setdefault(
+                event_run_id, set()
+            ).add(event_type)
             try:
                 self._maximum_event_seq_by_run[event_run_id] = max(
                     self._maximum_event_seq_by_run.get(event_run_id, 0),
@@ -1303,6 +1307,11 @@ class _ChildDispatchReceiptTracker:
     def maximum_event_seq(self, run_id: str) -> int:
         return self._maximum_event_seq_by_run.get(str(run_id or ""), 0)
 
+    def has_event(self, run_id: str, event_type: str) -> bool:
+        return str(event_type or "") in self._event_types_by_run.get(
+            str(run_id or ""), set()
+        )
+
     @property
     def last_progress_monotonic(self) -> float:
         return self._last_progress_monotonic
@@ -1346,6 +1355,114 @@ _ACTIVE_CHILD_CANCELLATION_ATTRIBUTION: ContextVar[
 ] = ContextVar("delegation_child_cancellation_attribution", default=None)
 
 
+async def _publish_missing_child_failure_terminal(
+    *,
+    task: dict[str, Any],
+    child_context: ToolContext,
+    index: int,
+    child_run_id: str,
+    receipt_tracker: _ChildDispatchReceiptTracker,
+    error: str,
+    terminal_reason: str,
+    failure_class: str,
+    retryable: bool,
+) -> None:
+    """Persist a child card when validation failed before nested run_stream.
+
+    Most child lifecycle events are emitted by ``run_stream``. Metadata and
+    authority validation happens before that boundary, so a rejected child
+    previously existed only inside the outer delegate result envelope and
+    disappeared from the durable run/task view. Emit the same bounded semantic
+    identity plus one authoritative failure terminal, without fabricating a
+    model or tool dispatch.
+    """
+
+    if receipt_tracker.terminal_event(child_run_id) is not None:
+        return
+    root_run_id = (
+        child_context.root_run_id
+        or child_context.run_id
+        or child_run_id
+    )
+    agent_name = _semantic_agent_name(task, index)
+    base = {
+        "type": "agent_event",
+        "run_id": child_run_id,
+        "root_run_id": root_run_id,
+        "parent_run_id": child_context.run_id,
+        "agent_kind": "delegate",
+        "agent_name": agent_name,
+        "depth": int(child_context.depth or 0) + 1,
+        "workspace_scope": str(
+            task.get("workspace_scope") or "shared_session"
+        ),
+    }
+    events: list[dict[str, Any]] = []
+    if not receipt_tracker.has_event(child_run_id, "agent.spawned"):
+        events.append({
+            **base,
+            "event_type": "agent.spawned",
+            "seq": 0,
+            "payload": {
+                "index": index,
+                "goal": str(task.get("goal") or "")[:4000],
+                "skill_name": str(task.get("skill_name") or "") or None,
+                "worker_id": str(task.get("worker_id") or "") or None,
+                "worker_file": str(task.get("worker_file") or "") or None,
+                "workflow_stage": (
+                    str(task.get("workflow_stage") or "") or None
+                ),
+                "step_type": str(task.get("step_type") or "") or None,
+                "step_id": str(task.get("step_id") or "") or None,
+                "pre_spawn_validation": True,
+            },
+        })
+    dispatch_audit = receipt_tracker.snapshot()
+    events.append({
+        **base,
+        "event_type": "run.failed",
+        "seq": receipt_tracker.maximum_event_seq(child_run_id) + 1,
+        "payload": {
+            "authoritative": True,
+            "error": str(error or "Delegated child validation failed.")[:4000],
+            "finish_reason": terminal_reason,
+            "terminal_reason": terminal_reason,
+            "failure_class": failure_class,
+            "retryable": retryable,
+            "actual_dispatch_attempted": (
+                dispatch_audit.get("dispatch_count", 0) > 0
+            ),
+            "pre_spawn_validation": (
+                dispatch_audit.get("dispatch_count", 0) == 0
+            ),
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+        },
+    })
+    for event in events:
+        if bool(getattr(settings, "agent_debug_trace", False)):
+            from agent_loop import _append_workspace_debug_event_async
+
+            await _append_workspace_debug_event_async(
+                child_context.user_id,
+                child_context.session_id,
+                event,
+            )
+        receipt_tracker.observe_event(event)
+        if child_context.event_sink is not None:
+            try:
+                maybe = child_context.event_sink(event)
+                if hasattr(maybe, "__await__"):
+                    await asyncio.wait_for(maybe, timeout=0.25)
+            except BaseException:
+                # Event projection is best effort here; the authoritative
+                # result envelope still reaches the parent reducer.
+                pass
+
+
 async def _run_child_with_dispatch_receipts(
     task: dict[str, Any],
     context: ToolContext,
@@ -1376,12 +1493,64 @@ async def _run_child_with_dispatch_receipts(
         cancellation_attribution,
     )
     try:
-        return await _run_child(
-            task,
-            child_context,
-            index,
-            parallel_child=parallel_child,
-        )
+        try:
+            result = await _run_child(
+                task,
+                child_context,
+                index,
+                parallel_child=parallel_child,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if receipt_tracker.terminal_event(child_run_id) is None:
+                await _publish_missing_child_failure_terminal(
+                    task=task,
+                    child_context=child_context,
+                    index=index,
+                    child_run_id=child_run_id,
+                    receipt_tracker=receipt_tracker,
+                    error=(
+                        "Delegated child raised before terminal projection: "
+                        f"{type(exc).__name__}."
+                    ),
+                    terminal_reason="delegated_child_exception",
+                    failure_class="child_internal_exception",
+                    retryable=not receipt_tracker.mutating_dispatch_observed,
+                )
+            raise
+        if isinstance(result, dict):
+            result.setdefault("child_run_id", child_run_id)
+            result.setdefault(
+                "agent_name",
+                _semantic_agent_name(task, index),
+            )
+        if (
+            isinstance(result, dict)
+            and result.get("status") != "completed"
+            and receipt_tracker.terminal_event(child_run_id) is None
+        ):
+            await _publish_missing_child_failure_terminal(
+                task=task,
+                child_context=child_context,
+                index=index,
+                child_run_id=child_run_id,
+                receipt_tracker=receipt_tracker,
+                error=str(
+                    result.get("error")
+                    or "Delegated child validation failed."
+                ),
+                terminal_reason=str(
+                    result.get("terminal_reason")
+                    or "delegated_pre_dispatch_rejected"
+                ),
+                failure_class=str(
+                    result.get("failure_class")
+                    or "contract_validation"
+                ),
+                retryable=bool(result.get("retryable") is True),
+            )
+        return result
     except asyncio.CancelledError:
         if receipt_tracker.terminal_event(child_run_id) is None:
             attribution_payload = _cancellation_attribution_payload(
@@ -12251,6 +12420,30 @@ async def delegate_task(
     return json.dumps(payload, ensure_ascii=False)
 
 
+_EXACT_EGRESS_RULE_PARAMETER_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "methods": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 16,
+            "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 16,
+            },
+        },
+        "url_prefix": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+        },
+    },
+    "required": ["methods", "url_prefix"],
+}
+
+
 _EXACT_CAPABILITY_BINDINGS_PARAMETER_SCHEMA = {
     "type": "array",
     "minItems": 1,
@@ -12285,6 +12478,26 @@ _EXACT_CAPABILITY_BINDINGS_PARAMETER_SCHEMA = {
             "http_method": {"type": "string"},
             "runtime_profile": {"type": "string"},
             "required_cwd": {"type": "string"},
+            "sandbox_egress_url_prefixes": {
+                "type": "array",
+                "maxItems": 256,
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096,
+                },
+            },
+            "sandbox_egress_rules": {
+                "type": "array",
+                "maxItems": 256,
+                "items": _EXACT_EGRESS_RULE_PARAMETER_SCHEMA,
+            },
+            "browser_egress_rules": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 256,
+                "items": _EXACT_EGRESS_RULE_PARAMETER_SCHEMA,
+            },
             "schema_sha256": {"type": "string"},
             "descriptor_sha256": {"type": "string"},
         },

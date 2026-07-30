@@ -1741,6 +1741,67 @@ class SkillRuntimeProfileTests(unittest.TestCase):
         self.assertNotIn("browser.py", selection.runtime_commands)
         self.assertEqual("skill", selection.required_cwd)
 
+    def test_python_package_data_default_selects_script_cwd(self) -> None:
+        self.write(
+            "agents/reviewer.py",
+            "import sqlite3\n"
+            "class Reviewer:\n"
+            "    def __init__(self, db_path='../data/evidence.db'):\n"
+            "        self.db_path = db_path\n"
+            "    def run(self):\n"
+            "        return sqlite3.connect(self.db_path)\n",
+        )
+        self.write("data/evidence.db", "bounded fixture")
+        snapshot = snapshot_skill_package(self.root)
+
+        selection = select_skill_runtime_profile(
+            snapshot,
+            "agents/reviewer.py",
+        )
+
+        self.assertEqual("script", selection.required_cwd)
+
+    def test_python_package_data_default_selects_skill_cwd(self) -> None:
+        self.write(
+            "agents/reviewer.py",
+            "import sqlite3\n"
+            "class Reviewer:\n"
+            "    def __init__(self, database='data/evidence.db'):\n"
+            "        self.database = database\n"
+            "    def run(self):\n"
+            "        return sqlite3.connect(self.database)\n",
+        )
+        self.write("data/evidence.db", "bounded fixture")
+        snapshot = snapshot_skill_package(self.root)
+
+        selection = select_skill_runtime_profile(
+            snapshot,
+            "agents/reviewer.py",
+        )
+
+        self.assertEqual("skill", selection.required_cwd)
+
+    def test_python_package_data_default_with_two_targets_fails_closed(self):
+        self.write(
+            "agents/reviewer.py",
+            "def run(db_path='data/evidence.db'):\n"
+            "    return db_path\n",
+        )
+        self.write("agents/data/evidence.db", "script fixture")
+        self.write("data/evidence.db", "skill fixture")
+        snapshot = snapshot_skill_package(self.root)
+
+        with self.assertRaises(IsolatedSkillExecutorError) as raised:
+            select_skill_runtime_profile(
+                snapshot,
+                "agents/reviewer.py",
+            )
+
+        self.assertEqual(
+            "skill_runtime_cwd_ambiguous",
+            raised.exception.code,
+        )
+
     def test_nested_helper_dispatch_uses_entrypoint_script_cwd(self) -> None:
         self.write(
             "scripts/run.sh",

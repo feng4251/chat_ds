@@ -878,6 +878,29 @@ class ToolPreflightResult:
     error_payload: dict[str, Any] | None = None
     reason: str = ""
 
+    def __post_init__(self) -> None:
+        """Canonicalize every rejection as an explicit non-dispatch receipt.
+
+        Preflight is a pure boundary check and can never have entered a tool
+        handler.  Keeping that fact on every error payload prevents downstream
+        reducers from confusing a schema/authority rejection with a handler
+        result envelope merely because both are represented as JSON objects.
+        """
+
+        if self.error_payload is None:
+            return
+        payload = dict(self.error_payload)
+        canonical_reason = str(
+            payload.get("reason") or self.reason or "tool_preflight_rejected"
+        )
+        payload.setdefault("reason", canonical_reason)
+        payload.setdefault("tool_name", self.name)
+        payload["actual_dispatch_attempted"] = False
+        payload.setdefault("dispatch_state", "not_dispatched")
+        object.__setattr__(self, "error_payload", payload)
+        if not self.reason:
+            object.__setattr__(self, "reason", canonical_reason)
+
     @property
     def ok(self) -> bool:
         return self.error_payload is None
