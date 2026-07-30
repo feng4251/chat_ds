@@ -53,6 +53,44 @@ def proxy_connect(
     return connection, bytes(response)
 
 
+def rejected_proxy_connect(
+    proxy_host: str,
+    proxy_port: int,
+    host: str,
+    port: int,
+) -> bytes:
+    """Prove an unauthorized CONNECT cannot yield an upstream request.
+
+    Policy v3 may acknowledge the local CONNECT before inspecting its inner
+    HTTP request.  That 200 establishes only the worker-to-proxy inspection
+    channel: DNS and the upstream connection remain deferred.  Complete the
+    proxy-authenticated TLS leg and require the inner request to receive 403
+    instead of mistaking the CONNECT acknowledgement for destination access.
+    """
+
+    connection, response = proxy_connect(
+        proxy_host,
+        proxy_port,
+        host,
+        port,
+    )
+    if response.startswith(b"HTTP/1.1 403"):
+        connection.close()
+        return response
+    assert response.startswith(b"HTTP/1.1 200"), response
+    context = ssl.create_default_context()
+    with context.wrap_socket(connection, server_hostname=host) as tls:
+        tls.settimeout(5)
+        tls.sendall(
+            (
+                "HEAD / HTTP/1.1\r\n"
+                f"Host: {host}:{port}\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode("ascii")
+        )
+        return tls.recv(4096)
+
+
 status = {}
 for name, host in (
     ("public", "1.1.1.1"),
@@ -85,8 +123,12 @@ for name, host in (
     ("private", "10.0.0.1"),
     ("metadata", "169.254.169.254"),
 ):
-    rejected, response = proxy_connect(proxy_host, proxy_port, host, 80)
-    rejected.close()
+    response = rejected_proxy_connect(
+        proxy_host,
+        proxy_port,
+        host,
+        80,
+    )
     assert response.startswith(b"HTTP/1.1 403"), (name, response)
     status[f"proxy_{name}"] = "403"
 
