@@ -7,17 +7,39 @@
 - 工作目录：`/nfs/yangbb/codes/chat_ds`。
 - 分支：`fix/generic-skill-harness-20260717`。
 - 2026-07-30 最新功能提交：
+  - `100f42ba fix: harden bounded skill egress lifecycle`
+  - `f1e59c20 test: inspect denied CONNECT requests end to end`
+- `100f42ba` 将统一 session sandbox 的签名出网协议升级为强制 policy v3：
+  每个 root run 的所有 one-shot、persistent process、delegate 和 retry 共用 Proxy
+  预算 scope；调用级 identity、exact authority 与预算都受 HMAC 绑定。Proxy 对请求数、
+  client→Proxy wire bytes 和 Proxy→client wire bytes 做跨连接原子累计，GET/HEAD body、
+  超限 query/header/body、未授权 method/origin/path 和预算越界均 fail closed。
+- Bridge 的调用级 audit 只作为本地遥测，不再冒充 Proxy 跨调用账本的终态证明。
+  因此任何 controlled-egress effect receipt 当前都明确为
+  `effect_known=false/replay_safe=false`；联网子任务在 wrapper/流异常后不会自动重放。
+- one-shot 和 persistent process 的 Bridge seal、expiry、ACK、janitor、shutdown 和
+  controller reap 已形成同一隔离闭环。终态 audit 缺失或清理失败时保留 exact
+  Bridge/lease/admission 并 quarantine；失败不会丢 handle、占死其他 lease 或杀死
+  janitor，只有后续 seal 与 worker containment 都成功才重新入池。
+- `f1e59c20` 修正真实网络验收对 policy-v3 CONNECT 时序的理解：本地
+  `200 Connection Established` 只建立可检查隧道，不代表目的地已获授权；探针会继续
+  完成 Proxy MITM TLS 并要求未授权内层请求得到 403。
+- 上述三个 clean-archive 候选镜像已经部署生产：四个 session-sandbox、
+  `skill-egress-proxy` 和 Harness revision 均为完整提交
+  `f1e59c20129d9c3ba91b0f80850983e93d24d9dc`，全部 healthy、restart 0。Backend、
+  Frontend、legacy Browser 和数据库未重建。
+- 2026-07-30 上一轮功能提交：
   `2486f008 fix: harden generic skill execution convergence`。该提交系统性修复了
   mandatory retrieval 调度/收敛、provider 长流 deadline、TLS 1.3 上游兼容、
   intent typed-result 验证、只读 Skill 调用的 effect receipt/retry 判定和静态
   authority 可观测性；没有加入 V2.3、疾病、文件名或 session 特判。
 - `2486f008` 已从 clean Git archive 构建并只替换生产 Harness 与
-  `skill-egress-proxy`。当前两者 revision 都是完整提交
+  `skill-egress-proxy`。该轮部署时两者 revision 都是完整提交
   `2486f008b19f760d0fe63111137feb9d103a1a45`，健康且 restart 0；三个 Frontend
   `/api/health` 入口均为 200。Backend、Frontend、四个 session-sandbox 和 legacy
   browser 未重建。
-- 本地 HEAD 是位于该功能提交之上的交接文档提交；生产功能 revision 仍以
-  `2486f008b19f760d0fe63111137feb9d103a1a45` 为准。
+- 本地 HEAD 是位于 `f1e59c20` 功能提交之上的交接文档提交；当前生产功能 revision
+  以 `f1e59c20129d9c3ba91b0f80850983e93d24d9dc` 为准。
 - 2026-07-30 当前功能提交：
   - `b4e8dc18 fix: require durable delete intent for orphan cleanup`
   - `c62a4a69 feat: unify session sandbox and harden session lifecycle`
@@ -513,6 +535,9 @@ reconciler 把“DB 中没有 conversation row”直接视为删除授权。若�
   返回、产物精确为零且实际方法全为 GET/HEAD 的调用才可标记 replay-safe；POST、产物、
   缺失/损坏/canceled/wrong-call receipt 均不可自动重放。父层 retry 使用实际 unsafe
   invocation 数，不再只看工具的静态 mutating 标签。
+  `100f42ba` 随后发现调用级 Bridge receipt 不能证明 Proxy 跨调用聚合预算，因此已
+  进一步安全收紧：只要存在 controlled egress，当前一律 effect unknown 且不可自动
+  replay；无网络调用仍保留原有精确证明。
 - run start/final/result/debug 都携带 secret-free、内容寻址的初始 child static
   authority snapshot，包括工具与 plan SHA，以及资源、脚本、命令、URL/egress 的
   安全摘要，便于之后从 debug 还原当时真正授予的执行权限。
@@ -523,10 +548,65 @@ reconciler 把“DB 中没有 conversation row”直接视为删除授权。若�
   仍需独立 read-query lane、查询/header schema、敏感信息检测与速率/字节配额，不能
   只用 HTTP method 名称证明单向数据流。
 
+### 4.16 Policy v3、根任务预算与沙箱清理闭环
+
+本轮没有增加第二套 Bash/浏览器沙箱，也没有让模型选择运行环境。四个同质
+`session-sandbox-v1` 槽继续保持 `network_mode:none`；所有 HTTP(S) 仍只能经过
+`skill-egress-proxy`。新增的是通用控制面闭环：
+
+- Harness 从 runtime-owned `user/session/root_run/tool_operation` 派生不透明 SHA-256
+  scope/call identity。原始身份不跨 Executor 边界；同一 root run 的 child、retry、
+  one-shot 和 persistent process 都使用同一预算 scope。
+- policy v3 的 scope、call、exact rules、private origins、trust generation 和三项
+  limits 全部进入 HMAC。生产 Executor 与 Proxy 都强制 v3；无出网规则的 deny-all
+  兼容请求仍可保留 v2，不能借此获得网络 authority。
+- Proxy 的线程安全 scope ledger 在每个实际 HTTP 请求进入 DNS/上游连接前累计请求数
+  和 outbound bytes，在响应转发前累计 response bytes。默认上限为 2048 requests、
+  16 MiB outbound、512 MiB response；scope 容量 65,536，inactive TTL 24 小时。
+  inactive scope 使用独立 LRU，长期 active scope 不会阻塞其后过期项回收；容量满时
+  不驱逐未过期账本，而是 fail closed。
+- 请求仍需 exact method/origin/path-prefix 匹配。GET/HEAD body、chunked request、
+  parser 歧义、过大 target/query/header/body、forwarding identity header、未授权
+  私网/metadata/loopback 和 DNS rebinding 都在上游连接前拒绝。
+- Bridge 在封印前停止接受连接、有界等待 handler、关闭残留 socket，并生成不可变的
+  invocation-local receipt。它能证明本地调用已收尾，但不能证明 Proxy 跨调用累计
+  账本，因此模型侧只保留安全 counters/effect projection，原始 scope/call receipt
+  会在工具结果返回前移除。
+- persistent lease 的 open/expiry/close/ACK、janitor、shutdown 和 controller reap
+  都按 lease 隔离 seal failure。one-shot 连续 seal 失败会把 Bridge 转移到
+  controller-owned orphan registry；registry 非空时 runtime capability/health
+  fail closed，统一 admission 保持 quarantined，后续 reap seal 成功后才解封。
+- process sync ACK 必须精确匹配 pending operation：close ACK 只能是 `closed`，
+  live sync ACK 只能是 `open/running/exited`。expired/closed/quarantined bound error
+  携带严格 terminal state，Harness 对结构、authority、scope/call 和 audit digest
+  任一漂移都会 quarantine 对应物理槽。
+
+网络安全结论不能写成“只控制方向就不需要白名单”。TCP/TLS/HTTP 检索本身必须向外发送
+DNS、握手、域名、path/query/header；状态防火墙无法区分合法查询与把数据编码进 query
+的上传。当前实现是“无直连 + exact 目标/方法 + metadata/body 约束 + 根任务字节/次数
+预算”的有界受控交换。若要求严格零外传，只能提供固定模板 broker 或 deployment-owned
+query/header schema/DLP，不再允许任意浏览器/API 请求。
+
 ## 5. 当前验证证据
 
 2026-07-30 当前生产 cohort 已通过：
 
+- `100f42ba + f1e59c20` 最终验证：
+  - Executor/Proxy/Bridge 全组合：
+    `210 passed, 1 skipped, 254 subtests passed`；
+  - Harness changed-path 聚焦：
+    `40 passed, 57 subtests passed`；独立 release audit 另验证
+    `80 passed, 81 subtests passed`，无 P0/P1 blocker；
+  - 非 root Harness 全量为 `1779 passed, 1 skipped, 725 subtests passed`，19 项均由
+    测试进程无权读取生产 NFS tombstone 触发；隔离 root 容器消除该噪声后为
+    `1789 passed, 734 subtests passed`，唯一未跑项是 Harness 镜像按设计不含 Node。
+    该 CommonJS 用例在宿主完整 runtime 通过，并由下述统一沙箱真实验收覆盖；
+  - clean-archive 候选真实启动独立 Proxy/Executor，完整通过 Node CJS/MJS
+    Playwright、Python Playwright/Selenium、persistent class/factory、IPC deny、
+    UID/capability/route/UDS 隔离、public v3 egress、loopback/private/metadata deny、
+    descendant cleanup 和 12,589,062-byte artifact；
+  - `py_compile`、Compose effective config、cached diff/secret/scope/genericity scan
+    通过；生产代码没有 V2.3、疾病、session ID、文件名或 route 特判。
 - `2486f008` 最终验证：
   - Harness 全量：`1775 passed, 1 skipped, 3 warnings, 717 subtests passed`；
     warnings 仅为既有 multiprocessing/fork deprecation；
@@ -691,6 +771,18 @@ reconciler 把“DB 中没有 conversation row”直接视为删除授权。若�
   - 部署后 Harness/proxy healthy、restart 0，Harness `/health` 与 `/v1/models`
     为 200，SQLite `quick_check=ok`、foreign-key violation 为 0，active/scheduled
     run 为 0。
+- 2026-07-30 随后完成 `100f42ba + f1e59c20` policy-v3 生产切换：
+  - 部署前 active AgentRun、running/enable schedule 与 5173 established connection
+    均为 0；SQLite `quick_check=ok`、foreign-key violation 为 0。先停止 Frontend 和
+    旧 Harness，再按 Proxy → 四槽 → Harness → Frontend 顺序切换；
+  - 三个候选都来自 clean Git archive
+    `/tmp/chat_ds_build_f1e59c20.bNq8hp`，revision label 为完整 Git SHA。切换前镜像
+    分别保留 `rollback-pre-f1e59c20`；候选、部署和 `latest` tag 均指向已验收镜像；
+  - 仅替换 Proxy、四个 session-sandbox 和 Harness。Backend、数据库、Frontend、
+    Browser、SearXNG/Valkey 均未替换；
+  - 部署后三个 Frontend 入口的 `/` 与 `/api/health` 全部 200；Harness 容器内以及
+    Backend→Harness 的 `/health`、`/v1/models` 全部 200。六个新容器 healthy、
+    restart 0，active/scheduled run 仍为 0，相关日志严重错误匹配均为 0。
 - 2026-07-29（Asia/Shanghai）完成 `7bbc0809` 完整生产迁移：
   - 先确认旧生产 active run、未结束 run 和 5173 established connection 全为 0；
   - 停止旧 Frontend 后再次确认，再停止旧 Backend/Harness/所有执行器和 Browser；
@@ -713,10 +805,10 @@ reconciler 把“DB 中没有 conversation row”直接视为删除授权。若�
 
 | 服务 | Image ID | 状态 |
 |---|---|---|
-| `chat_acits_executor` ～ `_4` | `sha256:f993157d9861219d88725b44b0275d03533dc46be8068b9c6e541aaa24d2055e` | 4 个同质槽 / healthy / restart 0 / revision `c62a4a69` |
-| `chat_acits_skill_egress_proxy` | `sha256:21f5bbe08ff31204be28efd42a83ab4ddafafafcf24c0e05ca8222196b3cc34f` | healthy / restart 0 / revision `2486f008` |
+| `chat_acits_executor` ～ `_4` | `sha256:08996fb6e1da586de9ee57d1812dda75826145bdf07d86dfa784f24b35ec004a` | 4 个同质槽 / healthy / restart 0 / revision `f1e59c20` |
+| `chat_acits_skill_egress_proxy` | `sha256:6f23e97983ace0c4855af3dbf65967678902d2cd8d5c5b33e92eeecb2cec072f` | healthy / restart 0 / revision `f1e59c20` |
 | `chat_acits_browser` | `sha256:08bcf8860c10ba8fcd647b6d1a96c2c12e13e46db800c812acea82e17007240c` | healthy / restart 0 / revision `7bbc0809` |
-| `chat_acits_harness` | `sha256:9722827a2a254a406456f3d75c2cfc89f32256d652302d0679549a1e3b9f267e` | healthy / restart 0 / revision `2486f008` |
+| `chat_acits_harness` | `sha256:415009541d8611891f84c04aacc24917687076bebd729cf4f0b18ad4964b59f0` | healthy / restart 0 / revision `f1e59c20` |
 | `chat_acits_backend` | `sha256:42c62055effbece0a6c3aedb5011baf7f1ed226dc6db9fbd2df3d5794688be2a` | running / restart 0 / revision `b4e8dc18` / `/api/health` 200 |
 | `chat_acits_frontend` | `sha256:907c5abb41a5288c852ae55d2bbc3258196e4fc03fe0305ce072366f9255cb24` | running / restart 0 / revision `c62a4a69` / `/` 200 |
 
@@ -728,7 +820,7 @@ reconciler 把“DB 中没有 conversation row”直接视为删除授权。若�
   Backend `/api/health` 为 200。四槽 capability probe 的 runtime build 完全一致。
 - 生产 SQLite `quick_check=ok`、foreign-key violation 为 0；当前计数为
   conversations/messages/runs/events/tasks =
-  `197 / 763 / 388 / 57275 / 343`，nonterminal agent run 为 0，enabled schedule 为 0。
+  `198 / 765 / 393 / 57761 / 348`，nonterminal agent run 为 0，enabled schedule 为 0。
 - `task_items` 中有 18 条历史 `running` 投影，但其对应 root AgentRun 均已终态
   （10 succeeded、8 failed），不是当前活跃执行；判断运行态应以 durable AgentRun
   和 terminal event 为准。
@@ -736,8 +828,8 @@ reconciler 把“DB 中没有 conversation row”直接视为删除授权。若�
   SearXNG/Valkey 均 healthy。免费上游仍可能动态出现 unresponsive engine，不属于
   Harness 执行环境缺失。
 - Backend revision label 为完整提交
-  `b4e8dc18f315995354798910edb4c77f6da2b252`；Harness/proxy 为
-  `2486f008b19f760d0fe63111137feb9d103a1a45`；四槽/Frontend 为
+  `b4e8dc18f315995354798910edb4c77f6da2b252`；Harness/proxy/四槽为
+  `f1e59c20129d9c3ba91b0f80850983e93d24d9dc`；Frontend 为
   `c62a4a69cfbbfb46404cfa1eb51b5f8e0498dce2`；legacy Browser 保持兼容基线。
   所有长期容器 restart 均为 0。
 - executor/proxy/browser/Harness/Backend/Frontend 日志未发现 traceback、
@@ -746,6 +838,12 @@ reconciler 把“DB 中没有 conversation row”直接视为删除授权。若�
 
 回滚点：
 
+- `f1e59c20` 切换前四槽、Proxy、Harness 分别保留
+  `chat_ds-session-sandbox:rollback-pre-f1e59c20`、
+  `chat_ds-skill-egress-proxy:rollback-pre-f1e59c20` 和
+  `chat_ds-harness:rollback-pre-f1e59c20`；当前候选/部署 tag 为
+  `candidate-f1e59c20` / `deploy-f1e59c20`。clean archive build 目录为
+  `/tmp/chat_ds_build_f1e59c20.bNq8hp`。
 - `2486f008` 切换前 Harness/proxy 分别保留
   `chat_ds-harness:rollback-pre-2486f008` 与
   `chat_ds-skill-egress-proxy:rollback-pre-2486f008`；当前候选/部署 tag 分别为
@@ -887,6 +985,12 @@ checkout 分离或完成一次审计后的 untrack/migration。
   域名、路径、查询词和协议元数据；GET 也可把数据编码进 query/header。当前已拒绝
   GET/HEAD body 并精确限制 method/origin/path，严格 DLP 仍需查询/header schema、
   内容检查和出站字节/速率预算，不能把 GET/HEAD 等同于数学意义上的单向通道。
+- policy-v3 root-run scope ledger 当前只存在于单个 Proxy 进程内并保留最多 24 小时；
+  Proxy 重启会重置累计值。65,536 个未过期 scope 满载时会全局 fail closed，而不会
+  LRU 驱逐并重置安全预算。若该累计值未来要成为跨重启安全证明，应迁移到持久 ledger。
+- Proxy 尚未提供结构化 aggregate terminal attestation；Bridge receipt 只证明一次
+  invocation 的本地连接/字节/封印状态。因此 controlled-egress 工具当前一律
+  effect unknown/non-replay，这会少自动重试一次，但不会因证据不足重复外部副作用。
 - stdio MCP 已降权和隔离 ambient secret，但不是完整 mount/network namespace；仍只注册可信配置。
 - 免费搜索引擎健康度、CAPTCHA、协议变化和上游站点 4xx/5xx 是动态外部条件，不能误归因为 Harness 回归。
 - Workflow IR 当前能机器证明结构、source digest、required-node 与结果路径覆盖，但结构覆盖不等于业务语义质量证明；长期可增加逐 instruction evidence ledger。
