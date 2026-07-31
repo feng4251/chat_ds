@@ -273,9 +273,127 @@ running/enabled schedule 和 5173 established connection 均为 0；SQLite
 保留 `rollback-pre-aac60951`；部署后三入口、Harness 与 Backend→Harness health/models
 均为 200，长期容器 restart 0，严重启动日志 0，数据库与空闲状态再次通过。
 
-## Round 3
+## Round 3：恢复预算粒度、计算能力投影与权威终态
 
-待执行。
+### 冻结身份与终态
+
+- 被测生产代码：`aac609518430b348a518712136569f94cc7442db`；Harness image：
+  `sha256:08a4576feee38a6cec6f845ffc1ad9d4e2b07681e0b62f31cb288520d31925d4`；
+  Backend image：
+  `sha256:ffc8c793cb67cf5fea3219f67575134b494252b63c71592782e6adab48f34cdb`。
+- Conversation：`2dcbcfa305084c5a9e11d4a359075054`；root run：
+  `69cbcaacf1174ab4b9d96821e1bfeb7a`。
+- 原始 ZIP SHA-256：
+  `78b890eab57ff516c20a39a565631caa5d784f839b42f6ad9efbdbdd951eb0a0`；
+  829,621 bytes，1 个 primary 加 18 个 supporting Skills，上传件已持久化到该
+  session workspace。
+- 维护端连续消费 SSE 4,816 秒直到正常 EOF；root 的唯一 durable terminal 是
+  `run.failed / delegate_step_failed`。不是浏览器断线、Backend/Harness timeout、人工取消、
+  沙箱缺失或共同网络故障。Backend 的客户端终态错误显示成 transport `stop`，与权威 root
+  event 冲突，这是独立的投影缺陷。
+- 0 个业务 Markdown、0 个 Artifact row。required worker barrier 尚未通过，因此 fan-in、
+  11 个模块、strong-final 和 post-merge verifier 没有启动；已完成 sibling 的 child result
+  仍被持久保存。
+
+### 对话、Skill 与执行图对比
+
+业务输入保持历史手工基线。Harness 正确选择内容寻址的 `healthsim-trialsim` 包，完成
+intent、7 路 bootstrap，并进入声明的 worker wave；不是直接 chat，也没有伪造 multi-agent。
+13 个 AgentRun 中有 10 个 succeeded、3 个 failed（包含 competitive bootstrap 的一次
+retryable 失败及成功重试）。root 的 `delegate_failures` 正确携带 Safety blocker，证明
+Round 2 的并行失败可见性修复已生效。
+
+### Delegate/attempt 逐项结果
+
+| Run | 语义身份 | 终态 | input/output tokens | 结论 |
+|---|---|---|---:|---|
+| `a07e5f43...` | Intent classification | succeeded | 1,547 / 658 | typed route 正常 |
+| `cf156c15...` | clinicaltrials bootstrap | succeeded/degraded | 225,679 / 1,994 | 来源级降级 |
+| `d887a3ae...` | PubMed bootstrap | succeeded/degraded | 186,979 / 3,475 | 来源级降级 |
+| `39beed73...` | ICH bootstrap | succeeded/degraded | 111,316 / 4,361 | 来源级降级 |
+| `1d082720...` | FDA bootstrap | succeeded/degraded | 284,562 / 4,281 | 一次脚本退出和一次 404，其余链推进 |
+| `5e025fc0...` | EMA bootstrap | succeeded/degraded | 149,090 / 2,578 | 一次 metasearch provider 失败 |
+| `1a1a6816...` | Target biology bootstrap | succeeded/complete | 398,397 / 2,846 | 多次来源失败后仍有 5 个 POST receipt |
+| `7f6185d6...` | Competitive bootstrap 首次 | failed/retryable | 36,143 / 4,641 | 填充了无证据字段，被 typed contract 拒绝 |
+| `130f2f34...` | Competitive bootstrap 重试 | succeeded/degraded | 36,143 / 873 | 以 null/gap 合法收敛 |
+| `7c3e7d4c...` | PICO/standards/simulation | succeeded/degraded | 860,827 / 12,365 | 计算工具投影丢失后猜测不存在的脚本 |
+| `b33813fc...` | Termination analysis | succeeded/complete | 1,156,520 / 10,517 | 多个成功工具 receipt |
+| `bd1d5425...` | Safety extraction | failed | 432,827 / 5,863 | 第三个独立 mandatory group 首次 non-call 即被误判终态 |
+
+没有 child cancelled。FDA/EMA/target 的 4xx、DNS、API 和搜索失败各自被限制在来源链内；
+Safety 的两次 `skill_http_get` 均成功，说明 root blocker 不是“网站都不可达”。PICO 的 3 次
+脚本/可调用对象错误均在 dispatcher 前拒绝，暴露的是能力 surface 与已验证 authority
+不一致，而不是沙箱执行失败。
+
+### 模拟人工追问后的通用根因
+
+1. **一次纠形预算错误绑定到整个 child，而不是 immutable mandatory frontier。** Safety
+   有 5 个 Knowledge Gate checks/groups，其中 3 个激活。第一个 exact group 完成后，模型
+   在第二组上返回 length prose；Round 2 的两消息隔离纠正把约 374K 字符旧历史压到 2 条、
+   约 35K 字符，并成功取得第二组 receipt，证明隔离机制有效。receipt 推进后第三组形成了
+   新 frontier，模型第一次再次忽略 required call，旧的 run-global boolean 却立即 fail
+   closed。正确语义应是“同一 exact frontier 最多纠正一次”，而不是“整个子任务最多一次”。
+2. **编译、校验和模型 surface 三层发生 authority 漂移。** PICO worker 的声明要求有界
+   Monte Carlo/统计计算；compiler 把 `execute_code` 放入 worker tools，delegation validator
+   也以 `bounded_calculation_allowed` 明确接受，但 Knowledge Gate 最终 runtime projection
+   只保留 evidence candidates/readers/decision tool，静默删除 `execute_code`。模型因此猜测
+   package 中不存在的脚本和 callable。计算是独立的 compiler-owned worker control，不是
+   Knowledge Gate evidence candidate。
+3. **客户端终态服从了传输层而非运行事件。** OpenAI-compatible transport 正常 EOF 的
+   `stop` 被写入 `stream_terminal.finish_reason`，覆盖了已持久化 root
+   `delegate_step_failed`。状态虽为 failed，reason 却为 stop，削弱了 debug 的可判定性。
+
+### 成熟实现对照与决策
+
+| 问题 | 官方成熟机制 | 决策 |
+|---|---|---|
+| 多个独立步骤各自重试 | LangGraph node/task retry 与 checkpointed pending writes；Temporal Activity retry | adapt：恢复预算绑定 exact frontier fingerprint；全局 iteration/hard deadline 继续封顶 |
+| 成功 receipt 不随 sibling/frontier 失败回滚 | LangGraph persistence/pending writes | 已采用并保留；只重采样当前未结算 frontier |
+| 工具 surface 与运行状态一致 | Pydantic AI dynamic tool preparation/typed dependencies | adapt：runtime projection 复用已验证的 compiler-owned control，不新授予权限 |
+| 终态唯一权威 | Temporal event history；LangGraph durable state | adopt：root terminal event 优先，transport reason 仅在无终态时 fallback |
+| 替换现有主循环 | LangGraph/Temporal/Deep Agents | reject：本轮是三个局部契约漂移；替换会分叉现有 Skill authority、沙箱、CAS 和 durable event 语义 |
+
+官方参考：
+
+- <https://docs.langchain.com/oss/python/langgraph/persistence>
+- <https://docs.langchain.com/oss/python/langgraph/durable-execution>
+- <https://docs.temporal.io/encyclopedia/retry-policies>
+- <https://ai.pydantic.dev/tools-advanced/>
+
+### 通用修复与确定性证明
+
+- mandatory non-call recovery 由单个 run-global boolean 改为 exact frontier SHA-256 集合。
+  fingerprint 只含 required call kind、机器 mandatory frontier、精确 HTTP continuation action
+  与当前暴露工具；同一 fingerprint 第二次 non-call 仍 fail closed，真实 receipt 推进产生的
+  新 fingerprint 可获得一次新的两消息纠正。全局 iteration budget 不变，不能无限循环。
+- Knowledge Gate runtime projection 仅在 validator 已证明“声明式 worker file + 已准入
+  `execute_code`”时保留本地计算控制；非 worker、未验证节点和普通 child 不扩权。
+- Backend 的 `stream_terminal.finish_reason` 服从权威 root event 的 `finish_reason`/
+  `terminal_reason`；只有无 root terminal 时才使用 transport reason。
+- 通用两来源集成测试构造两个相继出现的 exact frontier，各自第一次 length non-call、纠正后
+  取得 receipt 并完成；同时保留同一 frontier 二次 non-call 的既有 fail-closed 回归。另以
+  非领域纯 projection 测试证明 validated worker 保留计算、未授权 worker 删除计算。
+
+聚焦回归为 `15 passed`；Backend 全量 `224 passed`。Harness 宿主全量的 19 个红灯全部是
+当前用户无权读取生产 NFS tombstone 的已知隔离噪声；换成独立 tmpfs 后为
+`1836 passed, 1 failed, 772 subtests passed`，唯一失败是生产 Harness 镜像按设计不带
+Node 的 CommonJS round-trip，同一测试在宿主 Node 22.23.1 下 `1 passed`。`py_compile`、
+`git diff --check`、staged secret/genericity scan 均通过。
+
+本轮功能提交为
+`3987613c43405b0347bc8606260abde078b707ba fix: scope delegated frontier recovery`。
+clean archive：`/tmp/chat_ds_deploy_3987613c.mAmjOI`；生产 Harness image：
+`sha256:4f15d7e8afd7b579d0ab0c7d19b979af076642f68b70a66d470333d3161630fb`；
+Backend image：
+`sha256:817390d6069315d69aef3bcd471f60d3f91f16ceac8e55cbb3d777127bfd1767`；
+revision label 均为完整提交。旧镜像保留 `rollback-pre-3987613c`。
+
+部署前两次确认 active AgentRun/root、enabled/running schedule 和 5173 established
+connection 均为 0，SQLite `quick_check=ok`、foreign-key violation 为 0。只依次
+force-recreate Harness、Backend；Frontend、四个统一沙箱、egress proxy、Browser、
+SearXNG/Valkey 和数据库卷均未替换。部署后三入口 `/`/`api/health`、Harness 与
+Backend→Harness `/health`/`v1/models` 均为 200；两容器 restart 0、严重日志 0，数据库
+健康且生产仍空闲。
 
 ## Round 4
 
