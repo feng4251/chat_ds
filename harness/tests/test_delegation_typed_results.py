@@ -17,6 +17,7 @@ from tools.delegation import (
     _adaptive_delegate_output_tokens,
     _child_failure_fields,
     _canonicalize_machine_gap_ledger,
+    _canonicalize_machine_knowledge_gate_check_ledger,
     _completion_quality_declaration,
     _content_declares_degraded_completion,
     _exact_capability_gap_ledger_error,
@@ -142,6 +143,63 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
             canonical,
             ["group:source-a:failed"],
         ))
+
+    def test_machine_gate_check_ledger_replaces_model_state_from_receipts(self):
+        content = (
+            "# Findings\n"
+            "```text\n"
+            "KNOWLEDGE_GATE_CHECKS_JSON: documented example\n"
+            "```\n"
+            "KNOWLEDGE_GATE_CHECKS_JSON: {forged model state}\n"
+            'RESULT_FIELDS_JSON: {"finding":"bounded"}'
+        )
+        plan = {
+            "groups": [
+                {"id": "group-a", "check_id": "CHECK-A"},
+                {"id": "group-b", "check_id": "CHECK-B"},
+            ],
+        }
+        receipt_audit = {
+            "decisions": [
+                {"check_id": "CHECK-A", "outcome": "yes"},
+                {"check_id": "CHECK-B", "outcome": "no"},
+            ],
+            "unknown_check_ids": [],
+            "failed_group_ids": ["group-b"],
+            "unresolved_group_ids": [],
+            "missing_receipt_group_ids": [],
+        }
+
+        canonical, audit = (
+            _canonicalize_machine_knowledge_gate_check_ledger(
+                content,
+                plan,
+                receipt_audit,
+            )
+        )
+
+        self.assertIn(
+            "KNOWLEDGE_GATE_CHECKS_JSON: documented example",
+            canonical,
+        )
+        self.assertNotIn("forged model state", canonical)
+        self.assertIn(
+            '"id":"CHECK-A","decision":"yes","status":"pass"',
+            canonical,
+        )
+        self.assertIn(
+            '"id":"CHECK-B","decision":"no","status":"degraded"',
+            canonical,
+        )
+        self.assertEqual(1, audit["removed_model_ledger_count"])
+        self.assertEqual(1, audit["degraded_check_count"])
+        self.assertIsNone(
+            _completion_quality_declaration(canonical)["status"]
+        )
+        self.assertEqual(
+            'RESULT_FIELDS_JSON: {"finding":"bounded"}',
+            canonical.splitlines()[-1],
+        )
 
     def test_machine_gap_ledger_is_removed_when_receipts_have_no_gaps(self):
         canonical, audit = _canonicalize_machine_gap_ledger(

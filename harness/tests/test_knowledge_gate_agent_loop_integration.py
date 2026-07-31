@@ -72,6 +72,47 @@ def _stop_response(content: str) -> list[str]:
     ]
 
 
+def _length_response(content: str) -> list[str]:
+    return [
+        "data: " + json.dumps({
+            "choices": [{
+                "delta": {"content": content},
+                "finish_reason": None,
+            }],
+        }),
+        "data: " + json.dumps({
+            "choices": [{"delta": {}, "finish_reason": "length"}],
+        }),
+        "data: [DONE]",
+    ]
+
+
+def _corrupt_tool_response(tool_name: str) -> list[str]:
+    return [
+        "data: " + json.dumps({
+            "choices": [{
+                "delta": {
+                    "content": "discarded corrupt sample",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "corrupt-call",
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": '{"query":"unterminated',
+                        },
+                    }],
+                },
+                "finish_reason": None,
+            }],
+        }),
+        "data: " + json.dumps({
+            "choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+        }),
+        "data: [DONE]",
+    ]
+
+
 def _empty_authority(candidates: list[dict]) -> dict:
     return {
         "resource_grants": [],
@@ -553,6 +594,260 @@ class KnowledgeGateAgentLoopIntegrationTests(
             [first_url, second_url, first_url],
             dispatched_urls,
         )
+
+        # Exercise the same invariant exactly at the synthesis reserve.  The
+        # first HTTP response has an open pagination frontier, while the
+        # second independent gate group still lacks a receipt.  A provider
+        # that emits length-limited prose instead of the required second call
+        # must get one bounded call correction; the Harness must not close the
+        # tool surface merely because an earlier HTTP family remains open.
+        request_number = 0
+        dispatched_urls.clear()
+        ignored = (
+            "This truncated prose is not the missing independent receipt."
+        )
+        reserve_responses = [
+            _tool_call_response(
+                "submit_knowledge_gate_decisions",
+                {
+                    "plan_sha256": digest,
+                    "decisions": [{
+                        "check_id": "source-check",
+                        "outcome": "yes",
+                        "reason": "Both exact declared sources are required.",
+                    }],
+                },
+                call_id="call-reserve-decision",
+            ),
+            _tool_call_response(
+                "skill_http_get",
+                {"url": first_url, "max_chars": 10, "timeout": 20},
+                call_id="call-reserve-archive",
+            ),
+            _length_response(ignored),
+            _tool_call_response(
+                "skill_http_get",
+                {"url": second_url, "max_chars": 100_000, "timeout": 20},
+                call_id="call-reserve-registry",
+            ),
+            _stop_response(
+                "status: WARN\nThe independent receipts are present; "
+                "the first pagination frontier remains bounded."
+            ),
+        ]
+
+        reserve_bodies, reserve_events = await self._run(
+            reserve_responses,
+            plan=plan,
+            authority=authority,
+            allow_session_mcp=False,
+            enabled_tools=[
+                "skill_http_get",
+                "submit_knowledge_gate_decisions",
+            ],
+            extra_run_kwargs={
+                "allowed_skill_http_prefixes": (
+                    ("generic-skill", first_prefix),
+                    ("generic-skill", second_prefix),
+                ),
+            },
+            native_dispatch=fake_dispatch,
+            max_iterations=5,
+            resolved_skill_path=skill_main,
+        )
+
+        self.assertEqual([first_url, second_url], dispatched_urls)
+        for request_body in reserve_bodies[2:4]:
+            self.assertEqual("required", request_body.get("tool_choice"))
+            self.assertEqual(
+                ["skill_http_get"],
+                [
+                    tool["function"]["name"]
+                    for tool in request_body.get("tools", [])
+                ],
+            )
+        emitted = "".join(
+            str(event.get("content") or "")
+            for event in reserve_events
+            if event.get("type") == "delta"
+        )
+        self.assertNotIn(ignored, emitted)
+        self.assertTrue(any(
+            message.get("role") == "user"
+            and "single bounded correction turn" in str(
+                message.get("content") or ""
+            )
+            for message in reserve_bodies[3]["messages"]
+        ))
+        self.assertFalse(any(
+            event.get("event_type") == "run.failed"
+            for event in reserve_events
+        ), reserve_events)
+
+    async def test_corrupt_replan_preserves_pending_mandatory_gate_frontier(self):
+        candidates = [
+            {
+                "candidate_id": "candidate-a",
+                "kind": "native_tool",
+                "tool_name": "web_search",
+                "tool_names": ["web_search"],
+            },
+            {
+                "candidate_id": "candidate-b",
+                "kind": "native_tool",
+                "tool_name": "web_search",
+                "tool_names": ["web_search"],
+            },
+        ]
+        plan = {
+            "schema_version": 1,
+            "worker_id": "worker-generic",
+            "owner_skill": "generic-skill",
+            "checks": [{
+                "id": "source-check",
+                "question": "Are both independent sources required?",
+                "branches": [{
+                    "outcome": "yes",
+                    "action": "Acquire both exact sources.",
+                    "group_ids": ["group-a", "group-b"],
+                }],
+                "legacy_ambiguous": False,
+            }],
+            "groups": [
+                {
+                    "id": "group-a",
+                    "check_id": "source-check",
+                    "outcome": "yes",
+                    "mode": "one_of",
+                    "candidate_ids": ["candidate-a"],
+                    "selectors": ["web_search"],
+                    "unresolved_selectors": [],
+                },
+                {
+                    "id": "group-b",
+                    "check_id": "source-check",
+                    "outcome": "yes",
+                    "mode": "one_of",
+                    "candidate_ids": ["candidate-b"],
+                    "selectors": ["web_search"],
+                    "unresolved_selectors": [],
+                },
+            ],
+            "candidates": candidates,
+        }
+        digest = canonical_json_sha256(plan)
+        dispatched_queries: list[str] = []
+
+        async def fake_dispatch(name, args, *, context):
+            if name != "web_search":
+                return await native_registry_dispatch(
+                    name,
+                    args,
+                    context=context,
+                )
+            dispatched_queries.append(str(args.get("query") or ""))
+            return json.dumps({
+                "status": "success",
+                "results": [{"title": "bounded evidence"}],
+            })
+        responses = [
+            _tool_call_response(
+                "submit_knowledge_gate_decisions",
+                {
+                    "plan_sha256": digest,
+                    "decisions": [{
+                        "check_id": "source-check",
+                        "outcome": "yes",
+                        "reason": "Both exact sources are required.",
+                    }],
+                },
+                call_id="call-decision",
+            ),
+            _tool_call_response(
+                "web_search",
+                {"query": "first independent source"},
+                call_id="call-source-a",
+            ),
+            _corrupt_tool_response("web_search"),
+            _corrupt_tool_response("web_search"),
+            _tool_call_response(
+                "web_search",
+                {"query": "second independent source"},
+                call_id="call-source-b",
+            ),
+            _stop_response(
+                "status: PASS\nBoth independent source receipts are present."
+            ),
+        ]
+
+        with patch(
+            "agent_loop._request_openai_nonstream_tool_call_fallback",
+            AsyncMock(return_value=(
+                None,
+                {},
+                {"failure_kind": "transport_error"},
+            )),
+        ):
+            bodies, events = await self._run(
+                responses,
+                plan=plan,
+                authority=_empty_authority(candidates),
+                allow_session_mcp=False,
+                enabled_tools=[
+                    "submit_knowledge_gate_decisions",
+                    "web_search",
+                ],
+                native_dispatch=fake_dispatch,
+                max_iterations=7,
+            )
+
+        self.assertEqual(
+            2,
+            len(dispatched_queries),
+            msg={
+                "requests": [
+                    {
+                        "tool_names": [
+                            tool.get("function", {}).get("name")
+                            for tool in body.get("tools", [])
+                        ],
+                        "tool_choice": body.get("tool_choice"),
+                    }
+                    for body in bodies
+                ],
+                "events": [
+                    {
+                        "event_type": event.get("event_type"),
+                        "gate": event.get("payload", {}).get("gate"),
+                        "reason": event.get("payload", {}).get("reason"),
+                    }
+                    for event in events
+                    if event.get("event_type") in {
+                        "debug.gate.continuation",
+                        "debug.tool.stream.mandatory_frontier_recovery.requested",
+                        "debug.tool.stream.post_dispatch_synthesis.requested",
+                        "run.failed",
+                    }
+                ],
+            },
+        )
+        self.assertIn("tools", bodies[4])
+        self.assertEqual("required", bodies[4].get("tool_choice"))
+        self.assertEqual(
+            ["web_search"],
+            [
+                tool["function"]["name"]
+                for tool in bodies[4]["tools"]
+            ],
+        )
+        self.assertIn(
+            "mandatory exact receipt obligations remain",
+            json.dumps(bodies[4]["messages"], ensure_ascii=False),
+        )
+        self.assertNotIn("tools", bodies[5])
+        self.assertFalse(any(
+            event.get("event_type") == "run.failed" for event in events
+        ), events)
 
     async def test_direct_chat_strips_registry_default_decision_control(self):
         bodies, events = await self._run(

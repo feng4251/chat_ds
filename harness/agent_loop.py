@@ -13861,6 +13861,7 @@ async def run_stream(
     delegate_post_dispatch_stream_synthesis_attempted = False
     pending_delegate_post_dispatch_stream_synthesis = False
     pending_post_dispatch_synthesis_terminal_contract_audit = False
+    delegate_mandatory_frontier_corrupt_recovery_attempted = False
     pending_delegate_required_capability_recovery = False
     pending_delegate_required_capability_noncall_recovery = False
     # Some OpenAI-compatible providers accept ``tool_choice=required`` but
@@ -17818,6 +17819,18 @@ async def run_stream(
             and budget.remaining > 0
             and not delegate_post_dispatch_stream_synthesis_attempted
             and delegate_visible_length_recoveries == 0
+            # A tools-closed synthesis can never satisfy a still-pending
+            # mandatory receipt.  Keep that exact frontier executable and let
+            # the bounded continuation below spend one fresh logical turn.
+            and not pending_knowledge_gate_tool_groups()
+            and not unsatisfied_standard_required_capabilities()
+            and not (
+                delegated_required_capability_tools
+                and not (
+                    set(delegated_required_capability_tools)
+                    & delegate_attempted_tool_names
+                )
+            )
         ):
             return None
 
@@ -17868,6 +17881,98 @@ async def run_stream(
             "recovery_count": 1,
             "max_recoveries": 1,
             "tools_exposed_next_turn": 0,
+        }
+
+    def queue_delegate_mandatory_frontier_after_corrupt_replan(
+        reason: str,
+    ) -> dict[str, Any]:
+        """Keep one unresolved mandatory frontier executable after corruption.
+
+        The corrupt sample and its failed exact-one repair crossed no handler
+        boundary.  When other exact obligations remain, synthesizing from a
+        partial receipt set is guaranteed to fail the outer contract.  Spend
+        at most one existing child iteration on the still-frozen frontier;
+        another no-progress corruption remains terminal under the ordinary
+        stream-recovery counters.
+        """
+
+        nonlocal delegate_mandatory_frontier_corrupt_recovery_attempted
+        nonlocal forced_workflow_policy
+        nonlocal previous_length_content
+
+        gate_groups = pending_knowledge_gate_tool_groups()
+        standard_rows = unsatisfied_standard_required_capabilities()
+        legacy_names = [
+            name
+            for name in delegated_required_capability_tools
+            if name not in delegate_attempted_tool_names
+        ]
+        declared_names: list[str] = []
+        for group in gate_groups:
+            declared_names.extend(str(name) for name in group if name)
+        for row in standard_rows:
+            tool_name = str(row.get("tool_name") or "")
+            if tool_name:
+                declared_names.append(tool_name)
+            declared_names.extend(
+                str(name) for name in (row.get("tool_names") or []) if name
+            )
+        declared_names.extend(legacy_names)
+        available_names = list(dict.fromkeys(
+            name
+            for name in declared_names
+            if name in tools and name not in delegate_quarantined_tools
+        ))
+        obligation_count = (
+            len(gate_groups) + len(standard_rows) + int(bool(legacy_names))
+        )
+        if obligation_count == 0:
+            return {"queued": False, "reason": "no_mandatory_frontier"}
+        if budget.remaining <= 0:
+            return {"queued": False, "reason": "iteration_budget_exhausted"}
+        if delegate_mandatory_frontier_corrupt_recovery_attempted:
+            return {
+                "queued": False,
+                "reason": "mandatory_frontier_recovery_limit_exhausted",
+            }
+        if not available_names:
+            return {
+                "queued": False,
+                "reason": "mandatory_frontier_capability_unavailable",
+            }
+
+        delegate_mandatory_frontier_corrupt_recovery_attempted = True
+        forced_workflow_policy = {
+            "tools": available_names,
+            "max_calls": 1,
+            "reason": "delegated mandatory frontier after corrupt replan",
+        }
+        previous_length_content = ""
+        conversation.append({
+            "role": "user",
+            "content": (
+                "The preceding tool-call sample and its single structural "
+                "repair were invalid and were discarded without dispatch. "
+                "One or more mandatory exact receipt obligations remain. "
+                "Emit exactly one fresh, complete structured call for the "
+                "currently most necessary exposed mandatory frontier. Do "
+                "not synthesize a final result, emit prose, or repeat a "
+                "previously completed call on this turn."
+            ),
+        })
+        return {
+            "queued": True,
+            "gate": "delegate_mandatory_frontier_after_corrupt_replan",
+            "reason": reason,
+            "iteration": budget.used,
+            "remaining_iterations": budget.remaining,
+            "pending_gate_group_count": len(gate_groups),
+            "pending_standard_candidate_count": len(standard_rows),
+            "pending_legacy_group": bool(legacy_names),
+            "exposed_tool_names": available_names,
+            "max_calls": 1,
+            "recovery_count": 1,
+            "max_recoveries": 1,
         }
 
     def queue_tool_stream_exact_one_replan(
@@ -20673,6 +20778,22 @@ async def run_stream(
             delegate_retrieval_tracker is not None
             and delegate_retrieval_tracker.has_open_chains
             and not iteration_delegated_retrieval_degraded_synthesis
+            # A retrieval coverage frontier is subordinate to every exact
+            # receipt obligation.  Closing the HTTP phase at the synthesis
+            # reserve while a separate mandatory DAG node is still pending
+            # creates a contradictory turn: the result cannot pass its outer
+            # contract, but the required tool is no longer call-required.
+            # Keep the exact frontier executable first; once it is satisfied,
+            # the same reserve can close any merely open pagination chain.
+            and not knowledge_gate_required_groups
+            and not unsatisfied_standard_required_capabilities()
+            and not (
+                delegated_required_capability_tools
+                and not (
+                    set(delegated_required_capability_tools)
+                    & delegate_attempted_tool_names
+                )
+            )
             and budget.remaining <= delegate_synthesis_turn_reserve
         ):
             reserve_reason = (
@@ -21412,11 +21533,7 @@ async def run_stream(
         }
         iteration_exposed_tools.discard("")
         delegate_required_capability_at_request = bool(
-            (
-                iteration_required_capability_recovery
-                or iteration_initial_required_capability_dispatch
-            )
-            and delegate_required_capability_unsatisfied
+            delegate_required_capability_unsatisfied
             and iteration_exposed_tools
             and set(delegate_required_capability_candidates)
             .intersection(iteration_exposed_tools)
@@ -24970,6 +25087,34 @@ async def run_stream(
                     failed_debug,
                 ):
                     yield debug_evt
+                mandatory_frontier_recovery = (
+                    queue_delegate_mandatory_frontier_after_corrupt_replan(
+                        "provider_tool_stream_corrupt_after_replan"
+                    )
+                )
+                if mandatory_frontier_recovery.get("queued"):
+                    for debug_evt in await debug_stream_event(
+                        "gate.continuation",
+                        mandatory_frontier_recovery,
+                    ):
+                        yield debug_evt
+                    for debug_evt in await debug_stream_event(
+                        "tool.stream.mandatory_frontier_recovery.requested",
+                        mandatory_frontier_recovery,
+                    ):
+                        yield debug_evt
+                    yield {
+                        "type": "tool_progress",
+                        "msg": (
+                            "↻ Retrying one still-pending mandatory receipt "
+                            "frontier after a malformed replanning turn"
+                        ),
+                    }
+                    await notify_turn_boundary("finished", {
+                        **turn_finished_payload,
+                        "finish_reason": "tool_calls",
+                    })
+                    continue
                 post_dispatch_recovery = (
                     queue_delegate_post_dispatch_stream_synthesis(
                         "provider_tool_stream_corrupt_after_replan"
@@ -31825,6 +31970,12 @@ async def run_stream(
                     and not tool_call_accumulator.fragment_count
                     and length_raw_protocol_count == 0
                     and not buffer_visible_output
+                    # A visible continuation is a terminal, tools-closed
+                    # result phase.  It must never pre-empt an exact receipt
+                    # frontier, even if an earlier handler call succeeded.
+                    # The required-capability non-call gate above owns this
+                    # response shape and provides its single bounded retry.
+                    and not delegate_required_capability_unsatisfied
                     and (
                         delegate_dispatched_tool_result_count > 0
                         or (
