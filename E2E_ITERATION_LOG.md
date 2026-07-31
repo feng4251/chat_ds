@@ -133,11 +133,25 @@ Knowledge Gate/delegation 组合除一个已知宿主生产 NFS tombstone 隔离
 workspace 与 path-security root 后为 `13 passed, 9 subtests passed`；3 个依赖未跟踪
 runtime Skill fixture 的合同测试在真实 fixture 下为 `3 passed`。这些复跑确认没有本轮
 代码回归。
-本轮 commit、clean-archive 全量、生产 revision/image/smoke 将在完成后追加。
+本轮生产修复提交：
+`26d65158e4a0bf52a9e5256a156feec4c5aee20b`（`fix: isolate exact mandatory
+capability phases`）。clean archive：`/tmp/chat_ds_deploy_26d65158.agPdNd`；候选/
+生产 image：
+`sha256:1f25a2f577428e3cb7a3c26a734ae98d96cf592f45902f92b32e474eb86164a8`，
+revision label 与提交全 SHA 一致；旧 Harness 保存为
+`chat_ds-harness:rollback-pre-26d65158`。
+
+部署前连续两次确认 nonterminal root/run、enabled schedule 与 5173 established
+connection 均为 0，SQLite `quick_check=ok`、foreign-key violations 为 0；只
+force-recreate Harness。部署后 Harness healthy/restart 0，容器内与 Backend→Harness
+的 `/health`、`/v1/models` 均为 200，三个 Frontend `/api/health` 均为 200，严重启动
+日志匹配为 0；再次确认 active/schedule/connection 为 0。Backend、Frontend、四个统一
+沙箱、egress proxy、Browser、SearXNG/Valkey 和数据库卷未替换。
 
 ## Round 2
 
-待 Round 1 的通用修复完成回归、commit 和生产切换后启动。
+Round 1 已完成回归、commit 与生产切换；下一步创建全新 conversation/root，使用同一
+历史业务输入开始 Round 2。
 
 ## Round 3
 

@@ -6,6 +6,23 @@
 
 - 工作目录：`/nfs/yangbb/codes/chat_ds`。
 - 分支：`fix/generic-skill-harness-20260717`。
+- 2026-07-31 五轮 E2E campaign 的 Round 1 通用修复提交：
+  `26d65158 fix: isolate exact mandatory capability phases`。它由新会话
+  `8314f40fa1a449f88cca55c140df218d` 暴露的跨领域不变量驱动：同名 bridge 必须在
+  handler dispatch 前匹配当前 exact candidate coordinate；mandatory corrupt-tool
+  recovery 必须使用 machine receipt/frontier 的 phase-isolated request，不能重放已结算
+  assistant tool-call/tool-result 历史。生产代码与通用测试没有 V2.3、疾病、Skill/
+  session/worker/KG/文件名或固定数量特判。
+- `26d65158` 的核心回归为 `272 passed, 52 subtests passed`，宽组合为
+  `566 passed, 214 subtests passed`；clean tracked-tree 全量主体为
+  `1818 passed, 3 skipped, 759 subtests passed`，生产 NFS 隔离 cohort 与真实 runtime
+  Skill fixture 分别复跑 `13 passed, 9 subtests passed` 和 `3 passed`。逐轮证据与成熟
+  Harness 对照记录在 `E2E_ITERATION_LOG.md`。
+- `26d65158` 已从 clean archive `/tmp/chat_ds_deploy_26d65158.agPdNd` 构建并只替换
+  Harness。当前 image 为
+  `sha256:1f25a2f577428e3cb7a3c26a734ae98d96cf592f45902f92b32e474eb86164a8`，
+  revision 为完整提交 `26d65158e4a0bf52a9e5256a156feec4c5aee20b`，healthy/restart
+  0；Backend/Frontend/沙箱/Proxy/Browser/搜索和数据库均未重建。
 - 2026-07-31 最新功能提交：
   `2a07218a fix: preserve mandatory delegated evidence frontiers`。它继续以
   `9b1fc851323b477d95e09b3f531c6903` 为压力测试，但生产代码和合成测试没有加入
@@ -107,7 +124,7 @@
   `/api/health` 入口均为 200。Backend、Frontend、四个 session-sandbox 和 legacy
   browser 未重建。
 - 当前生产 Harness 功能 revision 为
-  `2a07218a6f59454ec72a21a878f70d486dba2e46`；Backend 保持
+  `26d65158e4a0bf52a9e5256a156feec4c5aee20b`；Backend 保持
   `82c818fc6d7eb135e63d74f3b176c4b56bf4947e`。交接文档可另有 docs-only HEAD。
 - 2026-07-30 其他基础功能提交：
   - `b4e8dc18 fix: require durable delete intent for orphan cleanup`
@@ -932,6 +949,19 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 - 前端：`http://10.10.132.126:5173`、`http://172.30.100.126:5173`。
 - Harness 使用同机 SearXNG `http://10.10.132.126:8088`；既有 SearXNG/Valkey 在切换
   中未重建，健康状态和数据卷保持不变。
+- 2026-07-31 完成 `26d65158` exact mandatory phase 更新：
+  - 部署前连续两次确认 nonterminal AgentRun/root、enabled schedule 与 5173
+    established connection 均为 0；SQLite `quick_check=ok`、foreign-key violation 0；
+  - 候选来自 clean Git archive `/tmp/chat_ds_deploy_26d65158.agPdNd`，revision label
+    为完整 Git SHA，镜像内 compileall/import smoke 通过；
+  - 仅 force-recreate Harness，旧 image 保留
+    `chat_ds-harness:rollback-pre-26d65158`；Backend、Frontend、四槽、Proxy、Browser、
+    SearXNG/Valkey 和数据库卷均未替换；
+  - 部署后 image 为
+    `sha256:1f25a2f577428e3cb7a3c26a734ae98d96cf592f45902f92b32e474eb86164a8`，
+    revision 为 `26d65158e4a0bf52a9e5256a156feec4c5aee20b`，healthy/restart 0；
+    Harness 与 Backend→Harness 的 health/models、三个 Frontend health 均为 200，
+    严重启动日志匹配、active run、schedule 与 established connection 均为 0。
 - 2026-07-31 完成 `2a07218a` mandatory evidence frontier 更新：
   - 等用户手工 E2E root durable terminal 后，连续两次确认 active root/AgentRun、
     enabled schedule 与 5173 established connection 都为 0；SQLite
@@ -1043,7 +1073,7 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 | `chat_acits_executor` ～ `_4` | `sha256:08996fb6e1da586de9ee57d1812dda75826145bdf07d86dfa784f24b35ec004a` | 4 个同质槽 / healthy / restart 0 / revision `f1e59c20` |
 | `chat_acits_skill_egress_proxy` | `sha256:6f23e97983ace0c4855af3dbf65967678902d2cd8d5c5b33e92eeecb2cec072f` | healthy / restart 0 / revision `f1e59c20` |
 | `chat_acits_browser` | `sha256:08bcf8860c10ba8fcd647b6d1a96c2c12e13e46db800c812acea82e17007240c` | healthy / restart 0 / revision `7bbc0809` |
-| `chat_acits_harness` | `sha256:5e9689d2f0c6926e7e94a3154a451ea972ad1a61d1d5630e2da2b4e5417f2d90` | healthy / restart 0 / revision `2a07218a` |
+| `chat_acits_harness` | `sha256:1f25a2f577428e3cb7a3c26a734ae98d96cf592f45902f92b32e474eb86164a8` | healthy / restart 0 / revision `26d65158` |
 | `chat_acits_backend` | `sha256:28cc61b9c80eebccbdcb9b0ad4421272ffc63cd3e3a4de320ae7d09934ce2176` | running / restart 0 / revision `82c818fc` / `/api/health` 200 |
 | `chat_acits_frontend` | `sha256:907c5abb41a5288c852ae55d2bbc3258196e4fc03fe0305ce072366f9255cb24` | running / restart 0 / revision `c62a4a69` / `/` 200 |
 
@@ -1063,7 +1093,7 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
   SearXNG/Valkey 均 healthy。免费上游仍可能动态出现 unresponsive engine，不属于
   Harness 执行环境缺失。
 - Harness revision label 为完整提交
-  `2a07218a6f59454ec72a21a878f70d486dba2e46`；Backend 为
+  `26d65158e4a0bf52a9e5256a156feec4c5aee20b`；Backend 为
   `82c818fc6d7eb135e63d74f3b176c4b56bf4947e`；proxy/四槽为
   `f1e59c20129d9c3ba91b0f80850983e93d24d9dc`；Frontend 为
   `c62a4a69cfbbfb46404cfa1eb51b5f8e0498dce2`；legacy Browser 保持兼容基线。
@@ -1075,6 +1105,10 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 
 回滚点：
 
+- `26d65158` 切换前 Harness 保留
+  `chat_ds-harness:rollback-pre-26d65158`；候选 tag 为
+  `chat_ds-harness:candidate-26d65158`，clean archive build 目录为
+  `/tmp/chat_ds_deploy_26d65158.agPdNd`。
 - `2a07218a` 切换前 Harness 保留
   `chat_ds-harness:rollback-pre-2a07218a`；候选 tag 为
   `chat_ds-harness:candidate-2a07218a`，clean archive build 目录为
@@ -1263,10 +1297,9 @@ tool_choice、dispatch/preflight/receipt，recovery 原因与次数，fan-in coh
 逐轮证据、模拟人工追问链、delegate 明细、成熟实现对照、通用不变量、确定性复现、
 revision/image 与生产 smoke 统一记录在 `E2E_ITERATION_LOG.md`。Round 1 的新会话为
 `8314f40fa1a449f88cca55c140df218d`，root 为
-`25f48718174746118e2e3662bd177816`；它已到 durable failed terminal。当前正在完成该轮
-暴露的两项通用修复：共享工具的 exact-coordinate 派发前 frontier，以及 mandatory
-corrupt-tool recovery 的 phase-isolated request。Round 2 只能在 Round 1 修复通过回归、
-本地 commit、clean-archive 部署并确认生产空闲后启动。
+`25f48718174746118e2e3662bd177816`；它已到 durable failed terminal。该轮两项通用修复
+已在 `26d65158` 完成回归、本地 commit、clean-archive 部署与生产 smoke。生产当前空闲，
+可以创建全新 conversation/root 开始 Round 2。
 
 ## 10. 已知非 blocker 边界
 
