@@ -1258,6 +1258,16 @@ Skill/package/workflow digest，provider/model/context/max-output/finish/elapsed
 tool_choice、dispatch/preflight/receipt，recovery 原因与次数，fan-in cohort，artifact 路径/大小/
 摘要/合同结果，inner/outer terminal 关联，以及成熟方案的 problem-to-pattern-to-decision 对照。
 
+### 9.2 当前五轮 campaign 状态
+
+逐轮证据、模拟人工追问链、delegate 明细、成熟实现对照、通用不变量、确定性复现、
+revision/image 与生产 smoke 统一记录在 `E2E_ITERATION_LOG.md`。Round 1 的新会话为
+`8314f40fa1a449f88cca55c140df218d`，root 为
+`25f48718174746118e2e3662bd177816`；它已到 durable failed terminal。当前正在完成该轮
+暴露的两项通用修复：共享工具的 exact-coordinate 派发前 frontier，以及 mandatory
+corrupt-tool recovery 的 phase-isolated request。Round 2 只能在 Round 1 修复通过回归、
+本地 commit、clean-archive 部署并确认生产空闲后启动。
+
 ## 10. 已知非 blocker 边界
 
 - V2.3 与 ground truth 的业务级一致性仍需用户手工真实模型 E2E；基础回归不能替代这项验收。
