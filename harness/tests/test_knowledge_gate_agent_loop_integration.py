@@ -589,6 +589,7 @@ class KnowledgeGateAgentLoopIntegrationTests(
             native_dispatch=fake_dispatch,
             max_iterations=6,
             resolved_skill_path=skill_main,
+            debug_trace=True,
         )
 
         self.assertFalse(any(
@@ -599,6 +600,26 @@ class KnowledgeGateAgentLoopIntegrationTests(
             [first_url, second_url, first_url],
             dispatched_urls,
         )
+        receipt_events = [
+            event["payload"] for event in events
+            if event.get("event_type")
+            == "debug.knowledge_gate.group.receipt"
+        ]
+        self.assertGreaterEqual(len(receipt_events), 2)
+        self.assertTrue(all(
+            receipt.get("receipt_transition")
+            in {"first_completion", "existing_group_reassigned"}
+            and isinstance(receipt.get("first_transition"), bool)
+            and receipt.get("unique_completed_group_count", 0)
+            <= receipt.get("activated_group_count", 0)
+            and receipt.get("pending_group_count")
+            == len(receipt.get("pending_group_ids") or [])
+            for receipt in receipt_events
+        ))
+        self.assertEqual(2, max(
+            receipt["unique_completed_group_count"]
+            for receipt in receipt_events
+        ))
 
         # Exercise the same invariant exactly at the synthesis reserve.  The
         # first HTTP response has an open pagination frontier, while the
@@ -677,12 +698,16 @@ class KnowledgeGateAgentLoopIntegrationTests(
             if event.get("type") == "delta"
         )
         self.assertNotIn(ignored, emitted)
-        self.assertTrue(any(
-            message.get("role") == "user"
-            and "single bounded correction turn" in str(
-                message.get("content") or ""
-            )
-            for message in reserve_bodies[3]["messages"]
+        recovery_messages = reserve_bodies[3]["messages"]
+        self.assertEqual(["system", "user"], [
+            message.get("role") for message in recovery_messages
+        ])
+        self.assertIn(
+            "Harness machine-owned mandatory phase snapshot",
+            str(recovery_messages[1].get("content") or ""),
+        )
+        self.assertNotIn(ignored, json.dumps(
+            recovery_messages, ensure_ascii=False
         ))
         self.assertFalse(any(
             event.get("event_type") == "run.failed"

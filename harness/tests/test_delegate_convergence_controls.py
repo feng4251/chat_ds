@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 from agent_loop import (
     DirectToolExposure,
     _delegated_success_no_progress_candidate,
+    _workspace_debug_record,
     run_stream,
 )
 from retrieval_completeness import build_http_retrieval_receipt
@@ -331,6 +332,30 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
             **common,
         ))
 
+    def test_workspace_debug_renames_inner_terminal_candidate(self):
+        record = _workspace_debug_record({
+            "event_type": "run.completed",
+            "run_id": "child",
+            "payload": {
+                "finish_reason": "stop",
+                "provisional_terminal": True,
+                "authoritative": False,
+            },
+        })
+
+        self.assertEqual(
+            "debug.agent_loop.terminal_candidate",
+            record["event_type"],
+        )
+        self.assertEqual(
+            "run.completed",
+            record["payload"]["candidate_terminal_type"],
+        )
+        self.assertEqual(
+            "inner_agent_loop_candidate",
+            record["payload"]["lifecycle_scope"],
+        )
+
     async def test_truncated_http_receipt_requires_exact_retry_before_completion(self):
         url = "https://api.vendor.test/search?q=evidence&pageSize=20"
         responses = [
@@ -625,6 +650,15 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
                 ["skill_http_get"],
                 [item["function"]["name"] for item in body["tools"]],
             )
+        recovery_messages = request_bodies[2]["messages"]
+        self.assertEqual(2, len(recovery_messages))
+        self.assertEqual(["system", "user"], [
+            message["role"] for message in recovery_messages
+        ])
+        recovery_snapshot = str(recovery_messages[1]["content"])
+        self.assertIn("required_http_retrieval_action", recovery_snapshot)
+        self.assertIn(smaller_url, recovery_snapshot)
+        self.assertNotIn(ignored, recovery_snapshot)
         emitted = "".join(
             str(event.get("content") or "")
             for event in events
@@ -882,13 +916,16 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
                 "Bounded evidence draft with invalid raw protocol.\n"
                 + raw_protocol
             ),
-            _visible_length_response(
-                "Status: WARN/degraded\n"
-                "Evidence: retained bounded response; coverage remains partial."
-            ),
-            _stop_response(
-                "\nConclusion: no complete-coverage claim was made.\n"
-                + _result_fields_footer("evidence", degraded=True)
+            _tool_call_response(
+                "call-submit-evidence-fields",
+                tool_name="submit_result_fields",
+                arguments={
+                    "evidence": {
+                        "status": "degraded",
+                        "reason": "authorized bounded source was truncated",
+                        "provenance": "authoritative HTTP tool receipt",
+                    },
+                },
             ),
         ]
 
@@ -913,14 +950,21 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(responses)
         self.assertEqual(1, dispatch_mock.await_count)
-        self.assertEqual(4, len(request_bodies))
+        self.assertEqual(3, len(request_bodies))
         for request in request_bodies[1:]:
             exposed = [
                 item["function"]["name"]
                 for item in request.get("tools") or []
             ]
             self.assertNotIn("skill_http_get", exposed)
-        self.assertGreater(request_bodies[2]["max_tokens"], 2_048)
+        self.assertEqual(
+            ["submit_result_fields"],
+            [
+                item["function"]["name"]
+                for item in request_bodies[2].get("tools") or []
+            ],
+        )
+        self.assertEqual("required", request_bodies[2].get("tool_choice"))
         self.assertFalse(any(
             event.get("event_type") == "run.failed"
             for event in events
@@ -945,7 +989,7 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.assertTrue(any(
             event.get("event_type")
-            == "debug.delegate.output_contract_repair.requested"
+            == "debug.delegate.result_footer_repair.requested"
             for event in events
         ))
         self.assertEqual(events[-1], {"type": "done", "finish_reason": "stop"})
@@ -1326,6 +1370,11 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
                 "results": [{"title": "bounded evidence"}],
             }),
             required_capability_tools=["web_search"],
+            user_content=(
+                "GENERIC_TASK_START\n"
+                + ("large prior context " * 2_000)
+                + "\nGENERIC_TASK_END"
+            ),
         )
 
         self.assertFalse(responses)
@@ -1439,9 +1488,17 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
                 body.get("chat_template_kwargs"),
             )
         correction_messages = request_bodies[1]["messages"]
+        self.assertEqual(2, len(correction_messages))
+        self.assertEqual(["system", "user"], [
+            message["role"] for message in correction_messages
+        ])
+        self.assertLess(
+            sum(len(str(message.get("content") or "")) for message in correction_messages),
+            20_000,
+        )
         self.assertTrue(any(
             message.get("role") == "user"
-            and "single bounded correction turn" in str(
+            and "Harness machine-owned mandatory phase snapshot" in str(
                 message.get("content") or ""
             )
             for message in correction_messages

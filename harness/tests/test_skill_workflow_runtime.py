@@ -148,6 +148,40 @@ class SkillWorkflowRuntimeTests(unittest.TestCase):
         )
         return state
 
+    def test_delegate_failure_snapshot_preserves_parallel_sibling_failures(self):
+        state = HarnessRunState()
+        safety = ("generic", "worker", "safety")
+        efficacy = ("generic", "worker", "efficacy")
+        state.delegate_step_attempts[safety] = 1
+        state.delegate_step_attempts[efficacy] = 1
+        state.delegate_step_status[safety] = {
+            "status": "error",
+            "error": "typed result invalid",
+            "terminal_reason": "delegated_output_contract_failed",
+            "failure_class": "agent_contract_noncompliance",
+            "retryable": True,
+        }
+        state.delegate_step_status[efficacy] = {
+            "status": "error",
+            "error": "required tool not attempted",
+            "terminal_reason": "required_capability_not_attempted",
+            "failure_class": "agent_contract_noncompliance",
+            "retryable": False,
+        }
+
+        failures = state.delegate_failure_snapshot()
+
+        self.assertEqual(["efficacy", "safety"], [
+            failure["step_id"] for failure in failures
+        ])
+        self.assertEqual([True, False], [
+            failure["terminal"] for failure in failures
+        ])
+        self.assertEqual(
+            "efficacy",
+            state.terminal_delegate_failure()["step_id"],
+        )
+
     def test_machine_degraded_bootstrap_advances_dag_and_preserves_gap(self):
         state = self._seven_source_state()
         gap = {

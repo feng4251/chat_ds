@@ -827,6 +827,113 @@ def _bounded_delegate_result_footer_source(
     }
 
 
+def _delegated_output_contract_evidence_capsule(
+    *,
+    task_text: str,
+    conversation: Iterable[dict[str, Any]],
+    rejected_content: str,
+    protocol_invalid: bool,
+) -> str:
+    """Build a bounded, data-only source for terminal schema projection.
+
+    A delegated worker can finish after many authoritative tool receipts but
+    serialize its final answer as pseudo tool syntax or an invalid typed
+    footer.  Replaying the whole conversation asks the provider to solve the
+    task again under a very large, stale context.  This capsule retains the
+    original task, recent tool-result evidence, and (only when protocol-safe)
+    the rejected substantive draft.  The next turn is the existing closed
+    ``submit_result_fields`` control-plane projection, never an executable
+    tool turn.
+    """
+
+    def edge_excerpt(value: Any, limit: int) -> str:
+        text = str(value or "")
+        if len(text) <= limit:
+            return text
+        head = max(1, limit // 2)
+        tail = max(1, limit - head)
+        return (
+            text[:head]
+            + "\n[HARNESS_EVIDENCE_CAPSULE_MIDDLE_OMITTED chars="
+            + str(len(text) - limit)
+            + "]\n"
+            + text[-tail:]
+        )
+
+    sections = [
+        "[ORIGINAL_DELEGATED_TASK]\n" + edge_excerpt(task_text, 8_000)
+    ]
+    remaining_tool_chars = 36_000
+    dispatched_coordinates: dict[str, dict[str, Any]] = {}
+    for row in conversation:
+        if not isinstance(row, dict) or row.get("role") != "assistant":
+            continue
+        for call in row.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function")
+            if not isinstance(function, dict):
+                continue
+            call_id = str(call.get("id") or "").strip()
+            if not call_id:
+                continue
+            dispatched_coordinates[call_id] = {
+                "tool_name": str(function.get("name") or "")[:256],
+                "arguments": edge_excerpt(function.get("arguments"), 2_000),
+            }
+    tool_rows = [
+        row for row in conversation
+        if isinstance(row, dict) and row.get("role") == "tool"
+    ]
+    retained_tool_rows: list[str] = []
+    for ordinal, row in enumerate(reversed(tool_rows[-32:]), start=1):
+        if remaining_tool_chars <= 0:
+            break
+        allowance = min(8_000, remaining_tool_chars)
+        content = edge_excerpt(row.get("content"), allowance)
+        call_id = str(row.get("tool_call_id") or "").strip()
+        coordinate = dispatched_coordinates.get(call_id)
+        coordinate_label = (
+            " coordinate="
+            + json.dumps(
+                coordinate,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if coordinate is not None
+            else ""
+        )
+        retained_tool_rows.append(
+            "[AUTHORITATIVE_TOOL_RESULT recent_ordinal="
+            + str(ordinal)
+            + coordinate_label
+            + "]\n"
+            + content
+        )
+        remaining_tool_chars -= len(content)
+    if retained_tool_rows:
+        # Restore chronological order inside the selected recent window.
+        sections.extend(reversed(retained_tool_rows))
+    if not protocol_invalid and str(rejected_content or "").strip():
+        clean_draft, _removed = strip_result_fields_candidate_tail(
+            rejected_content
+        )
+        if clean_draft.strip():
+            sections.append(
+                "[REJECTED_SUBSTANTIVE_DRAFT]\n"
+                + edge_excerpt(clean_draft, 4_000)
+            )
+    else:
+        sections.append(
+            "[REJECTED_DRAFT_OMITTED]\n"
+            "The draft contained executable-looking pseudo protocol and is "
+            "not evidence. Project only values supported by the task and "
+            "authoritative tool results; use typed degraded gaps otherwise."
+        )
+    return "\n\n".join(sections)
+
+
 def _delegate_result_footer_repair_messages(
     retained_source: str,
     required_fields: tuple[str, ...],
@@ -2571,14 +2678,28 @@ def _workspace_debug_trace_enabled() -> bool:
     return bool(getattr(settings, "agent_debug_trace_workspace", True))
 
 
-def _append_workspace_debug_event(user_id: str, session_id: str, event: dict[str, Any]) -> None:
-    if not _workspace_debug_trace_enabled():
-        return
-    run_id = str(event.get("run_id") or "unknown")
-    safe_run_id = re.sub(r"[^A-Za-z0-9_.-]", "_", run_id)[:128] or "unknown"
-    record = {
+def _workspace_debug_record(event: dict[str, Any]) -> dict[str, Any]:
+    """Project one event into an unambiguous workspace-debug record.
+
+    Nested ``run_stream`` owns convergence only; its terminal candidate is
+    validated by the outer delegation contract before a child can finish.
+    Keep that candidate observable without writing a second authoritative-
+    looking ``run.completed``/``run.failed`` line into the same child trace.
+    Public SSE and durable event semantics are unchanged.
+    """
+
+    event_type = str(event.get("event_type") or "")
+    payload = dict(event.get("payload") or {})
+    if (
+        event_type in {"run.completed", "run.failed"}
+        and payload.get("authoritative") is False
+    ):
+        payload.setdefault("candidate_terminal_type", event_type)
+        payload.setdefault("lifecycle_scope", "inner_agent_loop_candidate")
+        event_type = "debug.agent_loop.terminal_candidate"
+    return {
         "recorded_at": datetime.now(timezone.utc).isoformat(),
-        "event_type": event.get("event_type"),
+        "event_type": event_type,
         "run_id": event.get("run_id"),
         "root_run_id": event.get("root_run_id"),
         "parent_run_id": event.get("parent_run_id"),
@@ -2589,8 +2710,16 @@ def _append_workspace_debug_event(user_id: str, session_id: str, event: dict[str
         "seq": event.get("seq"),
         "tool_name": event.get("tool_name"),
         "tool_call_id": event.get("tool_call_id"),
-        "payload": event.get("payload") or {},
+        "payload": payload,
     }
+
+
+def _append_workspace_debug_event(user_id: str, session_id: str, event: dict[str, Any]) -> None:
+    if not _workspace_debug_trace_enabled():
+        return
+    run_id = str(event.get("run_id") or "unknown")
+    safe_run_id = re.sub(r"[^A-Za-z0-9_.-]", "_", run_id)[:128] or "unknown"
+    record = _workspace_debug_record(event)
     try:
         workspace = get_workspace(user_id, session_id)
         with workspace_mutation_guard(workspace):
@@ -5296,24 +5425,44 @@ class HarnessRunState:
         common_mode = self.common_mode_delegate_failure()
         if common_mode is not None:
             return common_mode
-        for key, record in self.delegate_step_status.items():
+        for failure in self.delegate_failure_snapshot():
+            if failure.get("terminal") is True:
+                return failure
+        return None
+
+    def delegate_failure_snapshot(self) -> list[dict[str, Any]]:
+        """Return every attempted, currently failed workflow node.
+
+        The scheduler still uses one deterministic terminal blocker for its
+        state transition, but observability must not hide retryable sibling
+        failures from the same parallel wave.  This projection is bounded by
+        the compiled workflow node count and contains no model payloads.
+        """
+
+        failures: list[dict[str, Any]] = []
+        for key, record in sorted(self.delegate_step_status.items()):
             if str(record.get("status") or "") in {
                 "completed", "awaiting_resource_inspection",
             }:
                 continue
             attempts = self.delegate_step_attempts.get(key, 0)
-            if (
-                record.get("retryable") is not True
-                or attempts >= _MAX_PARENT_DELEGATE_ATTEMPTS_PER_STEP
-            ):
-                return {
-                    "skill_name": key[0],
-                    "step_type": key[1],
-                    "step_id": key[2],
-                    "attempts": attempts,
-                    **record,
-                }
-        return None
+            if attempts <= 0:
+                continue
+            retryable = record.get("retryable") is True
+            retry_exhausted = bool(
+                retryable
+                and attempts >= _MAX_PARENT_DELEGATE_ATTEMPTS_PER_STEP
+            )
+            failures.append({
+                "skill_name": key[0],
+                "step_type": key[1],
+                "step_id": key[2],
+                "attempts": attempts,
+                **record,
+                "retry_exhausted": retry_exhausted,
+                "terminal": bool(not retryable or retry_exhausted),
+            })
+        return failures
 
     def workflow_debug_snapshot(self) -> dict[str, Any]:
         skills: dict[str, Any] = {}
@@ -20691,6 +20840,9 @@ async def run_stream(
                     return
                 terminal_failure = run_state.terminal_delegate_failure()
                 if terminal_failure is not None:
+                    delegate_failures = run_state.delegate_failure_snapshot()
+                    if not delegate_failures:
+                        delegate_failures = [terminal_failure]
                     retry_exhausted = (
                         terminal_failure.get("retryable") is True
                         and int(terminal_failure.get("attempts") or 0)
@@ -20707,11 +20859,39 @@ async def run_stream(
                         f"{terminal_failure.get('step_id')} — "
                         f"{terminal_failure.get('error') or terminal_failure.get('failure_class')}"
                     )
+                    sibling_failures = [
+                        failure for failure in delegate_failures
+                        if not (
+                            failure.get("skill_name")
+                            == terminal_failure.get("skill_name")
+                            and failure.get("step_type")
+                            == terminal_failure.get("step_type")
+                            and failure.get("step_id")
+                            == terminal_failure.get("step_id")
+                        )
+                    ]
+                    if sibling_failures:
+                        msg += "; concurrent failed nodes: " + ", ".join(
+                            f"{item.get('step_type')}/{item.get('step_id')}"
+                            f"[{item.get('terminal_reason') or item.get('failure_class') or 'failed'}]"
+                            for item in sibling_failures[:12]
+                        )
                     yield await emit_agent_event("run.failed", {
                         "error": msg,
                         "finish_reason": finish_reason,
                         "tool_call_id": auto_call_id,
                         "delegate_failure": terminal_failure,
+                        "delegate_failures": delegate_failures[:64],
+                        "delegate_failure_count": len(delegate_failures),
+                        "terminal_delegate_failure_count": sum(
+                            item.get("terminal") is True
+                            for item in delegate_failures
+                        ),
+                        "retryable_delegate_failure_count": sum(
+                            item.get("retryable") is True
+                            and item.get("terminal") is not True
+                            for item in delegate_failures
+                        ),
                     })
                     yield {"type": "error", "msg": msg}
                     return
@@ -21764,11 +21944,18 @@ async def run_stream(
                 requested_max_tokens,
                 _DELEGATE_BOUNDED_CAPABILITY_CALL_MAX_TOKENS,
             )
-        if (
-            structural_atomic_tool_stream_repair
-            and delegated_subtask
-            and delegate_required_capability_at_request
-        ):
+        mandatory_frontier_context_isolation = bool(
+            delegated_subtask
+            and (
+                structural_atomic_tool_stream_repair
+                or iteration_required_capability_noncall_recovery
+            )
+            and (
+                delegate_required_capability_at_request
+                or delegate_retrieval_call_at_request
+            )
+        )
+        if mandatory_frontier_context_isolation:
             before_message_count = len(sanitized)
             before_estimated_input_tokens = _estimate_payload_tokens(
                 sanitized,
@@ -21779,10 +21966,18 @@ async def run_stream(
                 for message in sanitized
                 if isinstance(message, dict)
             )
+            phase_frontier = mandatory_frontier_phase_payload()
+            if (
+                delegate_retrieval_call_at_request
+                and isinstance(iteration_delegated_retrieval_action, dict)
+            ):
+                phase_frontier["required_http_retrieval_action"] = copy.deepcopy(
+                    iteration_delegated_retrieval_action
+                )
             mandatory_frontier_repair_sanitized = (
                 _delegated_mandatory_frontier_repair_messages(
                     task_text=original_user_text,
-                    frontier=mandatory_frontier_phase_payload(),
+                    frontier=phase_frontier,
                     completed_receipts=[
                         *knowledge_gate_group_receipts.values(),
                         *standard_required_candidate_receipts.values(),
@@ -21821,6 +22016,14 @@ async def run_stream(
                     "retained_tool_call_envelope_count": 0,
                     "retained_tool_result_message_count": 0,
                     "durable_history_mutated": False,
+                    "isolation_trigger": (
+                        "required_capability_noncall_recovery"
+                        if iteration_required_capability_noncall_recovery
+                        else "corrupt_tool_stream_repair"
+                    ),
+                    "required_http_retrieval_action_present": bool(
+                        phase_frontier.get("required_http_retrieval_action")
+                    ),
                 },
             ):
                 yield debug_evt
@@ -22120,11 +22323,17 @@ async def run_stream(
                 structural_atomic_tool_stream_repair
             ),
             "repair_tool_choice_required": bool(
-                structural_atomic_tool_stream_repair
+                (
+                    structural_atomic_tool_stream_repair
+                    or iteration_required_capability_noncall_recovery
+                )
                 and body.get("tool_choice") == "required"
             ),
             "repair_parallel_calls_forbidden": bool(
-                structural_atomic_tool_stream_repair
+                (
+                    structural_atomic_tool_stream_repair
+                    or iteration_required_capability_noncall_recovery
+                )
                 and (
                     protocol == "anthropic"
                     or body.get("parallel_tool_calls") is False
@@ -22132,7 +22341,14 @@ async def run_stream(
             ),
             "repair_closed_tool_schema_count": (
                 len(tool_schemas)
-                if structural_atomic_tool_stream_repair else 0
+                if (
+                    structural_atomic_tool_stream_repair
+                    or iteration_required_capability_noncall_recovery
+                )
+                else 0
+            ),
+            "mandatory_frontier_context_isolated": (
+                mandatory_frontier_context_isolation
             ),
             "delegate_result_footer_structured_repair": bool(
                 iteration_result_footer_repair
@@ -27780,10 +27996,60 @@ async def run_stream(
                 delegated_subtask
                 and output_contract_repair_needed
                 and not delegate_output_contract_repair_attempted
+                and not delegate_result_footer_repair_attempted
                 and budget.remaining > 0
                 and not iteration_result_footer_repair
                 and not iteration_visible_length_recovery
             ):
+                if delegated_required_result_fields:
+                    evidence_capsule = (
+                        _delegated_output_contract_evidence_capsule(
+                            task_text=original_user_text,
+                            conversation=conversation,
+                            rejected_content=full_content,
+                            protocol_invalid=protocol_invalid,
+                        )
+                    )
+                    repair_debug = queue_delegate_result_footer_repair(
+                        evidence_capsule,
+                        footer_error=result_footer_audit.get("footer_error"),
+                        origin=(
+                            "raw_pseudo_tool_protocol_evidence_projection"
+                            if protocol_invalid
+                            else "post_dispatch_typed_footer_evidence_projection"
+                        ),
+                    )
+                    repair_debug.update({
+                        "reason": (
+                            "raw_pseudo_tool_protocol"
+                            if protocol_invalid
+                            else "post_dispatch_typed_footer_invalid"
+                        ),
+                        "post_dispatch_terminal_contract_audit": bool(
+                            iteration_post_dispatch_synthesis_terminal_contract_audit
+                        ),
+                        "evidence_capsule": True,
+                        "raw_protocol_replayed": False,
+                        "terminal_projection_mode": "structured_submitter",
+                    })
+                    for debug_evt in await debug_stream_event(
+                        "gate.continuation",
+                        repair_debug,
+                    ):
+                        yield debug_evt
+                    for debug_evt in await debug_stream_event(
+                        "delegate.result_footer_repair.requested",
+                        repair_debug,
+                    ):
+                        yield debug_evt
+                    yield {
+                        "type": "tool_progress",
+                        "msg": (
+                            "↻ Projecting one delegated result through the "
+                            "closed typed-result submitter"
+                        ),
+                    }
+                    continue
                 delegate_output_contract_repair_attempted = True
                 pending_delegate_output_contract_repair = True
                 previous_length_content = ""
@@ -30148,6 +30414,9 @@ async def run_stream(
                     if written_size is not None:
                         run_state.successful_write_sizes.append(written_size)
                 knowledge_gate_exact_receipt: dict[str, Any] | None = None
+                knowledge_gate_receipt_groups_before = set(
+                    knowledge_gate_group_receipts
+                )
                 exact_skill_resource_complete: bool | None = None
                 if actual_dispatch_attempted:
                     receipt_args = (
@@ -30954,6 +31223,16 @@ async def run_stream(
                     ):
                         yield debug_evt
                 if knowledge_gate_exact_receipt is not None:
+                    receipt_group_id = str(
+                        knowledge_gate_exact_receipt.get("group_id") or ""
+                    )
+                    activated_group_count = len(
+                        knowledge_gate_decision_receipt.get(
+                            "activated_group_ids"
+                        ) or []
+                    ) if isinstance(
+                        knowledge_gate_decision_receipt, dict
+                    ) else 0
                     for debug_evt in await debug_stream_event(
                         "knowledge_gate.group.receipt",
                         {
@@ -30972,6 +31251,23 @@ async def run_stream(
                             ),
                             "tool_name": display_tool_name,
                             "outcome": outcome,
+                            "receipt_transition": (
+                                "first_completion"
+                                if receipt_group_id
+                                not in knowledge_gate_receipt_groups_before
+                                else "existing_group_reassigned"
+                            ),
+                            "first_transition": (
+                                receipt_group_id
+                                not in knowledge_gate_receipt_groups_before
+                            ),
+                            "unique_completed_group_count": len(
+                                knowledge_gate_group_receipts
+                            ),
+                            "activated_group_count": activated_group_count,
+                            "pending_group_count": len(
+                                pending_knowledge_gate_group_ids()
+                            ),
                             "pending_group_ids": (
                                 pending_knowledge_gate_group_ids()
                             ),

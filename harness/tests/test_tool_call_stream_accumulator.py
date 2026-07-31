@@ -2737,26 +2737,23 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
             "pending synthesis\n"
             "<tool_call><arguments>{\"query\":\"retry\"}</arguments></tool_call>"
         )
-        clean_result = (
-            "status: WARN/degraded\n"
-            "Evidence from evidence.md was retained with provenance.\n"
-            "Gap: registry fields not present in the returned fixture.\n"
-            "RESULT_FIELDS_JSON: "
-            + json.dumps({
-                "NCT_ID": {
-                    "status": "degraded",
-                    "reason": "not present in fixture",
-                    "provenance": "attempted source/fallback",
-                },
-            })
-        )
+        clean_fields = {
+            "NCT_ID": {
+                "status": "degraded",
+                "reason": "not present in fixture",
+                "provenance": "attempted source/fallback",
+            },
+        }
         requests, dispatch_mock, events = await self._run_stream_sequence(
             [
                 self._valid_tool_lines("evidence.md"),
                 self._partial_corrupt_lines(),
                 self._partial_corrupt_lines(content="repair-still-corrupt"),
                 self._stop_lines(invalid_result),
-                self._stop_lines(clean_result),
+                self._structured_tool_lines(
+                    "submit_result_fields",
+                    clean_fields,
+                ),
             ],
             max_iterations=6,
             delegated=True,
@@ -2768,12 +2765,15 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
             [request["kind"] for request in requests],
         )
         dispatch_mock.assert_awaited_once()
-        self.assertNotIn("tools", requests[-1]["body"])
+        self.assertEqual(
+            "submit_result_fields",
+            requests[-1]["body"]["tools"][0]["function"]["name"],
+        )
         repair_history = json.dumps(
             requests[-1]["body"]["messages"],
             ensure_ascii=False,
         )
-        self.assertIn("output-contract", repair_history)
+        self.assertIn("bounded typed-result projector", repair_history)
         self.assertIn("evidence.md", repair_history)
         self.assertNotIn("pending synthesis", repair_history)
         self.assertNotIn("<arguments>", repair_history)
@@ -2781,22 +2781,21 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
             event for event in events
             if event.get("event_type") == "debug.gate.continuation"
             and event.get("payload", {}).get("gate")
-            == "delegate_output_contract_repair"
+            == "delegate_result_footer_repair"
         ]
         self.assertEqual(1, len(repair_gates))
         completed = next(
             event for event in events
             if event.get("event_type")
-            == "debug.delegate.output_contract_repair.completed"
+            == "debug.delegate.result_footer_repair.completed"
         )
-        self.assertEqual(0, completed["payload"]["raw_protocol_count"])
         self.assertTrue(completed["payload"]["footer_valid"])
         terminal = [
             event for event in events
             if event.get("event_type") == "run.completed"
         ][-1]
         self.assertEqual(
-            "delegated_output_contract_repair",
+            "delegated_result_footer_structured_repair",
             terminal["payload"]["terminal_reason"],
         )
         self.assertEqual(
@@ -2849,96 +2848,65 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(0, completed["payload"]["raw_protocol_count"])
 
-    async def test_output_contract_repair_length_continues_transactionally(self):
+    async def test_output_contract_repair_uses_isolated_structured_submitter(self):
         invalid_result = (
             "rejected draft\n"
             "<tool_call><name>execute_code</name><arguments>"
             '{"code":"print(1)"}</arguments></tool_call>'
         )
-        repair_prefix = (
-            "# Rebuilt evidence\n"
-            "The retained source is recorded with bounded provenance and all "
-            "unavailable values are explicitly degraded."
-        )
-        repair_suffix = (
-            "Conclusion: the bounded evidence result is complete.\n"
-            "RESULT_FIELDS_JSON: "
-            + json.dumps({
-                "study_title": {
-                    "status": "degraded",
-                    "reason": "not present in retained evidence",
-                    "provenance": "attempted source/fallback",
-                },
-            })
-        )
-        accumulated = repair_prefix + "\n" + repair_suffix
+        fields = {
+            "study_title": {
+                "status": "degraded",
+                "reason": "not present in retained evidence",
+                "provenance": "attempted source/fallback",
+            },
+        }
 
         requests, dispatch_mock, events = await self._run_stream_sequence(
             [
                 self._stop_lines(invalid_result),
-                self._length_lines(
-                    repair_prefix,
-                    reasoning="private repair reasoning",
+                self._structured_tool_lines(
+                    "submit_result_fields",
+                    fields,
                 ),
-                self._stop_lines(repair_suffix),
             ],
             max_iterations=4,
             delegated=True,
             required_result_fields=["study_title"],
         )
 
-        self.assertEqual(3, len(requests))
+        self.assertEqual(2, len(requests))
         dispatch_mock.assert_not_awaited()
-        for request in requests[1:]:
-            self.assertNotIn("tools", request["body"])
-            self.assertEqual(
-                {"enable_thinking": False},
-                request["body"].get("chat_template_kwargs"),
-            )
-        continuation_messages = requests[-1]["body"]["messages"]
-        continuation_history = json.dumps(
-            continuation_messages,
-            ensure_ascii=False,
+        self.assertEqual(
+            "submit_result_fields",
+            requests[1]["body"]["tools"][0]["function"]["name"],
         )
-        self.assertTrue(any(
-            message.get("role") == "assistant"
-            and message.get("content") == repair_prefix
-            for message in continuation_messages
-        ))
-        self.assertIn("single bounded, tools-closed completion", continuation_history)
-        self.assertNotIn(invalid_result, continuation_history)
+        self.assertEqual("required", requests[1]["body"]["tool_choice"])
+        self.assertEqual(2, len(requests[1]["body"]["messages"]))
+        repair_history = json.dumps(
+            requests[1]["body"]["messages"], ensure_ascii=False
+        )
+        self.assertNotIn(invalid_result, repair_history)
+        self.assertIn("REJECTED_DRAFT_OMITTED", repair_history)
         self.assertEqual(1, sum(
             event.get("event_type") == "debug.gate.continuation"
             and event.get("payload", {}).get("gate")
-            == "delegate_output_contract_repair_length_continuation"
+            == "delegate_result_footer_repair"
             for event in events
         ))
         completed = next(
             event for event in events
             if event.get("event_type")
-            == (
-                "debug.delegate.output_contract_repair_length_"
-                "continuation.completed"
-            )
+            == "debug.delegate.result_footer_repair.completed"
         )
-        self.assertEqual("valid", completed["payload"]["footer_status"])
-        self.assertEqual(len(accumulated), completed["payload"][
-            "accumulated_content_chars"
-        ])
-        self.assertEqual(64, len(completed["payload"]["content_sha256"]))
-        emitted_chunks = [
-            event.get("content")
-            for event in events
-            if event.get("type") == "delta"
-        ]
-        self.assertIn(accumulated, emitted_chunks)
-        self.assertNotIn(repair_prefix, emitted_chunks)
+        self.assertTrue(completed["payload"]["footer_valid"])
+        self.assertFalse(completed["payload"]["registry_dispatch_attempted"])
         terminal = [
             event for event in events
             if event.get("event_type") == "run.completed"
         ][-1]
         self.assertEqual(
-            "delegated_output_contract_repair_length_continuation",
+            "delegated_result_footer_structured_repair",
             terminal["payload"]["terminal_reason"],
         )
         self.assertFalse(any(
@@ -5343,25 +5311,22 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
             "<tool_call><name>web_search</name><arguments>"
             '{"query":"retry"}</arguments></tool_call>'
         )
-        clean_result = (
-            "status: WARN/degraded\n"
-            "Evidence: retained tool evidence with explicit provenance.\n"
-            "Gap: unavailable facts remain explicitly degraded.\n"
-            "RESULT_FIELDS_JSON: "
-            + json.dumps({
-                "study_title": {
-                    "status": "degraded",
-                    "reason": "not present in retained evidence",
-                    "provenance": "attempted source/fallback",
-                },
-            })
-        )
+        clean_fields = {
+            "study_title": {
+                "status": "degraded",
+                "reason": "not present in retained evidence",
+                "provenance": "attempted source/fallback",
+            },
+        }
         requests, dispatch_mock, events = await self._run_stream_sequence(
             [
                 self._valid_tool_lines("evidence.md"),
                 reasoning_only,
                 self._stop_lines(invalid_result),
-                self._stop_lines(clean_result),
+                self._structured_tool_lines(
+                    "submit_result_fields",
+                    clean_fields,
+                ),
                 self._stop_lines("must not be requested"),
             ],
             max_iterations=6,
@@ -5374,17 +5339,21 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
             [request["kind"] for request in requests],
         )
         dispatch_mock.assert_awaited_once()
-        for request in requests[2:]:
-            self.assertNotIn("tools", request["body"])
-            self.assertEqual(
-                {"enable_thinking": False},
-                request["body"].get("chat_template_kwargs"),
-            )
+        self.assertNotIn("tools", requests[2]["body"])
+        self.assertEqual(
+            "submit_result_fields",
+            requests[3]["body"]["tools"][0]["function"]["name"],
+        )
+        self.assertEqual("required", requests[3]["body"]["tool_choice"])
+        self.assertEqual(
+            {"enable_thinking": False},
+            requests[3]["body"].get("chat_template_kwargs"),
+        )
         repair_history = json.dumps(
             requests[-1]["body"]["messages"],
             ensure_ascii=False,
         )
-        self.assertIn("single bounded delegated output-contract", repair_history)
+        self.assertIn("bounded typed-result projector", repair_history)
         self.assertIn("evidence.md", repair_history)
         self.assertNotIn("draft without its typed ledger", repair_history)
         self.assertNotIn('<arguments>{"query":"retry"}', repair_history)
@@ -5392,7 +5361,7 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
             event for event in events
             if event.get("event_type") == "debug.gate.continuation"
             and event.get("payload", {}).get("gate")
-            == "delegate_output_contract_repair"
+            == "delegate_result_footer_repair"
         ]
         self.assertEqual(1, len(repair_gates))
         self.assertEqual(
@@ -5404,20 +5373,20 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
                 "post_dispatch_terminal_contract_audit"
             ]
         )
-        self.assertFalse(repair_gates[0]["payload"]["footer_valid"])
+        self.assertTrue(repair_gates[0]["payload"]["evidence_capsule"])
+        self.assertFalse(repair_gates[0]["payload"]["raw_protocol_replayed"])
         completed = next(
             event for event in events
             if event.get("event_type")
-            == "debug.delegate.output_contract_repair.completed"
+            == "debug.delegate.result_footer_repair.completed"
         )
-        self.assertEqual(0, completed["payload"]["raw_protocol_count"])
         self.assertTrue(completed["payload"]["footer_valid"])
         terminal = [
             event for event in events
             if event.get("event_type") == "run.completed"
         ][-1]
         self.assertEqual(
-            "delegated_output_contract_repair",
+            "delegated_result_footer_structured_repair",
             terminal["payload"]["terminal_reason"],
         )
         self.assertEqual("done", events[-1]["type"])
@@ -5454,7 +5423,10 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
             [request["kind"] for request in requests],
         )
         dispatch_mock.assert_awaited_once()
-        self.assertNotIn("tools", requests[-1]["body"])
+        self.assertEqual(
+            "submit_result_fields",
+            requests[-1]["body"]["tools"][0]["function"]["name"],
+        )
         self.assertEqual(
             {"enable_thinking": False},
             requests[-1]["body"].get("chat_template_kwargs"),
@@ -5462,25 +5434,18 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, sum(
             event.get("event_type") == "debug.gate.continuation"
             and event.get("payload", {}).get("gate")
-            == "delegate_output_contract_repair"
+            == "delegate_result_footer_repair"
             for event in events
         ))
-        completed = next(
-            event for event in events
-            if event.get("event_type")
-            == "debug.delegate.output_contract_repair.completed"
-        )
-        self.assertGreater(completed["payload"]["raw_protocol_count"], 0)
-        self.assertFalse(completed["payload"]["footer_valid"])
         terminal = [
             event for event in events
-            if event.get("event_type") == "run.completed"
+            if event.get("event_type") == "run.failed"
         ][-1]
         self.assertEqual(
-            "delegated_output_contract_repair",
-            terminal["payload"]["terminal_reason"],
+            "delegated_result_footer_structured_repair_failed",
+            terminal["payload"]["finish_reason"],
         )
-        self.assertEqual("done", events[-1]["type"])
+        self.assertEqual("error", events[-1]["type"])
 
     async def test_terminal_audit_repairs_missing_footer_without_raw_protocol(self):
         reasoning_only = [
@@ -5497,23 +5462,22 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
             "Evidence: retained tool evidence with explicit provenance.\n"
             "Gap: the declared typed field is unavailable."
         )
-        repaired_result = (
-            missing_footer
-            + "\nRESULT_FIELDS_JSON: "
-            + json.dumps({
-                "study_title": {
-                    "status": "degraded",
-                    "reason": "not present in retained evidence",
-                    "provenance": "attempted source/fallback",
-                },
-            })
-        )
+        repaired_fields = {
+            "study_title": {
+                "status": "degraded",
+                "reason": "not present in retained evidence",
+                "provenance": "attempted source/fallback",
+            },
+        }
         requests, dispatch_mock, events = await self._run_stream_sequence(
             [
                 self._valid_tool_lines("evidence.md"),
                 reasoning_only,
                 self._stop_lines(missing_footer),
-                self._stop_lines(repaired_result),
+                self._structured_tool_lines(
+                    "submit_result_fields",
+                    repaired_fields,
+                ),
             ],
             max_iterations=6,
             delegated=True,
@@ -5522,7 +5486,10 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(4, len(requests))
         dispatch_mock.assert_awaited_once()
-        self.assertNotIn("tools", requests[-1]["body"])
+        self.assertEqual(
+            "submit_result_fields",
+            requests[-1]["body"]["tools"][0]["function"]["name"],
+        )
         self.assertEqual(
             {"enable_thinking": False},
             requests[-1]["body"].get("chat_template_kwargs"),
@@ -5531,7 +5498,7 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
             event for event in events
             if event.get("event_type") == "debug.gate.continuation"
             and event.get("payload", {}).get("gate")
-            == "delegate_output_contract_repair"
+            == "delegate_result_footer_repair"
         )
         self.assertEqual(
             "post_dispatch_typed_footer_invalid",
@@ -5572,7 +5539,7 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(
             event.get("event_type") == "debug.gate.continuation"
             and event.get("payload", {}).get("gate")
-            == "delegate_output_contract_repair"
+            == "delegate_result_footer_repair"
             for event in events
         ))
         terminal = [
