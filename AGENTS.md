@@ -26,6 +26,13 @@ Key operating constraints:
   provider/artifact timeline, compare the declared workflow and deliverable
   contract with the durable result, and record the terminal reason. Replaying
   or reinterpreting one run does not count as another round.
+- After every E2E terminal, automatically apply the user's established repair
+  question chain without waiting for the user to repeat it: determine current
+  status and exact failure point; correlate conversation, immutable Skill and
+  debug/AgentRun/tool evidence; explain every delegated attempt and artifact
+  stage; define root cause and observable invariants; create deterministic
+  reproductions; compare mature harness patterns; then implement, test, commit
+  and deploy only a generic cross-Skill correction.
 - Before changing production code for an E2E defect, restate it as a cross-domain
   invariant, create a deterministic failure-injection or scripted-provider
   reproduction, and add a non-V2.3 holdout or mutation/rename case when

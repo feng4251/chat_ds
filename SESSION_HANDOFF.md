@@ -1240,6 +1240,14 @@ conversation/root run，并在该轮达到 durable terminal 后才计数；同�
    Git archive 构建候选并按现有无活跃任务部署协议切换。记录代码 revision、镜像、回滚点
    和生产 smoke 后再开始下一轮。
 
+维护代理应在每轮 terminal 后自动模拟用户此前有效的修复追问链，而不是等待用户再次发送：
+“这个 session 在干什么/哪里失败” -> “结合具体 Skill、对话、工具调用、思考/回复和 debug
+log 仔细查验” -> “逐个排查 delegate 的 failed/degraded/cancelled” -> “针对各问题先定义原因、
+观察信号和彻底修复思路，并设计更多测试复现” -> “调研成熟 session-wise Harness 如何解决，
+不要闭门造车” -> “实现跨 Skill 的系统性通用改进，完成回归、commit、部署并继续观察”。
+这条追问链属于维护侧诊断流程；ChatDS E2E 的用户业务输入仍保持历史手工基线，不把内部
+测试答案、工作流提示或修复暗示注入被测模型。
+
 控制面遵循单调阶段：`compile/bind -> conditional decision -> mandatory receipts -> optional
 retrieval -> synthesis -> fan-in -> artifact validation -> exactly one durable terminal`。所有
 bounded recovery 必须停留在当前 mandatory frontier；模型正文不能覆盖 handler receipt、
