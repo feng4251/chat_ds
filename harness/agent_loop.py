@@ -51,11 +51,17 @@ from delegated_result_contract import (
     strip_result_fields_candidate_tail,
 )
 from error_classifier import FailoverReason, classify_api_error
+from failure_taxonomy import (
+    FAILURE_TAXONOMY_VERSION,
+    build_failure_fingerprint,
+    common_mode_breaker_eligible,
+)
 from iteration_budget import IterationBudget
 from knowledge_gate_runtime import (
     KNOWLEDGE_GATE_DECISION_TOOL_NAME,
     KnowledgeGateCompileError,
     activated_knowledge_gate_candidate_authority,
+    build_knowledge_gate_decision_receipt,
     candidate_tool_names as knowledge_gate_candidate_tool_names,
     canonical_json_sha256 as knowledge_gate_plan_sha256_for,
     compile_runtime_knowledge_gate_plan,
@@ -364,6 +370,7 @@ _MAX_SKILL_WORKFLOW_TOTAL_CONTINUATIONS_HARD_LIMIT = (
     + _MAX_SKILL_WORKFLOW_PHASE_CONTINUATIONS
 )
 _MAX_PARENT_DELEGATE_ATTEMPTS_PER_STEP = 2
+_COMMON_MODE_DELEGATE_FAILURE_THRESHOLD = 2
 _MAX_INTENT_CLASSIFIER_CONTRACT_BYTES = 128 * 1024
 # Some reasoning-capable providers can consume an entire response budget in
 # hidden reasoning before emitting either a tool call or visible child output.
@@ -399,6 +406,7 @@ _MAX_TOOL_STREAM_RUN_RECOVERIES = 8
 # operations.  Exact-one repair turns apply the stricter limit of one below.
 _MAX_CORRUPT_TOOL_CALL_SALVAGE_CALLS = 8
 _VERIFIED_PRELOADED_INPUT_RECEIPT_VERSION = 1
+_PRELOADED_KNOWLEDGE_GATE_RESOURCE_RECEIPT_VERSION = 1
 _MAX_VERIFIED_PRELOADED_INPUT_SOURCES = 128
 _VERIFIED_PRELOADED_INPUT_KINDS = frozenset({"read_file", "skill_view"})
 _WORKFLOW_FILE_CATEGORIES = (
@@ -577,6 +585,105 @@ def _validated_preloaded_input_receipt(
         "complete": True,
         **expected_binding,
     }
+
+
+def _validated_preloaded_knowledge_gate_resource_receipts(
+    raw_receipts: Any,
+    *,
+    verified_preloaded_input_receipt: dict[str, Any] | None,
+    run_id: str | None,
+) -> tuple[dict[str, Any], ...]:
+    """Validate body-free exact Skill-resource preload receipts.
+
+    These receipts are delegation control-plane state, never model-authored
+    prompt claims.  They remain inert until a typed Knowledge Gate decision
+    activates a candidate whose Skill name, relative path, and compiler-bound
+    digest all match.  Any malformed row invalidates the complete set; the
+    child can still perform an ordinary post-decision ``skill_view`` read.
+    """
+
+    if raw_receipts in (None, []):
+        return ()
+    aggregate = verified_preloaded_input_receipt
+    if (
+        not isinstance(raw_receipts, list)
+        or not isinstance(aggregate, dict)
+        or not run_id
+    ):
+        return ()
+    source_count = aggregate.get("source_count")
+    skill_view_count = (
+        (aggregate.get("kind_counts") or {}).get("skill_view")
+        if isinstance(aggregate.get("kind_counts"), dict)
+        else None
+    )
+    if (
+        isinstance(source_count, bool)
+        or not isinstance(source_count, int)
+        or isinstance(skill_view_count, bool)
+        or not isinstance(skill_view_count, int)
+        or skill_view_count <= 0
+        or not raw_receipts
+        or len(raw_receipts) > min(
+            source_count,
+            skill_view_count,
+            _MAX_VERIFIED_PRELOADED_INPUT_SOURCES,
+        )
+    ):
+        return ()
+    aggregate_sha256 = aggregate.get("aggregate_sha256")
+    expected_keys = {
+        "version",
+        "run_id",
+        "aggregate_sha256",
+        "skill_name",
+        "resource_path",
+        "sha256",
+        "complete",
+    }
+    normalized: list[dict[str, Any]] = []
+    identities: set[tuple[str, str, str]] = set()
+    for raw in raw_receipts:
+        if not isinstance(raw, dict) or set(raw) != expected_keys:
+            return ()
+        version = raw.get("version")
+        skill_name = raw.get("skill_name")
+        resource_path = raw.get("resource_path")
+        sha256 = raw.get("sha256")
+        identity = (skill_name, resource_path, sha256)
+        if (
+            isinstance(version, bool)
+            or version
+            != _PRELOADED_KNOWLEDGE_GATE_RESOURCE_RECEIPT_VERSION
+            or raw.get("run_id") != run_id
+            or raw.get("aggregate_sha256") != aggregate_sha256
+            or raw.get("complete") is not True
+            or not isinstance(skill_name, str)
+            or not skill_name
+            or len(skill_name) > 256
+            or "\x00" in skill_name
+            or not isinstance(resource_path, str)
+            or not resource_path
+            or len(resource_path) > 4_096
+            or "\x00" in resource_path
+            or not isinstance(sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+            or identity in identities
+        ):
+            return ()
+        identities.add(identity)
+        normalized.append({
+            "version": (
+                _PRELOADED_KNOWLEDGE_GATE_RESOURCE_RECEIPT_VERSION
+            ),
+            "run_id": run_id,
+            "aggregate_sha256": aggregate_sha256,
+            "skill_name": skill_name,
+            "resource_path": resource_path,
+            "sha256": sha256,
+            "complete": True,
+        })
+    return tuple(normalized)
 
 
 def _delegate_result_footer_submit_tool_schema(
@@ -5023,6 +5130,8 @@ class HarnessRunState:
         declared_step_ids: list[str],
     ) -> list[str]:
         """Schedule every declared step once before retrying a failed step."""
+        if self.common_mode_delegate_failure(skill_name) is not None:
+            return []
         unattempted: list[str] = []
         retryable_failed: list[str] = []
         for step_id in declared_step_ids:
@@ -5042,7 +5151,76 @@ class HarnessRunState:
                 retryable_failed.append(step_id)
         return unattempted + retryable_failed
 
+    def common_mode_delegate_failure(
+        self,
+        skill_name: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Trip only on one stable Harness/validator failure across steps."""
+
+        buckets: dict[
+            tuple[str, str], list[tuple[tuple[str, str, str], dict[str, Any]]]
+        ] = {}
+        for key, record in self.delegate_step_status.items():
+            if skill_name is not None and key[0] != skill_name:
+                continue
+            if str(record.get("status") or "") in {
+                "completed",
+                "awaiting_resource_inspection",
+            }:
+                continue
+            origin = str(record.get("failure_origin") or "")
+            fingerprint = str(record.get("failure_fingerprint") or "")
+            if not common_mode_breaker_eligible(origin, fingerprint):
+                continue
+            buckets.setdefault((origin, fingerprint), []).append(
+                (key, record)
+            )
+        candidates = [
+            (origin, fingerprint, rows)
+            for (origin, fingerprint), rows in buckets.items()
+            if len({key for key, _record in rows})
+            >= _COMMON_MODE_DELEGATE_FAILURE_THRESHOLD
+        ]
+        if not candidates:
+            return None
+        origin, fingerprint, rows = sorted(
+            candidates,
+            key=lambda item: (
+                -len(item[2]),
+                item[0],
+                item[1],
+            ),
+        )[0]
+        ordered_rows = sorted(rows, key=lambda item: item[0])
+        implicated = [key[2] for key, _record in ordered_rows]
+        return {
+            "status": "error",
+            "skill_name": ordered_rows[0][0][0],
+            "step_type": "workflow_common_mode",
+            "step_id": implicated[0],
+            "implicated_step_ids": implicated,
+            "implicated_step_count": len(implicated),
+            "attempts": sum(
+                self.delegate_step_attempts.get(key, 0)
+                for key, _record in ordered_rows
+            ),
+            "error": (
+                "A stable Harness/validator failure fingerprint occurred "
+                "across independent declared workflow steps; no new wave "
+                "was launched."
+            ),
+            "terminal_reason": "common_mode_workflow_invariant",
+            "failure_class": "harness_invariant_common_mode",
+            "failure_origin": origin,
+            "failure_fingerprint": fingerprint,
+            "common_mode_breaker_eligible": True,
+            "retryable": False,
+        }
+
     def terminal_delegate_failure(self) -> dict[str, Any] | None:
+        common_mode = self.common_mode_delegate_failure()
+        if common_mode is not None:
+            return common_mode
         for key, record in self.delegate_step_status.items():
             if str(record.get("status") or "") in {
                 "completed", "awaiting_resource_inspection",
@@ -5141,6 +5319,9 @@ class HarnessRunState:
                     "failed": self.skill_failed_aggregation.get(skill_name, {}),
                     "results": self.skill_aggregation_results.get(skill_name, {}),
                 },
+                "common_mode_breaker": (
+                    self.common_mode_delegate_failure(skill_name)
+                ),
                 "artifact_plan": {
                     "completed_binding": (
                         skill_name in self.skill_completed_artifact_binding
@@ -6528,6 +6709,56 @@ class HarnessRunState:
                 completion_quality = "pending"
             elif not completion_quality_supplied and status != "completed":
                 completion_quality = "failed"
+            failure_taxonomy: dict[str, Any] = {}
+            if status not in {
+                "completed",
+                "awaiting_resource_inspection",
+            }:
+                supplied_origin = result.get("failure_origin")
+                supplied_fingerprint = result.get(
+                    "failure_fingerprint"
+                )
+                supplied_taxonomy_version = result.get(
+                    "failure_taxonomy_version",
+                    FAILURE_TAXONOMY_VERSION,
+                )
+                supplied_taxonomy_valid = (
+                    isinstance(supplied_taxonomy_version, int)
+                    and not isinstance(supplied_taxonomy_version, bool)
+                    and supplied_taxonomy_version
+                    == FAILURE_TAXONOMY_VERSION
+                    and isinstance(supplied_fingerprint, str)
+                    and re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        supplied_fingerprint,
+                    )
+                    and isinstance(supplied_origin, str)
+                    and supplied_origin.strip()
+                )
+                if supplied_taxonomy_valid:
+                    failure_taxonomy = {
+                        "failure_taxonomy_version": (
+                            FAILURE_TAXONOMY_VERSION
+                        ),
+                        "failure_origin": supplied_origin.strip(),
+                        "failure_fingerprint": supplied_fingerprint,
+                        "common_mode_breaker_eligible": (
+                            common_mode_breaker_eligible(
+                                supplied_origin,
+                                supplied_fingerprint,
+                            )
+                        ),
+                    }
+                else:
+                    failure_taxonomy = build_failure_fingerprint(
+                        failure_class=failure_class,
+                        terminal_reason=terminal_reason,
+                        error=(
+                            validation_error
+                            or workflow_ir_degraded_error
+                            or result.get("error")
+                        ),
+                    )
             step_key = _delegate_step_key(
                 skill_name, step_type, step_id, worker_id
             )
@@ -6553,6 +6784,7 @@ class HarnessRunState:
                 ),
                 "terminal_reason": terminal_reason or None,
                 "failure_class": failure_class or None,
+                **failure_taxonomy,
                 "retryable": retryable,
                 "attempts": attempts,
                 "runtime_warning": result.get("runtime_warning"),
@@ -6631,6 +6863,16 @@ class HarnessRunState:
                 "error": result_record.get("error"),
                 "terminal_reason": result_record.get("terminal_reason"),
                 "failure_class": result_record.get("failure_class"),
+                "failure_taxonomy_version": result_record.get(
+                    "failure_taxonomy_version"
+                ),
+                "failure_origin": result_record.get("failure_origin"),
+                "failure_fingerprint": result_record.get(
+                    "failure_fingerprint"
+                ),
+                "common_mode_breaker_eligible": result_record.get(
+                    "common_mode_breaker_eligible"
+                ) is True,
                 "retryable": retryable,
             }
             if status == "completed":
@@ -12100,6 +12342,9 @@ async def run_stream(
     knowledge_gate_plan_sha256: str | None = None,
     knowledge_gate_candidate_authority: dict[str, Any] | None = None,
     verified_preloaded_input_receipt: dict[str, Any] | None = None,
+    preloaded_knowledge_gate_resource_receipts: (
+        list[dict[str, Any]] | None
+    ) = None,
     declared_artifact_patterns: list[str] | None = None,
     thinking_policy: str = "provider_default",
     temperature_override: float | None = None,
@@ -12897,6 +13142,17 @@ async def run_stream(
         )
         if delegated_subtask
         else None
+    )
+    delegated_preloaded_knowledge_gate_resource_receipts = (
+        _validated_preloaded_knowledge_gate_resource_receipts(
+            preloaded_knowledge_gate_resource_receipts,
+            verified_preloaded_input_receipt=(
+                delegated_preloaded_input_receipt
+            ),
+            run_id=run_id,
+        )
+        if delegated_subtask
+        else ()
     )
     # Only typed delegated evidence tasks receive the HTTP completeness gate.
     # Primary chat and untyped utility children retain their existing behavior.
@@ -29625,6 +29881,32 @@ async def run_stream(
                             knowledge_gate_decision_receipt = copy.deepcopy(
                                 decision_result
                             )
+                            accepted_preloaded_receipt_count = 0
+                            for preload_receipt in (
+                                delegated_preloaded_knowledge_gate_resource_receipts
+                            ):
+                                recorded_preload = (
+                                    record_knowledge_gate_candidate_receipt(
+                                        "skill_view",
+                                        {
+                                            "name": preload_receipt[
+                                                "skill_name"
+                                            ],
+                                            "file_path": preload_receipt[
+                                                "resource_path"
+                                            ],
+                                        },
+                                        {
+                                            "sha256": preload_receipt[
+                                                "sha256"
+                                            ],
+                                        },
+                                        "success",
+                                        skill_resource_complete=True,
+                                    )
+                                )
+                                if recorded_preload is not None:
+                                    accepted_preloaded_receipt_count += 1
                             workflow_state_changed = True
                             activated_frontier = (
                                 _knowledge_gate_activated_frontier_payload(
@@ -29635,6 +29917,15 @@ async def run_stream(
                                     ),
                                 )
                             )
+                            preloaded_receipt_guidance = (
+                                "The runtime also accepted "
+                                f"{accepted_preloaded_receipt_count} exact "
+                                "preloaded Skill-resource receipt(s); do not "
+                                "reread groups already absent from the "
+                                "pending frontier. "
+                                if accepted_preloaded_receipt_count
+                                else ""
+                            )
                             boundary_guidance_messages.append(
                                 "The knowledge-gate decision was accepted and "
                                 "only its branch-selected exact authority was "
@@ -29643,7 +29934,8 @@ async def run_stream(
                                 "synthesis; separate groups require distinct "
                                 "dispatches. Preserve unknown or unresolved "
                                 "groups as explicit WARN/degraded gaps. "
-                                "Runtime-owned activated frontier: "
+                                + f"{preloaded_receipt_guidance}Runtime-owned "
+                                "activated frontier: "
                                 + json.dumps(
                                     activated_frontier,
                                     ensure_ascii=False,
@@ -30101,6 +30393,22 @@ async def run_stream(
                                     exact_skill_resource_complete
                                 ),
                                 "evidence_outcome": evidence_outcome,
+                                **(
+                                    {
+                                        "knowledge_gate_decision_receipt": (
+                                            build_knowledge_gate_decision_receipt(
+                                                knowledge_gate_decision_receipt
+                                            )
+                                        ),
+                                    }
+                                    if (
+                                        display_tool_name
+                                        == KNOWLEDGE_GATE_DECISION_TOOL_NAME
+                                        and knowledge_gate_decision_receipt
+                                        is not None
+                                    )
+                                    else {}
+                                ),
                                 **(
                                     {
                                         "callable_result_receipt": (

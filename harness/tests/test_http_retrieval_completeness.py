@@ -808,6 +808,52 @@ class RetrievalCompletenessReceiptTests(unittest.TestCase):
         )
         self.assertEqual(2, repeated["total_requests"])
 
+    def test_one_terminal_family_does_not_close_independent_family(self):
+        tracker = RetrievalCompletenessTracker()
+        url_a = "https://api.a.test/search?q=a&pageSize=50"
+        url_b = "https://api.b.test/search?q=b&pageSize=50"
+        full_a = json.dumps({"items": [{"text": "a" * 300}]})
+        full_b = json.dumps({"items": [{"text": "b" * 300}]})
+
+        tracker.observe(_receipt(
+            url_a,
+            full_a[:100],
+            number=1,
+            truncated=True,
+            max_chars=100,
+            full_body=full_a,
+            wire_complete=True,
+            hard_max_chars=100,
+        ))
+        tracker.observe(_receipt(
+            url_b,
+            full_b[:100],
+            number=2,
+            truncated=True,
+            max_chars=100,
+            full_body=full_b,
+            wire_complete=True,
+            hard_max_chars=100,
+        ))
+        snapshot = tracker.observe(_receipt(
+            url_a,
+            full_a[:100],
+            number=3,
+            truncated=True,
+            max_chars=100,
+            full_body=full_a,
+            wire_complete=True,
+            hard_max_chars=100,
+        ))
+
+        self.assertIsNone(snapshot["terminal_failure"])
+        self.assertEqual(2, snapshot["open_chain_count"])
+        self.assertEqual(1, snapshot["terminal_chain_count"])
+        self.assertEqual(1, snapshot["runnable_chain_count"])
+        action = tracker.next_continuation_action()
+        self.assertIsNotNone(action)
+        self.assertIn("api.b.test", action["args"]["url"])
+
     def test_complete_wire_explicit_end_does_not_complete_truncated_evidence(self):
         full = json.dumps({
             "items": [{"text": "x" * 300}],

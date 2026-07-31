@@ -1,4 +1,4 @@
-# ChatDS 当前会话交接（2026-07-30）
+# ChatDS 当前会话交接（2026-07-31）
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
@@ -6,6 +6,12 @@
 
 - 工作目录：`/nfs/yangbb/codes/chat_ds`。
 - 分支：`fix/generic-skill-harness-20260717`。
+- 2026-07-31 当前候选继续保留现有 AgentLoop、内容寻址编译器、Workflow IR、
+  session sandbox 和 exact authority/receipt 主链；没有切换 LangChain/LangGraph/
+  Deep Agents 主循环。新候选补齐 handler-owned Knowledge Gate typed receipt、
+  exact Skill-resource preload receipt、按 retrieval family 隔离失败、正文与终态
+  质量元数据分离、稳定失败 taxonomy 和跨独立步骤 common-mode breaker，并加入
+  可复用 `ScriptedProvider` 边界测试夹具。
 - 2026-07-30 当前功能提交：
   `82c818fc fix: close generic skill workflow contracts`。
 - `82c818fc` 保留现有内容寻址 Skill 编译器、typed Workflow IR、统一沙箱、
@@ -634,7 +640,48 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
   middleware 分层，不引入其第二套 agent loop。未来若采用其组件，应先以 adapter
   接入并通过现有 authority/receipt/terminal contract，不能绕开当前安全与持久化层。
 
+### 4.18 2026-07-31 跨层回执、检索隔离与同源故障熔断
+
+- Knowledge Gate 决策的语义权威从 debug/compacted argument projection 移到
+  handler-owned typed receipt。回执只保存 plan digest、check/outcome 和运行时重算
+  frontier，不保存模型 reason；outer delegate 必须重新验证 schema、digest 和
+  frontier，不能从 `tool.started` 或空 `audit_args` 猜测语义。
+- 编译期已完整预加载且 digest 完全一致的 `skill_view` 资源，会生成绑定
+  child run 与 aggregate preload digest 的 body-free control-plane receipt。只有
+  typed decision 激活后、Skill 名称/相对路径/资源 SHA-256 与 exact candidate 全部
+  相等时才计入 gate；`read_file`、HTTP、MCP、脚本、不完整分页和错误摘要都不能借此
+  提升 authority 或满足 receipt obligation。
+- Retrieval tracker 将 page/cursor/truncation 失败限定在各自 family；一个来源达到
+  chain-local 上限不会把其他仍可推进的独立来源一并终止。请求数、累计响应字节和总
+  耗时仍是 run-global 硬预算；snapshot 明确区分 global terminal、terminal chain
+  和 runnable chain。
+- `COMPLETION_QUALITY_JSON` 的整个 ledger 继续受 4096-byte 严格上限和 exact JSON
+  schema 约束，但较长或含转义换行的 substantive reason 不再把已经完成的大正文误判
+  为失败。审计只持久化 reason 的 SHA-256、字符/字节数和 shape，不复制正文。
+- 子任务失败现在带稳定、secret-free 的 `failure_origin`、
+  `failure_fingerprint` 和 taxonomy version。只有同一个 Harness/validator
+  fingerprint 在至少两个独立声明步骤重复时才停止后续 wave；provider、模型、网络/
+  上游失败不会触发 common-mode breaker，已成功步骤和 artifacts 保持不变。
+- 新增 tests-only `ScriptedProvider`，在真实 OpenAI-compatible HTTP/SSE 边界按顺序
+  驱动请求、工具批次和中断，并可断言实际 request body；它不参与生产执行，也没有
+  第二套 agent loop。现有仓储、卫星、博物馆等非临床 holdout Skill 继续验证通用编译
+  与 artifact/workflow 契约，V2.3 仍只是一项用户手工 E2E 用例。
+
 ## 5. 当前验证证据
+
+2026-07-31 当前候选已通过：
+
+- 受影响面组合回归：
+  `245 passed, 95 subtests passed`。
+- 非 root 宿主全量：
+  `1801 passed, 1 skipped, 19 failed, 751 subtests passed`；19 项全部在测试断言前
+  因当前用户无权读取生产 NFS tombstone 而 fail closed，与既有环境噪声同型。
+- 只读源码挂载的隔离 root 容器全量：
+  `1812 passed, 1 deselected, 760 subtests passed`；唯一 deselect 是生产 Harness
+  镜像按设计不带 Node 的 CommonJS round-trip，该项已在宿主 Node 运行时单独
+  `1 passed`。warnings 只有既有 multiprocessing/fork deprecation。
+- `compileall`/`py_compile`、`git diff --check` 和生产逻辑 genericity scan 通过；
+  没有执行模型重型 V2.3 E2E。
 
 2026-07-30 当前生产 cohort 已通过：
 

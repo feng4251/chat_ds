@@ -409,6 +409,155 @@ class SkillWorkflowRuntimeTests(unittest.TestCase):
         self.assertEqual(candidates[1:], first_batch)
         self.assertIsNone(state.terminal_delegate_failure())
 
+    def test_common_validator_fingerprint_stops_new_wave_and_keeps_success(
+        self,
+    ):
+        state = self._seven_source_state()
+        fingerprint = "f" * 64
+        update = state.record_delegate_task(
+            {"tasks": [
+                {
+                    "skill_name": "generic",
+                    "step_type": "knowledge_bootstrap",
+                    "step_id": step_id,
+                }
+                for step_id in ("source-1", "source-2", "source-3")
+            ]},
+            {
+                "status": "error",
+                "results": [
+                    {
+                        "status": "completed",
+                        "skill_name": "generic",
+                        "step_type": "knowledge_bootstrap",
+                        "step_id": "source-1",
+                        "result_path": "results/source-1.json",
+                        "result_chars": 50,
+                        "result_shape": {
+                            "semantic_short_result_valid": True,
+                            "structured_value": True,
+                        },
+                    },
+                    *[
+                        {
+                            **self._failed_bootstrap_result(
+                                step_id,
+                                retryable=True,
+                                terminal_reason=(
+                                    "validator_receipt_mismatch"
+                                ),
+                                failure_class="contract_validation",
+                            ),
+                            "failure_origin": "validator",
+                            "failure_fingerprint": fingerprint,
+                        }
+                        for step_id in ("source-2", "source-3")
+                    ],
+                ],
+            },
+        )
+
+        self.assertEqual(["source-1"], update["completed_step_ids"])
+        self.assertIn(
+            "source-1",
+            state.skill_completed_bootstrap["generic"],
+        )
+        self.assertEqual(
+            [],
+            state.ordered_delegate_candidates(
+                "generic",
+                "bootstrap",
+                [f"source-{index}" for index in range(1, 8)],
+            ),
+        )
+        terminal = state.terminal_delegate_failure()
+        self.assertIsNotNone(terminal)
+        self.assertEqual(
+            "harness_invariant_common_mode",
+            terminal["failure_class"],
+        )
+        self.assertEqual(fingerprint, terminal["failure_fingerprint"])
+        self.assertEqual(
+            ["source-2", "source-3"],
+            terminal["implicated_step_ids"],
+        )
+
+    def test_same_model_failure_fingerprint_does_not_trip_common_breaker(
+        self,
+    ):
+        state = self._seven_source_state()
+        fingerprint = "e" * 64
+        state.record_delegate_task(
+            {"tasks": [
+                {
+                    "skill_name": "generic",
+                    "step_type": "knowledge_bootstrap",
+                    "step_id": step_id,
+                }
+                for step_id in ("source-1", "source-2")
+            ]},
+            {
+                "status": "error",
+                "results": [
+                    {
+                        **self._failed_bootstrap_result(
+                            step_id,
+                            retryable=True,
+                            terminal_reason="model_hit_max_output_tokens",
+                            failure_class="model_output_limit",
+                        ),
+                        "failure_origin": "model",
+                        "failure_fingerprint": fingerprint,
+                    }
+                    for step_id in ("source-1", "source-2")
+                ],
+            },
+        )
+
+        candidates = state.ordered_delegate_candidates(
+            "generic",
+            "bootstrap",
+            [f"source-{index}" for index in range(1, 8)],
+        )
+        self.assertEqual("source-3", candidates[0])
+        self.assertIsNone(state.terminal_delegate_failure())
+
+    def test_malformed_supplied_failure_taxonomy_is_rederived_safely(self):
+        state = self._seven_source_state()
+        supplied_fingerprint = "d" * 64
+
+        state.record_delegate_task(
+            {
+                "skill_name": "generic",
+                "step_type": "knowledge_bootstrap",
+                "step_id": "source-1",
+            },
+            {
+                "status": "error",
+                "results": [{
+                    **self._failed_bootstrap_result(
+                        "source-1",
+                        retryable=True,
+                        terminal_reason="validator_receipt_mismatch",
+                        failure_class="contract_validation",
+                    ),
+                    "failure_taxonomy_version": "future-version",
+                    "failure_origin": "validator",
+                    "failure_fingerprint": supplied_fingerprint,
+                }],
+            },
+        )
+
+        record = state.delegate_step_status[
+            ("generic", "bootstrap", "source-1")
+        ]
+        self.assertEqual(1, record["failure_taxonomy_version"])
+        self.assertEqual("validator", record["failure_origin"])
+        self.assertNotEqual(
+            supplied_fingerprint,
+            record["failure_fingerprint"],
+        )
+
     def test_parent_accepts_short_result_with_child_semantic_shape_receipt(self):
         state = self._seven_source_state()
         update = state.record_delegate_task(

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import unittest
@@ -9,10 +10,17 @@ from agent_loop import (
     run_stream,
 )
 from knowledge_gate_runtime import canonical_json_sha256
+from tools.context import ToolContext
+from tools.delegation import _exact_knowledge_gate_candidate_grants
+from tools.isolated_skill_executor import compute_skill_package_digest
 from tools.mcp_contract import (
     build_mcp_tool_descriptor,
     freeze_mcp_catalog,
     preflight_mcp_tool_call,
+)
+from tests.support.scripted_provider import (
+    ScriptedProvider,
+    ScriptedTurn,
 )
 
 
@@ -159,44 +167,19 @@ class KnowledgeGateAgentLoopIntegrationTests(
         enabled_tools: list[str] | None = None,
         source: str = "delegate",
         agent_kind: str = "delegate",
+        extra_run_kwargs: dict | None = None,
     ):
-        request_bodies: list[dict] = []
-
-        class FakeResponse:
-            status_code = 200
-
-            def __init__(self, lines):
-                self._lines = lines
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, exc_type, exc, tb):
-                return False
-
-            async def aiter_lines(self):
-                for line in self._lines:
-                    yield line
-                    if isinstance(line, str) and line.startswith("data"):
-                        yield ""
-
-        class FakeAsyncClient:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, exc_type, exc, tb):
-                return False
-
-            def stream(self, method, url, **kwargs):
-                request_bodies.append(kwargs["json"])
-                return FakeResponse(responses.pop(0))
+        provider = ScriptedProvider(
+            ScriptedTurn(tuple(lines))
+            for lines in responses
+        )
 
         digest = canonical_json_sha256(plan) if plan is not None else ""
         patches = [
-            patch("agent_loop.httpx.AsyncClient", FakeAsyncClient),
+            patch(
+                "agent_loop.httpx.AsyncClient",
+                provider.client_factory,
+            ),
             patch("agent_loop.build_system_prompt", return_value="system"),
             patch("agent_loop.load_workspace_context", return_value=""),
             patch("agent_loop._fetch_goal", AsyncMock(return_value=None)),
@@ -262,12 +245,16 @@ class KnowledgeGateAgentLoopIntegrationTests(
                             agent_kind=agent_kind,
                             max_iterations=4,
                             **gate_kwargs,
+                            **(extra_run_kwargs or {}),
                         )
                     ]
                 finally:
                     for active_patch in reversed(entered):
                         active_patch.stop()
-        return request_bodies, events
+        provider.assert_exhausted()
+        return [
+            request["body"] for request in provider.requests
+        ], events
 
     async def test_provider_receives_plan_bound_exact_decision_schema(self):
         checks = [
@@ -381,6 +368,160 @@ class KnowledgeGateAgentLoopIntegrationTests(
             "submit_knowledge_gate_decisions",
             resolved["payload"]["effective_tools"],
         )
+
+    async def test_exact_preloaded_resource_closes_activated_frontier(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "generic-skill"
+            (root / "references").mkdir(parents=True)
+            main = root / "SKILL.md"
+            resource = root / "references" / "gate.md"
+            main.write_text("# Generic Skill\n", encoding="utf-8")
+            resource.write_text(
+                "bounded exact evidence\n",
+                encoding="utf-8",
+            )
+            main_sha256 = hashlib.sha256(main.read_bytes()).hexdigest()
+            resource_sha256 = hashlib.sha256(
+                resource.read_bytes()
+            ).hexdigest()
+            package_sha256 = compute_skill_package_digest(root)
+            candidate = {
+                "candidate_id": "candidate-resource",
+                "kind": "skill_resource",
+                "skill_name": "generic-skill",
+                "resource_path": "references/gate.md",
+                "sha256": resource_sha256,
+                "skill_md_sha256": main_sha256,
+                "package_sha256": package_sha256,
+                "tool_names": [],
+            }
+            plan = {
+                "schema_version": 1,
+                "worker_id": "worker-resource",
+                "owner_skill": "generic-skill",
+                "checks": [{
+                    "id": "resource-required",
+                    "question": "Is the exact local resource required?",
+                    "branches": [{
+                        "outcome": "yes",
+                        "action": "Use the exact local evidence.",
+                        "group_ids": ["group-resource"],
+                    }],
+                    "legacy_ambiguous": False,
+                }],
+                "groups": [{
+                    "id": "group-resource",
+                    "check_id": "resource-required",
+                    "outcome": "yes",
+                    "mode": "one_of",
+                    "candidate_ids": ["candidate-resource"],
+                    "selectors": [
+                        "skill:generic-skill/references/gate.md",
+                    ],
+                    "unresolved_selectors": [],
+                }],
+                "candidates": [candidate],
+            }
+            digest = canonical_json_sha256(plan)
+            context = ToolContext(
+                user_id="u-knowledge-gate",
+                session_id="s-knowledge-gate",
+                enabled_tools=("skill_view",),
+                enabled_user_skills=("generic-skill",),
+                skill_execution_resource_boundary=True,
+                allowed_skill_resources=(
+                    ("generic-skill", "SKILL.md"),
+                    ("generic-skill", "references/gate.md"),
+                ),
+                allowed_skill_package_digests=(
+                    ("generic-skill", package_sha256),
+                ),
+            )
+            run_id = "run-preloaded-resource"
+            aggregate_sha256 = "e" * 64
+            aggregate_receipt = {
+                "version": 1,
+                "source_count": 1,
+                "kind_counts": {"skill_view": 1},
+                "aggregate_sha256": aggregate_sha256,
+                "complete": True,
+                "run_id": run_id,
+                "user_id": "u-knowledge-gate",
+                "session_id": "s-knowledge-gate",
+                "workspace_scope": "shared_session",
+            }
+            resource_receipt = {
+                "version": 1,
+                "run_id": run_id,
+                "aggregate_sha256": aggregate_sha256,
+                "skill_name": "generic-skill",
+                "resource_path": "references/gate.md",
+                "sha256": resource_sha256,
+                "complete": True,
+            }
+            responses = [
+                _tool_call_response(
+                    "submit_knowledge_gate_decisions",
+                    {
+                        "plan_sha256": digest,
+                        "decisions": [{
+                            "check_id": "resource-required",
+                            "outcome": "yes",
+                            "reason": (
+                                "The exact preloaded local evidence is "
+                                "required."
+                            ),
+                        }],
+                    },
+                    call_id="call-resource-decision",
+                ),
+                _stop_response(
+                    "status: PASS\nThe exact local evidence was retained."
+                ),
+            ]
+            with patch(
+                "skills.scanner.resolve_skill_path",
+                return_value=main,
+            ):
+                authority, error = (
+                    _exact_knowledge_gate_candidate_grants(
+                        plan,
+                        context=context,
+                    )
+                )
+                self.assertIsNone(error)
+                bodies, events = await self._run(
+                    responses,
+                    plan=plan,
+                    authority=authority,
+                    allow_session_mcp=False,
+                    enabled_tools=[
+                        "skill_view",
+                        "submit_knowledge_gate_decisions",
+                    ],
+                    extra_run_kwargs={
+                        "run_id": run_id,
+                        "verified_preloaded_input_receipt": (
+                            aggregate_receipt
+                        ),
+                        "preloaded_knowledge_gate_resource_receipts": [
+                            resource_receipt,
+                        ],
+                    },
+                )
+
+        self.assertEqual(2, len(bodies))
+        self.assertFalse(any(
+            event.get("event_type") == "run.failed"
+            for event in events
+        ))
+        self.assertTrue(any(
+            event.get("event_type") == "run.completed"
+            for event in events
+        ))
+        self.assertNotEqual("required", bodies[1].get("tool_choice"))
 
     async def test_conditional_mcp_is_hidden_then_activated(self):
         descriptor = build_mcp_tool_descriptor(

@@ -15,6 +15,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from config import settings
+from failure_taxonomy import build_failure_fingerprint
 from retrieval_completeness import (
     RETRIEVAL_QUALITY_IMPACT_ADVISORY,
     RETRIEVAL_QUALITY_IMPACT_DEGRADED,
@@ -76,6 +77,7 @@ from knowledge_gate_runtime import (
     MAX_GATE_TEXT_CHARS as _MAX_KNOWLEDGE_GATE_TEXT_CHARS,
     MAX_KNOWLEDGE_GATE_PLAN_BYTES as _MAX_KNOWLEDGE_GATE_PLAN_BYTES,
     MAX_UNCONDITIONAL_CAPABILITY_PLAN_BYTES,
+    validate_knowledge_gate_decision_receipt,
 )
 from tools.path_security import sandbox_dir
 from workspace_patterns import (
@@ -462,6 +464,7 @@ def _completion_quality_declaration(
         }
 
     declared_status: str | None = None
+    reason_receipt: dict[str, Any] | None = None
     sources: list[str] = []
     if candidate_lines:
         raw = candidate_lines[0][
@@ -504,17 +507,13 @@ def _completion_quality_declaration(
             and (
                 not isinstance(reason, str)
                 or not reason.strip()
-                or len(reason) > 1_000
-                or "\n" in reason
-                or "\r" in reason
             )
         ):
             return {
                 "status": None,
                 "source": "completion_quality_json",
                 "error": (
-                    "COMPLETION_QUALITY_JSON reason must be a non-empty "
-                    "single-line string of at most 1000 characters"
+                    "COMPLETION_QUALITY_JSON reason must be a non-empty string"
                 ),
             }
         if status == "degraded" and not isinstance(reason, str):
@@ -525,6 +524,19 @@ def _completion_quality_declaration(
                     "degraded COMPLETION_QUALITY_JSON requires a reason"
                 ),
             }
+        if isinstance(reason, str):
+            reason_receipt = {
+                "representation": "sha256+shape",
+                "sha256": hashlib.sha256(
+                    reason.encode("utf-8")
+                ).hexdigest(),
+                "chars": len(reason),
+                "utf8_bytes": len(reason.encode("utf-8")),
+                "contains_line_break": bool(
+                    "\n" in reason or "\r" in reason
+                ),
+                "raw_reason_persisted_in_audit": False,
+            }
         declared_status = status
         sources.append("completion_quality_json")
 
@@ -533,6 +545,7 @@ def _completion_quality_declaration(
             "status": declared_status,
             "source": "+".join(dict.fromkeys(sources)),
             "error": None,
+            "reason_receipt": reason_receipt,
         }
 
     legacy_status = (
@@ -544,6 +557,7 @@ def _completion_quality_declaration(
         "status": legacy_status,
         "source": "legacy_status" if legacy_status else "none",
         "error": None,
+        "reason_receipt": None,
     }
 
 
@@ -1655,10 +1669,16 @@ def _child_failure_fields(
             resolved_class = "terminal_runtime"
             resolved_retryable = False
 
+    taxonomy = build_failure_fingerprint(
+        failure_class=resolved_class,
+        terminal_reason=reason,
+        error=error,
+    )
     return {
         "terminal_reason": reason or None,
         "failure_class": resolved_class,
         "retryable": bool(resolved_retryable),
+        **taxonomy,
     }
 
 
@@ -5947,27 +5967,54 @@ def _knowledge_gate_receipt_audit(
             "successful submit_knowledge_gate_decisions dispatch."
         )
     decision_call_index = indexed_decision_calls[0][0]
-    decision_args = (
-        decision_calls[0].get("args")
-        if isinstance(decision_calls[0].get("args"), dict)
-        else {}
+    typed_decision_receipt = decision_calls[0].get(
+        "knowledge_gate_decision_receipt"
     )
-    try:
-        from knowledge_gate_runtime import validate_knowledge_gate_decisions
-
-        decision_result = validate_knowledge_gate_decisions(
-            plan,
-            expected_sha256=plan_sha256,
-            supplied_sha256=str(
-                decision_args.get("plan_sha256") or ""
-            ),
-            decisions=decision_args.get("decisions"),
+    if isinstance(typed_decision_receipt, dict):
+        try:
+            decision_result = validate_knowledge_gate_decision_receipt(
+                plan,
+                expected_sha256=plan_sha256,
+                receipt=typed_decision_receipt,
+            )
+        except (RuntimeError, TypeError, ValueError):
+            decision_result = {
+                "status": "error",
+                "error": (
+                    "knowledge-gate typed decision receipt validation "
+                    "failed closed"
+                ),
+            }
+    else:
+        # Compatibility for legacy/mocked producers that supplied exact
+        # preflight arguments directly. Production producers use the typed
+        # handler-owned receipt because debug/audit argument projections are
+        # intentionally not semantic state.
+        decision_args = (
+            decision_calls[0].get("args")
+            if isinstance(decision_calls[0].get("args"), dict)
+            else {}
         )
-    except (RuntimeError, TypeError, ValueError):
-        decision_result = {
-            "status": "error",
-            "error": "knowledge-gate decision validation failed closed",
-        }
+        try:
+            from knowledge_gate_runtime import (
+                validate_knowledge_gate_decisions,
+            )
+
+            decision_result = validate_knowledge_gate_decisions(
+                plan,
+                expected_sha256=plan_sha256,
+                supplied_sha256=str(
+                    decision_args.get("plan_sha256") or ""
+                ),
+                decisions=decision_args.get("decisions"),
+            )
+        except (RuntimeError, TypeError, ValueError):
+            decision_result = {
+                "status": "error",
+                "error": (
+                    "knowledge-gate decision validation failed closed"
+                ),
+            }
     if (
         not isinstance(decision_result, dict)
         or decision_result.get("status") != "accepted"
@@ -6058,10 +6105,22 @@ def _knowledge_gate_receipt_audit(
     candidate_dispatch_calls: list[tuple[int, dict[str, Any]]] = []
     seen_process_receipt_ids: set[str] = set()
     for index, call in enumerate(dispatched_tool_calls):
+        deterministic_resource_preload = (
+            call.get("deterministic_prerequisite_preload") is True
+            and call.get("tool_name") == "skill_view"
+            and call.get("outcome") == "success"
+            and call.get("skill_resource_complete") is True
+        )
         if (
-            index <= decision_call_index
-            or call.get("tool_name") == _KNOWLEDGE_GATE_DECISION_TOOL
-            or call.get("deterministic_prerequisite_preload") is True
+            call.get("tool_name") == _KNOWLEDGE_GATE_DECISION_TOOL
+            or (
+                index <= decision_call_index
+                and not deterministic_resource_preload
+            )
+            or (
+                call.get("deterministic_prerequisite_preload") is True
+                and not deterministic_resource_preload
+            )
         ):
             continue
         result_data = (
@@ -8725,6 +8784,9 @@ async def _run_child(
     preloaded_result_bytes = 0
     prerequisite_fan_in: dict[str, Any] | None = None
     verified_preloaded_input_receipt: dict[str, Any] | None = None
+    preloaded_knowledge_gate_resource_receipts: list[
+        dict[str, Any]
+    ] = []
     exact_resource_binding_digests = {
         (
             str(binding.get("skill_name") or ""),
@@ -9709,8 +9771,63 @@ async def _run_child(
                     "session_id": context.session_id,
                     "workspace_scope": workspace_scope,
                 }
+                conditional_resource_digests = {
+                    (
+                        str(candidate.get("skill_name") or ""),
+                        str(candidate.get("resource_path") or ""),
+                    ): str(candidate.get("sha256") or "")
+                    for candidate in (
+                        (knowledge_gate_plan or {}).get("candidates") or []
+                    )
+                    if (
+                        isinstance(candidate, dict)
+                        and candidate.get("kind") == "skill_resource"
+                    )
+                }
+                for call in dispatched_tool_calls:
+                    args = (
+                        call.get("args")
+                        if isinstance(call.get("args"), dict)
+                        else {}
+                    )
+                    coordinate = (
+                        str(args.get("name") or ""),
+                        str(args.get("file_path") or "SKILL.md"),
+                    )
+                    sha256 = str(
+                        (
+                            call.get("result_data")
+                            if isinstance(call.get("result_data"), dict)
+                            else {}
+                        ).get("sha256")
+                        or ""
+                    )
+                    if (
+                        call.get("deterministic_prerequisite_preload")
+                        is not True
+                        or call.get("tool_name") != "skill_view"
+                        or call.get("outcome") != "success"
+                        or call.get("skill_resource_complete") is not True
+                        or conditional_resource_digests.get(coordinate)
+                        != sha256
+                    ):
+                        continue
+                    preloaded_knowledge_gate_resource_receipts.append({
+                        "version": 1,
+                        "run_id": child_run_id,
+                        "aggregate_sha256": (
+                            verified_preloaded_input_receipt[
+                                "aggregate_sha256"
+                            ]
+                        ),
+                        "skill_name": coordinate[0],
+                        "resource_path": coordinate[1],
+                        "sha256": sha256,
+                        "complete": True,
+                    })
             except (ValueError, FanInExecutionError) as exc:
                 verified_preloaded_input_receipt = None
+                preloaded_knowledge_gate_resource_receipts = []
                 preload_error = (
                     "Delegated prerequisite preload failed closed before model "
                     f"execution: {exc}"
@@ -9920,6 +10037,9 @@ async def _run_child(
         ),
         verified_preloaded_input_receipt=(
             verified_preloaded_input_receipt
+        ),
+        preloaded_knowledge_gate_resource_receipts=(
+            preloaded_knowledge_gate_resource_receipts
         ),
         declared_artifact_patterns=(
             artifact_output_patterns if is_artifact_synthesis else None
@@ -10223,6 +10343,22 @@ async def _run_child(
                             "process_evidence_receipt",
                         }
                     },
+                    **(
+                        {
+                            "knowledge_gate_decision_receipt": dict(
+                                exact_capability_receipt[
+                                    "knowledge_gate_decision_receipt"
+                                ]
+                            ),
+                        }
+                        if isinstance(
+                            exact_capability_receipt.get(
+                                "knowledge_gate_decision_receipt"
+                            ),
+                            dict,
+                        )
+                        else {}
+                    ),
                     "skill_resource_complete": (
                         exact_capability_receipt.get(
                             "skill_resource_complete"
@@ -11210,6 +11346,14 @@ async def _run_child(
     completion_quality_audit = {
         "declared_status": completion_quality_declaration.get("status"),
         "declaration_source": completion_quality_declaration.get("source"),
+        "declaration_reason_receipt": (
+            completion_quality_declaration.get("reason_receipt")
+            if isinstance(
+                completion_quality_declaration.get("reason_receipt"),
+                dict,
+            )
+            else None
+        ),
         "receipt_forced_degraded": receipt_forced_degraded,
         "receipt_degraded_reasons": receipt_degraded_reasons,
         "strict_complete_conflict_reasons": (
@@ -11493,6 +11637,16 @@ async def _run_child(
             ),
             "terminal_reason": failure_fields.get("terminal_reason"),
             "failure_class": failure_fields.get("failure_class"),
+            "failure_taxonomy_version": failure_fields.get(
+                "failure_taxonomy_version"
+            ),
+            "failure_origin": failure_fields.get("failure_origin"),
+            "failure_fingerprint": failure_fields.get(
+                "failure_fingerprint"
+            ),
+            "common_mode_breaker_eligible": failure_fields.get(
+                "common_mode_breaker_eligible"
+            ) is True,
             "retryable": failure_fields.get("retryable") is True,
             "provisional_terminal": False,
             "authoritative": True,
