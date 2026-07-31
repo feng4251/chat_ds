@@ -31,6 +31,12 @@ Key operating constraints:
   reproduction, and add a non-V2.3 holdout or mutation/rename case when
   applicable. Machine-owned receipts and durable state are authoritative for
   control-plane facts; model prose is content, not workflow state.
+- An E2E defect iteration counts as a repair iteration only when the resulting
+  production change improves execution for arbitrary conforming Skills through
+  a generic compiler, workflow, capability, sandbox, evidence, artifact,
+  recovery, or lifecycle invariant. A passing acceptance round may be recorded
+  without manufacturing a code change; a fixture-specific workaround never
+  counts as an iteration.
 - Every E2E repair iteration must include a current comparison with mature
   session-wise Harness/workflow implementations. Map the observed mechanism to
   concrete patterns such as durable checkpoints/pending writes, typed state and

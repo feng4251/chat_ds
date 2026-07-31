@@ -1233,6 +1233,9 @@ conversation/root run，并在该轮达到 durable terminal 后才计数；同�
    Semantic Kernel/Inspect AI 名称不算完成调研。
 6. 修复只能进入通用 compiler/workflow/capability/evidence/artifact/recovery/lifecycle 层；
    不得加入疾病、V2.3、package/session/route/worker/KG ID、固定数量或报告文件名特判。
+   只有确实提升任意规范 Skill 执行能力、并由通用复现及跨领域 holdout 证明的修改，才计为
+   一轮“修复”；纯 V2.3 workaround 不计数。若某轮验收没有暴露通用缺陷，则记录为通过轮，
+   不为了凑修复数量制造代码改动。
 7. 运行受影响回归、跨领域 holdout、隔离基础全量、secret/genericity/diff 检查；从 clean
    Git archive 构建候选并按现有无活跃任务部署协议切换。记录代码 revision、镜像、回滚点
    和生产 smoke 后再开始下一轮。
