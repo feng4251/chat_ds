@@ -909,6 +909,28 @@ def _agent_event_terminal_status(
     return None, None
 
 
+def _authoritative_root_terminal_payload(
+    agent_events: list[dict],
+    *,
+    run_id: str,
+) -> tuple[str | None, dict]:
+    """Return the first authoritative root terminal and its payload."""
+
+    for event in sorted(
+        agent_events or [], key=lambda item: int(item.get("seq") or 0)
+    ):
+        if str(event.get("run_id") or "") != run_id:
+            continue
+        event_type = str(event.get("event_type") or "")
+        if event_type not in {"run.completed", "run.failed", "run.cancelled"}:
+            continue
+        payload = _normalized_event_payload(event)
+        if not _event_is_authoritative(event, payload):
+            continue
+        return event_type, payload
+    return None, {}
+
+
 def _reconcile_root_stream_error(
     agent_events: list[dict],
     *,
@@ -2121,6 +2143,12 @@ async def _persist_stream_projection_once(
             terminal_status, _ = _agent_event_terminal_status(
                 agent_events, run_id=run_id
             )
+            root_terminal_type, root_terminal_payload = (
+                _authoritative_root_terminal_payload(
+                    agent_events,
+                    run_id=run_id,
+                )
+            )
             reconciled_usage = _reconciled_root_run_usage(
                 usage,
                 agent_events,
@@ -2198,12 +2226,24 @@ async def _persist_stream_projection_once(
                 run.resolved_model_id = resolved_model_id or model_id
                 if terminal_status == "cancelled":
                     run.status = "cancelled"
-                    run.finish_reason = "task_cancelled"
+                    run.finish_reason = str(
+                        root_terminal_payload.get("finish_reason")
+                        or root_terminal_payload.get("terminal_reason")
+                        or "task_cancelled"
+                    )[:256]
                     run.error = None
                 else:
                     run.status = "failed" if error_message else "succeeded"
-                    run.finish_reason = finish_reason
-                    run.error = _bounded_agent_run_error(error_message)
+                    run.finish_reason = str(
+                        root_terminal_payload.get("finish_reason")
+                        or root_terminal_payload.get("terminal_reason")
+                        or finish_reason
+                    )[:256]
+                    run.error = _bounded_agent_run_error(
+                        root_terminal_payload.get("error")
+                        if root_terminal_type == "run.failed"
+                        else error_message
+                    )
                 run.tool_events = json.dumps(
                     tool_progress.splitlines() if tool_progress else [],
                     ensure_ascii=False,

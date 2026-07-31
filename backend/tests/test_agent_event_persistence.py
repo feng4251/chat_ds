@@ -660,6 +660,7 @@ class AgentEventPersistenceTests(unittest.IsolatedAsyncioTestCase):
                 )
             )).scalar_one()
             self.assertEqual(root.status, "failed")
+            self.assertEqual("fixture_failure", root.finish_reason)
             self.assertEqual(
                 (root.input_tokens, root.output_tokens, root.total_tokens),
                 (13, 5, 18),
