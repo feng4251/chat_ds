@@ -6,9 +6,11 @@
 
 - 工作目录：`/nfs/yangbb/codes/chat_ds`。
 - 分支：`fix/generic-skill-harness-20260717`。
-- 2026-07-31 当前候选继续保留现有 AgentLoop、内容寻址编译器、Workflow IR、
+- 2026-07-31 当前功能提交：
+  `17e261ef fix: harden generic workflow evidence convergence`。该提交继续保留现有
+  AgentLoop、内容寻址编译器、Workflow IR、
   session sandbox 和 exact authority/receipt 主链；没有切换 LangChain/LangGraph/
-  Deep Agents 主循环。新候选补齐 handler-owned Knowledge Gate typed receipt、
+  Deep Agents 主循环。该提交补齐 handler-owned Knowledge Gate typed receipt、
   exact Skill-resource preload receipt、按 retrieval family 隔离失败、正文与终态
   质量元数据分离、稳定失败 taxonomy 和跨独立步骤 common-mode breaker，并加入
   可复用 `ScriptedProvider` 边界测试夹具。
@@ -62,8 +64,9 @@
   `2486f008b19f760d0fe63111137feb9d103a1a45`，健康且 restart 0；三个 Frontend
   `/api/health` 入口均为 200。Backend、Frontend、四个 session-sandbox 和 legacy
   browser 未重建。
-- 当前本地与生产的 Harness/Backend 功能 revision 均以
-  `82c818fc6d7eb135e63d74f3b176c4b56bf4947e` 为准；交接文档可另有 docs-only HEAD。
+- 当前生产 Harness 功能 revision 为
+  `17e261ef61b913e804e9875a8010480edfb5081a`；Backend 保持
+  `82c818fc6d7eb135e63d74f3b176c4b56bf4947e`。交接文档可另有 docs-only HEAD。
 - 2026-07-30 其他基础功能提交：
   - `b4e8dc18 fix: require durable delete intent for orphan cleanup`
   - `c62a4a69 feat: unify session sandbox and harden session lifecycle`
@@ -669,10 +672,10 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 
 ## 5. 当前验证证据
 
-2026-07-31 当前候选已通过：
+2026-07-31 功能提交 `17e261ef` 已通过：
 
 - 受影响面组合回归：
-  `245 passed, 95 subtests passed`。
+  `246 passed, 95 subtests passed`。
 - 非 root 宿主全量：
   `1801 passed, 1 skipped, 19 failed, 751 subtests passed`；19 项全部在测试断言前
   因当前用户无权读取生产 NFS tombstone 而 fail closed，与既有环境噪声同型。
@@ -849,6 +852,22 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 - 前端：`http://10.10.132.126:5173`、`http://172.30.100.126:5173`。
 - Harness 使用同机 SearXNG `http://10.10.132.126:8088`；既有 SearXNG/Valkey 在切换
   中未重建，健康状态和数据卷保持不变。
+- 2026-07-31 完成 `17e261ef` Harness 收敛更新：
+  - 部署前连续两次确认 active AgentRun、active root run、running/enabled schedule
+    与 5173 established connection 均为 0；
+  - 候选来自 clean Git archive
+    `/tmp/chat_ds_deploy_17e261ef.YWE8va`，archive 文件数与 tracked tree 精确一致，
+    revision label 为完整 Git SHA；
+  - 候选先通过离线 compile/import，再复用真实四槽与 Browser UDS 做隔离
+    `/health`、`/v1/models` smoke；随后仅 force-recreate Harness。Backend、
+    Frontend、四槽、Proxy、Browser、SearXNG/Valkey 和数据库均未替换；
+  - 部署后 Harness image 为
+    `sha256:9da0762b742e50d55d8d064b5acb51f49e3043cc65945bff3df9519b0e273139`，
+    revision 为完整提交
+    `17e261ef61b913e804e9875a8010480edfb5081a`，healthy/restart 0；
+    Backend→Harness `/v1/models`、Harness `/health` 与三个 Frontend
+    `/api/health` 均为 200，启动严重错误匹配为 0，active/root/scheduled run
+    仍为 0。
 - 2026-07-30 完成 `82c818fc` 通用 workflow 契约更新：
   - 部署前两次确认 active AgentRun、active root run、running schedule 与 5173
     established connection 都为 0；
@@ -930,7 +949,7 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 | `chat_acits_executor` ～ `_4` | `sha256:08996fb6e1da586de9ee57d1812dda75826145bdf07d86dfa784f24b35ec004a` | 4 个同质槽 / healthy / restart 0 / revision `f1e59c20` |
 | `chat_acits_skill_egress_proxy` | `sha256:6f23e97983ace0c4855af3dbf65967678902d2cd8d5c5b33e92eeecb2cec072f` | healthy / restart 0 / revision `f1e59c20` |
 | `chat_acits_browser` | `sha256:08bcf8860c10ba8fcd647b6d1a96c2c12e13e46db800c812acea82e17007240c` | healthy / restart 0 / revision `7bbc0809` |
-| `chat_acits_harness` | `sha256:d26880378cd2e28905efe853d581440cc0881b3f42c7e958e2ffb30f0c887627` | healthy / restart 0 / revision `82c818fc` |
+| `chat_acits_harness` | `sha256:9da0762b742e50d55d8d064b5acb51f49e3043cc65945bff3df9519b0e273139` | healthy / restart 0 / revision `17e261ef` |
 | `chat_acits_backend` | `sha256:28cc61b9c80eebccbdcb9b0ad4421272ffc63cd3e3a4de320ae7d09934ce2176` | running / restart 0 / revision `82c818fc` / `/api/health` 200 |
 | `chat_acits_frontend` | `sha256:907c5abb41a5288c852ae55d2bbc3258196e4fc03fe0305ce072366f9255cb24` | running / restart 0 / revision `c62a4a69` / `/` 200 |
 
@@ -949,7 +968,8 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 - SearXNG 真实 `OpenAI GPT` 查询返回 27 条结果，命中 `360search`、`bing`、`mojeek`；
   SearXNG/Valkey 均 healthy。免费上游仍可能动态出现 unresponsive engine，不属于
   Harness 执行环境缺失。
-- Backend/Harness revision label 为完整提交
+- Harness revision label 为完整提交
+  `17e261ef61b913e804e9875a8010480edfb5081a`；Backend 为
   `82c818fc6d7eb135e63d74f3b176c4b56bf4947e`；proxy/四槽为
   `f1e59c20129d9c3ba91b0f80850983e93d24d9dc`；Frontend 为
   `c62a4a69cfbbfb46404cfa1eb51b5f8e0498dce2`；legacy Browser 保持兼容基线。
@@ -960,6 +980,10 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 
 回滚点：
 
+- `17e261ef` 切换前 Harness 保留
+  `chat_ds-harness:rollback-pre-17e261ef`；候选/部署 tag 为
+  `candidate-17e261ef` / `deploy-17e261ef`，clean archive build 目录为
+  `/tmp/chat_ds_deploy_17e261ef.YWE8va`。
 - `82c818fc` 切换前 Harness/Backend 分别保留
   `chat_ds-harness:rollback-pre-82c818fc` 和
   `chat_ds-backend:rollback-pre-82c818fc`；候选/部署 tag 为
