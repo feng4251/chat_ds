@@ -6657,6 +6657,37 @@ def _tool_allowed_in_child(name: str, *, parallel_child: bool) -> bool:
     return metadata.get("allow_in_parallel_child") is True
 
 
+def _delegated_runtime_base_tools(
+    tools: list[str],
+    *,
+    exact_bound_tool_names: set[str],
+    knowledge_gate_active: bool,
+    bounded_calculation_allowed: bool,
+) -> list[str]:
+    """Project validated child authority onto the model-facing surface.
+
+    Knowledge-gate candidates are exact evidence authority, but bounded local
+    calculation is a separate compiler-owned worker control. Validation has
+    already admitted that control only for a declared worker file. Preserve it
+    alongside the decision control and prerequisite readers; otherwise the
+    validation and projection phases disagree and a simulation worker is
+    forced to invent a package script that was never declared.
+    """
+
+    if not knowledge_gate_active:
+        return list(tools)
+    return [
+        name
+        for name in tools
+        if (
+            name in exact_bound_tool_names
+            or name in _PRELOADED_READER_TOOLS
+            or name == _KNOWLEDGE_GATE_DECISION_TOOL
+            or (bounded_calculation_allowed and name == "execute_code")
+        )
+    ]
+
+
 async def _run_child(
     task: dict[str, Any],
     context: ToolContext,
@@ -8763,18 +8794,11 @@ async def _run_child(
         for skill, path in capability_resource_grants
     )
     base_exact_tool_names = set(exact_grants("bound_tool_names"))
-    runtime_base_tools = (
-        [
-            name
-            for name in tools
-            if (
-                name in base_exact_tool_names
-                or name in _PRELOADED_READER_TOOLS
-                or name == _KNOWLEDGE_GATE_DECISION_TOOL
-            )
-        ]
-        if knowledge_gate_plan is not None
-        else list(tools)
+    runtime_base_tools = _delegated_runtime_base_tools(
+        tools,
+        exact_bound_tool_names=base_exact_tool_names,
+        knowledge_gate_active=knowledge_gate_plan is not None,
+        bounded_calculation_allowed=bounded_calculation_allowed,
     )
     model_tools = (
         [

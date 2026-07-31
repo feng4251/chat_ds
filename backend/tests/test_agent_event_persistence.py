@@ -80,6 +80,25 @@ def _event(event_type: str, seq: int, *, run_id: str = "child") -> dict:
 
 
 class AgentEventPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    def test_stream_terminal_finish_reason_uses_authoritative_root_event(self):
+        failed = _event("run.failed", 7, run_id="root")
+        self.assertEqual(
+            "fixture_failure",
+            chat_router._authoritative_root_finish_reason(
+                [failed],
+                run_id="root",
+                transport_finish_reason="stop",
+            ),
+        )
+        self.assertEqual(
+            "stop",
+            chat_router._authoritative_root_finish_reason(
+                [],
+                run_id="root",
+                transport_finish_reason="stop",
+            ),
+        )
+
     async def asyncSetUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         db_path = Path(self.temp_dir.name) / "events.db"

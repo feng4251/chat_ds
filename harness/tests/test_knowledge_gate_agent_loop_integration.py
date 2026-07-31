@@ -714,6 +714,103 @@ class KnowledgeGateAgentLoopIntegrationTests(
             for event in reserve_events
         ), reserve_events)
 
+        # A one-shot correction belongs to one exact mandatory frontier, not
+        # to the lifetime of the child.  After a real receipt advances the
+        # frontier, a later independent group gets its own bounded correction.
+        # Reusing one run-global boolean made the second ignored call terminal
+        # even though the first correction had already produced progress.
+        request_number = 0
+        dispatched_urls.clear()
+        first_ignored = "Discarded prose before the first exact receipt."
+        second_ignored = "Discarded prose before the second exact receipt."
+        independent_frontier_responses = [
+            _tool_call_response(
+                "submit_knowledge_gate_decisions",
+                {
+                    "plan_sha256": digest,
+                    "decisions": [{
+                        "check_id": "source-check",
+                        "outcome": "yes",
+                        "reason": "Both exact declared sources are required.",
+                    }],
+                },
+                call_id="call-independent-decision",
+            ),
+            _length_response(first_ignored),
+            _tool_call_response(
+                "skill_http_get",
+                {"url": second_url, "max_chars": 100_000, "timeout": 20},
+                call_id="call-independent-registry",
+            ),
+            _length_response(second_ignored),
+            _tool_call_response(
+                "skill_http_get",
+                {"url": first_url, "max_chars": 100_000, "timeout": 20},
+                call_id="call-independent-archive",
+            ),
+            _stop_response(
+                "status: PASS\nBoth independent exact receipts are present."
+            ),
+        ]
+
+        independent_bodies, independent_events = await self._run(
+            independent_frontier_responses,
+            plan=plan,
+            authority=authority,
+            allow_session_mcp=False,
+            enabled_tools=[
+                "skill_http_get",
+                "submit_knowledge_gate_decisions",
+            ],
+            extra_run_kwargs={
+                "allowed_skill_http_prefixes": (
+                    ("generic-skill", first_prefix),
+                    ("generic-skill", second_prefix),
+                ),
+            },
+            native_dispatch=fake_dispatch,
+            max_iterations=7,
+            resolved_skill_path=skill_main,
+            debug_trace=True,
+        )
+
+        self.assertEqual([second_url, first_url], dispatched_urls)
+        recovery_events = [
+            event["payload"] for event in independent_events
+            if event.get("event_type")
+            == "debug.delegate.required_capability_noncall_recovery.requested"
+        ]
+        self.assertEqual(2, len(recovery_events), independent_events)
+        self.assertEqual(
+            2,
+            len({event["mandatory_frontier_sha256"] for event in recovery_events}),
+        )
+        self.assertEqual(
+            [1, 2],
+            [event["recovered_frontier_count"] for event in recovery_events],
+        )
+        self.assertTrue(all(
+            event["recovery_scope"] == "mandatory_frontier"
+            and event["max_recoveries"] == 1
+            for event in recovery_events
+        ))
+        for body in (independent_bodies[2], independent_bodies[4]):
+            self.assertEqual(["system", "user"], [
+                message.get("role") for message in body["messages"]
+            ])
+            self.assertEqual("required", body.get("tool_choice"))
+        emitted = "".join(
+            str(event.get("content") or "")
+            for event in independent_events
+            if event.get("type") == "delta"
+        )
+        self.assertNotIn(first_ignored, emitted)
+        self.assertNotIn(second_ignored, emitted)
+        self.assertFalse(any(
+            event.get("event_type") == "run.failed"
+            for event in independent_events
+        ), independent_events)
+
     async def test_off_frontier_shared_http_coordinate_is_blocked_pre_dispatch(
         self,
     ):

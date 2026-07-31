@@ -14151,11 +14151,15 @@ async def run_stream(
     pending_delegate_required_capability_noncall_recovery = False
     # Some OpenAI-compatible providers accept ``tool_choice=required`` but
     # still return an ordinary stop or output-limit response without a
-    # structured call. Treat that provider hint as a request, not as proof:
-    # one clean bounded retry may correct the shape, after which the inner run
-    # fails before unverified prose can escape to the authoritative outer
-    # delegated-result audit. Stop and length share this run-scoped budget.
-    delegate_required_capability_noncall_recovery_attempted = False
+    # structured call. Treat that provider hint as a request, not as proof.
+    # A compiled child can have several independent mandatory frontiers, so a
+    # single run-scoped boolean is too coarse: consuming the correction for G1
+    # must not make a later, newly exposed G2 terminal on its first malformed
+    # sample. Bind the one-shot correction to the exact machine frontier
+    # instead. The same fingerprint still fails closed on its second non-call,
+    # while monotonic receipt progress may expose another fingerprint. The
+    # global iteration budget remains the outer bound over all such episodes.
+    delegate_required_capability_noncall_recovery_frontiers: set[str] = set()
     pending_delegate_preflight_denial_synthesis = False
     consecutive_length_continuations = 0
     previous_length_content = ""
@@ -27003,6 +27007,22 @@ async def run_stream(
                     & iteration_exposed_tools
                 )
             )
+            noncall_frontier_payload = {
+                "required_call_kind": noncall_kind,
+                "mandatory_frontier": mandatory_frontier_phase_payload(),
+                "required_http_retrieval_action": (
+                    iteration_delegated_retrieval_action
+                    if retrieval_continuation_noncall else None
+                ),
+                "exposed_required_capability_tools": expected_noncall_tools,
+            }
+            noncall_frontier_sha256 = knowledge_gate_plan_sha256_for(
+                noncall_frontier_payload
+            )
+            frontier_recovery_attempted = (
+                noncall_frontier_sha256
+                in delegate_required_capability_noncall_recovery_frontiers
+            )
             ignored_debug = {
                 "gate": "delegate_required_capability_noncall_recovery",
                 "reason": "provider_ignored_required_tool_choice",
@@ -27020,10 +27040,13 @@ async def run_stream(
                     delegate_required_capability_candidates
                 ),
                 "exposed_required_capability_tools": expected_noncall_tools,
-                "recovery_count": int(
-                    delegate_required_capability_noncall_recovery_attempted
-                ),
+                "mandatory_frontier_sha256": noncall_frontier_sha256,
+                "recovery_count": int(frontier_recovery_attempted),
                 "max_recoveries": 1,
+                "recovery_scope": "mandatory_frontier",
+                "recovered_frontier_count": len(
+                    delegate_required_capability_noncall_recovery_frontiers
+                ),
             }
             await notify_turn_boundary("finished", {
                 **turn_finished_payload,
@@ -27033,12 +27056,17 @@ async def run_stream(
                 "reasoning_chars": len(full_reasoning),
             })
             if (
-                not delegate_required_capability_noncall_recovery_attempted
+                not frontier_recovery_attempted
                 and budget.remaining > 0
             ):
-                delegate_required_capability_noncall_recovery_attempted = True
+                delegate_required_capability_noncall_recovery_frontiers.add(
+                    noncall_frontier_sha256
+                )
                 pending_delegate_required_capability_noncall_recovery = True
                 ignored_debug["recovery_count"] = 1
+                ignored_debug["recovered_frontier_count"] = len(
+                    delegate_required_capability_noncall_recovery_frontiers
+                )
                 conversation.append({
                     "role": "user",
                     "content": (
