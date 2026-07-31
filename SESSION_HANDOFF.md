@@ -1207,6 +1207,46 @@ checkout 分离或完成一次审计后的 untrack/migration。
 4. 将终稿与 ground truth 做结构、覆盖、证据链、表格、附录、traceability 和可用性对比，不要求逐字节相同。
 5. 只修复跨领域可复现的通用根因，并增加非 V2.3 特定回归。
 
+### 9.1 五轮 E2E 迭代协议（用户于 2026-07-31 明确授权）
+
+用户已明确要求由维护代理自动执行连续 5 轮 V2.3 模型重型 E2E；这项明确授权覆盖本次
+五轮 campaign，替代“下一轮必须由用户手工发起”的默认限制。每轮必须使用新的
+conversation/root run，并在该轮达到 durable terminal 后才计数；同一 run 的重试、补跑、
+刷新或重复解读不算新一轮。任何生产切换必须先确认没有其他用户 active root run，且不得
+为了赶轮次人为取消正在运行的任务。
+
+每轮固定执行以下闭环：
+
+1. 冻结并核对持久化对话、该 run 实际 Skill/package/resource 内容寻址快照，以及
+   debug/AgentRun/tool/provider/artifact 事件，构造从 compile/bind 到唯一 terminal 的时间线。
+2. 对照 Skill 声明的 route、worker DAG、Knowledge Gate、exact capability、fan-in、
+   artifact/strong-final/post-merge 合同与 ground truth 的结构、覆盖、证据链、表格、附录、
+   traceability 和可用性；不要求逐字节相同。
+3. 将异常分别归因到 Harness、Skill、provider/model、沙箱/依赖、网络/策略或上游来源；
+   逐个解释 succeeded/degraded/failed/cancelled attempt，不能用前端最后一条文案代替证据。
+4. 在修改生产代码前，把缺陷重述为跨领域不变量，并先建立 ScriptedProvider、故障注入、
+   mutation/rename 或非临床 holdout 的确定性复现。V2.3 E2E 只能验收，不能单独证明泛化。
+5. 同步查阅成熟 session-wise Harness/workflow 的官方资料，把本轮故障逐项映射到 durable
+   checkpoint/pending write、typed state/structured output、幂等 activity retry、subgraph
+   隔离、sandbox/workspace boundary、trace 与 exactly-one terminal 等机制，并明确
+   adopt/adapt/reject 决策；只罗列 LangGraph/Deep Agents/Temporal/PydanticAI/AutoGen/
+   Semantic Kernel/Inspect AI 名称不算完成调研。
+6. 修复只能进入通用 compiler/workflow/capability/evidence/artifact/recovery/lifecycle 层；
+   不得加入疾病、V2.3、package/session/route/worker/KG ID、固定数量或报告文件名特判。
+7. 运行受影响回归、跨领域 holdout、隔离基础全量、secret/genericity/diff 检查；从 clean
+   Git archive 构建候选并按现有无活跃任务部署协议切换。记录代码 revision、镜像、回滚点
+   和生产 smoke 后再开始下一轮。
+
+控制面遵循单调阶段：`compile/bind -> conditional decision -> mandatory receipts -> optional
+retrieval -> synthesis -> fan-in -> artifact validation -> exactly one durable terminal`。所有
+bounded recovery 必须停留在当前 mandatory frontier；模型正文不能覆盖 handler receipt、
+effect ledger、artifact CAS 或 durable terminal 等机器事实。
+
+本 campaign 每轮的持久化记录至少包含：conversation/root/child IDs，代码与镜像 revision，
+Skill/package/workflow digest，provider/model/context/max-output/finish/elapsed，实际 tool schemas、
+tool_choice、dispatch/preflight/receipt，recovery 原因与次数，fan-in cohort，artifact 路径/大小/
+摘要/合同结果，inner/outer terminal 关联，以及成熟方案的 problem-to-pattern-to-decision 对照。
+
 ## 10. 已知非 blocker 边界
 
 - V2.3 与 ground truth 的业务级一致性仍需用户手工真实模型 E2E；基础回归不能替代这项验收。

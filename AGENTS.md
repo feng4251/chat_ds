@@ -20,3 +20,27 @@ Key operating constraints:
   Skill, provider/model, network/policy, and upstream availability, then fix
   only generic root causes. A frontend error string or one evidence source is
   never sufficient by itself.
+- For an explicitly requested iterative E2E campaign, treat each round as an
+  independent run and close the same evidence loop before counting it: freeze
+  the exact conversation and Skill snapshot, reconstruct the AgentRun/tool/
+  provider/artifact timeline, compare the declared workflow and deliverable
+  contract with the durable result, and record the terminal reason. Replaying
+  or reinterpreting one run does not count as another round.
+- Before changing production code for an E2E defect, restate it as a cross-domain
+  invariant, create a deterministic failure-injection or scripted-provider
+  reproduction, and add a non-V2.3 holdout or mutation/rename case when
+  applicable. Machine-owned receipts and durable state are authoritative for
+  control-plane facts; model prose is content, not workflow state.
+- Every E2E repair iteration must include a current comparison with mature
+  session-wise Harness/workflow implementations. Map the observed mechanism to
+  concrete patterns such as durable checkpoints/pending writes, typed state and
+  structured output, idempotent activity retries, subgraph failure isolation,
+  sandbox/workspace boundaries, and trace/terminal semantics. State whether to
+  adopt, adapt behind the existing authority/receipt contracts, or reject each
+  relevant pattern. Listing framework names without this problem-to-pattern-to-
+  decision mapping is not sufficient.
+- The preferred phase order is monotonic: compile/bind -> decide conditional
+  authority -> satisfy mandatory receipts -> optional retrieval -> synthesize ->
+  fan-in -> validate artifacts -> persist exactly one authoritative terminal.
+  Bounded recovery must preserve the current mandatory frontier and must not
+  silently advance to a later phase.
