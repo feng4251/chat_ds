@@ -6,6 +6,31 @@
 
 - 工作目录：`/nfs/yangbb/codes/chat_ds`。
 - 分支：`fix/generic-skill-harness-20260717`。
+- 2026-07-31 五轮 E2E campaign 的 Round 2 通用修复提交：
+  `aac60951 fix: isolate delegated recovery contracts`。新会话
+  `2b1e321d275543de9328c3079259f5a8` / root
+  `b64b7cf03538447588965a602fcdf42b` 正确编译并执行 V2.3 workflow，但在 worker barrier
+  暴露了四项跨领域缺陷：mandatory non-call/retrieval correction 重放十几万 token 旧历史；
+  typed terminal 仍有一条大历史自由正文重写路径；workspace debug 混淆 inner candidate 与
+  outer authoritative terminal；root 只显示并行 wave 的一个失败且 Backend 用 transport
+  `stop` 覆盖 event finish reason。上游 4xx/429/DNS/TLS 是来源级退化，不是共同根因。
+- `aac60951` 将 mandatory no-call 与 corrupt recovery 统一为两消息 machine frontier
+  snapshot；有 result schema 的 terminal repair 统一为非 registry 的 exact-one
+  `submit_result_fields`，输入是原任务、已 dispatch 工具坐标/result 形成的 48KiB evidence
+  capsule；debug 候选终态改名并增加 receipt unique/transition 计数；root terminal 携带所有
+  当前失败节点，AgentRun projection 服从权威 event。生产代码和测试没有 V2.3、疾病、
+  session/package/worker/KG ID、报告名或固定数量特判。
+- Round 2 聚焦组合为 `428 passed, 142 subtests passed`；Harness 全量为
+  `1835 passed, 3 warnings, 772 subtests passed`，唯一 Node 环境项在固定
+  `/usr/bin/node` 下通过；Backend 主体 `214 passed`，跨组件 mount cohort 复跑
+  `47 passed`。`py_compile`、`git diff --check`、secret/genericity scan 通过。完整三源
+  诊断、delegate 明细和成熟官方机制对照见 `E2E_ITERATION_LOG.md`。
+- `aac60951` 已从 clean archive `/tmp/chat_ds_deploy_aac60951.npJK2J` 构建并只替换
+  Harness/Backend。当前镜像分别为
+  `sha256:08a4576feee38a6cec6f845ffc1ad9d4e2b07681e0b62f31cb288520d31925d4` 与
+  `sha256:ffc8c793cb67cf5fea3219f67575134b494252b63c71592782e6adab48f34cdb`，revision
+  都是完整提交 `aac609518430b348a518712136569f94cc7442db`，restart 0；三入口与内部
+  health/models 为 200，SQLite/foreign key、active run/schedule/connection 均正常。
 - 2026-07-31 五轮 E2E campaign 的 Round 1 通用修复提交：
   `26d65158 fix: isolate exact mandatory capability phases`。它由新会话
   `8314f40fa1a449f88cca55c140df218d` 暴露的跨领域不变量驱动：同名 bridge 必须在
@@ -949,6 +974,20 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 - 前端：`http://10.10.132.126:5173`、`http://172.30.100.126:5173`。
 - Harness 使用同机 SearXNG `http://10.10.132.126:8088`；既有 SearXNG/Valkey 在切换
   中未重建，健康状态和数据卷保持不变。
+- 2026-07-31 完成 `aac60951` delegated recovery contract 更新：
+  - 部署前连续两次确认 active AgentRun/root、running/enabled schedule 与 5173
+    established connection 都为 0；SQLite `quick_check=ok`、foreign-key violation 0；
+  - 候选来自 clean Git archive `/tmp/chat_ds_deploy_aac60951.npJK2J`，两个 revision
+    label 都是完整 Git SHA；镜像内 compileall/import smoke 通过；
+  - 只 force-recreate Harness 与 Backend；旧镜像保留
+    `rollback-pre-aac60951`。Frontend、四槽、Proxy、Browser、SearXNG/Valkey 和数据库卷
+    均未替换；
+  - 部署后 Harness/Backend image 分别为
+    `sha256:08a4576feee38a6cec6f845ffc1ad9d4e2b07681e0b62f31cb288520d31925d4`、
+    `sha256:ffc8c793cb67cf5fea3219f67575134b494252b63c71592782e6adab48f34cdb`，
+    revision 都是 `aac609518430b348a518712136569f94cc7442db`，restart 0；Harness、
+    Backend→Harness、三个 Frontend health/models 均为 200，严重启动日志、active run、
+    schedule 和 established connection 都为 0。
 - 2026-07-31 完成 `26d65158` exact mandatory phase 更新：
   - 部署前连续两次确认 nonterminal AgentRun/root、enabled schedule 与 5173
     established connection 均为 0；SQLite `quick_check=ok`、foreign-key violation 0；
@@ -1092,9 +1131,8 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 - SearXNG 真实 `OpenAI GPT` 查询返回 27 条结果，命中 `360search`、`bing`、`mojeek`；
   SearXNG/Valkey 均 healthy。免费上游仍可能动态出现 unresponsive engine，不属于
   Harness 执行环境缺失。
-- Harness revision label 为完整提交
-  `26d65158e4a0bf52a9e5256a156feec4c5aee20b`；Backend 为
-  `82c818fc6d7eb135e63d74f3b176c4b56bf4947e`；proxy/四槽为
+- Harness 与 Backend revision label 当前均为完整提交
+  `aac609518430b348a518712136569f94cc7442db`；proxy/四槽为
   `f1e59c20129d9c3ba91b0f80850983e93d24d9dc`；Frontend 为
   `c62a4a69cfbbfb46404cfa1eb51b5f8e0498dce2`；legacy Browser 保持兼容基线。
   所有长期容器 restart 均为 0。
@@ -1105,6 +1143,11 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 
 回滚点：
 
+- `aac60951` 切换前 Harness/Backend 分别保留
+  `chat_ds-harness:rollback-pre-aac60951`、
+  `chat_ds-backend:rollback-pre-aac60951`；候选/部署 tag 为
+  `candidate-aac60951` / `deploy-aac60951`，clean archive build 目录为
+  `/tmp/chat_ds_deploy_aac60951.npJK2J`。
 - `26d65158` 切换前 Harness 保留
   `chat_ds-harness:rollback-pre-26d65158`；候选 tag 为
   `chat_ds-harness:candidate-26d65158`，clean archive build 目录为
@@ -1297,9 +1340,11 @@ tool_choice、dispatch/preflight/receipt，recovery 原因与次数，fan-in coh
 逐轮证据、模拟人工追问链、delegate 明细、成熟实现对照、通用不变量、确定性复现、
 revision/image 与生产 smoke 统一记录在 `E2E_ITERATION_LOG.md`。Round 1 的新会话为
 `8314f40fa1a449f88cca55c140df218d`，root 为
-`25f48718174746118e2e3662bd177816`；它已到 durable failed terminal。该轮两项通用修复
-已在 `26d65158` 完成回归、本地 commit、clean-archive 部署与生产 smoke。生产当前空闲，
-可以创建全新 conversation/root 开始 Round 2。
+`25f48718174746118e2e3662bd177816`；Round 2 为
+`2b1e321d275543de9328c3079259f5a8`，root 为
+`b64b7cf03538447588965a602fcdf42b`。两轮均已到 durable failed terminal，各自通用修复
+已在 `26d65158`、`aac60951` 完成回归、本地 commit、clean-archive 部署与生产 smoke。
+生产当前空闲，可以创建全新 conversation/root 开始 Round 3。
 
 ## 10. 已知非 blocker 边界
 

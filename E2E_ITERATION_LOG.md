@@ -148,10 +148,130 @@ force-recreate Harness。部署后 Harness healthy/restart 0，容器内与 Back
 日志匹配为 0；再次确认 active/schedule/connection 为 0。Backend、Frontend、四个统一
 沙箱、egress proxy、Browser、SearXNG/Valkey 和数据库卷未替换。
 
-## Round 2
+## Round 2：mandatory non-call、终态 schema 与并行失败可观测性
 
-Round 1 已完成回归、commit 与生产切换；下一步创建全新 conversation/root，使用同一
-历史业务输入开始 Round 2。
+### 冻结身份与终态
+
+- 生产代码：`26d65158e4a0bf52a9e5256a156feec4c5aee20b`；Harness image：
+  `sha256:1f25a2f577428e3cb7a3c26a734ae98d96cf592f45902f92b32e474eb86164a8`。
+- Conversation：`2b1e321d275543de9328c3079259f5a8`；root run：
+  `b64b7cf03538447588965a602fcdf42b`。
+- 原始 ZIP SHA-256：
+  `78b890eab57ff516c20a39a565631caa5d784f839b42f6ad9efbdbdd951eb0a0`；
+  primary `SKILL.md` SHA-256：
+  `85ecc2fc48b290596c0cf2153b8268cc9f1a6b4f50ca75fb3989f477c8e7df1b`；
+  package SHA-256：
+  `2a91527a2c1a72d3608a1969ead3310491ae6e6effa81a70d1c050148098a4eb`。
+- SSE 被维护端持续消费到正常 EOF；root 的唯一 durable terminal 是
+  `run.failed / delegate_step_failed`。因此不是浏览器断线、Backend 无 terminal、Harness
+  HTTP timeout 或人为取消。
+- 上传 ZIP 已持久化到 session workspace（829,621 bytes）；没有业务 Markdown，因为
+  required worker barrier 未通过，literature、I/E、aggregation、11 模块写入、README、
+  checklist、strong-final merge 与 post-merge validation 都尚未开始。
+
+### 对话、Skill 与执行图对比
+
+业务输入与历史手工测试相同。Harness 正确选择一个 primary 与 18 个 supporting Skills，
+正确解析 `composite_full_protocol_design`，完成 intent、7 路 bootstrap，并按声明并行启动
+PICO、Safety、Termination、AE adjudication、Target biology、Competitive landscape。
+执行没有退化为直接 chat，也没有漏编 DAG；失败发生在 worker receipt/typed-result 层。
+
+### Delegate/attempt 逐项结果
+
+| Run | 语义身份 | 终态 | input/output tokens | 结论 |
+|---|---|---|---:|---|
+| `558e...` | Intent classification | succeeded | 1,547 / 511 | route 正常 |
+| `2d870...` | clinicaltrials bootstrap | succeeded/degraded | 175,237 / 1,334 | 3 个工具调用成功 |
+| `8adfe...` | pubmed bootstrap | succeeded/degraded | 295,089 / 3,093 | typed gap + contract repair |
+| `2edc...` | ICH bootstrap | succeeded | 149,508 / 4,221 | 正常 |
+| `9f8...` | FDA bootstrap | succeeded/degraded | 212,441 / 5,523 | 一个上游 404，其他证据推进 |
+| `11266...` | EMA bootstrap | succeeded | 150,911 / 3,820 | 正常 |
+| `fdfe...` | target biology bootstrap | succeeded/degraded | 498,884 / 3,339 | DNS/400/TLS 来源级退化后仍有 3 次成功 |
+| `033247...` | competitive bootstrap | succeeded/degraded | 36,148 / 1,015 | 无工具 dispatch |
+| `a7ee...` | PICO worker | succeeded/degraded | 1,213,732 / 27,243 | partial/open-chain gap 被显式保留 |
+| `e55d...` | Safety worker | failed/retryable | 1,072,087 / 8,311 | raw pseudo protocol 后走大历史正文重写，footer 仍坏 |
+| `d682...` | Termination worker | succeeded | 321,501 / 8,853 | 2 次脚本成功；无效 `dict` 未 dispatch |
+| `ed523...` | AE adjudication worker | failed/terminal | 1,075,931 / 25,526 | mandatory call 被忽略；纠正请求再次 length |
+| `93f...` | Target biology worker | succeeded/degraded | 2,034,571 / 19,367 | 404/400/429 与坐标拒绝均保留为来源/前置证据 |
+| `9d292...` | Competitive worker | failed/retryable | 1,891,847 / 6,904 | HTTP continuation 纠正再次 length |
+
+上游 404/429/400/DNS/TLS 并非共同根因：同一 run 内其他请求成功，且真正 root blocker
+是 mandatory non-call/typed terminal convergence。Round 1 的 pre-dispatch exact-coordinate
+修复在本轮生效：3 次越界坐标都以 `actual_dispatch_attempted=false` 被挡在 handler 前。
+
+### 模拟人工追问后的通用根因
+
+1. **non-call correction 没有复用 phase isolation。** AE 初始 mandatory 请求约 139K
+   tokens，纠正仍约 137K；Competitive 的 retrieval correction 约 155K，随后 continuation
+   请求约 185K。模型已经忽略 `tool_choice=required`，Harness 却只在旧 conversation 后
+   追加一句纠正，导致下一采样继续受旧 tool/result/phase 锚定并耗尽 2,048 output。
+2. **终态修复存在两套不一致协议。** 小型 `submit_result_fields` schema 投影已有两消息、
+   强制 tool choice、严格校验的可靠路径；Safety 却进入旧的 tools-closed 正文重写，带 19
+   条消息、约 157K input 和 6 个旧工具 envelope，生成 21K 字符后 footer 仍不合法。
+3. **debug 把内部 convergence terminal 写成第二个 `run.*`。** durable DB 每个 child
+   实际只有一个权威 terminal，但 workspace JSONL 同时出现内部候选和外层合同终态；Safety
+   因而看起来先 completed 后 failed。问题是 debug 命名歧义，不是 durable terminal 翻转。
+4. **receipt event 数量不等于完成组数量。** 同一 Knowledge Gate 组的分页/重取会再次
+   发 `group.receipt`；真实 ledger 按 group ID 唯一，但原 debug 没有 first/no-op transition
+   和 unique/activated/pending 计数，人工统计容易虚增。
+5. **root 只显示一个 blocker。** 同一并行 wave 中 Safety、AE、Competitive 都失败，
+   workflow snapshot 有三者，但 root error 只显示 AE；同时最终 assistant projection 又用
+   OpenAI transport `stop` 覆写 AgentRun 的 `delegate_step_failed` finish reason。
+
+### 成熟机制对照与决策
+
+| 问题 | 官方成熟机制 | 决策 |
+|---|---|---|
+| 并行 sibling 成功不能因一项失败丢失 | LangGraph checkpoint/pending writes | 保留现有 receipt-owned pending writes，不整批重跑 |
+| 子 Agent/恢复阶段上下文隔离 | LangGraph per-invocation subgraph | adapt 为 machine phase snapshot，不替换主循环 |
+| 结构化终态 | Pydantic AI output function/schema validation/ModelRetry | adopt 现有内部 submitter，废除有 schema 时的自由正文重写 |
+| 易失败 I/O 与 LLM 重试边界 | Temporal Activity retry | adapt：只重试当前无副作用 control/activity phase，不重放 whole child |
+| 全框架迁移 | LangGraph/Temporal/Pydantic AI | reject：会分叉既有 authority、sandbox、CAS、event 与终态语义 |
+
+官方参考：
+
+- <https://docs.langchain.com/oss/python/langgraph/persistence>
+- <https://docs.langchain.com/oss/python/langgraph/use-subgraphs>
+- <https://docs.temporal.io/encyclopedia/retry-policies>
+- <https://pydantic.dev/docs/ai/core-concepts/output/>
+- <https://pydantic.dev/docs/ai/capabilities/durable_execution/temporal/>
+
+### 通用修复与确定性证明
+
+- mandatory non-call 与 exact HTTP continuation correction 统一使用两消息 phase snapshot；
+  只含有界原任务、机器 completed receipts、当前 pending frontier 与精确 HTTP action，旧
+  assistant/tool messages 不上 wire，durable history 不被删除。
+- 有声明 `required_result_fields/schema` 的 raw pseudo/malformed terminal 统一进入内部
+  `submit_result_fields`：Harness 从原任务、最近已 dispatch 的工具坐标及 tool results 构造
+  最多 48KiB 的不可信 evidence capsule，强制 exact-one schema call；该调用不进入 registry、
+  capability ledger 或副作用计数，缺证据必须产生 typed degraded gap。
+- workspace debug 将内部候选终态记录为 `debug.agent_loop.terminal_candidate`，保留原
+  candidate type 和 lifecycle scope；外层仍只写一个权威 `run.completed/failed`。
+- Knowledge Gate receipt debug 增加 `first_transition`、transition type、unique completed、
+  activated 与 pending count；事件数不再被误读为已完成 DAG 节点数。
+- root terminal payload 同时包含所有当前失败节点及 terminal/retryable 状态；最终
+  `AgentRun.finish_reason/error` 以权威 root event 为准，不再被 transport `stop` 覆写。
+
+通用合成测试覆盖：大上下文 mandatory no-call、HTTP 精确 continuation、raw pseudo 后
+内部 schema 投影、无 registry dispatch、无旧协议重放、同组多次 receipt transition、并行
+sibling failure snapshot、debug 候选/权威终态区分，以及 Backend finish reason 投影。
+聚焦组合为 `428 passed, 142 subtests passed`；Harness 全量为
+`1835 passed, 3 warnings, 772 subtests passed`，唯一 Node 环境项在生产同版固定
+`/usr/bin/node` 下 `1 passed`；Backend 主体 `214 passed`，缺少 `/harness` mount 的 9 项
+在正确跨组件 mount 下随该文件 `47 passed`。`py_compile`、`git diff --check` 与生产代码
+genericity scan 通过。
+
+本轮功能提交为 `aac60951 fix: isolate delegated recovery contracts`。候选来自 clean
+archive `/tmp/chat_ds_deploy_aac60951.npJK2J`；Harness image 为
+`sha256:08a4576feee38a6cec6f845ffc1ad9d4e2b07681e0b62f31cb288520d31925d4`，
+Backend image 为
+`sha256:ffc8c793cb67cf5fea3219f67575134b494252b63c71592782e6adab48f34cdb`，
+两者 revision label 都是完整提交
+`aac609518430b348a518712136569f94cc7442db`。部署前连续两次确认 active AgentRun/root、
+running/enabled schedule 和 5173 established connection 均为 0；SQLite
+`quick_check=ok`、foreign-key violation 为 0。只 force-recreate Harness/Backend，旧镜像
+保留 `rollback-pre-aac60951`；部署后三入口、Harness 与 Backend→Harness health/models
+均为 200，长期容器 restart 0，严重启动日志 0，数据库与空闲状态再次通过。
 
 ## Round 3
 
