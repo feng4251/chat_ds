@@ -33,6 +33,7 @@ from knowledge_gate import (
 
 
 KNOWLEDGE_GATE_PLAN_SCHEMA_VERSION = 1
+KNOWLEDGE_GATE_DECISION_RECEIPT_SCHEMA_VERSION = 1
 UNCONDITIONAL_CAPABILITY_PLAN_SCHEMA_VERSION = 1
 KNOWLEDGE_GATE_DECISION_TOOL_NAME = "submit_knowledge_gate_decisions"
 MAX_KNOWLEDGE_GATE_PLAN_BYTES = 512 * 1024
@@ -1776,6 +1777,167 @@ def validate_knowledge_gate_decisions(
         "unresolved_group_ids": unresolved,
         "unknown_check_ids": unknown,
         "required_tool_groups": required_tool_groups,
+    }
+
+
+def build_knowledge_gate_decision_receipt(
+    accepted_decision: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the secret-free handler-owned receipt used across run layers.
+
+    Decision reasons are model-authored explanatory text. They are useful in
+    the immediate child conversation but are neither authority nor safe audit
+    identifiers. The durable receipt therefore binds only the exact plan,
+    check/outcome set, and runtime-derived activated frontier.
+    """
+
+    if (
+        not isinstance(accepted_decision, dict)
+        or accepted_decision.get("status") != "accepted"
+    ):
+        raise KnowledgeGateCompileError(
+            "knowledge_gate_decision_receipt_not_accepted",
+            "Only an accepted knowledge-gate decision can produce a receipt.",
+        )
+    core = {
+        "schema_version": KNOWLEDGE_GATE_DECISION_RECEIPT_SCHEMA_VERSION,
+        "plan_sha256": str(
+            accepted_decision.get("plan_sha256") or ""
+        ),
+        "decision_outcomes": [
+            {
+                "check_id": str(row.get("check_id") or ""),
+                "outcome": str(row.get("outcome") or ""),
+            }
+            for row in accepted_decision.get("decisions") or []
+            if isinstance(row, dict)
+        ],
+        "activated_group_ids": [
+            str(value)
+            for value in accepted_decision.get("activated_group_ids") or []
+        ],
+        "unresolved_group_ids": [
+            str(value)
+            for value in accepted_decision.get("unresolved_group_ids") or []
+        ],
+        "unknown_check_ids": [
+            str(value)
+            for value in accepted_decision.get("unknown_check_ids") or []
+        ],
+    }
+    return {
+        **core,
+        "receipt_sha256": canonical_json_sha256(core),
+    }
+
+
+def validate_knowledge_gate_decision_receipt(
+    plan: dict[str, Any] | None,
+    *,
+    expected_sha256: str,
+    receipt: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Validate a handler-owned decision receipt and rederive its frontier."""
+
+    if not isinstance(receipt, dict):
+        return {
+            "status": "error",
+            "error_code": "knowledge_gate_decision_receipt_missing",
+            "error": "The handler-owned knowledge-gate decision receipt is missing.",
+        }
+    required_fields = {
+        "schema_version",
+        "plan_sha256",
+        "decision_outcomes",
+        "activated_group_ids",
+        "unresolved_group_ids",
+        "unknown_check_ids",
+        "receipt_sha256",
+    }
+    if (
+        set(receipt) != required_fields
+        or receipt.get("schema_version")
+        != KNOWLEDGE_GATE_DECISION_RECEIPT_SCHEMA_VERSION
+    ):
+        return {
+            "status": "error",
+            "error_code": "knowledge_gate_decision_receipt_invalid",
+            "error": "The knowledge-gate decision receipt schema is invalid.",
+        }
+    core = {
+        key: receipt.get(key)
+        for key in required_fields
+        if key != "receipt_sha256"
+    }
+    try:
+        expected_receipt_sha256 = canonical_json_sha256(core)
+    except KnowledgeGateCompileError:
+        expected_receipt_sha256 = ""
+    if (
+        not isinstance(receipt.get("receipt_sha256"), str)
+        or receipt.get("receipt_sha256") != expected_receipt_sha256
+    ):
+        return {
+            "status": "error",
+            "error_code": "knowledge_gate_decision_receipt_digest_mismatch",
+            "error": "The knowledge-gate decision receipt digest is invalid.",
+        }
+    outcomes = receipt.get("decision_outcomes")
+    if not isinstance(outcomes, list):
+        return {
+            "status": "error",
+            "error_code": "knowledge_gate_decision_receipt_invalid",
+            "error": "The knowledge-gate decision receipt outcomes are invalid.",
+        }
+    decisions: list[dict[str, str]] = []
+    for row in outcomes:
+        if (
+            not isinstance(row, dict)
+            or set(row) != {"check_id", "outcome"}
+            or not isinstance(row.get("check_id"), str)
+            or row.get("outcome") not in {"yes", "no", "unknown"}
+        ):
+            return {
+                "status": "error",
+                "error_code": "knowledge_gate_decision_receipt_invalid",
+                "error": "The knowledge-gate decision receipt outcomes are invalid.",
+            }
+        decisions.append({
+            "check_id": row["check_id"],
+            "outcome": row["outcome"],
+            "reason": "handler-owned typed decision receipt",
+        })
+    derived = validate_knowledge_gate_decisions(
+        plan,
+        expected_sha256=expected_sha256,
+        supplied_sha256=str(receipt.get("plan_sha256") or ""),
+        decisions=decisions,
+    )
+    if derived.get("status") != "accepted":
+        return derived
+    for field_name in (
+        "activated_group_ids",
+        "unresolved_group_ids",
+        "unknown_check_ids",
+    ):
+        declared = receipt.get(field_name)
+        if (
+            not isinstance(declared, list)
+            or declared != derived.get(field_name)
+        ):
+            return {
+                "status": "error",
+                "error_code": (
+                    "knowledge_gate_decision_receipt_frontier_mismatch"
+                ),
+                "error": (
+                    "The knowledge-gate decision receipt frontier differs "
+                    "from the frozen plan."
+                ),
+            }
+    return {
+        **derived,
+        "decision_receipt_sha256": receipt["receipt_sha256"],
     }
 
 

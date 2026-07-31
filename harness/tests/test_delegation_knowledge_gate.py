@@ -14,6 +14,7 @@ from agent_loop import (
 from tools.context import ToolContext
 from knowledge_gate_runtime import (
     activated_knowledge_gate_candidate_authority,
+    build_knowledge_gate_decision_receipt,
     validate_knowledge_gate_candidate_authority,
     validate_knowledge_gate_decisions,
 )
@@ -1204,8 +1205,279 @@ class KnowledgeGatePlanContractTests(unittest.TestCase):
             audit["gap_ids"],
         )
 
+    def test_exact_resource_preload_can_satisfy_only_its_matching_gate_group(
+        self,
+    ):
+        resource_sha256 = "c" * 64
+        plan = _resource_plan(
+            skill_md_sha256="a" * 64,
+            package_sha256="b" * 64,
+            resource_sha256=resource_sha256,
+        )
+        exact_preload = {
+            "tool_name": "skill_view",
+            "args": {
+                "name": "generic-skill",
+                "file_path": "references/gate.md",
+            },
+            "outcome": "success",
+            "artifacts": [],
+            "result_data": {"sha256": resource_sha256},
+            "skill_resource_complete": True,
+            "deterministic_prerequisite_preload": True,
+        }
+
+        audit, error = _knowledge_gate_receipt_audit(
+            plan,
+            _digest(plan),
+            [exact_preload, _decision_call(plan)],
+            allowed_skill_scripts=[],
+            allowed_skill_commands=[],
+            allowed_skill_http_prefixes=[],
+            allowed_skill_http_post_prefixes=[],
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual(
+            ["gate-group-resource"],
+            audit["successful_group_ids"],
+        )
+        self.assertEqual([], audit["missing_receipt_group_ids"])
+
+        for changed_call in (
+            {
+                **exact_preload,
+                "result_data": {"sha256": "d" * 64},
+            },
+            {
+                **exact_preload,
+                "tool_name": "read_file",
+            },
+            {
+                **exact_preload,
+                "skill_resource_complete": False,
+            },
+        ):
+            rejected, rejected_error = _knowledge_gate_receipt_audit(
+                plan,
+                _digest(plan),
+                [changed_call, _decision_call(plan)],
+                allowed_skill_scripts=[],
+                allowed_skill_commands=[],
+                allowed_skill_http_prefixes=[],
+                allowed_skill_http_post_prefixes=[],
+            )
+            self.assertIn(
+                "distinct actual dispatch receipt",
+                rejected_error,
+            )
+            self.assertEqual(
+                ["gate-group-resource"],
+                rejected["missing_receipt_group_ids"],
+            )
+
 
 class KnowledgeGateDelegatedChildTests(unittest.IsolatedAsyncioTestCase):
+    async def test_exact_gate_resource_preload_is_bound_into_child_runtime(
+        self,
+    ):
+        from tools.isolated_skill_executor import (
+            compute_skill_package_digest,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "references").mkdir()
+            main = root / "SKILL.md"
+            resource = root / "references" / "gate.md"
+            main.write_text("# Generic Skill\n", encoding="utf-8")
+            resource.write_text("bounded local evidence\n", encoding="utf-8")
+            main_sha256 = hashlib.sha256(main.read_bytes()).hexdigest()
+            resource_sha256 = hashlib.sha256(
+                resource.read_bytes()
+            ).hexdigest()
+            package_sha256 = compute_skill_package_digest(root)
+            plan = _resource_plan(
+                skill_md_sha256=main_sha256,
+                package_sha256=package_sha256,
+                resource_sha256=resource_sha256,
+            )
+            accepted = validate_knowledge_gate_decisions(
+                plan,
+                expected_sha256=_digest(plan),
+                supplied_sha256=_digest(plan),
+                decisions=[{
+                    "check_id": "KG-1",
+                    "outcome": "yes",
+                    "reason": "The exact local evidence is required.",
+                }],
+            )
+            typed_decision_receipt = (
+                build_knowledge_gate_decision_receipt(accepted)
+            )
+            observed: dict[str, object] = {}
+
+            async def fake_dispatch(name, args, *, context):
+                self.assertEqual("skill_view", name)
+                self.assertEqual("generic-skill", args["name"])
+                selected_file = {
+                    "SKILL.md": main,
+                    "references/gate.md": resource,
+                }[args["file_path"]]
+                return json.dumps({
+                    "success": True,
+                    "content": selected_file.read_text(encoding="utf-8"),
+                    "sha256": hashlib.sha256(
+                        selected_file.read_bytes()
+                    ).hexdigest(),
+                    "truncated": False,
+                })
+
+            async def fake_run_stream(*args, **kwargs):
+                observed.update(kwargs)
+                receipts = kwargs[
+                    "preloaded_knowledge_gate_resource_receipts"
+                ]
+                self.assertEqual(1, len(receipts))
+                self.assertEqual(
+                    {
+                        "skill_name": "generic-skill",
+                        "resource_path": "references/gate.md",
+                        "sha256": resource_sha256,
+                        "complete": True,
+                    },
+                    {
+                        key: receipts[0][key]
+                        for key in (
+                            "skill_name",
+                            "resource_path",
+                            "sha256",
+                            "complete",
+                        )
+                    },
+                )
+                call_id = "decision-preloaded-resource"
+                yield {
+                    "type": "agent_event",
+                    "event_type": "tool.started",
+                    "tool_name": "submit_knowledge_gate_decisions",
+                    "tool_call_id": call_id,
+                    "payload": {
+                        "tool_name": (
+                            "submit_knowledge_gate_decisions"
+                        ),
+                        "tool_call_id": call_id,
+                        "args_compacted": {},
+                    },
+                }
+                yield {
+                    "type": "agent_event",
+                    "event_type": "tool.dispatch_started",
+                    "tool_name": "submit_knowledge_gate_decisions",
+                    "tool_call_id": call_id,
+                    "payload": {
+                        "tool_name": (
+                            "submit_knowledge_gate_decisions"
+                        ),
+                        "tool_call_id": call_id,
+                        "actual_dispatch_attempted": True,
+                        "audit_args": {},
+                        "audit_args_are_dispatch_derived": True,
+                    },
+                }
+                yield {
+                    "type": "agent_event",
+                    "event_type": "tool.completed",
+                    "tool_name": "submit_knowledge_gate_decisions",
+                    "tool_call_id": call_id,
+                    "payload": {
+                        "tool_name": (
+                            "submit_knowledge_gate_decisions"
+                        ),
+                        "tool_call_id": call_id,
+                        "outcome": "success",
+                        "actual_dispatch_attempted": True,
+                        "exact_capability_receipt": {
+                            "result_data": {},
+                            "knowledge_gate_decision_receipt": (
+                                typed_decision_receipt
+                            ),
+                        },
+                    },
+                }
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "Substantive result grounded in the exact preloaded "
+                        "local evidence, with provenance and explicit scope. "
+                        * 20
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop"}
+
+            context = replace(
+                _context("skill_view"),
+                enabled_user_skills=("generic-skill",),
+                allowed_skill_resources=(
+                    ("generic-skill", "SKILL.md"),
+                    ("generic-skill", "references/gate.md"),
+                ),
+                allowed_skill_package_digests=(
+                    ("generic-skill", package_sha256),
+                ),
+            )
+            with (
+                patch(
+                    "skills.scanner.resolve_skill_path",
+                    return_value=main,
+                ),
+                patch(
+                    "tools.delegation.registry_dispatch",
+                    fake_dispatch,
+                ),
+                patch("agent_loop.run_stream", fake_run_stream),
+                patch(
+                    "tools.delegation.persist_result_for_history",
+                    return_value="results/preloaded-resource.txt",
+                ),
+            ):
+                result = await _run_child(
+                    {
+                        "goal": (
+                            "Use the exact conditional local evidence and "
+                            "produce one bounded finding."
+                        ),
+                        "skill_name": "generic-skill",
+                        "worker_id": "worker-a",
+                        "worker_file": "references/gate.md",
+                        "step_type": "worker",
+                        "step_id": "worker-a",
+                        "workflow_stage": "analysis",
+                        "tools": [
+                            "skill_view",
+                            "submit_knowledge_gate_decisions",
+                        ],
+                        "required_capability_skills": [
+                            "generic-skill",
+                        ],
+                        "knowledge_gate_plan": plan,
+                        "knowledge_gate_plan_sha256": _digest(plan),
+                    },
+                    context,
+                    0,
+                )
+
+        self.assertEqual("completed", result["status"], result.get("error"))
+        self.assertEqual(
+            ["gate-group-resource"],
+            result["knowledge_gate_receipt_audit"][
+                "successful_group_ids"
+            ],
+        )
+        self.assertTrue(
+            observed["verified_preloaded_input_receipt"]["complete"]
+        )
+
     async def test_unmarked_static_candidate_requires_no_receipt(self):
         plan = _static_native_plan()
 
@@ -1621,3 +1893,160 @@ class KnowledgeGateDelegatedChildTests(unittest.IsolatedAsyncioTestCase):
             final_audit["payload"]["successful_group_ids"],
         )
         self.assertEqual([], final_audit["payload"]["gap_ids"])
+
+    async def test_decision_receipt_survives_secret_free_dispatch_projection(
+        self,
+    ):
+        """Final audit must not reconstruct control state from debug args."""
+
+        plan = _native_plan()
+        plan_sha256 = _digest(plan)
+        accepted = validate_knowledge_gate_decisions(
+            plan,
+            expected_sha256=plan_sha256,
+            supplied_sha256=plan_sha256,
+            decisions=_decision_call(plan)["args"]["decisions"],
+        )
+        receipt_core = {
+            "schema_version": 1,
+            "plan_sha256": plan_sha256,
+            "decision_outcomes": [
+                {
+                    "check_id": row["check_id"],
+                    "outcome": row["outcome"],
+                }
+                for row in accepted["decisions"]
+            ],
+            "activated_group_ids": accepted["activated_group_ids"],
+            "unresolved_group_ids": accepted["unresolved_group_ids"],
+            "unknown_check_ids": accepted["unknown_check_ids"],
+        }
+        decision_receipt = {
+            **receipt_core,
+            "receipt_sha256": _digest(receipt_core),
+        }
+
+        def started(name: str, call_id: str) -> dict:
+            return {
+                "type": "agent_event",
+                "event_type": "tool.started",
+                "tool_name": name,
+                "tool_call_id": call_id,
+                "payload": {
+                    "tool_name": name,
+                    "tool_call_id": call_id,
+                    "args_compacted": {
+                        "_chatds_arguments_redacted": True,
+                    },
+                    "args_are_dispatch_payload": False,
+                    "preflight_pending": True,
+                },
+            }
+
+        def dispatch_started(
+            name: str,
+            call_id: str,
+            audit_args: dict,
+        ) -> dict:
+            return {
+                "type": "agent_event",
+                "event_type": "tool.dispatch_started",
+                "tool_name": name,
+                "tool_call_id": call_id,
+                "payload": {
+                    "tool_name": name,
+                    "tool_call_id": call_id,
+                    "actual_dispatch_attempted": True,
+                    "audit_args": audit_args,
+                    "audit_args_are_dispatch_derived": True,
+                },
+            }
+
+        def completed(
+            name: str,
+            call_id: str,
+            *,
+            typed_decision_receipt: dict | None = None,
+        ) -> dict:
+            exact_receipt = {"result_data": {}}
+            if typed_decision_receipt is not None:
+                exact_receipt["knowledge_gate_decision_receipt"] = (
+                    typed_decision_receipt
+                )
+            return {
+                "type": "agent_event",
+                "event_type": "tool.completed",
+                "tool_name": name,
+                "tool_call_id": call_id,
+                "payload": {
+                    "tool_name": name,
+                    "tool_call_id": call_id,
+                    "outcome": "success",
+                    "actual_dispatch_attempted": True,
+                    "exact_capability_receipt": exact_receipt,
+                },
+            }
+
+        async def fake_run_stream(*args, **kwargs):
+            self.assertEqual(plan, kwargs["knowledge_gate_plan"])
+            yield started(
+                "submit_knowledge_gate_decisions",
+                "decision-secret-free",
+            )
+            yield dispatch_started(
+                "submit_knowledge_gate_decisions",
+                "decision-secret-free",
+                {},
+            )
+            yield completed(
+                "submit_knowledge_gate_decisions",
+                "decision-secret-free",
+                typed_decision_receipt=decision_receipt,
+            )
+            yield started("web_search", "search-secret-free")
+            yield dispatch_started(
+                "web_search",
+                "search-secret-free",
+                {},
+            )
+            yield completed("web_search", "search-secret-free")
+            yield {
+                "type": "delta",
+                "content": (
+                    "Substantive bounded evidence result with findings and "
+                    "verification. " * 20
+                ),
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                return_value="results/gate-secret-free.txt",
+            ),
+        ):
+            result = await _run_child(
+                {
+                    "goal": "perform one bounded evidence check",
+                    "skill_name": "generic-skill",
+                    "worker_id": "worker-a",
+                    "step_type": "knowledge_bootstrap",
+                    "tools": [
+                        "submit_knowledge_gate_decisions",
+                        "web_search",
+                    ],
+                    "knowledge_gate_plan": plan,
+                    "knowledge_gate_plan_sha256": plan_sha256,
+                },
+                _context("web_search"),
+                0,
+            )
+
+        self.assertEqual("completed", result["status"])
+        self.assertEqual(
+            ["gate-group-1"],
+            result["knowledge_gate_receipt_audit"][
+                "successful_group_ids"
+            ],
+        )

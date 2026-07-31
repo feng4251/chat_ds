@@ -189,6 +189,30 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(unscoped_gap_only["status"])
         self.assertEqual("none", unscoped_gap_only["source"])
 
+    def test_completion_quality_reason_is_content_addressed_not_body_fatal(
+        self,
+    ):
+        reason = ("bounded evidence gap; " * 55) + "source unavailable"
+        declaration = _completion_quality_declaration(
+            "COMPLETION_QUALITY_JSON: "
+            + json.dumps({
+                "status": "degraded",
+                "reason": reason,
+            })
+        )
+
+        self.assertGreater(len(reason), 1_000)
+        self.assertEqual("degraded", declaration["status"])
+        self.assertIsNone(declaration["error"])
+        self.assertEqual(
+            len(reason),
+            declaration["reason_receipt"]["chars"],
+        )
+        self.assertEqual(
+            hashlib.sha256(reason.encode("utf-8")).hexdigest(),
+            declaration["reason_receipt"]["sha256"],
+        )
+
     def test_exact_gap_ledgers_ignore_examples_and_reject_ambiguous_json(self):
         cases = (
             (
@@ -511,6 +535,54 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             "advisory",
             terminal["payload"]["unresolved_retrieval"]["quality_impact"],
+        )
+
+    async def test_long_completion_reason_preserves_substantive_body(self):
+        substantive = "# Evidence report\n\n" + (
+            "Verified bounded evidence paragraph.\n" * 5_000
+        )
+        reason = ("bounded evidence gap; " * 55) + "source unavailable"
+        footer = (
+            "COMPLETION_QUALITY_JSON: "
+            + json.dumps({
+                "status": "degraded",
+                "reason": reason,
+            })
+        )
+        body = substantive + footer
+        persisted: dict[str, str] = {}
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            yield {"type": "delta", "content": body}
+            yield {"type": "done", "finish_reason": "stop"}
+
+        def persist(content, *args, **kwargs):
+            persisted["content"] = content
+            return "results/long-completion-reason.md"
+
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                side_effect=persist,
+            ),
+        ):
+            result = await _run_child(
+                {"goal": "return one bounded evidence report"},
+                _context(),
+                0,
+            )
+
+        self.assertGreater(len(reason), 1_000)
+        self.assertEqual("completed", result["status"])
+        self.assertEqual("degraded", result["completion_quality"])
+        self.assertEqual(body, persisted["content"])
+        self.assertTrue(persisted["content"].startswith(substantive))
+        self.assertEqual(
+            hashlib.sha256(reason.encode("utf-8")).hexdigest(),
+            result["completion_quality_audit"][
+                "declaration_reason_receipt"
+            ]["sha256"],
         )
 
     async def test_outer_validation_failure_discards_provisional_output(self):

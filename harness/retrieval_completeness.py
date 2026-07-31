@@ -1555,16 +1555,42 @@ class RetrievalCompletenessTracker:
     total_requests: int = 0
     total_response_bytes: int = 0
     total_request_elapsed_ms: int = 0
-    terminal_failure: str | None = None
+    _global_terminal_failure: str | None = None
+    _terminal_chain_failures: dict[str, str] = field(default_factory=dict)
 
-    def _set_terminal(self, reason: str) -> None:
-        if self.terminal_failure is None:
-            self.terminal_failure = reason
+    @property
+    def terminal_failure(self) -> str | None:
+        """Return a run-terminal reason only when no family can advance."""
+
+        if self._global_terminal_failure is not None:
+            return self._global_terminal_failure
+        runnable = set(self._open) - set(self._terminal_chain_failures)
+        if self._open and not runnable:
+            first_family = min(self._open)
+            return self._terminal_chain_failures.get(first_family)
+        return None
+
+    def _set_terminal(
+        self,
+        reason: str,
+        *,
+        family: str | None = None,
+        global_scope: bool = False,
+    ) -> None:
+        clean = str(reason or "retrieval_incomplete")
+        if global_scope or not family:
+            if self._global_terminal_failure is None:
+                self._global_terminal_failure = clean
+            return
+        self._terminal_chain_failures.setdefault(family, clean)
 
     def mark_terminal(self, reason: str) -> None:
         """Close further retrieval while preserving the unresolved receipt."""
 
-        self._set_terminal(str(reason or "retrieval_incomplete"))
+        self._set_terminal(
+            str(reason or "retrieval_incomplete"),
+            global_scope=True,
+        )
 
     def _observe_collection_evidence(
         self,
@@ -1927,7 +1953,10 @@ class RetrievalCompletenessTracker:
             # bound for the exact same HTTP request. Another identical call
             # cannot reveal new visible evidence, so fail closed immediately
             # instead of spending a second grace attempt and growing context.
-            self._set_terminal("body_truncation_no_progress_at_limit")
+            self._set_terminal(
+                "body_truncation_no_progress_at_limit",
+                family=family,
+            )
         elif state == "incomplete":
             if prior is not None and not linked:
                 prior.unlinked_attempts += 1
@@ -1935,9 +1964,11 @@ class RetrievalCompletenessTracker:
                     self._set_terminal(
                         "body_truncation_continuation_not_followed"
                         if "body_truncated" in prior.incomplete_reasons
-                        else "pagination_cursor_not_consumed"
+                        else "pagination_cursor_not_consumed",
+                        family=family,
                     )
             else:
+                self._terminal_chain_failures.pop(family, None)
                 pages = (
                     1
                     if prior is None or replacement_restart
@@ -1955,7 +1986,10 @@ class RetrievalCompletenessTracker:
                         or set(next_url_hashes) & consumed_url_hashes
                     )
                 ):
-                    self._set_terminal("pagination_cursor_repeated")
+                    self._set_terminal(
+                        "pagination_cursor_repeated",
+                        family=family,
+                    )
                 remaining_cursor_hashes = set()
                 remaining_url_hashes = set()
                 if prior is not None and truncation_retry:
@@ -2006,19 +2040,31 @@ class RetrievalCompletenessTracker:
                     ready_sequence=self.total_requests,
                 )
                 if "pagination_frontier_truncated" in reasons:
-                    self._set_terminal("pagination_frontier_limit")
+                    self._set_terminal(
+                        "pagination_frontier_limit",
+                        family=family,
+                    )
                 elif "pagination_scan_bounded" in reasons:
-                    self._set_terminal("pagination_scan_limit")
+                    self._set_terminal(
+                        "pagination_scan_limit",
+                        family=family,
+                    )
                 if (
                     continuation_action is not None
                     and continuation_action.get("kind") == "degrade"
                 ):
-                    self._set_terminal(str(
-                        continuation_action.get("reason")
-                        or "retrieval_incomplete"
-                    ))
+                    self._set_terminal(
+                        str(
+                            continuation_action.get("reason")
+                            or "retrieval_incomplete"
+                        ),
+                        family=family,
+                    )
                 if pages >= self.max_pages_per_chain:
-                    self._set_terminal("pagination_page_limit")
+                    self._set_terminal(
+                        "pagination_page_limit",
+                        family=family,
+                    )
         elif prior is not None and not linked:
             # A syntactically valid response from the same broad family is not
             # evidence that the exact outstanding cursor/URL was consumed.
@@ -2029,9 +2075,11 @@ class RetrievalCompletenessTracker:
                 self._set_terminal(
                     "body_truncation_continuation_not_followed"
                     if "body_truncated" in prior.incomplete_reasons
-                    else "pagination_cursor_not_consumed"
+                    else "pagination_cursor_not_consumed",
+                    family=family,
                 )
         elif prior is not None and linked:
+            self._terminal_chain_failures.pop(family, None)
             if replacement_restart:
                 # A smaller first page replaces the oversized request only
                 # when the server explicitly says that this replacement chain
@@ -2041,7 +2089,10 @@ class RetrievalCompletenessTracker:
                     remaining_cursor_hashes: set[str] = set()
                     remaining_url_hashes: set[str] = set()
                 else:
-                    self._set_terminal("pagination_replacement_unproven")
+                    self._set_terminal(
+                        "pagination_replacement_unproven",
+                        family=family,
+                    )
                     remaining_cursor_hashes = set(
                         prior.expected_cursor_sha256s
                     )
@@ -2082,20 +2133,30 @@ class RetrievalCompletenessTracker:
                 )
             else:
                 self._open.pop(family, None)
+                self._terminal_chain_failures.pop(family, None)
 
         if self.total_requests >= self.max_total_requests and self._open:
-            self._set_terminal("retrieval_request_limit")
+            self._set_terminal(
+                "retrieval_request_limit",
+                global_scope=True,
+            )
         if (
             self.total_response_bytes >= self.max_total_response_bytes
             and self._open
         ):
-            self._set_terminal("retrieval_cumulative_byte_limit")
+            self._set_terminal(
+                "retrieval_cumulative_byte_limit",
+                global_scope=True,
+            )
         if (
             self.total_request_elapsed_ms
             >= self.max_total_request_elapsed_ms
             and self._open
         ):
-            self._set_terminal("retrieval_total_time_limit")
+            self._set_terminal(
+                "retrieval_total_time_limit",
+                global_scope=True,
+            )
         return self.snapshot()
 
     @property
@@ -2119,14 +2180,15 @@ class RetrievalCompletenessTracker:
             self._chain_requires_mandatory_continuation(
                 chain, normalized
             )
-            for chain in self._open.values()
+            for family, chain in self._open.items()
+            if family not in self._terminal_chain_failures
         )
 
     def has_optional_pagination_frontier(self, policy: str) -> bool:
         normalized = normalize_retrieval_completeness_policy(policy)
         return bool(
             normalized == RETRIEVAL_COMPLETENESS_POLICY_BOUNDED
-            and self._open
+            and bool(set(self._open) - set(self._terminal_chain_failures))
             and self.terminal_failure is None
             and not self.requires_mandatory_continuation(normalized)
         )
@@ -2134,7 +2196,11 @@ class RetrievalCompletenessTracker:
     def closure_quality_impact(self, policy: str) -> str:
         """Classify the current open frontier at the tracker authority."""
 
-        if self.has_optional_pagination_frontier(policy):
+        if (
+            not self._terminal_chain_failures
+            and self._global_terminal_failure is None
+            and self.has_optional_pagination_frontier(policy)
+        ):
             return RETRIEVAL_QUALITY_IMPACT_ADVISORY
         return RETRIEVAL_QUALITY_IMPACT_DEGRADED
 
@@ -2181,7 +2247,11 @@ class RetrievalCompletenessTracker:
             return None
 
         ordered = sorted(
-            self._open.values(),
+            (
+                chain
+                for family, chain in self._open.items()
+                if family not in self._terminal_chain_failures
+            ),
             key=lambda chain: (
                 max(0, int(chain.ready_sequence)),
                 chain.family_sha256,
@@ -2339,6 +2409,22 @@ class RetrievalCompletenessTracker:
             ),
             "max_total_requests": self.max_total_requests,
             "terminal_failure": self.terminal_failure,
+            "global_terminal_failure": self._global_terminal_failure,
+            "terminal_chain_count": len(
+                set(self._open) & set(self._terminal_chain_failures)
+            ),
+            "runnable_chain_count": len(
+                set(self._open) - set(self._terminal_chain_failures)
+            ),
+            "terminal_chain_failures": [
+                {
+                    "family_sha256": family,
+                    "reason": self._terminal_chain_failures[family],
+                }
+                for family in sorted(
+                    set(self._open) & set(self._terminal_chain_failures)
+                )
+            ],
             "continuation_action": self._continuation_action_summary(),
             "frontier_receipt": self.frontier_receipt(),
             "evidence_ledger": self.evidence_ledger(),
