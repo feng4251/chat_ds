@@ -738,6 +738,7 @@ class ModelHistorySafetyTests(unittest.TestCase):
             "request_method": "POST",
             "request_number": 3,
             "root_request_number": 9,
+            "transport_retry_count": 1,
             "http_status": 400,
             "url": "https://api.vendor.test/private?token=SECRET",
             "matched_prefix": "https://api.vendor.test/",
@@ -752,6 +753,7 @@ class ModelHistorySafetyTests(unittest.TestCase):
         self.assertEqual(400, payload["http_status"])
         self.assertEqual(3, payload["request_number"])
         self.assertEqual(9, payload["root_request_number"])
+        self.assertEqual(1, payload["transport_retry_count"])
         self.assertEqual(
             hashlib.sha256(
                 b"https://api.vendor.test/private?token=SECRET"

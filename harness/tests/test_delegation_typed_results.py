@@ -14,7 +14,9 @@ from delegated_result_contract import (
 from tools.context import ToolContext
 from tools.delegation import (
     DELEGATE_TASK_SCHEMA,
+    _adaptive_delegate_output_tokens,
     _child_failure_fields,
+    _canonicalize_machine_gap_ledger,
     _completion_quality_declaration,
     _content_declares_degraded_completion,
     _exact_capability_gap_ledger_error,
@@ -84,6 +86,77 @@ def _legacy_envelope_schema() -> dict:
 
 
 class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
+    def test_delegate_output_budget_scales_with_contract_shape(self):
+        self.assertEqual(
+            8_192,
+            _adaptive_delegate_output_tokens(["result"], {"result": "string"}),
+        )
+        medium_fields = [f"field_{index}" for index in range(7)]
+        self.assertEqual(
+            16_384,
+            _adaptive_delegate_output_tokens(
+                medium_fields,
+                {field: {"type": "string"} for field in medium_fields},
+            ),
+        )
+        large_fields = [f"field_{index}" for index in range(22)]
+        self.assertEqual(
+            32_768,
+            _adaptive_delegate_output_tokens(
+                large_fields,
+                {field: {"type": "object"} for field in large_fields},
+            ),
+        )
+
+    def test_machine_gap_ledger_is_receipt_owned_and_footer_stays_terminal(self):
+        content = (
+            "# Findings\n"
+            "```text\n"
+            "KNOWLEDGE_GATE_GAPS_JSON: documented example\n"
+            "```\n"
+            "KNOWLEDGE_GATE_GAPS_JSON: {malformed model state}\n"
+            "KNOWLEDGE_GATE_GAPS_JSON: "
+            '{"status":"degraded","gap_ids":["invented"]}\n'
+            'RESULT_FIELDS_JSON: {"finding":"bounded"}'
+        )
+
+        canonical, audit = _canonicalize_machine_gap_ledger(
+            content,
+            "KNOWLEDGE_GATE_GAPS_JSON",
+            ["group:source-a:failed", "group:source-a:failed"],
+        )
+
+        self.assertIn(
+            "KNOWLEDGE_GATE_GAPS_JSON: documented example",
+            canonical,
+        )
+        self.assertNotIn("invented", canonical)
+        self.assertNotIn("malformed model state", canonical)
+        self.assertEqual(2, audit["removed_model_ledger_count"])
+        self.assertTrue(audit["inserted_canonical_ledger"])
+        self.assertEqual(
+            'RESULT_FIELDS_JSON: {"finding":"bounded"}',
+            canonical.splitlines()[-1],
+        )
+        self.assertIsNone(_exact_knowledge_gate_gap_ledger_error(
+            canonical,
+            ["group:source-a:failed"],
+        ))
+
+    def test_machine_gap_ledger_is_removed_when_receipts_have_no_gaps(self):
+        canonical, audit = _canonicalize_machine_gap_ledger(
+            "Evidence is complete.\n"
+            "CAPABILITY_GAPS_JSON: "
+            '{"status":"degraded","failed_candidate_ids":["stale"]}',
+            "CAPABILITY_GAPS_JSON",
+            [],
+        )
+
+        self.assertEqual("Evidence is complete.", canonical)
+        self.assertEqual(1, audit["removed_model_ledger_count"])
+        self.assertFalse(audit["inserted_canonical_ledger"])
+        self.assertIsNone(_exact_capability_gap_ledger_error(canonical, []))
+
     def test_only_explicit_status_shapes_declare_degraded_completion(self):
         self.assertTrue(
             _content_declares_degraded_completion(

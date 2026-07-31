@@ -435,8 +435,8 @@ def _native_candidates(
         candidates.append({
             "candidate_id": _candidate_id("native", coordinates),
             "kind": "native_tool",
-            "tool_name": name,
             "tool_names": [name],
+            **coordinates,
         })
     return candidates
 

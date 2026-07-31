@@ -2822,7 +2822,7 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
                 run_stream.assert_not_called()
                 persist.assert_not_called()
 
-    async def test_failed_exact_candidate_rejects_negated_degraded_prose(self):
+    async def test_failed_exact_candidate_receipt_overrides_negated_prose(self):
         skill = "evidence-skill"
         prefix = "https://api.github.com/repos/"
         bindings = [{
@@ -2870,7 +2870,10 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
                 "tools.delegation._load_complete_skill_view_preload",
                 fake_preload,
             ),
-            patch("tools.delegation.persist_result_for_history") as persist,
+            patch(
+                "tools.delegation.persist_result_for_history",
+                return_value="results/exact-gap.md",
+            ) as persist,
         ):
             result = await _run_child(
                 {
@@ -2889,11 +2892,16 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
                 0,
             )
 
-        self.assertEqual("error", result["status"])
-        self.assertIn("result-level degraded status", result["error"])
-        persist.assert_not_called()
+        self.assertEqual("completed", result["status"])
+        self.assertEqual("degraded", result["completion_quality"])
+        persisted = persist.call_args.args[0]
+        self.assertIn(
+            'CAPABILITY_GAPS_JSON: {"status":"degraded",'
+            '"failed_candidate_ids":["http-required"]}',
+            persisted,
+        )
 
-    async def test_failed_exact_candidate_needs_exact_structured_gap_ids(self):
+    async def test_failed_exact_candidate_replaces_model_gap_ids(self):
         skill = "evidence-skill"
         prefix = "https://api.github.com/repos/"
         bindings = [{
@@ -2944,7 +2952,10 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
                 "tools.delegation._load_complete_skill_view_preload",
                 fake_preload,
             ),
-            patch("tools.delegation.persist_result_for_history") as persist,
+            patch(
+                "tools.delegation.persist_result_for_history",
+                return_value="results/exact-gap.md",
+            ) as persist,
         ):
             result = await _run_child(
                 {
@@ -2963,9 +2974,15 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
                 0,
             )
 
-        self.assertEqual("error", result["status"])
-        self.assertIn("must exactly cover", result["error"])
-        persist.assert_not_called()
+        self.assertEqual("completed", result["status"])
+        self.assertEqual("degraded", result["completion_quality"])
+        persisted = persist.call_args.args[0]
+        self.assertNotIn("some-other-candidate", persisted)
+        self.assertIn(
+            'CAPABILITY_GAPS_JSON: {"status":"degraded",'
+            '"failed_candidate_ids":["http-required"]}',
+            persisted,
+        )
 
     async def test_exact_resource_missing_sha_is_rejected_before_model(self):
         binding = {
@@ -3233,9 +3250,7 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
         )
         with (
             patch("agent_loop.run_stream") as run_stream,
-            patch(
-                "tools.delegation.persist_result_for_history"
-            ) as persist,
+            patch("tools.delegation.persist_result_for_history") as persist,
         ):
             result = await _run_child(
                 {
@@ -3566,7 +3581,8 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
                 fake_preload,
             ),
             patch(
-                "tools.delegation.persist_result_for_history"
+                "tools.delegation.persist_result_for_history",
+                return_value="results/catalog-gap.md",
             ) as persist,
         ):
             result = await _run_child(
@@ -3588,7 +3604,8 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
                 0,
             )
 
-        self.assertEqual("error", result["status"])
+        self.assertEqual("completed", result["status"])
+        self.assertEqual("degraded", result["completion_quality"])
         audit = result["capability_receipt_audit"]
         self.assertEqual(["catalog-query"], audit["satisfied_candidate_ids"])
         self.assertEqual([], audit["successful_candidate_ids"])
@@ -3623,7 +3640,12 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
             ("https://catalog.example.test:443/v1/item?id=42",),
             observed["user_url_authorization_urls"],
         )
-        persist.assert_not_called()
+        persisted = persist.call_args.args[0]
+        self.assertIn(
+            'CAPABILITY_GAPS_JSON: {"status":"degraded",'
+            '"failed_candidate_ids":["catalog-query"]}',
+            persisted,
+        )
 
     async def test_argument_free_demo_main_is_execution_not_query_evidence(self):
         async def fake_dispatch(name, args, *, context):

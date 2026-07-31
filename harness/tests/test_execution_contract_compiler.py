@@ -1781,6 +1781,141 @@ class ExecutionContractCompilerTests(unittest.TestCase):
             execution["output_contract"]["local_resources"],
         )
 
+    def test_worker_compiles_every_named_instruction_output_block(self):
+        """Renamed sibling blocks are obligations, not domain-specific prose."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write(
+                root,
+                "SKILL.md",
+                """
+                ---
+                name: orbital-assurance
+                description: Runs a multi-capability orbital assurance worker.
+                ---
+                Execute the declared worker contract.
+                """,
+            )
+            self._write(
+                root,
+                "orchestration/main.yaml",
+                """
+                orchestrator_id: orbital-assurance
+                workers:
+                  analyst:
+                    file: orchestration/workers/analyst.yaml
+                routing_rules:
+                  full:
+                    patterns: ["full.*orbital"]
+                    worker: analyst
+                    default: true
+                """,
+            )
+            self._write(
+                root,
+                "orchestration/workers/analyst.yaml",
+                """
+                worker_id: analyst
+                name: Orbital Assurance Analyst
+                instructions: |
+                  Extract the declared mission assumptions.
+                output_format:
+                  mission_assumptions:
+                    orbit: string
+                thermal_instructions: |
+                  Execute the thermal-margin analysis.
+                thermal_output_format:
+                  thermal_margin:
+                    status: string
+                radiation_instructions: |
+                  Execute the radiation-tolerance analysis.
+                radiation_output_format:
+                  radiation_tolerance:
+                    status: string
+                """,
+            )
+            execution = load_skill_content(
+                root / "SKILL.md",
+                skill_dir=str(root),
+                session_id="multi-block-worker",
+            )["execution_contract"]
+
+        self.assertTrue(
+            execution["diagnostics"]["valid"],
+            execution["diagnostics"],
+        )
+        worker = execution["workers"][0]
+        self.assertEqual(
+            [
+                "mission_assumptions",
+                "thermal_margin",
+                "radiation_tolerance",
+            ],
+            list(worker["output_schema"]),
+        )
+        self.assertEqual(
+            ["primary", "thermal", "radiation"],
+            [block["id"] for block in worker["instruction_blocks"]],
+        )
+        self.assertTrue(all(
+            block["required"] is True
+            and len(block["instruction_sha256"]) == 64
+            and len(block["output_sha256"]) == 64
+            for block in worker["instruction_blocks"]
+        ))
+        self.assertEqual(
+            [["mission_assumptions"], ["thermal_margin"], ["radiation_tolerance"]],
+            [block["required_result_fields"] for block in worker["instruction_blocks"]],
+        )
+
+    def test_conflicting_worker_output_blocks_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write(
+                root,
+                "SKILL.md",
+                "---\nname: conflicting-worker\ndescription: Reject ambiguous blocks.\n---\nRun it.\n",
+            )
+            self._write(
+                root,
+                "orchestration/main.yaml",
+                """
+                orchestrator_id: conflicting-worker
+                workers:
+                  analyst:
+                    file: orchestration/workers/analyst.yaml
+                """,
+            )
+            self._write(
+                root,
+                "orchestration/workers/analyst.yaml",
+                """
+                worker_id: analyst
+                instructions: "Perform the primary analysis."
+                output_format:
+                  status: string
+                audit_instructions: "Perform the independent audit."
+                audit_output_format:
+                  status:
+                    type: object
+                """,
+            )
+            execution = load_skill_content(
+                root / "SKILL.md",
+                skill_dir=str(root),
+                session_id="conflicting-worker-blocks",
+            )["execution_contract"]
+
+        self.assertFalse(execution["diagnostics"]["valid"])
+        self.assertIn(
+            "conflicting_worker_output_field",
+            {
+                error["code"]
+                for error in execution["diagnostics"]["errors"]
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,9 +10,12 @@ from agent_loop import (
     run_stream,
 )
 from knowledge_gate_runtime import canonical_json_sha256
+from skill_capability_plan import canonical_https_prefix
 from tools.context import ToolContext
 from tools.delegation import _exact_knowledge_gate_candidate_grants
 from tools.isolated_skill_executor import compute_skill_package_digest
+from tools.registry import dispatch as native_registry_dispatch
+from tools.skill_http import _retrieval_receipt
 from tools.mcp_contract import (
     build_mcp_tool_descriptor,
     freeze_mcp_catalog,
@@ -80,11 +83,11 @@ def _empty_authority(candidates: list[dict]) -> dict:
         "http_get_grants": [],
         "http_post_grants": [],
         "sandbox_egress_grants": [],
-        "tool_names": [
+        "tool_names": list(dict.fromkeys(
             candidate["tool_name"]
             for candidate in candidates
             if candidate.get("tool_name")
-        ],
+        )),
         "receipt_bindings": candidates,
     }
 
@@ -168,6 +171,9 @@ class KnowledgeGateAgentLoopIntegrationTests(
         source: str = "delegate",
         agent_kind: str = "delegate",
         extra_run_kwargs: dict | None = None,
+        native_dispatch=None,
+        max_iterations: int = 4,
+        resolved_skill_path: Path | None = None,
     ):
         provider = ScriptedProvider(
             ScriptedTurn(tuple(lines))
@@ -212,6 +218,13 @@ class KnowledgeGateAgentLoopIntegrationTests(
                     dispatch_mcp,
                 ),
             ])
+        if native_dispatch is not None:
+            patches.append(patch("agent_loop.dispatch", native_dispatch))
+        if resolved_skill_path is not None:
+            patches.append(patch(
+                "skills.scanner.resolve_skill_path",
+                return_value=resolved_skill_path,
+            ))
 
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch(
@@ -243,7 +256,7 @@ class KnowledgeGateAgentLoopIntegrationTests(
                             session_id="s-knowledge-gate",
                             source=source,
                             agent_kind=agent_kind,
-                            max_iterations=4,
+                            max_iterations=max_iterations,
                             **gate_kwargs,
                             **(extra_run_kwargs or {}),
                         )
@@ -338,6 +351,207 @@ class KnowledgeGateAgentLoopIntegrationTests(
                 tool["function"]["name"]
                 for tool in bodies[1].get("tools", [])
             ],
+        )
+
+    async def test_pending_gate_group_precedes_http_family_continuation(self):
+        skill_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(skill_temp.cleanup)
+        skill_root = Path(skill_temp.name) / "generic-skill"
+        skill_root.mkdir()
+        skill_main = skill_root / "SKILL.md"
+        skill_main.write_text("# Generic Skill\n", encoding="utf-8")
+        skill_main_sha256 = hashlib.sha256(
+            skill_main.read_bytes()
+        ).hexdigest()
+        package_sha256 = compute_skill_package_digest(skill_root)
+        first_prefix = "https://archive.example.test:443/records/"
+        second_prefix = "https://registry.example.test:443/entries/"
+        first_url = first_prefix + "?limit=25"
+        second_url = second_prefix + "?limit=5"
+        candidates = [
+            {
+                "candidate_id": "candidate-archive",
+                "kind": "skill_http_prefix",
+                "tool_name": "skill_http_get",
+                "tool_names": ["skill_http_get"],
+                "skill_name": "generic-skill",
+                "skill_md_sha256": skill_main_sha256,
+                "package_sha256": package_sha256,
+                "url_prefix": first_prefix,
+                "http_method": "GET",
+            },
+            {
+                "candidate_id": "candidate-registry",
+                "kind": "skill_http_prefix",
+                "tool_name": "skill_http_get",
+                "tool_names": ["skill_http_get"],
+                "skill_name": "generic-skill",
+                "skill_md_sha256": skill_main_sha256,
+                "package_sha256": package_sha256,
+                "url_prefix": second_prefix,
+                "http_method": "GET",
+            },
+        ]
+        plan = {
+            "schema_version": 1,
+            "worker_id": "worker-generic",
+            "owner_skill": "generic-skill",
+            "checks": [{
+                "id": "source-check",
+                "question": "Are both declared sources required?",
+                "branches": [{
+                    "outcome": "yes",
+                    "action": "Acquire both exact sources.",
+                    "group_ids": ["group-archive", "group-registry"],
+                }],
+                "legacy_ambiguous": False,
+            }],
+            "groups": [
+                {
+                    "id": "group-archive",
+                    "check_id": "source-check",
+                    "outcome": "yes",
+                    "mode": "one_of",
+                    "candidate_ids": ["candidate-archive"],
+                    "selectors": ["skill:generic-skill/archive"],
+                    "unresolved_selectors": [],
+                },
+                {
+                    "id": "group-registry",
+                    "check_id": "source-check",
+                    "outcome": "yes",
+                    "mode": "one_of",
+                    "candidate_ids": ["candidate-registry"],
+                    "selectors": ["skill:generic-skill/registry"],
+                    "unresolved_selectors": [],
+                },
+            ],
+            "candidates": candidates,
+        }
+        digest = canonical_json_sha256(plan)
+        authority = _empty_authority(candidates)
+        authority["http_get_grants"] = [
+            ("generic-skill", first_prefix),
+            ("generic-skill", second_prefix),
+        ]
+        authority["package_grants"] = [
+            ("generic-skill", package_sha256),
+        ]
+        request_number = 0
+        dispatched_urls: list[str] = []
+
+        async def fake_dispatch(name, args, *, context):
+            nonlocal request_number
+            if name != "skill_http_get":
+                return await native_registry_dispatch(
+                    name,
+                    args,
+                    context=context,
+                )
+            request_number += 1
+            url = args["url"]
+            dispatched_urls.append(url)
+            first_source = url.startswith(first_prefix)
+            truncated = first_source and request_number == 1
+            body = (
+                '{"results":[{"id":"record-1"}]}'
+                if first_source else
+                '{"entries":[{"id":"entry-1"}]}'
+            )
+            prefix = first_prefix if first_source else second_prefix
+            receipt = _retrieval_receipt(
+                method="GET",
+                request_url=url,
+                request_body=None,
+                response_body=body,
+                pagination_scan_body=body,
+                body_truncated=truncated,
+                wire_body_complete=True,
+                response_bytes_read=len(body.encode("utf-8")),
+                response_chars_read=len(body),
+                max_chars=int(args["max_chars"]),
+                timeout=20,
+                request_number=request_number,
+                request_elapsed_ms=1,
+                grants=(
+                    ("generic-skill", first_prefix),
+                    ("generic-skill", second_prefix),
+                ),
+            )
+            return json.dumps({
+                "status": "success",
+                "request_sent": True,
+                "request_number": request_number,
+                "root_request_number": request_number,
+                "matched_skill": "generic-skill",
+                "matched_prefix_sha256": hashlib.sha256(
+                    canonical_https_prefix(prefix).encode("utf-8")
+                ).hexdigest(),
+                "http_status": 200,
+                "body": body[:10] if truncated else body,
+                "body_chars": 10 if truncated else len(body),
+                "body_truncated": truncated,
+                "retrieval": receipt,
+            })
+
+        responses = [
+            _tool_call_response(
+                "submit_knowledge_gate_decisions",
+                {
+                    "plan_sha256": digest,
+                    "decisions": [{
+                        "check_id": "source-check",
+                        "outcome": "yes",
+                        "reason": "Both exact declared sources are required.",
+                    }],
+                },
+                call_id="call-decision",
+            ),
+            _tool_call_response(
+                "skill_http_get",
+                {"url": first_url, "max_chars": 10, "timeout": 20},
+                call_id="call-archive",
+            ),
+            _tool_call_response(
+                "skill_http_get",
+                {"url": second_url, "max_chars": 100_000, "timeout": 20},
+                call_id="call-registry",
+            ),
+            _tool_call_response(
+                "skill_http_get",
+                {"url": first_url, "max_chars": 31, "timeout": 20},
+                call_id="call-archive-continuation",
+            ),
+            _stop_response("status: PASS\nBoth exact sources are accounted for."),
+        ]
+
+        bodies, events = await self._run(
+            responses,
+            plan=plan,
+            authority=authority,
+            allow_session_mcp=False,
+            enabled_tools=[
+                "skill_http_get",
+                "submit_knowledge_gate_decisions",
+            ],
+            extra_run_kwargs={
+                "allowed_skill_http_prefixes": (
+                    ("generic-skill", first_prefix),
+                    ("generic-skill", second_prefix),
+                ),
+            },
+            native_dispatch=fake_dispatch,
+            max_iterations=6,
+            resolved_skill_path=skill_main,
+        )
+
+        self.assertFalse(any(
+            event.get("event_type") == "run.failed"
+            for event in events
+        ), events)
+        self.assertEqual(
+            [first_url, second_url, first_url],
+            dispatched_urls,
         )
 
     async def test_direct_chat_strips_registry_default_decision_control(self):

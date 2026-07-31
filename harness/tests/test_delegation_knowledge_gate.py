@@ -236,20 +236,32 @@ def _search_call(outcome: str = "success") -> dict:
     }
 
 
-def _http_call(prefix: str, outcome: str = "success") -> dict:
+def _http_call(
+    prefix: str,
+    outcome: str = "success",
+    *,
+    request_sent: bool = True,
+    error_code: str | None = None,
+    request_number: int | None = None,
+) -> dict:
+    result_data = {
+        "request_sent": request_sent,
+        "matched_skill": "generic-skill",
+        "matched_prefix_sha256": hashlib.sha256(
+            prefix.encode("utf-8"),
+        ).hexdigest(),
+    }
+    if error_code is not None:
+        result_data["error_code"] = error_code
+    if request_number is not None:
+        result_data["request_number"] = request_number
     return {
         "tool_name": "skill_http_get",
         # Delegation receipts deliberately do not retain the raw request URL.
         "args": {},
         "outcome": outcome,
         "artifacts": [],
-        "result_data": {
-            "request_sent": True,
-            "matched_skill": "generic-skill",
-            "matched_prefix_sha256": hashlib.sha256(
-                prefix.encode("utf-8"),
-            ).hexdigest(),
-        },
+        "result_data": result_data,
         "skill_resource_complete": None,
     }
 
@@ -946,6 +958,74 @@ class KnowledgeGatePlanContractTests(unittest.TestCase):
         self.assertEqual(
             ["candidate-narrow"],
             [receipt["candidate_id"] for receipt in audit["receipts"]],
+        )
+
+    def test_authenticated_pre_submit_transport_failure_is_a_failed_gate_receipt(self):
+        prefix = "https://telemetry.example.test/archive/"
+        identity = {
+            "skill_name": "generic-skill",
+            "skill_md_sha256": "a" * 64,
+            "package_sha256": "b" * 64,
+        }
+        plan = {
+            "schema_version": 1,
+            "worker_id": "worker-a",
+            "owner_skill": "generic-skill",
+            "checks": [{
+                "id": "KG-1",
+                "question": "Is the exact telemetry archive required?",
+                "branches": [{
+                    "outcome": "yes",
+                    "action": "Retrieve the exact bounded archive source.",
+                    "group_ids": ["group-archive"],
+                }],
+                "legacy_ambiguous": False,
+            }],
+            "groups": [{
+                "id": "group-archive",
+                "check_id": "KG-1",
+                "outcome": "yes",
+                "mode": "one_of",
+                "candidate_ids": ["candidate-archive"],
+                "selectors": ["skill:generic-skill/archive"],
+                "unresolved_selectors": [],
+            }],
+            "candidates": [{
+                "candidate_id": "candidate-archive",
+                "kind": "skill_http_prefix",
+                "tool_name": "skill_http_get",
+                "tool_names": ["skill_http_get"],
+                "url_prefix": prefix,
+                "http_method": "GET",
+                **identity,
+            }],
+        }
+
+        audit, error = _knowledge_gate_receipt_audit(
+            plan,
+            _digest(plan),
+            [
+                _decision_call(plan),
+                _http_call(
+                    prefix,
+                    "error",
+                    request_sent=False,
+                    error_code="transport_error",
+                    request_number=17,
+                ),
+            ],
+            allowed_skill_scripts=[],
+            allowed_skill_commands=[],
+            allowed_skill_http_prefixes=[("generic-skill", prefix)],
+            allowed_skill_http_post_prefixes=[],
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual([], audit["missing_receipt_group_ids"])
+        self.assertEqual(["group-archive"], audit["failed_group_ids"])
+        self.assertEqual(
+            ["group:group-archive:failed"],
+            audit["gap_ids"],
         )
 
     def test_dispatch_before_decision_cannot_satisfy_activated_group(self):

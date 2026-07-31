@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import socket
 from pathlib import Path
 import tempfile
 import threading
@@ -843,6 +844,43 @@ class SkillHttpToolTests(unittest.IsolatedAsyncioTestCase):
             skill_http.DEFAULT_MAX_REQUESTS_PER_RUN,
             result["retrieval"]["request_run_hop_limit"],
         )
+
+    async def test_get_retries_one_transient_dns_failure_within_same_budget(self) -> None:
+        resolver = AsyncMock(side_effect=[
+            socket.gaierror(-5, "temporary resolver failure"),
+            (("203.0.113.10", 2),),
+        ])
+        with (
+            patch.object(skill_http, "_public_addresses", resolver),
+            patch.object(skill_http.aiohttp, "ClientSession", _FakeSession),
+        ):
+            result = json.loads(await skill_http.skill_http_get(
+                "https://api.vendor.test/v1/search?q=retry",
+                timeout=5,
+                context=self.context,
+            ))
+
+        self.assertEqual("success", result["status"])
+        self.assertEqual(2, resolver.await_count)
+        self.assertEqual(2, result["request_number"])
+        self.assertEqual(2, result["root_request_number"])
+        self.assertEqual(1, result["transport_retry_count"])
+
+    async def test_get_transport_retry_has_one_owner_and_one_attempt(self) -> None:
+        resolver = AsyncMock(
+            side_effect=socket.gaierror(-5, "persistent resolver failure")
+        )
+        with patch.object(skill_http, "_public_addresses", resolver):
+            result = json.loads(await skill_http.skill_http_get(
+                "https://api.vendor.test/v1/search?q=bounded",
+                timeout=5,
+                context=self.context,
+            ))
+
+        self.assertEqual("skill_http_transport_error", result["error_code"])
+        self.assertEqual(2, resolver.await_count)
+        self.assertEqual(2, result["request_number"])
+        self.assertEqual(1, result["transport_retry_count"])
 
     async def test_visible_truncation_scans_complete_wire_and_builds_repage(self) -> None:
         full = json.dumps({

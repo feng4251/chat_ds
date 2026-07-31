@@ -202,6 +202,7 @@ class KnowledgeGateRuntimeTests(unittest.IsolatedAsyncioTestCase):
         allowed_http_post=(),
         allowed_sandbox_egress=(),
         allowed_sandbox_egress_rules=(),
+        allowed_browser_egress_rules=(),
         frozen_mcp_catalog=None,
         resolve_tool_selector=_resolve_declared_tool_selector,
         worker_id="worker-evidence",
@@ -240,6 +241,9 @@ class KnowledgeGateRuntimeTests(unittest.IsolatedAsyncioTestCase):
             allowed_sandbox_egress_rules=(
                 allowed_sandbox_egress_rules
             ),
+            allowed_browser_egress_rules=(
+                allowed_browser_egress_rules
+            ),
             frozen_mcp_catalog=frozen_mcp_catalog,
             resolve_tool_selector=resolve_tool_selector,
         )
@@ -259,6 +263,7 @@ class KnowledgeGateRuntimeTests(unittest.IsolatedAsyncioTestCase):
         allowed_http_post=(),
         allowed_sandbox_egress=(),
         allowed_sandbox_egress_rules=(),
+        allowed_browser_egress_rules=(),
         frozen_mcp_catalog=None,
         resolve_tool_selector=_resolve_declared_tool_selector,
         worker_id="worker-evidence",
@@ -296,6 +301,9 @@ class KnowledgeGateRuntimeTests(unittest.IsolatedAsyncioTestCase):
             allowed_sandbox_egress=allowed_sandbox_egress,
             allowed_sandbox_egress_rules=(
                 allowed_sandbox_egress_rules
+            ),
+            allowed_browser_egress_rules=(
+                allowed_browser_egress_rules
             ),
             frozen_mcp_catalog=frozen_mcp_catalog,
             resolve_tool_selector=resolve_tool_selector,
@@ -398,6 +406,128 @@ class KnowledgeGateRuntimeTests(unittest.IsolatedAsyncioTestCase):
         # Bindings are retained for coordinate validation/debug only; the
         # delegated runtime does not audit them as mandatory receipts.
         self.assertEqual(plan["candidates"], authority["receipt_bindings"])
+
+    def test_browser_egress_coordinates_survive_both_plan_compilers(self):
+        browser_rules = (
+            (
+                "https://archives.museum.org:443/exhibits/",
+                ("GET", "HEAD"),
+            ),
+            (
+                "https://tracking.logistics.org:443/shipments/",
+                ("GET",),
+            ),
+        )
+        expected_payload = [
+            {
+                "methods": list(methods),
+                "url_prefix": prefix,
+            }
+            for prefix, methods in browser_rules
+        ]
+        context = ToolContext(
+            user_id="user",
+            session_id="session",
+            enabled_tools=("browser_navigate",),
+            skill_execution_resource_boundary=True,
+            allowed_browser_egress_rules=browser_rules,
+        )
+
+        static_plan, static_digest = self._compile_static(
+            ["browser_navigate"],
+            available_tools={"browser_navigate"},
+            allowed_browser_egress_rules=browser_rules,
+        )
+        assert static_plan is not None and static_digest is not None
+        static_candidate = static_plan["candidates"][0]
+        self.assertEqual(
+            expected_payload,
+            static_candidate["browser_egress_rules"],
+        )
+        strict_static, strict_static_digest, static_error = (
+            _strict_unconditional_capability_plan({
+                "skill_name": OWNER_SKILL,
+                "worker_id": "worker-evidence",
+                "unconditional_capability_plan": static_plan,
+                "unconditional_capability_plan_sha256": static_digest,
+            })
+        )
+        self.assertIsNone(static_error)
+        self.assertEqual(static_plan, strict_static)
+        self.assertEqual(static_digest, strict_static_digest)
+        static_authority, static_authority_error = (
+            _exact_unconditional_capability_grants(
+                strict_static,
+                context=context,
+            )
+        )
+        self.assertIsNone(static_authority_error)
+        self.assertEqual(
+            list(browser_rules),
+            static_authority["browser_egress_rule_grants"],
+        )
+
+        conditional_plan, conditional_digest = self._compile(
+            _symbolic(_check(
+                "external-browser-evidence",
+                _branch("yes", _group("browser_navigate")),
+            )),
+            available_tools={"browser_navigate"},
+            allowed_browser_egress_rules=browser_rules,
+        )
+        assert conditional_plan is not None
+        assert conditional_digest is not None
+        conditional_candidate = conditional_plan["candidates"][0]
+        self.assertEqual(
+            expected_payload,
+            conditional_candidate["browser_egress_rules"],
+        )
+        strict_conditional, strict_conditional_digest, conditional_error = (
+            _strict_knowledge_gate_plan({
+                "skill_name": OWNER_SKILL,
+                "worker_id": "worker-evidence",
+                "knowledge_gate_plan": conditional_plan,
+                "knowledge_gate_plan_sha256": conditional_digest,
+            })
+        )
+        self.assertIsNone(conditional_error)
+        self.assertEqual(conditional_plan, strict_conditional)
+        self.assertEqual(conditional_digest, strict_conditional_digest)
+        conditional_authority, conditional_authority_error = (
+            _exact_knowledge_gate_candidate_grants(
+                strict_conditional,
+                context=context,
+            )
+        )
+        self.assertIsNone(conditional_authority_error)
+        self.assertEqual(
+            list(browser_rules),
+            conditional_authority["browser_egress_rule_grants"],
+        )
+        decision = validate_knowledge_gate_decisions(
+            strict_conditional,
+            expected_sha256=strict_conditional_digest,
+            supplied_sha256=strict_conditional_digest,
+            decisions=[{
+                "check_id": "external-browser-evidence",
+                "outcome": "yes",
+                "reason": "The declared browser source is required.",
+            }],
+        )
+        self.assertEqual("accepted", decision["status"])
+        activated = activated_knowledge_gate_candidate_authority(
+            strict_conditional,
+            decision,
+            conditional_authority,
+        )
+        self.assertEqual(
+            list(browser_rules),
+            activated["browser_egress_rule_grants"],
+        )
+        self.assertEqual(
+            [conditional_candidate],
+            activated["receipt_bindings"],
+        )
 
     def test_unconditional_plan_fails_closed_on_unresolved_selector(self):
         with self.assertRaisesRegex(

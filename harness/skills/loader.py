@@ -9,6 +9,7 @@ Simplified from hermes-agent/agent/skill_utils.py and skill_preprocessing.py:
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 from pathlib import Path, PurePosixPath
@@ -2732,6 +2733,216 @@ def _registered_worker_resource_paths(
     return paths
 
 
+def _canonical_declaration_sha256(value: Any) -> str:
+    """Hash a declarative block without depending on mapping insertion order."""
+    try:
+        canonical = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    except (TypeError, ValueError, RecursionError):
+        # The structure audit has already made cyclic/unsupported declarations
+        # fail closed.  Keep diagnostic compilation non-throwing without
+        # pretending that an invalid block has an authoritative content hash.
+        canonical = "<invalid-declaration>"
+    encoded = canonical.encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _compile_worker_instruction_blocks(
+    worker_id: str,
+    config: dict[str, Any],
+    *,
+    diagnostics: dict[str, list[dict[str, Any]]],
+    source_file: str | None,
+) -> tuple[Any, list[dict[str, Any]]]:
+    """Compile every root instruction/output pair declared by a worker.
+
+    Skill packages commonly extend a worker with sibling blocks such as
+    ``audit_instructions`` + ``audit_output_format``.  Treating only the
+    unprefixed pair as executable silently drops declared work.  Pair blocks
+    mechanically by key suffix so the compiler remains domain agnostic.
+    """
+    declarations: list[tuple[str, str, str | None]] = []
+    if "instructions" in config:
+        output_key = next(
+            (
+                key
+                for key in ("output_schema", "output_format")
+                if key in config and config.get(key) is not None
+            ),
+            None,
+        )
+        declarations.append(("primary", "instructions", output_key))
+
+    for key in config:
+        if key == "instructions" or not key.endswith("_instructions"):
+            continue
+        prefix = key[: -len("_instructions")]
+        if not prefix:
+            continue
+        output_key = next(
+            (
+                candidate
+                for candidate in (
+                    f"{prefix}_output_schema",
+                    f"{prefix}_output_format",
+                )
+                if candidate in config and config.get(candidate) is not None
+            ),
+            None,
+        )
+        declarations.append((prefix, key, output_key))
+
+    declarations = _bounded_sequence(
+        declarations,
+        limit=64,
+        diagnostics=diagnostics,
+        field=f"workers[{worker_id}].instruction_blocks",
+        source_file=source_file,
+    )
+
+    # Preserve the legacy output-only declaration when no instruction block
+    # exists.  It remains a valid result contract even though there is no
+    # separately addressable instruction block to attest.
+    if not declarations:
+        legacy_key = next(
+            (
+                key
+                for key in ("output_schema", "output_format")
+                if key in config and config.get(key) is not None
+            ),
+            None,
+        )
+        compact = _compact_mapping(
+            config.get(legacy_key) if legacy_key else None,
+            max_items=80,
+            max_text=1_500,
+            diagnostics=diagnostics,
+            field=f"workers[{worker_id}].output_schema",
+            source_file=source_file,
+        )
+        return compact, []
+
+    compiled_blocks: list[dict[str, Any]] = []
+    output_blocks: list[tuple[str, str, Any]] = []
+    if "instructions" not in config:
+        unpaired_primary_output_key = next(
+            (
+                key
+                for key in ("output_schema", "output_format")
+                if key in config and config.get(key) is not None
+            ),
+            None,
+        )
+        if unpaired_primary_output_key:
+            output_blocks.append((
+                "primary_output",
+                unpaired_primary_output_key,
+                _compact_mapping(
+                    config.get(unpaired_primary_output_key),
+                    max_items=80,
+                    max_text=1_500,
+                    diagnostics=diagnostics,
+                    field=(
+                        f"workers[{worker_id}]."
+                        f"{unpaired_primary_output_key}"
+                    ),
+                    source_file=source_file,
+                ),
+            ))
+    for block_id, instruction_key, output_key in declarations:
+        instruction_value = config.get(instruction_key)
+        output_value = config.get(output_key) if output_key else None
+        compact_output = _compact_mapping(
+            output_value,
+            max_items=80,
+            max_text=1_500,
+            diagnostics=diagnostics,
+            field=(
+                f"workers[{worker_id}].{output_key}"
+                if output_key
+                else f"workers[{worker_id}].{block_id}.output_schema"
+            ),
+            source_file=source_file,
+        )
+        required_fields = (
+            [str(key) for key in compact_output]
+            if isinstance(compact_output, dict)
+            else []
+        )
+        block = {
+            "id": block_id,
+            "instruction_key": instruction_key,
+            "output_key": output_key,
+            "required": True,
+            "instruction_sha256": _canonical_declaration_sha256(
+                instruction_value
+            ),
+            "output_sha256": _canonical_declaration_sha256(output_value),
+            "required_result_fields": required_fields,
+        }
+        compiled_blocks.append(
+            {key: value for key, value in block.items() if value is not None}
+        )
+        if output_key:
+            output_blocks.append((block_id, output_key, compact_output))
+
+    if not output_blocks:
+        return None, compiled_blocks
+    if len(output_blocks) == 1:
+        return output_blocks[0][2], compiled_blocks
+
+    merged_output: dict[str, Any] = {}
+    field_owners: dict[str, tuple[str, str]] = {}
+    for block_id, output_key, output_value in output_blocks:
+        if not isinstance(output_value, dict):
+            _diagnostic(
+                diagnostics,
+                "errors",
+                "unsupported_multi_block_worker_output",
+                "Multiple worker instruction blocks require mapping-shaped output declarations.",
+                worker_id=worker_id,
+                block_id=block_id,
+                output_key=output_key,
+                source_file=source_file,
+            )
+            continue
+        for field_name, field_schema in output_value.items():
+            field_name = str(field_name)
+            if field_name in merged_output:
+                if merged_output[field_name] != field_schema:
+                    prior_block, prior_key = field_owners[field_name]
+                    _diagnostic(
+                        diagnostics,
+                        "errors",
+                        "conflicting_worker_output_field",
+                        "Worker instruction blocks declare incompatible schemas for the same output field.",
+                        worker_id=worker_id,
+                        field=field_name,
+                        first_block=prior_block,
+                        first_output_key=prior_key,
+                        conflicting_block=block_id,
+                        conflicting_output_key=output_key,
+                        source_file=source_file,
+                    )
+                continue
+            merged_output[field_name] = field_schema
+            field_owners[field_name] = (block_id, output_key)
+    bounded_merged_output = _compact_mapping(
+        merged_output,
+        max_items=80,
+        max_text=1_500,
+        diagnostics=diagnostics,
+        field=f"workers[{worker_id}].merged_output_schema",
+        source_file=source_file,
+    )
+    return bounded_merged_output, compiled_blocks
+
+
 def _normalize_worker_config(
     worker_id: str,
     config: dict[str, Any],
@@ -2741,6 +2952,12 @@ def _normalize_worker_config(
     diagnostics: dict[str, list[dict[str, Any]]],
     source_file: str | None,
 ) -> dict[str, Any]:
+    output_schema, instruction_blocks = _compile_worker_instruction_blocks(
+        worker_id,
+        config,
+        diagnostics=diagnostics,
+        source_file=source_file,
+    )
     dependencies = _as_string_list(
         config.get("depends_on")
         or config.get("dependencies")
@@ -2903,14 +3120,8 @@ def _normalize_worker_config(
         ),
         "local_resources": ordinary_local_resources,
         "environment_contract": environment_contract,
-        "output_schema": _compact_mapping(
-            config.get("output_schema") or config.get("output_format"),
-            max_items=80,
-            max_text=1_500,
-            diagnostics=diagnostics,
-            field=f"workers[{worker_id}].output_schema",
-            source_file=source_file,
-        ),
+        "output_schema": output_schema,
+        "instruction_blocks": instruction_blocks,
     }
     return {key: value for key, value in worker.items() if value not in ("", None, [], {})}
 

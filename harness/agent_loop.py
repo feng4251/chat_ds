@@ -116,6 +116,7 @@ from skill_capability_plan import (
     capability_call_satisfies_candidate,
     capability_catalog_json,
     normalize_skill_process_evidence_receipt,
+    project_exact_capability_result_receipt,
     validate_capability_plan,
 )
 from workflow_ir import (
@@ -2606,6 +2607,7 @@ def _tool_debug_result(raw: str) -> dict[str, Any]:
             "request_method",
             "request_number",
             "root_request_number",
+            "transport_retry_count",
             "http_status",
             "content_type",
             "body_chars",
@@ -7903,6 +7905,7 @@ def _declared_child_tools(
     http_post_capability_skills: (
         set[str] | list[str] | tuple[str, ...]
     ) = (),
+    allow_bounded_calculation: bool = False,
 ) -> list[str]:
     """Resolve a contract's capability names into a closed child allowlist.
 
@@ -8061,6 +8064,12 @@ def _declared_child_tools(
             name for name in ("skill_view", "read_file", "search_files")
             if name in available
         )
+    if allow_bounded_calculation and "execute_code" in available:
+        # A compiled worker may need local arithmetic/simulation to satisfy
+        # its declared output contract even when no package script exists.
+        # execute_code retains the ordinary session workspace and sandbox
+        # boundaries; this does not grant a Skill runner, shell, or network.
+        resolved.append("execute_code")
     for selector in native_selectors:
         for canonical in _resolve_declared_tool_selector(selector, available):
             if canonical not in managed_bridges:
@@ -9041,6 +9050,7 @@ def _delegated_child_iteration_limit(
     step_type: str,
     required_output_ids: list[str] | None = None,
     required_capability_skills: list[str] | None = None,
+    knowledge_gate_plan: dict[str, Any] | None = None,
 ) -> int:
     """Scale a child's bounded turn budget from its declared contract.
 
@@ -9055,9 +9065,24 @@ def _delegated_child_iteration_limit(
         return min(default_limit, 30)
     capability_count = len(list(dict.fromkeys(required_capability_skills or [])))
     output_count = len(list(dict.fromkeys(required_output_ids or [])))
+    gate_group_count = len({
+        str(group.get("id") or "")
+        for group in (
+            knowledge_gate_plan.get("groups")
+            if isinstance(knowledge_gate_plan, dict)
+            and isinstance(knowledge_gate_plan.get("groups"), list)
+            else []
+        )
+        if isinstance(group, dict) and str(group.get("id") or "")
+    })
     declared_complexity_limit = (
-        4
-        + capability_count
+        # Decision/dispatch/synthesis overhead plus two bounded recovery turns
+        # for a malformed call or a rejected exact coordinate.  Without this
+        # reserve, a worker can be forced into synthesis while one compiled
+        # group remains undispatched even though the outer result is safely
+        # retryable only by replaying the whole expensive child.
+        6
+        + max(capability_count, gate_group_count)
         + (output_count + 1) // 2
     )
     return min(30, max(default_limit, declared_complexity_limit))
@@ -13434,18 +13459,9 @@ async def run_stream(
             "index": len(knowledge_gate_dispatch_ledger),
             "tool_name": tool_name,
             "args": copy.deepcopy(args),
-            "result_data": {
-                key: result_data.get(key)
-                for key in (
-                    "sha256",
-                    "error_code",
-                    "request_sent",
-                    "matched_skill",
-                    "matched_prefix_sha256",
-                    "process_evidence_receipt",
-                )
-                if result_data.get(key) is not None
-            },
+            "result_data": project_exact_capability_result_receipt(
+                result_data
+            ),
             "outcome": evidence_outcome,
             "transport_outcome": outcome,
             "callable_result_receipt": callable_result_receipt,
@@ -14511,6 +14527,7 @@ async def run_stream(
                     worker_tools = _declared_child_tools(
                         run_state.available_tools,
                         declared_capabilities,
+                        allow_bounded_calculation=True,
                         **_profile_bound_child_runner_kwargs(
                             tool_context,
                             required_capability_skills,
@@ -14911,6 +14928,20 @@ async def run_stream(
                         for item in (meta.get("instruction_refs") or [])
                         if isinstance(item, dict)
                     ]
+                    instruction_blocks = [
+                        {
+                            key: item.get(key)
+                            for key in (
+                                "id",
+                                "instruction_sha256",
+                                "output_sha256",
+                                "required_result_fields",
+                            )
+                            if item.get(key) not in (None, "", [])
+                        }
+                        for item in (meta.get("instruction_blocks") or [])
+                        if isinstance(item, dict) and item.get("id")
+                    ]
                     if instruction_refs:
                         worker_goal += (
                             " Execute every exact content-addressed instruction "
@@ -14918,6 +14949,18 @@ async def run_stream(
                             "documents are preloaded. Instruction refs: "
                             + json.dumps(
                                 instruction_refs,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            )
+                            + "."
+                        )
+                    if instruction_blocks:
+                        worker_goal += (
+                            " Execute every required compiled instruction block; "
+                            "these block receipts are structural obligations, "
+                            "not optional prose sections: "
+                            + json.dumps(
+                                instruction_blocks,
                                 ensure_ascii=False,
                                 sort_keys=True,
                             )
@@ -14952,6 +14995,9 @@ async def run_stream(
                                     required_output_ids=required_gate_ids,
                                     required_capability_skills=(
                                         required_capability_skills
+                                    ),
+                                    knowledge_gate_plan=(
+                                        exact_knowledge_gate_plan
                                     ),
                                 ),
                                 "required_result_paths": prior_paths,
@@ -20226,24 +20272,11 @@ async def run_stream(
                     ),
                     "exact_capability_receipt": (
                         {
-                            "result_data": {
-                                key: (auto_result_data or {}).get(key)
-                                for key in (
-                                    "sha256",
-                                    "error_code",
-                                    "request_sent",
-                                    "matched_skill",
-                                    "matched_prefix_sha256",
-                                    "status",
-                                    "plan_sha256",
-                                    "activated_group_ids",
-                                    "unresolved_group_ids",
-                                    "unknown_check_ids",
-                                    "process_evidence_receipt",
+                            "result_data": (
+                                project_exact_capability_result_receipt(
+                                    auto_result_data
                                 )
-                                if (auto_result_data or {}).get(key)
-                                is not None
-                            },
+                            ),
                             "skill_resource_complete": (
                                 auto_skill_resource_complete
                             ),
@@ -20592,6 +20625,10 @@ async def run_stream(
             or iteration_cross_tool_failure_synthesis
             or iteration_delegated_retrieval_degraded_synthesis
         )
+        knowledge_gate_required_groups = (
+            pending_knowledge_gate_tool_groups()
+            if delegated_subtask else []
+        )
         if (
             delegate_retrieval_tracker is not None
             and delegate_retrieval_phase == "acquiring"
@@ -20604,6 +20641,10 @@ async def run_stream(
             and delegate_retrieval_tracker.requires_mandatory_continuation(
                 delegated_retrieval_completeness_policy
             )
+            # Distinct compiled DAG nodes take priority over deepening an
+            # already-dispatched HTTP family.  Once every activated group has
+            # a receipt, bounded/exhaustive retrieval resumes normally.
+            and not knowledge_gate_required_groups
             and not iteration_delegated_retrieval_degraded_synthesis
             and delegate_retrieval_tracker.terminal_failure is None
         )
@@ -20613,6 +20654,7 @@ async def run_stream(
             and delegate_retrieval_tracker.has_optional_pagination_frontier(
                 delegated_retrieval_completeness_policy
             )
+            and not knowledge_gate_required_groups
             and not iteration_delegated_retrieval_degraded_synthesis
         )
         iteration_delegated_retrieval_action = (
@@ -20809,10 +20851,6 @@ async def run_stream(
                 set(delegated_required_capability_tools)
                 & delegate_attempted_tool_names
             )
-        )
-        knowledge_gate_required_groups = (
-            pending_knowledge_gate_tool_groups()
-            if delegated_subtask else []
         )
         knowledge_gate_decision_pending = bool(
             delegated_subtask
@@ -30372,23 +30410,11 @@ async def run_stream(
                         ),
                         "exact_capability_receipt": (
                             {
-                                "result_data": {
-                                    key: exact_result_data.get(key)
-                                    for key in (
-                                        "sha256",
-                                        "error_code",
-                                        "request_sent",
-                                        "matched_skill",
-                                        "matched_prefix_sha256",
-                                        "status",
-                                        "plan_sha256",
-                                        "activated_group_ids",
-                                        "unresolved_group_ids",
-                                        "unknown_check_ids",
-                                        "process_evidence_receipt",
+                                "result_data": (
+                                    project_exact_capability_result_receipt(
+                                        exact_result_data
                                     )
-                                    if exact_result_data.get(key) is not None
-                                },
+                                ),
                                 "skill_resource_complete": (
                                     exact_skill_resource_complete
                                 ),
@@ -39237,6 +39263,15 @@ def _bounded_skill_execution_exposure(
             has_compiled_orchestration = True
             if "delegate_task" in available:
                 requested.add("delegate_task")
+            if (
+                isinstance(plan.get("required_workers"), list)
+                and plan.get("required_workers")
+                and "execute_code" in available
+            ):
+                # Keep bounded local computation available to compiled worker
+                # children.  _declared_child_tools grants it only on the
+                # worker path; bootstrap and aggregation remain unchanged.
+                requested.add("execute_code")
         if artifact_output:
             for name in (
                 "read_file", "search_files", "write_file", "patch_file",

@@ -67,6 +67,7 @@ from skill_capability_plan import (
     callable_skill_result_receipt_is_failure,
     capability_call_satisfies_candidate,
     normalize_skill_process_evidence_receipt,
+    project_exact_capability_result_receipt,
     script_call_has_semantic_task_binding,
 )
 from knowledge_gate import (
@@ -133,6 +134,9 @@ _EVIDENCE_ACQUISITION_STEP_TYPES = {
 }
 _MAX_INTENT_CLASSIFIER_ITERATIONS = 2
 _MAX_INTENT_CLASSIFIER_OUTPUT_TOKENS = 4_096
+_DEFAULT_DELEGATE_OUTPUT_TOKENS = 8_192
+_MEDIUM_DELEGATE_OUTPUT_TOKENS = 16_384
+_LARGE_DELEGATE_OUTPUT_TOKENS = 32_768
 
 _TERMINAL_BUDGET_OR_LENGTH_REASONS = {
     "context_exhausted",
@@ -235,6 +239,113 @@ _CAPABILITY_GAPS_JSON_PATTERN = re.compile(
 _KNOWLEDGE_GATE_GAPS_JSON_PATTERN = re.compile(
     r"(?m)^\s*KNOWLEDGE_GATE_GAPS_JSON:\s*(\{[^\r\n]*\})\s*$"
 )
+
+_MACHINE_GAP_LEDGER_FIELDS = {
+    "CAPABILITY_GAPS_JSON": "failed_candidate_ids",
+    "KNOWLEDGE_GATE_GAPS_JSON": "gap_ids",
+}
+
+
+def _adaptive_delegate_output_tokens(
+    required_result_fields: list[str],
+    required_result_schema: dict[str, Any],
+) -> int:
+    """Select a bounded output tier from the compiled result contract.
+
+    This is deliberately structural rather than domain- or filename-based.
+    Provider/context-window clamps inside ``run_stream`` remain authoritative.
+    """
+    node_count = 0
+    stack: list[Any] = [required_result_schema]
+    while stack and node_count < 2_000:
+        value = stack.pop()
+        node_count += 1
+        if isinstance(value, dict):
+            stack.extend(value.values())
+        elif isinstance(value, (list, tuple)):
+            stack.extend(value)
+    score = (len(required_result_fields) * 8) + node_count
+    if score <= 48:
+        return _DEFAULT_DELEGATE_OUTPUT_TOKENS
+    if score <= 120:
+        return _MEDIUM_DELEGATE_OUTPUT_TOKENS
+    return _LARGE_DELEGATE_OUTPUT_TOKENS
+
+
+def _canonicalize_machine_gap_ledger(
+    content: str,
+    ledger_name: str,
+    expected_ids: list[str],
+) -> tuple[str, dict[str, Any]]:
+    """Replace model-authored gap state with receipt-owned canonical state.
+
+    Exact candidate and knowledge-gate identifiers are computed from Harness
+    dispatch receipts.  Asking the model to reproduce that state introduces a
+    second, fallible source of truth.  Preserve documentation/examples inside
+    Markdown code regions, remove every protocol-visible candidate ledger,
+    and insert at most one Harness-owned line before a terminal typed footer.
+    """
+    identifier_key = _MACHINE_GAP_LEDGER_FIELDS.get(str(ledger_name or ""))
+    if identifier_key is None:
+        raise ValueError("unsupported machine gap ledger")
+    canonical_ids = list(dict.fromkeys(
+        str(identifier)
+        for identifier in expected_ids
+        if isinstance(identifier, str) and identifier
+    ))
+    original = str(content or "")
+    masked = _mask_markdown_code_for_protocol_audit(original)
+    retained_lines: list[str] = []
+    removed_count = 0
+    visible_prefix = re.compile(
+        rf"^\s*{re.escape(ledger_name)}\s*:",
+    )
+    original_lines = original.splitlines(keepends=True)
+    masked_lines = masked.splitlines(keepends=True)
+    for index, original_line in enumerate(original_lines):
+        masked_line = masked_lines[index] if index < len(masked_lines) else ""
+        if visible_prefix.match(masked_line):
+            removed_count += 1
+            continue
+        retained_lines.append(original_line)
+    normalized = "".join(retained_lines).rstrip("\r\n")
+
+    inserted = False
+    if canonical_ids:
+        payload = json.dumps(
+            {
+                "status": "degraded",
+                identifier_key: canonical_ids,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        ledger_line = f"{ledger_name}: {payload}"
+        lines = normalized.splitlines()
+        terminal_footer = None
+        if lines and lines[-1].strip().startswith("RESULT_FIELDS_JSON:"):
+            terminal_footer = lines.pop()
+        lines.append(ledger_line)
+        if terminal_footer is not None:
+            lines.append(terminal_footer)
+        normalized = "\n".join(lines)
+        inserted = True
+
+    audit = {
+        "ledger_name": ledger_name,
+        "expected_id_count": len(canonical_ids),
+        "expected_ids_sha256": hashlib.sha256(
+            json.dumps(
+                canonical_ids,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+        "removed_model_ledger_count": removed_count,
+        "inserted_canonical_ledger": inserted,
+        "content_changed": normalized != original.rstrip("\r\n"),
+    }
+    return normalized, audit
 
 
 def _strict_single_line_json_object(
@@ -608,6 +719,13 @@ def _exact_capability_gap_ledger_error(
     ))
     masked = _mask_markdown_code_for_protocol_audit(str(content or ""))
     matches = _CAPABILITY_GAPS_JSON_PATTERN.findall(masked)
+    if not expected:
+        if matches:
+            return (
+                "CAPABILITY_GAPS_JSON is present although the exact "
+                "capability receipt audit found no failed candidates"
+            )
+        return None
     if len(matches) != 1:
         return (
             "failed exact capability candidates require exactly one "
@@ -6997,6 +7115,11 @@ async def _run_child(
         or unconditional_capability_plan is not None
         or knowledge_gate_plan is not None
     )
+    bounded_calculation_allowed = bool(
+        normalized_step_type == "worker"
+        and worker_file
+        and "execute_code" in tools
+    )
     if metadata_error is None and exact_authority_active:
         exact_bound_tools = set(
             (exact_node_capability_grants or {}).get("bound_tool_names") or []
@@ -7012,6 +7135,8 @@ async def _run_child(
             if knowledge_gate_plan is not None
             else set()
         )
+        if bounded_calculation_allowed:
+            allowed_control_tools.add("execute_code")
         if (
             knowledge_gate_plan is not None
             and _KNOWLEDGE_GATE_DECISION_TOOL not in tools
@@ -7301,11 +7426,10 @@ async def _run_child(
             "Required exact capability candidates (each candidate requires one "
             "distinct real handler dispatch receipt; calling another candidate "
             "that shares the same public tool name does not satisfy it). If an "
-            "exact candidate dispatch fails, return a result-level degraded "
-            "status and exactly one single-line ledger "
-            '`CAPABILITY_GAPS_JSON: {"status":"degraded",'
-            '"failed_candidate_ids":["<exact candidate id>",...]}` whose IDs '
-            "exactly cover every failed candidate receipt. Candidates: "
+            "exact candidate dispatch fails, describe the resulting evidence "
+            "gap and do not fabricate values or candidate identifiers. The "
+            "Harness derives the canonical capability-gap ledger directly "
+            "from dispatch receipts. Candidates: "
             + json.dumps(
                 [
                     {
@@ -7349,12 +7473,9 @@ async def _run_child(
             "own distinct actual dispatch; another group's receipt cannot be "
             "reused. An unknown decision, an activated group with no resolved "
             "candidates, or a group whose matching dispatches all fail requires "
-            "a result-level degraded status and exactly one single-line ledger "
-            '`KNOWLEDGE_GATE_GAPS_JSON: {"status":"degraded",'
-            '"gap_ids":["<exact Harness gap id>",...]}`. Use only these '
-            "deterministic IDs: `check:<check_id>:unknown`, "
-            "`group:<group_id>:unresolved`, and "
-            "`group:<group_id>:failed`. Do not report "
+            "a clearly described evidence gap; the Harness derives the exact "
+            "knowledge-gate gap ledger from its frozen plan and dispatch "
+            "receipts. Do not invent or copy machine gap IDs, and do not report "
             "unselected branches or unused alternatives as gaps. "
             + "\n"
             if knowledge_gate_plan is not None else ""
@@ -7392,6 +7513,13 @@ async def _run_child(
             "Execute only this assigned worker; do not attempt the parent Skill's full workflow. "
             if skill_name and worker_file else ""
         )
+        + (
+            "When the declared worker instructions require arithmetic, "
+            "statistical simulation, or another bounded local calculation, "
+            "use execute_code and ground the reported numeric result in that "
+            "tool receipt. Do not substitute an invented calculation. "
+            if bounded_calculation_allowed else ""
+        )
         + (f"Context supplied by the parent:\n{extra}\n\n" if extra else "")
         + (
             "Whole-result completion quality is a machine protocol, not a "
@@ -7403,8 +7531,8 @@ async def _run_child(
             "when evidence is unavailable, incomplete, unverified, or supported "
             "only by a failed/unresolved capability. Put this line before the "
             "terminal RESULT_FIELDS_JSON line when typed fields are required. "
-            "It supplements rather than replaces any required "
-            "CAPABILITY_GAPS_JSON or KNOWLEDGE_GATE_GAPS_JSON ledger. A heading "
+            "Harness-owned capability/knowledge gap ledgers supplement this "
+            "line when exact receipt state requires them. A heading "
             "such as `Fallback / Degraded Status` is descriptive only and does "
             "not declare quality. "
             if (
@@ -9975,7 +10103,10 @@ async def _run_child(
         max_tokens=(
             _MAX_INTENT_CLASSIFIER_OUTPUT_TOKENS
             if is_model_intent_classifier
-            else None
+            else _adaptive_delegate_output_tokens(
+                required_result_fields,
+                required_result_schema,
+            )
         ),
         provider_override=context.provider_config,
         fallback_overrides=list(context.fallback_configs),
@@ -10326,23 +10457,9 @@ async def _run_child(
                         else {}
                     ),
                     "artifacts": emitted_artifacts,
-                    "result_data": {
-                        key: value
-                        for key, value in receipt_result_data.items()
-                        if key in {
-                            "sha256",
-                            "error_code",
-                            "request_sent",
-                            "status",
-                            "plan_sha256",
-                            "activated_group_ids",
-                            "unresolved_group_ids",
-                            "unknown_check_ids",
-                            "matched_skill",
-                            "matched_prefix_sha256",
-                            "process_evidence_receipt",
-                        }
-                    },
+                    "result_data": project_exact_capability_result_receipt(
+                        receipt_result_data
+                    ),
                     **(
                         {
                             "knowledge_gate_decision_receipt": dict(
@@ -10925,6 +11042,17 @@ async def _run_child(
             "missing_candidate_ids": missing_exact_candidate_ids,
             "receipts": exact_receipts,
         }
+        content, capability_ledger_canonicalization = (
+            _canonicalize_machine_gap_ledger(
+                content,
+                "CAPABILITY_GAPS_JSON",
+                failed_exact_candidate_ids,
+            )
+        )
+        await forward_event(child_event(
+            "debug.capability_gap_ledger.canonicalized",
+            capability_ledger_canonicalization,
+        ))
         if validation_error is None and missing_exact_candidate_ids:
             validation_error = (
                 "Delegated step did not produce one distinct exact dispatch "
@@ -10932,25 +11060,17 @@ async def _run_child(
                 + ", ".join(missing_exact_candidate_ids)
             )
         if validation_error is None and failed_exact_candidate_ids:
-            if completion_quality_declaration.get("status") != "degraded":
+            gap_ledger_error = _exact_capability_gap_ledger_error(
+                content,
+                failed_exact_candidate_ids,
+            )
+            if gap_ledger_error:
                 validation_error = (
-                    "One or more exact required capability candidates failed; "
-                    "completion requires an explicit result-level degraded "
-                    "status and a structured capability gap ledger: "
+                    gap_ledger_error + "; failed candidates: "
                     + ", ".join(failed_exact_candidate_ids)
                 )
             else:
-                gap_ledger_error = _exact_capability_gap_ledger_error(
-                    content,
-                    failed_exact_candidate_ids,
-                )
-                if gap_ledger_error:
-                    validation_error = (
-                        gap_ledger_error + "; failed candidates: "
-                        + ", ".join(failed_exact_candidate_ids)
-                    )
-                else:
-                    verified_exact_capability_gap_ledger = True
+                verified_exact_capability_gap_ledger = True
     elif knowledge_gate_plan is not None:
         capability_receipt_audit = {
             "mode": "conditional_knowledge_gate_plan",
@@ -11072,26 +11192,31 @@ async def _run_child(
         knowledge_gate_receipt_audit.get("gap_ids") or []
     )
     verified_knowledge_gate_gap_ledger = False
+    if knowledge_gate_plan is not None and knowledge_gate_receipt_error is None:
+        content, knowledge_ledger_canonicalization = (
+            _canonicalize_machine_gap_ledger(
+                content,
+                "KNOWLEDGE_GATE_GAPS_JSON",
+                knowledge_gate_gap_ids,
+            )
+        )
+        await forward_event(child_event(
+            "debug.knowledge_gate_gap_ledger.canonicalized",
+            knowledge_ledger_canonicalization,
+        ))
     if (
         validation_error is None
         and knowledge_gate_plan is not None
         and knowledge_gate_gap_ids
     ):
-        if completion_quality_declaration.get("status") != "degraded":
-            validation_error = (
-                "Knowledge-gate unknown, unresolved, or failed branches require "
-                "an explicit result-level degraded status and an exact "
-                "KNOWLEDGE_GATE_GAPS_JSON ledger."
-            )
+        gate_gap_error = _exact_knowledge_gate_gap_ledger_error(
+            content,
+            knowledge_gate_gap_ids,
+        )
+        if gate_gap_error:
+            validation_error = gate_gap_error
         else:
-            gate_gap_error = _exact_knowledge_gate_gap_ledger_error(
-                content,
-                knowledge_gate_gap_ids,
-            )
-            if gate_gap_error:
-                validation_error = gate_gap_error
-            else:
-                verified_knowledge_gate_gap_ledger = True
+            verified_knowledge_gate_gap_ledger = True
     elif (
         validation_error is None
         and knowledge_gate_plan is not None
@@ -11164,6 +11289,8 @@ async def _run_child(
         validation_error is None
         and attempted_required_capabilities
         and not successful_required_capabilities
+        and capability_receipt_audit.get("mode")
+        == "legacy_tool_alternative"
         and completion_quality_declaration.get("status") != "degraded"
     ):
         validation_error = (

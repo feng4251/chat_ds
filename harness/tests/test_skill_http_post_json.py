@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import socket
 from pathlib import Path
 import tempfile
 import unittest
@@ -16,6 +17,7 @@ from agent_loop import (
 from skill_capability_plan import (
     build_capability_catalog,
     capability_call_satisfies_candidate,
+    project_exact_capability_result_receipt,
     validate_capability_plan,
 )
 from skills.http_grants import (
@@ -375,8 +377,44 @@ class SkillHttpPostJsonTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["request_sent"])
         self.assertLess(elapsed, 1.5)
 
+    async def test_post_transport_failure_is_never_replayed(self):
+        resolver = AsyncMock(
+            side_effect=socket.gaierror(-5, "temporary resolver failure")
+        )
+        with patch.object(skill_http, "_public_addresses", resolver):
+            result = json.loads(await skill_http.skill_http_post_json(
+                "https://api.vendor.test/v1/graphql",
+                {"query": "{ ping }"},
+                timeout=5,
+                context=self.context,
+            ))
+
+        self.assertEqual("skill_http_transport_error", result["error_code"])
+        self.assertEqual(1, resolver.await_count)
+        self.assertFalse(result["request_sent"])
+
 
 class SkillHttpPostCapabilityTests(unittest.TestCase):
+    def test_exact_receipt_projection_keeps_transport_identity_not_payload(self):
+        projected = project_exact_capability_result_receipt({
+            "request_sent": False,
+            "request_number": 11,
+            "root_request_number": 29,
+            "error_code": "transport_error",
+            "matched_skill": "archive-lookup",
+            "matched_prefix_sha256": "a" * 64,
+            "url": "https://must-not-cross.example/private?q=secret",
+            "headers": {"Authorization": "must-not-cross"},
+            "body": "must-not-cross",
+        })
+
+        self.assertEqual(11, projected["request_number"])
+        self.assertEqual(29, projected["root_request_number"])
+        self.assertEqual("transport_error", projected["error_code"])
+        self.assertNotIn("url", projected)
+        self.assertNotIn("headers", projected)
+        self.assertNotIn("body", projected)
+
     def test_method_authority_requires_explicit_post_or_graphql(self):
         ordinary = {
             "_chatds_scope": "session",
@@ -591,6 +629,18 @@ class SkillHttpPostCapabilityTests(unittest.TestCase):
             outcome="error",
             allowed_skill_http_post_prefixes=grant,
         ))
+        self.assertFalse(capability_call_satisfies_candidate(
+            post,
+            tool_name="skill_http_post_json",
+            args=args,
+            result_data={
+                "request_sent": False,
+                "request_number": 1,
+                "error_code": "skill_http_transport_error",
+            },
+            outcome="error",
+            allowed_skill_http_post_prefixes=grant,
+        ))
         self.assertTrue(capability_call_satisfies_candidate(
             post,
             tool_name="skill_http_post_json",
@@ -601,6 +651,21 @@ class SkillHttpPostCapabilityTests(unittest.TestCase):
         safe_prefix_hash = hashlib.sha256(
             prefix.encode("utf-8")
         ).hexdigest()
+        self.assertTrue(capability_call_satisfies_candidate(
+            post,
+            tool_name="skill_http_post_json",
+            args={},
+            result_data={
+                "request_sent": False,
+                "request_number": 1,
+                "status": "error",
+                "error_code": "skill_http_transport_error",
+                "matched_skill": "json-api",
+                "matched_prefix_sha256": safe_prefix_hash,
+            },
+            outcome="error",
+            allowed_skill_http_post_prefixes=grant,
+        ))
         self.assertTrue(capability_call_satisfies_candidate(
             post,
             tool_name="skill_http_post_json",

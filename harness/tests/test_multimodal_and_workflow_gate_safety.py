@@ -915,6 +915,24 @@ class WorkflowGateToolPolicyTests(unittest.TestCase):
         )
         self.assertNotIn("run_skill_python", tools)
 
+    def test_compiled_worker_can_receive_bounded_local_calculation(self):
+        available = {
+            "skill_view", "read_file", "search_files", "execute_code",
+        }
+
+        ordinary = _declared_child_tools(available, {})
+        compiled_worker = _declared_child_tools(
+            available,
+            {},
+            allow_bounded_calculation=True,
+        )
+
+        self.assertNotIn("execute_code", ordinary)
+        self.assertEqual(
+            ["skill_view", "read_file", "search_files", "execute_code"],
+            compiled_worker,
+        )
+
     def test_instruction_only_skill_capability_does_not_gain_ambient_web(self):
         tools = _declared_child_tools(
             {
@@ -1137,7 +1155,7 @@ class WorkflowGateToolPolicyTests(unittest.TestCase):
                     f"database-{index}" for index in range(1, 13)
                 ],
             ),
-            20,
+            22,
         )
         self.assertEqual(
             _delegated_child_iteration_limit(
@@ -1146,6 +1164,24 @@ class WorkflowGateToolPolicyTests(unittest.TestCase):
                 required_capability_skills=["catalog-database"],
             ),
             12,
+        )
+
+        conditional_plan = {
+            "groups": [
+                {"id": f"source-group-{index}"}
+                for index in range(8)
+            ],
+        }
+        self.assertEqual(
+            19,
+            _delegated_child_iteration_limit(
+                step_type="worker",
+                required_output_ids=[
+                    f"CHECK-{index}" for index in range(9)
+                ],
+                required_capability_skills=["archive-database"],
+                knowledge_gate_plan=conditional_plan,
+            ),
         )
 
     def test_worker_cross_skill_metadata_cannot_be_removed_or_changed(self):
@@ -1587,6 +1623,43 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
         self.assertNotIn("workers/route-b.yaml", resources_a)
         self.assertIn("workers/route-b.yaml", resources_b)
         self.assertNotIn("workers/route-a.yaml", resources_b)
+
+    def test_compiled_worker_exposure_keeps_bounded_calculation_available(self):
+        worker = {
+            "id": "orbital-analysis",
+            "file": "workers/orbital-analysis.yaml",
+            "output_schema": {"operating_characteristics": "object"},
+        }
+        workflow = {
+            "workers": [worker],
+            "execution_contract": {
+                "workers": [worker],
+                "routes": [{
+                    "id": "full",
+                    "default": True,
+                    "workers": ["orbital-analysis"],
+                }],
+            },
+        }
+        loaded = self._materialized_skill_package(
+            "orbital-skill",
+            workflow_contract=workflow,
+            resource_paths=("workers/orbital-analysis.yaml",),
+        )
+        plan = _build_skill_execution_plan(workflow, "run orbital-skill")
+
+        exposure = _bounded_skill_execution_exposure(
+            "run orbital-skill",
+            ["skills_list", "skill_view", "delegate_task", "execute_code"],
+            {"orbital-skill"},
+            {"orbital-skill": loaded},
+            {},
+            selected_skill_names=("orbital-skill",),
+            compiled_plans={"orbital-skill": plan},
+        )
+
+        self.assertIn("delegate_task", exposure.tools)
+        self.assertIn("execute_code", exposure.tools)
 
     def test_selected_resource_closure_keeps_all_33_files(self):
         files = ["orchestration/workflow.yaml"] + [
