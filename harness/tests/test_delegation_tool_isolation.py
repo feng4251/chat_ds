@@ -12,6 +12,7 @@ from tools.isolated_skill_executor import compute_skill_package_digest
 from tools.delegation import (
     DELEGATE_TASK_SCHEMA,
     _MAX_PRELOADED_PREREQUISITE_CHARS,
+    _delegated_runtime_base_tools,
     _extract_intent_selections,
     _exact_node_capability_grants,
     _render_preloaded_prerequisites,
@@ -157,6 +158,35 @@ def _catalog_for_bindings(
 
 
 class DelegationToolPolicyTests(unittest.TestCase):
+    def test_exact_knowledge_gate_projection_preserves_validated_calculation(self):
+        tools = [
+            "skill_view",
+            "read_file",
+            "execute_code",
+            "web_search",
+            "submit_knowledge_gate_decisions",
+        ]
+        projected = _delegated_runtime_base_tools(
+            tools,
+            exact_bound_tool_names={"web_search"},
+            knowledge_gate_active=True,
+            bounded_calculation_allowed=True,
+        )
+        self.assertEqual(tools, projected)
+
+        without_worker_authority = _delegated_runtime_base_tools(
+            tools,
+            exact_bound_tool_names={"web_search"},
+            knowledge_gate_active=True,
+            bounded_calculation_allowed=False,
+        )
+        self.assertNotIn("execute_code", without_worker_authority)
+        self.assertIn("web_search", without_worker_authority)
+        self.assertIn(
+            "submit_knowledge_gate_decisions",
+            without_worker_authority,
+        )
+
     def test_public_schema_accepts_exact_egress_in_all_candidate_locations(self):
         parameters = DELEGATE_TASK_SCHEMA["parameters"]
         rule = {

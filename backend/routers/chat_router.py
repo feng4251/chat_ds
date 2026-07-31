@@ -931,6 +931,38 @@ def _authoritative_root_terminal_payload(
     return None, {}
 
 
+def _authoritative_root_finish_reason(
+    agent_events: list[dict],
+    *,
+    run_id: str,
+    transport_finish_reason: str | None,
+) -> str | None:
+    """Project the root event reason into the client terminal envelope.
+
+    An OpenAI-compatible stream commonly ends with transport ``stop`` even
+    when the Harness has already emitted an authoritative ``run.failed`` with
+    a domain finish reason.  The event is the run authority; the transport
+    reason is only a fallback when no authoritative terminal exists.
+    """
+
+    terminal_type, payload = _authoritative_root_terminal_payload(
+        agent_events,
+        run_id=run_id,
+    )
+    if terminal_type is None:
+        return transport_finish_reason
+    event_reason = payload.get("finish_reason") or payload.get(
+        "terminal_reason"
+    )
+    if isinstance(event_reason, str) and event_reason.strip():
+        return event_reason.strip()
+    return {
+        "run.completed": "stop",
+        "run.failed": "agent_run_failed",
+        "run.cancelled": "task_cancelled",
+    }.get(terminal_type, transport_finish_reason)
+
+
 def _reconcile_root_stream_error(
     agent_events: list[dict],
     *,
@@ -3238,7 +3270,11 @@ async def _chat_stream_with_turn(
                 "stream_terminal": {
                     "status": root_terminal_status or "interrupted",
                     "complete": root_terminal_status == "succeeded",
-                    "finish_reason": finish_reason,
+                    "finish_reason": _authoritative_root_finish_reason(
+                        agent_events,
+                        run_id=run.id,
+                        transport_finish_reason=finish_reason,
+                    ),
                     "termination_source": termination_source,
                 },
                 "conversation_id": conv_id,
