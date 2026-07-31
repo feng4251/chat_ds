@@ -12,6 +12,7 @@ import socket
 import threading
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qsl, urljoin, urlsplit
@@ -83,6 +84,10 @@ _DNS_EXECUTOR = ThreadPoolExecutor(
     thread_name_prefix="skill-http-dns",
 )
 _DNS_SLOTS = threading.BoundedSemaphore(MAX_DNS_WORKERS)
+_GET_TRANSPORT_RETRY_DEPTH: ContextVar[int] = ContextVar(
+    "skill_http_get_transport_retry_depth",
+    default=0,
+)
 
 
 def _configured_max_requests_per_run() -> int:
@@ -824,6 +829,9 @@ async def skill_http_get(
                                 "body_truncated": body_truncated,
                                 "body_sha256": hashlib.sha256(raw).hexdigest(),
                                 "redirects_followed": redirects,
+                                "transport_retry_count": (
+                                    _GET_TRANSPORT_RETRY_DEPTH.get()
+                                ),
                                 "retrieval": _retrieval_receipt(
                                     method="GET",
                                     request_url=current,
@@ -881,7 +889,33 @@ async def skill_http_get(
             redirects_followed=redirects,
             **matched_receipt,
         )
-    except (aiohttp.ClientError, OSError, ValueError) as exc:
+    except (aiohttp.ClientError, OSError) as exc:
+        # GET is the only idempotent bridge. Retry one pre-submit transport/DNS
+        # failure inside the caller's original total deadline; the recursive
+        # attempt reacquires admission so both attempts remain quota-visible.
+        # Once request submission was entered, preserve its exact side-effect
+        # attribution instead of hiding it behind a second attempt. POST and
+        # policy/status failures are never replayed.
+        remaining_seconds = deadline - loop.time()
+        if (
+            _GET_TRANSPORT_RETRY_DEPTH.get() == 0
+            and not request_sent
+            and remaining_seconds >= 1.0
+        ):
+            token = _GET_TRANSPORT_RETRY_DEPTH.set(1)
+            try:
+                retry_timeout = max(
+                    1,
+                    min(MAX_TIMEOUT, int(remaining_seconds)),
+                )
+                return await skill_http_get(
+                    current,
+                    max_chars=max_chars,
+                    timeout=retry_timeout,
+                    context=context,
+                )
+            finally:
+                _GET_TRANSPORT_RETRY_DEPTH.reset(token)
         return _error(
             "skill_http_transport_error",
             f"Skill HTTP GET failed safely ({type(exc).__name__}: {exc}).",
@@ -889,6 +923,18 @@ async def skill_http_get(
             request_number=request_number,
             root_request_number=root_request_number,
             redirects_followed=redirects,
+            transport_retry_count=_GET_TRANSPORT_RETRY_DEPTH.get(),
+            **matched_receipt,
+        )
+    except ValueError as exc:
+        return _error(
+            "skill_http_transport_error",
+            f"Skill HTTP GET failed safely ({type(exc).__name__}: {exc}).",
+            request_sent=request_sent,
+            request_number=request_number,
+            root_request_number=root_request_number,
+            redirects_followed=redirects,
+            transport_retry_count=_GET_TRANSPORT_RETRY_DEPTH.get(),
             **matched_receipt,
         )
 

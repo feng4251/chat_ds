@@ -50,6 +50,40 @@ MAX_UNSUPPORTED_ITEMS = 64
 MAX_WORKFLOW_INSTRUCTION_CATALOG_BYTES = 750_000
 MAX_SANDBOX_EGRESS_PREFIXES = 256
 
+# Fixed-shape, URL/body-free handler facts that may cross the child/parent
+# boundary for exact capability matching.  Keep one projection authority so
+# a validator change cannot silently depend on a field dropped by one of the
+# several event/knowledge-gate adapters.
+EXACT_CAPABILITY_RESULT_RECEIPT_FIELDS = (
+    "sha256",
+    "error_code",
+    "request_sent",
+    "request_number",
+    "root_request_number",
+    "matched_skill",
+    "matched_prefix_sha256",
+    "status",
+    "plan_sha256",
+    "activated_group_ids",
+    "unresolved_group_ids",
+    "unknown_check_ids",
+    "process_evidence_receipt",
+)
+
+
+def project_exact_capability_result_receipt(
+    result_data: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Project only fixed-shape evidence metadata across trust boundaries."""
+
+    if not isinstance(result_data, dict):
+        return {}
+    return {
+        key: result_data[key]
+        for key in EXACT_CAPABILITY_RESULT_RECEIPT_FIELDS
+        if result_data.get(key) is not None
+    }
+
 # These public bridge schemas are never selectable without a more specific,
 # backend-issued candidate.  This keeps a model from turning the presence of a
 # runner schema into package/script/egress authority.
@@ -2779,8 +2813,6 @@ def capability_call_satisfies_candidate(
                 and path_matches
             ):
                 return False
-        if receipt.get("request_sent") is not True:
-            return False
         # A handler-level invalid/boundary error means no exact granted HTTP
         # attempt occurred even though its public handler was entered.
         error_code = str(receipt.get("error_code") or "")
@@ -2788,8 +2820,26 @@ def capability_call_satisfies_candidate(
             "invalid_url", "missing_skill_http_grant",
             "skill_http_boundary_violation", "invalid_json_body",
             "invalid_max_chars", "invalid_timeout",
+            "execution_authority_revoked",
         }:
             return False
+        if receipt.get("request_sent") is not True:
+            # DNS, admission, or other pre-submit infrastructure failures are
+            # still concrete failed attempts at this exact authenticated
+            # candidate.  Count them only as degraded receipts: require the
+            # handler-owned safe grant identity, a consumed/proposed request
+            # number, and a terminal error outcome.  Raw model args alone can
+            # never manufacture this state.
+            request_number = receipt.get("request_number")
+            if not (
+                outcome != "success"
+                and safe_identity_present
+                and isinstance(request_number, int)
+                and not isinstance(request_number, bool)
+                and request_number > 0
+                and error_code
+            ):
+                return False
         return True
 
     return False
