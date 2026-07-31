@@ -2613,6 +2613,128 @@ def script_call_has_semantic_task_binding(
     return has_arguments
 
 
+def capability_call_targets_candidate(
+    candidate: dict[str, Any],
+    *,
+    tool_name: str,
+    args: dict[str, Any] | None,
+    allowed_skill_scripts: Iterable[tuple[str, str, str]] = (),
+    allowed_skill_commands: Iterable[
+        tuple[str, str, str, tuple[str, ...]]
+    ] = (),
+    allowed_skill_http_prefixes: Iterable[tuple[str, str]] = (),
+    allowed_skill_http_post_prefixes: Iterable[tuple[str, str]] = (),
+) -> bool:
+    """Match a proposed call to one exact compiler-owned coordinate.
+
+    This is the pre-dispatch counterpart of
+    :func:`capability_call_satisfies_candidate`.  It deliberately proves only
+    where a call is aimed; handler-owned result identities, EOF, artifacts,
+    and evidence quality remain receipt-time facts.  Shared public bridges
+    such as ``skill_http_get`` therefore cannot cross a mandatory phase
+    boundary merely because their *name* appears on the active frontier.
+    """
+
+    if not isinstance(candidate, dict) or not isinstance(args, dict):
+        return False
+    kind = str(candidate.get("kind") or "")
+    skill_name = str(candidate.get("skill_name") or "")
+
+    if kind in {"native_tool", "mcp_tool"}:
+        return tool_name == str(candidate.get("tool_name") or "")
+
+    if kind == "skill_resource":
+        requested_path = args.get("file_path")
+        if requested_path in {None, ""}:
+            requested_path = "SKILL.md"
+        return (
+            tool_name == "skill_view"
+            and args.get("name") == skill_name
+            and requested_path == str(candidate.get("resource_path") or "")
+        )
+
+    if kind == "skill_script":
+        candidate_tools = {
+            str(item)
+            for item in candidate.get("tool_names") or []
+            if str(item)
+        }
+        if tool_name not in candidate_tools:
+            return False
+        path = str(candidate.get("resource_path") or "")
+        digest = str(candidate.get("sha256") or "")
+        if (skill_name, path, digest) not in set(allowed_skill_scripts):
+            return False
+        if tool_name == "run_skill_process":
+            # Start calls carry the exact script path. Later read/sync/close
+            # calls carry only a handler-issued process ID; the executor lease
+            # is the authoritative coordinate for those continuations.
+            operation = str(args.get("operation") or "start")
+            return operation != "start" or args.get(
+                "script_path"
+            ) == f"skills/{skill_name}/{path}"
+        return args.get("script_path") == f"skills/{skill_name}/{path}"
+
+    if kind == "declared_command":
+        command_id = str(candidate.get("command_id") or "")
+        exact_grant = (
+            skill_name,
+            command_id,
+            str(candidate.get("executable") or ""),
+            tuple(str(item) for item in candidate.get("fixed_argv") or []),
+        )
+        if exact_grant not in set(allowed_skill_commands):
+            return False
+        if (
+            candidate.get("additional_argv") is False
+            and args.get("argv") != []
+        ):
+            return False
+        return (
+            tool_name == "run_declared_command"
+            and args.get("skill_name") == skill_name
+            and args.get("command_id") == command_id
+        )
+
+    if kind == "skill_http_prefix":
+        candidate_tool = str(candidate.get("tool_name") or "")
+        if (
+            candidate_tool not in {
+                "skill_http_get", "skill_http_post_json",
+            }
+            or tool_name != candidate_tool
+        ):
+            return False
+        prefix = str(candidate.get("url_prefix") or "")
+        allowed_prefixes = (
+            allowed_skill_http_post_prefixes
+            if candidate_tool == "skill_http_post_json"
+            else allowed_skill_http_prefixes
+        )
+        if (skill_name, prefix) not in set(allowed_prefixes):
+            return False
+        canonical_prefix = canonical_https_prefix(prefix)
+        request_url = canonical_https_request_url(args.get("url"))
+        if canonical_prefix is None or request_url is None:
+            return False
+        request = urlsplit(request_url)
+        granted = urlsplit(canonical_prefix)
+        prefix_path = granted.path or "/"
+        request_path = request.path or "/"
+        path_matches = (
+            request_path.startswith(prefix_path)
+            if prefix_path.endswith("/")
+            else request_path == prefix_path
+        )
+        return bool(
+            (request.hostname or "").casefold()
+            == (granted.hostname or "").casefold()
+            and path_matches
+        )
+
+    return False
+
+
 def capability_call_satisfies_candidate(
     candidate: dict[str, Any],
     *,

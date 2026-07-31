@@ -215,6 +215,7 @@ class KnowledgeGateAgentLoopIntegrationTests(
         native_dispatch=None,
         max_iterations: int = 4,
         resolved_skill_path: Path | None = None,
+        debug_trace: bool = False,
     ):
         provider = ScriptedProvider(
             ScriptedTurn(tuple(lines))
@@ -231,6 +232,10 @@ class KnowledgeGateAgentLoopIntegrationTests(
             patch("agent_loop.load_workspace_context", return_value=""),
             patch("agent_loop._fetch_goal", AsyncMock(return_value=None)),
             patch("skills.scanner.find_all_skills", return_value=[]),
+            patch(
+                "agent_loop.settings.agent_debug_trace",
+                debug_trace,
+            ),
         ]
         if frozen_catalog is not None:
             patches.extend([
@@ -684,6 +689,179 @@ class KnowledgeGateAgentLoopIntegrationTests(
             for event in reserve_events
         ), reserve_events)
 
+    async def test_off_frontier_shared_http_coordinate_is_blocked_pre_dispatch(
+        self,
+    ):
+        skill_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(skill_temp.cleanup)
+        skill_root = Path(skill_temp.name) / "generic-skill"
+        skill_root.mkdir()
+        skill_main = skill_root / "SKILL.md"
+        skill_main.write_text("# Generic Skill\n", encoding="utf-8")
+        main_sha256 = hashlib.sha256(skill_main.read_bytes()).hexdigest()
+        package_sha256 = compute_skill_package_digest(skill_root)
+        active_prefix = "https://active.example.test:443/evidence/"
+        inactive_prefix = "https://inactive.example.test:443/archive/"
+        active_url = active_prefix + "?subject=portable"
+        inactive_url = inactive_prefix + "?subject=portable"
+        candidates = [
+            {
+                "candidate_id": "candidate-active",
+                "kind": "skill_http_prefix",
+                "tool_name": "skill_http_get",
+                "tool_names": ["skill_http_get"],
+                "skill_name": "generic-skill",
+                "skill_md_sha256": main_sha256,
+                "package_sha256": package_sha256,
+                "url_prefix": active_prefix,
+                "http_method": "GET",
+            },
+            {
+                "candidate_id": "candidate-inactive",
+                "kind": "skill_http_prefix",
+                "tool_name": "skill_http_get",
+                "tool_names": ["skill_http_get"],
+                "skill_name": "generic-skill",
+                "skill_md_sha256": main_sha256,
+                "package_sha256": package_sha256,
+                "url_prefix": inactive_prefix,
+                "http_method": "GET",
+            },
+        ]
+        plan = {
+            "schema_version": 1,
+            "worker_id": "worker-generic",
+            "owner_skill": "generic-skill",
+            "checks": [{
+                "id": "route-check",
+                "question": "Which exact source branch is active?",
+                "branches": [
+                    {
+                        "outcome": "yes",
+                        "action": "Acquire active evidence.",
+                        "group_ids": ["group-active"],
+                    },
+                    {
+                        "outcome": "no",
+                        "action": "Acquire archive evidence.",
+                        "group_ids": ["group-inactive"],
+                    },
+                ],
+                "legacy_ambiguous": False,
+            }],
+            "groups": [
+                {
+                    "id": "group-active",
+                    "check_id": "route-check",
+                    "outcome": "yes",
+                    "mode": "one_of",
+                    "candidate_ids": ["candidate-active"],
+                    "selectors": ["active-source"],
+                    "unresolved_selectors": [],
+                },
+                {
+                    "id": "group-inactive",
+                    "check_id": "route-check",
+                    "outcome": "no",
+                    "mode": "one_of",
+                    "candidate_ids": ["candidate-inactive"],
+                    "selectors": ["archive-source"],
+                    "unresolved_selectors": [],
+                },
+            ],
+            "candidates": candidates,
+        }
+        digest = canonical_json_sha256(plan)
+        authority = _empty_authority(candidates)
+        authority["http_get_grants"] = [
+            ("generic-skill", active_prefix),
+            ("generic-skill", inactive_prefix),
+        ]
+        authority["package_grants"] = [
+            ("generic-skill", package_sha256),
+        ]
+        dispatched_urls: list[str] = []
+
+        async def fake_dispatch(name, args, *, context):
+            if name != "skill_http_get":
+                return await native_registry_dispatch(
+                    name, args, context=context,
+                )
+            dispatched_urls.append(str(args.get("url") or ""))
+            return json.dumps({
+                "status": "success",
+                "request_sent": True,
+                "request_number": 1,
+                "root_request_number": 1,
+                "matched_skill": "generic-skill",
+                "matched_prefix_sha256": hashlib.sha256(
+                    canonical_https_prefix(active_prefix).encode("utf-8")
+                ).hexdigest(),
+            })
+
+        bodies, events = await self._run(
+            [
+                _tool_call_response(
+                    "submit_knowledge_gate_decisions",
+                    {
+                        "plan_sha256": digest,
+                        "decisions": [{
+                            "check_id": "route-check",
+                            "outcome": "yes",
+                            "reason": "The active branch is required.",
+                        }],
+                    },
+                    call_id="call-decision",
+                ),
+                _tool_call_response(
+                    "skill_http_get",
+                    {"url": inactive_url, "max_chars": 10_000},
+                    call_id="call-inactive",
+                ),
+                _tool_call_response(
+                    "skill_http_get",
+                    {"url": active_url, "max_chars": 10_000},
+                    call_id="call-active",
+                ),
+                _stop_response("status: PASS\nThe active receipt is present."),
+            ],
+            plan=plan,
+            authority=authority,
+            allow_session_mcp=False,
+            enabled_tools=[
+                "skill_http_get",
+                "submit_knowledge_gate_decisions",
+            ],
+            extra_run_kwargs={
+                "allowed_skill_http_prefixes": (
+                    ("generic-skill", active_prefix),
+                    ("generic-skill", inactive_prefix),
+                ),
+            },
+            native_dispatch=fake_dispatch,
+            max_iterations=4,
+            resolved_skill_path=skill_main,
+            debug_trace=True,
+        )
+
+        self.assertEqual([active_url], dispatched_urls)
+        rejected = [
+            event for event in events
+            if event.get("event_type")
+            == "debug.knowledge_gate.candidate.preflight_rejected"
+        ]
+        self.assertEqual(1, len(rejected), events)
+        self.assertFalse(
+            rejected[0]["payload"]["actual_dispatch_attempted"]
+        )
+        self.assertIn(
+            "blocked before dispatch",
+            json.dumps(bodies[2]["messages"], ensure_ascii=False),
+        )
+        self.assertFalse(any(
+            event.get("event_type") == "run.failed" for event in events
+        ), events)
+
     async def test_corrupt_replan_preserves_pending_mandatory_gate_frontier(self):
         candidates = [
             {
@@ -695,8 +873,8 @@ class KnowledgeGateAgentLoopIntegrationTests(
             {
                 "candidate_id": "candidate-b",
                 "kind": "native_tool",
-                "tool_name": "web_search",
-                "tool_names": ["web_search"],
+                "tool_name": "read_file",
+                "tool_names": ["read_file"],
             },
         ]
         plan = {
@@ -736,16 +914,16 @@ class KnowledgeGateAgentLoopIntegrationTests(
             "candidates": candidates,
         }
         digest = canonical_json_sha256(plan)
-        dispatched_queries: list[str] = []
+        dispatched_calls: list[tuple[str, dict]] = []
 
         async def fake_dispatch(name, args, *, context):
-            if name != "web_search":
+            if name not in {"web_search", "read_file"}:
                 return await native_registry_dispatch(
                     name,
                     args,
                     context=context,
                 )
-            dispatched_queries.append(str(args.get("query") or ""))
+            dispatched_calls.append((name, dict(args)))
             return json.dumps({
                 "status": "success",
                 "results": [{"title": "bounded evidence"}],
@@ -771,8 +949,8 @@ class KnowledgeGateAgentLoopIntegrationTests(
             _corrupt_tool_response("web_search"),
             _corrupt_tool_response("web_search"),
             _tool_call_response(
-                "web_search",
-                {"query": "second independent source"},
+                "read_file",
+                {"filepath": "results/second-independent-source.txt"},
                 call_id="call-source-b",
             ),
             _stop_response(
@@ -796,14 +974,16 @@ class KnowledgeGateAgentLoopIntegrationTests(
                 enabled_tools=[
                     "submit_knowledge_gate_decisions",
                     "web_search",
+                    "read_file",
                 ],
                 native_dispatch=fake_dispatch,
                 max_iterations=7,
+                debug_trace=True,
             )
 
         self.assertEqual(
-            2,
-            len(dispatched_queries),
+            ["web_search", "read_file"],
+            [name for name, _args in dispatched_calls],
             msg={
                 "requests": [
                     {
@@ -834,12 +1014,52 @@ class KnowledgeGateAgentLoopIntegrationTests(
         self.assertIn("tools", bodies[4])
         self.assertEqual("required", bodies[4].get("tool_choice"))
         self.assertEqual(
-            ["web_search"],
+            ["read_file"],
             [
                 tool["function"]["name"]
                 for tool in bodies[4]["tools"]
             ],
         )
+        isolated_requests = [
+            body
+            for body in bodies
+            if any(
+                message.get("role") == "user"
+                and "Harness machine-owned mandatory phase snapshot"
+                in str(message.get("content") or "")
+                for message in body.get("messages", [])
+            )
+        ]
+        self.assertGreaterEqual(len(isolated_requests), 1)
+        for body in isolated_requests:
+            self.assertEqual(
+                ["system", "user"],
+                [message.get("role") for message in body["messages"]],
+            )
+            self.assertFalse(any(
+                message.get("role") == "tool"
+                or message.get("tool_calls")
+                for message in body["messages"]
+            ))
+            self.assertEqual(
+                ["read_file"],
+                [
+                    tool["function"]["name"]
+                    for tool in body.get("tools", [])
+                ],
+            )
+        isolation_events = [
+            event for event in events
+            if event.get("event_type")
+            == "debug.tool.stream.mandatory_frontier_context.isolated"
+        ]
+        self.assertGreaterEqual(len(isolation_events), 1, events)
+        self.assertTrue(all(
+            event["payload"]["retained_tool_call_envelope_count"] == 0
+            and event["payload"]["retained_tool_result_message_count"] == 0
+            and event["payload"]["durable_history_mutated"] is False
+            for event in isolation_events
+        ))
         self.assertIn(
             "mandatory exact receipt obligations remain",
             json.dumps(bodies[4]["messages"], ensure_ascii=False),

@@ -114,6 +114,7 @@ from skill_capability_plan import (
     build_callable_skill_result_receipt,
     callable_skill_result_evidence_outcome,
     capability_call_satisfies_candidate,
+    capability_call_targets_candidate,
     capability_catalog_json,
     normalize_skill_process_evidence_receipt,
     project_exact_capability_result_receipt,
@@ -1921,6 +1922,78 @@ def _reset_delegated_output_contract_history(
         "removed_content_chars": removed_content_chars,
         "retained_tool_call_count": retained_tool_pairs,
     }
+
+
+def _delegated_mandatory_frontier_repair_messages(
+    *,
+    task_text: str,
+    frontier: dict[str, Any],
+    completed_receipts: Iterable[dict[str, Any]] = (),
+    max_task_chars: int = 16_000,
+) -> list[dict[str, Any]]:
+    """Build a phase-isolated request for one mandatory tool-call repair.
+
+    A provider can remain anchored to tool names and argument shapes from an
+    earlier, already-settled phase even after the exposed schema changes.  A
+    structural repair is a new control-plane transaction, so it needs only a
+    bounded task capsule, the machine-owned completed receipt ledger, and the
+    current exact frontier.  Earlier assistant tool-call envelopes and tool
+    messages stay in the durable run history for later synthesis, but are not
+    replayed into this atomic call-generation request.
+    """
+
+    text = str(task_text or "")
+    limit = max(1_024, min(64_000, int(max_task_chars)))
+    if len(text) > limit:
+        head = max(1, (limit * 3) // 4)
+        tail = max(1, limit - head)
+        text = (
+            text[:head]
+            + "\n[... task context omitted at isolated phase boundary ...]\n"
+            + text[-tail:]
+        )
+    receipt_rows = [
+        {
+            key: row.get(key)
+            for key in (
+                "group_id", "candidate_id", "tool_name", "outcome",
+                "transport_outcome",
+            )
+            if row.get(key) not in (None, "")
+        }
+        for row in completed_receipts
+        if isinstance(row, dict)
+    ]
+    phase_state = {
+        "task_capsule": text,
+        "completed_receipts": receipt_rows[:512],
+        "pending_frontier": frontier,
+    }
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are executing one isolated mandatory capability phase. "
+                "The runtime state below, not any tool name quoted inside the "
+                "task text, is authoritative. Emit exactly one complete call "
+                "to one currently exposed tool and target one exact pending "
+                "candidate. Do not emit prose, hidden planning, XML, code, or "
+                "a call to a completed/inactive coordinate."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "[Harness machine-owned mandatory phase snapshot]\n"
+                + json.dumps(
+                    phase_state,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            ),
+        },
+    ]
 
 
 _NON_SENSITIVE_DEBUG_TOKEN_KEYS = {
@@ -13380,6 +13453,69 @@ async def run_stream(
                 result.append(clean)
         return result
 
+    def pending_knowledge_gate_call_targets_frontier(
+        tool_name: str,
+        args: dict[str, Any] | None,
+    ) -> bool:
+        """Prove a proposed call targets one still-pending exact candidate."""
+
+        if not isinstance(args, dict):
+            return False
+        pending = set(pending_knowledge_gate_group_ids())
+        for group_id in pending:
+            group = knowledge_gate_group_by_id.get(group_id)
+            if not isinstance(group, dict):
+                continue
+            for candidate_id in group.get("candidate_ids") or []:
+                candidate = knowledge_gate_candidate_by_id.get(
+                    str(candidate_id)
+                )
+                if not isinstance(candidate, dict):
+                    continue
+                if capability_call_targets_candidate(
+                    candidate,
+                    tool_name=tool_name,
+                    args=args,
+                    allowed_skill_scripts=(
+                        tool_context.allowed_skill_scripts
+                    ),
+                    allowed_skill_commands=(
+                        tool_context.allowed_skill_commands
+                    ),
+                    allowed_skill_http_prefixes=(
+                        tool_context.allowed_skill_http_prefixes
+                    ),
+                    allowed_skill_http_post_prefixes=(
+                        tool_context.allowed_skill_http_post_prefixes
+                    ),
+                ):
+                    return True
+        return False
+
+    def mandatory_frontier_phase_payload() -> dict[str, Any]:
+        """Project the current machine-owned mandatory phase for repair."""
+
+        gate_frontier = _knowledge_gate_activated_frontier_payload(
+            delegated_knowledge_gate_plan,
+            knowledge_gate_decision_receipt,
+            completed_group_ids=set(knowledge_gate_group_receipts),
+        )
+        standard = unsatisfied_standard_required_capabilities()
+        legacy = [
+            name
+            for name in delegated_required_capability_tools
+            if name not in delegate_attempted_tool_names
+        ]
+        return {
+            "knowledge_gate": gate_frontier,
+            "standard_required_candidates": standard,
+            "legacy_required_tool_names": legacy,
+            "instructions": (
+                "Satisfy exactly one listed pending obligation. Completed "
+                "receipts are immutable and must not be replayed."
+            ),
+        }
+
     def pending_knowledge_gate_resource_coordinate_matches(
         tool_name: str,
         args: dict[str, Any] | None,
@@ -21404,6 +21540,9 @@ async def run_stream(
 
         # ── Sanitize messages before sending ──────────────────────────
         footer_repair_sanitized: list[dict[str, Any]] | None = None
+        mandatory_frontier_repair_sanitized: (
+            list[dict[str, Any]] | None
+        ) = None
         sanitized = _sanitize_messages(
             conversation,
             strip_images=not bool(provider.get("is_multimodal", False)),
@@ -21625,6 +21764,66 @@ async def run_stream(
                 requested_max_tokens,
                 _DELEGATE_BOUNDED_CAPABILITY_CALL_MAX_TOKENS,
             )
+        if (
+            structural_atomic_tool_stream_repair
+            and delegated_subtask
+            and delegate_required_capability_at_request
+        ):
+            before_message_count = len(sanitized)
+            before_estimated_input_tokens = _estimate_payload_tokens(
+                sanitized,
+                tool_schemas,
+            )
+            before_message_chars = sum(
+                len(str(message.get("content") or ""))
+                for message in sanitized
+                if isinstance(message, dict)
+            )
+            mandatory_frontier_repair_sanitized = (
+                _delegated_mandatory_frontier_repair_messages(
+                    task_text=original_user_text,
+                    frontier=mandatory_frontier_phase_payload(),
+                    completed_receipts=[
+                        *knowledge_gate_group_receipts.values(),
+                        *standard_required_candidate_receipts.values(),
+                    ],
+                )
+            )
+            sanitized = mandatory_frontier_repair_sanitized
+            for debug_evt in await debug_stream_event(
+                "tool.stream.mandatory_frontier_context.isolated",
+                {
+                    "iteration": budget.used,
+                    "before_message_count": before_message_count,
+                    "after_message_count": len(sanitized),
+                    "before_estimated_input_tokens": (
+                        before_estimated_input_tokens
+                    ),
+                    "after_estimated_input_tokens": (
+                        _estimate_payload_tokens(sanitized, tool_schemas)
+                    ),
+                    "before_message_chars": before_message_chars,
+                    "after_message_chars": sum(
+                        len(str(message.get("content") or ""))
+                        for message in sanitized
+                    ),
+                    "pending_knowledge_gate_group_count": len(
+                        pending_knowledge_gate_group_ids()
+                    ),
+                    "pending_standard_candidate_count": len(
+                        unsatisfied_standard_required_capabilities()
+                    ),
+                    "pending_legacy_tool_count": len([
+                        name
+                        for name in delegated_required_capability_tools
+                        if name not in delegate_attempted_tool_names
+                    ]),
+                    "retained_tool_call_envelope_count": 0,
+                    "retained_tool_result_message_count": 0,
+                    "durable_history_mutated": False,
+                },
+            ):
+                yield debug_evt
         estimated_input_tokens = _estimate_payload_tokens(sanitized, tool_schemas)
         compressor.update_from_response({
             "prompt_tokens": estimated_input_tokens,
@@ -21644,6 +21843,8 @@ async def run_stream(
             )
             if footer_repair_sanitized is not None:
                 sanitized = footer_repair_sanitized
+            if mandatory_frontier_repair_sanitized is not None:
+                sanitized = mandatory_frontier_repair_sanitized
             estimated_input_tokens = _estimate_payload_tokens(sanitized, tool_schemas)
             compressor.update_from_response({
                 "prompt_tokens": estimated_input_tokens,
@@ -21677,6 +21878,8 @@ async def run_stream(
             )
             if footer_repair_sanitized is not None:
                 sanitized = footer_repair_sanitized
+            if mandatory_frontier_repair_sanitized is not None:
+                sanitized = mandatory_frontier_repair_sanitized
             estimated_input_tokens = _estimate_payload_tokens(sanitized, tool_schemas)
             compressor.update_from_response({
                 "prompt_tokens": estimated_input_tokens,
@@ -23427,6 +23630,8 @@ async def run_stream(
                         )
                         if footer_repair_sanitized is not None:
                             sanitized = footer_repair_sanitized
+                        if mandatory_frontier_repair_sanitized is not None:
+                            sanitized = mandatory_frontier_repair_sanitized
                         body["messages"] = sanitized
                         logger.warning(
                             "Model %s rejected image content — stripped images, retrying",
@@ -23509,6 +23714,8 @@ async def run_stream(
                     )
                     if footer_repair_sanitized is not None:
                         sanitized = footer_repair_sanitized
+                    if mandatory_frontier_repair_sanitized is not None:
+                        sanitized = mandatory_frontier_repair_sanitized
                     body["messages"] = sanitized
                     estimated_input_tokens = _estimate_payload_tokens(
                         sanitized,
@@ -29255,9 +29462,47 @@ async def run_stream(
                     if tc.name not in iteration_exposed_tools else ""
                 )
                 workflow_batch_error = workflow_batch_errors.get(tool_call_id)
+                mandatory_frontier_preflight_denied = bool(
+                    not workflow_batch_error
+                    and not exposure_error
+                    and not has_parse_error
+                    and knowledge_gate_decision_receipt is not None
+                    and pending_knowledge_gate_group_ids()
+                    and not pending_knowledge_gate_call_targets_frontier(
+                        tc.name,
+                        args if isinstance(args, dict) else {},
+                    )
+                )
+                knowledge_gate_frontier_preflight_observation: (
+                    dict[str, Any] | None
+                ) = None
+                if mandatory_frontier_preflight_denied:
+                    knowledge_gate_candidate_mismatch_count += 1
+                    knowledge_gate_frontier_preflight_observation = {
+                        "plan_sha256": (
+                            delegated_knowledge_gate_plan_sha256
+                        ),
+                        "tool_name": tc.name,
+                        "pending_group_ids": (
+                            pending_knowledge_gate_group_ids()
+                        ),
+                        "mismatch_count": (
+                            knowledge_gate_candidate_mismatch_count
+                        ),
+                        "actual_dispatch_attempted": False,
+                        "reason": (
+                            "mandatory_exact_candidate_coordinate_mismatch"
+                        ),
+                    }
+                mandatory_frontier_error = (
+                    "The proposed call does not target any still-pending "
+                    "exact mandatory candidate and was not dispatched."
+                    if mandatory_frontier_preflight_denied else ""
+                )
                 workflow_gate_error = (
                     str((workflow_batch_error or {}).get("error") or "")
                     or exposure_error
+                    or mandatory_frontier_error
                     or _workflow_gate_call_error(
                         iteration_workflow_policy,
                         tc.name,
@@ -29308,7 +29553,11 @@ async def run_stream(
                 elif workflow_gate_error:
                     result = json.dumps({
                         "error": workflow_gate_error,
-                        "reason": "workflow_gate_tool_not_allowed",
+                        "reason": (
+                            "knowledge_gate_candidate_not_on_pending_frontier"
+                            if mandatory_frontier_preflight_denied
+                            else "workflow_gate_tool_not_allowed"
+                        ),
                         "required_policy": iteration_workflow_policy,
                     }, ensure_ascii=False)
                 elif tc.name == "tool_search" and deferred_catalog is not None:
@@ -30248,7 +30497,7 @@ async def run_stream(
                     workflow_state_changed = True
                 knowledge_gate_candidate_mismatch_observation: (
                     dict[str, Any] | None
-                ) = None
+                ) = knowledge_gate_frontier_preflight_observation
                 pending_gate_groups = pending_knowledge_gate_group_ids()
                 pending_gate_tool_names = {
                     name
@@ -30256,7 +30505,8 @@ async def run_stream(
                     for name in group
                 }
                 if (
-                    actual_dispatch_attempted
+                    knowledge_gate_candidate_mismatch_observation is None
+                    and actual_dispatch_attempted
                     and knowledge_gate_decision_receipt is not None
                     and pending_gate_groups
                     and display_tool_name in pending_gate_tool_names
@@ -30275,15 +30525,6 @@ async def run_stream(
                     )
                 ):
                     knowledge_gate_candidate_mismatch_count += 1
-                    active_frontier = (
-                        _knowledge_gate_activated_frontier_payload(
-                            delegated_knowledge_gate_plan,
-                            knowledge_gate_decision_receipt,
-                            completed_group_ids=set(
-                                knowledge_gate_group_receipts
-                            ),
-                        )
-                    )
                     knowledge_gate_candidate_mismatch_observation = {
                         "plan_sha256": (
                             delegated_knowledge_gate_plan_sha256
@@ -30298,11 +30539,32 @@ async def run_stream(
                                 "request_sent"
                             )
                         ),
+                        "actual_dispatch_attempted": True,
                     }
+                if knowledge_gate_candidate_mismatch_observation is not None:
+                    active_frontier = (
+                        _knowledge_gate_activated_frontier_payload(
+                            delegated_knowledge_gate_plan,
+                            knowledge_gate_decision_receipt,
+                            completed_group_ids=set(
+                                knowledge_gate_group_receipts
+                            ),
+                        )
+                    )
                     boundary_guidance_messages.append(
-                        "The preceding call did not match any still-pending "
-                        "activated Knowledge Gate candidate and therefore did "
-                        "not advance the gate. Do not repeat or vary an "
+                        "The preceding call did not target any still-pending "
+                        "activated Knowledge Gate candidate and therefore "
+                        "did not advance the gate. "
+                        + (
+                            "It was blocked before dispatch because the "
+                            "coordinate mismatch was knowable from its "
+                            "arguments. "
+                            if not knowledge_gate_candidate_mismatch_observation.get(
+                                "actual_dispatch_attempted"
+                            )
+                            else ""
+                        )
+                        + "Do not repeat or vary an "
                         "inactive coordinate. Use one exact candidate from "
                         "this runtime-owned pending frontier: "
                         + json.dumps(
@@ -30411,6 +30673,7 @@ async def run_stream(
                 ):
                     eligible_cross_tool_failure = bool(
                         not tool_completed
+                        and not mandatory_frontier_preflight_denied
                         and display_tool_name in tools
                     )
                     if eligible_cross_tool_failure:
@@ -30528,7 +30791,11 @@ async def run_stream(
                         yield debug_evt
                 if knowledge_gate_candidate_mismatch_observation is not None:
                     for debug_evt in await debug_stream_event(
-                        "knowledge_gate.candidate.dispatch_unmatched",
+                        (
+                            "knowledge_gate.candidate.preflight_rejected"
+                            if mandatory_frontier_preflight_denied
+                            else "knowledge_gate.candidate.dispatch_unmatched"
+                        ),
                         knowledge_gate_candidate_mismatch_observation,
                         tool_name=display_tool_name,
                         tool_call_id=tool_call_id,

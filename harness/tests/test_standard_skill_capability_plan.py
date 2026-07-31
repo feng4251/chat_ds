@@ -22,6 +22,7 @@ from skill_capability_plan import (
     build_skill_process_evidence_receipt,
     callable_skill_result_evidence_outcome,
     capability_call_satisfies_candidate,
+    capability_call_targets_candidate,
     catalog_prompt_payload,
     skill_process_artifact_manifest_sha256,
     validate_capability_plan,
@@ -2303,6 +2304,57 @@ class StandardSkillCapabilityPlanTests(unittest.TestCase):
                 "sha256": required["sha256"],
             },
             skill_resource_complete=True,
+        ))
+
+    def test_call_target_preflight_distinguishes_shared_http_coordinates(self):
+        selected_prefix = "https://selected.vendor.test:443/catalog/"
+        other_prefix = "https://other.vendor.test:443/archive/"
+        candidate = {
+            "id": "selected-http",
+            "kind": "skill_http_prefix",
+            "skill_name": "portable-skill",
+            "tool_name": "skill_http_get",
+            "url_prefix": selected_prefix,
+        }
+        grants = [
+            ("portable-skill", selected_prefix),
+            ("portable-skill", other_prefix),
+        ]
+        self.assertTrue(capability_call_targets_candidate(
+            candidate,
+            tool_name="skill_http_get",
+            args={
+                "url": (
+                    "https://selected.vendor.test:443/catalog/"
+                    "?query=portable"
+                ),
+            },
+            allowed_skill_http_prefixes=grants,
+        ))
+        self.assertFalse(capability_call_targets_candidate(
+            candidate,
+            tool_name="skill_http_get",
+            args={
+                "url": (
+                    "https://other.vendor.test:443/archive/"
+                    "?query=portable"
+                ),
+            },
+            allowed_skill_http_prefixes=grants,
+        ))
+        self.assertFalse(capability_call_targets_candidate(
+            candidate,
+            tool_name="skill_http_get",
+            args={
+                "url": "https://selected.vendor.test:443/catalogue/",
+            },
+            allowed_skill_http_prefixes=grants,
+        ))
+        self.assertFalse(capability_call_targets_candidate(
+            candidate,
+            tool_name="skill_http_post_json",
+            args={"url": selected_prefix},
+            allowed_skill_http_prefixes=grants,
         ))
 
     def test_catalog_identity_covers_authority_bearing_frontmatter(self):
