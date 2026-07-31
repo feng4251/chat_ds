@@ -239,7 +239,6 @@ _CAPABILITY_GAPS_JSON_PATTERN = re.compile(
 _KNOWLEDGE_GATE_GAPS_JSON_PATTERN = re.compile(
     r"(?m)^\s*KNOWLEDGE_GATE_GAPS_JSON:\s*(\{[^\r\n]*\})\s*$"
 )
-
 _MACHINE_GAP_LEDGER_FIELDS = {
     "CAPABILITY_GAPS_JSON": "failed_candidate_ids",
     "KNOWLEDGE_GATE_GAPS_JSON": "gap_ids",
@@ -348,6 +347,121 @@ def _canonicalize_machine_gap_ledger(
     return normalized, audit
 
 
+def _canonicalize_machine_knowledge_gate_check_ledger(
+    content: str,
+    plan: dict[str, Any],
+    receipt_audit: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Persist exact gate-check status without asking the model to repeat it.
+
+    Knowledge-gate decisions and activated-group outcomes are handler-owned
+    typed receipts.  Requiring a child model to restate every check ID creates
+    a second, weaker source of truth and can reject an otherwise valid result.
+    This ledger contains only frozen IDs, decision outcomes, and a status
+    derived from the exact receipt audit; model-authored copies are removed.
+    """
+
+    group_to_check = {
+        str(group.get("id") or ""): str(group.get("check_id") or "")
+        for group in (plan.get("groups") or [])
+        if (
+            isinstance(group, dict)
+            and str(group.get("id") or "")
+            and str(group.get("check_id") or "")
+        )
+    }
+    degraded_check_ids = {
+        str(check_id)
+        for check_id in (receipt_audit.get("unknown_check_ids") or [])
+        if isinstance(check_id, str) and check_id
+    }
+    for field_name in (
+        "failed_group_ids",
+        "unresolved_group_ids",
+        "missing_receipt_group_ids",
+    ):
+        for group_id in receipt_audit.get(field_name) or []:
+            check_id = group_to_check.get(str(group_id or ""))
+            if check_id:
+                degraded_check_ids.add(check_id)
+
+    checks: list[dict[str, str]] = []
+    seen_check_ids: set[str] = set()
+    for decision in receipt_audit.get("decisions") or []:
+        if not isinstance(decision, dict):
+            continue
+        check_id = str(
+            decision.get("check_id") or decision.get("id") or ""
+        ).strip()
+        outcome = str(decision.get("outcome") or "").strip().casefold()
+        if (
+            not check_id
+            or check_id in seen_check_ids
+            or outcome not in {"yes", "no", "unknown"}
+        ):
+            continue
+        seen_check_ids.add(check_id)
+        checks.append({
+            "id": check_id,
+            "decision": outcome,
+            "status": (
+                "degraded" if check_id in degraded_check_ids else "pass"
+            ),
+        })
+
+    original = str(content or "")
+    masked = _mask_markdown_code_for_protocol_audit(original)
+    retained_lines: list[str] = []
+    removed_count = 0
+    visible_prefix = re.compile(r"^\s*KNOWLEDGE_GATE_CHECKS_JSON\s*:")
+    original_lines = original.splitlines(keepends=True)
+    masked_lines = masked.splitlines(keepends=True)
+    for index, original_line in enumerate(original_lines):
+        masked_line = masked_lines[index] if index < len(masked_lines) else ""
+        if visible_prefix.match(masked_line):
+            removed_count += 1
+            continue
+        retained_lines.append(original_line)
+    normalized = "".join(retained_lines).rstrip("\r\n")
+
+    inserted = False
+    if checks:
+        payload = json.dumps(
+            {"checks": checks},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        ledger_line = f"KNOWLEDGE_GATE_CHECKS_JSON: {payload}"
+        lines = normalized.splitlines()
+        terminal_footer = None
+        if lines and lines[-1].strip().startswith("RESULT_FIELDS_JSON:"):
+            terminal_footer = lines.pop()
+        lines.append(ledger_line)
+        if terminal_footer is not None:
+            lines.append(terminal_footer)
+        normalized = "\n".join(lines)
+        inserted = True
+
+    audit = {
+        "ledger_name": "KNOWLEDGE_GATE_CHECKS_JSON",
+        "check_count": len(checks),
+        "checks_sha256": hashlib.sha256(
+            json.dumps(
+                checks,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+        "degraded_check_count": sum(
+            row["status"] == "degraded" for row in checks
+        ),
+        "removed_model_ledger_count": removed_count,
+        "inserted_canonical_ledger": inserted,
+        "content_changed": normalized != original.rstrip("\r\n"),
+    }
+    return normalized, audit
+
+
 def _strict_single_line_json_object(
     raw: str,
     *,
@@ -398,6 +512,7 @@ def _legacy_completion_quality_status(content: str) -> str | None:
             continue
         if raw_line.startswith((
             "CAPABILITY_GAPS_JSON:",
+            "KNOWLEDGE_GATE_CHECKS_JSON:",
             "KNOWLEDGE_GATE_GAPS_JSON:",
         )):
             # These ledgers become authoritative only after the task-scoped
@@ -10766,32 +10881,6 @@ async def _run_child(
         )
     if (
         validation_error is None
-        and required_output_ids
-        and not is_artifact_synthesis
-    ):
-        content_folded = content.casefold()
-        missing_ids = [
-            item for item in required_output_ids
-            if item.casefold() not in content_folded
-        ]
-        if missing_ids:
-            validation_error = (
-                "Delegated step omitted required output/check IDs: "
-                + ", ".join(missing_ids[:30])
-            )
-        else:
-            unaccounted_ids = [
-                item for item in required_output_ids
-                if not _required_output_has_status(content, item)
-            ]
-            if unaccounted_ids:
-                validation_error = (
-                    "Delegated step listed required output/check IDs without a "
-                    "nearby explicit PASS/WARN/FAIL/degraded status: "
-                    + ", ".join(unaccounted_ids[:30])
-                )
-    if (
-        validation_error is None
         and required_result_fields
         and not result_field_audit["footer_valid"]
     ):
@@ -11227,6 +11316,49 @@ async def _run_child(
         )
         if gate_gap_error:
             validation_error = gate_gap_error
+
+    if knowledge_gate_plan is not None and knowledge_gate_receipt_error is None:
+        content, knowledge_check_ledger_canonicalization = (
+            _canonicalize_machine_knowledge_gate_check_ledger(
+                content,
+                knowledge_gate_plan,
+                knowledge_gate_receipt_audit,
+            )
+        )
+        await forward_event(child_event(
+            "debug.knowledge_gate_check_ledger.canonicalized",
+            knowledge_check_ledger_canonicalization,
+        ))
+
+    # Knowledge-gate check IDs are now represented by the handler-owned
+    # canonical ledger above.  All other declared output/check IDs retain the
+    # same strict, content-visible status requirement.
+    if (
+        validation_error is None
+        and required_output_ids
+        and not is_artifact_synthesis
+    ):
+        content_folded = content.casefold()
+        missing_ids = [
+            item for item in required_output_ids
+            if item.casefold() not in content_folded
+        ]
+        if missing_ids:
+            validation_error = (
+                "Delegated step omitted required output/check IDs: "
+                + ", ".join(missing_ids[:30])
+            )
+        else:
+            unaccounted_ids = [
+                item for item in required_output_ids
+                if not _required_output_has_status(content, item)
+            ]
+            if unaccounted_ids:
+                validation_error = (
+                    "Delegated step listed required output/check IDs without a "
+                    "nearby explicit PASS/WARN/FAIL/degraded status: "
+                    + ", ".join(unaccounted_ids[:30])
+                )
 
     for script_runner in ("run_skill_python", "run_skill_script"):
         if not (

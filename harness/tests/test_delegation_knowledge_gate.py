@@ -1974,6 +1974,100 @@ class KnowledgeGateDelegatedChildTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual([], final_audit["payload"]["gap_ids"])
 
+    async def test_handler_receipt_accounts_for_unactivated_gate_check_id(self):
+        """A valid typed decision must not depend on model ID repetition."""
+
+        plan = json.loads(json.dumps(_native_plan()))
+        plan["checks"][0]["branches"][0]["outcome"] = "no"
+        plan["groups"][0]["outcome"] = "no"
+        plan_sha256 = _digest(plan)
+        decision_args = {
+            "plan_sha256": plan_sha256,
+            "decisions": [{
+                "check_id": "KG-1",
+                "outcome": "yes",
+                "reason": "The preloaded source is sufficient.",
+            }],
+        }
+        accepted = validate_knowledge_gate_decisions(
+            plan,
+            expected_sha256=plan_sha256,
+            supplied_sha256=plan_sha256,
+            decisions=decision_args["decisions"],
+        )
+        decision_receipt = build_knowledge_gate_decision_receipt(accepted)
+
+        async def fake_run_stream(*args, **kwargs):
+            self.assertEqual(plan, kwargs["knowledge_gate_plan"])
+            yield {
+                "type": "agent_event",
+                "event_type": "tool.started",
+                "tool_name": "submit_knowledge_gate_decisions",
+                "tool_call_id": "decision-1",
+                "payload": {
+                    "tool_name": "submit_knowledge_gate_decisions",
+                    "tool_call_id": "decision-1",
+                    "args_compacted": decision_args,
+                },
+            }
+            yield {
+                "type": "agent_event",
+                "event_type": "tool.completed",
+                "tool_name": "submit_knowledge_gate_decisions",
+                "tool_call_id": "decision-1",
+                "payload": {
+                    "tool_name": "submit_knowledge_gate_decisions",
+                    "tool_call_id": "decision-1",
+                    "outcome": "success",
+                    "actual_dispatch_attempted": True,
+                    "exact_capability_receipt": {
+                        "result_data": {},
+                        "knowledge_gate_decision_receipt": decision_receipt,
+                    },
+                },
+            }
+            # The model deliberately omits KG-1. The exact handler receipt is
+            # the authority for that already-decided control-plane state.
+            yield {"type": "delta", "content": '{"finding":"bounded"}'}
+            yield {"type": "done", "finish_reason": "stop"}
+
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                return_value="results/gate-worker.txt",
+            ),
+        ):
+            result = await _run_child(
+                {
+                    "goal": "perform one bounded evidence check",
+                    "skill_name": "generic-skill",
+                    "worker_id": "worker-a",
+                    "step_type": "knowledge_bootstrap",
+                    "tools": [
+                        "submit_knowledge_gate_decisions",
+                        "web_search",
+                    ],
+                    "required_output_ids": ["KG-1"],
+                    "knowledge_gate_plan": plan,
+                    "knowledge_gate_plan_sha256": plan_sha256,
+                },
+                _context(
+                    "submit_knowledge_gate_decisions",
+                    "web_search",
+                ),
+                0,
+            )
+
+        self.assertEqual("completed", result["status"])
+        self.assertIn("KNOWLEDGE_GATE_CHECKS_JSON", result["summary"])
+        self.assertIn('"id":"KG-1"', result["summary"])
+        self.assertIn('"status":"pass"', result["summary"])
+        self.assertEqual(
+            [],
+            result["knowledge_gate_receipt_audit"]["activated_group_ids"],
+        )
+
     async def test_decision_receipt_survives_secret_free_dispatch_projection(
         self,
     ):
