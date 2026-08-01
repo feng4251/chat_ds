@@ -979,6 +979,16 @@ _SUBSTANTIVE_RESULT_SIGNAL_PATTERN = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+_EMPTY_RESULT_SET_PATTERN = re.compile(
+    r"\b(?:zero|no)\s+(?:matching\s+|eligible\s+|qualifying\s+)?"
+    r"(?:rows?|records?|results?|items?|entries|matches|cases|documents?|"
+    r"studies|trials|events?)\b|"
+    r"\b(?:empty|zero-length)\s+(?:result|record|row|match)\s*set\b|"
+    r"(?:零|没有|无)(?:条|个|项)?(?:匹配|符合条件)?"
+    r"(?:记录|结果|条目|病例|文档|研究|试验|事件)",
+    re.IGNORECASE,
+)
+
 # Free-prose delegates may legitimately return a compact fact, label, or
 # transformation.  The historical 200-character floor confused size with
 # semantics, so short results are now rejected only for bounded, domain-neutral
@@ -5057,6 +5067,58 @@ def _is_process_narration_only(content: str) -> bool:
     if len(process_markers) < 3:
         return False
     return _SUBSTANTIVE_RESULT_SIGNAL_PATTERN.search(value) is None
+
+
+def _structured_value_is_substantive(value: Any, depth: int = 0) -> bool:
+    """Return whether a JSON value contains at least one semantic leaf.
+
+    Empty containers are valid JSON and may be valid for an individual field,
+    but a ledger made entirely from empty containers cannot by itself prove a
+    delegated task completed. Boolean false and numeric zero remain semantic
+    values; this is deliberately not a truthiness check.
+    """
+
+    if depth > 16 or value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (bool, int, float)):
+        return True
+    if isinstance(value, dict):
+        return bool(value) and any(
+            _structured_value_is_substantive(item, depth + 1)
+            for item in value.values()
+        )
+    if isinstance(value, list):
+        return bool(value) and any(
+            _structured_value_is_substantive(item, depth + 1)
+            for item in value
+        )
+    return False
+
+
+def _typed_result_substantive_body(content: str) -> str:
+    """Return model-authored body text that can explain an all-empty ledger.
+
+    Harness-owned receipt/quality ledgers remain authoritative audit metadata,
+    but they are not a substitute for a result. Strip those single-line
+    machine records before deciding whether an otherwise schema-valid empty
+    typed ledger is accompanied by a substantive zero-result explanation.
+    """
+
+    retained, _removed = strip_result_fields_candidate_tail(content)
+    machine_prefixes = (
+        "[HARNESS_",
+        "CAPABILITY_GAPS_JSON:",
+        "COMPLETION_QUALITY_JSON:",
+        "KNOWLEDGE_GATE_CHECKS_JSON:",
+        "KNOWLEDGE_GATE_GAPS_JSON:",
+    )
+    return "\n".join(
+        line
+        for line in retained.splitlines()
+        if not line.strip().startswith(machine_prefixes)
+    ).strip()
 
 
 def _normalized_terminal_prose(content: str) -> str:
@@ -10851,32 +10913,13 @@ async def _run_child(
     structured_result = False
     structured_container = False
 
-    def structured_value_is_substantive(value: Any, depth: int = 0) -> bool:
-        if depth > 16 or value is None:
-            return False
-        if isinstance(value, str):
-            return bool(value.strip())
-        if isinstance(value, (bool, int, float)):
-            return True
-        if isinstance(value, dict):
-            return bool(value) and any(
-                structured_value_is_substantive(item, depth + 1)
-                for item in value.values()
-            )
-        if isinstance(value, list):
-            return bool(value) and any(
-                structured_value_is_substantive(item, depth + 1)
-                for item in value
-            )
-        return False
-
     if stripped_content:
         try:
             parsed_structured = json.loads(stripped_content)
             structured_container = isinstance(parsed_structured, (dict, list))
             structured_result = bool(
                 structured_container
-                and structured_value_is_substantive(parsed_structured)
+                and _structured_value_is_substantive(parsed_structured)
             )
         except (TypeError, ValueError, json.JSONDecodeError):
             structured_container = False
@@ -10933,6 +10976,65 @@ async def _run_child(
             + ". Missing/invalid fields: "
             + ", ".join(result_field_audit["missing"][:30])
         )
+    typed_result_semantic_audit: dict[str, Any] = {
+        "all_fields_structurally_empty": False,
+        "non_substantive_fields": [],
+        "substantive_body": False,
+        "empty_ledger_justified": False,
+        "body_audit_reason": "typed_footer_not_validated",
+    }
+    if (
+        validation_error is None
+        and required_result_fields
+        and result_field_audit.get("footer_valid") is True
+    ):
+        semantic_ledger = _validated_typed_result_ledger(
+            content,
+            result_field_audit,
+        )
+        non_substantive_fields = [
+            field
+            for field in required_result_fields
+            if field in semantic_ledger
+            and not _structured_value_is_substantive(
+                semantic_ledger.get(field)
+            )
+        ]
+        all_fields_structurally_empty = bool(
+            required_result_fields
+            and len(non_substantive_fields) == len(required_result_fields)
+        )
+        substantive_body = _typed_result_substantive_body(content)
+        body_audit = _audit_free_prose_result(substantive_body, goal)
+        body_is_substantive = bool(
+            body_audit.get("valid")
+            and not _is_process_narration_only(substantive_body)
+        )
+        empty_ledger_justified = bool(
+            body_is_substantive
+            and (
+                _EMPTY_RESULT_SET_PATTERN.search(substantive_body)
+                or _DEGRADED_GAP_PATTERN.search(substantive_body)
+            )
+        )
+        typed_result_semantic_audit = {
+            "all_fields_structurally_empty": (
+                all_fields_structurally_empty
+            ),
+            "non_substantive_fields": non_substantive_fields,
+            "substantive_body": body_is_substantive,
+            "empty_ledger_justified": empty_ledger_justified,
+            "body_chars": len(substantive_body),
+            "body_audit_reason": body_audit.get("reason"),
+        }
+        if all_fields_structurally_empty and not empty_ledger_justified:
+            validation_error = (
+                "Delegated typed result is schema-valid but semantically "
+                "empty: every required field is an empty/null value and no "
+                "substantive zero-result or degraded explanation accompanies "
+                "the ledger. Empty containers are not generic unavailable "
+                "markers."
+            )
     if validation_error is None and is_artifact_synthesis:
         if not artifact_receipts:
             validation_error = (
@@ -12040,6 +12142,7 @@ async def _run_child(
                 error is None and free_prose_audit.get("valid") is True
             ),
             "free_prose_audit_reason": free_prose_audit.get("reason"),
+            "typed_result_semantic_audit": typed_result_semantic_audit,
         },
         "reasoning_summary": (
             reasoning[-1000:] if reasoning and error is None else ""

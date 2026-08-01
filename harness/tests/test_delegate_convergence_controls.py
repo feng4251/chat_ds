@@ -1955,6 +1955,63 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(continuation_events[0]["payload"]["remaining_iterations"], 1)
         self.assertEqual(events[-1], {"type": "done", "finish_reason": "stop"})
 
+    async def test_length_completion_at_budget_edge_still_finalizes_footer(self):
+        prefix = (
+            "# Evidence\n"
+            + "Retained source-backed finding with provenance. " * 40
+        )
+        suffix = (
+            "\n## Conclusion\n"
+            "The bounded evidence supports the stated finding; unavailable "
+            "sources remain explicit gaps."
+        )
+        responses = [
+            _tool_call_response("call-edge-search-1"),
+            _tool_call_response("call-edge-search-2"),
+            _visible_length_response(prefix),
+            _stop_response(suffix),
+            _stop_response(_result_fields_footer("evidence")),
+        ]
+
+        request_bodies, dispatch_mock, events, _persisted = await self._run(
+            responses,
+            max_iterations=4,
+            dispatch_result=json.dumps({
+                "status": "ok",
+                "results": [{"title": "bounded evidence"}],
+            }),
+            required_result_fields=["evidence"],
+        )
+
+        self.assertFalse(responses)
+        self.assertEqual(len(request_bodies), 5)
+        self.assertEqual(dispatch_mock.await_count, 2)
+        self.assertTrue(all("tools" not in body for body in request_bodies[2:4]))
+        self.assertEqual(
+            request_bodies[4]["tools"][0]["function"]["name"],
+            "submit_result_fields",
+        )
+        requested = next(
+            event for event in events
+            if event.get("event_type")
+            == "debug.delegate.result_footer_repair.requested"
+        )
+        self.assertEqual(
+            requested["payload"]["origin"],
+            "synthesis_length_continuation",
+        )
+        self.assertTrue(requested["payload"]["main_iteration_budget_exhausted"])
+        self.assertTrue(requested["payload"]["finalization_slot_borrowed"])
+        emitted = "".join(
+            str(event.get("content") or "")
+            for event in events
+            if event.get("type") == "delta"
+        )
+        self.assertEqual(emitted.count("# Evidence"), 1)
+        self.assertEqual(emitted.count("## Conclusion"), 1)
+        self.assertEqual(emitted.count("RESULT_FIELDS_JSON:"), 1)
+        self.assertEqual(events[-1], {"type": "done", "finish_reason": "stop"})
+
     async def test_synthesis_length_continuation_is_bounded_to_one(self):
         responses = [
             _tool_call_response("call-bounded-1"),
@@ -2569,7 +2626,7 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
                 {"type": "done", "finish_reason": "stop"},
             )
 
-    async def test_visible_recovery_bad_footer_with_zero_budget_does_not_expand(self):
+    async def test_visible_recovery_uses_independent_footer_finalizer(self):
         malformed = 'RESULT_FIELDS_JSON: {"wrong_key":'
         responses = [
             _tool_call_response("call-visible-footer-no-budget"),
@@ -2578,9 +2635,9 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
             _stop_response(_result_fields_footer("study_id")),
         ]
 
-        # Use a one-turn synthesis reserve to exercise the exact state where
-        # visible recovery consumes the final existing iteration. The bridge
-        # must not manufacture a fourth turn.
+        # Use a one-turn synthesis reserve to exercise the exact production
+        # failure where visible recovery consumes the final ordinary
+        # iteration. The isolated footer validator owns one independent slot.
         with patch("agent_loop._DELEGATE_SYNTHESIS_TURN_RESERVE", 1):
             request_bodies, dispatch_mock, events, _persisted = await self._run(
                 responses,
@@ -2589,22 +2646,18 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
                 required_result_fields=["study_id"],
             )
 
-        self.assertEqual(len(request_bodies), 3)
-        self.assertEqual(len(responses), 1)
+        self.assertEqual(len(request_bodies), 4)
+        self.assertFalse(responses)
         self.assertEqual(dispatch_mock.await_count, 1)
-        self.assertFalse(any(
-            event.get("event_type")
-            == "debug.delegate.result_footer_repair.requested"
-            for event in events
-        ))
-        unavailable = next(
+        requested = next(
             event for event in events
             if event.get("event_type")
-            == "debug.delegate.result_footer_repair.unavailable"
+            == "debug.delegate.result_footer_repair.requested"
         )
+        self.assertTrue(requested["payload"]["finalization_slot_borrowed"])
         self.assertEqual(
-            unavailable["payload"]["reason"],
-            "iteration_budget_exhausted",
+            requested["payload"]["finalization_budget_kind"],
+            "independent_output_validation",
         )
         emitted = "".join(
             str(event.get("content") or "")
@@ -3014,7 +3067,7 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.assertEqual(events[-1]["type"], "error")
 
-    async def test_stream_repair_bad_footer_with_zero_budget_does_not_expand(self):
+    async def test_stream_repair_bad_footer_uses_finalization_slot(self):
         responses = [
             _partial_corrupt_tool_response(),
             _tool_call_response(
@@ -3035,23 +3088,15 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
             required_result_fields=["study_id"],
         )
 
-        self.assertEqual(len(request_bodies), 3)
-        self.assertEqual(len(responses), 1)
+        self.assertEqual(len(request_bodies), 4)
+        self.assertFalse(responses)
         self.assertEqual(dispatch_mock.await_count, 1)
-        self.assertFalse(any(
-            event.get("event_type")
-            == "debug.delegate.result_footer_repair.requested"
-            for event in events
-        ))
-        unavailable = next(
+        requested = next(
             event for event in events
             if event.get("event_type")
-            == "debug.delegate.result_footer_repair.unavailable"
+            == "debug.delegate.result_footer_repair.requested"
         )
-        self.assertEqual(
-            unavailable["payload"]["reason"],
-            "iteration_budget_exhausted",
-        )
+        self.assertTrue(requested["payload"]["finalization_slot_borrowed"])
         self.assertEqual(events[-1], {"type": "done", "finish_reason": "stop"})
 
     async def test_valid_typed_footer_does_not_trigger_repair(self):
@@ -3077,13 +3122,13 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.assertEqual(events[-1], {"type": "done", "finish_reason": "stop"})
 
-    async def test_missing_footer_with_no_remaining_budget_goes_to_outer_audit(self):
+    async def test_missing_footer_after_last_turn_uses_finalization_slot(self):
         responses = [
             _stop_response(
                 "# Findings\nstatus: PASS\nEvidence: substantive but the "
                 "typed footer is absent. " * 8
             ),
-            _stop_response("must not be requested"),
+            _stop_response(_result_fields_footer("study_id")),
         ]
 
         request_bodies, dispatch_mock, events, _persisted = await self._run(
@@ -3093,20 +3138,17 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
             required_result_fields=["study_id"],
         )
 
-        self.assertEqual(len(request_bodies), 1)
-        self.assertEqual(len(responses), 1)
+        self.assertEqual(len(request_bodies), 2)
+        self.assertFalse(responses)
         self.assertEqual(dispatch_mock.await_count, 0)
-        unavailable = [
+        requested = [
             event
             for event in events
             if event.get("event_type")
-            == "debug.delegate.result_footer_repair.unavailable"
+            == "debug.delegate.result_footer_repair.requested"
         ]
-        self.assertEqual(len(unavailable), 1)
-        self.assertEqual(
-            unavailable[0]["payload"]["reason"],
-            "iteration_budget_exhausted",
-        )
+        self.assertEqual(len(requested), 1)
+        self.assertTrue(requested[0]["payload"]["finalization_slot_borrowed"])
         self.assertEqual(events[-1], {"type": "done", "finish_reason": "stop"})
 
     async def test_invalid_footer_repair_is_not_repeated(self):
