@@ -2510,6 +2510,104 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, persisted.count("RESULT_FIELDS_JSON:"))
         self.assertTrue(persisted.rstrip().endswith(valid_footer))
 
+    async def test_structured_projection_replaces_protocol_contaminated_turn(self):
+        contaminated = (
+            "# Inventory reconciliation\n"
+            "The bounded warehouse receipts were reviewed.\n"
+            "<tool_call><arguments>{\"query\":\"pending\"}"
+            "</arguments></tool_call>"
+        )
+        valid_footer = "RESULT_FIELDS_JSON: " + json.dumps({
+            "shipment_status": {
+                "status": "degraded",
+                "reason": "one registry remained unavailable",
+                "provenance": "bounded receipt ledger",
+            },
+        })
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            boundary_sink = kwargs["turn_boundary_sink"]
+            await boundary_sink({"phase": "started", "iteration": 1})
+            yield {"type": "delta", "content": contaminated}
+            await boundary_sink({
+                "phase": "finished",
+                "iteration": 1,
+                "finish_reason": "stop",
+            })
+            await boundary_sink({
+                "phase": "started",
+                "iteration": 2,
+                "delegate_result_footer_repair": True,
+                "delegate_result_footer_repair_origin": (
+                    "raw_pseudo_tool_protocol_evidence_projection"
+                ),
+                "delegate_result_footer_repair_discard_invalid_tail": True,
+                (
+                    "delegate_result_footer_repair_"
+                    "replace_invalid_source_turn"
+                ): True,
+            })
+            # The provider's internal submitter call is control-plane only.
+            await boundary_sink({
+                "phase": "finished",
+                "iteration": 2,
+                "finish_reason": "tool_calls",
+            })
+            await boundary_sink({
+                "phase": "started",
+                "iteration": 2,
+                "delegate_result_footer_repair": True,
+                "delegate_result_footer_repair_origin": (
+                    "raw_pseudo_tool_protocol_evidence_projection"
+                ),
+                "delegate_result_footer_repair_discard_invalid_tail": True,
+                "internal_structured_submitter_release": True,
+            })
+            yield {"type": "delta", "content": "\n" + valid_footer}
+            await boundary_sink({
+                "phase": "finished",
+                "iteration": 2,
+                "finish_reason": "stop",
+            })
+            yield {
+                "type": "agent_event",
+                "event_type": "run.completed",
+                "payload": {
+                    "finish_reason": "stop",
+                    "terminal_reason": (
+                        "delegated_result_footer_structured_repair"
+                    ),
+                },
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                return_value="results/delegate_inventory_projection.md",
+            ) as persist_result,
+        ):
+            result = await _run_child(
+                {
+                    "goal": "return typed shipment evidence",
+                    "required_result_fields": ["shipment_status"],
+                },
+                _context(),
+                0,
+            )
+
+        self.assertEqual("completed", result["status"])
+        self.assertEqual(
+            "delegated_result_footer_structured_repair",
+            result["terminal_reason"],
+        )
+        persisted = persist_result.call_args.args[0]
+        self.assertNotIn("<tool_call>", persisted)
+        self.assertNotIn("Inventory reconciliation", persisted)
+        self.assertEqual(valid_footer, persisted.strip())
+        self.assertEqual(0, result["output_protocol_audit"]["detected_count"])
+
     async def test_visible_footer_bridge_failure_is_retryable_without_mutation(self):
         async def fake_run_stream(model_id, messages, tools, **kwargs):
             boundary_sink = kwargs["turn_boundary_sink"]

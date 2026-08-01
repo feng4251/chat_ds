@@ -5375,6 +5375,21 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(repair_gates[0]["payload"]["evidence_capsule"])
         self.assertFalse(repair_gates[0]["payload"]["raw_protocol_replayed"])
+        repair_iterations = [
+            event["payload"]
+            for event in events
+            if event.get("event_type") == "debug.iteration.started"
+            and event.get("payload", {}).get(
+                "delegate_result_footer_repair"
+            )
+        ]
+        self.assertEqual(1, len(repair_iterations))
+        self.assertTrue(
+            repair_iterations[0][
+                "delegate_result_footer_repair_"
+                "replace_invalid_source_turn"
+            ]
+        )
         completed = next(
             event for event in events
             if event.get("event_type")

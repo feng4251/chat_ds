@@ -17994,6 +17994,7 @@ async def run_stream(
         *,
         footer_error: Any,
         origin: str,
+        replace_invalid_source_turn: bool = False,
     ) -> dict[str, Any]:
         """Queue the run-scoped, exact-one-line delegated footer correction."""
         nonlocal delegate_result_footer_repair_attempted
@@ -18063,6 +18064,9 @@ async def run_stream(
         pending_delegate_result_footer_repair_context = {
             "retained_source": bounded_source,
             "source_shape": source_shape,
+            "replace_invalid_source_turn": bool(
+                replace_invalid_source_turn
+            ),
         }
         previous_length_content = ""
         forced_workflow_policy = None
@@ -18081,6 +18085,9 @@ async def run_stream(
             "tools_exposed_next_turn": 1,
             "internal_submitter": True,
             "registry_dispatch_allowed": False,
+            "replace_invalid_source_turn": bool(
+                replace_invalid_source_turn
+            ),
             **source_shape,
         }
 
@@ -21022,6 +21029,13 @@ async def run_stream(
             else None
         )
         pending_delegate_result_footer_repair_context = None
+        iteration_result_footer_repair_replaces_source = bool(
+            iteration_result_footer_repair
+            and isinstance(iteration_result_footer_repair_context, dict)
+            and iteration_result_footer_repair_context.get(
+                "replace_invalid_source_turn"
+            )
+        )
         iteration_output_contract_repair = (
             pending_delegate_output_contract_repair
         )
@@ -21700,6 +21714,9 @@ async def run_stream(
             ),
             "delegate_result_footer_repair_discard_invalid_tail": bool(
                 iteration_result_footer_repair
+            ),
+            "delegate_result_footer_repair_replace_invalid_source_turn": (
+                iteration_result_footer_repair_replaces_source
             ),
             "delegate_output_contract_repair": (
                 iteration_output_contract_repair
@@ -28046,6 +28063,12 @@ async def run_stream(
                             if protocol_invalid
                             else "post_dispatch_typed_footer_evidence_projection"
                         ),
+                        # A closed structured projection supersedes a
+                        # protocol-contaminated terminal sample.  The source
+                        # sample is evidence-capsule input, not part of the
+                        # committed child result.  A merely malformed typed
+                        # footer still retains its clean substantive body.
+                        replace_invalid_source_turn=protocol_invalid,
                     )
                     repair_debug.update({
                         "reason": (

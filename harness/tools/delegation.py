@@ -7799,6 +7799,12 @@ async def _run_child(
                 "delegate_result_footer_repair_discard_invalid_tail"
             )
         )
+        replace_invalid_source_turn = bool(
+            appends_to_previous_terminal
+            and next_boundary.get(
+                "delegate_result_footer_repair_replace_invalid_source_turn"
+            )
+        )
         discard_invalid_visible_prefix_tail = bool(
             continuing
             and next_boundary.get(
@@ -7824,7 +7830,20 @@ async def _run_child(
         # also append-only and remain retained for visible-length recovery.
         if continuing and finish_reason in {"", "stop"}:
             discard_turn = not appends_to_previous_terminal
-        if (
+        if replace_invalid_source_turn:
+            # A protocol-contaminated terminal sample has already been
+            # replaced by an isolated, schema-validated control-plane
+            # projection.  It is not a report prefix: committing any part of
+            # that sample would make the outer authoritative audit reject the
+            # very replacement that the inner transaction accepted.  Drop
+            # this turn atomically while retaining any earlier committed
+            # terminal segment (ordinary malformed-footer repair continues to
+            # use the append/strip branch below).
+            discarded_interim_content_chars += len(current_turn_content)
+            discarded_interim_reasoning_chars += len(
+                current_turn_reasoning
+            )
+        elif (
             discard_invalid_footer_tail
             or discard_invalid_visible_prefix_tail
             or discard_invalid_synthesis_prefix_tail
