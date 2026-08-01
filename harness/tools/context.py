@@ -142,6 +142,13 @@ class ToolContext:
     )
     knowledge_gate_plan_sha256: str = field(default="", repr=False)
     allowed_read_paths: tuple[str, ...] = ()
+    # Opaque handles for complete oversized tool outputs created by this run.
+    # The model cannot mint these from paths; read_tool_result requires exact
+    # membership and still performs session-root/no-symlink validation.
+    allowed_tool_result_handles: tuple[str, ...] = field(
+        default=(),
+        repr=False,
+    )
     # Artifact-synthesis delegates receive a runtime-owned closed write set.
     # This is separate from the read/resource boundary: model-authored task
     # arguments can narrow the set but can never widen it.  An enabled boundary

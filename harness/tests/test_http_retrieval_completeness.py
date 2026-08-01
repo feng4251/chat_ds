@@ -29,6 +29,7 @@ def _receipt(
     full_body: str | None = None,
     wire_complete: bool | None = None,
     hard_max_chars: int | None = None,
+    body_spilled_complete: bool = False,
 ) -> dict:
     scan_body = full_body if full_body is not None else body
     return build_http_retrieval_receipt(
@@ -40,6 +41,7 @@ def _receipt(
             scan_body if wire_complete is not False else None
         ),
         body_truncated=truncated,
+        body_spilled_complete=body_spilled_complete,
         wire_body_complete=wire_complete,
         response_bytes_read=len(scan_body.encode("utf-8")),
         response_byte_limit=400_000,
@@ -210,6 +212,40 @@ class RetrievalCompletenessReceiptTests(unittest.TestCase):
             RETRIEVAL_QUALITY_IMPACT_DEGRADED,
             tracker.closure_quality_impact("bounded"),
         )
+
+    def test_lossless_spill_closes_body_truncation_but_not_pagination(self):
+        tracker = RetrievalCompletenessTracker()
+        complete = tracker.observe(_receipt(
+            "https://api.museum.test/catalog?q=bronze",
+            '{"items":[1',
+            number=1,
+            truncated=True,
+            max_chars=10,
+            full_body='{"items":[1,2,3]}',
+            wire_complete=True,
+            hard_max_chars=100,
+            body_spilled_complete=True,
+        ))
+        self.assertEqual(0, complete["open_chain_count"])
+        self.assertFalse(tracker.requires_mandatory_continuation("bounded"))
+
+        paged = tracker.observe(_receipt(
+            "https://api.museum.test/catalog?q=ceramic",
+            '{"items":[1',
+            number=2,
+            truncated=True,
+            max_chars=10,
+            full_body='{"items":[1],"nextPageToken":"A"}',
+            wire_complete=True,
+            hard_max_chars=100,
+            body_spilled_complete=True,
+        ))
+        self.assertEqual(1, paged["open_chain_count"])
+        self.assertEqual(
+            {"pagination_more_available": 1},
+            paged["open_reasons"],
+        )
+        self.assertFalse(tracker.requires_mandatory_continuation("bounded"))
 
     def test_bounded_mandatory_repair_preempts_older_optional_cursor(self):
         tracker = RetrievalCompletenessTracker()

@@ -284,18 +284,62 @@ class SkillHttpPostJsonTests(unittest.IsolatedAsyncioTestCase):
         _FakeSession.response = _FakeResponse(body=b'{"long":"response"}')
         dns_patch, session_patch = self._network_patches()
         with dns_patch, session_patch:
-            bounded = json.loads(await skill_http.skill_http_post_json(
-                "https://api.vendor.test/v1/graphql",
-                {"query": "{ ping }"},
-                max_chars=5,
-                context=self.context,
-            ))
+            with patch.object(
+                skill_http,
+                "persist_tool_result_spill",
+                return_value=None,
+            ):
+                bounded = json.loads(await skill_http.skill_http_post_json(
+                    "https://api.vendor.test/v1/graphql",
+                    {"query": "{ ping }"},
+                    max_chars=5,
+                    context=self.context,
+                ))
         self.assertTrue(bounded["body_truncated"])
         self.assertEqual(5, bounded["body_chars"])
         self.assertEqual("incomplete", bounded["retrieval"]["state"])
         self.assertIn(
             "body_truncated",
             bounded["retrieval"]["incomplete_reasons"],
+        )
+
+    async def test_complete_large_post_body_is_losslessly_spilled(self):
+        full = json.dumps({
+            "data": {"records": [{"text": "x" * 300}]},
+        }).encode("utf-8")
+        _FakeSession.response = _FakeResponse(body=full)
+        handle = "tool-result:complete-post-body.txt"
+        dns_patch, session_patch = self._network_patches()
+        with (
+            dns_patch,
+            session_patch,
+            patch.object(skill_http, "MAX_CHARS", 100),
+            patch.object(
+                skill_http,
+                "persist_tool_result_spill",
+                return_value=handle,
+            ) as persist,
+        ):
+            result = json.loads(await skill_http.skill_http_post_json(
+                "https://api.vendor.test/v1/graphql",
+                {"query": "{ records { id } }"},
+                max_chars=100,
+                context=self.context,
+            ))
+
+        receipt = result["retrieval"]
+        self.assertTrue(result["body_truncated"])
+        self.assertTrue(result["body_spilled_complete"])
+        self.assertEqual(handle, result["body_result_handle"])
+        self.assertEqual("complete", receipt["state"])
+        self.assertEqual([], receipt["incomplete_reasons"])
+        self.assertTrue(receipt["body_retrievable_complete"])
+        self.assertIsNone(receipt["continuation_action"])
+        persist.assert_called_once_with(
+            full.decode("utf-8"),
+            "skill_http_post_json_body",
+            user_id="post-user",
+            session_id="post-session",
         )
 
     async def test_post_complete_wire_scan_builds_exact_limit_repage(self):
@@ -313,6 +357,11 @@ class SkillHttpPostJsonTests(unittest.IsolatedAsyncioTestCase):
             dns_patch,
             session_patch,
             patch.object(skill_http, "MAX_CHARS", 100),
+            patch.object(
+                skill_http,
+                "persist_tool_result_spill",
+                return_value=None,
+            ),
         ):
             result = json.loads(await skill_http.skill_http_post_json(
                 "https://api.vendor.test/v1/graphql",

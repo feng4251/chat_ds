@@ -896,6 +896,11 @@ class SkillHttpToolTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(skill_http.aiohttp, "ClientSession", _FakeSession),
             patch.object(skill_http, "MAX_CHARS", 100),
+            patch.object(
+                skill_http,
+                "persist_tool_result_spill",
+                return_value=None,
+            ),
         ):
             result = json.loads(await skill_http.skill_http_get(
                 "https://api.vendor.test/v1/search?q=x&pageSize=50",
@@ -923,6 +928,47 @@ class SkillHttpToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("restart_with_smaller_page", action["kind"])
         self.assertIn("pageSize=", action["args"]["url"])
         self.assertNotIn("pageSize=50", action["args"]["url"])
+
+    async def test_complete_large_wire_body_is_losslessly_spilled(self) -> None:
+        full = json.dumps({
+            "items": [{"text": "x" * 300}],
+        }).encode("utf-8")
+        _FakeSession.response = _FakeResponse(body=full)
+        handle = "tool-result:complete-http-body.txt"
+        with (
+            patch.object(
+                skill_http,
+                "_public_addresses",
+                AsyncMock(return_value=(("203.0.113.10", 2),)),
+            ),
+            patch.object(skill_http.aiohttp, "ClientSession", _FakeSession),
+            patch.object(skill_http, "MAX_CHARS", 100),
+            patch.object(
+                skill_http,
+                "persist_tool_result_spill",
+                return_value=handle,
+            ) as persist,
+        ):
+            result = json.loads(await skill_http.skill_http_get(
+                "https://api.vendor.test/v1/search?q=x",
+                max_chars=100,
+                context=self.context,
+            ))
+
+        receipt = result["retrieval"]
+        self.assertTrue(result["body_truncated"])
+        self.assertTrue(result["body_spilled_complete"])
+        self.assertEqual(handle, result["body_result_handle"])
+        self.assertEqual("complete", receipt["state"])
+        self.assertEqual([], receipt["incomplete_reasons"])
+        self.assertTrue(receipt["body_retrievable_complete"])
+        self.assertIsNone(receipt["continuation_action"])
+        persist.assert_called_once_with(
+            full.decode("utf-8"),
+            "skill_http_get_body",
+            user_id="u",
+            session_id="s",
+        )
 
     async def test_wire_byte_truncation_is_not_parsed_and_reduces_page_size(self) -> None:
         full = json.dumps({

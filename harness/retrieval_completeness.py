@@ -1362,6 +1362,7 @@ def build_http_retrieval_receipt(
     request_body: Mapping[str, Any] | None,
     response_body: str,
     body_truncated: bool,
+    body_spilled_complete: bool = False,
     response_bytes_read: int,
     response_byte_limit: int,
     response_chars_returned: int,
@@ -1382,6 +1383,12 @@ def build_http_retrieval_receipt(
         # cannot prove that a truncated payload was completely read.
         wire_body_complete = visible_body_complete
     wire_body_complete = bool(wire_body_complete)
+    body_spilled_complete = bool(
+        body_spilled_complete and wire_body_complete
+    )
+    body_retrievable_complete = bool(
+        visible_body_complete or body_spilled_complete
+    )
     scan_body = (
         pagination_scan_body
         if wire_body_complete and isinstance(pagination_scan_body, str)
@@ -1415,7 +1422,7 @@ def build_http_retrieval_receipt(
         ),
     )
     reasons: list[str] = []
-    if body_truncated:
+    if body_truncated and not body_spilled_complete:
         reasons.append("body_truncated")
     if signals.get("has_more") is True:
         reasons.append("pagination_more_available")
@@ -1452,7 +1459,9 @@ def build_http_retrieval_receipt(
         request_url=request_url,
         request_body=request_body,
         request_timeout=request_timeout,
-        body_truncated=bool(body_truncated),
+        body_truncated=bool(
+            body_truncated and not body_spilled_complete
+        ),
         wire_body_complete=wire_body_complete,
         response_chars_read=chars_read,
         response_char_limit=max(1, int(response_char_limit)),
@@ -1470,6 +1479,8 @@ def build_http_retrieval_receipt(
         "state": "incomplete" if reasons else "complete",
         "incomplete_reasons": reasons,
         "body_truncated": bool(body_truncated),
+        "body_spilled_complete": body_spilled_complete,
+        "body_retrievable_complete": body_retrievable_complete,
         "visible_body_complete": visible_body_complete,
         "wire_body_complete": wire_body_complete,
         "response_bytes_read": max(0, int(response_bytes_read)),
@@ -1857,7 +1868,13 @@ class RetrievalCompletenessTracker:
         response_char_limit = max(
             1, int(receipt.get("response_char_limit") or 1)
         )
-        current_body_truncated = bool(receipt.get("body_truncated"))
+        # A losslessly spilled complete wire body is visibly truncated but no
+        # longer an unresolved evidence obligation.  Drive chain state from
+        # the producer's incomplete reasons, not the presentation flag.
+        current_body_truncated = "body_truncated" in {
+            str(item)
+            for item in (receipt.get("incomplete_reasons") or [])
+        }
         continuation_action = receipt.get("continuation_action")
         if not (
             isinstance(continuation_action, dict)
