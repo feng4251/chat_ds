@@ -16,6 +16,7 @@ from tool_call_stream import (
     ToolCallStreamAssembly,
 )
 from tools.registry import ToolPreflightResult, registry as native_tool_registry
+from tools.tool_result_reader import READ_TOOL_RESULT_SCHEMA
 
 
 def _tool_call_response(
@@ -447,6 +448,125 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
             {"type": "done", "finish_reason": "stop"},
             events[-1],
         )
+
+    async def test_http_body_spill_handle_is_granted_for_bounded_readback(self):
+        url = "https://api.vendor.test/search?q=evidence"
+        handle = "tool-result:skill_http_get_body_123.txt"
+        full_body = '{"items":[{"text":"' + ("x" * 300) + '"}]}'
+        visible = full_body[:100]
+        receipt = build_http_retrieval_receipt(
+            method="GET",
+            request_url=url,
+            request_body=None,
+            response_body=visible,
+            body_truncated=True,
+            body_spilled_complete=True,
+            wire_body_complete=True,
+            pagination_scan_body=full_body,
+            response_bytes_read=len(full_body.encode("utf-8")),
+            response_byte_limit=400_000,
+            response_chars_read=len(full_body),
+            response_chars_returned=len(visible),
+            response_char_limit=100,
+            response_char_hard_limit=100_000,
+            request_number=1,
+            request_run_hop_limit=16,
+            request_elapsed_ms=5,
+        )
+        http_result = json.dumps({
+            "status": "success",
+            "request_sent": True,
+            "request_number": 1,
+            "url": url,
+            "body_result_handle": handle,
+            "body": visible,
+            "body_chars": len(visible),
+            "body_truncated": True,
+            "body_spilled_complete": True,
+            "retrieval": receipt,
+        })
+        responses = [
+            _tool_call_response(
+                "call-http-spill",
+                tool_name="skill_http_get",
+                arguments={"url": url, "max_chars": 100},
+            ),
+            _tool_call_response(
+                "call-read-spill",
+                tool_name="read_tool_result",
+                arguments={"handle": handle, "pattern": "text"},
+            ),
+            _stop_response(
+                "Evidence readback completed.\n"
+                + _result_fields_footer("evidence")
+            ),
+        ]
+        schemas = [*self.http_schema, {
+            "type": "function",
+            "function": READ_TOOL_RESULT_SCHEMA,
+        }]
+
+        def schema_resolver(names):
+            selected = set(names)
+            return [
+                schema
+                for schema in schemas
+                if schema["function"]["name"] in selected
+            ]
+
+        request_bodies, dispatch_mock, events, _persisted = await self._run(
+            responses,
+            max_iterations=5,
+            dispatch_result="",
+            dispatch_results=[
+                http_result,
+                json.dumps({
+                    "status": "success",
+                    "handle": handle,
+                    "content": '"text":"' + ("x" * 20),
+                    "start_offset": 10,
+                    "end_offset": 39,
+                    "total_chars": len(full_body),
+                    "has_more_before": True,
+                    "has_more_after": True,
+                }),
+            ],
+            tools=["skill_http_get"],
+            schemas=schemas,
+            schema_resolver=schema_resolver,
+            required_result_fields=["evidence"],
+            required_capability_tools=["skill_http_get"],
+            allowed_skill_http_prefixes=[(
+                "evidence-api", "https://api.vendor.test/search"
+            )],
+        )
+
+        self.assertEqual(2, dispatch_mock.await_count)
+        self.assertNotIn(
+            "read_tool_result",
+            {
+                item["function"]["name"]
+                for item in request_bodies[0]["tools"]
+            },
+        )
+        second_context = dispatch_mock.await_args_list[1].kwargs["context"]
+        self.assertIn(handle, second_context.allowed_tool_result_handles)
+        self.assertIn(
+            "read_tool_result",
+            {
+                item["function"]["name"]
+                for item in request_bodies[1]["tools"]
+            },
+        )
+        self.assertTrue(any(
+            event.get("event_type") == "debug.tool.result_spill"
+            and event.get("payload", {}).get("source")
+            == "complete_http_body"
+            for event in events
+        ))
+        self.assertFalse(any(
+            event.get("event_type") == "run.failed" for event in events
+        ))
 
     async def test_repage_action_is_injected_into_exact_http_followup_turn(self):
         root = "https://api.vendor.test/search?q=evidence&pageSize=50"
@@ -1236,6 +1356,7 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
         dispatch_results=None,
         turn_boundary_events=None,
         user_content=None,
+        schema_resolver=None,
     ):
         request_bodies = []
         tools = list(tools or ["web_search"])
@@ -1283,7 +1404,12 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
                 patch("workspace_context.WORKSPACE_ROOT", Path(temp_dir)),
                 patch("agent_loop.httpx.AsyncClient", FakeAsyncClient),
                 patch("agent_loop.dispatch", dispatch_mock),
-                patch("agent_loop.get_schemas", return_value=schemas),
+                patch(
+                    "agent_loop.get_schemas",
+                    side_effect=schema_resolver,
+                ) if schema_resolver is not None else patch(
+                    "agent_loop.get_schemas", return_value=schemas
+                ),
                 patch("agent_loop.build_system_prompt", return_value="system"),
                 patch("agent_loop.load_workspace_context", return_value=""),
                 patch("agent_loop._fetch_goal", AsyncMock(return_value=None)),

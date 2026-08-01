@@ -30,6 +30,7 @@ from tools.execution_fence import (
     ExecutionAuthorityRevoked,
     require_execution_authority,
 )
+from tools.tool_result_storage import persist_tool_result_spill
 
 
 DEFAULT_MAX_CHARS = 40_000
@@ -326,6 +327,7 @@ def _retrieval_receipt(
     response_body: str,
     pagination_scan_body: str | None,
     body_truncated: bool,
+    body_spilled_complete: bool = False,
     wire_body_complete: bool,
     response_bytes_read: int,
     response_chars_read: int,
@@ -349,6 +351,7 @@ def _retrieval_receipt(
         response_body=response_body,
         pagination_scan_body=pagination_scan_body,
         body_truncated=body_truncated,
+        body_spilled_complete=body_spilled_complete,
         wire_body_complete=wire_body_complete,
         response_bytes_read=response_bytes_read,
         response_byte_limit=MAX_RESPONSE_BYTES,
@@ -809,6 +812,18 @@ async def skill_http_get(
                                 or len(full_body) > max_chars
                             )
                             body = full_body[:max_chars]
+                            body_result_handle = None
+                            if (
+                                wire_body_complete
+                                and len(full_body) > max_chars
+                            ):
+                                body_result_handle = persist_tool_result_spill(
+                                    full_body,
+                                    "skill_http_get_body",
+                                    user_id=context.user_id,
+                                    session_id=context.session_id,
+                                )
+                            body_spilled_complete = bool(body_result_handle)
                             payload = {
                                 "status": (
                                     "success"
@@ -824,9 +839,13 @@ async def skill_http_get(
                                 "url": current,
                                 "http_status": response.status,
                                 "content_type": content_type,
+                                "body_result_handle": body_result_handle,
                                 "body": body,
                                 "body_chars": len(body),
                                 "body_truncated": body_truncated,
+                                "body_spilled_complete": (
+                                    body_spilled_complete
+                                ),
                                 "body_sha256": hashlib.sha256(raw).hexdigest(),
                                 "redirects_followed": redirects,
                                 "transport_retry_count": (
@@ -842,6 +861,9 @@ async def skill_http_get(
                                         if wire_body_complete else None
                                     ),
                                     body_truncated=body_truncated,
+                                    body_spilled_complete=(
+                                        body_spilled_complete
+                                    ),
                                     wire_body_complete=wire_body_complete,
                                     response_bytes_read=len(raw),
                                     response_chars_read=len(full_body),
@@ -1147,6 +1169,18 @@ async def skill_http_post_json(
                         or len(full_response_body) > max_chars
                     )
                     response_body = full_response_body[:max_chars]
+                    body_result_handle = None
+                    if (
+                        wire_body_complete
+                        and len(full_response_body) > max_chars
+                    ):
+                        body_result_handle = persist_tool_result_spill(
+                            full_response_body,
+                            "skill_http_post_json_body",
+                            user_id=context.user_id,
+                            session_id=context.session_id,
+                        )
+                    body_spilled_complete = bool(body_result_handle)
                     payload = {
                         "status": (
                             "success"
@@ -1167,9 +1201,11 @@ async def skill_http_post_json(
                         "url": current,
                         "http_status": response.status,
                         "content_type": content_type,
+                        "body_result_handle": body_result_handle,
                         "body": response_body,
                         "body_chars": len(response_body),
                         "body_truncated": body_truncated,
+                        "body_spilled_complete": body_spilled_complete,
                         "body_sha256": hashlib.sha256(raw).hexdigest(),
                         "redirects_followed": 0,
                         "retrieval": _retrieval_receipt(
@@ -1182,6 +1218,7 @@ async def skill_http_post_json(
                                 if wire_body_complete else None
                             ),
                             body_truncated=body_truncated,
+                            body_spilled_complete=body_spilled_complete,
                             wire_body_complete=wire_body_complete,
                             response_bytes_read=len(raw),
                             response_chars_read=len(full_response_body),

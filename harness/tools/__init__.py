@@ -7,6 +7,10 @@ from tools.skill_http import (
     RUN_SKILL_HTTP_GET_SCHEMA,
     RUN_SKILL_HTTP_POST_JSON_SCHEMA,
 )
+from tools.tool_result_reader import (
+    read_tool_result,
+    READ_TOOL_RESULT_SCHEMA,
+)
 from tools.code_execution import execute_code, EXECUTE_CODE_SCHEMA
 from tools.skill_python import (
     run_skill_python,
@@ -144,6 +148,17 @@ register(
     mutates_workspace=False,
     external_interaction=True,
     emoji="🔐",
+)
+
+register(
+    "read_tool_result",
+    READ_TOOL_RESULT_SCHEMA,
+    read_tool_result,
+    is_read_only=True,
+    parallel_safe=True,
+    allow_in_parallel_child=True,
+    mutates_workspace=False,
+    emoji="📖",
 )
 
 # ── Phase 2: New tools ───────────────────────────────────────────────────────

@@ -173,7 +173,11 @@ from tools.registry import (
     json_schema_shape_error,
     preflight as preflight_tool,
 )
-from tools.tool_result_storage import persist_result_for_history, wrap_result
+from tools.tool_result_storage import (
+    persist_result_for_history,
+    result_path_for_handle,
+    wrap_result_with_receipt,
+)
 from tools.session_execution_registry import (
     register_session_execution,
     unregister_session_execution,
@@ -2826,6 +2830,7 @@ def _tool_debug_result(raw: str) -> dict[str, Any]:
             "content_type",
             "body_chars",
             "body_truncated",
+            "body_spilled_complete",
             "redirects_followed",
             "request_body_bytes",
             "request_body_sha256",
@@ -2934,6 +2939,8 @@ def _tool_debug_result(raw: str) -> dict[str, Any]:
                     "request_elapsed_ms",
                     "wire_body_complete",
                     "body_truncated",
+                    "body_spilled_complete",
+                    "body_retrievable_complete",
                 )
                 if retrieval.get(key) is not None
             }
@@ -8514,7 +8521,12 @@ def _profile_bound_child_runner_kwargs(
     }
 
 
-_PREREQUISITE_READER_TOOLS = {"skill_view", "read_file", "search_files"}
+_PREREQUISITE_READER_TOOLS = {
+    "skill_view",
+    "read_file",
+    "search_files",
+    "read_tool_result",
+}
 
 
 def _bounded_runtime_int(value: Any, default: int, *, low: int, high: int) -> int:
@@ -9407,6 +9419,11 @@ def _workflow_gate_call_error(
     prior_call_count: int,
 ) -> str:
     if policy is None:
+        return ""
+    if tool_name == "read_tool_result":
+        # This runtime-only, exact-handle reader is auxiliary to the current
+        # workflow frontier. Registry preflight and the handler still require
+        # a handle minted by this run; it cannot satisfy or widen a Skill gate.
         return ""
     allowed_tools = {str(name) for name in (policy.get("tools") or [])}
     if tool_name not in allowed_tools:
@@ -13031,6 +13048,24 @@ async def run_stream(
         execution_fence=_execution_fence,
         execution_fence_generation=_execution_fence_generation,
     )
+
+    def grant_runtime_tool_result_handle(value: Any) -> bool:
+        """Install one locally-created opaque handle without path authority."""
+
+        nonlocal tool_context, tools
+        handle = str(value or "")
+        if result_path_for_handle(handle) is None:
+            return False
+        current = tuple(tool_context.allowed_tool_result_handles)
+        if "read_tool_result" not in tools:
+            tools = [*tools, "read_tool_result"]
+        handles = current if handle in current else (*current, handle)
+        tool_context = replace(
+            tool_context,
+            enabled_tools=tuple(tools),
+            allowed_tool_result_handles=handles,
+        )
+        return True
     require_execution_authority(
         tool_context,
         boundary="run_stream.child_start",
@@ -20787,14 +20822,30 @@ async def run_stream(
                         run_state.successful_write_sizes.append(size)
 
             if not deterministic_skill_inspection:
-                auto_wrapped_result = await run_sync_cancellation_safe(
-                    lambda: wrap_result(
-                        str(auto_result),
-                        auto_tool_name,
-                        user_id=user_id,
-                        session_id=session_id,
+                auto_wrapped_result, auto_result_handle = (
+                    await run_sync_cancellation_safe(
+                        lambda: wrap_result_with_receipt(
+                            str(auto_result),
+                            auto_tool_name,
+                            user_id=user_id,
+                            session_id=session_id,
+                        )
                     )
                 )
+                if auto_result_handle is not None:
+                    grant_runtime_tool_result_handle(auto_result_handle)
+                    for debug_evt in await debug_stream_event(
+                        "tool.result_spill",
+                        {
+                            "source": "generic_wrapper",
+                            "tool_name": auto_tool_name,
+                            "handle_sha256": hashlib.sha256(
+                                auto_result_handle.encode("utf-8")
+                            ).hexdigest(),
+                            "result_chars": len(str(auto_result)),
+                        },
+                    ):
+                        yield debug_evt
                 auto_history_index = len(conversation)
                 conversation.append({
                     "role": "assistant",
@@ -21977,6 +22028,18 @@ async def run_stream(
                 if name in set(iteration_workflow_policy.get("tools") or [])
             ]
         )
+        if not tool_context.allowed_tool_result_handles:
+            schema_tool_names = [
+                name
+                for name in schema_tool_names
+                if name != "read_tool_result"
+            ]
+        if (
+            tool_context.allowed_tool_result_handles
+            and "read_tool_result" in tools
+            and "read_tool_result" not in schema_tool_names
+        ):
+            schema_tool_names.append("read_tool_result")
         tool_schemas = get_schemas(schema_tool_names) if schema_tool_names else []
         if iteration_result_footer_repair:
             # Replace the ordinary executable surface with one internal,
@@ -30015,6 +30078,7 @@ async def run_stream(
                     and not has_parse_error
                     and knowledge_gate_decision_receipt is not None
                     and pending_knowledge_gate_group_ids()
+                    and tc.name != "read_tool_result"
                     and not pending_knowledge_gate_call_targets_frontier(
                         tc.name,
                         args if isinstance(args, dict) else {},
@@ -31586,14 +31650,71 @@ async def run_stream(
                             session_id=session_id,
                         )
                     )
-                wrapped = await run_sync_cancellation_safe(
-                    lambda: wrap_result(
-                        str(result),
-                        display_tool_name,
-                        user_id=user_id,
-                        session_id=session_id,
+                body_result_handle = (
+                    exact_result_data.get("body_result_handle")
+                    if (
+                        actual_dispatch_attempted
+                        and display_tool_name in {
+                            "skill_http_get",
+                            "skill_http_post_json",
+                        }
+                    )
+                    else None
+                )
+                if (
+                    isinstance(body_result_handle, str)
+                    and grant_runtime_tool_result_handle(body_result_handle)
+                ):
+                    for debug_evt in await debug_stream_event(
+                        "tool.result_spill",
+                        {
+                            "source": "complete_http_body",
+                            "tool_name": display_tool_name,
+                            "handle_sha256": hashlib.sha256(
+                                body_result_handle.encode("utf-8")
+                            ).hexdigest(),
+                            "result_chars": int(
+                                (
+                                    exact_result_data.get("retrieval")
+                                    if isinstance(
+                                        exact_result_data.get("retrieval"),
+                                        dict,
+                                    )
+                                    else {}
+                                ).get("response_chars_read")
+                                or 0
+                            ),
+                        },
+                        tool_name=display_tool_name,
+                        tool_call_id=tool_call_id,
+                    ):
+                        yield debug_evt
+                wrapped, generic_result_handle = (
+                    await run_sync_cancellation_safe(
+                        lambda: wrap_result_with_receipt(
+                            str(result),
+                            display_tool_name,
+                            user_id=user_id,
+                            session_id=session_id,
+                        )
                     )
                 )
+                if generic_result_handle is not None:
+                    grant_runtime_tool_result_handle(generic_result_handle)
+                    for debug_evt in await debug_stream_event(
+                        "tool.result_spill",
+                        {
+                            "source": "generic_wrapper",
+                            "tool_name": display_tool_name,
+                            "handle_sha256": hashlib.sha256(
+                                generic_result_handle.encode("utf-8")
+                            ).hexdigest(),
+                            "result_chars": len(str(result)),
+                        },
+                        tool_name=display_tool_name,
+                        tool_call_id=tool_call_id,
+                    ):
+                        yield debug_evt
                 if history_result_path:
                     wrapped_data = _json_object(wrapped)
                     history_metadata = {

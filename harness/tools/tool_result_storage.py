@@ -1,4 +1,4 @@
-"""Tool result storage — cap & persist overflow tool outputs.
+"""Tool result storage — losslessly spill oversized tool outputs.
 
 In a multi-user web environment, tool results flowing through the conversation
 must be bounded.  Large outputs (e.g. a 200 KB web page extract) are written to
@@ -12,17 +12,18 @@ Per-tool caps (characters):
   - ``read_file``    …… 100 000 (100 KB)
   -  everything else …… 50 000  (50 KB)
 
-The persisted file path is always relative to the sandbox root so the model
-can read it back later with ``read_file`` if needed.
+The persisted payload is outside the model-visible workspace.  The model gets
+an opaque, runtime-granted handle and can read bounded character slices through
+``read_tool_result``.  This keeps large/minified JSON lossless without granting
+ambient filesystem access.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import tempfile
-import time
+import uuid
 from pathlib import Path
 
 from tools.path_security import sandbox_dir
@@ -43,6 +44,10 @@ _DEFAULT_CAP = 50_000
 
 # Maximum file size we will write to disk (safety net)
 _MAX_PERSIST_BYTES = 5 * 1024 * 1024  # 5 MB
+TOOL_RESULT_HANDLE_PREFIX = "tool-result:"
+_TOOL_RESULT_FILENAME_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-."
+)
 
 
 def _cap_for_tool(tool_name: str) -> int:
@@ -50,13 +55,15 @@ def _cap_for_tool(tool_name: str) -> int:
     return _TOOL_CAPS.get(tool_name, _DEFAULT_CAP)
 
 
-def _persist(
+def _persist_path(
     tool_name: str,
     full_result: str,
     user_id: str,
     session_id: str,
-) -> str:
-    """Write the full tool result to disk and return a relative path."""
+    *,
+    require_lossless: bool = True,
+) -> str | None:
+    """Write the full tool result and return its session-relative path."""
     # ``results`` is outside the model-visible workspace, but it belongs to
     # the same session transaction.  Use the exact sibling workspace lock so
     # Backend deletion/tombstone publication and every Harness commit have one
@@ -66,22 +73,30 @@ def _persist(
     workspace = sandbox_dir(user_id, session_id, sub="workspace")
     with workspace_mutation_guard(workspace):
         results_dir = sandbox_dir(user_id, session_id, sub="results")
-        ts = time.time_ns()
         safe_name = "".join(
-            c if c.isalnum() or c in "_-." else "_"
+            c if c in _TOOL_RESULT_FILENAME_CHARS else "_"
             for c in tool_name
-        )
-        filename = f"{safe_name}_{ts}.txt"
+        )[:96] or "tool"
+        filename = f"{safe_name}_{uuid.uuid4().hex}.txt"
         filepath = results_dir / filename
         temporary: Path | None = None
 
         try:
-            # Truncate to max persist size
             data = full_result
-            if len(data) > _MAX_PERSIST_BYTES:
+            encoded = data.encode("utf-8")
+            if len(encoded) > _MAX_PERSIST_BYTES:
+                if require_lossless:
+                    logger.warning(
+                        "Refused non-lossless %s spill above %d bytes",
+                        tool_name,
+                        _MAX_PERSIST_BYTES,
+                    )
+                    return None
+                marker = b"\n\n[... truncated at 5 MB safety limit]"
                 data = (
-                    data[:_MAX_PERSIST_BYTES]
-                    + "\n\n[... truncated at 5 MB safety limit]"
+                    encoded[:_MAX_PERSIST_BYTES - len(marker)]
+                    .decode("utf-8", errors="ignore")
+                    + marker.decode("ascii")
                 )
             descriptor, temporary_name = tempfile.mkstemp(
                 prefix=f".{filename}.",
@@ -128,10 +143,93 @@ def _persist(
                 tool_name,
                 exc,
             )
-            return f"[Result too large to persist — {exc}]"
+            return None
 
-    # Return a path relative to the sandbox root so read_file can find it
+    # The path remains runtime-only; the model receives an opaque handle.
     return f"results/{filename}"
+
+
+def _handle_for_path(path: str | None) -> str | None:
+    if not isinstance(path, str) or not path.startswith("results/"):
+        return None
+    filename = path.removeprefix("results/")
+    if not filename or Path(filename).name != filename:
+        return None
+    return TOOL_RESULT_HANDLE_PREFIX + filename
+
+
+def result_path_for_handle(handle: str) -> str | None:
+    """Decode one syntactically valid spill handle to a relative path.
+
+    This function does not grant access.  ``read_tool_result`` additionally
+    requires exact membership in the runtime-owned handle ledger.
+    """
+
+    if not isinstance(handle, str) or not handle.startswith(
+        TOOL_RESULT_HANDLE_PREFIX
+    ):
+        return None
+    filename = handle.removeprefix(TOOL_RESULT_HANDLE_PREFIX)
+    if (
+        not filename
+        or Path(filename).name != filename
+        or any(c not in _TOOL_RESULT_FILENAME_CHARS for c in filename)
+    ):
+        return None
+    return f"results/{filename}"
+
+
+def persist_tool_result_spill(
+    raw_result: str,
+    tool_name: str,
+    user_id: str = "default",
+    session_id: str = "default",
+) -> str | None:
+    """Persist a complete payload and return an opaque readback handle."""
+
+    return _handle_for_path(
+        _persist_path(tool_name, raw_result, user_id, session_id)
+    )
+
+
+def wrap_result_with_receipt(
+    raw_result: str,
+    tool_name: str,
+    user_id: str = "default",
+    session_id: str = "default",
+) -> tuple[str, str | None]:
+    """Return bounded model content plus any lossless spill handle."""
+
+    cap = _cap_for_tool(tool_name)
+    result_len = len(raw_result)
+
+    if result_len <= cap:
+        return raw_result, None
+
+    handle = persist_tool_result_spill(
+        raw_result,
+        tool_name,
+        user_id=user_id,
+        session_id=session_id,
+    )
+    truncated = raw_result[:cap]
+    if handle is None:
+        summary = (
+            f"{truncated}\n\n"
+            f"[... {result_len - cap} more chars truncated; lossless spill "
+            "was unavailable ...]"
+        )
+    else:
+        summary = (
+            f"{truncated}\n\n"
+            f"[... {result_len - cap} more chars omitted from context ...]\n"
+            f"[Full result handle: {handle} — use read_tool_result with this "
+            "exact handle and bounded offset/limit or literal pattern]"
+        )
+
+    if len(summary) > cap + 2000:
+        summary = summary[:cap + 2000]
+    return summary, handle
 
 
 def wrap_result(
@@ -154,33 +252,16 @@ def wrap_result(
     Returns:
         A (possibly truncated) result string safe to inject into the
         conversation.  Overflow is persisted to ``results/`` in the session
-        sandbox, and the message includes a reference so the model can
-        ``read_file`` the persisted file.
+        sandbox, and the message includes an opaque handle for the bounded
+        ``read_tool_result`` capability.
     """
-    cap = _cap_for_tool(tool_name)
-    result_len = len(raw_result)
-
-    if result_len <= cap:
-        return raw_result
-
-    # Persist the full result and return a truncated summary
-    persisted_path = _persist(tool_name, raw_result, user_id, session_id)
-
-    # Truncate to cap chars, keeping the beginning (most relevant part)
-    truncated = raw_result[:cap]
-
-    summary = (
-        f"{truncated}\n\n"
-        f"[... {result_len - cap} more chars truncated ...]\n"
-        f"[Full result persisted to sandbox: {persisted_path} — "
-        f"use read_file({json.dumps(persisted_path)}) to retrieve]"
+    wrapped, _handle = wrap_result_with_receipt(
+        raw_result,
+        tool_name,
+        user_id=user_id,
+        session_id=session_id,
     )
-
-    # Ensure the summary itself doesn't exceed cap by too much
-    if len(summary) > cap + 2000:
-        summary = summary[:cap + 2000]
-
-    return summary
+    return wrapped
 
 
 def persist_result_for_history(
@@ -190,7 +271,14 @@ def persist_result_for_history(
     session_id: str = "default",
 ) -> str:
     """Persist a result whose executable arguments will be removed from history."""
-    return _persist(tool_name, raw_result, user_id, session_id)
+    path = _persist_path(
+        tool_name,
+        raw_result,
+        user_id,
+        session_id,
+        require_lossless=False,
+    )
+    return path or "[Result too large to persist]"
 
 
 def get_tool_caps() -> dict[str, int]:
