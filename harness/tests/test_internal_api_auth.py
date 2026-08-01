@@ -67,7 +67,16 @@ class InternalAPIAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("root-1", observed["root_run_id"])
 
     async def test_health_and_model_catalog_remain_read_only_probes(self) -> None:
-        health = await self._request("GET", "/health")
+        with patch.object(
+            harness_main,
+            "storage_root_attestation",
+            return_value={
+                "version": 1,
+                "available": True,
+                "identity_sha256": "a" * 64,
+            },
+        ):
+            health = await self._request("GET", "/health")
         models = await self._request("GET", "/v1/models")
         self.assertEqual(200, health.status_code)
         self.assertEqual(200, models.status_code)

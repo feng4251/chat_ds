@@ -450,12 +450,12 @@ services:
       - "65533"
     volumes:
       - type: bind
-        source: ${CHATDS_DATA_ROOT:-./data}
+        source: ${CHATDS_DATA_ROOT:?Set CHATDS_DATA_ROOT to the canonical shared host data directory}
         target: /app/data
         bind:
           create_host_path: false
       - type: bind
-        source: ${CHATDS_MEMORY_ROOT:-./harness/data/memories}
+        source: ${CHATDS_MEMORY_ROOT:?Set CHATDS_MEMORY_ROOT to the canonical host memory directory}
         target: /app/data/memories
         bind:
           create_host_path: false
@@ -531,7 +531,7 @@ services:
       WORKSPACE_ORPHAN_RECONCILE_INTERVAL_SECONDS: ${WORKSPACE_ORPHAN_RECONCILE_INTERVAL_SECONDS:-60}
     volumes:
       - type: bind
-        source: ${CHATDS_DATA_ROOT:-./data}
+        source: ${CHATDS_DATA_ROOT:?Set CHATDS_DATA_ROOT to the canonical shared host data directory}
         target: /app/data
         bind:
           create_host_path: false
@@ -544,6 +544,20 @@ services:
           nocopy: true
     networks:
       - chat_net
+    # Backend health includes a cross-container /app/data inode attestation
+    # against Harness.  This catches relative bind mounts rebased by a clean
+    # archive deployment before Frontend accepts user traffic.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -I
+        - -c
+        - "import urllib.request; raise SystemExit(0 if urllib.request.urlopen('http://127.0.0.1:8010/api/health', timeout=3).status == 200 else 1)"
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 20s
     # Backend is not exposed externally — nginx in frontend container proxies
     # to it via the chat_net Docker network. Uncomment for direct debugging:
     # ports:
@@ -557,7 +571,8 @@ services:
     ports:
       - "5173:5173"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     networks:
       - chat_net
 
