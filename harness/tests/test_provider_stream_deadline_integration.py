@@ -39,6 +39,35 @@ def _short_plan(
 
 
 class ProviderStreamDeadlineIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_request_budget_allows_silent_reasoning_past_floor(self):
+        loop = asyncio.get_running_loop()
+        plan = _short_plan(
+            initial=0.02,
+            grace=0.02,
+            hard=0.20,
+            output_tokens=10,
+        )
+        lease = MaterialProgressLease.start(plan, now=loop.time())
+
+        async def silent_then_terminal_provider():
+            # No transport/material progress arrives before the first result.
+            # The request-specific budget (~0.10s) must protect this healthy
+            # silent reasoning period from the 0.02s configured floor.
+            await asyncio.sleep(0.05)
+            yield {"terminal": True}
+
+        values = [
+            value
+            async for value in _aiter_with_timeout(
+                silent_then_terminal_provider(),
+                timeout_seconds=plan.planned_deadline_seconds,
+                material_progress_lease=lease,
+            )
+        ]
+
+        self.assertEqual([{"terminal": True}], values)
+        self.assertGreater(plan.initial_lease_seconds, 0.05)
+
     async def test_buffered_material_progress_renews_without_outer_yields(self):
         loop = asyncio.get_running_loop()
         plan = _short_plan(
@@ -112,7 +141,7 @@ class ProviderStreamDeadlineIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_empty_frames_do_not_renew_initial_lease(self):
         loop = asyncio.get_running_loop()
-        plan = _short_plan(initial=0.02, grace=0.04)
+        plan = _short_plan(initial=0.02, grace=0.04, output_tokens=1)
         lease = MaterialProgressLease.start(plan, now=loop.time())
         provider_closed = asyncio.Event()
 

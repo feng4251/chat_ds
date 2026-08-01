@@ -56,11 +56,11 @@ class Settings(BaseSettings):
     agent_debug_trace: bool = False
     agent_debug_trace_result_chars: int = 4000
     agent_debug_trace_workspace: bool = True
-    # One concrete provider stream starts with a bounded no-progress lease, but
-    # may use a larger deterministic allowance when its real input/output token
-    # budget warrants it and material model output keeps arriving.  The total
-    # timeout is the absolute deployment cap; neither progress nor a caller can
-    # extend a request beyond it.
+    # One concrete provider stream starts with a bounded no-progress floor.
+    # Large requests raise that initial lease to their deterministic
+    # input/output budget, and material output may renew it.  The total timeout
+    # is the absolute deployment cap; neither planning, progress, nor a caller
+    # can extend a request beyond it.
     # GLM-class reasoning streams can remain productively active for roughly
     # half an hour on large Skill workflows.  This absolute ceiling therefore
     # leaves a measured buffer beyond 30 minutes; the shorter initial/read

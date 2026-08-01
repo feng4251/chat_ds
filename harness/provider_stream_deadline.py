@@ -4,9 +4,8 @@ The model context window answers whether a request fits; it does not say how
 long a slow but healthy decoder needs to reach its terminal frame.  This
 module therefore separates three limits:
 
-* an initial lease that catches streams which make no useful progress;
-* a request-specific planning checkpoint derived from input/output budgets
-  for observability and capacity diagnostics;
+* a configured initial-lease floor for small requests;
+* a request-specific initial lease derived from input/output budgets;
 * an absolute configured/caller hard cap which progress can never extend.
 
 Only callers that have observed material provider output may renew the soft
@@ -55,6 +54,7 @@ class ProviderStreamDeadlinePlan:
 
     estimated_input_tokens: int
     max_output_tokens: int
+    configured_initial_lease_seconds: float
     initial_lease_seconds: float
     progress_grace_seconds: float
     planned_deadline_seconds: float
@@ -67,6 +67,9 @@ class ProviderStreamDeadlinePlan:
         return {
             "estimated_input_tokens": self.estimated_input_tokens,
             "max_output_tokens": self.max_output_tokens,
+            "configured_initial_lease_seconds": (
+                self.configured_initial_lease_seconds
+            ),
             "initial_lease_seconds": self.initial_lease_seconds,
             "progress_grace_seconds": self.progress_grace_seconds,
             "planned_deadline_seconds": self.planned_deadline_seconds,
@@ -156,11 +159,15 @@ def build_provider_stream_deadline_plan(
     return ProviderStreamDeadlinePlan(
         estimated_input_tokens=input_tokens,
         max_output_tokens=output_tokens,
-        # ``planned`` is an estimate/checkpoint for observability.  It must
-        # never shorten either of the independently configured soft-lease
-        # inputs: a healthy stream may continue past that estimate while
-        # remaining bounded by the effective configured/caller hard cap.
-        initial_lease_seconds=min(initial, hard_cap),
+        configured_initial_lease_seconds=initial,
+        # Treat the request-specific budget as the initial no-progress lease,
+        # not merely an observability checkpoint.  Some reasoning providers
+        # can remain transport-alive but materially silent after a partial
+        # fragment.  Expiring those streams at the small-request floor would
+        # contradict the budget already derived from their concrete token
+        # envelope.  Genuine material progress may extend this lease, but the
+        # immutable configured/caller hard cap remains authoritative.
+        initial_lease_seconds=planned,
         progress_grace_seconds=min(progress_grace, hard_cap),
         planned_deadline_seconds=planned,
         hard_cap_seconds=hard_cap,
@@ -241,8 +248,18 @@ class MaterialProgressLease:
         normalized_now = float(now)
         if self.hard_deadline <= self.soft_deadline:
             reason = "configured_or_caller_hard_cap"
-        elif self.last_material_progress_at is None:
-            reason = "initial_lease"
+        elif self.soft_deadline <= (
+            self.started_at + self.plan.initial_lease_seconds
+        ):
+            reason = (
+                "request_budget_lease"
+                if self.plan.initial_lease_seconds
+                > min(
+                    self.plan.configured_initial_lease_seconds,
+                    self.plan.hard_cap_seconds,
+                )
+                else "initial_lease"
+            )
         else:
             reason = "progress_lease"
         planned_deadline = (
