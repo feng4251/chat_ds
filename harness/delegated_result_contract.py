@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from typing import Any, Sequence
@@ -202,6 +203,158 @@ def canonical_result_fields_footer_from_json(
         required_fields,
         field_schema,
     )
+
+
+def canonical_result_fields_footer_from_internal_submitter_json(
+    raw_json: str,
+    required_fields: Sequence[str],
+    field_schema: dict[str, Any] | None = None,
+) -> tuple[str | None, dict[str, Any], dict[str, Any]]:
+    """Validate an internal submitter payload with one safe wire adaptation.
+
+    Some OpenAI-compatible providers double-serialize an object- or
+    array-valued *field* while producing otherwise valid native tool
+    arguments.  At this exact, non-dispatchable, closed-schema boundary the
+    harness may unwrap one such JSON string envelope, but only when all of the
+    following are true:
+
+    * the outer arguments are one complete strict JSON object;
+    * the original string does not satisfy the declared field schema;
+    * the string is one complete strict JSON object or array; and
+    * the decoded container satisfies the same declared schema exactly.
+
+    This is transport normalization, not semantic repair.  It never changes a
+    schema-valid string, scalar, key set, or malformed/ambiguous value, and the
+    ordinary authoritative footer audit still runs after normalization.
+    Diagnostics intentionally expose only counts and hashes, never values.
+    """
+
+    diagnostics: dict[str, Any] = {
+        "transport_envelope_normalized": False,
+        "normalized_field_count": 0,
+        "normalized_field_name_sha256": [],
+        "candidate_string_count": 0,
+        "rejected_candidate_count": 0,
+    }
+    raw = str(raw_json or "")
+    if not raw or len(raw) > MAX_RESULT_FIELDS_JSON_CHARS:
+        return None, {
+            "footer_valid": False,
+            "footer_error": "structured result JSON is empty or exceeds 64 KiB",
+        }, diagnostics
+
+    decoder = json.JSONDecoder(
+        object_pairs_hook=_reject_duplicate_result_field_pairs,
+        parse_constant=_reject_nonfinite_json_constant,
+    )
+    try:
+        ledger, consumed = decoder.raw_decode(raw.lstrip())
+    except (json.JSONDecodeError, TypeError, ValueError, RecursionError) as exc:
+        return None, {
+            "footer_valid": False,
+            "footer_error": (
+                "structured result JSON is invalid: " + type(exc).__name__
+            ),
+        }, diagnostics
+    leading = len(raw) - len(raw.lstrip())
+    if raw[leading + consumed:].strip():
+        return None, {
+            "footer_valid": False,
+            "footer_error": "structured result JSON has trailing data",
+        }, diagnostics
+
+    fields = tuple(str(field) for field in required_fields)
+    schemas = normalize_result_field_schema(fields, field_schema)
+    if not isinstance(ledger, dict) or set(ledger) != set(fields):
+        footer, audit = canonical_result_fields_footer(
+            ledger,
+            fields,
+            field_schema,
+        )
+        return footer, audit, diagnostics
+
+    normalized = dict(ledger)
+    normalized_fields: list[str] = []
+    try:
+        # Use the same bounded schema validator as both native tool arguments
+        # and the final delegated-result audit.  A permissive or string-valued
+        # schema therefore leaves the provider value untouched.
+        from tools.registry import json_schema_value_error
+    except Exception:  # pragma: no cover - downstream audit remains fail closed
+        json_schema_value_error = None
+
+    for field in fields:
+        value = ledger.get(field)
+        schema = schemas.get(field)
+        if (
+            json_schema_value_error is None
+            or not isinstance(value, str)
+            or not isinstance(schema, dict)
+        ):
+            continue
+        stripped = value.strip()
+        if not stripped.startswith(("{", "[")):
+            continue
+        diagnostics["candidate_string_count"] += 1
+
+        original_error = json_schema_value_error(
+            value,
+            schema,
+            value_path=f"result_fields.{field}",
+            schema_path=f"result_schema.{field}",
+        )
+        if original_error is None:
+            # The declared contract legitimately accepts the string.  Parsing
+            # it would change semantics, so it is not a transport envelope.
+            diagnostics["rejected_candidate_count"] += 1
+            continue
+        if len(value) > MAX_RESULT_FIELDS_JSON_CHARS:
+            diagnostics["rejected_candidate_count"] += 1
+            continue
+        try:
+            candidate, inner_consumed = decoder.raw_decode(value.lstrip())
+        except (
+            json.JSONDecodeError,
+            TypeError,
+            ValueError,
+            RecursionError,
+        ):
+            diagnostics["rejected_candidate_count"] += 1
+            continue
+        inner_leading = len(value) - len(value.lstrip())
+        if (
+            value[inner_leading + inner_consumed:].strip()
+            or not isinstance(candidate, (dict, list))
+        ):
+            diagnostics["rejected_candidate_count"] += 1
+            continue
+        candidate_error = json_schema_value_error(
+            candidate,
+            schema,
+            value_path=f"result_fields.{field}",
+            schema_path=f"result_schema.{field}",
+        )
+        if candidate_error is not None:
+            diagnostics["rejected_candidate_count"] += 1
+            continue
+        normalized[field] = candidate
+        normalized_fields.append(field)
+
+    if normalized_fields:
+        diagnostics.update({
+            "transport_envelope_normalized": True,
+            "normalized_field_count": len(normalized_fields),
+            "normalized_field_name_sha256": sorted(
+                hashlib.sha256(field.encode("utf-8")).hexdigest()
+                for field in normalized_fields
+            ),
+        })
+    footer, audit = canonical_result_fields_footer(
+        normalized,
+        fields,
+        field_schema,
+    )
+    return footer, audit, diagnostics
 
 
 def extract_canonical_result_fields_footer(

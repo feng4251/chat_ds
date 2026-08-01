@@ -4147,6 +4147,143 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.assertEqual("done", events[-1]["type"])
 
+    async def test_internal_submitter_normalizes_double_serialized_containers(self):
+        retained = (
+            "# Observatory result\n"
+            "The retained preload contains a bounded manifest and readings."
+        )
+        schema = {
+            "mission_manifest": {
+                "type": "object",
+                "properties": {
+                    "vehicle": {"type": "string"},
+                    "revision": {"type": "integer"},
+                },
+                "required": ["vehicle", "revision"],
+                "additionalProperties": False,
+            },
+            "observations": {
+                "type": "array",
+                "items": {"type": "number"},
+            },
+        }
+        wire_values = {
+            "mission_manifest": json.dumps({
+                "vehicle": "orbiter",
+                "revision": 3,
+            }),
+            "observations": json.dumps([1.25, 2.5]),
+        }
+
+        requests, dispatch_mock, events = await self._run_stream_sequence(
+            [
+                self._stop_lines(retained),
+                self._structured_tool_lines(
+                    "submit_result_fields",
+                    wire_values,
+                ),
+            ],
+            max_iterations=3,
+            delegated=True,
+            enabled_tool=None,
+            required_result_fields=["mission_manifest", "observations"],
+            required_result_schema=schema,
+            verified_preloaded_input_receipt=self._verified_preload_receipt(),
+        )
+
+        self.assertEqual(2, len(requests))
+        dispatch_mock.assert_not_awaited()
+        visible = "".join(
+            str(event.get("content") or "")
+            for event in events
+            if event.get("type") == "delta"
+        )
+        submitted = json.loads(
+            visible.rsplit("RESULT_FIELDS_JSON: ", 1)[1]
+        )
+        self.assertEqual({
+            "mission_manifest": {
+                "vehicle": "orbiter",
+                "revision": 3,
+            },
+            "observations": [1.25, 2.5],
+        }, submitted)
+        completed = next(
+            event for event in events
+            if event.get("event_type")
+            == "debug.delegate.result_footer_repair.completed"
+        )
+        self.assertTrue(
+            completed["payload"]["transport_envelope_normalized"]
+        )
+        self.assertEqual(
+            2,
+            completed["payload"]["normalized_field_count"],
+        )
+        self.assertFalse(
+            completed["payload"]["registry_dispatch_attempted"]
+        )
+        self.assertFalse(any(
+            event.get("event_type") == "run.failed" for event in events
+        ))
+        self.assertEqual("done", events[-1]["type"])
+
+    async def test_internal_submitter_text_wire_uses_same_container_normalizer(self):
+        schema = {
+            "release_manifest": {
+                "type": "object",
+                "properties": {
+                    "version": {"type": "integer"},
+                },
+                "required": ["version"],
+                "additionalProperties": False,
+            },
+        }
+        wire_footer = "RESULT_FIELDS_JSON: " + json.dumps({
+            "release_manifest": json.dumps({"version": 7}),
+        })
+
+        requests, dispatch_mock, events = await self._run_stream_sequence(
+            [
+                self._stop_lines(
+                    "# Release result\nThe retained manifest is bounded."
+                ),
+                self._stop_lines(wire_footer),
+            ],
+            max_iterations=3,
+            delegated=True,
+            enabled_tool=None,
+            required_result_fields=["release_manifest"],
+            required_result_schema=schema,
+            verified_preloaded_input_receipt=self._verified_preload_receipt(),
+        )
+
+        self.assertEqual(2, len(requests))
+        dispatch_mock.assert_not_awaited()
+        compatibility = next(
+            event for event in events
+            if event.get("event_type")
+            == "debug.delegate.result_footer_repair.text_compatibility"
+        )
+        self.assertTrue(compatibility["payload"]["accepted"])
+        self.assertEqual(
+            "canonical_footer_text",
+            compatibility["payload"]["method"],
+        )
+        self.assertTrue(
+            compatibility["payload"]["transport_envelope_normalized"]
+        )
+        visible = "".join(
+            str(event.get("content") or "")
+            for event in events
+            if event.get("type") == "delta"
+        )
+        self.assertEqual(
+            {"release_manifest": {"version": 7}},
+            json.loads(visible.rsplit("RESULT_FIELDS_JSON: ", 1)[1]),
+        )
+        self.assertEqual("done", events[-1]["type"])
+
     async def test_verified_preloaded_typed_tools_closed_length_recovers_across_domains(self):
         cases = (
             (
