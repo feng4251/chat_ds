@@ -15,9 +15,9 @@ Scan paths (priority order):
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
-import hashlib
 from pathlib import Path, PurePosixPath
 from typing import Iterator, Optional
 
@@ -46,6 +46,16 @@ MAX_RUNNABLE_SCRIPT_BYTES = 10_000_000
 # Collection roots may contain arbitrary category/grouping directories.  Keep
 # discovery domain-neutral while bounding traversal against pathological trees.
 MAX_SKILL_SCAN_DEPTH = 32
+
+
+def _sha256_file(path: Path) -> str:
+    """Hash one scanner-validated regular file without buffering it whole."""
+
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 
 def is_excluded_path(path: Path) -> bool:
@@ -217,6 +227,7 @@ def find_all_skills(
 
             try:
                 content = read_skill_frontmatter_source(skill_md)
+                skill_md_sha256 = _sha256_file(skill_md)
                 frontmatter, _body = parse_frontmatter(content, strict=True)
                 manifest_diagnostics = validate_skill_manifest(
                     frontmatter,
@@ -275,6 +286,11 @@ def find_all_skills(
                 "scope": scope,
                 "path": str(skill_md),
                 "skill_dir": str(skill_dir),
+                # The Backend-issued registry carries its expected DB-backed
+                # identity and digest, while this filesystem scanner remains
+                # the local authority boundary. Matching both proves that the
+                # services see the same manifest before model sampling.
+                "skill_md_sha256": skill_md_sha256,
             }
             if diagnostics:
                 skill["diagnostics"] = diagnostics

@@ -449,8 +449,16 @@ services:
     group_add:
       - "65533"
     volumes:
-      - ./data:/app/data
-      - ./harness/data/memories:/app/data/memories
+      - type: bind
+        source: ${CHATDS_DATA_ROOT:-./data}
+        target: /app/data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${CHATDS_MEMORY_ROOT:-./harness/data/memories}
+        target: /app/data/memories
+        bind:
+          create_host_path: false
       - /nfs/temp/chat_ds:/nfs/temp/chat_ds
       - executor_socket:/run/chat-ds-executor:ro
       - executor_socket_2:/run/chat-ds-executor-2:ro
@@ -522,7 +530,11 @@ services:
       WORKSPACE_ORPHAN_RECONCILE_LIMIT: ${WORKSPACE_ORPHAN_RECONCILE_LIMIT:-256}
       WORKSPACE_ORPHAN_RECONCILE_INTERVAL_SECONDS: ${WORKSPACE_ORPHAN_RECONCILE_INTERVAL_SECONDS:-60}
     volumes:
-      - ./data:/app/data
+      - type: bind
+        source: ${CHATDS_DATA_ROOT:-./data}
+        target: /app/data
+        bind:
+          create_host_path: false
       - chat_ds_db:/app/db
       - /nfs/temp/chat_ds:/nfs/temp/chat_ds
       - type: volume
