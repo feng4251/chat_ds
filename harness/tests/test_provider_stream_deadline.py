@@ -60,6 +60,32 @@ class ProviderStreamDeadlinePlanTests(unittest.TestCase):
 
         self.assertEqual(600.0, plan.planned_deadline_seconds)
 
+    def test_large_context_uses_its_budget_below_four_hour_absolute_cap(self):
+        plan = _plan(
+            estimated_input_tokens=139_593,
+            max_output_tokens=32_768,
+            configured_hard_cap_seconds=14_400.0,
+        )
+
+        self.assertGreater(plan.estimated_budget_seconds, 5_100.0)
+        self.assertLess(plan.estimated_budget_seconds, 5_200.0)
+        self.assertEqual(
+            plan.estimated_budget_seconds,
+            plan.initial_lease_seconds,
+        )
+        self.assertEqual(14_400.0, plan.hard_cap_seconds)
+
+    def test_four_hour_absolute_cap_still_bounds_extreme_request_budget(self):
+        plan = _plan(
+            estimated_input_tokens=300_000,
+            max_output_tokens=131_072,
+            configured_hard_cap_seconds=14_400.0,
+        )
+
+        self.assertGreater(plan.estimated_budget_seconds, 14_400.0)
+        self.assertEqual(14_400.0, plan.initial_lease_seconds)
+        self.assertEqual(14_400.0, plan.hard_cap_seconds)
+
     def test_planned_estimate_does_not_shrink_progress_grace(self):
         plan = _plan(
             estimated_input_tokens=0,

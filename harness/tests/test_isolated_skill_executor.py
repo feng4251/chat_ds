@@ -2101,6 +2101,46 @@ class IsolatedSkillExecutorClientTests(unittest.TestCase):
             {"SKILL.md", "assets/binary.bin", "scripts/task.sh"},
             {item["path"] for item in payload["skill_files"]},
         )
+        self.assertEqual([], payload["result_files"])
+
+    def test_session_code_request_snapshots_only_selected_persisted_results(self) -> None:
+        results = self.root / "results"
+        results.mkdir()
+        (results / "selected.txt").write_bytes(b"selected")
+        (results / "unselected.txt").write_bytes(b"unselected")
+
+        payload, _ = client.build_session_code_request(
+            workspace=self.workspace,
+            results_root=results,
+            result_paths=["selected.txt"],
+            code="print(open('../results/selected.txt').read())",
+        )
+
+        self.assertEqual(
+            ["selected.txt"],
+            [item["path"] for item in payload["result_files"]],
+        )
+        self.assertEqual(
+            b"selected",
+            base64.b64decode(payload["result_files"][0]["content_b64"]),
+        )
+
+    def test_session_code_result_snapshot_rejects_traversal_and_symlinks(self) -> None:
+        results = self.root / "results"
+        results.mkdir()
+        (results / "target.txt").write_text("target", encoding="utf-8")
+        (results / "link.txt").symlink_to(results / "target.txt")
+
+        for selected in (["../target.txt"], ["link.txt"]):
+            with self.subTest(selected=selected):
+                with self.assertRaises(client.IsolatedSkillExecutorError) as caught:
+                    client.build_session_code_request(
+                        workspace=self.workspace,
+                        results_root=results,
+                        result_paths=selected,
+                        code="print('never dispatched')",
+                    )
+                self.assertIn(caught.exception.code, {"invalid_path", "unsafe_snapshot_file"})
 
     def test_session_code_response_has_complete_verified_artifact_receipts(self) -> None:
         request_id = str(uuid.uuid4())

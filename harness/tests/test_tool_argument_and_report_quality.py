@@ -18,6 +18,7 @@ from tools.code_execution import (
     _code_with_session_snapshot,
     _execution_boundary_error,
     _managed_runtime_reason,
+    _referenced_persisted_result_paths,
     _rewrite_isolated_session_paths,
 )
 
@@ -121,6 +122,7 @@ class ToolArgumentAndReportQualityTests(unittest.TestCase):
                     "open('/app/workspace/input.txt').read()",
                     "open('workspace/output.txt', 'w').write('ok')",
                     "open('/app/data/skills/u/s/demo/assets/a.txt').read()",
+                    "open('results/tool-output.txt').read()",
                     "label = 'friendships/example'",
                 )),
                 "u",
@@ -128,9 +130,31 @@ class ToolArgumentAndReportQualityTests(unittest.TestCase):
             )
 
         self.assertIn("open('./input.txt')", rewritten)
+        self.assertIn("open('../results/tool-output.txt')", rewritten)
+        self.assertIn("friendships/example", rewritten)
         self.assertIn("open('./output.txt', 'w')", rewritten)
         self.assertIn("open('../skills/demo/assets/a.txt')", rewritten)
         self.assertIn("'friendships/example'", rewritten)
+
+    def test_persisted_result_selection_is_current_session_literal_and_regular(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            current = root / "u" / "s" / "results"
+            other = root / "u" / "other" / "results"
+            current.mkdir(parents=True)
+            other.mkdir(parents=True)
+            (current / "tool.txt").write_text("current", encoding="utf-8")
+            (other / "tool.txt").write_text("other", encoding="utf-8")
+            (current / "escape.txt").symlink_to(other / "tool.txt")
+            with patch.object(code_execution, "SANDBOX_ROOT", root):
+                selected = _referenced_persisted_result_paths(
+                    "print(open('results/tool.txt').read())\n"
+                    "print(open('results/escape.txt').read())",
+                    "u",
+                    "s",
+                )
+
+        self.assertEqual(("tool.txt",), selected)
 
     def test_workspace_file_reads_use_managed_runtime(self):
         reason = _managed_runtime_reason("from pathlib import Path\nprint(Path('workspace/report.md').stat().st_size)")
@@ -420,6 +444,44 @@ class ToolArgumentAndReportQualityTests(unittest.TestCase):
 
 
 class ExecuteCodeWorkspaceRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_persisted_result_reference_is_snapshotted_into_session_runtime(self):
+        isolated = AsyncMock(return_value={
+            "status": "success",
+            "stdout": "current",
+            "stderr": "",
+            "returncode": 0,
+            "network": "disabled",
+            "artifacts": [],
+            "workspace_applied": True,
+        })
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with (
+                patch.object(path_security, "SANDBOX_ROOT", root),
+                patch.object(code_execution, "SANDBOX_ROOT", root),
+                patch.object(code_execution, "SKILL_DATA_ROOT", root / "skills"),
+                patch(
+                    "tools.isolated_skill_executor.execute_isolated_session_code",
+                    isolated,
+                ),
+            ):
+                workspace = path_security.sandbox_dir("u", "s", sub="workspace")
+                results = path_security.sandbox_dir("u", "s", sub="results")
+                (results / "tool.txt").write_text("current", encoding="utf-8")
+                result = json.loads(await code_execution.execute_code(
+                    "print(open('results/tool.txt').read())",
+                    user_id="u",
+                    session_id="s",
+                ))
+
+        self.assertEqual("success", result["status"])
+        isolated.assert_awaited_once()
+        kwargs = isolated.await_args.kwargs
+        self.assertEqual(workspace, kwargs["workspace"])
+        self.assertEqual(results, kwargs["results_root"])
+        self.assertEqual(("tool.txt",), kwargs["result_paths"])
+        self.assertIn("open('../results/tool.txt')", kwargs["code"])
+
     async def test_pandas_relative_read_dispatches_isolated_session_runtime(self):
         isolated = AsyncMock(return_value={
             "status": "success",

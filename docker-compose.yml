@@ -421,7 +421,7 @@ services:
       DELEGATION_BATCH_HARD_TIMEOUT_SECONDS: ${DELEGATION_BATCH_HARD_TIMEOUT_SECONDS:-21600}
       # Absolute ceiling for a stream that continues making real progress.
       # Initial-response and read-stall leases remain independently shorter.
-      LLM_STREAM_TOTAL_TIMEOUT_SECONDS: ${LLM_STREAM_TOTAL_TIMEOUT_SECONDS:-2400}
+      LLM_STREAM_TOTAL_TIMEOUT_SECONDS: ${LLM_STREAM_TOTAL_TIMEOUT_SECONDS:-14400}
       WEB_SEARCH_PROVIDERS: ${WEB_SEARCH_PROVIDERS:-searxng}
       SEARXNG_BASE_URL: ${SEARXNG_BASE_URL:-http://searxng:8080}
       SEARXNG_TIMEOUT_SECONDS: ${SEARXNG_TIMEOUT_SECONDS:-10}
@@ -513,9 +513,9 @@ services:
       # Override JWT secret in production. Generate with: python -c 'import secrets; print(secrets.token_urlsafe(48))'
       SECRET_KEY: ${SECRET_KEY:-chat-acits-CHANGE-ME-IN-PRODUCTION}
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-chat-ds-internal-token}
-      # Must exceed Harness's absolute provider-stream ceiling so productive
-      # long-context reasoning is not severed by the HTTP proxy first.
-      HARNESS_STREAM_TIMEOUT_SECONDS: ${HARNESS_STREAM_TIMEOUT_SECONDS:-3000}
+      # Idle/read boundary: must exceed Harness's four-hour absolute
+      # provider-stream ceiling so this outer transport cannot fire first.
+      HARNESS_STREAM_TIMEOUT_SECONDS: ${HARNESS_STREAM_TIMEOUT_SECONDS:-18000}
       # Primary AgentModel (GLM-5.2) and auxiliary multimodal endpoint.
       DEEPSEEK_PRO_BASE_URL: ${DEEPSEEK_PRO_BASE_URL:-http://10.10.132.2:1025/v1}
       QWEN3_5_BASE_URL: ${QWEN3_5_BASE_URL:-http://10.10.132.128:1025/v1}

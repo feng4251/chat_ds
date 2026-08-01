@@ -658,6 +658,72 @@ def _snapshot_tree(
     return files
 
 
+def _snapshot_selected_files(
+    root: Path,
+    relative_paths: tuple[str, ...] | list[str],
+    *,
+    field: str,
+    max_files: int,
+    max_file_bytes: int,
+    max_total_bytes: int,
+) -> list[dict[str, Any]]:
+    """Snapshot only explicitly selected regular files below one trusted root."""
+
+    verified_root = _verified_directory(root, field=field)
+    safe_paths = sorted({
+        _safe_relative_path(path, field=f"{field} path")
+        for path in relative_paths
+    })
+    if len(safe_paths) > max_files:
+        raise IsolatedSkillExecutorError(
+            "snapshot_limit_exceeded",
+            f"{field} exceeds the {max_files}-file limit.",
+        )
+
+    files: list[dict[str, Any]] = []
+    total = 0
+    for relative in safe_paths:
+        candidate = verified_root.joinpath(*relative.split("/"))
+        try:
+            resolved = candidate.resolve(strict=True)
+            lexical = candidate.lstat()
+        except (OSError, RuntimeError) as exc:
+            raise IsolatedSkillExecutorError(
+                "unsafe_snapshot_file",
+                f"Cannot safely resolve selected snapshot file: {relative}",
+            ) from exc
+        try:
+            resolved.relative_to(verified_root)
+        except ValueError as exc:
+            raise IsolatedSkillExecutorError(
+                "unsafe_snapshot_file",
+                f"Selected snapshot file escapes {field}: {relative}",
+            ) from exc
+        if Path(os.path.abspath(candidate)) != resolved or stat.S_ISLNK(lexical.st_mode):
+            raise IsolatedSkillExecutorError(
+                "unsafe_snapshot_file",
+                f"Selected snapshot file contains a symlink: {relative}",
+            )
+        content = _read_snapshot_file(
+            resolved,
+            display_path=relative,
+            max_file_bytes=max_file_bytes,
+        )
+        total += len(content)
+        if total > max_total_bytes:
+            raise IsolatedSkillExecutorError(
+                "snapshot_limit_exceeded",
+                f"{field} exceeds its aggregate byte limit.",
+            )
+        files.append({
+            "path": relative,
+            "content_b64": base64.b64encode(content).decode("ascii"),
+            "size_bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        })
+    return files
+
+
 def _validated_args(args: list[str] | None) -> list[str]:
     if args is None:
         return []
@@ -1658,6 +1724,8 @@ def build_session_code_request(
     code: str,
     timeout: int = 30,
     skills_root: Path | None = None,
+    results_root: Path | None = None,
+    result_paths: tuple[str, ...] | list[str] | None = None,
     request_id: str | None = None,
 ) -> tuple[dict[str, Any], bytes]:
     """Build a bounded request for model-authored Python with session files.
@@ -1708,6 +1776,22 @@ def build_session_code_request(
             max_file_bytes=MAX_SKILL_FILE_BYTES,
             max_total_bytes=MAX_SKILL_TOTAL_BYTES,
         )
+    selected_result_paths = [] if result_paths is None else list(result_paths)
+    if selected_result_paths and results_root is None:
+        raise IsolatedSkillExecutorError(
+            "invalid_result_snapshot",
+            "result_paths require one trusted current-session results_root.",
+        )
+    result_files: list[dict[str, Any]] = []
+    if results_root is not None and selected_result_paths:
+        result_files = _snapshot_selected_files(
+            Path(results_root),
+            selected_result_paths,
+            field="results",
+            max_files=MAX_WORKSPACE_FILES,
+            max_file_bytes=MAX_WORKSPACE_FILE_BYTES,
+            max_total_bytes=MAX_WORKSPACE_TOTAL_BYTES,
+        )
 
     payload: dict[str, Any] = {
         "protocol_version": PROTOCOL_VERSION,
@@ -1717,6 +1801,7 @@ def build_session_code_request(
         "timeout": timeout,
         "skill_files": skill_files,
         "workspace_files": workspace_files,
+        "result_files": result_files,
     }
     encoded = json.dumps(
         payload,
@@ -4708,6 +4793,8 @@ async def execute_isolated_session_code(
     code: str,
     timeout: int = 30,
     skills_root: Path | None = None,
+    results_root: Path | None = None,
+    result_paths: tuple[str, ...] | list[str] | None = None,
     socket_path: str = EXECUTOR_SOCKET,
     apply_artifacts: bool = True,
     execution_authority_check: Callable[[], None] | None = None,
@@ -4719,6 +4806,8 @@ async def execute_isolated_session_code(
         code=code,
         timeout=timeout,
         skills_root=skills_root,
+        results_root=results_root,
+        result_paths=result_paths,
     )
     reservation: ExecutorSlotReservation | None = None
     try:

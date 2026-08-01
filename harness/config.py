@@ -61,11 +61,11 @@ class Settings(BaseSettings):
     # input/output budget, and material output may renew it.  The total timeout
     # is the absolute deployment cap; neither planning, progress, nor a caller
     # can extend a request beyond it.
-    # GLM-class reasoning streams can remain productively active for roughly
-    # half an hour on large Skill workflows.  This absolute ceiling therefore
-    # leaves a measured buffer beyond 30 minutes; the shorter initial/read
-    # no-progress leases below still terminate genuinely stalled providers.
-    llm_stream_total_timeout_seconds: float = 2400.0
+    # This is an absolute ceiling, not the lease granted to every request.
+    # Concrete input/output budgets derive a smaller request-specific lease;
+    # material progress may renew it only up to this final bound.  Outer
+    # transport idle deadlines must remain strictly larger.
+    llm_stream_total_timeout_seconds: float = 14400.0
     llm_stream_initial_timeout_seconds: float = 600.0
     llm_stream_progress_grace_seconds: float = 180.0
     llm_stream_input_planning_tokens_per_second: float = 256.0
