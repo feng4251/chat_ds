@@ -974,8 +974,13 @@ def _delegate_result_footer_repair_messages(
                 f"`{_DELEGATE_RESULT_FOOTER_SUBMIT_TOOL_NAME}` function exactly "
                 "once. Copy only values supported by that retained result and "
                 "the declared schema; do not add facts, defaults, prose, XML, "
-                "code, or another call. If the retained result does not support "
-                "a schema-valid value, do not guess."
+                "code, or another call. Empty strings, objects, and arrays are "
+                "not generic unavailable markers. If the retained result does "
+                "not support a value, use an explicit schema-valid degraded "
+                "value with reason/provenance, or null only when the declared "
+                "schema permits null. Use an empty collection only when the "
+                "retained evidence explicitly proves a valid zero-result set. "
+                "Never guess."
             ),
         },
         {
@@ -13504,12 +13509,16 @@ async def run_stream(
     # confuse the latter with a post-dispatch synthesis.
     pending_delegate_visible_recovery_origin: str | None = None
     # A delegated model can return a complete substantive body with a normal
-    # stop while omitting only its declared terminal typed ledger.  The outer
-    # delegate wrapper remains the contract authority, but the same run may
-    # spend one existing iteration correcting only that footer.  This state is
-    # separate from stream repair and post-dispatch synthesis so their bounded
-    # recovery paths can never chain into this one.
+    # stop while omitting only its declared terminal typed ledger.  Treat the
+    # exact-one structured footer projection as a finalization phase, not as
+    # another reasoning/tool iteration.  One run-scoped slot may therefore run
+    # after the ordinary iteration budget is exhausted; it exposes only the
+    # internal non-dispatchable submitter and cannot chain into another repair.
+    # This mirrors mature runtimes' separate output-validation/finalization
+    # budget and prevents a retained length continuation from consuming the
+    # only turn that can commit its typed result.
     delegate_result_footer_repair_attempted = False
+    delegate_result_footer_finalization_slot_used = False
     pending_delegate_result_footer_repair = False
     pending_delegate_result_footer_repair_origin: str | None = None
     pending_delegate_result_footer_repair_context: dict[str, Any] | None = None
@@ -18072,6 +18081,7 @@ async def run_stream(
     ) -> dict[str, Any]:
         """Queue the run-scoped, exact-one-line delegated footer correction."""
         nonlocal delegate_result_footer_repair_attempted
+        nonlocal delegate_result_footer_finalization_slot_used
         nonlocal pending_delegate_result_footer_repair
         nonlocal pending_delegate_result_footer_repair_origin
         nonlocal pending_delegate_result_footer_repair_context
@@ -18132,6 +18142,22 @@ async def run_stream(
                 candidate_diagnostics.get("trailing_escape")
             ),
         })
+        main_iteration_budget_exhausted = budget.remaining <= 0
+        finalization_slot_borrowed = False
+        if main_iteration_budget_exhausted:
+            # The outer loop consumes an IterationBudget unit before it knows
+            # which phase will run. Give back the just-consumed terminal body
+            # turn exactly once so the next loop tick can execute the isolated
+            # finalizer without increasing the ordinary reasoning/tool budget.
+            # The run-scoped boolean, exact-one submitter, and terminal repair
+            # branch make this bounded even across provider failover.
+            if delegate_result_footer_finalization_slot_used:
+                raise RuntimeError(
+                    "delegated result-footer finalization slot exhausted"
+                )
+            budget.refund()
+            delegate_result_footer_finalization_slot_used = True
+            finalization_slot_borrowed = True
         delegate_result_footer_repair_attempted = True
         pending_delegate_result_footer_repair = True
         pending_delegate_result_footer_repair_origin = origin
@@ -18156,6 +18182,15 @@ async def run_stream(
             "footer_error": footer_error,
             "repair_count": 1,
             "max_repairs": 1,
+            "finalization_budget_kind": "independent_output_validation",
+            "main_iteration_budget_exhausted": (
+                main_iteration_budget_exhausted
+            ),
+            "finalization_slot_borrowed": finalization_slot_borrowed,
+            "finalization_slot_count": int(
+                delegate_result_footer_finalization_slot_used
+            ),
+            "max_finalization_slots": 1,
             "tools_exposed_next_turn": 1,
             "internal_submitter": True,
             "registry_dispatch_allowed": False,
@@ -27241,12 +27276,30 @@ async def run_stream(
             and full_content
             and not (buffer_direct_required and finish_reason == "stop")
         ):
+            continuation_comparison_prefix = previous_length_content
+            if (
+                delegated_required_result_fields
+                and (
+                    iteration_visible_length_recovery
+                    or iteration_synthesis_length_continuation
+                )
+            ):
+                # The outer delegated collector removes an incomplete typed
+                # ledger tail at this turn boundary. Compare the continuation
+                # against that same retained prefix; otherwise overlap
+                # detection can also erase the complete replacement footer
+                # emitted by the continuation.
+                continuation_comparison_prefix, _discarded_candidate_chars = (
+                    strip_result_fields_candidate_tail(
+                        continuation_comparison_prefix
+                    )
+                )
             deduplicated_visible_suffix = _continuation_unique_suffix(
-                previous_length_content,
+                continuation_comparison_prefix,
                 full_content,
             )
             repeated = _is_repeated_length_response(
-                previous_length_content,
+                continuation_comparison_prefix,
                 full_content,
             )
             if (
@@ -28116,7 +28169,6 @@ async def run_stream(
                 and output_contract_repair_needed
                 and not delegate_output_contract_repair_attempted
                 and not delegate_result_footer_repair_attempted
-                and budget.remaining > 0
                 and not iteration_result_footer_repair
                 and not iteration_visible_length_recovery
             ):
@@ -28438,7 +28490,6 @@ async def run_stream(
                 ):
                     if (
                         not delegate_result_footer_repair_attempted
-                        and budget.remaining > 0
                     ):
                         repair_debug = queue_delegate_result_footer_repair(
                             visible_recovery_retained_content,
@@ -28619,15 +28670,17 @@ async def run_stream(
                 # dispatch evidence and return to ordinary execution before the
                 # reserved final synthesis turn.  Historical repair counters
                 # must not poison that later terminal contract check.  In
-                # contrast, a stop emitted by a recovery sample itself remains
-                # terminal: its explicit iteration bit keeps it from chaining
-                # into this footer-only model turn.  The post-dispatch recovery
+                # contrast, a stop emitted by an error-recovery sample itself
+                # remains terminal: its explicit iteration bit keeps it from
+                # chaining into this footer-only model turn. A successful
+                # synthesis-length continuation is different: it completes a
+                # retained result body and may therefore enter the isolated
+                # output validator exactly once. The post-dispatch recovery
                 # run-scoped guard is retained as a defence-in-depth boundary
                 # because that path owns the terminal result once requested.
                 footer_repair_current_phase_compatible = bool(
                     iteration_tool_stream_repair is None
                     and not iteration_reasoning_only_recovery
-                    and not iteration_synthesis_length_continuation
                     and not iteration_visible_length_recovery
                     and not iteration_output_contract_repair
                     and not iteration_post_dispatch_stream_synthesis
@@ -28639,15 +28692,23 @@ async def run_stream(
                 )
                 if (
                     not delegate_result_footer_repair_attempted
-                    and budget.remaining > 0
                     and footer_repair_current_phase_compatible
                     and not delegate_post_dispatch_stream_synthesis_attempted
                     and action_promise_continuations == 0
                 ):
+                    footer_repair_source = (
+                        accumulated_visible_result
+                        if iteration_synthesis_length_continuation
+                        else full_content
+                    )
                     repair_debug = queue_delegate_result_footer_repair(
-                        full_content or "(No visible response.)",
+                        footer_repair_source or "(No visible response.)",
                         footer_error=result_footer_audit.get("footer_error"),
-                        origin="ordinary_stop",
+                        origin=(
+                            "synthesis_length_continuation"
+                            if iteration_synthesis_length_continuation
+                            else "ordinary_stop"
+                        ),
                     )
                     for debug_evt in await debug_stream_event(
                         "gate.continuation",
@@ -28670,8 +28731,8 @@ async def run_stream(
                     yield {
                         "type": "tool_progress",
                         "msg": (
-                            "↻ Repairing the delegated typed-result footer once "
-                            "within its existing iteration budget"
+                            "↻ Finalizing the delegated typed-result footer "
+                            "once through the isolated output validator"
                         ),
                     }
                     continue

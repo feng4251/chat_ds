@@ -4889,6 +4889,7 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
             "<tool_call><name>execute_code</name>",
             '<tool_call>{"name":"execute_code"}',
             "<tool_call>execute_code\n```python\nprint('example')\n```",
+            '<tool_call>read_file\\":{\\"path\\":\\"result.md\\"}',
         )
         for content in samples:
             with self.subTest(content=content):
@@ -4896,8 +4897,134 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(audit["detected_count"], 1)
                 self.assertEqual(
                     audit["unsupported_tool_names"],
-                    ["execute_code"],
+                    [
+                        "read_file"
+                        if "read_file" in content
+                        else "execute_code"
+                    ],
                 )
+
+    async def test_all_empty_typed_ledger_without_result_body_is_rejected(self):
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            yield {
+                "type": "delta",
+                "content": 'RESULT_FIELDS_JSON: {"rows":[]}',
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        persist = MagicMock(return_value="results/delegate_empty_rows.md")
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                persist,
+            ),
+        ):
+            result = await _run_child(
+                {
+                    "goal": "return the bounded query rows",
+                    "required_result_fields": ["rows"],
+                    "required_result_schema": {
+                        "rows": {"type": "array"},
+                    },
+                },
+                _context(),
+                0,
+            )
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("semantically empty", result["error"])
+        self.assertTrue(
+            result["result_shape"]["typed_result_semantic_audit"][
+                "all_fields_structurally_empty"
+            ]
+        )
+        persist.assert_not_called()
+
+    async def test_empty_typed_collection_with_explicit_zero_result_is_valid(self):
+        body = (
+            "The bounded registry query completed and returned zero matching "
+            "rows. Provenance: registry receipt R-0."
+        )
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            yield {
+                "type": "delta",
+                "content": body + '\nRESULT_FIELDS_JSON: {"rows":[]}',
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        persist = MagicMock(return_value="results/delegate_zero_rows.md")
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                persist,
+            ),
+        ):
+            result = await _run_child(
+                {
+                    "goal": "return the bounded query rows",
+                    "required_result_fields": ["rows"],
+                    "required_result_schema": {
+                        "rows": {"type": "array"},
+                    },
+                },
+                _context(),
+                0,
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(
+            result["result_shape"]["typed_result_semantic_audit"][
+                "substantive_body"
+            ]
+        )
+        self.assertTrue(
+            result["result_shape"]["typed_result_semantic_audit"][
+                "empty_ledger_justified"
+            ]
+        )
+        persist.assert_called_once()
+
+    async def test_empty_typed_collection_with_unrelated_body_is_rejected(self):
+        body = (
+            "# Findings\nThe retained evidence supports a material finding.\n"
+            "Provenance: bounded registry receipt R-1."
+        )
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            yield {
+                "type": "delta",
+                "content": body + '\nRESULT_FIELDS_JSON: {"rows":[]}',
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        persist = MagicMock(return_value="results/delegate_empty_rows.md")
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                persist,
+            ),
+        ):
+            result = await _run_child(
+                {
+                    "goal": "return the bounded query rows",
+                    "required_result_fields": ["rows"],
+                    "required_result_schema": {
+                        "rows": {"type": "array"},
+                    },
+                },
+                _context(),
+                0,
+            )
+
+        self.assertEqual(result["status"], "error")
+        semantic = result["result_shape"]["typed_result_semantic_audit"]
+        self.assertTrue(semantic["substantive_body"])
+        self.assertFalse(semantic["empty_ledger_justified"])
+        persist.assert_not_called()
 
     def test_all_provider_stream_corruption_reasons_share_one_failure_class(self):
         for reason in (

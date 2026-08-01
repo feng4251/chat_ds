@@ -597,10 +597,12 @@ def audit_raw_tool_protocol(
             immediate_match = re.match(
                 rf"(?is)^\s*(?P<name>{_RAW_TOOL_NAME_PATTERN})"
                 # Common provider dialects serialize a call as
-                # ``<tool_call>write_file(...)`` without a nested name tag or
-                # closing ``</tool_call>``.  The opening parenthesis is an
-                # executable-call delimiter, not ordinary prose.
-                r"(?=\s*(?:\(|>|\r?\n|\{|$))",
+                # ``<tool_call>write_file(...)`` or the escaped JSON-key form
+                # ``<tool_call>write_file\":{...}`` without a nested name tag
+                # or closing ``</tool_call>``. These delimiters identify an
+                # executable call, unlike prose that merely discusses the
+                # literal ``<tool_call>`` marker.
+                r"(?=\s*(?:\(|>|\r?\n|\{|$|\\?[\"']\s*:))",
                 body,
             )
             if immediate_match is not None:

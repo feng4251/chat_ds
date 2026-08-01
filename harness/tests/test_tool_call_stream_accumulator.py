@@ -5660,7 +5660,7 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
             repair_gate["payload"]["post_dispatch_terminal_contract_audit"]
         )
 
-    async def test_terminal_audit_does_not_expand_exhausted_budget_for_repair(self):
+    async def test_terminal_audit_uses_independent_output_retry_budget(self):
         reasoning_only = [
             "data: " + json.dumps({
                 "choices": [{
@@ -5679,27 +5679,43 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
                 self._valid_tool_lines("evidence.md"),
                 reasoning_only,
                 self._stop_lines(invalid_result),
-                self._stop_lines("must not be requested"),
+                self._structured_tool_lines(
+                    "submit_result_fields",
+                    {
+                        "study_title": {
+                            "status": "degraded",
+                            "reason": "retained evidence is incomplete",
+                            "provenance": "bounded evidence receipt",
+                        },
+                    },
+                ),
             ],
             max_iterations=3,
             delegated=True,
             required_result_fields=["study_title"],
         )
 
-        self.assertEqual(3, len(requests))
+        self.assertEqual(4, len(requests))
         dispatch_mock.assert_awaited_once()
-        self.assertFalse(any(
+        repair = any(
             event.get("event_type") == "debug.gate.continuation"
             and event.get("payload", {}).get("gate")
             == "delegate_result_footer_repair"
             for event in events
-        ))
+        )
+        self.assertTrue(repair)
+        requested = next(
+            event for event in events
+            if event.get("event_type")
+            == "debug.delegate.result_footer_repair.requested"
+        )
+        self.assertTrue(requested["payload"]["finalization_slot_borrowed"])
         terminal = [
             event for event in events
             if event.get("event_type") == "run.completed"
         ][-1]
         self.assertEqual(
-            "delegated_result_footer_repair_unavailable",
+            "delegated_result_footer_structured_repair",
             terminal["payload"]["terminal_reason"],
         )
         self.assertEqual("done", events[-1]["type"])
