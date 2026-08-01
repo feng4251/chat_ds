@@ -16,6 +16,7 @@ from typing import Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from storage_attestation import storage_root_attestation
 
 from config import (
     DEFAULT_AGENT_MODEL_ID,
@@ -225,7 +226,22 @@ async def require_internal_api_token(request: Request, call_next):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "title": "Chat ACITS Harness"}
+    storage = storage_root_attestation("/app/data")
+    if storage["available"] is not True:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "error",
+                "title": "Chat ACITS Harness",
+                "code": "storage_root_unavailable",
+                "storage": storage,
+            },
+        )
+    return {
+        "status": "ok",
+        "title": "Chat ACITS Harness",
+        "storage": storage,
+    }
 
 
 # ── Internal endpoints (not exposed externally) ────────────────────────────
