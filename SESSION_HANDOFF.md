@@ -1,4 +1,4 @@
-# ChatDS 当前会话交接（2026-07-31）
+# ChatDS 当前会话交接（2026-08-01）
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
@@ -6,6 +6,39 @@
 
 - 工作目录：`/nfs/yangbb/codes/chat_ds`。
 - 分支：`fix/generic-skill-harness-20260717`。
+- 自动 E2E campaign 的 Round 5 会话为
+  `c8d53cd3f6904e90b88640a9125b7c0b`，root 为
+  `6421809b83be4d53a698ddfee550b01c`。它在生产连续运行约 6 小时 26 分后达到唯一
+  durable failed terminal；不是浏览器断开、统一沙箱缺失、共同网络故障或 Harness
+  timeout。exact Skill 正确选择 `composite_full_protocol_design`，完成 intent、7 路
+  bootstrap、PICO/Safety/Termination，以及 AE/Target/Competitive wave；Target worker
+  在 22 轮完成约 40.6K 字符正文后触发一次 length continuation，第 23 轮完成约 7.7K
+  字符续写，却因主 iteration budget 同时耗尽而没有机会执行 typed-output finalizer。
+  I/E、Literature、fan-in、11 个模块、strong-final 与 post-merge verifier 因 required
+  worker barrier 未通过而未启动，Artifact row 为 0。
+- Round 5 同时发现一个被旧校验误报为 succeeded/degraded 的 AE worker：其正文停在
+  `Let me read...`，随后输出 GLM escaped pseudo-call，footer projector 又把 13 个字段
+  全部填成空对象/空数组。旧 raw-protocol regex 未识别 `tool_name\":{...}` 方言，粗粒度
+  JSON Schema 又把全空 ledger 当成合法完成。Competitive worker 的同批结果为实质性
+  typed output，说明不是该 wave 的共同网络或调度故障。
+- 通用修复提交为
+  `36e8ea43dffe2fd29e3d20a372313f91bf2decfb fix: finalize delegated typed results independently`：
+  typed footer projection 现在拥有独立、严格一次的 output-validation slot，不扩大普通
+  推理/工具迭代；length continuation 与事务性坏 footer 撤销共用同一清洗前缀；raw
+  pseudo-tool audit 覆盖 escaped JSON-key 方言；所有 required fields 均为空时，只有带
+  明确 zero-result 或 degraded/gap 解释的实质正文才允许完成。无 V2.3、疾病、包、route、
+  worker/KG、session、文件名或固定数量特判。
+- Round 5 聚焦回归为 `320 passed, 104 subtests passed`；隔离 workspace/SANDBOX root
+  下 Harness 全量为 `1861 passed, 1 skipped, 782 subtests passed`。宿主默认根第一次的
+  19 个失败全部由生产 root-owned tombstone 在被测逻辑之前 fail closed，受影响的
+  13 个测试/9 个子测试在双根隔离后先行全部通过。`py_compile`、diff、secret 与
+  genericity 检查通过。
+- `36e8ea43` 已从 clean archive `/tmp/chat_ds_deploy_36e8ea43.lAJHbD` 构建并只替换生产
+  Harness。当前 Harness image 为
+  `sha256:09072ee7a688907251a5d4e96a94a08c6aeb791b40be7162423982effb77545c`，revision
+  label 为完整提交，切换前镜像保留 `rollback-pre-36e8ea43`。容器 healthy/restart 0，
+  三个入口、Harness 与 Backend→Harness health/models 均为 200，严重启动日志 0，
+  SQLite quick_check/FK、active root 和 running schedule 均正常。
 - 2026-07-31 五轮 E2E campaign 的 Round 3 通用修复提交：
   `3987613c fix: scope delegated frontier recovery`。新会话
   `2dcbcfa305084c5a9e11d4a359075054` / root
@@ -1343,10 +1376,11 @@ checkout 分离或完成一次审计后的 untrack/migration。
 4. 将终稿与 ground truth 做结构、覆盖、证据链、表格、附录、traceability 和可用性对比，不要求逐字节相同。
 5. 只修复跨领域可复现的通用根因，并增加非 V2.3 特定回归。
 
-### 9.1 五轮 E2E 迭代协议（用户于 2026-07-31 明确授权）
+### 9.1 最多八轮 E2E 迭代协议（用户于 2026-07-31/08-01 明确授权）
 
-用户已明确要求由维护代理自动执行连续 5 轮 V2.3 模型重型 E2E；这项明确授权覆盖本次
-五轮 campaign，替代“下一轮必须由用户手工发起”的默认限制。每轮必须使用新的
+用户已明确要求由维护代理自动执行连续 5 轮 V2.3 模型重型 E2E；若 5 轮后仍未收敛，
+可按同一协议最多继续到第 8 轮。这项明确授权覆盖本次 campaign，替代“下一轮必须由用户
+手工发起”的默认限制。每轮必须使用新的
 conversation/root run，并在该轮达到 durable terminal 后才计数；同一 run 的重试、补跑、
 刷新或重复解读不算新一轮。任何生产切换必须先确认没有其他用户 active root run，且不得
 为了赶轮次人为取消正在运行的任务。
@@ -1394,7 +1428,7 @@ Skill/package/workflow digest，provider/model/context/max-output/finish/elapsed
 tool_choice、dispatch/preflight/receipt，recovery 原因与次数，fan-in cohort，artifact 路径/大小/
 摘要/合同结果，inner/outer terminal 关联，以及成熟方案的 problem-to-pattern-to-decision 对照。
 
-### 9.2 当前五轮 campaign 状态
+### 9.2 当前最多八轮 campaign 状态
 
 逐轮证据、模拟人工追问链、delegate 明细、成熟实现对照、通用不变量、确定性复现、
 revision/image 与生产 smoke 统一记录在 `E2E_ITERATION_LOG.md`。Round 1 的新会话为
@@ -1405,10 +1439,13 @@ revision/image 与生产 smoke 统一记录在 `E2E_ITERATION_LOG.md`。Round 1 
 `2dcbcfa305084c5a9e11d4a359075054`，root 为
 `69cbcaacf1174ab4b9d96821e1bfeb7a`；Round 4 为
 `205709a7f8b447119670b6686f2e7601`，root 为
-`7287d853563d46cd949e86727db11ef4`。四轮均已到 durable failed terminal，各自通用修复
-已在 `26d65158`、`aac60951`、`3987613c`、`867ebdd9` 完成回归、本地 commit、
-clean-archive 部署与生产 smoke。生产当前空闲，可以创建全新 conversation/root 开始
-Round 5。
+`7287d853563d46cd949e86727db11ef4`；Round 5 为
+`c8d53cd3f6904e90b88640a9125b7c0b`，root 为
+`6421809b83be4d53a698ddfee550b01c`。五轮均已到 durable failed terminal，各自通用修复
+已在 `26d65158`、`aac60951`、`3987613c`、`867ebdd9`、`36e8ea43` 完成回归、
+本地 commit、clean-archive 部署与生产 smoke。生产当前空闲；因 Round 5 尚未产生
+strong-final artifact，campaign 可按用户授权继续创建全新 conversation/root 执行 Round 6，
+最多到 Round 8，不能复用失败 run 或把同一 run 的重试计为新一轮。
 
 ## 10. 已知非 blocker 边界
 

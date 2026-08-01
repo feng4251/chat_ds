@@ -505,4 +505,120 @@ Backend、Frontend、四个统一沙箱、egress proxy、Browser、SearXNG/Valke
 
 ## Round 5
 
-待执行。
+### 冻结身份、对话与 durable terminal
+
+- 被测生产代码为 `0fe27ab6`；Conversation：
+  `c8d53cd3f6904e90b88640a9125b7c0b`；root run：
+  `6421809b83be4d53a698ddfee550b01c`。用户业务输入仍是历史手工基线，没有注入维护提示。
+- 原始 ZIP SHA-256 仍为
+  `78b890eab57ff516c20a39a565631caa5d784f839b42f6ad9efbdbdd951eb0a0`；primary
+  `SKILL.md` SHA-256 仍为
+  `85ecc2fc48b290596c0cf2153b8268cc9f1a6b4f50ca75fb3989f477c8e7df1b`。
+  exact package 位于该 session 的内容寻址 Skill root，Harness 正确选择
+  `healthsim-trialsim/composite_full_protocol_design`。
+- root 从 09:11 到 15:37 连续运行约 6 小时 26 分，唯一权威终态为
+  `run.failed / delegate_step_failed`；无 child cancelled，0 个 Artifact row。失败不是
+  SSE/浏览器断线、1500 秒或 4 小时 stream timeout、统一沙箱缺失、人工取消或所有网站
+  共同不可达。
+- ground truth 是 200,094 bytes/3,383 行，H1/H2/H3 为 13/74/172、table rows 1,159、
+  code fences 92。该轮 required worker barrier 未通过，I/E、Literature、fan-in、11 个
+  模块、strong-final 与 post-merge verifier 都未启动，因此没有可做业务结构验收的最终 MD；
+  这是明确失败，不能用已持久化的 child results 冒充报告完成。
+
+### exact Skill、执行图与 delegate 明细
+
+Skill 为 comprehensive route 声明 8 个 worker：PICO、Safety、Termination、I/E、AE、Target、
+Competitive、Literature，并为各 worker 编译独立 Knowledge Gate、exact tools 和 typed
+output fields。实际完成 intent、7 路 bootstrap、PICO/Safety/Termination wave，以及
+AE/Target/Competitive wave；Target 是唯一 terminal blocker：
+
+| Run | 语义身份 | 终态 | input/output tokens | 结论 |
+|---|---|---|---:|---|
+| `56dc8...` | Intent classification | succeeded | 1,547 / 758 | route 正常 |
+| `3f4a6...` | PubMed bootstrap | succeeded/degraded | 246,423 / 5,749 | 来源级降级 |
+| `bb5ec...` | ICH bootstrap | succeeded/degraded | 152,035 / 5,988 | 收敛 |
+| `d44d3...` | CT.gov bootstrap | succeeded/degraded | 175,872 / 2,469 | 收敛 |
+| `66214...` | FDA bootstrap | succeeded/degraded | 434,492 / 4,897 | 收敛 |
+| `80f30...` | Target bootstrap | succeeded/degraded | 346,580 / 1,793 | 收敛 |
+| `d540e...` | EMA bootstrap | succeeded/degraded | 110,333 / 2,748 | 收敛 |
+| `5894f...` | Competitive bootstrap | succeeded/degraded | 36,132 / 904 | 收敛 |
+| `2807e...` | Termination worker | succeeded/degraded | 1,112,657 / 11,728 | 实质结果已持久化 |
+| `55e88...` | Safety worker | succeeded/degraded | 549,594 / 14,986 | 实质结果已持久化 |
+| `79f9f...` | PICO worker | succeeded/degraded | 1,843,261 / 33,164 | 实质结果已持久化 |
+| `227b1...` | Competitive worker | succeeded/degraded | 1,866,639 / 16,402 | 实质 typed result |
+| `af7ef...` | AE worker | 旧 Harness 误报 succeeded/degraded | 1,254,713 / 2,774 | 空 ledger 假完成 |
+| `e9538...` | Target worker | failed | 3,135,884 / 44,202 | finalizer 预算耦合 |
+
+Target exact schema 有 11 个 required fields。它完成 7/7 Knowledge Gate groups；末端来源
+HTTP 429 被正确封为 degraded gap。第 15–21 轮执行多个有界 evidence-processing 工具，
+第 22 轮 tools closed，生成 40,637 visible chars 并以 `length` 停止；Harness 保留前缀并
+排入唯一 synthesis-length continuation。第 23 轮生成 7,747 chars、正常 `stop`，但仍无
+`RESULT_FIELDS_JSON`。旧逻辑把正文/工具 iteration 与 output finalization 共用同一个
+23-turn budget，而且把 synthesis continuation 当作禁止再接 footer repair 的错误恢复态，
+于是记录 `delegate.result_footer_repair.unavailable / iteration_budget_exhausted` 并失败。
+
+AE 的已持久化结果只有 3,323 bytes，正文实际停在 “I have ... Let me read ...”，紧跟
+`<tool_call>read_file\":{...}` escaped pseudo-call；后面基本全是 Harness receipt ledger。
+footer projector 将该 worker 的 13 个 required fields 全部写成 `{}`/`[]`。旧 raw-tool
+regex 没识别这个 GLM 方言，coarse object/array schema 又把全空 ledger 当成合法，所以形成
+语义 false-positive。Competitive 同批结果为 14,086 bytes，包含实质表格、provenance、
+degraded gaps 和非空 typed fields；这证明并行 wave、Provider 和网络并非共同故障。
+
+### 模拟人工追问后的通用根因
+
+1. **执行预算与输出定稿预算耦合。** 完成长正文所需的最后一次 continuation 可以耗尽
+   reasoning/tool iteration，但一个已保留正文仍需要独立的、严格有界的 typed commit node。
+2. **续写去重与事务性坏尾撤销使用了不同前缀。** 当 length 截断落在半个 typed footer
+   上时，collector 会撤销坏尾，deduplicator 却仍可能把续写中的完整替代 footer 一并删掉。
+3. **raw pseudo-call 识别没有覆盖 provider escaped JSON-key 方言。** 审计器只接受 `(`、
+   `>`、换行、`{` 等 delimiter，没有覆盖 `tool_name\":{...}`。
+4. **JSON shape valid 不等于语义完成。** 所有 required fields 都是 empty/null 时，必须有
+   明确 zero-result 或 degraded/gap 的实质解释；过程叙述和机器 receipt 不能替代结果。
+
+### 成熟 session-wise Harness 对照与决策
+
+| 问题 | 官方成熟机制 | 决策 |
+|---|---|---|
+| typed result 占用最后一个普通 turn | Pydantic AI 为 output validator/output tool 单独维护 output retry budget，默认 1，可独立配置 | adopt：exact-one internal submitter 获得独立 finalization slot，不增加普通 reasoning/tool budget |
+| partial stream 与 final validation 混淆 | Pydantic AI `partial_output` 区分流式中间值和最终完整值；OpenAI Agents SDK 的 `final_output` 在完整结束前保持 `None` | adopt：只在 retained body 完成后做 final-only schema/semantic audit |
+| sibling 成功不能因一个 worker 失败丢失 | LangGraph step checkpoint 与 pending writes 保存同一 super-step 的已完成 sibling | 已采用并保留：所有 completed child results 持久化，root 只封 target blocker |
+| 长 activity 的 timeout/retry 粒度 | Temporal 区分 Start-to-Close、Schedule-to-Close、heartbeat，并把 retry 绑定 activity attempt | 已采用/继续：provider stream、batch hard cap、progress lease 独立；本轮不是 timeout |
+| 规划、文件卸载、命名 subagent、Skill 隔离 | Deep Agents 的 planning/filesystem/subagent/response_format 和 LangGraph durable runtime | adapt 其边界；reject 整体换栈，避免分叉现有 authority、sandbox、CAS 与 durable event 主链 |
+
+官方参考：
+
+- <https://pydantic.dev/docs/ai/core-concepts/output/>
+- <https://docs.langchain.com/oss/python/langgraph/persistence>
+- <https://docs.langchain.com/oss/python/langgraph/functional-api>
+- <https://docs.langchain.com/oss/python/deepagents/overview>
+- <https://docs.langchain.com/oss/python/deepagents/subagents>
+- <https://docs.temporal.io/encyclopedia/detecting-activity-failures>
+- <https://openai.github.io/openai-agents-python/results/>
+
+### 通用修复、确定性复现、回归与部署
+
+- footer projector 获得一个 run-scoped、exact-one、internal-submit-tool-only 的独立
+  output-validation slot。普通推理、工具、HTTP、纠错 budget 均未放宽；provider failover
+  也不能重复消费第二个 finalizer。
+- synthesis-length completion 可进入 finalizer，并把已保留 prefix 与 unique suffix 的
+  合并正文交给 projector。去重器在 typed candidate 被事务撤销时改用相同 clean prefix，
+  不再删除完整替代 footer。
+- raw protocol audit 覆盖 escaped JSON-key call；typed semantic audit 忽略 Harness-owned
+  receipt 行，拒绝全空 required ledger，除非模型正文明确证明 zero-result 或 degraded gap。
+- 新增非临床、非固定 route 的 ScriptedProvider 测试：两个工具调用后长正文 length、最后
+  continuation 用完主预算仍执行一次 finalizer；半个 footer 的撤销/替代；escaped pseudo-call；
+  全空 ledger 拒绝、明确零结果接受、无关实质正文仍拒绝。
+- 聚焦三组为 `320 passed, 104 subtests passed`；隔离 workspace/SANDBOX root 的 Harness
+  全量为 `1861 passed, 1 skipped, 782 subtests passed`。默认生产 NFS 下的 19 个红灯均在
+  被测逻辑前命中 root-owned tombstone；双根隔离的失败 cohort 先行
+  `13 passed, 9 subtests passed`，随后全量全绿。`py_compile`、diff、secret 与 production
+  genericity scan 均通过。
+
+本轮功能提交为
+`36e8ea43dffe2fd29e3d20a372313f91bf2decfb fix: finalize delegated typed results independently`。
+clean archive 位于 `/tmp/chat_ds_deploy_36e8ea43.lAJHbD`；Harness image 为
+`sha256:09072ee7a688907251a5d4e96a94a08c6aeb791b40be7162423982effb77545c`，旧镜像保留
+`rollback-pre-36e8ea43`。部署前两次确认 active root、schedule、5173 established connection
+均为 0，SQLite quick_check/FK 正常；只 force-recreate Harness。部署后三入口与
+Harness/Backend→Harness health/models 均为 200，restart 0、严重启动日志 0，数据库健康且
+生产空闲。Round 5 尚未收敛到 strong-final artifact，按用户授权继续 Round 6，最多 Round 8。
