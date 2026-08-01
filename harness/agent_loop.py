@@ -46,7 +46,7 @@ from delegated_result_contract import (
     RESULT_FIELDS_JSON_PREFIX,
     audit_raw_tool_protocol,
     audit_result_fields,
-    canonical_result_fields_footer_from_json,
+    canonical_result_fields_footer_from_internal_submitter_json,
     extract_canonical_result_fields_footer,
     strip_result_fields_candidate_tail,
 )
@@ -750,44 +750,51 @@ def _canonical_footer_from_internal_submitter_text(
         return None, diagnostics
 
     if stripped.startswith(RESULT_FIELDS_JSON_PREFIX):
-        recovered = extract_canonical_result_fields_footer(
-            stripped,
-            required_fields,
-            field_schema,
+        raw_json = stripped[len(RESULT_FIELDS_JSON_PREFIX):].strip()
+        footer, audit, transport_diagnostics = (
+            canonical_result_fields_footer_from_internal_submitter_json(
+                raw_json,
+                required_fields,
+                field_schema,
+            )
         )
-        footer = recovered.get("footer")
-        if recovered.get("recovered") is True and isinstance(footer, str):
+        if isinstance(footer, str):
             diagnostics.update({
                 "accepted": True,
                 "method": "canonical_footer_text",
-                "candidate_count": int(
-                    recovered.get("candidate_count") or 0
-                ),
+                "candidate_count": 1,
+                **transport_diagnostics,
             })
             return footer, diagnostics
         diagnostics.update({
             "reason": "canonical_footer_text_invalid",
-            "candidate_count": int(recovered.get("candidate_count") or 0),
+            "candidate_count": 1,
+            "footer_error": audit.get("footer_error"),
+            **transport_diagnostics,
         })
         return None, diagnostics
 
     if not stripped.startswith("{"):
         diagnostics["reason"] = "text_submission_is_not_json_object"
         return None, diagnostics
-    footer, audit = canonical_result_fields_footer_from_json(
-        stripped,
-        required_fields,
-        field_schema,
+    footer, audit, transport_diagnostics = (
+        canonical_result_fields_footer_from_internal_submitter_json(
+            stripped,
+            required_fields,
+            field_schema,
+        )
     )
     if footer is None:
         diagnostics.update({
             "reason": "bare_json_text_invalid",
             "footer_error": audit.get("footer_error"),
+            **transport_diagnostics,
         })
         return None, diagnostics
     diagnostics.update({
         "accepted": True,
         "method": "bare_json_text",
+        **transport_diagnostics,
     })
     return footer, diagnostics
 
@@ -29291,6 +29298,13 @@ async def run_stream(
                 submit_protocol_audit: dict[str, Any] = {
                     "detected_count": 0,
                 }
+                submit_transport_diagnostics: dict[str, Any] = {
+                    "transport_envelope_normalized": False,
+                    "normalized_field_count": 0,
+                    "normalized_field_name_sha256": [],
+                    "candidate_string_count": 0,
+                    "rejected_candidate_count": 0,
+                }
                 if exact_one_submit:
                     raw_submit_arguments = (
                         assembled_calls[0].arguments or ""
@@ -29300,8 +29314,12 @@ async def run_stream(
                         "result_fields",
                     )
                     if omission_path is None:
-                        canonical_footer, footer_submit_audit = (
-                            canonical_result_fields_footer_from_json(
+                        (
+                            canonical_footer,
+                            footer_submit_audit,
+                            submit_transport_diagnostics,
+                        ) = (
+                            canonical_result_fields_footer_from_internal_submitter_json(
                                 raw_submit_arguments,
                                 delegated_required_result_fields,
                                 delegated_required_result_schema,
@@ -29361,6 +29379,7 @@ async def run_stream(
                     "raw_protocol_count": int(
                         submit_protocol_audit.get("detected_count") or 0
                     ),
+                    **submit_transport_diagnostics,
                     "required_field_count": len(
                         delegated_required_result_fields
                     ),

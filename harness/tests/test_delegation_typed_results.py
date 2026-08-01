@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 from delegated_result_contract import (
     audit_raw_tool_protocol as _raw_pseudo_tool_protocol_audit,
     canonical_result_fields_footer_from_json,
+    canonical_result_fields_footer_from_internal_submitter_json,
     extract_canonical_result_fields_footer,
     strip_result_fields_candidate_tail,
 )
@@ -1270,6 +1271,126 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertIsNone(footer)
                 self.assertFalse(audit["footer_valid"])
+
+    def test_internal_submitter_unwraps_only_schema_proven_json_containers(self):
+        schema = {
+            "mission_manifest": {
+                "type": "object",
+                "properties": {
+                    "vehicle": {"type": "string"},
+                    "revision": {"type": "integer"},
+                },
+                "required": ["vehicle", "revision"],
+                "additionalProperties": False,
+            },
+            "observations": {
+                "type": "array",
+                "items": {"type": "number"},
+                "minItems": 2,
+            },
+        }
+        values = {
+            "mission_manifest": json.dumps({
+                "vehicle": "orbiter",
+                "revision": 3,
+            }),
+            "observations": json.dumps([1.25, 2.5]),
+        }
+
+        footer, audit, diagnostics = (
+            canonical_result_fields_footer_from_internal_submitter_json(
+                json.dumps(values),
+                ["mission_manifest", "observations"],
+                schema,
+            )
+        )
+
+        self.assertTrue(audit["footer_valid"])
+        self.assertIsNotNone(footer)
+        self.assertEqual({
+            "mission_manifest": {
+                "vehicle": "orbiter",
+                "revision": 3,
+            },
+            "observations": [1.25, 2.5],
+        }, json.loads(footer.split(": ", 1)[1]))
+        self.assertTrue(diagnostics["transport_envelope_normalized"])
+        self.assertEqual(2, diagnostics["normalized_field_count"])
+        self.assertEqual(2, len(diagnostics["normalized_field_name_sha256"]))
+        self.assertNotIn("orbiter", json.dumps(diagnostics))
+
+    def test_internal_submitter_never_reinterprets_schema_valid_strings(self):
+        value = '{"note":"this is intentionally text"}'
+        schema = {
+            "payload": {
+                "anyOf": [
+                    {"type": "string"},
+                    {"type": "object"},
+                ],
+            },
+        }
+
+        footer, audit, diagnostics = (
+            canonical_result_fields_footer_from_internal_submitter_json(
+                json.dumps({"payload": value}),
+                ["payload"],
+                schema,
+            )
+        )
+
+        self.assertTrue(audit["footer_valid"])
+        self.assertEqual(
+            {"payload": value},
+            json.loads(footer.split(": ", 1)[1]),
+        )
+        self.assertFalse(diagnostics["transport_envelope_normalized"])
+        self.assertEqual(1, diagnostics["rejected_candidate_count"])
+
+    def test_internal_submitter_rejects_ambiguous_or_invalid_envelopes(self):
+        schema = {
+            "manifest": {
+                "type": "object",
+                "properties": {"revision": {"type": "integer"}},
+                "required": ["revision"],
+                "additionalProperties": False,
+            },
+        }
+        invalid_values = (
+            '{"revision":3} trailing',
+            '{"revision":3,"revision":4}',
+            '{"revision":NaN}',
+            '[3]',
+            '{"revision":"three"}',
+            '"scalar"',
+            'ordinary prose',
+        )
+        for value in invalid_values:
+            with self.subTest(value=value):
+                footer, audit, diagnostics = (
+                    canonical_result_fields_footer_from_internal_submitter_json(
+                        json.dumps({"manifest": value}),
+                        ["manifest"],
+                        schema,
+                    )
+                )
+                self.assertIsNone(footer)
+                self.assertFalse(audit["footer_valid"])
+                self.assertFalse(
+                    diagnostics["transport_envelope_normalized"]
+                )
+
+    def test_regular_footer_parser_remains_strict_about_stringified_objects(self):
+        schema = {"manifest": {"type": "object"}}
+        raw = json.dumps({"manifest": json.dumps({"revision": 3})})
+
+        footer, audit = canonical_result_fields_footer_from_json(
+            raw,
+            ["manifest"],
+            schema,
+        )
+
+        self.assertIsNone(footer)
+        self.assertFalse(audit["footer_valid"])
 
     def test_schema_exposes_typed_result_fields_for_single_and_batch_tasks(self):
         properties = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
