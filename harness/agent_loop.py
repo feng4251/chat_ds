@@ -16114,6 +16114,7 @@ async def run_stream(
     session_skill_bundle_catalog = SessionSkillBundleCatalog(
         (), (), "not_scanned",
     )
+    session_skill_registry_integrity_failed = False
     if enforce_session_skill_workflow and "skill_view" in tools:
         try:
             from skills.scanner import find_all_skills
@@ -16148,16 +16149,60 @@ async def run_stream(
                 str(skill["name"]): skill for skill in session_records
             }
             run_state.session_skill_names = set(session_skill_catalog)
+            session_skill_registry_integrity_failed = bool(
+                session_skill_registry is not None
+                and (
+                    not isinstance(session_skill_registry, list)
+                    or (
+                        session_skill_bundle_catalog.registry_rows > 0
+                        and (
+                            session_skill_bundle_catalog.unmatched_rows > 0
+                            or session_skill_bundle_catalog.applied_rows
+                            != session_skill_bundle_catalog.registry_rows
+                        )
+                    )
+                )
+            )
         except Exception:
             logger.debug(
                 "Failed to inspect session skills for user=%s session=%s",
                 user_id, session_id, exc_info=True,
             )
+            registry_rows = (
+                len(session_skill_registry)
+                if isinstance(session_skill_registry, list) else 0
+            )
+            if (
+                not isinstance(session_skill_registry, list)
+                and session_skill_registry is not None
+            ) or bool(session_skill_registry):
+                session_skill_bundle_catalog = SessionSkillBundleCatalog(
+                    (), (), "invalid",
+                    registry_rows=registry_rows,
+                    unmatched_rows=registry_rows,
+                    failure_codes=("registry_inventory_scan_failed",),
+                )
+                session_skill_registry_integrity_failed = True
+    elif session_skill_registry:
+        # A non-empty registry is an ingress storage assertion.  If this run
+        # cannot inspect the canonical packages, continuing as ordinary chat
+        # would erase the user's selected execution contract.
+        registry_rows = (
+            len(session_skill_registry)
+            if isinstance(session_skill_registry, list) else 0
+        )
+        session_skill_bundle_catalog = SessionSkillBundleCatalog(
+            (), (), "invalid",
+            registry_rows=registry_rows,
+            unmatched_rows=registry_rows,
+            failure_codes=("registry_inventory_unavailable",),
+        )
+        session_skill_registry_integrity_failed = True
     # Exact Skill-name activation is possible only after the session-scoped
     # catalog has been resolved.  The decision still comes solely from a
     # user action phrase plus an exact available name; catalog discovery or a
     # bare name mention cannot activate the workflow.
-    if not delegated_subtask:
+    if not delegated_subtask and not session_skill_registry_integrity_failed:
         run_state.skill_workflow_activation = _skill_workflow_activation_for_request(
             run_state.original_user_text,
             set(explicit_skill_catalog),
@@ -17317,6 +17362,28 @@ async def run_stream(
             },
         ):
             yield debug_evt
+    if session_skill_registry_integrity_failed:
+        msg = (
+            "The session Skill storage registry could not be reconciled with "
+            "the immutable package inventory. The run stopped before any "
+            "model or tool dispatch instead of silently falling back to "
+            "direct chat."
+        )
+        yield await emit_agent_event("run.failed", {
+            "error": msg,
+            "finish_reason": "session_skill_registry_mismatch",
+            "registry_rows": session_skill_bundle_catalog.registry_rows,
+            "inventory_count": len(
+                session_skill_bundle_catalog.inventory_records
+            ),
+            "applied_rows": session_skill_bundle_catalog.applied_rows,
+            "unmatched_rows": session_skill_bundle_catalog.unmatched_rows,
+            "failure_codes": list(
+                session_skill_bundle_catalog.failure_codes
+            ),
+        })
+        yield {"type": "error", "msg": msg}
+        return
     if session_skill_relevance_decision.semantic_status != "not_attempted":
         for debug_evt in await debug_stream_event(
             "session_skill.semantic_selection",
@@ -37155,17 +37222,27 @@ def _session_skill_bundle_catalog(
         )
 
     failures: list[str] = []
+    content_addressed_registry = any(
+        isinstance(raw_row, dict)
+        and "skill_md_sha256" in raw_row
+        for raw_row in raw_registry
+    )
+    invalid_rows = 0
     parsed: dict[tuple[str, str], dict[str, str]] = {}
     duplicate_keys: set[tuple[str, str]] = set()
     for raw_row in raw_registry:
         if not isinstance(raw_row, dict):
             failures.append("registry_row_not_object")
+            invalid_rows += 1
             continue
         name = str(raw_row.get("name") or "").strip()
         scope = str(raw_row.get("scope") or "").strip()
         bundle_id = str(raw_row.get("bundle_id") or "").strip().lower()
         role = str(raw_row.get("bundle_role") or "").strip().lower()
         root_name = str(raw_row.get("bundle_root_name") or "").strip()
+        skill_md_sha256 = str(
+            raw_row.get("skill_md_sha256") or ""
+        ).strip().lower()
         if (
             not name
             or len(name) > 256
@@ -37176,29 +37253,64 @@ def _session_skill_bundle_catalog(
             or len(root_name) > 256
         ):
             failures.append("registry_row_invalid")
+            invalid_rows += 1
+            continue
+        if (
+            content_addressed_registry
+            and not re.fullmatch(r"[a-f0-9]{64}", skill_md_sha256)
+        ):
+            failures.append("registry_manifest_digest_invalid")
+            invalid_rows += 1
             continue
         key = (scope, name)
         if key in parsed:
             duplicate_keys.add(key)
             failures.append("registry_key_duplicate")
+            invalid_rows += 1
             continue
         parsed[key] = {
             "bundle_id": bundle_id,
             "bundle_role": role,
             "bundle_root_name": root_name,
+            **(
+                {"skill_md_sha256": skill_md_sha256}
+                if content_addressed_registry else {}
+            ),
         }
     for key in duplicate_keys:
         parsed.pop(key, None)
+        # The first occurrence is also unusable once its key is ambiguous.
+        invalid_rows += 1
 
-    available_keys = {
-        (str(record.get("scope") or ""), str(record.get("name") or ""))
+    available_by_key = {
+        (str(record.get("scope") or ""), str(record.get("name") or "")): record
         for record in inventory
     }
-    unmatched_rows = sum(1 for key in parsed if key not in available_keys)
+    available_keys = set(available_by_key)
+    digest_mismatch_keys = {
+        key
+        for key, metadata in parsed.items()
+        if (
+            key in available_by_key
+            and content_addressed_registry
+            and str(
+                available_by_key[key].get("skill_md_sha256") or ""
+            ).lower()
+            != metadata.get("skill_md_sha256")
+        )
+    }
+    if digest_mismatch_keys:
+        failures.append("registry_manifest_digest_mismatch")
+    eligible_keys = available_keys - digest_mismatch_keys
+    unmatched_rows = invalid_rows + sum(
+        1 for key in parsed if key not in eligible_keys
+    )
+    if unmatched_rows:
+        failures.append("registry_inventory_mismatch")
 
     groups: dict[tuple[str, str], list[tuple[tuple[str, str], dict[str, str]]]] = {}
     for key, metadata in parsed.items():
-        if key not in available_keys:
+        if key not in eligible_keys:
             continue
         groups.setdefault(
             (key[0], metadata["bundle_id"]),

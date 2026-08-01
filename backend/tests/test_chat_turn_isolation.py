@@ -225,11 +225,11 @@ class ChatTurnIsolationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(requests), 2)
         self.assertEqual(
-            expected_skill_registry,
+            [{**expected_skill_registry[0], "skill_md_sha256": None}],
             requests[0]["session_skill_registry"],
         )
         self.assertEqual(
-            expected_skill_registry,
+            [{**expected_skill_registry[0], "skill_md_sha256": None}],
             requests[1]["session_skill_registry"],
         )
         second_messages = requests[1]["messages"]

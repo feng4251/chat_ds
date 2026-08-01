@@ -42,7 +42,10 @@ from model_routing import (
     filter_agentic_fallback_model_ids,
 )
 from auth import get_current_user
-from skill_bundles import skill_bundle_registry_rows
+from skill_bundles import (
+    content_address_skill_bundle_registry_rows,
+    skill_bundle_registry_rows,
+)
 from stream_observability import (
     _ObservedStreamingResponse,
     _StreamObservation,
@@ -2908,6 +2911,16 @@ async def _chat_stream_with_turn(
     session_skill_registry = skill_bundle_registry_rows(
         skill_registry_rows
     )
+    if session_skill_registry:
+        # Import lazily to share the router's configured/test-overridden root
+        # without creating an import cycle at module initialization.
+        from routers.skill_router import SKILLS_DATA_DIR
+        session_skill_registry = await asyncio.to_thread(
+            content_address_skill_bundle_registry_rows,
+            session_skill_registry,
+            skill_registry_rows,
+            SKILLS_DATA_DIR,
+        )
     fallback_ids, removed_fallback_ids = filter_agentic_fallback_model_ids(
         serialize_json_list(conv.fallback_model_ids, []),
         requested_model_id=model_id,

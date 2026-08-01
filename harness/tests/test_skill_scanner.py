@@ -1,3 +1,4 @@
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -70,6 +71,14 @@ class SkillScannerTests(unittest.TestCase):
                 self.assertEqual(
                     directory_conflict.resolve(),
                     scanner.resolve_skill_path("different", user_id, session_id),
+                )
+                canonical = next(
+                    item for item in scanner.find_all_skills(user_id, session_id)
+                    if item["name"] == "canonical"
+                )
+                self.assertEqual(
+                    hashlib.sha256(declared.read_bytes()).hexdigest(),
+                    canonical["skill_md_sha256"],
                 )
             finally:
                 scanner.USER_SKILLS_BASE = old_base

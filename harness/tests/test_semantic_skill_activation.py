@@ -98,6 +98,47 @@ class SemanticSkillActivationTests(unittest.IsolatedAsyncioTestCase):
             catalog.failure_codes,
         )
 
+    def test_bundle_registry_missing_from_inventory_is_an_integrity_failure(self):
+        catalog = _session_skill_bundle_catalog([], [{
+            "name": "workflow-root",
+            "scope": "session",
+            "bundle_id": "d" * 64,
+            "bundle_role": "primary",
+            "bundle_root_name": "workflow-root",
+        }])
+
+        self.assertEqual("invalid", catalog.status)
+        self.assertEqual(1, catalog.registry_rows)
+        self.assertEqual(1, catalog.unmatched_rows)
+        self.assertIn(
+            "registry_inventory_mismatch",
+            catalog.failure_codes,
+        )
+
+    def test_content_addressed_registry_rejects_stale_manifest(self):
+        catalog = _session_skill_bundle_catalog(
+            [{
+                "name": "workflow-root",
+                "scope": "session",
+                "skill_md_sha256": "e" * 64,
+            }],
+            [{
+                "name": "workflow-root",
+                "scope": "session",
+                "bundle_id": "f" * 64,
+                "bundle_role": "primary",
+                "bundle_root_name": "workflow-root",
+                "skill_md_sha256": "a" * 64,
+            }],
+        )
+
+        self.assertEqual("invalid", catalog.status)
+        self.assertEqual(1, catalog.unmatched_rows)
+        self.assertIn(
+            "registry_manifest_digest_mismatch",
+            catalog.failure_codes,
+        )
+
     async def _run(
         self,
         request: str,
@@ -106,6 +147,7 @@ class SemanticSkillActivationTests(unittest.IsolatedAsyncioTestCase):
         *,
         extra_selector_tool_calls: list[dict] | None = None,
         session_skill_registry: list[dict] | None = None,
+        scanner_error: Exception | None = None,
     ):
         selector_requests: list[dict] = []
         stream_requests: list[dict] = []
@@ -318,9 +360,23 @@ class SemanticSkillActivationTests(unittest.IsolatedAsyncioTestCase):
                     )),
                     encoding="utf-8",
                 )
+                record["skill_md_sha256"] = hashlib.sha256(
+                    skill_path.read_bytes()
+                ).hexdigest()
             by_name = {
                 str(record["name"]): record for record in normalized_records
             }
+            scanner_patch = (
+                patch(
+                    "skills.scanner.find_all_skills",
+                    side_effect=scanner_error,
+                )
+                if scanner_error is not None else
+                patch(
+                    "skills.scanner.find_all_skills",
+                    return_value=normalized_records,
+                )
+            )
             with (
                 patch("workspace_context.WORKSPACE_ROOT", Path(temp_dir)),
                 patch("agent_loop.httpx.AsyncClient", FakeAsyncClient),
@@ -332,10 +388,7 @@ class SemanticSkillActivationTests(unittest.IsolatedAsyncioTestCase):
                 patch("agent_loop.settings.agent_debug_trace", True),
                 patch("agent_loop.settings.complex_report_max_iterations", 1),
                 patch("skills.loader.load_skill_content", side_effect=loaded_package),
-                patch(
-                    "skills.scanner.find_all_skills",
-                    return_value=normalized_records,
-                ),
+                scanner_patch,
                 patch(
                     "skills.scanner.skill_runnable_script_resources",
                     return_value=(),
@@ -937,6 +990,9 @@ class SemanticSkillActivationTests(unittest.IsolatedAsyncioTestCase):
             },
         ]
         bundle_id = "c" * 64
+        manifest_digest = hashlib.sha256(
+            b"# Instructions\n\nAnswer using the selected writing guidance."
+        ).hexdigest()
         registry = [
             {
                 "name": "workflow-root",
@@ -944,6 +1000,7 @@ class SemanticSkillActivationTests(unittest.IsolatedAsyncioTestCase):
                 "bundle_id": bundle_id,
                 "bundle_role": "primary",
                 "bundle_root_name": "workflow-root",
+                "skill_md_sha256": manifest_digest,
             },
             {
                 "name": "workflow-support",
@@ -951,6 +1008,7 @@ class SemanticSkillActivationTests(unittest.IsolatedAsyncioTestCase):
                 "bundle_id": bundle_id,
                 "bundle_role": "supporting",
                 "bundle_root_name": "workflow-root",
+                "skill_md_sha256": manifest_digest,
             },
         ]
 
@@ -982,6 +1040,116 @@ class SemanticSkillActivationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2, bundle["inventory_count"])
         self.assertEqual(1, bundle["routing_count"])
         self.assertEqual(1, bundle["supporting_rows"])
+
+    async def test_registry_inventory_mismatch_fails_before_model_dispatch(self):
+        registry = [{
+            "name": "workflow-root",
+            "scope": "session",
+            "bundle_id": "d" * 64,
+            "bundle_role": "primary",
+            "bundle_root_name": "workflow-root",
+        }]
+
+        def selector(_body):
+            self.fail("storage-integrity preflight must run before any model call")
+
+        selector_requests, stream_requests, dispatches, events = await self._run(
+            "Prepare a detailed cross-functional project plan.",
+            [],
+            selector,
+            session_skill_registry=registry,
+        )
+
+        self.assertEqual([], selector_requests)
+        self.assertEqual([], stream_requests)
+        self.assertEqual([], dispatches)
+        failed = [
+            event for event in events
+            if event.get("event_type") == "run.failed"
+        ]
+        self.assertEqual(1, len(failed))
+        self.assertEqual(
+            "session_skill_registry_mismatch",
+            failed[0]["payload"]["finish_reason"],
+        )
+
+    async def test_registry_scan_failure_fails_before_model_dispatch(self):
+        registry = [{
+            "name": "workflow-root",
+            "scope": "session",
+            "bundle_id": "d" * 64,
+            "bundle_role": "primary",
+            "bundle_root_name": "workflow-root",
+        }]
+
+        def selector(_body):
+            self.fail("scanner-integrity failure must precede model dispatch")
+
+        _selector, stream_requests, dispatches, events = await self._run(
+            "Prepare a detailed cross-functional project plan.",
+            [],
+            selector,
+            session_skill_registry=registry,
+            scanner_error=OSError("simulated storage read failure"),
+        )
+
+        self.assertEqual([], stream_requests)
+        self.assertEqual([], dispatches)
+        failed = next(
+            event for event in events
+            if event.get("event_type") == "run.failed"
+        )
+        self.assertIn(
+            "registry_inventory_scan_failed",
+            failed["payload"]["failure_codes"],
+        )
+
+    async def test_empty_registry_scan_failure_does_not_break_direct_chat(self):
+        def selector(_body):
+            self.fail("empty Skill registry must not invoke a selector")
+
+        _selector, stream_requests, dispatches, events = await self._run(
+            "What is two plus two?",
+            [],
+            selector,
+            session_skill_registry=[],
+            scanner_error=OSError("simulated optional inventory read failure"),
+        )
+
+        self.assertEqual(1, len(stream_requests))
+        self.assertEqual([], dispatches)
+        self.assertFalse(any(
+            event.get("event_type") == "run.failed"
+            and event.get("payload", {}).get("finish_reason")
+            == "session_skill_registry_mismatch"
+            for event in events
+        ))
+
+    async def test_malformed_registry_fails_before_model_dispatch(self):
+        def selector(_body):
+            self.fail("malformed registry must fail before any model call")
+
+        _selector, stream_requests, dispatches, events = await self._run(
+            "Prepare a detailed cross-functional project plan.",
+            [],
+            selector,
+            session_skill_registry={"unexpected": "object"},
+        )
+
+        self.assertEqual([], stream_requests)
+        self.assertEqual([], dispatches)
+        failed = next(
+            event for event in events
+            if event.get("event_type") == "run.failed"
+        )
+        self.assertEqual(
+            "session_skill_registry_mismatch",
+            failed["payload"]["finish_reason"],
+        )
+        self.assertIn(
+            "registry_not_list",
+            failed["payload"]["failure_codes"],
+        )
 
     async def test_explicit_exact_name_bypasses_semantic_model(self):
         records = [{
