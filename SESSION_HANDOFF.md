@@ -997,6 +997,18 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 - 前端：`http://10.10.132.126:5173`、`http://172.30.100.126:5173`。
 - Harness 使用同机 SearXNG `http://10.10.132.126:8088`；既有 SearXNG/Valkey 在切换
   中未重建，健康状态和数据卷保持不变。
+- 2026-08-01 完成 `867ebdd9` delegated terminal transaction 更新：
+  - 部署前连续两次确认 active root、running/enabled schedule 与 5173 established
+    connection 均为 0；SQLite `quick_check=ok`、foreign-key violation 0；
+  - 候选来自 clean Git archive `/tmp/chat_ds_deploy_867ebdd9.RfTPTD`，Harness revision
+    label 是完整 Git SHA；镜像内 compileall/import smoke 通过；
+  - 只 force-recreate Harness；旧镜像保留 `rollback-pre-867ebdd9`。Backend、Frontend、
+    四槽、Proxy、Browser、SearXNG/Valkey 和数据库卷均未替换；
+  - 部署后 Harness image 为
+    `sha256:632069f4cb29b2c77f30f3990e53d35e0c2717199851c84ff97354cb637cad91`，revision
+    为 `867ebdd9453790af96bd54efd2f7ead968c81aec`，restart 0；Harness、
+    Backend→Harness health/models 与三个 Frontend health 均为 200，严重启动日志、active
+    root、schedule 与 established connection 均为 0。
 - 2026-07-31 完成 `3987613c` delegated frontier recovery 更新：
   - 部署前连续两次确认 active AgentRun/root、running/enabled schedule 与 5173
     established connection 均为 0；SQLite `quick_check=ok`、foreign-key violation 0；
@@ -1149,7 +1161,7 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 | `chat_acits_executor` ～ `_4` | `sha256:08996fb6e1da586de9ee57d1812dda75826145bdf07d86dfa784f24b35ec004a` | 4 个同质槽 / healthy / restart 0 / revision `f1e59c20` |
 | `chat_acits_skill_egress_proxy` | `sha256:6f23e97983ace0c4855af3dbf65967678902d2cd8d5c5b33e92eeecb2cec072f` | healthy / restart 0 / revision `f1e59c20` |
 | `chat_acits_browser` | `sha256:08bcf8860c10ba8fcd647b6d1a96c2c12e13e46db800c812acea82e17007240c` | healthy / restart 0 / revision `7bbc0809` |
-| `chat_acits_harness` | `sha256:4f15d7e8afd7b579d0ab0c7d19b979af076642f68b70a66d470333d3161630fb` | healthy / restart 0 / revision `3987613c` |
+| `chat_acits_harness` | `sha256:632069f4cb29b2c77f30f3990e53d35e0c2717199851c84ff97354cb637cad91` | healthy / restart 0 / revision `867ebdd9` |
 | `chat_acits_backend` | `sha256:817390d6069315d69aef3bcd471f60d3f91f16ceac8e55cbb3d777127bfd1767` | running / restart 0 / revision `3987613c` / `/api/health` 200 |
 | `chat_acits_frontend` | `sha256:907c5abb41a5288c852ae55d2bbc3258196e4fc03fe0305ce072366f9255cb24` | running / restart 0 / revision `c62a4a69` / `/` 200 |
 
@@ -1168,7 +1180,8 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 - SearXNG 真实 `OpenAI GPT` 查询返回 27 条结果，命中 `360search`、`bing`、`mojeek`；
   SearXNG/Valkey 均 healthy。免费上游仍可能动态出现 unresponsive engine，不属于
   Harness 执行环境缺失。
-- Harness 与 Backend revision label 当前均为完整提交
+- Harness revision label 当前为完整提交
+  `867ebdd9453790af96bd54efd2f7ead968c81aec`，Backend 保持
   `3987613c43405b0347bc8606260abde078b707ba`；proxy/四槽为
   `f1e59c20129d9c3ba91b0f80850983e93d24d9dc`；Frontend 为
   `c62a4a69cfbbfb46404cfa1eb51b5f8e0498dce2`；legacy Browser 保持兼容基线。
@@ -1180,6 +1193,10 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 
 回滚点：
 
+- `867ebdd9` 切换前 Harness 保留
+  `chat_ds-harness:rollback-pre-867ebdd9`；候选/部署 tag 为
+  `candidate-867ebdd9` / `deploy-867ebdd9`，clean archive build 目录为
+  `/tmp/chat_ds_deploy_867ebdd9.RfTPTD`。
 - `3987613c` 切换前 Harness/Backend 分别保留
   `chat_ds-harness:rollback-pre-3987613c`、
   `chat_ds-backend:rollback-pre-3987613c`；候选/部署 tag 为
@@ -1386,9 +1403,12 @@ revision/image 与生产 smoke 统一记录在 `E2E_ITERATION_LOG.md`。Round 1 
 `2b1e321d275543de9328c3079259f5a8`，root 为
 `b64b7cf03538447588965a602fcdf42b`；Round 3 为
 `2dcbcfa305084c5a9e11d4a359075054`，root 为
-`69cbcaacf1174ab4b9d96821e1bfeb7a`。三轮均已到 durable failed terminal，各自通用修复
-已在 `26d65158`、`aac60951`、`3987613c` 完成回归、本地 commit、clean-archive 部署与
-生产 smoke。生产当前空闲，可以创建全新 conversation/root 开始 Round 4。
+`69cbcaacf1174ab4b9d96821e1bfeb7a`；Round 4 为
+`205709a7f8b447119670b6686f2e7601`，root 为
+`7287d853563d46cd949e86727db11ef4`。四轮均已到 durable failed terminal，各自通用修复
+已在 `26d65158`、`aac60951`、`3987613c`、`867ebdd9` 完成回归、本地 commit、
+clean-archive 部署与生产 smoke。生产当前空闲，可以创建全新 conversation/root 开始
+Round 5。
 
 ## 10. 已知非 blocker 边界
 

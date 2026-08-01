@@ -395,9 +395,113 @@ SearXNG/Valkey 和数据库卷均未替换。部署后三入口 `/`/`api/health`
 Backend→Harness `/health`/`v1/models` 均为 200；两容器 restart 0、严重日志 0，数据库
 健康且生产仍空闲。
 
-## Round 4
+## Round 4：闭式结构化修复的事务替换边界
 
-待执行。
+### 冻结身份与终态
+
+- 被测生产代码：`3987613c43405b0347bc8606260abde078b707ba`；Harness image：
+  `sha256:4f15d7e8afd7b579d0ab0c7d19b979af076642f68b70a66d470333d3161630fb`。
+- Conversation：`205709a7f8b447119670b6686f2e7601`；root run：
+  `7287d853563d46cd949e86727db11ef4`。第一次 setup-only conversation
+  `345819b2c94b4e22bad306e8ccf7123f` 在发送业务 prompt 前因维护脚本无权读取外部
+  workspace 而退出，没有 root run，不计入 E2E 轮次。
+- 原始 ZIP SHA-256：
+  `78b890eab57ff516c20a39a565631caa5d784f839b42f6ad9efbdbdd951eb0a0`，
+  829,621 bytes，1 个 primary 加 18 个 supporting Skills，上传件已持久化到 session
+  workspace。primary `SKILL.md` digest 为
+  `85ecc2fc48b290596c0cf2153b8268cc9f1a6b4f50ca75fb3989f477c8e7df1b`，orchestrator
+  resource digest 为
+  `6e8520593ebe68c5fb19c32dcae846f2525668f22d81701b9f201300d41939df`。
+- 维护端连续消费 1,556 条 SSE 到正常 EOF；root 的唯一 durable terminal 是
+  `run.failed / delegate_step_failed`。运行约 17 分钟，不是浏览器断线、Backend 无
+  terminal、Harness timeout、人工取消或全部网站不可达。
+- 0 个业务 Markdown：失败发生在 required bootstrap barrier，worker/fan-in、11 个模块、
+  strong-final 与 post-merge verifier 尚未开始。
+
+### 对话、Skill 与执行图对比
+
+业务输入继续使用历史手工基线。Harness 正确选择内容寻址的 `healthsim-trialsim` 包，完成
+intent，并按声明启动 6 路 bootstrap；不是直接 chat，也没有漏编 workflow。Exact Skill
+对 `target_biology_intel` 声明 `opentargets-database` 和 7 个 typed fields：
+`target_ensembl_id`、`disease_efo_id`、`overall_association_score`、
+`tractability_small_molecule`、`tractability_antibody`、`genetic_association_score`、
+`safety_liabilities`。失败发生在该 child 已成功完成闭式 typed projection 之后的外层提交审计。
+
+### Delegate/attempt 逐项结果
+
+| Run | 语义身份 | 终态 | input/output tokens | 结论 |
+|---|---|---|---:|---|
+| `e6dd9...` | Intent classification | succeeded | 1,547 / 661 | route 正常 |
+| `9d6a...` | clinicaltrials bootstrap | succeeded/degraded | 175,214 / 1,369 | 来源级降级后收敛 |
+| `5fdd...` | PubMed bootstrap | succeeded/degraded | 262,777 / 3,259 | 来源级降级后收敛 |
+| `7047...` | ICH bootstrap | succeeded/degraded | 150,276 / 4,355 | 收敛 |
+| `719b...` | FDA bootstrap | succeeded/degraded | 216,299 / 7,174 | 来源级降级后收敛 |
+| `c5a6...` | EMA bootstrap | succeeded/degraded | 150,367 / 2,646 | 收敛 |
+| `87e12...` | Target biology bootstrap | failed/nonretryable | 352,561 / 1,678 | 内层修复成功，外层误审计已被替代草稿 |
+
+Target biology 共 101 条 debug events。前 5 次迭代中虽然有 POST/脚本来源失败，但也有
+4 次成功 POST receipt；因此网络不是共同根因。第 6 次模型在可见长度降级合成中返回
+1,068 字符、带 raw pseudo-tool protocol 的污染终态。Harness 正确省略该污染正文并构造
+evidence capsule；第 7 次只有 2 条隔离消息、约 16,221 estimated input，模型以
+`submit_result_fields` 一次返回精确 7 字段，内层记录
+`delegate.result_footer_repair.completed` 与 provisional completed terminal。随后外层
+`_run_child` 仍审计累计的第 6 次污染正文，最终以
+`delegated_result_footer_structured_repair` 失败。root 正确只列该 blocker，已完成 sibling
+均保留，且没有 child cancelled。
+
+### 模拟人工追问后的通用根因
+
+1. **内层 replace 与外层 commit 语义不一致。** 闭式结构化 projector 的语义是用已验证
+   typed result 替代污染候选；外层 turn transaction 却仍按 append-only 聚合旧候选。
+2. **控制面成功没有形成原子提交边界。** 内层 repair completed 只是事件提示，外层不知道
+   哪一段 source turn 已被 supersede，因而权威审计再次看见已被隔离的 raw protocol。
+3. **普通 malformed footer 与 protocol-contaminated candidate 不能共用同一保留策略。**
+   前者应保留干净业务正文、只剥离坏 footer；后者必须整 turn 丢弃，只提交闭式投影。
+
+### 成熟实现对照与决策
+
+| 问题 | 官方成熟机制 | 决策 |
+|---|---|---|
+| 失败 attempt 的写入不能污染成功状态 | LangGraph persistence 的 pending writes / task-local retry | adapt：显式标记 superseded source turn，外层原子丢弃该 attempt |
+| 已完成 sibling/更早已提交段不能回滚 | LangGraph fault tolerance 与 checkpoint | 保留更早 committed terminal segments，只替换当前污染 turn |
+| 易失败活动与最终状态分离 | Temporal Activity/event-history retry | adapt：repair 是 control-plane transaction，不重放整个 child |
+| typed output 成为唯一权威结果 | Pydantic AI structured output / validation | 继续采用内部 submitter，外层只提交 canonical validated footer |
+| 整体迁移框架 | LangGraph/Temporal/Pydantic AI | reject：局部事务边界可在既有 authority、sandbox、CAS 和 event 模型内修复 |
+
+官方参考：
+
+- <https://docs.langchain.com/oss/python/langgraph/persistence>
+- <https://docs.langchain.com/oss/python/langgraph/durable-execution>
+- <https://docs.temporal.io/encyclopedia/retry-policies>
+- <https://ai.pydantic.dev/output/>
+
+### 通用修复与确定性证明
+
+- footer repair context 新增 machine-owned `replace_invalid_source_turn` 控制位；只有 raw
+  pseudo protocol 已被闭式 schema projection 替代时为 true。普通 malformed footer
+  repair 保持既有 append/strip 语义。
+- turn boundary 将该控制位传给外层 `_run_child`；外层原子丢弃当前污染 turn 的 content
+  和 reasoning，只保留更早 committed segments，再提交 canonical structured footer。
+  该标志不进入工具 registry、不扩权，也不允许模型自行声明。
+- 新增非临床 inventory/shipment 跨层 holdout：模拟污染终态、闭式 structured submitter、
+  synthetic canonical release，证明持久结果不含 raw protocol/source body，只有一个合法
+  footer；既有普通 footer repair 回归继续证明干净正文不会丢失。
+- 聚焦受影响组合为 `311 passed, 96 subtests passed`。隔离 tmpfs 全量为
+  `1837 passed, 1 failed, 772 subtests passed`；唯一失败是生产 Harness 镜像不带 Node
+  的 CommonJS runtime 项，同一测试在宿主 Node 22.23.1 下 `1 passed`。`py_compile`、
+  `git diff --check`、secret scan 与生产逻辑 genericity scan 通过。
+
+本轮功能提交为
+`867ebdd9453790af96bd54efd2f7ead968c81aec fix: replace superseded delegated terminal turns`。
+clean archive：`/tmp/chat_ds_deploy_867ebdd9.RfTPTD`；生产 Harness image：
+`sha256:632069f4cb29b2c77f30f3990e53d35e0c2717199851c84ff97354cb637cad91`；revision
+label 为完整提交，旧镜像保留 `rollback-pre-867ebdd9`。
+
+部署前两次确认 active root、enabled/running schedule 和 5173 established connection 均为
+0，SQLite `quick_check=ok`、foreign-key violation 为 0。只 force-recreate Harness；
+Backend、Frontend、四个统一沙箱、egress proxy、Browser、SearXNG/Valkey 和数据库卷均未
+替换。部署后 Harness restart 0，三入口 `/api/health`、Harness 与 Backend→Harness
+`/health`/`v1/models` 均为 200；严重启动日志 0，数据库健康且生产仍空闲。
 
 ## Round 5
 
