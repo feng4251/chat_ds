@@ -6,6 +6,30 @@
 
 - 工作目录：`/nfs/yangbb/codes/chat_ds`。
 - 分支：`fix/generic-skill-harness-20260717`。
+- 自动 E2E campaign Round 6 为 Conversation
+  `862eb37670634f5394fab116429fa948` / root
+  `88d0fd14ec01449cace347fcde4d6858`。它从 SSE 收到明确 durable failed terminal；intent 与
+  ClinicalTrials/PubMed/ICH/FDA/EMA/Target Biology bootstrap 均完成，唯一 Competitive
+  bootstrap 两次未通过 output contract。exact Skill 的 `drugbank-database` 是需账户/许可、
+  只有说明而无 MCP/脚本/HTTP/command bridge 的 supporting Skill，所以 child 没有 evidence
+  receipt。第一次模型虽声明 degraded，却填入 7 个未验证字段而被正确拒绝；第二次改成全 null，
+  但只给 legacy prose status，没有 exact `COMPLETION_QUALITY_JSON`，父级重试耗尽。
+- Round 6 的通用根因是父级 retry 只重新采样相同 task，没有携带上一 attempt 已持久化的
+  validator finding。修复提交
+  `70df8b51a34fa767c8cf3badb87b14449c76e872 fix: carry validator feedback into delegate retries`：
+  所有 declared delegate 类型的唯一 retry 现在附带 bounded、脱敏、Harness-owned 的
+  attempt/terminal reason/failure class/validator error 数据；失败正文仍不进入下一 child，工具、
+  schema、资源、Skill authority、重试次数和预算不变。没有 V2.3、疾病、包、source、worker、
+  route、session、文件名或固定数量特判。
+- Round 6 聚焦双根隔离回归为 `290 passed, 188 subtests passed`；Harness 全量为
+  `1862 passed, 1 skipped, 782 subtests passed`。默认 NFS 下唯一红灯仍是 root-owned tombstone
+  在 provider stream 前阻断，双根隔离单项及全量均通过。`py_compile`、diff、secret 与
+  genericity scan 通过。
+- `70df8b51` 已从 clean archive `/tmp/chat_ds_deploy_70df8b51.WprOt9` 构建并只替换生产
+  Harness。当前 image 为
+  `sha256:3d328d1af220fc51531fe9544685e728fc8eecf047d90686be76339c2323bb1b`，revision label
+  精确匹配完整提交，旧镜像保留为 `rollback-pre-70df8b51`。Harness healthy/restart 0；三入口、
+  Harness 与 Backend→Harness health/models 全 200；严重启动日志 0，数据库健康且生产空闲。
 - 自动 E2E campaign 的 Round 5 会话为
   `c8d53cd3f6904e90b88640a9125b7c0b`，root 为
   `6421809b83be4d53a698ddfee550b01c`。它在生产连续运行约 6 小时 26 分后达到唯一
@@ -33,8 +57,8 @@
   19 个失败全部由生产 root-owned tombstone 在被测逻辑之前 fail closed，受影响的
   13 个测试/9 个子测试在双根隔离后先行全部通过。`py_compile`、diff、secret 与
   genericity 检查通过。
-- `36e8ea43` 已从 clean archive `/tmp/chat_ds_deploy_36e8ea43.lAJHbD` 构建并只替换生产
-  Harness。当前 Harness image 为
+- `36e8ea43` 当时从 clean archive `/tmp/chat_ds_deploy_36e8ea43.lAJHbD` 构建并只替换生产
+  Harness。当时 Harness image 为
   `sha256:09072ee7a688907251a5d4e96a94a08c6aeb791b40be7162423982effb77545c`，revision
   label 为完整提交，切换前镜像保留 `rollback-pre-36e8ea43`。容器 healthy/restart 0，
   三个入口、Harness 与 Backend→Harness health/models 均为 200，严重启动日志 0，
@@ -1441,15 +1465,19 @@ revision/image 与生产 smoke 统一记录在 `E2E_ITERATION_LOG.md`。Round 1 
 `205709a7f8b447119670b6686f2e7601`，root 为
 `7287d853563d46cd949e86727db11ef4`；Round 5 为
 `c8d53cd3f6904e90b88640a9125b7c0b`，root 为
-`6421809b83be4d53a698ddfee550b01c`。五轮均已到 durable failed terminal，各自通用修复
+`6421809b83be4d53a698ddfee550b01c`；Round 6 为
+`862eb37670634f5394fab116429fa948`，root 为
+`88d0fd14ec01449cace347fcde4d6858`。六轮均已到 durable failed terminal，各自通用修复
 已在 `26d65158`、`aac60951`、`3987613c`、`867ebdd9`、`36e8ea43` 完成回归、
-本地 commit、clean-archive 部署与生产 smoke。生产当前空闲；因 Round 5 尚未产生
-strong-final artifact，campaign 可按用户授权继续创建全新 conversation/root 执行 Round 6，
+本地 commit、clean-archive 部署与生产 smoke；Round 6 修复在 `70df8b51`。生产当前空闲；
+因 Round 6 尚未产生 strong-final artifact，campaign 可按用户授权继续创建全新
+conversation/root 执行 Round 7，
 最多到 Round 8，不能复用失败 run 或把同一 run 的重试计为新一轮。
 
 ## 10. 已知非 blocker 边界
 
-- V2.3 与 ground truth 的业务级一致性仍需用户手工真实模型 E2E；基础回归不能替代这项验收。
+- V2.3 与 ground truth 的业务级一致性仍需真实模型重型 E2E；基础回归不能替代这项验收。
+  当前自动 campaign 已获用户明确授权，Round 7 可由维护代理继续发起。
 - Legacy `knowledge_gate.checks[].tools` 只能安全解释为单个 OR 组；需要多个独立
   必须条件的 Skill 应显式使用 `tool_groups` 或 `tools: {all_of: ...}`。Harness 不从
   自然语言 action 猜 AND/OR。

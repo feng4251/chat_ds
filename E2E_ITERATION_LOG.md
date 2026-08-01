@@ -622,3 +622,106 @@ clean archive 位于 `/tmp/chat_ds_deploy_36e8ea43.lAJHbD`；Harness image 为
 均为 0，SQLite quick_check/FK 正常；只 force-recreate Harness。部署后三入口与
 Harness/Backend→Harness health/models 均为 200，restart 0、严重启动日志 0，数据库健康且
 生产空闲。Round 5 尚未收敛到 strong-final artifact，按用户授权继续 Round 6，最多 Round 8。
+
+## Round 6：父级重试缺少 validator feedback
+
+### 冻结身份、exact Skill 与 durable terminal
+
+- 被测生产代码为 `36e8ea43dffe2fd29e3d20a372313f91bf2decfb`；Conversation：
+  `862eb37670634f5394fab116429fa948`；root run：
+  `88d0fd14ec01449cace347fcde4d6858`。维护端消费 1,774 条 SSE，并从 SSE 明确收到
+  `run.failed`；运行约 21 分钟，不是页面断线、SSE 无 terminal、provider timeout、沙箱缺失、
+  人工取消或共同网络故障。
+- 原始 ZIP SHA-256 仍为
+  `78b890eab57ff516c20a39a565631caa5d784f839b42f6ad9efbdbdd951eb0a0`；primary
+  `SKILL.md` SHA-256 仍为
+  `85ecc2fc48b290596c0cf2153b8268cc9f1a6b4f50ca75fb3989f477c8e7df1b`。19 个 Skill
+  全部安装，Harness 正确选择 `healthsim-trialsim/composite_full_protocol_design`；数据库对话
+  只有原始业务问题与明确失败回复。
+- intent 与前 6 个 bootstrap 全部完成，Competitive bootstrap 消耗唯一父级重试后仍未
+  通过 required barrier。worker、aggregation、artifact synthesis、merge、strong-final 与
+  post-merge verifier 均未启动，Artifact row 为 0；不能把 bootstrap 结果冒充终稿。
+
+### exact Skill、执行图与两次 Competitive attempt
+
+| Run | 语义身份 | 终态 | input/output tokens | 结论 |
+|---|---|---|---:|---|
+| `888039b4...` | Intent classification | succeeded | 1,547 / 730 | route 正常 |
+| `51f5ace4...` | ClinicalTrials.gov | succeeded/degraded | 172,560 / 1,754 | 来源级降级后收敛 |
+| `8e242d14...` | PubMed | succeeded/degraded | 278,316 / 1,484 | 来源级降级后收敛 |
+| `0b2eb151...` | ICH | succeeded/degraded | 151,715 / 5,493 | 收敛 |
+| `3ad663d2...` | FDA | succeeded/degraded | 259,867 / 4,575 | 收敛 |
+| `80dd5434...` | EMA | succeeded/degraded | 110,194 / 2,590 | 收敛 |
+| `1710c8b5...` | Target Biology | succeeded/degraded | 397,911 / 2,751 | 收敛 |
+| `2b324409...` | Competitive attempt 1 | failed/retryable | 36,119 / 2,471 | 无 receipt 却填充 7 字段 |
+| `ca1d8481...` | Competitive attempt 2 | failed/exhausted | 36,119 / 958 | 全 null，但缺 machine quality ledger |
+
+Exact orchestrator 把该 source 绑定到 `skill:drugbank-database`，要求 7 个字段。该 supporting
+Skill 是说明型包：描述需账户/许可的 DrugBank 下载、解析和依赖安装，没有 MCP、可运行脚本、
+literal HTTP grant 或声明命令。Harness 正确预载其主说明，但两个 child 的有效模型工具均为空，
+没有 evidence dispatch receipt。
+
+第一次模型仍返回 6,389 字符，带合法 degraded `COMPLETION_QUALITY_JSON`，但给 7 个字段全部
+填入未经 receipt 支持的事实。Harness 正确以 `agent_contract_noncompliance` 拒绝，且丢弃整个
+output transaction。父级随后保留 7 个成功 sibling，只为该 node 启动一次新 child。第二次
+模型已把 7 字段全改为 JSON null，并写了文本/legacy degraded 状态，却没有原始 prompt 要求的
+精确单行 `COMPLETION_QUALITY_JSON`；因此不能由模型自称的 prose gap 替代机器声明，最终
+`delegate_retry_exhausted` fail closed。
+
+### 模拟人工追问后的通用根因
+
+1. **父级 retry 是无反馈的重新采样。** `delegate_step_status` 已持久化第一 attempt 的精确
+   terminal reason、failure class 和 validator error，但第二 task 仍获得与第一次完全相同的
+   goal/context；被丢弃的输出不会污染新 child 是正确的，丢掉 validator finding 则不正确。
+2. **说明型 capability 允许合法 gap，但机器协议不能靠猜。** 无可执行候选时不得编造事实；
+   nullable schema 加 exact degraded ledger 可以收敛。旧父级重试没有告诉新 child 上轮究竟是
+   哪条输出合同失败，浪费了唯一有界修正机会。
+3. **不能用“全 null 自动通过”修复。** 那会削弱 forged/unscoped gap 防线。正确边界是保留
+   receipt 和 machine-ledger 审计，只给下一 attempt 最小、脱敏、Harness-owned 的错误反馈。
+
+### 成熟实现对照与决策
+
+| 问题 | 官方成熟机制 | 决策 |
+|---|---|---|
+| output validator 失败后重试不知道修什么 | Pydantic AI `ModelRetry` 把 validator 错误反馈给模型，并使用独立 output retry budget | adopt：父级唯一 retry 带结构化 validator feedback，不增加次数 |
+| fresh retry 与失败草稿隔离 | LangGraph task retry/pending writes 保存成功 sibling，但失败 task-local write 不提交 | 保留：不携带旧正文，只携带 control-plane finding |
+| activity 重试边界 | Temporal 对单一 Activity attempt 应用 retry policy，不重放整个 workflow | 保留：只重跑失败 node，7 个 sibling 不重跑 |
+| named subagent、planning、filesystem offload | Deep Agents 以 LangGraph runtime 组织这些能力 | 借鉴边界；不整体迁移，避免分叉既有 Skill authority、session sandbox、CAS 与 durable events |
+
+官方参考继续采用：
+
+- <https://pydantic.dev/docs/ai/core-concepts/output/>
+- <https://docs.langchain.com/oss/python/langgraph/persistence>
+- <https://docs.langchain.com/oss/python/langgraph/functional-api>
+- <https://docs.langchain.com/oss/python/deepagents/overview>
+- <https://docs.temporal.io/encyclopedia/detecting-activity-failures>
+
+### 通用修复、确定性测试与生产部署
+
+- 所有 declared delegate 类型（intent、artifact binding、bootstrap、worker、aggregation、
+  artifact synthesis）的父级重试统一附加一段 Harness-owned feedback JSON：前/后 attempt、
+  terminal reason、failure class、validator error。它位于既有 context 中，不更改 node 身份、
+  tools、resources、schema、Skill authority、重试次数或预算。
+- feedback 只投递到已失败且 retryable 的下一 attempt；URL 被换成内容寻址句柄，credential
+  assignment 被遮蔽，控制字符展平，error 上限 2,000 字符。失败正文和 reasoning 继续整段丢弃，
+  不允许复制未经验证的值。
+- 新增非临床 inventory holdout：首轮不带 feedback；记录一个 retryable typed validator
+  failure 后，下一轮只出现一次结构化反馈，包含精确 reason/class/attempt，且 URL/token/password
+  原文不可见、总长度有界。既有 nullable machine-degraded、伪造 gap、side-effect retry、batch
+  lease、workflow gate 回归共同证明安全边界未放宽。
+- 聚焦组合双根隔离为 `290 passed, 188 subtests passed`；完整 Harness 双根隔离为
+  `1862 passed, 1 skipped, 782 subtests passed`。第一次非隔离组合的唯一红灯在 provider stream
+  之前命中生产 NFS root-owned tombstone，单项双根隔离后通过。`py_compile`、diff、secret 与
+  production genericity 检查通过；生产 diff 中 V2.3/疾病/包/source/route 特判为 0。
+
+功能提交为
+`70df8b51a34fa767c8cf3badb87b14449c76e872 fix: carry validator feedback into delegate retries`。
+clean archive：`/tmp/chat_ds_deploy_70df8b51.WprOt9`；生产 image：
+`sha256:3d328d1af220fc51531fe9544685e728fc8eecf047d90686be76339c2323bb1b`；旧镜像保留为
+`rollback-pre-70df8b51`。切换前 active root/schedule/5173 connection 均为 0；只替换 Harness。
+部署后三入口、Harness 与 Backend→Harness health/models 均为 200，restart 0、严重启动日志 0，
+数据库健康且生产空闲。Round 6 仍未产生 strong-final artifact，按授权继续 Round 7。
+
+## Round 7
+
+待执行。
