@@ -1,4 +1,4 @@
-# ChatDS 当前会话交接（2026-08-01）
+# ChatDS 当前会话交接（2026-08-02）
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
@@ -6,6 +6,39 @@
 
 - 工作目录：`/nfs/yangbb/codes/chat_ds`。
 - 分支：`fix/generic-skill-harness-20260717`。
+- 自动 E2E campaign Round 7 为 Conversation
+  `67119645fa874ecba689c8a61e3874de` / root
+  `5e494f191ead47a6ad640295cd48e36e`。它从 2026-08-01 17:37:13 到 20:17:14 UTC
+  连续运行约 2 小时 40 分并收到明确 durable failed terminal；exact Skill 正确选择
+  `composite_full_protocol_design`，完成 intent、7 路 bootstrap、PICO/Safety/Termination
+  与 Target/Competitive worker。唯一 AE worker 因完整约 191.5K-char HTTP wire body 在
+  `skill_http_get` producer 内先截成 100K，后续旧 wrapper 只能保存已截断 JSON；该 minified
+  payload 又没有安全分页坐标，最终以
+  `response_exceeds_visible_limit_no_safe_page_window` fail closed。I/E、Literature、fan-in、
+  模块和 strong-final 未启动，Artifact row 为 0。它不是 timeout、断线、provider corrupt、
+  沙箱缺失或共同网络故障。
+- Round 7 通用修复提交
+  `064391529b767a2bb0228a5e74088d4572ad37c0 fix: spill oversized tool results losslessly`：
+  任意大文本工具结果在 producer/middleware 边界先无损 spill，再给模型 preview + runtime-owned
+  opaque handle；`read_tool_result` 只在本 run 产生 handle 后动态暴露，支持 bounded
+  offset/from-end/literal-pattern 回读。GET/POST 的完整 wire body 与 inline presentation
+  truncation 分权；真实 pagination 仍独立保持 open。句柄受 user/session/run ledger、dirfd、
+  `O_NOFOLLOW`、0600、UID、单硬链接、常规文件和 5 MiB 上限约束，且不参与 Skill/KG
+  candidate、mandatory/no-progress 或 mutation 计账。生产代码没有 V2.3、疾病、包、route、
+  worker、session、文件名或固定数量特判。
+- Round 7 changed-path 为 `268 passed`，宽组合为 `401 passed, 1 skipped`；隔离全量 1,870
+  项中 1,864 通过、5 项因未挂 runtime/reference assets 跳过，唯一 Node/CommonJS 环境 holdout
+  在宿主 Node 22.23.1 下单独 `1 passed`。`py_compile`、diff、secret 与 genericity scan
+  通过。成熟方案对照采用 Pydantic AI Harness 的 lossless Spill/readback 边界，并对照
+  Deep Agents thread-scoped backend、LangGraph pending writes、Temporal Activity、OpenAI
+  tracing 与 AutoGen state；保留现有 Harness 主循环与 authority/receipt/terminal 主链。
+- `06439152` 已从 clean archive `/tmp/chat_ds_deploy_06439152.LEJAcb` 构建并只替换生产
+  Harness。当前 image 为
+  `sha256:63ddfc85f83dc8aa1d89fc2e51ec80dba42831df6546370f8670a7e9cfdbe95b`，revision label
+  精确匹配完整提交，旧镜像保留为 `rollback-pre-06439152`。Harness healthy/restart 0；
+  三入口、Harness 与 Backend→Harness health/models 全 200；新回读工具已注册，严重日志 0，
+  SQLite quick_check/FK 正常且生产空闲。下一项是全新 conversation/root 的 Round 8，也是本
+  campaign 最后一轮模型重型 E2E。
 - 自动 E2E campaign Round 6 为 Conversation
   `862eb37670634f5394fab116429fa948` / root
   `88d0fd14ec01449cace347fcde4d6858`。它从 SSE 收到明确 durable failed terminal；intent 与
@@ -229,7 +262,8 @@
   `2486f008b19f760d0fe63111137feb9d103a1a45`，健康且 restart 0；三个 Frontend
   `/api/health` 入口均为 200。Backend、Frontend、四个 session-sandbox 和 legacy
   browser 未重建。
-- 当前生产 Harness 与 Backend 功能 revision 均为
+- 当前生产 Harness 功能 revision 为
+  `064391529b767a2bb0228a5e74088d4572ad37c0`，Backend 功能 revision 为
   `3987613c43405b0347bc8606260abde078b707ba`。交接文档可另有 docs-only HEAD。
 - 2026-07-30 其他基础功能提交：
   - `b4e8dc18 fix: require durable delete intent for orphan cleanup`
@@ -1054,6 +1088,18 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 - 前端：`http://10.10.132.126:5173`、`http://172.30.100.126:5173`。
 - Harness 使用同机 SearXNG `http://10.10.132.126:8088`；既有 SearXNG/Valkey 在切换
   中未重建，健康状态和数据卷保持不变。
+- 2026-08-02 完成 `06439152` lossless tool-result spill/readback 更新：
+  - 部署前连续两次确认 active AgentRun/root、running/enabled schedule 与 5173
+    established connection 均为 0；SQLite `quick_check=ok`、foreign-key violation 0；
+  - 候选来自 clean Git archive `/tmp/chat_ds_deploy_06439152.LEJAcb`，Harness revision
+    label 精确匹配完整 Git SHA；镜像内 compile/import 与工具注册 smoke 通过；
+  - 只 force-recreate Harness；旧镜像保留 `rollback-pre-06439152`。Backend、Frontend、
+    四槽、Proxy、Browser、SearXNG/Valkey 和数据库卷均未替换；
+  - 部署后 Harness image 为
+    `sha256:63ddfc85f83dc8aa1d89fc2e51ec80dba42831df6546370f8670a7e9cfdbe95b`，revision
+    为 `064391529b767a2bb0228a5e74088d4572ad37c0`，healthy/restart 0；三个 Frontend
+    入口、Harness 以及 Backend→Harness health/models 均为 200，`read_tool_result`
+    已注册，严重启动日志、active root 和 schedule 均为 0。
 - 2026-08-01 完成 `867ebdd9` delegated terminal transaction 更新：
   - 部署前连续两次确认 active root、running/enabled schedule 与 5173 established
     connection 均为 0；SQLite `quick_check=ok`、foreign-key violation 0；
@@ -1209,7 +1255,9 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 - 当前非 root 运维用户不能直接读取 `.env`。不要把 `.env` 通过 `/dev/stdin` 交给
   Compose：Compose 会重复读取并可能渲染为空。需要时在隔离 subshell 中从只读挂载解析
   环境，并配合 `--env-file /dev/null`；不得输出或落盘 secret。
-- Harness stream ceiling 为 2400 秒，Backend proxy deadline 为 3000 秒，Frontend Nginx SSE deadline 为 3600 秒。
+- Harness 单次 provider stream hard ceiling 默认 14,400 秒，Backend→Harness SSE
+  deadline 默认 18,000 秒，Frontend Nginx SSE read timeout 为 21,600 秒；各层依次留出
+  cleanup、durable terminal 与传输余量，生产性长思考不会再被旧 40/50/60 分钟链路截断。
 
 当前生产镜像：
 
@@ -1218,7 +1266,7 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 | `chat_acits_executor` ～ `_4` | `sha256:08996fb6e1da586de9ee57d1812dda75826145bdf07d86dfa784f24b35ec004a` | 4 个同质槽 / healthy / restart 0 / revision `f1e59c20` |
 | `chat_acits_skill_egress_proxy` | `sha256:6f23e97983ace0c4855af3dbf65967678902d2cd8d5c5b33e92eeecb2cec072f` | healthy / restart 0 / revision `f1e59c20` |
 | `chat_acits_browser` | `sha256:08bcf8860c10ba8fcd647b6d1a96c2c12e13e46db800c812acea82e17007240c` | healthy / restart 0 / revision `7bbc0809` |
-| `chat_acits_harness` | `sha256:632069f4cb29b2c77f30f3990e53d35e0c2717199851c84ff97354cb637cad91` | healthy / restart 0 / revision `867ebdd9` |
+| `chat_acits_harness` | `sha256:63ddfc85f83dc8aa1d89fc2e51ec80dba42831df6546370f8670a7e9cfdbe95b` | healthy / restart 0 / revision `06439152` |
 | `chat_acits_backend` | `sha256:817390d6069315d69aef3bcd471f60d3f91f16ceac8e55cbb3d777127bfd1767` | running / restart 0 / revision `3987613c` / `/api/health` 200 |
 | `chat_acits_frontend` | `sha256:907c5abb41a5288c852ae55d2bbc3258196e4fc03fe0305ce072366f9255cb24` | running / restart 0 / revision `c62a4a69` / `/` 200 |
 
@@ -1238,18 +1286,22 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
   SearXNG/Valkey 均 healthy。免费上游仍可能动态出现 unresponsive engine，不属于
   Harness 执行环境缺失。
 - Harness revision label 当前为完整提交
-  `867ebdd9453790af96bd54efd2f7ead968c81aec`，Backend 保持
+  `064391529b767a2bb0228a5e74088d4572ad37c0`，Backend 保持
   `3987613c43405b0347bc8606260abde078b707ba`；proxy/四槽为
   `f1e59c20129d9c3ba91b0f80850983e93d24d9dc`；Frontend 为
   `c62a4a69cfbbfb46404cfa1eb51b5f8e0498dce2`；legacy Browser 保持兼容基线。
   所有长期容器 restart 均为 0。
 - executor/proxy/browser/Harness/Backend/Frontend 日志未发现 traceback、
   critical、fatal、unhandled、ProtocolError 或 exception。
-- 本轮分析的是用户手工发起并在旧生产持续运行的 V2.3 E2E；没有由 Codex 自动新建
-  另一轮模型重型 E2E。下一项仍是用户手工业务验收。
+- Round 7 已到 durable failed terminal 并完成通用修复、回归与部署。按本 campaign 的
+  明确授权，下一项是使用全新 conversation/root 自动执行最后一轮 Round 8。
 
 回滚点：
 
+- `06439152` 切换前 Harness 保留
+  `chat_ds-harness:rollback-pre-06439152`；候选/部署 tag 为
+  `candidate-06439152` / `deploy-06439152`，clean archive build 目录为
+  `/tmp/chat_ds_deploy_06439152.LEJAcb`。
 - `867ebdd9` 切换前 Harness 保留
   `chat_ds-harness:rollback-pre-867ebdd9`；候选/部署 tag 为
   `candidate-867ebdd9` / `deploy-867ebdd9`，clean archive build 目录为
@@ -1467,17 +1519,19 @@ revision/image 与生产 smoke 统一记录在 `E2E_ITERATION_LOG.md`。Round 1 
 `c8d53cd3f6904e90b88640a9125b7c0b`，root 为
 `6421809b83be4d53a698ddfee550b01c`；Round 6 为
 `862eb37670634f5394fab116429fa948`，root 为
-`88d0fd14ec01449cace347fcde4d6858`。六轮均已到 durable failed terminal，各自通用修复
+`88d0fd14ec01449cace347fcde4d6858`；Round 7 为
+`67119645fa874ecba689c8a61e3874de`，root 为
+`5e494f191ead47a6ad640295cd48e36e`。七轮均已到 durable failed terminal，各自通用修复
 已在 `26d65158`、`aac60951`、`3987613c`、`867ebdd9`、`36e8ea43` 完成回归、
-本地 commit、clean-archive 部署与生产 smoke；Round 6 修复在 `70df8b51`。生产当前空闲；
-因 Round 6 尚未产生 strong-final artifact，campaign 可按用户授权继续创建全新
-conversation/root 执行 Round 7，
-最多到 Round 8，不能复用失败 run 或把同一 run 的重试计为新一轮。
+本地 commit、clean-archive 部署与生产 smoke；Round 6 修复在 `70df8b51`，Round 7
+修复在 `06439152`。生产当前空闲；因 Round 7 尚未产生 strong-final artifact，campaign
+可按用户授权创建全新 conversation/root 执行 Round 8。Round 8 是最后一轮，不能复用失败
+run、把同一 run 的重试计为新一轮或继续创建 Round 9。
 
 ## 10. 已知非 blocker 边界
 
 - V2.3 与 ground truth 的业务级一致性仍需真实模型重型 E2E；基础回归不能替代这项验收。
-  当前自动 campaign 已获用户明确授权，Round 7 可由维护代理继续发起。
+  当前自动 campaign 已获用户明确授权，Round 8 可由维护代理继续发起，且是最后一轮。
 - Legacy `knowledge_gate.checks[].tools` 只能安全解释为单个 OR 组；需要多个独立
   必须条件的 Skill 应显式使用 `tool_groups` 或 `tools: {all_of: ...}`。Harness 不从
   自然语言 action 猜 AND/OR。
