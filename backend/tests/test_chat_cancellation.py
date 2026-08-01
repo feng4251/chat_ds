@@ -183,7 +183,7 @@ class ChatStreamFailureClassificationTests(unittest.TestCase):
     def test_default_backend_timeout_exceeds_harness_provider_deadline(self):
         self.assertGreater(
             chat_router.settings.harness_stream_timeout_seconds,
-            2400,
+            14400,
         )
 
     def test_lifecycle_persistence_does_not_depend_on_debug_mode(self):

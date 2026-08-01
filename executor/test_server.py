@@ -311,6 +311,33 @@ def _command_request(
 
 
 class SkillScriptServerTests(unittest.TestCase):
+    def test_session_code_reads_current_session_result_snapshot(self) -> None:
+        payload = {
+            "protocol_version": server.PROTOCOL_VERSION,
+            "kind": "session_code",
+            "request_id": str(uuid.uuid4()),
+            "code": (
+                "from pathlib import Path\n"
+                "result = Path('../results/tool.txt')\n"
+                "print(result.read_text())\n"
+                "try:\n"
+                "    result.write_text('tampered')\n"
+                "    print('writable')\n"
+                "except OSError:\n"
+                "    print('read-only')\n"
+                "print(Path(__import__('os').environ['CHATDS_RESULTS_ROOT']).name)\n"
+            ),
+            "timeout": 5,
+            "skill_files": [],
+            "workspace_files": [],
+            "result_files": [_file("tool.txt", b"current-session")],
+        }
+
+        response = server._run_session_code(payload)
+
+        self.assertEqual("success", response["status"], response)
+        self.assertEqual("current-session\nread-only\nresults\n", response["stdout"])
+
     def test_egress_bridge_close_failure_is_retryable_and_receipt_is_copied(
         self,
     ) -> None:

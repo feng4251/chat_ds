@@ -422,6 +422,47 @@ def _referenced_session_files(code: str, user_id: str, session_id: str) -> list[
     return refs
 
 
+def _referenced_persisted_result_paths(
+    code: str,
+    user_id: str,
+    session_id: str,
+) -> tuple[str, ...]:
+    """Resolve only literal, current-session ``results/`` file references."""
+
+    if not user_id or user_id == "default" or not session_id or session_id == "default":
+        return ()
+    _, _, _, explicit_paths = _inspect_file_operations(code)
+    root = SANDBOX_ROOT / user_id / session_id / "results"
+    if not root.is_dir() or root.is_symlink():
+        return ()
+    try:
+        verified_root = root.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return ()
+
+    selected: set[str] = set()
+    for raw_path in explicit_paths:
+        path = PurePosixPath(raw_path)
+        if path.is_absolute() or len(path.parts) < 2 or path.parts[0] != "results":
+            continue
+        relative = PurePosixPath(*path.parts[1:])
+        if any(part in {"", ".", ".."} for part in relative.parts):
+            continue
+        candidate = root.joinpath(*relative.parts)
+        try:
+            resolved = candidate.resolve(strict=True)
+            lexical = candidate.lstat()
+            resolved.relative_to(verified_root)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if candidate.is_symlink() or not candidate.is_file() or lexical.st_nlink != 1:
+            continue
+        if Path(os.path.abspath(candidate)) != resolved:
+            continue
+        selected.add(relative.as_posix())
+    return tuple(sorted(selected))
+
+
 def _session_snapshot(user_id: str, session_id: str, code: str = "") -> list[dict]:
     if not user_id or user_id == "default" or not session_id or session_id == "default":
         return []
@@ -484,7 +525,8 @@ def _rewrite_isolated_session_paths(code: str, user_id: str, session_id: str) ->
         skill_abs_prefix = f"{SKILL_DATA_ROOT}/{user_id}/{session_id}/"
         rewritten = rewritten.replace(workspace_abs_prefix, "./")
         rewritten = rewritten.replace(skill_abs_prefix, "../skills/")
-    return re.sub(r'''([(['"])(?:\./)?skills/''', r"\1../skills/", rewritten)
+    rewritten = re.sub(r'''([(['"])(?:\./)?skills/''', r"\1../skills/", rewritten)
+    return re.sub(r'''([(['"])(?:\./)?results/''', r"\1../results/", rewritten)
 
 
 def _references_session_skills(code: str, user_id: str, session_id: str) -> bool:
@@ -533,12 +575,20 @@ async def execute_code(
             else None
         )
         isolated_code = _rewrite_isolated_session_paths(code, user_id, session_id)
+        result_paths = _referenced_persisted_result_paths(code, user_id, session_id)
+        results_root = (
+            SANDBOX_ROOT / user_id / session_id / "results"
+            if result_paths
+            else None
+        )
         try:
             result = await execute_isolated_session_code(
                 workspace=workspace,
                 code=isolated_code,
                 timeout=timeout,
                 skills_root=skills_root,
+                results_root=results_root,
+                result_paths=result_paths,
                 **(
                     {
                         "execution_authority_check": lambda: (
@@ -648,14 +698,15 @@ EXECUTE_CODE_SCHEMA = {
     "description": (
         "Run Python code for calculations and data processing. By default this uses a dedicated, "
         "ephemeral container with networking disabled and only explicitly referenced session files "
-        "snapshotted under ./workspace or ./skills. If the code imports/calls network libraries such as "
+        "snapshotted under ./workspace, ./skills, or the current session's read-only ./results namespace. "
+        "If the code imports/calls network libraries such as "
         "requests/httpx/urllib/aiohttp/socket, writes files, or reads/stats/globs workspace files, "
         "execute_code runs that single call in a disposable session-aware sidecar, still with networking "
         "disabled; verified file changes are atomically applied to the session workspace. It never falls "
         "back to Python inside the harness container. Network requests fail explicitly; use an authorized "
         "web/API capability instead. Inline pip install is never allowed. Do not use execute_code to carry long Markdown/report bodies; "
         "write large artifacts with write_file/patch_file or run a real workspace/skill script with run_skill_python. "
-        "Use stable relative paths under skills/... and workspace/...; "
+        "Use stable relative paths under skills/..., workspace/..., and results/...; "
         "do not access other sessions or reuse /tmp/exec_* paths from prior calls. "
         f"Default timeout is {DEFAULT_TIMEOUT}s; maximum is {MAX_TIMEOUT}s."
     ),

@@ -5586,13 +5586,22 @@ def _run_session_code(payload: dict[str, Any]) -> dict[str, Any]:
             max_file_bytes=MAX_WORKSPACE_FILE_BYTES,
             max_total_bytes=MAX_WORKSPACE_TOTAL_BYTES,
         )
+        result_files = _decode_snapshot(
+            payload.get("result_files", []),
+            field="result_files",
+            max_files=MAX_WORKSPACE_FILES,
+            max_file_bytes=MAX_WORKSPACE_FILE_BYTES,
+            max_total_bytes=MAX_WORKSPACE_TOTAL_BYTES,
+        )
 
         temp_dir = _make_execution_temp_dir("session_code_")
         skills_root = temp_dir / "skills"
+        results_root = temp_dir / "results"
         workspace = temp_dir / "workspace"
         runtime_root = temp_dir / "runtime"
         code_root = temp_dir / "code"
         _materialize_snapshot(skills_root, skill_files, immutable=True)
+        _materialize_snapshot(results_root, result_files, immutable=True)
         _materialize_snapshot(workspace, workspace_files, immutable=False)
         runtime_root.mkdir(mode=0o700)
         (runtime_root / "home").mkdir(mode=0o700)
@@ -5622,12 +5631,13 @@ def _run_session_code(payload: dict[str, Any]) -> dict[str, Any]:
             "PYTHONUTF8": "1",
             "CHATDS_WORKSPACE": str(workspace),
             "CHATDS_SKILLS_ROOT": str(skills_root),
+            "CHATDS_RESULTS_ROOT": str(results_root),
             "CHATDS_OUTPUT_DIR": str(output_dir),
             **BLAS_THREAD_ENV,
         }
         _prepare_worker_tree(
             temp_dir,
-            immutable_roots=(skills_root,),
+            immutable_roots=(skills_root, results_root),
             writable_roots=(workspace, runtime_root, code_root),
         )
         try:
