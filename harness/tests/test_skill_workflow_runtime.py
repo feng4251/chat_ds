@@ -647,6 +647,60 @@ class SkillWorkflowRuntimeTests(unittest.TestCase):
         self.assertEqual(terminal["step_id"], "source-1")
         self.assertEqual(terminal["attempts"], 2)
 
+    def test_parent_retry_carries_bounded_sanitized_validator_feedback(self):
+        state = self._seven_source_state()
+        task = {
+            "skill_name": "generic",
+            "step_type": "knowledge_bootstrap",
+            "step_id": "source-1",
+            "context": "Use only the declared inventory source.",
+        }
+        state.apply_delegate_retry_feedback(task)
+        self.assertNotIn("Harness-owned bounded retry feedback", task["context"])
+
+        state.record_delegate_task(
+            {"tasks": [dict(task)]},
+            {
+                "status": "error",
+                "results": [{
+                    "status": "error",
+                    "skill_name": "generic",
+                    "step_type": "knowledge_bootstrap",
+                    "step_id": "source-1",
+                    "error": (
+                        "typed evidence needs a machine ledger; inspect "
+                        "https://inventory.example.test/query?token=private "
+                        "password=do-not-persist"
+                    ),
+                    "terminal_reason": "delegated_output_contract_failed",
+                    "failure_class": "agent_contract_noncompliance",
+                    "retryable": True,
+                }],
+            },
+        )
+
+        retry_task = {
+            "skill_name": "generic",
+            "step_type": "knowledge_bootstrap",
+            "step_id": "source-1",
+            "context": "Use only the declared inventory source.",
+        }
+        returned = state.apply_delegate_retry_feedback(retry_task)
+
+        self.assertIs(returned, retry_task)
+        feedback = retry_task["context"]
+        self.assertEqual(1, feedback.count("Harness-owned bounded retry feedback"))
+        self.assertIn('"previous_attempt":1', feedback)
+        self.assertIn('"next_attempt":2', feedback)
+        self.assertIn(
+            '"terminal_reason":"delegated_output_contract_failed"',
+            feedback,
+        )
+        self.assertIn("machine ledger", feedback)
+        self.assertNotIn("inventory.example.test", feedback)
+        self.assertNotIn("do-not-persist", feedback)
+        self.assertLess(len(feedback), 3_500)
+
     def test_workflow_ir_degraded_required_worker_retries_then_fails_closed(self):
         state = self._workflow_ir_state()
         args = {"tasks": [{
