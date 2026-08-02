@@ -30,14 +30,21 @@ from tools.execution_fence import (
     ExecutionAuthorityRevoked,
     require_execution_authority,
 )
-from tools.tool_result_storage import persist_tool_result_spill
+from tools.tool_result_storage import (
+    MAX_LOSSLESS_SPILL_BYTES,
+    persist_tool_result_spill,
+)
 
 
 DEFAULT_MAX_CHARS = 40_000
 MAX_CHARS = 100_000
 DEFAULT_TIMEOUT = 20
 MAX_TIMEOUT = 30
-MAX_RESPONSE_BYTES = 400_000
+# Keep the complete-wire capture ceiling coherent with the lossless spill
+# store.  ``max_chars`` remains the much smaller model-visible presentation
+# limit; increasing this producer ceiling therefore does not inflate context.
+# Responses above the spill safety limit still fail closed as partial wire.
+MAX_RESPONSE_BYTES = MAX_LOSSLESS_SPILL_BYTES
 MAX_REDIRECTS = 3
 MAX_JSON_BODY_BYTES = 64_000
 MAX_JSON_BODY_DEPTH = 20
@@ -89,6 +96,32 @@ _GET_TRANSPORT_RETRY_DEPTH: ContextVar[int] = ContextVar(
     "skill_http_get_transport_retry_depth",
     default=0,
 )
+
+
+async def _read_bounded_response_bytes(response: Any) -> tuple[bytes, bool]:
+    """Capture one response completely up to the lossless spill ceiling.
+
+    The returned boolean is true only when at least one wire byte could not be
+    retained.  GET and POST deliberately share this producer boundary so one
+    bridge cannot silently provide weaker completeness semantics than the
+    other.
+    """
+
+    chunks: list[bytes] = []
+    size = 0
+    truncated = False
+    async for chunk in response.content.iter_chunked(16_384):
+        remaining = MAX_RESPONSE_BYTES - size
+        if remaining <= 0:
+            truncated = True
+            break
+        retained = chunk[:remaining]
+        chunks.append(retained)
+        size += len(retained)
+        if len(chunk) > remaining:
+            truncated = True
+            break
+    return b"".join(chunks), truncated
 
 
 def _configured_max_requests_per_run() -> int:
@@ -781,22 +814,9 @@ async def skill_http_get(
                                     redirects_followed=redirects,
                                     **matched_receipt,
                                 )
-                            chunks: list[bytes] = []
-                            size = 0
-                            truncated_bytes = False
-                            async for chunk in response.content.iter_chunked(
-                                16_384
-                            ):
-                                remaining_bytes = MAX_RESPONSE_BYTES - size
-                                if remaining_bytes <= 0:
-                                    truncated_bytes = True
-                                    break
-                                chunks.append(chunk[:remaining_bytes])
-                                size += min(len(chunk), remaining_bytes)
-                                if len(chunk) > remaining_bytes:
-                                    truncated_bytes = True
-                                    break
-                            raw = b"".join(chunks)
+                            raw, truncated_bytes = (
+                                await _read_bounded_response_bytes(response)
+                            )
                             charset = response.charset or "utf-8"
                             try:
                                 full_body = raw.decode(
@@ -1140,20 +1160,9 @@ async def skill_http_post_json(
                             **matched_receipt,
                         )
 
-                    chunks: list[bytes] = []
-                    size = 0
-                    truncated_bytes = False
-                    async for chunk in response.content.iter_chunked(16_384):
-                        remaining_bytes = MAX_RESPONSE_BYTES - size
-                        if remaining_bytes <= 0:
-                            truncated_bytes = True
-                            break
-                        chunks.append(chunk[:remaining_bytes])
-                        size += min(len(chunk), remaining_bytes)
-                        if len(chunk) > remaining_bytes:
-                            truncated_bytes = True
-                            break
-                    raw = b"".join(chunks)
+                    raw, truncated_bytes = (
+                        await _read_bounded_response_bytes(response)
+                    )
                     charset = response.charset or "utf-8"
                     try:
                         full_response_body = raw.decode(

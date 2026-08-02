@@ -931,8 +931,12 @@ class SkillHttpToolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_complete_large_wire_body_is_losslessly_spilled(self) -> None:
         full = json.dumps({
-            "items": [{"text": "x" * 300}],
+            # Regression: the transport producer historically stopped at
+            # 400,000 bytes even though the session spill store could retain
+            # a much larger complete result.
+            "items": [{"text": "x" * 410_000}],
         }).encode("utf-8")
+        self.assertGreater(len(full), 400_000)
         _FakeSession.response = _FakeResponse(body=full)
         handle = "tool-result:complete-http-body.txt"
         with (

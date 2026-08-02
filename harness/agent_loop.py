@@ -22038,7 +22038,15 @@ async def run_stream(
             tool_context.allowed_tool_result_handles
             and "read_tool_result" in tools
             and "read_tool_result" not in schema_tool_names
+            and iteration_workflow_policy is None
         ):
+            # A runtime-created spill handle grants a bounded readback
+            # capability; it does not override the current workflow phase.
+            # In particular, a tools-closed synthesis/finalization policy must
+            # remain closed even when earlier turns produced unread handles.
+            # The model may consume those handles while the ordinary tool
+            # frontier is open, but the capability must not pierce a later
+            # terminal phase boundary.
             schema_tool_names.append("read_tool_result")
         tool_schemas = get_schemas(schema_tool_names) if schema_tool_names else []
         if iteration_result_footer_repair:
@@ -28824,24 +28832,48 @@ async def run_stream(
                 # output validator exactly once. The post-dispatch recovery
                 # run-scoped guard is retained as a defence-in-depth boundary
                 # because that path owns the terminal result once requested.
-                footer_repair_current_phase_compatible = bool(
-                    iteration_tool_stream_repair is None
-                    and not iteration_reasoning_only_recovery
-                    and not iteration_visible_length_recovery
-                    and not iteration_output_contract_repair
-                    and not iteration_post_dispatch_stream_synthesis
-                    and not iteration_post_dispatch_synthesis_continuation
-                    and (
-                        not delegate_forced_synthesis
-                        or not tool_schemas
+                footer_repair_incompatible_reasons: list[str] = []
+                if delegate_result_footer_repair_attempted:
+                    footer_repair_incompatible_reasons.append(
+                        "footer_repair_already_attempted"
                     )
-                )
-                if (
-                    not delegate_result_footer_repair_attempted
-                    and footer_repair_current_phase_compatible
-                    and not delegate_post_dispatch_stream_synthesis_attempted
-                    and action_promise_continuations == 0
-                ):
+                if iteration_tool_stream_repair is not None:
+                    footer_repair_incompatible_reasons.append(
+                        "tool_stream_repair_active"
+                    )
+                if iteration_reasoning_only_recovery:
+                    footer_repair_incompatible_reasons.append(
+                        "reasoning_only_recovery_active"
+                    )
+                if iteration_visible_length_recovery:
+                    footer_repair_incompatible_reasons.append(
+                        "visible_length_recovery_active"
+                    )
+                if iteration_output_contract_repair:
+                    footer_repair_incompatible_reasons.append(
+                        "output_contract_repair_active"
+                    )
+                if iteration_post_dispatch_stream_synthesis:
+                    footer_repair_incompatible_reasons.append(
+                        "post_dispatch_stream_synthesis_active"
+                    )
+                if iteration_post_dispatch_synthesis_continuation:
+                    footer_repair_incompatible_reasons.append(
+                        "post_dispatch_synthesis_continuation_active"
+                    )
+                if delegate_forced_synthesis and iteration_exposed_tools:
+                    footer_repair_incompatible_reasons.append(
+                        "forced_synthesis_tool_surface_open"
+                    )
+                if delegate_post_dispatch_stream_synthesis_attempted:
+                    footer_repair_incompatible_reasons.append(
+                        "post_dispatch_stream_synthesis_already_attempted"
+                    )
+                if action_promise_continuations:
+                    footer_repair_incompatible_reasons.append(
+                        "action_promise_recovery_already_used"
+                    )
+                if not footer_repair_incompatible_reasons:
                     footer_repair_source = (
                         accumulated_visible_result
                         if iteration_synthesis_length_continuation
@@ -28889,9 +28921,13 @@ async def run_stream(
                     "delegate.result_footer_repair.unavailable",
                     {
                         "reason": (
-                            "iteration_budget_exhausted"
-                            if budget.remaining <= 0
-                            else "repair_already_attempted_or_incompatible_state"
+                            "repair_already_attempted"
+                            if "footer_repair_already_attempted"
+                            in footer_repair_incompatible_reasons
+                            else "incompatible_current_phase"
+                        ),
+                        "incompatible_reasons": (
+                            footer_repair_incompatible_reasons
                         ),
                         "iteration": budget.used,
                         "remaining_iterations": budget.remaining,
@@ -31891,39 +31927,86 @@ async def run_stream(
                 and delegate_retrieval_tracker.terminal_failure is not None
             ):
                 retrieval_snapshot = delegate_retrieval_tracker.snapshot()
-                machine_gap = queue_delegate_retrieval_degraded_synthesis(
-                    str(delegate_retrieval_tracker.terminal_failure)
+                pending_gate_groups_after_dispatch = (
+                    pending_knowledge_gate_tool_groups()
                 )
-                if machine_gap is None:
-                    msg = (
-                        "Delegated required-evidence HTTP retrieval reached a "
-                        "bounded completeness limit with no remaining synthesis "
-                        "turn. The child cannot report the incomplete evidence "
-                        "as completed."
+                pending_standard_after_dispatch = (
+                    unsatisfied_standard_required_capabilities()
+                )
+                pending_legacy_after_dispatch = bool(
+                    delegated_required_capability_tools
+                    and not (
+                        set(delegated_required_capability_tools)
+                        & delegate_attempted_tool_names
                     )
-                    yield await emit_agent_event("run.failed", {
-                        "error": msg,
-                        "finish_reason": "delegated_retrieval_incomplete",
-                        "terminal_reason": (
-                            delegate_retrieval_tracker.terminal_failure
+                )
+                pending_sibling_frontier_count = (
+                    len(pending_gate_groups_after_dispatch)
+                    + len(pending_standard_after_dispatch)
+                    + int(pending_legacy_after_dispatch)
+                )
+                if pending_sibling_frontier_count:
+                    # A terminal retrieval family is an immutable evidence
+                    # gap, not authority to cancel independent mandatory DAG
+                    # nodes.  Preserve it while sibling exact receipts settle;
+                    # the last sibling will enter this branch again and queue
+                    # exactly one tools-closed degraded fan-in.
+                    for debug_evt in await debug_stream_event(
+                        "http_retrieval.degraded_synthesis_deferred",
+                        {
+                            "terminal_reason": (
+                                delegate_retrieval_tracker.terminal_failure
+                            ),
+                            "pending_sibling_frontier_count": (
+                                pending_sibling_frontier_count
+                            ),
+                            "pending_knowledge_gate_group_count": len(
+                                pending_gate_groups_after_dispatch
+                            ),
+                            "pending_standard_candidate_count": len(
+                                pending_standard_after_dispatch
+                            ),
+                            "pending_legacy_group": (
+                                pending_legacy_after_dispatch
+                            ),
+                            "retrieval": retrieval_snapshot,
+                        },
+                    ):
+                        yield debug_evt
+                else:
+                    machine_gap = queue_delegate_retrieval_degraded_synthesis(
+                        str(delegate_retrieval_tracker.terminal_failure)
+                    )
+                    if machine_gap is None:
+                        msg = (
+                            "Delegated required-evidence HTTP retrieval reached a "
+                            "bounded completeness limit with no remaining synthesis "
+                            "turn. The child cannot report the incomplete evidence "
+                            "as completed."
+                        )
+                        yield await emit_agent_event("run.failed", {
+                            "error": msg,
+                            "finish_reason": "delegated_retrieval_incomplete",
+                            "terminal_reason": (
+                                delegate_retrieval_tracker.terminal_failure
+                            ),
+                            "retrieval": retrieval_snapshot,
+                        })
+                        yield {"type": "error", "msg": msg}
+                        return
+                    retrieval_degraded_queued = True
+                    for debug_evt in await debug_stream_event(
+                        "http_retrieval.degraded_synthesis_requested",
+                        machine_gap,
+                    ):
+                        yield debug_evt
+                    yield {
+                        "type": "tool_progress",
+                        "msg": (
+                            "↻ Closing tools and preserving a machine-owned "
+                            "unresolved retrieval gap"
                         ),
-                        "retrieval": retrieval_snapshot,
-                    })
-                    yield {"type": "error", "msg": msg}
-                    return
-                retrieval_degraded_queued = True
-                for debug_evt in await debug_stream_event(
-                    "http_retrieval.degraded_synthesis_requested",
-                    machine_gap,
-                ):
-                    yield debug_evt
-                yield {
-                    "type": "tool_progress",
-                    "msg": (
-                        "↻ Closing tools and preserving a machine-owned "
-                        "unresolved retrieval gap"
-                    ),
-                }
+                    }
 
             evidence_ledger_prompt = None
             if (
