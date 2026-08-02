@@ -1224,7 +1224,7 @@ content authority、session workspace、sandbox/effect ledger、artifact CAS 和
 语义；成熟项目本轮提供的是清晰的边界模式。直接换栈会同时分叉这些控制面，不能自动解决这里的
 projection/validation 问题。
 
-### 通用实现与确定性验证（部署前）
+### 通用实现、确定性验证与生产切换
 
 - 新增 compact `workflow_plan` schema 与编译器。模型目录只包含 path/unit count、稳定 ID、kind、
   同文档位置和最多 64 字符 preview；不含完整 instruction text/runtime hashes。模型用 inclusive
@@ -1256,6 +1256,20 @@ projection/validation 问题。
   `executor` module 的 full Harness 共枚举 1,906 项，唯一错误是 CommonJS/Node holdout 因
   Harness image 按设计不含 Node；把宿主 Node 22.23.1 注入同一隔离容器后，该 exact holdout
   单独通过。因此组合证据覆盖全部 1,906 项，无代码失败。
-  `py_compile`、`git diff --check` 与 diff-only genericity 检查通过。本节仍是部署前记录；
-  肺癌旧 root 已自然到 durable terminal；还需确认生产无其他 active roots 后，才能本地 commit、
-  clean-archive 构建与切换。
+  `py_compile`、`git diff --check` 与 diff-only genericity 检查通过。
+- 通用修复提交为
+  `6657f3741ae0bb399333e5039dd2da994864e84b fix: compile generic skill workflows deterministically`。
+  部署前连续两次确认 nonterminal AgentRun/root、enabled/running schedule 与 5173 established
+  connection 均为 0，SQLite `quick_check=ok`、foreign-key violation 0。candidate 来自 clean
+  archive `/tmp/chat_ds_deploy_6657f374.SuZrMf`，文件数与 tracked tree 完全一致；compileall/import
+  通过，revision label 精确匹配完整提交。
+- 仅替换生产 Harness，旧 image 保留 `rollback-pre-6657f374`。新 image 为
+  `sha256:3fbcb23d2c26dbf70fd5469faea7a3418db02faa7d53428b83a392ac79ed5d8a`，healthy/restart 0；
+  Backend/Frontend/四槽/Proxy/Browser/SearXNG 与数据卷均未重建。三个 Frontend 入口、Harness
+  与 Backend→Harness health/models 全 200，两端 storage identity SHA-256 相同；45 个注册工具中
+  planner/delegate/process/readback/HTTP/Python 必需集合完整，严重启动日志 0。部署后数据库仍为
+  `quick_check=ok`、foreign-key violation 0、nonterminal root/run 与 schedule 均为 0。
+
+Round 9 至此完成“两项独立 E2E terminal → exact 三源诊断 → 官方成熟实现对照 → 通用复现与修复
+→ 完整回归 → local commit → clean-archive 生产切换”的闭环。生产当前空闲，可开始 Round 10；
+新的两个 case 必须继续顺序运行并使用全新 conversation/root。

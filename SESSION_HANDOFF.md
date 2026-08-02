@@ -18,7 +18,9 @@
   validation/no-progress budget；最终在约 12 小时 47 分、692 万持久 token 后以损坏的第 21 个
   plan call 终止。该 run 为 0 child、0 artifact、无业务 Markdown；不是网络、沙箱、delegate
   或前端断线问题。
-- Round 9 已在 worktree 完成尚未部署/提交的通用修复：model-facing `workflow_plan` 仅声明
+- Round 9 通用修复已提交为
+  `6657f3741ae0bb399333e5039dd2da994864e84b fix: compile generic skill workflows deterministically`
+  并部署生产 Harness。model-facing `workflow_plan` 仅声明
   语义节点、依赖、连续 instruction ranges 和额外 capability；Harness 从冻结 source/catalog
   确定性编译完整 Workflow IR，注入 mandatory delegate，派生 coverage/result/output/policy/count/
   digest 并复用严格 validator。control tool 只有 typed accepted 才推进 frontier；同一 plan 三次
@@ -57,7 +59,11 @@
   的 Workflow history、OpenHands 的 immutable action/observation event 和 Semantic Kernel 的
   typed process/SSRF validator 仅作边界参考；三者都不能替代现有 Skill compiler、artifact
   receipt、session sandbox 与统一 egress。完整证据见
-  `E2E_ITERATION_LOG.md` Round 9。
+  `E2E_ITERATION_LOG.md` Round 9。生产 Harness image 为
+  `sha256:3fbcb23d2c26dbf70fd5469faea7a3418db02faa7d53428b83a392ac79ed5d8a`，revision
+  label 精确匹配 `6657f374`，healthy/restart 0；Backend 保持 `1d2b7d9c`，三入口和内部
+  health/models 全 200，两端 storage identity 相同，数据库健康空闲。旧 Harness image 保留为
+  `rollback-pre-6657f374`。
 - 2026-08-02 用户在 Round 8 闭环后明确追加 5 轮自动 V2.3 E2E。新授权覆盖
   Round 9--13，并替代旧的“不得创建 Round 9”限制；每轮仍必须使用全新
   conversation/root，完整执行三源诊断、成熟方案对照、通用复现、回归、本地 commit、
@@ -1183,6 +1189,18 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 - 前端：`http://10.10.132.126:5173`、`http://172.30.100.126:5173`。
 - Harness 使用同机 SearXNG `http://10.10.132.126:8088`；既有 SearXNG/Valkey 在切换
   中未重建，健康状态和数据卷保持不变。
+- 2026-08-03 完成 `6657f374` generic compact-plan/compiler/terminal-boundary 更新：
+  - 部署前连续两次确认 nonterminal AgentRun/root、enabled/running schedule 与 5173
+    established connection 均为 0；SQLite `quick_check=ok`、foreign-key violation 0；
+  - 候选来自 clean archive `/tmp/chat_ds_deploy_6657f374.SuZrMf`，archive 文件数与 tracked
+    tree 完全一致；candidate image compileall/import 通过，revision label 精确匹配完整 Git SHA；
+  - 仅 force-recreate Harness，Backend、Frontend、四槽、Proxy、Browser、SearXNG/Valkey 和
+    数据卷均未重建；旧 Harness image 保留 `rollback-pre-6657f374`；
+  - 部署后 Harness image 为
+    `sha256:3fbcb23d2c26dbf70fd5469faea7a3418db02faa7d53428b83a392ac79ed5d8a`，revision
+    为 `6657f3741ae0bb399333e5039dd2da994864e84b`，healthy/restart 0；三个 Frontend 入口、
+    Harness 与 Backend→Harness health/models 全 200，两端 storage identity 相同，45 个工具中
+    planner/delegate/process/readback/HTTP/Python 必需工具均注册，严重启动日志 0，数据库仍健康空闲。
 - 2026-08-02 完成 `1d2b7d9c` terminal workflow phase 与 shared-storage attestation 更新：
   - 部署前连续两次确认 active/nonterminal root、enabled/running schedule 与 5173
     established connection 均为 0；SQLite `quick_check=ok`、foreign-key violation 0；
@@ -1376,7 +1394,7 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 | `chat_acits_executor` ～ `_4` | `sha256:7eb2b7a0526aa6b9a2560d5b722c2bf3ae44fc72fdb83c65d3e834050056d17a` | 4 个同质槽 / healthy / restart 0 / revision `f3be516b` |
 | `chat_acits_skill_egress_proxy` | `sha256:6f23e97983ace0c4855af3dbf65967678902d2cd8d5c5b33e92eeecb2cec072f` | healthy / restart 0 / revision `f1e59c20` |
 | `chat_acits_browser` | `sha256:08bcf8860c10ba8fcd647b6d1a96c2c12e13e46db800c812acea82e17007240c` | healthy / restart 0 / revision `7bbc0809` |
-| `chat_acits_harness` | `sha256:d335a4d9afd8becc19ae797330cd0c8f13ebd15128207b7f2ec591e1ac3a3d75` | healthy / restart 0 / revision `1d2b7d9c` |
+| `chat_acits_harness` | `sha256:3fbcb23d2c26dbf70fd5469faea7a3418db02faa7d53428b83a392ac79ed5d8a` | healthy / restart 0 / revision `6657f374` |
 | `chat_acits_backend` | `sha256:c763e8e9d55875117a9a7fa54b9242e5923d23cf77315118229f6ca73c5ba501` | healthy / restart 0 / revision `1d2b7d9c` / `/api/health` 200 |
 | `chat_acits_frontend` | `sha256:ffedcc8db1373f454e5650404ab724be884b6a70a0c8027fc7e99c06a530b0d8` | running / restart 0 / revision `f3be516b` / `/` 200 |
 
@@ -1388,7 +1406,7 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
   Backend `/api/health` 为 200。四槽 capability probe 的 runtime build 完全一致。
 - 生产 SQLite `quick_check=ok`、foreign-key violation 为 0；当前计数为
   conversations/messages/runs/events/tasks/artifacts =
-  `214 / 797 / 566 / 78652 / 522 / 829`，nonterminal agent run、active root、running/enabled
+  `216 / 801 / 583 / 81955 / 540 / 832`，nonterminal agent run、active root、running/enabled
   schedule 均为 0。
 - `task_items` 中有 18 条历史 `running` 投影，但其对应 root AgentRun 均已终态
   （10 succeeded、8 failed），不是当前活跃执行；判断运行态应以 durable AgentRun
@@ -1396,7 +1414,8 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 - SearXNG 真实 `OpenAI GPT` 查询返回 27 条结果，命中 `360search`、`bing`、`mojeek`；
   SearXNG/Valkey 均 healthy。免费上游仍可能动态出现 unresponsive engine，不属于
   Harness 执行环境缺失。
-- Harness/Backend revision label 当前均为完整提交
+- Harness revision label 当前为完整提交
+  `6657f3741ae0bb399333e5039dd2da994864e84b`，Backend 为
   `1d2b7d9ce412f58e9d21acf6f18a56c1ebef419d`；四槽与 Frontend 为
   `f3be516bdfc13c82e00fba66ac327364a585bb15`；Proxy 为
   `f1e59c20129d9c3ba91b0f80850983e93d24d9dc`；legacy Browser 为
@@ -1404,11 +1423,15 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
   所有长期容器 restart 均为 0。
 - executor/proxy/browser/Harness/Backend/Frontend 日志未发现 traceback、
   critical、fatal、unhandled、ProtocolError 或 exception。
-- Round 8 已到 durable failed terminal，并完成三项通用修复、回归、本地 commit 与部署。
-  用户已于 2026-08-02 明确追加 Round 9--13；生产空闲检查通过后可执行 Round 9。
+- Round 9 两个 case 均已到 durable failed terminal，通用修复、回归、本地 commit 与生产部署
+  已闭环；当前生产空闲，可按顺序启动 Round 10 的全新 V2.3 与肺癌 MDT roots。
 
 回滚点：
 
+- `6657f374` 切换前 Harness 保留
+  `chat_ds-harness:rollback-pre-6657f374`；候选/部署 tag 为
+  `candidate-6657f374` / `deploy-6657f374`，clean archive build 目录为
+  `/tmp/chat_ds_deploy_6657f374.SuZrMf`。
 - `1d2b7d9c` 切换前 Harness/Backend 分别保留
   `chat_ds-harness:rollback-pre-1d2b7d9c`、
   `chat_ds-backend:rollback-pre-1d2b7d9c`；候选/部署 tag 为
@@ -1659,9 +1682,9 @@ revision/image 与生产 smoke 统一记录在 `E2E_ITERATION_LOG.md`。Round 1 
 `06439152` 和 `1d2b7d9c` 完成回归、本地 commit、clean-archive 部署与生产 smoke。
 Round 8 还包含 shared-storage attestation 父提交 `c3f9f582`。用户已明确追加 5 轮；Round 9
 的 V2.3 与肺癌 MDT case 均已到 durable failed terminal，并已按 exact Skill、对话、debug/
-AgentRun/tool/provider/artifact 完成三源诊断。Round 9 通用修复正在完成本地提交与 clean-archive
-部署；生产确认空闲且 smoke 通过后才可启动 Round 10，最多继续到 Round 13；不得复用失败 run，
-或把同一 run 的重试、补跑和重复解读计为新轮。
+AgentRun/tool/provider/artifact 完成三源诊断。Round 9 通用修复已提交 `6657f374`、从 clean archive
+部署并通过生产 smoke；当前可启动 Round 10，最多继续到 Round 13。不得复用失败 run，或把同一
+run 的重试、补跑和重复解读计为新轮。
 
 ## 10. 已知非 blocker 边界
 
