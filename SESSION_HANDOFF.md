@@ -9,7 +9,10 @@
 - 2026-08-02 用户在 Round 8 闭环后明确追加 5 轮自动 V2.3 E2E。新授权覆盖
   Round 9--13，并替代旧的“不得创建 Round 9”限制；每轮仍必须使用全新
   conversation/root，完整执行三源诊断、成熟方案对照、通用复现、回归、本地 commit、
-  clean-archive 部署与生产 smoke。Round 13 是本次追加授权的硬上限。
+  clean-archive 部署与生产 smoke。用户随后补充：最后三轮 Round 11--13 每轮同时运行
+  两个独立用例——V2.3 与历史肺癌 MDT Skill——各自使用全新 conversation/root，分别
+  核对自身 Skill/对话/debug；不能把两种业务或夹具写成生产特判。Round 13 是本次追加
+  授权的硬上限。
 - 自动 E2E campaign Round 8（原八轮 campaign 的最终轮）为 Conversation
   `9ff98843e980458d832629ba9964ec96` / root
   `ad98fb353fb240f2b3ab84f345ceb247`。它运行约 3 小时 3 分并从 SSE 收到唯一 durable
@@ -1515,7 +1518,9 @@ checkout 分离或完成一次审计后的 untrack/migration。
 
 用户此前明确授权执行到 Round 8；Round 8 闭环后，又于 2026-08-02 明确追加 5 轮，
 因此当前可按同一协议继续 Round 9--13。这项明确授权覆盖本次 campaign，替代“下一轮必须
-由用户手工发起”的默认限制，Round 13 是当前绝对上限。每轮必须使用新的
+由用户手工发起”的默认限制，Round 13 是当前绝对上限。Round 11--13 每轮由两个独立
+acceptance case 组成：V2.3 与肺癌 MDT Skill 分别使用全新 conversation/root；只有两个
+case 都达到 durable terminal 并分别完成三源诊断，才算该轮结束。每轮必须使用新的
 conversation/root run，并在该轮达到 durable terminal 后才计数；同一 run 的重试、补跑、
 刷新或重复解读不算新一轮。任何生产切换必须先确认没有其他用户 active root run，且不得
 为了赶轮次人为取消正在运行的任务。
