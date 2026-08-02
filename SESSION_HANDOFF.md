@@ -6,7 +6,11 @@
 
 - 工作目录：`/nfs/yangbb/codes/chat_ds`。
 - 分支：`fix/generic-skill-harness-20260717`。
-- 自动 E2E campaign Round 8（最终轮）为 Conversation
+- 2026-08-02 用户在 Round 8 闭环后明确追加 5 轮自动 V2.3 E2E。新授权覆盖
+  Round 9--13，并替代旧的“不得创建 Round 9”限制；每轮仍必须使用全新
+  conversation/root，完整执行三源诊断、成熟方案对照、通用复现、回归、本地 commit、
+  clean-archive 部署与生产 smoke。Round 13 是本次追加授权的硬上限。
+- 自动 E2E campaign Round 8（原八轮 campaign 的最终轮）为 Conversation
   `9ff98843e980458d832629ba9964ec96` / root
   `ad98fb353fb240f2b3ab84f345ceb247`。它运行约 3 小时 3 分并从 SSE 收到唯一 durable
   failed terminal；exact Skill 正确选择
@@ -40,8 +44,7 @@
   `sha256:c763e8e9d55875117a9a7fa54b9242e5923d23cf77315118229f6ca73c5ba501`；revision
   label 均为完整提交，旧镜像保留 `rollback-pre-1d2b7d9c`。三入口、Backend->Harness
   health/models 全 200，两端 storage identity 相同，restart 0、严重日志 0、数据库健康空闲。
-  Round 8 是本 campaign 绝对最后一轮，**不得自动创建 Round 9**；下一次模型重型 V2.3
-  验收必须由用户重新明确授权或手工发起。
+  该轮是原八轮 campaign 的最终轮；用户随后已明确授权继续 Round 9--13。
 - 自动 E2E campaign Round 7 为 Conversation
   `67119645fa874ecba689c8a61e3874de` / root
   `5e494f191ead47a6ad640295cd48e36e`。它从 2026-08-01 17:37:13 到 20:17:14 UTC
@@ -74,7 +77,7 @@
   精确匹配完整提交，旧镜像保留为 `rollback-pre-06439152`。Harness healthy/restart 0；
   三入口、Harness 与 Backend→Harness health/models 全 200；新回读工具已注册，严重日志 0，
   SQLite quick_check/FK 正常且生产空闲。该部署随后用于全新 conversation/root 的 Round 8；
-  Round 8 已完成并成为本 campaign 最后一轮模型重型 E2E。
+  Round 8 已完成并成为原八轮 campaign 的最后一轮模型重型 E2E。
 - 自动 E2E campaign Round 6 为 Conversation
   `862eb37670634f5394fab116429fa948` / root
   `88d0fd14ec01449cace347fcde4d6858`。它从 SSE 收到明确 durable failed terminal；intent 与
@@ -1345,8 +1348,7 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 - executor/proxy/browser/Harness/Backend/Frontend 日志未发现 traceback、
   critical、fatal、unhandled、ProtocolError 或 exception。
 - Round 8 已到 durable failed terminal，并完成三项通用修复、回归、本地 commit 与部署。
-  它是本 campaign 的最后一轮；不得自动执行 Round 9。下一次模型重型 V2.3 E2E 只能由用户
-  明确重新授权或手工发起。
+  用户已于 2026-08-02 明确追加 Round 9--13；生产空闲检查通过后可执行 Round 9。
 
 回滚点：
 
@@ -1509,11 +1511,11 @@ checkout 分离或完成一次审计后的 untrack/migration。
 4. 将终稿与 ground truth 做结构、覆盖、证据链、表格、附录、traceability 和可用性对比，不要求逐字节相同。
 5. 只修复跨领域可复现的通用根因，并增加非 V2.3 特定回归。
 
-### 9.1 最多八轮 E2E 迭代协议（用户于 2026-07-31/08-01 明确授权）
+### 9.1 最多十三轮 E2E 迭代协议（用户于 2026-07-31/08-01/08-02 明确授权）
 
-用户已明确要求由维护代理自动执行连续 5 轮 V2.3 模型重型 E2E；若 5 轮后仍未收敛，
-可按同一协议最多继续到第 8 轮。这项明确授权覆盖本次 campaign，替代“下一轮必须由用户
-手工发起”的默认限制。每轮必须使用新的
+用户此前明确授权执行到 Round 8；Round 8 闭环后，又于 2026-08-02 明确追加 5 轮，
+因此当前可按同一协议继续 Round 9--13。这项明确授权覆盖本次 campaign，替代“下一轮必须
+由用户手工发起”的默认限制，Round 13 是当前绝对上限。每轮必须使用新的
 conversation/root run，并在该轮达到 durable terminal 后才计数；同一 run 的重试、补跑、
 刷新或重复解读不算新一轮。任何生产切换必须先确认没有其他用户 active root run，且不得
 为了赶轮次人为取消正在运行的任务。
@@ -1561,7 +1563,7 @@ Skill/package/workflow digest，provider/model/context/max-output/finish/elapsed
 tool_choice、dispatch/preflight/receipt，recovery 原因与次数，fan-in cohort，artifact 路径/大小/
 摘要/合同结果，inner/outer terminal 关联，以及成熟方案的 problem-to-pattern-to-decision 对照。
 
-### 9.2 当前最多八轮 campaign 状态
+### 9.2 当前最多十三轮 campaign 状态
 
 逐轮证据、模拟人工追问链、delegate 明细、成熟实现对照、通用不变量、确定性复现、
 revision/image 与生产 smoke 统一记录在 `E2E_ITERATION_LOG.md`。Round 1 的新会话为
@@ -1583,15 +1585,14 @@ revision/image 与生产 smoke 统一记录在 `E2E_ITERATION_LOG.md`。Round 1 
 `ad98fb353fb240f2b3ab84f345ceb247`。八轮均已到 durable failed terminal，各自通用修复
 已在 `26d65158`、`aac60951`、`3987613c`、`867ebdd9`、`36e8ea43`、`70df8b51`、
 `06439152` 和 `1d2b7d9c` 完成回归、本地 commit、clean-archive 部署与生产 smoke。
-Round 8 还包含 shared-storage attestation 父提交 `c3f9f582`。生产当前健康空闲，但 campaign
-已经达到用户授权的 8 轮绝对上限；不得复用失败 run、把同一 run 的重试计为新轮或创建
-Round 9。下一次模型重型 V2.3 E2E 必须由用户重新明确授权或手工发起。
+Round 8 还包含 shared-storage attestation 父提交 `c3f9f582`。用户已明确追加 5 轮，下一轮
+为全新 conversation/root 的 Round 9，最多继续到 Round 13；不得复用失败 run，或把同一
+run 的重试、补跑和重复解读计为新轮。
 
 ## 10. 已知非 blocker 边界
 
 - V2.3 与 ground truth 的业务级一致性仍需真实模型重型 E2E；基础回归不能替代这项验收。
-  当前自动 campaign 已完成用户授权的八轮上限，不得自动创建 Round 9；下一次模型重型
-  V2.3 E2E 必须由用户重新明确授权或手工发起。
+  用户已明确授权继续 Round 9--13；Round 13 后如仍需模型重型 E2E，必须重新获得授权。
 - Legacy `knowledge_gate.checks[].tools` 只能安全解释为单个 OR 组；需要多个独立
   必须条件的 Skill 应显式使用 `tool_groups` 或 `tools: {all_of: ...}`。Harness 不从
   自然语言 action 猜 AND/OR。
