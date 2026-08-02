@@ -1,4 +1,4 @@
-# ChatDS 当前会话交接（2026-08-02）
+# ChatDS 当前会话交接（2026-08-03）
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
@@ -6,6 +6,58 @@
 
 - 工作目录：`/nfs/yangbb/codes/chat_ds`。
 - 分支：`fix/generic-skill-harness-20260717`。
+- Round 9 的两个 case 均已到唯一 durable failed terminal，生产仍为 `1d2b7d9c`。V2.3 case
+  `24239b8bef374c8e9663a0849adafa05` / root
+  `0d3a0e9ee41e4153b129cbc4728d7761` 已于 2026-08-02 07:00:36 UTC 到唯一 durable
+  failed terminal：14 个 child succeeded，Literature synthesis 的复杂 typed footer 在旧实现中
+  从原始 16K 预算错误降到 8K finalizer，形成被截断的 28,662-character JSON tool arguments；
+  required barrier 正确 fail closed，没有最终报告。肺癌 MDT case
+  `4667d323114c4cce94faf861a6ea4347` / root
+  `1b8e7dcde41243558178463da601a60a` 已于 2026-08-02 19:54:21 UTC 自然结束：旧版让模型
+  反复手写 241-unit 完整 Workflow IR，20 次 deterministic semantic rejection 后仍无独立
+  validation/no-progress budget；最终在约 12 小时 47 分、692 万持久 token 后以损坏的第 21 个
+  plan call 终止。该 run 为 0 child、0 artifact、无业务 Markdown；不是网络、沙箱、delegate
+  或前端断线问题。
+- Round 9 已在 worktree 完成尚未部署/提交的通用修复：model-facing `workflow_plan` 仅声明
+  语义节点、依赖、连续 instruction ranges 和额外 capability；Harness 从冻结 source/catalog
+  确定性编译完整 Workflow IR，注入 mandatory delegate，派生 coverage/result/output/policy/count/
+  digest 并复用严格 validator。control tool 只有 typed accepted 才推进 frontier；同一 plan 三次
+  semantic rejection 后以稳定 code/path durable fail closed；accepted full IR 不回灌模型历史。
+  handler-level accepted 之后还必须完成 frozen-catalog revalidation 和 profile-bound runtime
+  preflight，authority 真正原子安装后才消费 plan frontier；安装失败同样返回稳定 receipt 并受
+  独立 runtime-install controller 立即 fail closed，不再冒充模型可纠正的 semantic retry。
+  catalog amendment 以 digest 作为新 planning epoch：旧 plan/worker/tool authority 全部撤销，
+  只有候选定义与 SHA 完全一致的成功只读 resource receipt 可以迁移；新 plan commit 前保持
+  plan-only surface。handler 到 installer 之间会再次核验 live Skill authority，所有 runtime
+  projection 先在局部 candidate 中派生，最后一次性提交，失败不会产生 `tool.completed` 或半安装
+  authority。
+  child 与唯一 footer finalizer 共享按 result schema 复杂度计算的 8K/16K/32K budget，terminal
+  payload usage 与独立 usage event 单调幂等合并，authoritative child terminal 绑定排序后的
+  artifact manifest/count/SHA。终审进一步把 field lexical、128 fields/256-character name/16 KiB
+  UTF-8 exact schema projection 提升为 compile/install/legacy dispatch 前共享边界；Workflow IR
+  worker/aggregation 都只消费 exact direct predecessor，wave 只是 readiness barrier，不再读取独立
+  兄弟分支；`run_skill_process` 的 sync/close 文件也进入与 script/python/command 相同的 artifact
+  receipt/terminal manifest 链。实现没有疾病、V2.3、Skill/session/worker/KG、文件名或固定图
+  数量特判。终态审计又补上统一 planning/verifier phase boundary：catalog 已发布但 required
+  typed plan 未原子安装时，普通 stop、length 和 iteration-budget terminal 都保留 pending-plan
+  workflow 原因，artifact verifier 不得提前运行；post-tool closure 也不能用通用 continuation
+  重新扩张编译器已收窄的 planner-only surface。完全披露后既无 executable candidate、也无
+  delegated workflow 的纯指令 Skill 则直接关闭工具面并遵循正文，不制造无权限收益的空 plan call。
+- 本轮终审后的扩展 changed-path 为 486/486 passed（其中 1 项预期 skip）。隔离 workspace/data
+  root 且包含 sibling executor module 的 full Harness 共枚举 1,906 项，唯一错误是 clean Harness
+  image 按设计不含 Node 造成的 CommonJS 环境 holdout；把宿主 Node 22.23.1 注入同一隔离容器后
+  该 exact holdout 单独 passed，因此组合证据覆盖全部 1,906 项且没有代码失败。`py_compile`、
+  `git diff --check` 与 diff-only genericity scan 通过。默认生产 NFS 根下的失败仍是不可读 tombstone
+  与错误 `PYTHONPATH` 的环境噪声，不是代码回归。肺癌与
+  V2.3 冻结 instruction catalog 的 compact/full 比分别为 35.73% 和 34.5%。官方对照已扩展到
+  Deep Agents、Codex、OpenClaw、Hermes、Claude Code、Pydantic AI、OpenAI Agents、LangGraph、
+  Inspect AI、AutoGen、Temporal Python SDK、Semantic Kernel 与 OpenHands；结论是保留现有
+  Harness，采用小型计划投影、运行时确定性展开、精确 predecessor/attempt receipt、独立
+  subagent/validation/execution retry budget 和 durable run/events 模式，不整体换栈。Temporal
+  的 Workflow history、OpenHands 的 immutable action/observation event 和 Semantic Kernel 的
+  typed process/SSRF validator 仅作边界参考；三者都不能替代现有 Skill compiler、artifact
+  receipt、session sandbox 与统一 egress。完整证据见
+  `E2E_ITERATION_LOG.md` Round 9。
 - 2026-08-02 用户在 Round 8 闭环后明确追加 5 轮自动 V2.3 E2E。新授权覆盖
   Round 9--13，并替代旧的“不得创建 Round 9”限制；每轮仍必须使用全新
   conversation/root，完整执行三源诊断、成熟方案对照、通用复现、回归、本地 commit、
@@ -1552,8 +1604,10 @@ semantic SHA-256 为 `ecc16dc8f97994015c62b529e210cbc67296160b4fa54a99a954999161
 5. 同步查阅成熟 session-wise Harness/workflow 的官方资料，把本轮故障逐项映射到 durable
    checkpoint/pending write、typed state/structured output、幂等 activity retry、subgraph
    隔离、sandbox/workspace boundary、trace 与 exactly-one terminal 等机制，并明确
-   adopt/adapt/reject 决策；只罗列 LangGraph/Deep Agents/Temporal/PydanticAI/AutoGen/
-   Semantic Kernel/Inspect AI 名称不算完成调研。
+   adopt/adapt/reject 决策。调研范围至少可覆盖 Deep Agents、OpenClaw、Hermes、Claude Code、
+   Codex、LangGraph、Temporal、PydanticAI、OpenAI Agents、AutoGen、Semantic Kernel 与
+   Inspect AI；开源项目优先冻结官方 repo revision 并检查实际源码，闭源项目（如 Claude Code）
+   只使用官方文档。仅罗列框架名称或采用二手文章不算完成调研。
 6. 修复只能进入通用 compiler/workflow/capability/evidence/artifact/recovery/lifecycle 层；
    不得加入疾病、V2.3、package/session/route/worker/KG ID、固定数量或报告文件名特判。
    只有确实提升任意规范 Skill 执行能力、并由通用复现及跨领域 holdout 证明的修改，才计为
@@ -1603,9 +1657,11 @@ revision/image 与生产 smoke 统一记录在 `E2E_ITERATION_LOG.md`。Round 1 
 `ad98fb353fb240f2b3ab84f345ceb247`。八轮均已到 durable failed terminal，各自通用修复
 已在 `26d65158`、`aac60951`、`3987613c`、`867ebdd9`、`36e8ea43`、`70df8b51`、
 `06439152` 和 `1d2b7d9c` 完成回归、本地 commit、clean-archive 部署与生产 smoke。
-Round 8 还包含 shared-storage attestation 父提交 `c3f9f582`。用户已明确追加 5 轮，下一轮
-为全新 conversation/root 的 Round 9，最多继续到 Round 13；不得复用失败 run，或把同一
-run 的重试、补跑和重复解读计为新轮。
+Round 8 还包含 shared-storage attestation 父提交 `c3f9f582`。用户已明确追加 5 轮；Round 9
+的 V2.3 与肺癌 MDT case 均已到 durable failed terminal，并已按 exact Skill、对话、debug/
+AgentRun/tool/provider/artifact 完成三源诊断。Round 9 通用修复正在完成本地提交与 clean-archive
+部署；生产确认空闲且 smoke 通过后才可启动 Round 10，最多继续到 Round 13；不得复用失败 run，
+或把同一 run 的重试、补跑和重复解读计为新轮。
 
 ## 10. 已知非 blocker 边界
 

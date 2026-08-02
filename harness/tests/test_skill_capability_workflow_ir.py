@@ -341,12 +341,60 @@ description: A generic instruction-only workflow.
             },
         }
 
+    def _workflow_plan(self, document):
+        executable = [unit for unit in document.units if unit.kind != "heading"]
+        first, second, aggregate = executable
+        return {
+            "schema_version": "1",
+            "nodes": [
+                {
+                    "id": "worker-first",
+                    "kind": "delegate",
+                    "title": "First independent result",
+                    "instruction_ranges": [{
+                        "start_instruction_id": first.id,
+                        "end_instruction_id": first.id,
+                    }],
+                    "depends_on": [],
+                    "capability_ids": [],
+                    "result_schema": {
+                        "type": "object",
+                        "required": ["finding"],
+                        "properties": {"finding": {"type": "string"}},
+                    },
+                },
+                {
+                    "id": "worker-second",
+                    "kind": "delegate",
+                    "title": "Second independent result",
+                    "instruction_ranges": [{
+                        "start_instruction_id": second.id,
+                        "end_instruction_id": second.id,
+                    }],
+                    "depends_on": [],
+                    "capability_ids": [],
+                },
+                {
+                    "id": "aggregate-all",
+                    "kind": "aggregate",
+                    "title": "Aggregate all prerequisites",
+                    "instruction_ranges": [{
+                        "start_instruction_id": aggregate.id,
+                        "end_instruction_id": aggregate.id,
+                    }],
+                    "depends_on": ["worker-first", "worker-second"],
+                    "capability_ids": [],
+                },
+            ],
+        }
+
     def _validate(
         self,
         catalog,
         delegate_id,
         *,
         workflow_ir=None,
+        workflow_plan=None,
         required=None,
         optional=None,
     ):
@@ -359,6 +407,7 @@ description: A generic instruction-only workflow.
             optional=[] if optional is None else optional,
             unsupported=[],
             workflow_ir=workflow_ir,
+            workflow_plan=workflow_plan,
         )
 
     def test_catalog_binds_and_projects_runtime_owned_instruction_units(self):
@@ -371,11 +420,72 @@ description: A generic instruction-only workflow.
         self.assertTrue(projection["workflow_ir_required"])
         self.assertEqual(
             len(document.units),
-            projection["instruction_catalog"]["counts"]["instruction_units"],
+            projection["workflow_plan_catalog"]["counts"]["instruction_units"],
+        )
+        self.assertNotIn(
+            '"text":',
+            json.dumps(projection["workflow_plan_catalog"], ensure_ascii=False),
         )
         self.assertNotIn("instruction_documents", projection)
-        self.assertIn("workflow_ir is mandatory", projection["instructions"])
+        self.assertIn("workflow_plan is mandatory", projection["instructions"])
         self.assertRegex(catalog["catalog_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_compact_workflow_plan_is_compiled_before_grants_are_installed(self):
+        _root, _main, document, catalog, delegate_id = self._fixture()
+
+        result = self._validate(
+            catalog,
+            delegate_id,
+            workflow_plan=self._workflow_plan(document),
+        )
+
+        self.assertTrue(result.valid, result.payload)
+        self.assertEqual("accepted", result.payload["status"])
+        self.assertNotIn("workflow_plan", result.payload)
+        self.assertEqual(3, len(result.payload["workflow_ir"]["nodes"]))
+        self.assertTrue(all(
+            delegate_id in node["capability_ids"]
+            for node in result.payload["workflow_ir"]["nodes"]
+        ))
+        self.assertEqual(
+            ["worker-first", "worker-second"],
+            result.payload["worker_plan"]["required_workers"],
+        )
+
+        conflict = self._validate(
+            catalog,
+            delegate_id,
+            workflow_ir=self._workflow_payload(document, catalog, delegate_id),
+            workflow_plan=self._workflow_plan(document),
+        )
+        self.assertFalse(conflict.valid)
+        self.assertEqual(
+            "capability_plan_workflow_payload_conflict",
+            conflict.payload["error_code"],
+        )
+
+    def test_compact_plan_validation_error_exposes_stable_code_and_path(self):
+        _root, _main, document, catalog, delegate_id = self._fixture()
+        plan = self._workflow_plan(document)
+        plan["nodes"][0]["instruction_ranges"][0][
+            "start_instruction_id"
+        ] = "iu-000000000000000000000000"
+
+        result = self._validate(
+            catalog,
+            delegate_id,
+            workflow_plan=plan,
+        )
+
+        self.assertFalse(result.valid)
+        self.assertEqual(
+            "unknown_workflow_plan_instruction_id",
+            result.payload["workflow_plan_error_code"],
+        )
+        self.assertIn(
+            "instruction_ranges[0].start_instruction_id",
+            result.payload["workflow_plan_error_path"],
+        )
 
     def test_agent_loop_catalog_requires_ir_for_declared_delegated_workflow(self):
         root, main, _document, _catalog, _delegate_id = self._fixture()
@@ -1053,6 +1163,10 @@ It mentions Round 1 and Round 2 only as historical examples.
     def test_submit_tool_schema_is_optional_at_root_and_strict_when_present(self):
         parameters = SUBMIT_SKILL_CAPABILITY_PLAN_SCHEMA["parameters"]
         self.assertNotIn("workflow_ir", parameters["required"])
+        self.assertNotIn("workflow_plan", parameters["required"])
+        compact_schema = parameters["properties"]["workflow_plan"]
+        self.assertFalse(compact_schema["additionalProperties"])
+        self.assertNotIn("coverage", compact_schema["properties"])
         workflow_schema = parameters["properties"]["workflow_ir"]
         self.assertFalse(workflow_schema["additionalProperties"])
         self.assertEqual(512, workflow_schema["properties"]["nodes"]["maxItems"])

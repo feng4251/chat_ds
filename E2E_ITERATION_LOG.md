@@ -993,6 +993,269 @@ force-recreate 两个服务；Frontend、四槽、Proxy、Browser、SearXNG/Valk
 健康空闲，严重启动日志 0，三个 HTTP/回读工具均注册。
 
 Round 8 未产生 strong-final artifact，因此业务级 V2.3 验收仍未通过；但它已经到唯一 durable
-terminal，三项新暴露的缺陷均完成跨领域复现、通用修复、回归、commit 与生产部署。本 campaign
-到此达到用户授权的 8 轮绝对上限：**不得自动创建 Round 9**。下一次模型重型 V2.3 E2E 必须由
-用户明确重新授权或手工发起。
+terminal，三项新暴露的缺陷均完成跨领域复现、通用修复、回归、commit 与生产部署。这里记录的
+旧八轮上限随后已被用户于 2026-08-02 的明确新授权替代：可继续 Round 9--13，且每轮顺序运行
+V2.3 与肺癌 MDT 两个独立 acceptance case；Round 13 是当前新上限。
+
+## Round 9：紧凑语义计划、运行时完整 IR 与结构化终态预算一致性
+
+### V2.3 case：冻结身份、exact Skill 与 durable terminal
+
+- 被测生产 revision 为 `1d2b7d9ce412f58e9d21acf6f18a56c1ebef419d`；Conversation
+  `24239b8bef374c8e9663a0849adafa05`，root
+  `0d3a0e9ee41e4153b129cbc4728d7761`，从 2026-08-02 01:09:21 到 07:00:36 UTC
+  连续运行约 5 小时 51 分。维护端消费 5,300 条 SSE，唯一权威终态为
+  `run.failed / delegate_step_failed`，不是前端断线、人工取消、统一沙箱缺失、共同网络故障、
+  provider stream timeout 或主 run timeout。
+- V2.3 ZIP SHA-256 为
+  `78b890eab57ff516c20a39a565631caa5d784f839b42f6ad9efbdbdd951eb0a0`，19 个 Skill
+  完整安装；primary route 正确选择 `healthsim-trialsim/composite_full_protocol_design`。
+  intent、7 路 bootstrap、PICO/Safety/Termination、AE/Target/Competitive 共 14 个 child
+  succeeded。唯一 Literature synthesis child `cf7e005b...` failed，required barrier 正确
+  fail closed；fan-in、11 模块、strong-final 与 post-merge verifier 未启动，没有最终报告文件。
+- Literature child 已连续完成 16 个普通迭代，原始复杂 typed contract 的 child 输出预算为
+  16,384 tokens。第 16 轮进入独立 footer finalizer 后，旧实现却把修复预算固定降为 8,192；
+  第 17 轮在 8,192-token 上限正好截断，形成 28,662-character 非完整 JSON tool arguments，
+  最终以 `delegated_result_footer_structured_repair_failed` 结束。它不是检索来源不可达，也不是
+  registry tool 执行失败；内部 footer submitter 在 dispatch 前即被结构校验拒绝。
+- 该 failed child 的 debug 累计了约 186 万 input/output tokens，但 AgentRun 行为 0/0/0。
+  原因是 terminal event 自身携带的 cumulative usage 没有并入父级 provisional terminal，
+  只有单独 usage event 的旧路径会写回。这是可观测性错误，不是 child 没有实际调用模型。
+
+### 肺癌 MDT case：exact Skill、完整终态与逐项失败归因
+
+- `yangbb` User Skill registry 的独立 case 使用 Conversation
+  `4667d323114c4cce94faf861a6ea4347`、root
+  `1b8e7dcde41243558178463da601a60a`。输入 raw SHA-256 为
+  `eefb885294e6849d1e5ab5ce9f6799a30dfff1b9520761bd403138b7f4b135b7`；`SKILL.md`
+  SHA-256 为 `2955c00a456f7ca4215e27091c55ceeca6c84d170e4af99560adb54e0d5b4d42`，
+  package 共 36 files，registry row 为 `3ac0ed1c89eb4244ae0ed4a057392865`；runtime 记录的
+  viewed/installed digest 完全相同，catalog SHA-256 为
+  `4999a8313852a4ed730510f73ad7e3285c1ec13efcd926f32d1867b17da10ac0`。
+  本 case 与 V2.3 顺序运行，没有 provider 并发污染。模型路由保持
+  `deepseek_v4_pro -> AgentModel`，metadata 将 context 修正为 250,368。
+- root 从 2026-08-02 07:06:43 到 19:54:21 UTC 自然运行约 12 小时 47 分 37 秒；维护端持续
+  消费 1,095,796 条 SSE，最终且唯一 durable terminal 是
+  `run.failed / provider_tool_stream_corrupt_after_content`。AgentRun、event ledger、SSE status
+  和 persisted assistant message 四处一致，不是前端断线、人工取消、沙箱/浏览器依赖、网络来源
+  不可达或 delegate worker 失败。
+- exact Skill 要求 Round 0 数据 gate、11 个专科 Agent 的 Round 1、无条件 Round 2 复核/冲突解决、
+  Coordinator Round 3 共识投票和最终 MDT 报告。实际 run 只有 1 个 primary AgentRun、0 child、
+  0 delegate、0 artifact；workspace 除 session scaffold/debug 外没有业务文件。因此执行意图在
+  planning frontier 即失败，不能把 39,584-character 草稿或前端 tool progress 当作 Skill 结果。
+- 旧版把 241 个 instruction units 的完整 runtime Workflow IR 交给模型手写。37 次 LLM finish
+  共产生 23 个已装配 tool result：2 次 `skill_view` 成功；20 次完整
+  `submit_skill_capability_plan` 进入 handler 后被 deterministic IR validator 拒绝；另 1 次因
+  `workflow_ir.skill.version=null` 在 schema preflight 拒绝且
+  `actual_dispatch_attempted=false`。语义拒绝中的 14 次甚至返回完全相同的 bounded result hash，
+  但旧实现没有独立 plan-validation/no-progress budget，仍可消费 160 次普通 iteration。
+  这些 planning handler dispatch 没有执行 worker、出网或写文件副作用。
+- 失败计划反复产生 59K--112K 字符级 arguments 和巨大 reasoning，并把控制面继续带入模型历史。
+  最后第 37 次调用自身仍正常完成 151,775 input + 97,904 output tokens，产生 181,910 reasoning
+  chars；但 28,249-character plan arguments 在末尾不完整（object balance 3、array balance 1，
+  0 valid object），以 `malformed_arguments_json` 在 dispatch 前被拒。由于此前同一 frontier 已耗尽
+  consecutive no-progress repair，Harness 正确不再重放，最终 corrupt-stream 文案只是终止触发器，
+  不是前面 12 小时不收敛的根因。
+- 持久 usage 为 4,812,385 input + 2,115,422 output = 6,927,807 tokens；assistant reasoning
+  3,084,412 chars，仍未产生业务 artifact。19:03:06 UTC 在 plan 尚未接受时还错误发布了一次
+  `artifact_integrity` verifier（空 target，结论为“未产生 artifact”），随后又返回 planning；这是
+  旧 `direct_called_tools` 将 attempted 当 accepted、且 length/budget verifier 不认识 pending plan
+  frontier 的共同后果。前一问题已由 typed accepted/install-only receipt 修复；终态审计又补上
+  `catalog present - installed plan absent` 的 mandatory workflow state，所有普通/length/budget 路径
+  均先结算 workflow frontier，artifact verifier 不再跨阶段运行。
+
+### 模拟人工追问后的通用根因与修复不变量
+
+1. **规划投影与执行 IR 混为一体。** 完整 source binding、逐 instruction coverage、result ID、
+   output mapping、join/failure policy、counts 与 digest 都是 Harness 可确定推导的运行时事实，
+   不应要求模型重复序列化。通用不变量是模型只提交小型语义节点/依赖/连续 instruction range/
+   capability 选择；Harness 依据冻结 catalog 确定性展开完整 IR，再复用既有严格 validator。
+2. **dispatch 不等于语义接受。** 任何 control-plane tool 只有返回 typed `status=accepted` 才能
+   推进 mandatory frontier；preflight、parse 或 semantic rejection 都必须停留在当前 frontier。
+   同一 plan 的结构错误最多重试三次，随后发出包含稳定 error code/path 的唯一 durable failure，
+   不能降权进入执行面，也不能用 160 个主循环迭代反复碰运气。
+3. **handler 接受不等于运行时安装。** control-plane handler 的 `status=accepted` 仍需通过冻结
+   catalog 的二次校验和 profile-bound runtime preflight；只有 authority 真正原子安装后才消费
+   mandatory frontier。schema/semantic rejection 是模型可纠正的三次有界 budget；runtime/profile/
+   live-authority/派生失败则属于独立、非模型可纠正的 install controller，应立即 typed fail closed，
+   不能要求模型把同一 JSON 重交三次，也不能先发成功事件。成功安装才提交 tool context、execution/
+   workflow/artifact plan 与 receipt frontier。
+4. **结构化原始输出与修复预算漂移。** typed child 与其唯一 footer finalizer 必须使用同一个、
+   由 required field/schema 结构复杂度计算的 8K/16K/32K 档位；context/provider clamp 仍具有最终
+   权威。预算不得按疾病、模型、worker 名或报告类型特判。
+5. **机器状态不应回灌大历史。** accepted full IR/worker plan 保留为 runtime-owned state，模型历史
+   只接收 digest、节点/输出/worker 数和 capability receipt。被拒绝计划只返回有界 validator
+   feedback。这样既不丢执行权威，也避免每轮重复数万字符。
+6. **终态 usage 必须单调合并。** child usage 从 standalone usage event 与 terminal payload 两条
+   可能重复的路径按字段 cumulative max 合并，并强制 `total >= input + output`，保证幂等且不双计。
+7. **catalog revision 是权限 epoch。** reference amendment 必须先撤销旧 plan、worker/aggregation/
+   artifact state、脚本/HTTP/MCP/sandbox grants 与 planner receipt，再发布新 catalog。只有候选结构、
+   path 与 SHA 全部相同的成功只读 resource receipt 可跨 epoch 复用；新 epoch 的 plan 未 commit 前
+   只能看到 progressive `skill_view` 与 planner，旧工具或 worker 不得复活。
+8. **编译可接受必须等价于 child wire contract 可传输。** Workflow IR 原先只限制完整 schema 为
+   64 KiB，而 delegation 另有限制 128 fields、256-character field name 和 16 KiB 精确 per-field
+   projection；这会让 authority 安装后才发现 worker 永远不可调度。现已由
+   `delegated_result_contract` 提供共享投影/限额，compact/full IR 都在 compile/install 前使用同一
+   字节级边界；16 KiB 精确接受，增加一个 ASCII 或多字节 UTF-8 字节即拒绝，128/129 fields
+   边界也在零 dispatch 阶段确定。字段名的非空、唯一、无首尾空白/换行/NUL 与 256-character
+   规则也由同一 validator 实施；legacy mapping/list 不再保留字符数计量或静默 strip 的旁路。
+9. **DAG 声明是 prerequisite 的唯一 authority。** Workflow IR aggregation/validation/synthesis
+   原先会先注入全部已完成 worker，再追加声明依赖，导致独立兄弟分支污染结果。现在仅对
+   `selection=workflow_ir` 使用该 step 的 exact `input_worker_ids` 与 `depends_on`；legacy 计划保持
+   兼容。两个 worker 但 aggregate 只选择一个、以及 aggregate→synthesize 两个 holdout 均证明
+   未声明 worker/aggregate 不再进入 child context。同理，wave dependency 只作为 readiness barrier；
+   `A/B` 同 wave 而 `C` 只声明依赖 `A` 时，`B` 不再因 wave 展开而成为 `C` 的数据输入。
+10. **所有受支持执行器必须产生同构 artifact receipt。** `run_skill_process` 已能在 sync/close
+    返回 path/size/SHA，但 delegated success capture 与 verifier runner 列表漏掉该 tool，合法文件
+    会得到空 manifest。两处现已统一纳入 persistent process；真实 workspace 文件的 path、size、
+    SHA 和 terminal manifest 由同一验证链闭环，不能由 child prose 冒充。
+11. **后置 verifier 不得越过 mandatory workflow frontier。** active standard Skill 的 catalog 已
+    发布但 typed plan 尚未安装时，`catalogs - plans` 是一等 planning frontier；它现在由
+    `needs_more_skill_workflow()` 与 artifact verifier 共用。普通 stop、length 和 iteration-budget
+    terminal 均先记录同一 `workflow_reason`，不能在 plan/worker 尚未结算时发布 artifact verifier、
+    action-promise 或 artifact-enforcement。非医疗 portable workflow 的两迭代预算耗尽反例验证：
+    一次 invalid plan 后 0 verifier、0 delegate、0 artifact，terminal 保留 pending-plan 原因。
+12. **规划 frontier 不应制造空控制事务。** 完整披露后若 standard Skill 的 catalog 既无
+    executable candidate、required group，也未要求 Workflow IR，则正文已是全部执行权威；Harness
+    直接关闭工具面并允许模型遵循正文回答，不要求一个不会收窄任何 grant 的空 plan call。反之，
+    只要存在候选、mandatory group 或 delegated workflow，typed plan 仍是不可跳过的 frontier。
+    post-tool closure 会让下一轮编译器发布 exact planner-only surface，不再用通用 workflow
+    continuation 把 `skill_view` 重新打开。纯指令 Skill 与脚本/浏览器/写文件三类标准 Skill 的
+    holdout 同时覆盖该分界。
+
+### 成熟官方实现的源代码/文档对照与决策
+
+| 当前问题 | 官方实现提供的模式 | 决策 |
+|---|---|---|
+| 模型手写巨大执行图 | Codex `update_plan` 只接受短小 1 句步骤清单，并明确与完整 Plan Mode 分离；Deep Agents 使用 `TodoListMiddleware`，而 graph/runtime 由框架组装 | **adopt** 小型 plan projection；完整 IR 由本 Harness 编译 |
+| 计划、文件与子代理职责混杂 | Deep Agents 将 planning、`FilesystemMiddleware`、`SubAgentMiddleware`/`AsyncSubAgentMiddleware` 分层，默认 `StateBackend`，生产建议 sandbox/backend | **adapt** 其分层；保留现有 content-addressed Skill、session workspace、sandbox lease 与 receipt |
+| 长 run 绑定前端 stream | Hermes runs API 用稳定 `run_id` 创建任务，再通过独立 events SSE 订阅；tool/subagent lifecycle 独立于正文 delta | 已有 durable AgentRun/event 主链；继续要求 exactly-one terminal，不整体换栈 |
+| sandbox/agent scope 与能力漂移 | OpenClaw 的 agent/sandbox 文档按 session/agent scope 计算可见工具并强调后层限制不能重新授予已拒绝能力 | **adopt** phase policy 优先于动态能力，能力边界单调收紧 |
+| subagent 独立上下文与预算 | Claude Code 官方 subagent 配置分别声明 context、tools、permission mode、skills/MCP 与 max turns | **adapt** 独立 child context/result contract；Claude Code 实现闭源，不虚构其内部源代码 |
+| provider/validation/execution 错误混成一次 retry | Pydantic AI/OpenAI Agents/LangGraph/Inspect AI 分别提供 structured validation、run/event、checkpoint/pending writes 与 turn-boundary state 模式 | **adopt** provider、validation、execution 三类恢复预算分离；本轮只新增 plan semantic validation budget |
+| plan revision 与安装竞态 | OpenClaw `planIntegrity`/fresh-plan digest 比对；Codex/Inspect/OpenClaw 的 update-plan 都只提交小型状态投影 | **adopt** catalog digest epoch、live authority 二次校验、staged candidate + short commit |
+| child terminal 与 artifact 证明分离 | OpenClaw subagent registry 区分 execution/outcome/delivery；Inspect `AgentFuture` 保证每个 child settle；Hermes 持久化 typed subagent lifecycle | **adapt** authoritative terminal 绑定排序 artifact receipt manifest、result hash、usage；父级只接受验证后的 terminal |
+| SSE/刷新后状态丢失 | OpenClaw event ledger 使用 run-local monotonic seq 与 durable replay；Codex rollout recorder 单 writer；Inspect DB cursor/reconstruction | 已有 durable event 主链，继续要求 terminal/event receipt 为唯一事实，不以浏览器连接决定生命周期 |
+| sandbox 文件与网络边界 | Codex 将 filesystem/network permission profile 分离；OpenClaw 做 session-exclusive workspace、canonical path/symlink guard，默认 sandbox network none | **adapt** 一个统一 session sandbox + workspace boundary + signed egress proxy；“只下载”不能替代 URL/method/private-network policy |
+
+官方依据：
+
+本轮只读 clone 的冻结 revisions 分别为 Deep Agents `46ee772b45e1`、Codex
+`2b5bdcf67547`、OpenClaw `98c0d9deca5d`、Hermes `845031ad81e4`、Pydantic AI
+`2375e5a3120d`、OpenAI Agents Python `fc084ae29cd7`、LangGraph `b2926a0ff958`、
+Inspect AI `1ea01a9e1b3c`、AutoGen `027ecf0a379b`、Temporal Python SDK
+`646d69e12e1f`、Semantic Kernel `383d102346b7`、OpenHands software-agent-sdk
+`abeb884cacac` 与 Agent Canvas `1708efc44608`；这些 clone 位于维护端临时只读参考目录，
+未复制进生产源码或镜像。Claude Code 没有可审计的官方开源 runtime，因此只引用其官方文档，
+不把第三方复刻实现当作 ground truth。
+
+本轮不是只读项目介绍，而是核对了以下冻结源码控制点：Deep Agents 的
+`middleware/filesystem.py`、`middleware/subagents.py`、`middleware/async_subagents.py`；
+OpenClaw 的 `agents/tools/update-plan-tool.ts`、`claws/update-plan.ts`、
+`claws/update-apply.ts`、`acp/event-ledger.ts`、`agents/subagent-registry.types.ts`、
+`agents/sandbox/workspace-authority.ts`、`agents/sandbox/fs-bridge-path-safety.ts`、
+`provider-runtime/operation-retry.ts` 与 SQLite transaction/state DB；Hermes 的
+`agent/turn_retry_state.py`、`agent/subagent_lifecycle.py`、`agent/tool_executor.py`、
+`gateway/delivery_ledger.py`、`tools/todo_tool.py`；Codex 的 `handlers/plan_spec.rs`、
+`handlers/plan.rs`、`tools/orchestrator.rs`、`session/turn.rs`、`rollout/recorder.rs` 与
+protocol permission models；LangGraph 的 `graph/state.py`、`pregel/_retry.py` 与 checkpoint
+base；Pydantic AI 的 `tool_manager.py`、`exceptions.py` 与 Pydantic Graph builder；OpenAI
+Agents 的 `run_steps.py`、`run_state.py`、`tool_execution.py`；Inspect AI 的
+`_update_plan.py`、deepagent `agent_tool.py`、buffer `database.py` 与 recovery reconstruct。
+这些实现共同支持“模型只写小型投影、运行时持有完整状态、校验前零 dispatch、分层 retry、
+commit 后发布 terminal/event”的方向；没有任何一个现成库单独提供 ChatDS 所需的
+content-addressed Skill + exact capability + workspace artifact receipt 全套语义。
+
+针对终审的三个边界又做了源码级细化：PydanticAI `FunctionSchema` 与 OpenAI Agents `FuncSchema`
+都从同一 typed model 同时生成 provider JSON Schema 和 runtime validator，采用其“canonical
+contract 单一来源”；LangGraph 只有显式 `add_edge([A,B], C)` 才生成 `NamedBarrierValue`，两个
+普通 `A→C`/`B→C` 不是 AND，采用其 exact barrier 语义，并结合 Pydantic Graph 的
+`fork_run_id/task_id` 实例隔离；OpenClaw attachment manifest-last 与 Hermes artifact-preservation
+transaction 只适合作为 artifact staging 参考，因为 Deep Agents/Codex/AutoGen/Inspect 等上游也
+没有同时绑定 path/hash/size/current producer attempt/terminal 的完整 output receipt。本 Harness
+因此保留自己的 verified workspace artifact receipt，不把 exit code、stdout 或最后一条 AI message
+提升为完成证明。Claude Code 对这些内部机制没有公开源码，仍只记录官方公开契约，不作反推。
+
+- Deep Agents：<https://github.com/langchain-ai/deepagents>、
+  <https://docs.langchain.com/oss/python/deepagents/overview>、
+  <https://docs.langchain.com/oss/python/deepagents/subagents>、
+  <https://docs.langchain.com/oss/python/deepagents/sandboxes>
+- Codex：<https://github.com/openai/codex/blob/main/codex-rs/protocol/src/prompts/base_instructions/default.md>、
+  <https://github.com/openai/codex/blob/main/codex-rs/collaboration-mode-templates/templates/plan.md>、
+  <https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md>
+- OpenClaw：<https://github.com/openclaw/openclaw/blob/main/docs/gateway/security/index.md>、
+  <https://github.com/openclaw/openclaw/blob/main/docs/tools/multi-agent-sandbox-tools.md>
+- Hermes：<https://github.com/NousResearch/hermes-agent>、
+  <https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/api-server.md>、
+  <https://github.com/NousResearch/hermes-agent/blob/main/website/docs/developer-guide/agent-loop.md>
+- Claude Code：<https://code.claude.com/docs/en/sub-agents>、
+  <https://code.claude.com/docs/en/hooks>
+- OpenAI Agents SDK：<https://openai.github.io/openai-agents-python/streaming/>、
+  <https://openai.github.io/openai-agents-python/sessions/>
+- Pydantic AI / LangGraph / Inspect AI / AutoGen：
+  <https://ai.pydantic.dev/output/>、
+  <https://docs.langchain.com/oss/python/langgraph/persistence>、
+  <https://docs.langchain.com/oss/python/langgraph/fault-tolerance>、
+  <https://inspect.aisi.org.uk/checkpointing.html>、
+  <https://microsoft.github.io/autogen/stable/reference/python/autogen_agentchat.teams.html>
+- Temporal / Semantic Kernel / OpenHands：
+  <https://github.com/temporalio/sdk-python>、
+  <https://docs.temporal.io/develop/python/failure-detection>、
+  <https://github.com/microsoft/semantic-kernel>、
+  <https://github.com/All-Hands-AI/agent-sdk>、
+  <https://github.com/All-Hands-AI/agent-sandbox>
+
+扩展源码核查没有改变保留当前 Harness 的结论，但进一步限定了实现边界：Temporal 的
+deterministic Workflow/Activity 分离、精确 sequence/run handle、RetryPolicy 与不可变 history
+close event 适合 **adopt/adapt** 为 `WorkflowIR + exact predecessor receipt + 分层 retry ledger +
+唯一持久终态`；它自己的 Workflow sandbox 明确不是安全边界，且 process 结果仍主要是
+stdout/stderr/exit code，不能替代 ChatDS 的 workspace artifact receipt。Semantic Kernel 的
+`ProcessBuilder` step/event namespace 与 OpenAPI URL validator 可局部 **adapt**，但 Magentic 的
+facts/plan/progress ledger 仍是模型 prose，local/Dapr process message 没有 attempt/revision/receipt
+身份，也没有可重放 root terminal，不能作为权威图或 exact fan-in。OpenHands 的 immutable
+event ID、action-to-observation linkage、append-only event store、显式 terminal enum 和可插拔
+Docker workspace 值得 **adapt**；其文件事件与 state HEAD 并非同一事务，默认 Docker network/
+volume 也不构成 session 安全或 egress policy，不能整体照搬。三者仍没有任何一个同时提供
+任意规范 Skill 的确定性编译、当前 producer attempt 绑定的 path/hash/size/contract receipt、
+session filesystem boundary 与统一出网策略。
+
+整体决策仍是保留当前 Harness，而不是引入第二套 agent loop。现有系统已经有更具体的 Skill
+content authority、session workspace、sandbox/effect ledger、artifact CAS 和 durable terminal
+语义；成熟项目本轮提供的是清晰的边界模式。直接换栈会同时分叉这些控制面，不能自动解决这里的
+projection/validation 问题。
+
+### 通用实现与确定性验证（部署前）
+
+- 新增 compact `workflow_plan` schema 与编译器。模型目录只包含 path/unit count、稳定 ID、kind、
+  同文档位置和最多 64 字符 preview；不含完整 instruction text/runtime hashes。模型用 inclusive
+  range 分组，runtime 绑定 source digest、展开 coverage，注入已选择的 `delegate_task`，派生
+  result/output/policy/count/digest，并再次通过完整 IR validator。unknown/stale/cross-document/
+  reversed/within-node overlap/heading-only/incomplete/cyclic/unselected 均 fail closed。
+- 真实冻结 fixture 的零模型测量：肺癌 MDT 241 units 的完整 catalog 为 104,621 bytes，compact
+  catalog 为 37,380 bytes（35.73%）；V2.3 primary 168 units 从 73,226 bytes 降至 25,266 bytes
+  （34.5%），两边 exact catalog digest 保持一致。另有 80-section 非医疗卫星 Skill mutation
+  验证 rename/domain independence。
+- Provider-facing schema 只暴露 compact plan；legacy full IR 仅保留给内部/兼容直接调用者。accepted
+  plan 的历史 projection 不含 full IR；三次 rejected plan 在真实 mock stream 中始终只暴露 plan
+  tool，第三次发出 stable durable terminal，`delegate_task` 从未提前出现。
+- handler-level accepted 之后若 profile/runtime preflight 拒绝，plan frontier 仍保持 required，执行
+  工具不会提前暴露，debug/SSE/model history 均只看到同一个失败事实；runtime install controller
+  立即给出唯一 durable failure，不消耗 semantic plan retry。确定性非医疗 Skill 分别覆盖
+  handler→installer live-file TOCTOU、artifact projection fault、schema-invalid 零 dispatch 和
+  amendment 中 replacement plan 先拒绝后成功。
+- compact compiler 在接受前使用同一 bounded JSON-Schema validator，限制单 instruction fan-out，
+  并把 aggregate 的所有必需后继闭包统一 lowering 到 aggregation stage，覆盖通用
+  `retrieve -> aggregate -> synthesize/artifact` 拓扑，避免“计划通过、执行阶段才拒绝”。
+- child/finalizer 的 8K/16K/32K 共享预算增加真实 `_run_child` 120→121 分边界测试；usage alias
+  忽略负数/boolean 后取有效 cumulative max；成功与失败 authoritative terminal 都绑定 canonical
+  artifact manifest。含两个真实 workspace artifact 的测试证明 terminal manifest 与外层 result
+  完全一致。
+- changed-path 组合在首轮终审前为 309/309；共享 schema/field validator、exact worker/aggregate
+  predecessor 与 process artifact 回归合入后，包含受影响 workflow activation 和跨领域管线的
+  扩展组合最终为 486/486 passed（1 项预期 skip）。隔离 workspace/data root 且包含 sibling
+  `executor` module 的 full Harness 共枚举 1,906 项，唯一错误是 CommonJS/Node holdout 因
+  Harness image 按设计不含 Node；把宿主 Node 22.23.1 注入同一隔离容器后，该 exact holdout
+  单独通过。因此组合证据覆盖全部 1,906 项，无代码失败。
+  `py_compile`、`git diff --check` 与 diff-only genericity 检查通过。本节仍是部署前记录；
+  肺癌旧 root 已自然到 durable terminal；还需确认生产无其他 active roots 后，才能本地 commit、
+  clean-archive 构建与切换。

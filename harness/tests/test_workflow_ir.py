@@ -9,12 +9,16 @@ from workflow_ir import (
     WorkflowIRValidationError,
     WorkflowPlanAdapterError,
     canonicalize_skill_markdown,
+    compile_workflow_plan,
     compile_worker_wave_plan,
     instruction_catalog_payload,
     parse_and_validate_workflow_ir,
     validate_workflow_ir,
     verify_instruction_execution_coverage,
+    workflow_plan_instruction_catalog_payload,
+    workflow_plan_json_schema,
 )
+from delegated_result_contract import MAX_REQUIRED_RESULT_SCHEMA_BYTES
 
 
 CATALOG_SHA256 = "a" * 64
@@ -207,6 +211,49 @@ version: "1"
             },
         }
 
+    def _compact_plan(self, document=None):
+        document = document or self._document()
+        complete = self._payload(document)
+        return {
+            "schema_version": "1",
+            "nodes": [
+                {
+                    "id": node["id"],
+                    "kind": node["kind"],
+                    "title": node.get("title", ""),
+                    "role": node.get("role", ""),
+                    "phase": node.get("phase", ""),
+                    **(
+                        {"round": node["round"]}
+                        if "round" in node
+                        else {}
+                    ),
+                    "instruction_ranges": [
+                        {
+                            "start_instruction_id": instruction_id,
+                            "end_instruction_id": instruction_id,
+                        }
+                        for instruction_id in node["instruction_ids"]
+                    ],
+                    "depends_on": node["depends_on"],
+                    "capability_ids": [
+                        capability_id
+                        for capability_id in node["capability_ids"]
+                        if capability_id != "cap-delegate"
+                    ],
+                    "result_schema": node["result_schema"],
+                }
+                for node in complete["nodes"]
+            ],
+            "outputs": [
+                {
+                    "id": output["id"],
+                    "producer_node_ids": output["producer_node_ids"],
+                }
+                for output in complete["outputs"]
+            ],
+        }
+
     def _validate(self, payload=None, document=None):
         document = document or self._document()
         return validate_workflow_ir(
@@ -315,6 +362,468 @@ version: "1"
         self.assertEqual(plan["aggregation_steps"][0]["depends_on"], [])
         self.assertFalse(plan["requires_artifact_output"])
         self.assertEqual(plan["workflow_ir_outputs"][0]["id"], "final-report")
+
+    def test_compact_plan_expands_to_complete_runtime_owned_ir(self):
+        document = self._document()
+        compact = self._compact_plan(document)
+
+        workflow_ir = compile_workflow_plan(
+            compact,
+            documents=[document],
+            skill_name="multilingual-workflow",
+            capability_catalog_sha256=CATALOG_SHA256,
+            available_capability_ids=CAPABILITIES,
+            mandatory_node_capability_ids=["cap-delegate"],
+        )
+
+        self.assertEqual(len(document.units), len(workflow_ir.coverage))
+        self.assertTrue(all(node.required for node in workflow_ir.nodes))
+        self.assertTrue(all(
+            node.executor == "child_agent" for node in workflow_ir.nodes
+        ))
+        self.assertTrue(all(
+            "cap-delegate" in node.capability_ids for node in workflow_ir.nodes
+        ))
+        self.assertEqual(
+            ["worker-alpha", "worker-beta"],
+            compile_worker_wave_plan(workflow_ir)["required_workers"],
+        )
+
+        exact = json.dumps(
+            instruction_catalog_payload([document]),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        planning = json.dumps(
+            workflow_plan_instruction_catalog_payload([document]),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        self.assertLess(len(planning), len(exact))
+        self.assertNotIn('"text":', planning)
+        self.assertIn("preview", planning)
+        schema = workflow_plan_json_schema()
+        self.assertNotIn("workflow_ir", json.dumps(schema))
+        self.assertNotIn("coverage", schema["properties"])
+
+    def test_compact_plan_permutations_compile_to_one_canonical_ir(self):
+        document = self._document()
+        canonical_plan = self._compact_plan(document)
+        permuted_plan = copy.deepcopy(canonical_plan)
+        permuted_plan["nodes"].reverse()
+        for node in permuted_plan["nodes"]:
+            node["instruction_ranges"].reverse()
+            node["depends_on"].reverse()
+            node["capability_ids"].reverse()
+        permuted_plan["outputs"].reverse()
+        for output in permuted_plan["outputs"]:
+            output["producer_node_ids"].reverse()
+
+        canonical = compile_workflow_plan(
+            canonical_plan,
+            documents=[document],
+            skill_name="multilingual-workflow",
+            capability_catalog_sha256=CATALOG_SHA256,
+            available_capability_ids=CAPABILITIES,
+            mandatory_node_capability_ids=["cap-delegate"],
+        )
+        permuted = compile_workflow_plan(
+            permuted_plan,
+            documents=[document],
+            skill_name="multilingual-workflow",
+            capability_catalog_sha256=CATALOG_SHA256,
+            available_capability_ids=reversed(CAPABILITIES),
+            mandatory_node_capability_ids=["cap-delegate"],
+        )
+
+        self.assertEqual(canonical.ir_sha256, permuted.ir_sha256)
+        self.assertEqual(canonical.to_dict(), permuted.to_dict())
+
+    def test_compact_plan_rejects_stale_cross_document_reversed_and_overlap(self):
+        first = self._document()
+        second = canonicalize_skill_markdown(
+            "# Second\n\nRun a separate operation.\n",
+            source_path="references/second.md",
+        )
+        base = self._compact_plan(first)
+
+        stale = copy.deepcopy(base)
+        stale["nodes"][0]["instruction_ranges"][0][
+            "start_instruction_id"
+        ] = "iu-000000000000000000000000"
+        with self.assertRaises(WorkflowIRValidationError) as raised:
+            compile_workflow_plan(
+                stale,
+                documents=[first],
+                skill_name="multilingual-workflow",
+                capability_catalog_sha256=CATALOG_SHA256,
+                available_capability_ids=CAPABILITIES,
+                mandatory_node_capability_ids=["cap-delegate"],
+            )
+        self.assertEqual(
+            "unknown_workflow_plan_instruction_id", raised.exception.code
+        )
+
+        cross_document = copy.deepcopy(base)
+        cross_document["nodes"][0]["instruction_ranges"] = [{
+            "start_instruction_id": first.units[0].id,
+            "end_instruction_id": second.units[-1].id,
+        }]
+        with self.assertRaises(WorkflowIRValidationError) as raised:
+            compile_workflow_plan(
+                cross_document,
+                documents=[first, second],
+                skill_name="multilingual-workflow",
+                capability_catalog_sha256=CATALOG_SHA256,
+                available_capability_ids=CAPABILITIES,
+                mandatory_node_capability_ids=["cap-delegate"],
+            )
+        self.assertEqual("cross_document_instruction_range", raised.exception.code)
+
+        reversed_plan = copy.deepcopy(base)
+        reversed_plan["nodes"][0]["instruction_ranges"] = [{
+            "start_instruction_id": first.units[-1].id,
+            "end_instruction_id": first.units[0].id,
+        }]
+        with self.assertRaises(WorkflowIRValidationError) as raised:
+            compile_workflow_plan(
+                reversed_plan,
+                documents=[first],
+                skill_name="multilingual-workflow",
+                capability_catalog_sha256=CATALOG_SHA256,
+                available_capability_ids=CAPABILITIES,
+                mandatory_node_capability_ids=["cap-delegate"],
+            )
+        self.assertEqual("reversed_instruction_range", raised.exception.code)
+
+        overlap = copy.deepcopy(base)
+        executable = [unit for unit in first.units if unit.kind != "heading"]
+        overlap["nodes"][0]["instruction_ranges"] = [
+            {
+                "start_instruction_id": executable[0].id,
+                "end_instruction_id": executable[1].id,
+            },
+            {
+                "start_instruction_id": executable[1].id,
+                "end_instruction_id": executable[1].id,
+            },
+        ]
+        with self.assertRaises(WorkflowIRValidationError) as raised:
+            compile_workflow_plan(
+                overlap,
+                documents=[first],
+                skill_name="multilingual-workflow",
+                capability_catalog_sha256=CATALOG_SHA256,
+                available_capability_ids=CAPABILITIES,
+                mandatory_node_capability_ids=["cap-delegate"],
+            )
+        self.assertEqual("overlapping_instruction_range", raised.exception.code)
+
+    def test_nonmedical_long_skill_compiles_from_coalesced_ranges(self):
+        sections = []
+        for index in range(1, 81):
+            sections.append(
+                f"## Satellite pass {index}\n\n"
+                f"Validate telemetry window {index} and preserve its evidence."
+            )
+        document = canonicalize_skill_markdown(
+            "# Orbital operations\n\n" + "\n\n".join(sections) + "\n",
+            source_path="SKILL.md",
+        )
+        executable = [unit for unit in document.units if unit.kind != "heading"]
+        midpoint = len(executable) // 2
+        plan = {
+            "schema_version": "1",
+            "nodes": [
+                {
+                    "id": "telemetry-a",
+                    "kind": "retrieve",
+                    "instruction_ranges": [{
+                        "start_instruction_id": executable[0].id,
+                        "end_instruction_id": executable[midpoint - 1].id,
+                    }],
+                    "depends_on": [],
+                    "capability_ids": [],
+                },
+                {
+                    "id": "telemetry-b",
+                    "kind": "verify",
+                    "instruction_ranges": [{
+                        "start_instruction_id": executable[midpoint].id,
+                        "end_instruction_id": executable[-1].id,
+                    }],
+                    "depends_on": ["telemetry-a"],
+                    "capability_ids": [],
+                },
+            ],
+        }
+        workflow_ir = compile_workflow_plan(
+            plan,
+            documents=[document],
+            skill_name="orbital-operations",
+            capability_catalog_sha256=CATALOG_SHA256,
+            available_capability_ids=["cap-delegate"],
+            mandatory_node_capability_ids=["cap-delegate"],
+        )
+
+        self.assertEqual(2, len(workflow_ir.nodes))
+        self.assertTrue(all(
+            finding.requirement == "required"
+            for finding in workflow_ir.coverage
+            if finding.instruction_id in {unit.id for unit in executable}
+        ))
+        plan_bytes = len(json.dumps(plan, separators=(",", ":")).encode())
+        ir_bytes = len(json.dumps(
+            workflow_ir.to_dict(), separators=(",", ":")
+        ).encode())
+        self.assertLess(plan_bytes, ir_bytes // 4)
+
+    def test_compact_plan_capability_authority_is_bounded_and_typed(self):
+        document = self._document()
+        plan = self._compact_plan(document)
+        with self.assertRaises(WorkflowIRValidationError) as raised:
+            compile_workflow_plan(
+                plan,
+                documents=[document],
+                skill_name="multilingual-workflow",
+                capability_catalog_sha256=CATALOG_SHA256,
+                available_capability_ids=[
+                    f"cap-{index}" for index in range(2_049)
+                ],
+                mandatory_node_capability_ids=[],
+            )
+        self.assertEqual("too_many_capability_ids", raised.exception.code)
+
+        with self.assertRaises(WorkflowIRValidationError) as raised:
+            compile_workflow_plan(
+                plan,
+                documents=[document],
+                skill_name="multilingual-workflow",
+                capability_catalog_sha256=CATALOG_SHA256,
+                available_capability_ids=CAPABILITIES,
+                mandatory_node_capability_ids="cap-delegate",
+            )
+        self.assertEqual("invalid_capability_catalog", raised.exception.code)
+
+    def test_compact_plan_rejects_invalid_result_schema_and_excessive_fanout(self):
+        document = canonicalize_skill_markdown(
+            "# Warehouse audit\n\nVerify the sealed inventory count.\n",
+            source_path="SKILL.md",
+        )
+        executable_id = next(
+            unit.id for unit in document.units if unit.kind != "heading"
+        )
+        base_node = {
+            "id": "audit-01",
+            "kind": "verify",
+            "instruction_ranges": [{
+                "start_instruction_id": executable_id,
+                "end_instruction_id": executable_id,
+            }],
+            "depends_on": [],
+            "capability_ids": [],
+        }
+        invalid_schema = {
+            "schema_version": "1",
+            "nodes": [{
+                **base_node,
+                "result_schema": {"type": "definitely-not-json-schema"},
+            }],
+        }
+        with self.assertRaises(WorkflowIRValidationError) as raised:
+            compile_workflow_plan(
+                invalid_schema,
+                documents=[document],
+                skill_name="warehouse-audit",
+                capability_catalog_sha256=CATALOG_SHA256,
+                available_capability_ids=["cap-delegate"],
+                mandatory_node_capability_ids=["cap-delegate"],
+            )
+        self.assertEqual("invalid_result_schema", raised.exception.code)
+
+        projection_base = len(json.dumps(
+            {
+                "payload": {
+                    "type": "string",
+                    "description": "",
+                }
+            },
+            ensure_ascii=False,
+        ).encode("utf-8"))
+        exact_schema = {
+            "type": "object",
+            "required": ["payload"],
+            "properties": {
+                "payload": {
+                    "type": "string",
+                    "description": "x" * (
+                        MAX_REQUIRED_RESULT_SCHEMA_BYTES - projection_base
+                    ),
+                }
+            },
+        }
+        exact_plan = {
+            "schema_version": "1",
+            "nodes": [{**base_node, "result_schema": exact_schema}],
+        }
+        exact_ir = compile_workflow_plan(
+            exact_plan,
+            documents=[document],
+            skill_name="warehouse-audit",
+            capability_catalog_sha256=CATALOG_SHA256,
+            available_capability_ids=["cap-delegate"],
+            mandatory_node_capability_ids=["cap-delegate"],
+        )
+        self.assertEqual(["payload"], list(exact_ir.nodes[0].result_schema["required"]))
+
+        oversized_plan = copy.deepcopy(exact_plan)
+        oversized_plan["nodes"][0]["result_schema"]["properties"]["payload"][
+            "description"
+        ] += "x"
+        with self.assertRaises(WorkflowIRValidationError) as raised:
+            compile_workflow_plan(
+                oversized_plan,
+                documents=[document],
+                skill_name="warehouse-audit",
+                capability_catalog_sha256=CATALOG_SHA256,
+                available_capability_ids=["cap-delegate"],
+                mandatory_node_capability_ids=["cap-delegate"],
+            )
+        self.assertEqual(
+            "result_contract_transport_incompatible", raised.exception.code
+        )
+
+        max_fields_schema = {
+            "type": "object",
+            "required": [f"field_{index}" for index in range(128)],
+            "properties": {
+                f"field_{index}": {} for index in range(128)
+            },
+            "additionalProperties": False,
+        }
+        max_fields_plan = {
+            "schema_version": "1",
+            "nodes": [{**base_node, "result_schema": max_fields_schema}],
+        }
+        compile_workflow_plan(
+            max_fields_plan,
+            documents=[document],
+            skill_name="warehouse-audit",
+            capability_catalog_sha256=CATALOG_SHA256,
+            available_capability_ids=["cap-delegate"],
+            mandatory_node_capability_ids=["cap-delegate"],
+        )
+        too_many_fields_plan = copy.deepcopy(max_fields_plan)
+        too_many_fields_plan["nodes"][0]["result_schema"]["required"].append(
+            "field_128"
+        )
+        too_many_fields_plan["nodes"][0]["result_schema"]["properties"][
+            "field_128"
+        ] = {}
+        with self.assertRaises(WorkflowIRValidationError) as raised:
+            compile_workflow_plan(
+                too_many_fields_plan,
+                documents=[document],
+                skill_name="warehouse-audit",
+                capability_catalog_sha256=CATALOG_SHA256,
+                available_capability_ids=["cap-delegate"],
+                mandatory_node_capability_ids=["cap-delegate"],
+            )
+        self.assertEqual(
+            "result_contract_transport_incompatible", raised.exception.code
+        )
+
+        for invalid_name in (" padded ", "line\nbreak", "a\x00b"):
+            invalid_name_plan = copy.deepcopy(exact_plan)
+            invalid_name_plan["nodes"][0]["result_schema"] = {
+                "type": "object",
+                "required": [invalid_name],
+                "properties": {invalid_name: {}},
+            }
+            with self.subTest(field=repr(invalid_name)):
+                with self.assertRaises(WorkflowIRValidationError) as raised:
+                    compile_workflow_plan(
+                        invalid_name_plan,
+                        documents=[document],
+                        skill_name="warehouse-audit",
+                        capability_catalog_sha256=CATALOG_SHA256,
+                        available_capability_ids=["cap-delegate"],
+                        mandatory_node_capability_ids=["cap-delegate"],
+                    )
+                self.assertEqual(
+                    "result_contract_transport_incompatible",
+                    raised.exception.code,
+                )
+
+        fanout = {
+            "schema_version": "1",
+            "nodes": [
+                {
+                    **base_node,
+                    "id": f"audit-{index:02d}",
+                    "instruction_ranges": [
+                        dict(base_node["instruction_ranges"][0])
+                    ],
+                    "depends_on": [],
+                    "capability_ids": ["cap-delegate"],
+                }
+                for index in range(1, 18)
+            ],
+        }
+        with self.assertRaises(WorkflowIRValidationError) as raised:
+            compile_workflow_plan(
+                fanout,
+                documents=[document],
+                skill_name="warehouse-audit",
+                capability_catalog_sha256=CATALOG_SHA256,
+                available_capability_ids=["cap-delegate"],
+                mandatory_node_capability_ids=["cap-delegate"],
+            )
+        self.assertEqual("instruction_fanout_too_large", raised.exception.code)
+
+    def test_compact_plan_lowers_post_aggregate_terminal_chain(self):
+        document = canonicalize_skill_markdown(
+            "# Museum workflow\n\n"
+            "1. Retrieve the conservation record.\n"
+            "2. Aggregate the inspected evidence.\n"
+            "3. Synthesize the restoration decision.\n"
+            "4. Publish the archival artifact.\n",
+            source_path="SKILL.md",
+        )
+        units = [unit for unit in document.units if unit.kind != "heading"]
+        kinds = ("retrieve", "aggregate", "synthesize", "artifact")
+        nodes = []
+        for index, (unit, kind) in enumerate(zip(units, kinds), start=1):
+            nodes.append({
+                "id": f"museum-{index}",
+                "kind": kind,
+                "instruction_ranges": [{
+                    "start_instruction_id": unit.id,
+                    "end_instruction_id": unit.id,
+                }],
+                "depends_on": [] if index == 1 else [f"museum-{index - 1}"],
+                "capability_ids": [],
+            })
+        workflow_ir = compile_workflow_plan(
+            {"schema_version": "1", "nodes": nodes},
+            documents=[document],
+            skill_name="museum-conservation",
+            capability_catalog_sha256=CATALOG_SHA256,
+            available_capability_ids=["cap-delegate"],
+            mandatory_node_capability_ids=["cap-delegate"],
+        )
+        lowered = compile_worker_wave_plan(workflow_ir)
+        self.assertEqual(["museum-1"], lowered["required_workers"])
+        self.assertEqual(
+            ["museum-2", "museum-3", "museum-4"],
+            [step["id"] for step in lowered["aggregation_steps"]],
+        )
+        self.assertEqual(
+            ["museum-2"], lowered["aggregation_steps"][1]["depends_on"]
+        )
+        self.assertEqual(
+            ["museum-3"], lowered["aggregation_steps"][2]["depends_on"]
+        )
 
     def test_dependency_levels_become_parallel_waves_and_aggregation_dag_is_preserved(
         self,
@@ -645,7 +1154,7 @@ version: "1"
         payload["nodes"][0]["required"] = False
         self.assert_ir_error("required_node_depends_on_optional", payload, document)
 
-    def test_adapter_rejects_executor_rerouting_and_worker_after_aggregation(self):
+    def test_adapter_rejects_executor_rerouting_and_promotes_downstream_nodes(self):
         document = self._document()
         payload = self._payload(document)
         payload["nodes"][0]["kind"] = "tool"
@@ -659,9 +1168,13 @@ version: "1"
         payload["nodes"][0]["depends_on"] = ["aggregate-final"]
         payload["nodes"][2]["depends_on"] = []
         workflow_ir = self._validate(payload, document)
-        with self.assertRaises(WorkflowPlanAdapterError) as raised:
-            compile_worker_wave_plan(workflow_ir)
-        self.assertEqual(raised.exception.code, "worker_depends_on_aggregation")
+        lowered = compile_worker_wave_plan(workflow_ir)
+        self.assertNotIn("worker-alpha", lowered["required_workers"])
+        downstream = next(
+            step for step in lowered["aggregation_steps"]
+            if step["id"] == "worker-alpha"
+        )
+        self.assertEqual(["aggregate-final"], downstream["depends_on"])
 
     def test_duplicate_and_unknown_execution_receipts_fail_closed(self):
         workflow_ir = self._validate()

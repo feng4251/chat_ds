@@ -3195,6 +3195,46 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
         self.assertEqual([], _declared_result_field_names(without_type))
         self.assertEqual({}, _declared_result_field_schema(without_type))
 
+    def test_result_field_metadata_rejects_lexical_and_legacy_wire_mismatches(self):
+        legacy_type_field = {"type": "object", "value": "string"}
+        self.assertEqual(
+            ["type", "value"],
+            _declared_result_field_names(legacy_type_field),
+        )
+        self.assertEqual(
+            {
+                "type": {"type": "object"},
+                "value": {"type": "string"},
+            },
+            _declared_result_field_schema(legacy_type_field),
+        )
+
+        for invalid_name in (" padded ", "line\nbreak", "a\x00b"):
+            formal = {
+                "type": "object",
+                "properties": {invalid_name: {"type": "string"}},
+                "required": [invalid_name],
+            }
+            with self.subTest(shape="formal", field=repr(invalid_name)):
+                with self.assertRaises(ValueError):
+                    _declared_result_field_names(formal)
+            with self.subTest(shape="legacy", field=repr(invalid_name)):
+                with self.assertRaises(ValueError):
+                    _declared_result_field_schema({invalid_name: "string"})
+
+        utf8_oversized = {
+            "payload": {
+                "type": "string",
+                "description": "汉" * 6_000,
+            }
+        }
+        with self.assertRaisesRegex(ValueError, "16 KiB"):
+            _declared_result_field_schema(utf8_oversized)
+
+        too_many = {f"field_{index}": None for index in range(129)}
+        with self.assertRaisesRegex(ValueError, "at most 128"):
+            _declared_result_field_schema(too_many)
+
     def test_declared_result_schema_preserves_supported_fragments_losslessly(self):
         nested_properties = {
             f"field_{index}": {

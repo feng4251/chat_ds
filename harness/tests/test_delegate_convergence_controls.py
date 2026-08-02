@@ -1677,6 +1677,8 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
         schemas=None,
         delegated=True,
         required_result_fields=None,
+        required_result_schema=None,
+        max_tokens=8192,
         retrieval_completeness_policy=None,
         required_capability_tools=None,
         allowed_skill_scripts=None,
@@ -1780,7 +1782,9 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
                         source="delegate" if delegated else "chat",
                         agent_kind="delegate" if delegated else "primary",
                         max_iterations=max_iterations,
+                        max_tokens=max_tokens,
                         required_result_fields=required_result_fields,
+                        required_result_schema=required_result_schema,
                         retrieval_completeness_policy=(
                             retrieval_completeness_policy
                         ),
@@ -3327,6 +3331,39 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
             content.rsplit("RESULT_FIELDS_JSON: ", 1)[1]
         )
         self.assertEqual(set(submitted), {"study_id", "endpoint"})
+        self.assertEqual(events[-1], {"type": "done", "finish_reason": "stop"})
+
+    async def test_complex_footer_repair_uses_same_32k_contract_tier(self):
+        fields = [f"field_{index}" for index in range(22)]
+        responses = [
+            _stop_response(
+                "# Structured evidence\n"
+                "The retained result supports each declared bounded field."
+            ),
+            _result_fields_submit_response(*fields),
+        ]
+        schema = {
+            field: {"type": "object"}
+            for field in fields
+        }
+
+        request_bodies, dispatch_mock, events, _persisted = await self._run(
+            responses,
+            max_iterations=3,
+            dispatch_result=json.dumps({"status": "unused"}),
+            required_result_fields=fields,
+            required_result_schema=schema,
+            max_tokens=32_768,
+        )
+
+        self.assertFalse(responses)
+        self.assertEqual(2, len(request_bodies))
+        self.assertEqual(32_768, request_bodies[1]["max_tokens"])
+        self.assertEqual(
+            "submit_result_fields",
+            request_bodies[1]["tools"][0]["function"]["name"],
+        )
+        self.assertEqual(0, dispatch_mock.await_count)
         self.assertEqual(events[-1], {"type": "done", "finish_reason": "stop"})
 
     async def test_footer_submitter_corrupt_stream_uses_one_nonstream_transport(self):

@@ -26,11 +26,17 @@ from retrieval_policy import (
     normalize_retrieval_completeness_policy,
 )
 from delegated_result_contract import (
+    MAX_REQUIRED_RESULT_FIELDS,
+    MAX_REQUIRED_RESULT_FIELD_CHARS,
+    MAX_REQUIRED_RESULT_SCHEMA_BYTES,
     _mask_markdown_code_for_protocol_audit,
+    adaptive_result_contract_output_tokens,
     audit_raw_tool_protocol,
     audit_result_fields as _result_field_audit,
     normalize_result_field_schema,
     strip_result_fields_candidate_tail,
+    validate_projected_result_contract,
+    validate_result_field_names,
 )
 from tools.context import ToolContext
 from tools.effect_receipt import (
@@ -134,9 +140,6 @@ _EVIDENCE_ACQUISITION_STEP_TYPES = {
 }
 _MAX_INTENT_CLASSIFIER_ITERATIONS = 2
 _MAX_INTENT_CLASSIFIER_OUTPUT_TOKENS = 4_096
-_DEFAULT_DELEGATE_OUTPUT_TOKENS = 8_192
-_MEDIUM_DELEGATE_OUTPUT_TOKENS = 16_384
-_LARGE_DELEGATE_OUTPUT_TOKENS = 32_768
 
 _TERMINAL_BUDGET_OR_LENGTH_REASONS = {
     "context_exhausted",
@@ -254,21 +257,54 @@ def _adaptive_delegate_output_tokens(
     This is deliberately structural rather than domain- or filename-based.
     Provider/context-window clamps inside ``run_stream`` remain authoritative.
     """
-    node_count = 0
-    stack: list[Any] = [required_result_schema]
-    while stack and node_count < 2_000:
-        value = stack.pop()
-        node_count += 1
-        if isinstance(value, dict):
-            stack.extend(value.values())
-        elif isinstance(value, (list, tuple)):
-            stack.extend(value)
-    score = (len(required_result_fields) * 8) + node_count
-    if score <= 48:
-        return _DEFAULT_DELEGATE_OUTPUT_TOKENS
-    if score <= 120:
-        return _MEDIUM_DELEGATE_OUTPUT_TOKENS
-    return _LARGE_DELEGATE_OUTPUT_TOKENS
+    return adaptive_result_contract_output_tokens(
+        required_result_fields,
+        required_result_schema,
+    )
+
+
+def _merge_child_usage(
+    current: dict[str, int] | None,
+    incoming: Any,
+) -> dict[str, int]:
+    """Monotonically merge cumulative child usage from duplicate event paths."""
+
+    existing = current if isinstance(current, dict) else {}
+    value = incoming if isinstance(incoming, dict) else {}
+
+    def integer(source: dict[str, Any], *keys: str) -> int:
+        candidates: list[int] = []
+        for key in keys:
+            raw = source.get(key)
+            if isinstance(raw, bool):
+                continue
+            try:
+                if raw is not None:
+                    parsed = int(raw)
+                    if parsed >= 0:
+                        candidates.append(parsed)
+            except (TypeError, ValueError, OverflowError):
+                continue
+        return max(candidates, default=0)
+
+    old_input = integer(existing, "input_tokens", "prompt_tokens")
+    old_output = integer(existing, "output_tokens", "completion_tokens")
+    old_total = integer(existing, "total_tokens")
+    new_input = integer(value, "input_tokens", "prompt_tokens")
+    new_output = integer(value, "output_tokens", "completion_tokens")
+    new_total = integer(value, "total_tokens")
+    input_tokens = max(old_input, new_input)
+    output_tokens = max(old_output, new_output)
+    total_tokens = max(
+        old_total,
+        new_total,
+        input_tokens + output_tokens,
+    )
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
 
 
 def _canonicalize_machine_gap_ledger(
@@ -1048,9 +1084,9 @@ _ARTIFACT_SYNTHESIS_STEP_TYPES = {
     "artifact-synthesis",
     "synthesis",
 }
-_MAX_REQUIRED_RESULT_FIELDS = 128
-_MAX_REQUIRED_RESULT_FIELD_CHARS = 256
-_MAX_REQUIRED_RESULT_SCHEMA_CHARS = 16 * 1024
+_MAX_REQUIRED_RESULT_FIELDS = MAX_REQUIRED_RESULT_FIELDS
+_MAX_REQUIRED_RESULT_FIELD_CHARS = MAX_REQUIRED_RESULT_FIELD_CHARS
+_MAX_REQUIRED_RESULT_SCHEMA_CHARS = MAX_REQUIRED_RESULT_SCHEMA_BYTES
 
 # Absolute memory/prompt-growth guard.  One MiB keeps exact, provider-token-fit
 # prerequisites out of a lossy reducer merely because UTF-8/JSON framing is a
@@ -4978,17 +5014,10 @@ def _strict_result_field_list(
     values, error = _strict_task_string_list(task, "required_result_fields")
     if error:
         return [], error
-    if len(values) > _MAX_REQUIRED_RESULT_FIELDS:
-        return [], (
-            "required_result_fields may declare at most "
-            f"{_MAX_REQUIRED_RESULT_FIELDS} exact fields."
-        )
-    if any(len(value) > _MAX_REQUIRED_RESULT_FIELD_CHARS for value in values):
-        return [], (
-            "Every required_result_fields entry must be at most "
-            f"{_MAX_REQUIRED_RESULT_FIELD_CHARS} characters."
-        )
-    return values, None
+    try:
+        return validate_result_field_names(values), None
+    except ValueError as exc:
+        return [], str(exc)
 
 
 def _strict_retrieval_completeness_policy(
@@ -5015,42 +5044,15 @@ def _strict_result_field_schema(
     """Validate parent-owned per-field JSON schema fragments."""
     raw = task.get("required_result_schema")
     if raw is None:
-        return normalize_result_field_schema(required_fields, None), None
-    if not isinstance(raw, dict):
-        return {}, "required_result_schema must be an object."
-    if set(raw) != set(required_fields):
-        return {}, (
-            "required_result_schema keys must exactly match "
-            "required_result_fields."
-        )
-    if any(not isinstance(value, dict) for value in raw.values()):
-        return {}, (
-            "Every required_result_schema value must be a JSON-schema object."
-        )
+        raw = normalize_result_field_schema(required_fields, None)
     try:
-        encoded = json.dumps(raw, ensure_ascii=False, allow_nan=False)
-    except (TypeError, ValueError, RecursionError):
-        return {}, "required_result_schema must contain only finite JSON values."
-    if len(encoded) > _MAX_REQUIRED_RESULT_SCHEMA_CHARS:
-        return {}, (
-            "required_result_schema exceeds the 16 KiB metadata limit."
+        _fields, validated = validate_projected_result_contract(
+            required_fields,
+            raw,
         )
-    # Use the same bounded schema subset as native registry arguments. A
-    # malformed Skill schema is a compiler/metadata error, never a permissive
-    # hint that the child may reinterpret.
-    from tools.registry import json_schema_shape_error
-
-    for field_name, schema in raw.items():
-        schema_error = json_schema_shape_error(
-            schema,
-            schema_path=f"required_result_schema.{field_name}",
-        )
-        if schema_error is not None:
-            return {}, (
-                f"required_result_schema for {field_name!r} is invalid: "
-                + schema_error
-            )
-    return raw, None
+    except ValueError as exc:
+        return {}, str(exc)
+    return validated, None
 
 
 def _is_process_narration_only(content: str) -> bool:
@@ -5357,7 +5359,10 @@ def _verified_artifact_receipts(
                 emitted_sha256 if isinstance(emitted_sha256, str) else None,
             ))
         elif tool_name in {
-            "run_skill_python", "run_skill_script", "run_declared_command",
+            "run_skill_process",
+            "run_skill_python",
+            "run_skill_script",
+            "run_declared_command",
         }:
             for item in emitted_artifacts:
                 if not isinstance(item, dict):
@@ -8048,6 +8053,7 @@ async def _run_child(
         nonlocal error, terminal_reason, runtime_failure_class
         nonlocal runtime_retryable, runtime_finish_reason
         nonlocal runtime_completion_quality, runtime_unresolved_retrieval
+        nonlocal usage
 
         event_type = str(event.get("event_type") or "")
         if event_type not in {"run.completed", "run.failed", "run.cancelled"}:
@@ -8057,6 +8063,7 @@ async def _run_child(
             if isinstance(event.get("payload"), dict)
             else {}
         )
+        usage = _merge_child_usage(usage, payload.get("usage"))
         observed_finish = str(payload.get("finish_reason") or "").strip()
         observed_terminal = str(
             payload.get("terminal_reason")
@@ -10721,6 +10728,7 @@ async def _run_child(
                     "write_file",
                     "patch_file",
                     "skill_copy_resource",
+                    "run_skill_process",
                     "run_skill_python",
                     "run_skill_script",
                     "run_declared_command",
@@ -10747,11 +10755,7 @@ async def _run_child(
                     if isinstance(read_path, str) and read_path.strip():
                         read_result_paths.add(read_path.strip().lstrip("./"))
         elif event["type"] == "usage":
-            usage = {
-                "input_tokens": int(event.get("input_tokens", 0) or 0),
-                "output_tokens": int(event.get("output_tokens", 0) or 0),
-                "total_tokens": int(event.get("total_tokens", 0) or 0),
-            }
+            usage = _merge_child_usage(usage, event)
         elif event["type"] == "error":
             error = event.get("msg", "Unknown child error")
     finalize_tracked_turn()
@@ -11968,6 +11972,41 @@ async def _run_child(
             retryable=True,
         )
 
+    artifact_manifest_receipts = sorted(
+        (
+            {
+                key: receipt.get(key)
+                for key in (
+                    "path",
+                    "source_tool",
+                    "tool_call_id",
+                    "size_bytes",
+                    "sha256",
+                )
+            }
+            for receipt in artifact_receipts
+            if isinstance(receipt, dict)
+        ),
+        key=lambda item: (
+            str(item.get("path") or ""),
+            str(item.get("source_tool") or ""),
+            str(item.get("tool_call_id") or ""),
+        ),
+    )
+    artifact_manifest = {
+        "schema_version": 1,
+        "receipt_count": len(artifact_manifest_receipts),
+        "receipts": artifact_manifest_receipts,
+    }
+    artifact_manifest["sha256"] = hashlib.sha256(
+        json.dumps(
+            artifact_manifest_receipts,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
     # Commit the delegated body only after every outer audit and the durable
     # results/ receipt have succeeded.  The inner run terminal was provisional
     # and was quarantined by ``runtime_event_sink``; publish exactly one
@@ -12016,6 +12055,7 @@ async def _run_child(
                 "content_sha256": content_sha256,
             },
             "authority_snapshot_sha256": authority_snapshot_sha256,
+            "artifact_manifest": artifact_manifest,
         }
         if terminal_reason:
             completed_payload["terminal_reason"] = terminal_reason
@@ -12061,6 +12101,7 @@ async def _run_child(
                 "reasoning_chars": len(reasoning),
             },
             "authority_snapshot_sha256": authority_snapshot_sha256,
+            "artifact_manifest": artifact_manifest,
         }
         await forward_event(child_event("run.failed", failed_payload))
     return {
@@ -12169,6 +12210,7 @@ async def _run_child(
         "result_field_audit": result_field_audit,
         "output_protocol_audit": output_protocol_audit,
         "artifact_receipts": artifact_receipts,
+        "artifact_manifest": artifact_manifest,
         # Parsed selections are bounded typed audit metadata, not the child
         # body. Preserve them for diagnosing a runtime failure without
         # exposing or persisting the invalid prose payload.
