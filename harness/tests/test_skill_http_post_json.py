@@ -305,8 +305,10 @@ class SkillHttpPostJsonTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_complete_large_post_body_is_losslessly_spilled(self):
         full = json.dumps({
-            "data": {"records": [{"text": "x" * 300}]},
+            # POST and GET must share the same lossless producer ceiling.
+            "data": {"records": [{"text": "x" * 410_000}]},
         }).encode("utf-8")
+        self.assertGreater(len(full), 400_000)
         _FakeSession.response = _FakeResponse(body=full)
         handle = "tool-result:complete-post-body.txt"
         dns_patch, session_patch = self._network_patches()
@@ -340,6 +342,32 @@ class SkillHttpPostJsonTests(unittest.IsolatedAsyncioTestCase):
             "skill_http_post_json_body",
             user_id="post-user",
             session_id="post-session",
+        )
+
+    async def test_post_wire_above_hard_capture_limit_remains_incomplete(self):
+        full = json.dumps({
+            "data": {"records": [{"text": "x" * 300}]},
+        }).encode("utf-8")
+        _FakeSession.response = _FakeResponse(body=full)
+        dns_patch, session_patch = self._network_patches()
+        with (
+            dns_patch,
+            session_patch,
+            patch.object(skill_http, "MAX_RESPONSE_BYTES", 64),
+        ):
+            result = json.loads(await skill_http.skill_http_post_json(
+                "https://api.vendor.test/v1/graphql",
+                {"query": "{ records { id } }"},
+                max_chars=100,
+                context=self.context,
+            ))
+
+        receipt = result["retrieval"]
+        self.assertFalse(receipt["wire_body_complete"])
+        self.assertFalse(result["body_spilled_complete"])
+        self.assertEqual("incomplete", receipt["state"])
+        self.assertEqual(
+            "none_partial_wire", receipt["pagination"]["scan_source"]
         )
 
     async def test_post_complete_wire_scan_builds_exact_limit_repage(self):

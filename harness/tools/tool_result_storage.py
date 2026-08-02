@@ -42,8 +42,12 @@ _TOOL_CAPS: dict[str, int] = {
 
 _DEFAULT_CAP = 50_000
 
-# Maximum file size we will write to disk (safety net)
-_MAX_PERSIST_BYTES = 5 * 1024 * 1024  # 5 MB
+# Maximum complete payload size we will write to disk (safety net).  Producers
+# that promise a lossless readback handle must use this same public ceiling;
+# otherwise an upstream bridge can discard bytes before the spill layer gets a
+# chance to preserve them.
+MAX_LOSSLESS_SPILL_BYTES = 5 * 1024 * 1024  # 5 MiB
+_MAX_PERSIST_BYTES = MAX_LOSSLESS_SPILL_BYTES
 TOOL_RESULT_HANDLE_PREFIX = "tool-result:"
 _TOOL_RESULT_FILENAME_CHARS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-."

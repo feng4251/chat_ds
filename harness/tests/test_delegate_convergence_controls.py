@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import unittest
@@ -10,12 +11,20 @@ from agent_loop import (
     _workspace_debug_record,
     run_stream,
 )
+from knowledge_gate_runtime import (
+    KNOWLEDGE_GATE_DECISION_TOOL_NAME,
+    canonical_json_sha256,
+    validate_knowledge_gate_decisions,
+)
 from retrieval_completeness import build_http_retrieval_receipt
 from tool_call_stream import (
     AssembledStreamToolCall,
     ToolCallStreamAssembly,
 )
 from tools.registry import ToolPreflightResult, registry as native_tool_registry
+from tools.context import ToolContext
+from tools.delegation import _exact_knowledge_gate_candidate_grants
+from tools.isolated_skill_executor import compute_skill_package_digest
 from tools.tool_result_reader import READ_TOOL_RESULT_SCHEMA
 
 
@@ -567,6 +576,133 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(
             event.get("event_type") == "run.failed" for event in events
         ))
+
+    async def test_spill_handle_does_not_reopen_tools_closed_footer_finalizer(self):
+        """A prior opaque handle cannot pierce the terminal phase boundary."""
+
+        url = "https://api.inventory.test/v1/records?q=archival"
+        handle = "tool-result:skill_http_get_body_inventory.txt"
+        full_body = '{"records":[{"note":"' + ("x" * 300) + '"}]}'
+        visible = full_body[:100]
+        receipt = build_http_retrieval_receipt(
+            method="GET",
+            request_url=url,
+            request_body=None,
+            response_body=visible,
+            body_truncated=True,
+            body_spilled_complete=True,
+            wire_body_complete=True,
+            pagination_scan_body=full_body,
+            response_bytes_read=len(full_body.encode("utf-8")),
+            response_byte_limit=400_000,
+            response_chars_read=len(full_body),
+            response_chars_returned=len(visible),
+            response_char_limit=100,
+            response_char_hard_limit=100_000,
+            request_number=1,
+            request_run_hop_limit=16,
+            request_elapsed_ms=5,
+        )
+        responses = [
+            _tool_call_response(
+                "call-inventory-spill",
+                tool_name="skill_http_get",
+                arguments={"url": url, "max_chars": 100},
+            ),
+            _tool_call_response(
+                "call-inventory-readback",
+                tool_name="read_tool_result",
+                arguments={"handle": handle, "pattern": "records"},
+            ),
+            _stop_response(
+                "# Inventory findings\n"
+                "The bounded readback supplied the retained evidence.\n"
+                'RESULT_FIELDS_JSON: {"evidence":'
+            ),
+            _result_fields_submit_response("evidence"),
+        ]
+        dispatch_results = [
+            json.dumps({
+                "status": "success",
+                "request_sent": True,
+                "request_number": 1,
+                "url": url,
+                "body_result_handle": handle,
+                "body": visible,
+                "body_chars": len(visible),
+                "body_truncated": True,
+                "body_spilled_complete": True,
+                "retrieval": receipt,
+            }),
+            json.dumps({
+                "status": "success",
+                "handle": handle,
+                "content": '"records":[{"note":"' + ("x" * 20),
+                "start_offset": 1,
+                "end_offset": 42,
+                "total_chars": len(full_body),
+                "has_more_before": True,
+                "has_more_after": True,
+            }),
+        ]
+        schemas = [*self.http_schema, {
+            "type": "function",
+            "function": READ_TOOL_RESULT_SCHEMA,
+        }]
+
+        def schema_resolver(names):
+            selected = set(names)
+            return [
+                schema
+                for schema in schemas
+                if schema["function"]["name"] in selected
+            ]
+
+        request_bodies, dispatch_mock, events, _persisted = await self._run(
+            responses,
+            max_iterations=4,
+            dispatch_result="",
+            dispatch_results=dispatch_results,
+            tools=["skill_http_get"],
+            schemas=schemas,
+            schema_resolver=schema_resolver,
+            required_result_fields=["evidence"],
+            required_capability_tools=["skill_http_get"],
+            allowed_skill_http_prefixes=[(
+                "inventory-api", "https://api.inventory.test/v1/records"
+            )],
+        )
+
+        self.assertFalse(responses)
+        self.assertEqual(2, dispatch_mock.await_count)
+        self.assertEqual(4, len(request_bodies))
+        self.assertIn("read_tool_result", {
+            item["function"]["name"]
+            for item in request_bodies[1]["tools"]
+        })
+        self.assertNotIn("tools", request_bodies[2])
+        self.assertEqual(
+            "submit_result_fields",
+            request_bodies[3]["tools"][0]["function"]["name"],
+        )
+        requested = next(
+            event for event in events
+            if event.get("event_type")
+            == "debug.delegate.result_footer_repair.requested"
+        )
+        self.assertEqual("ordinary_stop", requested["payload"]["origin"])
+        self.assertFalse(any(
+            event.get("event_type")
+            == "debug.delegate.result_footer_repair.unavailable"
+            for event in events
+        ))
+        completed = next(
+            event for event in events
+            if event.get("event_type")
+            == "debug.delegate.result_footer_repair.completed"
+        )
+        self.assertTrue(completed["payload"]["footer_valid"])
+        self.assertEqual(events[-1], {"type": "done", "finish_reason": "stop"})
 
     async def test_repage_action_is_injected_into_exact_http_followup_turn(self):
         root = "https://api.vendor.test/search?q=evidence&pageSize=50"
@@ -1339,6 +1475,198 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.assertEqual(events[-1], {"type": "done", "finish_reason": "stop"})
 
+    async def test_terminal_retrieval_waits_for_pending_exact_sibling(self):
+        """A failed evidence family must not close an independent DAG node."""
+
+        url = "https://api.inventory.test/v1/catalog?q=archival"
+        prefix = "https://api.inventory.test/v1/catalog"
+        skill_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(skill_temp.cleanup)
+        skill_root = Path(skill_temp.name)
+        skill_md = skill_root / "SKILL.md"
+        skill_md.write_text(
+            "# Inventory Audit\n\nUse the exact declared catalog endpoint.\n",
+            encoding="utf-8",
+        )
+        skill_md_sha256 = hashlib.sha256(skill_md.read_bytes()).hexdigest()
+        package_sha256 = compute_skill_package_digest(skill_root)
+        resolve_patch = patch(
+            "skills.scanner.resolve_skill_path",
+            return_value=skill_md,
+        )
+        resolve_patch.start()
+        self.addCleanup(resolve_patch.stop)
+        plan = {
+            "schema_version": 1,
+            "worker_id": "inventory-auditor",
+            "owner_skill": "inventory-audit",
+            "checks": [{
+                "id": "KG-INVENTORY",
+                "question": "Are both independent catalog receipts required?",
+                "branches": [{
+                    "outcome": "yes",
+                    "action": "Retrieve one receipt for each independent node.",
+                    "group_ids": ["catalog-a", "catalog-b"],
+                }],
+                "legacy_ambiguous": False,
+            }],
+            "groups": [
+                {
+                    "id": group_id,
+                    "check_id": "KG-INVENTORY",
+                    "outcome": "yes",
+                    "mode": "one_of",
+                    "candidate_ids": ["candidate-http"],
+                    "selectors": ["skill_http_get"],
+                    "unresolved_selectors": [],
+                }
+                for group_id in ("catalog-a", "catalog-b")
+            ],
+            "candidates": [{
+                "candidate_id": "candidate-http",
+                "kind": "skill_http_prefix",
+                "tool_name": "skill_http_get",
+                "tool_names": ["skill_http_get"],
+                "skill_name": "inventory-audit",
+                "skill_md_sha256": skill_md_sha256,
+                "package_sha256": package_sha256,
+                "url_prefix": prefix,
+                "http_method": "GET",
+            }],
+        }
+        digest = canonical_json_sha256(plan)
+        accepted = validate_knowledge_gate_decisions(
+            plan,
+            expected_sha256=digest,
+            supplied_sha256=digest,
+            decisions=[{
+                "check_id": "KG-INVENTORY",
+                "outcome": "yes",
+                "reason": "Both independent inventory receipts are required.",
+            }],
+        )
+        authority, authority_error = _exact_knowledge_gate_candidate_grants(
+            plan,
+            context=ToolContext(
+                user_id="u-delegate-convergence",
+                session_id="s-delegate-convergence",
+                enabled_tools=(
+                    KNOWLEDGE_GATE_DECISION_TOOL_NAME,
+                    "skill_http_get",
+                ),
+                skill_execution_resource_boundary=True,
+                allowed_skill_resources=((
+                    "inventory-audit", "SKILL.md"
+                ),),
+                allowed_skill_package_digests=((
+                    "inventory-audit", package_sha256
+                ),),
+                allowed_skill_http_prefixes=((
+                    "inventory-audit", prefix
+                ),),
+            ),
+        )
+        self.assertIsNone(authority_error)
+
+        decision_arguments = {
+            "plan_sha256": digest,
+            "decisions": [{
+                "check_id": "KG-INVENTORY",
+                "outcome": "yes",
+                "reason": "Both independent inventory receipts are required.",
+            }],
+        }
+        responses = [
+            _tool_call_response(
+                "call-inventory-decision",
+                tool_name=KNOWLEDGE_GATE_DECISION_TOOL_NAME,
+                arguments=decision_arguments,
+            ),
+            _tool_call_response(
+                "call-inventory-a",
+                tool_name="skill_http_get",
+                arguments={"url": url},
+            ),
+            _tool_call_response(
+                "call-inventory-b",
+                tool_name="skill_http_get",
+                arguments={"url": url},
+            ),
+            _stop_response(
+                "Status: WARN/degraded; both exact nodes ran, while the "
+                "pagination gap remains explicit.\n"
+                + _result_fields_footer("catalog_evidence", degraded=True)
+            ),
+        ]
+        dispatch_results = [
+            json.dumps(accepted),
+            _http_success_result(
+                url,
+                '{"items":[1],"nextPageToken":"NEXT"}',
+                request_number=1,
+            ),
+            _http_success_result(
+                url,
+                '{"items":[2]}',
+                request_number=2,
+            ),
+        ]
+
+        with patch(
+            "agent_loop.settings.delegated_retrieval_max_pages_per_chain",
+            1,
+        ):
+            request_bodies, dispatch_mock, events, _persisted = await self._run(
+                responses,
+                max_iterations=6,
+                dispatch_result="",
+                dispatch_results=dispatch_results,
+                tools=["skill_http_get"],
+                schemas=self.http_schema,
+                required_result_fields=["catalog_evidence"],
+                allowed_skill_http_prefixes=[(
+                    "inventory-audit", prefix
+                )],
+                allowed_skill_resources=[(
+                    "inventory-audit", "SKILL.md"
+                )],
+                allowed_skill_package_digests=[(
+                    "inventory-audit", package_sha256
+                )],
+                knowledge_gate_plan=plan,
+                knowledge_gate_plan_sha256=digest,
+                knowledge_gate_candidate_authority=authority,
+            )
+
+        self.assertFalse(responses)
+        self.assertEqual(3, dispatch_mock.await_count)
+        self.assertEqual(
+            [
+                KNOWLEDGE_GATE_DECISION_TOOL_NAME,
+                "skill_http_get",
+                "skill_http_get",
+            ],
+            [call.args[0] for call in dispatch_mock.await_args_list],
+        )
+        self.assertEqual(4, len(request_bodies))
+        self.assertEqual(
+            ["skill_http_get"],
+            [
+                item["function"]["name"]
+                for item in request_bodies[2]["tools"]
+            ],
+        )
+        self.assertNotIn("tools", request_bodies[3])
+        self.assertEqual(1, len([
+            event for event in events
+            if event.get("event_type")
+            == "debug.http_retrieval.degraded_synthesis_deferred"
+        ]))
+        self.assertFalse(any(
+            event.get("event_type") == "run.failed" for event in events
+        ))
+        self.assertEqual(events[-1], {"type": "done", "finish_reason": "stop"})
+
     async def _run(
         self,
         responses,
@@ -1352,11 +1680,16 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
         retrieval_completeness_policy=None,
         required_capability_tools=None,
         allowed_skill_scripts=None,
+        allowed_skill_resources=None,
+        allowed_skill_package_digests=None,
         allowed_skill_http_prefixes=None,
         dispatch_results=None,
         turn_boundary_events=None,
         user_content=None,
         schema_resolver=None,
+        knowledge_gate_plan=None,
+        knowledge_gate_plan_sha256=None,
+        knowledge_gate_candidate_authority=None,
     ):
         request_bodies = []
         tools = list(tools or ["web_search"])
@@ -1452,7 +1785,11 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
                             retrieval_completeness_policy
                         ),
                         required_capability_tools=required_capability_tools,
+                        allowed_skill_resources=allowed_skill_resources,
                         allowed_skill_scripts=allowed_skill_scripts,
+                        allowed_skill_package_digests=(
+                            allowed_skill_package_digests
+                        ),
                         allowed_skill_http_prefixes=(
                             allowed_skill_http_prefixes
                         ),
@@ -1460,6 +1797,13 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
                             turn_boundary_events.append
                             if turn_boundary_events is not None
                             else None
+                        ),
+                        knowledge_gate_plan=knowledge_gate_plan,
+                        knowledge_gate_plan_sha256=(
+                            knowledge_gate_plan_sha256
+                        ),
+                        knowledge_gate_candidate_authority=(
+                            knowledge_gate_candidate_authority
                         ),
                     )
                 ]
@@ -3459,7 +3803,11 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(unavailable), 1)
         self.assertEqual(
             unavailable[0]["payload"]["reason"],
-            "repair_already_attempted_or_incompatible_state",
+            "incompatible_current_phase",
+        )
+        self.assertEqual(
+            unavailable[0]["payload"]["incompatible_reasons"],
+            ["reasoning_only_recovery_active"],
         )
         self.assertEqual(events[-1], {"type": "done", "finish_reason": "stop"})
 
