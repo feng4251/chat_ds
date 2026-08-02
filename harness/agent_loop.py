@@ -44,11 +44,16 @@ from context.token_estimator import (
 )
 from delegated_result_contract import (
     RESULT_FIELDS_JSON_PREFIX,
+    adaptive_result_contract_output_tokens,
     audit_raw_tool_protocol,
     audit_result_fields,
     canonical_result_fields_footer_from_internal_submitter_json,
     extract_canonical_result_fields_footer,
+    is_formal_object_result_schema,
+    project_object_result_contract,
     strip_result_fields_candidate_tail,
+    validate_projected_result_contract,
+    validate_result_field_names,
 )
 from error_classifier import FailoverReason, classify_api_error
 from failure_taxonomy import (
@@ -126,6 +131,7 @@ from workflow_ir import (
     canonicalize_skill_markdown,
     validate_workflow_ir,
     verify_instruction_execution_coverage,
+    workflow_plan_json_schema,
 )
 from retry_utils import jittered_backoff
 from skills.route_safety import (
@@ -304,9 +310,11 @@ _DELEGATE_RETRIEVAL_MAX_NO_CALL_TURNS = 2
 # entire report-sized completion before its tool envelope.  Artifact writers,
 # code generators, and unknown native adapters are deliberately excluded.
 _DELEGATE_BOUNDED_CAPABILITY_CALL_MAX_TOKENS = 2_048
-_DELEGATE_RESULT_FOOTER_REPAIR_MAX_TOKENS = 8_192
 _DELEGATE_RESULT_FOOTER_REPAIR_SOURCE_CHARS = 48 * 1024
 _DELEGATE_RESULT_FOOTER_SUBMIT_TOOL_NAME = "submit_result_fields"
+_CAPABILITY_PLAN_SEMANTIC_VALIDATION_MAX_ATTEMPTS = 3
+_MEDIUM_WORKFLOW_PLAN_OUTPUT_TOKENS = 16_384
+_LARGE_WORKFLOW_PLAN_OUTPUT_TOKENS = 32_768
 _DELEGATE_BOUNDED_ARGUMENT_TOOLS = frozenset({
     "web_search",
     "web_extract",
@@ -318,8 +326,10 @@ _DELEGATE_BOUNDED_ARGUMENT_TOOLS = frozenset({
 })
 # Primary control phases use a separate, deliberately narrower allowlist.
 # Unknown/MCP tools and tools carrying content, code, patches, JSON request
-# bodies, command argv, or capability-plan prose retain the caller's normal
-# output allowance.  Keeping this list positive (rather than trying to
+# bodies or command argv retain the caller's normal output allowance. The
+# capability planner is included only because its provider-facing schema is
+# dynamically narrowed to the compact semantic range manifest. Keeping this
+# list positive (rather than trying to
 # enumerate every large tool) means a newly registered capability cannot be
 # accidentally truncated by the 8K control-phase cap.
 _PRIMARY_BOUNDED_ARGUMENT_TOOLS = frozenset({
@@ -332,6 +342,7 @@ _PRIMARY_BOUNDED_ARGUMENT_TOOLS = frozenset({
     "web_extract",
     "skill_http_get",
     "select_session_skill",
+    CAPABILITY_PLAN_TOOL_NAME,
 })
 _VOLATILE_TOOL_RESULT_FIELDS = frozenset({
     "request_id", "duration", "duration_ms", "duration_seconds",
@@ -2808,6 +2819,150 @@ async def _append_workspace_debug_event_async(
     )
 
 
+def _model_facing_capability_plan_schemas(
+    schemas: Iterable[dict[str, Any]],
+    catalog: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Replace legacy full-IR input with the compact run-scoped plan schema."""
+
+    copied = [copy.deepcopy(schema) for schema in schemas]
+    if not (
+        isinstance(catalog, dict)
+        and isinstance(catalog.get("instruction_plan_catalog"), dict)
+    ):
+        return copied
+    for candidate in copied:
+        function = (
+            candidate.get("function")
+            if isinstance(candidate, dict)
+            else None
+        )
+        if not (
+            isinstance(function, dict)
+            and function.get("name") == CAPABILITY_PLAN_TOOL_NAME
+        ):
+            continue
+        parameters = function.get("parameters")
+        properties = (
+            parameters.get("properties")
+            if isinstance(parameters, dict)
+            else None
+        )
+        if not isinstance(properties, dict):
+            continue
+        properties.pop("workflow_ir", None)
+        properties["workflow_plan"] = workflow_plan_json_schema()
+        required_fields = list(parameters.get("required") or [])
+        if catalog.get("workflow_ir_required") is True:
+            if "workflow_plan" not in required_fields:
+                required_fields.append("workflow_plan")
+        else:
+            required_fields = [
+                field for field in required_fields if field != "workflow_plan"
+            ]
+        parameters["required"] = required_fields
+    return copied
+
+
+def _semantic_control_call_accepted(
+    tool_name: str,
+    result_data: dict[str, Any] | None,
+) -> bool:
+    """Only an accepted planning control call advances its exact frontier."""
+
+    if tool_name != CAPABILITY_PLAN_TOOL_NAME:
+        return True
+    return bool(
+        isinstance(result_data, dict)
+        and result_data.get("status") == "accepted"
+    )
+
+
+def _adaptive_capability_plan_output_tokens(
+    catalog: dict[str, Any] | None,
+) -> int:
+    """Bound compact planning by declared instruction cardinality.
+
+    This is a control-plane structural budget, not a domain heuristic.  The
+    compiler accepts at most 128 KiB of compact plan JSON, so three output
+    tiers are sufficient while keeping small Skills on the ordinary 8K cap.
+    """
+
+    planning_catalog = (
+        catalog.get("instruction_plan_catalog")
+        if isinstance(catalog, dict)
+        else None
+    )
+    counts = (
+        planning_catalog.get("counts")
+        if isinstance(planning_catalog, dict)
+        else None
+    )
+    try:
+        instruction_units = int(
+            counts.get("instruction_units")
+            if isinstance(counts, dict)
+            else 0
+        )
+    except (TypeError, ValueError, OverflowError):
+        instruction_units = 0
+    if instruction_units > 384:
+        return _LARGE_WORKFLOW_PLAN_OUTPUT_TOKENS
+    if instruction_units > 96:
+        return _MEDIUM_WORKFLOW_PLAN_OUTPUT_TOKENS
+    return _PRIMARY_MANDATORY_FRONTIER_MAX_TOKENS
+
+
+def _capability_plan_history_projection(
+    result_data: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the bounded model-visible receipt for an accepted plan.
+
+    The complete Workflow IR and lowered worker plan are runtime state.  They
+    must not be echoed into model history after the model has already supplied
+    the compact semantic plan.  Stable identities/counts are sufficient for
+    conversational acknowledgement; exact execution uses the in-memory
+    accepted payload and durable machine receipts.
+    """
+
+    if result_data.get("status") != "accepted":
+        return dict(result_data)
+    workflow_ir = (
+        result_data.get("workflow_ir")
+        if isinstance(result_data.get("workflow_ir"), dict)
+        else {}
+    )
+    worker_plan = (
+        result_data.get("worker_plan")
+        if isinstance(result_data.get("worker_plan"), dict)
+        else {}
+    )
+    return {
+        "status": "accepted",
+        "schema_version": result_data.get("schema_version"),
+        "skill_name": result_data.get("skill_name"),
+        "body_sha256": result_data.get("body_sha256"),
+        "catalog_sha256": result_data.get("catalog_sha256"),
+        "catalog_revision": result_data.get("catalog_revision", 0),
+        "required_selection_count": len(result_data.get("required") or []),
+        "optional_selection_count": len(result_data.get("optional") or []),
+        "unsupported_count": len(result_data.get("unsupported") or []),
+        "selected_tools": list(result_data.get("selected_tools") or []),
+        "workflow_ir_required": bool(
+            result_data.get("workflow_ir_required")
+        ),
+        "workflow_ir_sha256": workflow_ir.get("ir_sha256"),
+        "workflow_node_count": len(workflow_ir.get("nodes") or []),
+        "workflow_output_count": len(workflow_ir.get("outputs") or []),
+        "worker_count": len(worker_plan.get("required_workers") or []),
+        "aggregation_step_count": len(
+            worker_plan.get("aggregation_steps") or []
+        ),
+        "runtime_owned_workflow": True,
+        "diagnostic": result_data.get("diagnostic"),
+    }
+
+
 def _tool_debug_result(raw: str) -> dict[str, Any]:
     parsed = _json_object(raw)
     payload: dict[str, Any] = {"raw_chars": len(raw or "")}
@@ -2846,6 +3001,21 @@ def _tool_debug_result(raw: str) -> dict[str, Any]:
         ):
             value = parsed.get(key)
             if value is not None:
+                payload[key] = value
+        for key in (
+            "workflow_ir_error_code",
+            "workflow_plan_error_code",
+            "workflow_ir_node_id",
+        ):
+            value = parsed.get(key)
+            if (
+                isinstance(value, str)
+                and re.fullmatch(r"[A-Za-z0-9_.:@/-]{1,256}", value)
+            ):
+                payload[key] = value
+        for key in ("workflow_ir_error_path", "workflow_plan_error_path"):
+            value = parsed.get(key)
+            if isinstance(value, str) and 0 < len(value) <= 512:
                 payload[key] = value
         matched_skill = parsed.get("matched_skill")
         if (
@@ -7308,9 +7478,38 @@ class HarnessRunState:
     def unviewed_session_skills(self) -> set[str]:
         return self.session_skill_names - self.viewed_skill_names
 
+    def pending_standard_capability_plan_skills(self) -> list[str]:
+        """Return active standard Skills whose typed plan is not installed.
+
+        A compiled catalog is planning authority, not execution authority.  It
+        remains a mandatory frontier until the matching accepted plan has
+        passed runtime installation.  Keeping this state query on the run
+        object lets normal stops, length/budget terminals, and artifact
+        verification share one phase boundary.
+        """
+
+        return sorted(
+            skill_name
+            for skill_name in self.session_skill_names
+            if isinstance(
+                self.skill_capability_catalogs.get(skill_name),
+                dict,
+            )
+            and _standard_capability_catalog_requires_plan(
+                self.skill_capability_catalogs[skill_name]
+            )
+            and skill_name not in self.skill_capability_plans
+        )
+
     def needs_more_skill_workflow(self) -> tuple[bool, str]:
         if not self.skill_workflow_is_active():
             return False, ""
+        pending_plan_skills = self.pending_standard_capability_plan_skills()
+        if pending_plan_skills:
+            return True, (
+                "submit and install the typed capability plan for session "
+                "skill(s): " + ", ".join(pending_plan_skills)
+            )
         for skill_name in sorted(self.viewed_skill_names & self.session_skill_names):
             if (skill_name, "skill.md") in self.skill_resource_next_offsets:
                 return True, (
@@ -8980,19 +9179,14 @@ def _declared_result_field_names(value: Any) -> list[str]:
     must not become executable delegate metadata.
     """
     fields: list[str] = []
-    if (
-        isinstance(value, dict)
-        and isinstance(value.get("properties"), dict)
-    ):
-        # This is a formal object-schema shape. JSON Schema makes every
-        # property optional unless its exact name appears in ``required``;
-        # absence of that keyword must therefore produce no required terminal
-        # ledger fields. Required names need not also appear in ``properties``
-        # (``additionalProperties`` can constrain them), so retain them here
-        # and let the schema compiler validate the complete declaration.
-        required = value.get("required")
-        candidates = required if isinstance(required, list) else []
-    elif isinstance(value, dict):
+    formal_object_schema = is_formal_object_result_schema(value)
+    if formal_object_schema:
+        fields, _projected = project_object_result_contract(
+            value,
+            schema_path="declared_result_schema",
+        )
+        return fields
+    if isinstance(value, dict):
         candidates = list(value)
     elif isinstance(value, (list, tuple)):
         candidates = value
@@ -9009,10 +9203,10 @@ def _declared_result_field_names(value: Any) -> list[str]:
             )
         if not isinstance(candidate, str):
             continue
-        field_name = candidate.strip()
+        field_name = candidate
         if field_name and field_name not in fields:
             fields.append(field_name)
-    return fields
+    return validate_result_field_names(fields)
 
 
 def _declared_result_field_schema(value: Any) -> dict[str, dict[str, Any]]:
@@ -9056,66 +9250,14 @@ def _declared_result_field_schema(value: Any) -> dict[str, dict[str, Any]]:
         "example",
         "label",
     }
-    formal_object_schema = (
-        isinstance(value, dict)
-        and isinstance(value.get("properties"), dict)
-    )
+    formal_object_schema = is_formal_object_result_schema(value)
     if formal_object_schema:
-        root_error = json_schema_shape_error(
+        _fields, projected = project_object_result_contract(
             value,
             schema_path="declared_result_schema",
-            reject_unsupported_keywords=True,
         )
-        if root_error is not None:
-            raise ValueError(root_error)
-
-        # The delegated ledger is always one exact JSON object. Root-level
-        # composition/value constraints cannot be projected into independent
-        # field fragments without changing their semantics, so fail explicitly
-        # instead of silently dropping them.
-        annotation_keywords = JSON_SCHEMA_LOSSLESS_KEYWORDS - schema_shaping_keys
-        projectable_root_keywords = {
-            "type",
-            "properties",
-            "required",
-            "additionalProperties",
-            *annotation_keywords,
-        }
-        unprojectable = sorted(set(value) - projectable_root_keywords)
-        if unprojectable:
-            raise ValueError(
-                "declared_result_schema."
-                + unprojectable[0]
-                + " cannot be losslessly projected into per-field result metadata"
-            )
-        declared_root_type = value.get("type")
-        if not fields and declared_root_type is None:
-            # A properties-only JSON Schema with no ``required`` keyword has a
-            # valid empty-object instance. No typed ledger is necessary, and
-            # optional properties must not manufacture one.
-            return {}
-        if declared_root_type != "object":
-            raise ValueError(
-                "declared_result_schema.type must be exactly 'object' when "
-                "properties are used for a delegated result contract"
-            )
-
-        properties = value["properties"]
-        additional = value.get("additionalProperties", True)
-        for field_name in fields:
-            if field_name in properties:
-                raw_by_field[field_name] = properties[field_name]
-            elif isinstance(additional, dict):
-                raw_by_field[field_name] = additional
-            elif additional is False:
-                raise ValueError(
-                    "declared_result_schema.required names property "
-                    f"{field_name!r}, but additionalProperties is false and "
-                    "no property schema is declared"
-                )
-            else:
-                raw_by_field[field_name] = None
-    elif isinstance(value, dict):
+        return projected
+    if isinstance(value, dict):
         raw_by_field = value
     elif isinstance(value, (list, tuple)):
         for item in value:
@@ -9348,24 +9490,13 @@ def _declared_result_field_schema(value: Any) -> dict[str, dict[str, Any]]:
         raise ValueError(
             "declared result schema keys do not match its required field names"
         )
-    try:
-        encoded = json.dumps(
-            schemas,
-            ensure_ascii=False,
-            allow_nan=False,
-        )
-    except (TypeError, ValueError, RecursionError) as exc:
-        raise ValueError(
-            "declared result schema must contain only finite, acyclic JSON values"
-        ) from exc
-    if len(encoded) > 16 * 1024:
-        raise ValueError(
-            "declared result schema exceeds the 16 KiB delegation metadata limit"
-        )
-    # Detach the returned metadata from loader-owned mutable structures while
-    # preserving every accepted key and value exactly. This round-trip occurs
-    # only after bounded registry validation and the 16 KiB transport guard.
-    return json.loads(encoded)
+    _validated_fields, validated_schema = validate_projected_result_contract(
+        fields,
+        schemas,
+        field_path="declared_result_fields",
+        schema_path="declared_result_schema",
+    )
+    return validated_schema
 
 
 def _delegated_child_iteration_limit(
@@ -10815,6 +10946,11 @@ def _declared_worker_dependencies(
             str(item) for item in (worker.get("dependencies") or [])
             if str(item).strip()
         )
+    if plan.get("selection") == "workflow_ir":
+        # Wave dependencies are scheduler barriers.  Workflow IR preserves
+        # the exact data edges on each worker, so expanding a predecessor wave
+        # would leak unrelated parallel siblings into the child context.
+        return _dedupe_paths(dependencies)
     dependency_stages = {
         str(item) for item in (wave.get("dependencies") or [])
         if str(item).strip()
@@ -10880,6 +11016,36 @@ def _prerequisite_result_paths(
         "aggregation", "aggregate", "validation",
         "artifact_synthesis", "artifact-synthesis", "synthesis",
     }:
+        if plan.get("selection") == "workflow_ir":
+            declared_step = next(
+                (
+                    step for step in (plan.get("aggregation_steps") or [])
+                    if isinstance(step, dict)
+                    and str(step.get("id") or "") == str(step_id or "")
+                ),
+                {},
+            )
+            worker_results = run_state.skill_worker_results.get(skill_name) or {}
+            paths.extend(
+                str((worker_results.get(dependency_id) or {}).get("result_path"))
+                for dependency_id in (declared_step.get("input_worker_ids") or [])
+                if (worker_results.get(dependency_id) or {}).get("status")
+                == "completed"
+                and (worker_results.get(dependency_id) or {}).get("result_path")
+            )
+            aggregation_results = (
+                run_state.skill_aggregation_results.get(skill_name) or {}
+            )
+            paths.extend(
+                str((aggregation_results.get(dependency_id) or {}).get("result_path"))
+                for dependency_id in _aggregation_step_dependencies(declared_step)
+                if (aggregation_results.get(dependency_id) or {}).get("status")
+                == "completed"
+                and (aggregation_results.get(dependency_id) or {}).get(
+                    "result_path"
+                )
+            )
+            return _dedupe_paths(paths)
         paths.extend(
             str(result.get("result_path"))
             for result in (run_state.skill_worker_results.get(skill_name) or {}).values()
@@ -13634,6 +13800,7 @@ async def run_stream(
     pending_delegate_result_footer_repair = False
     pending_delegate_result_footer_repair_origin: str | None = None
     pending_delegate_result_footer_repair_context: dict[str, Any] | None = None
+    capability_plan_semantic_validation_attempts = 0
     # A delegated terminal draft can be structurally non-executable even when
     # its evidence tools already ran successfully (for example, a provider
     # serializes a raw <tool_call> into visible text, or the one-shot
@@ -14683,10 +14850,10 @@ async def run_stream(
                         bootstrap_tools,
                     )
                 )
-                required_result_fields = _declared_result_field_names(
-                    source.get("extract_fields")
-                )
                 try:
+                    required_result_fields = _declared_result_field_names(
+                        source.get("extract_fields")
+                    )
                     required_result_schema = _declared_result_field_schema(
                         source.get("extract_fields")
                     )
@@ -15306,10 +15473,10 @@ async def run_stream(
                     workflow_ir_exact_bindings = (
                         plan.get("selection") == "workflow_ir"
                     )
-                    required_result_fields = _declared_result_field_names(
-                        meta.get("output_schema")
-                    )
                     try:
+                        required_result_fields = _declared_result_field_names(
+                            meta.get("output_schema")
+                        )
                         required_result_schema = _declared_result_field_schema(
                             meta.get("output_schema")
                         )
@@ -15692,10 +15859,10 @@ async def run_stream(
                 workflow_ir_exact_bindings = (
                     plan.get("selection") == "workflow_ir"
                 )
-                required_result_fields = _declared_result_field_names(
-                    step.get("output_schema")
-                )
                 try:
+                    required_result_fields = _declared_result_field_names(
+                        step.get("output_schema")
+                    )
                     required_result_schema = _declared_result_field_schema(
                         step.get("output_schema")
                     )
@@ -19206,6 +19373,42 @@ async def run_stream(
                     "page has been read with its exact next_offset."
                 )
 
+            if not _standard_capability_catalog_requires_plan(catalog):
+                # Complete disclosure produced no executable candidate and no
+                # declared delegated workflow.  Close the tool boundary and
+                # let the model follow the authoritative prose directly; an
+                # empty planning call would grant nothing and only introduces
+                # another provider protocol failure point.
+                tools = []
+                tool_context = replace(
+                    tool_context,
+                    enabled_tools=(),
+                    skill_execution_resource_boundary=True,
+                    allowed_skill_resources=planning_resources,
+                    selected_skill_browse_roots=(standard_name,),
+                    allowed_skill_scripts=(),
+                    process_only_skill_scripts=(),
+                    allowed_skill_script_authorities=(),
+                    allowed_skill_package_digests=(),
+                    allowed_skill_commands=(),
+                    allowed_skill_http_prefixes=(),
+                    allowed_skill_http_post_prefixes=(),
+                    allowed_skill_sandbox_egress_prefixes=(),
+                    allowed_skill_sandbox_egress_rules=(),
+                    allowed_browser_egress_rules=allowed_browser_egress_rules,
+                    skill_capability_catalog=catalog,
+                )
+                run_state.available_tools = set()
+                direct_required_tool_groups = []
+                direct_missing_requirements = []
+                forced_workflow_policy = None
+                return (
+                    "[Harness standard Skill direct-instruction boundary] "
+                    "The complete canonical SKILL.md declares no executable "
+                    "capability or delegated workflow. Follow its disclosed "
+                    "instructions directly; no execution tool is authorized."
+                )
+
             if CAPABILITY_PLAN_TOOL_NAME not in compiler_tools:
                 tools = [name for name in ("skill_view",) if name in compiler_tools]
                 tool_context = replace(
@@ -19517,8 +19720,14 @@ async def run_stream(
 
     def install_accepted_standard_capability_plan(
         result_data: dict[str, Any] | None,
-    ) -> str | None:
-        """Atomically install one handler-validated standard-Skill plan."""
+    ) -> tuple[str | None, dict[str, str] | None]:
+        """Atomically install one handler-validated standard-Skill plan.
+
+        The handler receipt and runtime installation are separate validation
+        boundaries.  Return a stable typed finding whenever the latter does
+        not commit so the caller can apply the same bounded validation retry
+        controller without inferring state from human-readable guidance.
+        """
 
         nonlocal tools, tool_context, direct_required_tool_groups
         nonlocal direct_missing_requirements, direct_mcp_exact_names
@@ -19533,11 +19742,49 @@ async def run_stream(
             not isinstance(result_data, dict)
             or result_data.get("status") != "accepted"
         ):
-            return None
+            return None, {
+                "error_code": "capability_plan_install_payload_invalid",
+                "workflow_error_code": "",
+                "workflow_error_path": "$",
+            }
         skill_name = str(result_data.get("skill_name") or "")
         catalog = run_state.skill_capability_catalogs.get(skill_name)
         if not isinstance(catalog, dict):
-            return None
+            return None, {
+                "error_code": "capability_plan_install_catalog_unavailable",
+                "workflow_error_code": "",
+                "workflow_error_path": "$.skill_name",
+            }
+        # The handler performs this same live-file check before returning its
+        # typed acceptance.  Repeat it immediately before installation: the
+        # handler result crosses observable/event boundaries, so package files
+        # may have changed in between.  No await occurs after this check and
+        # before the runtime-owned catalog is validated and committed below.
+        from tools.skill_capability_plan import (
+            revalidate_capability_plan_live_authority,
+        )
+
+        live_authority_failure = revalidate_capability_plan_live_authority(
+            skill_name,
+            catalog,
+            tool_context,
+        )
+        if live_authority_failure is not None:
+            return (
+                "[Harness capability plan rejected after dispatch] "
+                + str(
+                    live_authority_failure.get("error")
+                    or "live Skill authority changed before installation"
+                ),
+                {
+                    "error_code": str(
+                        live_authority_failure.get("error_code")
+                        or "capability_plan_install_authority_changed"
+                    )[:256],
+                    "workflow_error_code": "",
+                    "workflow_error_path": "$.catalog_authority",
+                },
+            )
         # Defense in depth: derive the effective closure again from the
         # runtime-owned catalog rather than trusting serialized handler fields.
         validated = validate_capability_plan(
@@ -19553,7 +19800,23 @@ async def run_stream(
         if not validated.valid:
             return (
                 "[Harness capability plan rejected after dispatch] "
-                + str(validated.payload.get("error") or "invalid plan")
+                + str(validated.payload.get("error") or "invalid plan"),
+                {
+                    "error_code": str(
+                        validated.payload.get("error_code")
+                        or "capability_plan_install_revalidation_failed"
+                    )[:256],
+                    "workflow_error_code": str(
+                        validated.payload.get("workflow_plan_error_code")
+                        or validated.payload.get("workflow_ir_error_code")
+                        or ""
+                    )[:256],
+                    "workflow_error_path": str(
+                        validated.payload.get("workflow_plan_error_path")
+                        or validated.payload.get("workflow_ir_error_path")
+                        or "$"
+                    )[:512],
+                },
             )
         plan = validated.payload
         runtime_preflight = _preflight_standard_skill_runtime_selection(
@@ -19579,7 +19842,12 @@ async def run_stream(
                 + json.dumps(
                     runtime_preflight.get("blockers") or [],
                     ensure_ascii=False,
-                )
+                ),
+                {
+                    "error_code": "capability_plan_runtime_preflight_failed",
+                    "workflow_error_code": "",
+                    "workflow_error_path": "$.required",
+                },
             )
         plan["runtime_preflight"] = runtime_preflight
         previous_receipts = dict(standard_required_candidate_receipts)
@@ -19709,10 +19977,9 @@ async def run_stream(
         except SessionSandboxPolicyError:
             selected_browser_egress_rules = ()
 
-        tools = selected_tools
-        tool_context = replace(
+        candidate_tool_context = replace(
             tool_context,
-            enabled_tools=tuple(tools),
+            enabled_tools=tuple(selected_tools),
             skill_execution_resource_boundary=True,
             allowed_skill_resources=allowed_resources,
             selected_skill_browse_roots=(skill_name,),
@@ -19742,80 +20009,89 @@ async def run_stream(
             # replacement list with a recomputed hash.
             skill_capability_catalog=catalog,
         )
-        run_state.available_tools = set(tools)
-        run_state.skill_capability_plans[skill_name] = plan
         workflow_plan = plan.get("worker_plan")
         workflow_ir_payload = plan.get("workflow_ir")
-        if (
-            isinstance(workflow_plan, dict)
-            and workflow_plan.get("selection") == "workflow_ir"
-            and isinstance(workflow_ir_payload, dict)
-        ):
-            existing_contract = copy.deepcopy(
-                run_state.skill_workflow_contracts.get(skill_name) or {}
-            )
-            (
-                workflow_output_contract,
-                workflow_artifact_required,
-            ) = _workflow_ir_artifact_output_contract(existing_contract)
-            installed_workflow_plan = copy.deepcopy(workflow_plan)
-            installed_workflow_plan["output_contract"] = copy.deepcopy(
-                workflow_output_contract
-            )
-            installed_workflow_plan["requires_artifact_output"] = (
-                workflow_artifact_required
-            )
-            installed_workflow_plan["requires_full_output"] = bool(
-                workflow_artifact_required
-                and existing_contract.get("requires_merge") is True
-            )
-            run_state.skill_execution_plans[skill_name] = (
-                installed_workflow_plan
-            )
-            run_state.skill_workflow_contracts[skill_name] = {
-                **existing_contract,
-                "schema_version": "workflow-ir-runtime-v1",
-                "source": "workflow_ir",
-                "workflow_ir_sha256": workflow_ir_payload.get("ir_sha256"),
-                "requires_worker_outputs": True,
-                "output_contract": copy.deepcopy(workflow_output_contract),
-                "requires_modular_artifacts": workflow_artifact_required,
-                "execution_contract": {
-                    "workers": copy.deepcopy(
-                        installed_workflow_plan.get("workers") or {}
+        staged_execution_plan: dict[str, Any] | None = None
+        staged_workflow_contract: dict[str, Any] | None = None
+        staged_artifact_plan: dict[str, Any] | None = None
+        staged_artifact_bindings: dict[str, Any] | None = None
+        try:
+            if (
+                isinstance(workflow_plan, dict)
+                and workflow_plan.get("selection") == "workflow_ir"
+                and isinstance(workflow_ir_payload, dict)
+            ):
+                existing_contract = copy.deepcopy(
+                    run_state.skill_workflow_contracts.get(skill_name) or {}
+                )
+                (
+                    workflow_output_contract,
+                    workflow_artifact_required,
+                ) = _workflow_ir_artifact_output_contract(existing_contract)
+                staged_execution_plan = copy.deepcopy(workflow_plan)
+                staged_execution_plan["output_contract"] = copy.deepcopy(
+                    workflow_output_contract
+                )
+                staged_execution_plan["requires_artifact_output"] = (
+                    workflow_artifact_required
+                )
+                staged_execution_plan["requires_full_output"] = bool(
+                    workflow_artifact_required
+                    and existing_contract.get("requires_merge") is True
+                )
+                staged_workflow_contract = {
+                    **existing_contract,
+                    "schema_version": "workflow-ir-runtime-v1",
+                    "source": "workflow_ir",
+                    "workflow_ir_sha256": workflow_ir_payload.get(
+                        "ir_sha256"
                     ),
-                    "aggregation": copy.deepcopy(
-                        installed_workflow_plan.get(
-                            "aggregation_steps"
-                        ) or []
-                    ),
+                    "requires_worker_outputs": True,
                     "output_contract": copy.deepcopy(
                         workflow_output_contract
                     ),
-                },
+                    "requires_modular_artifacts": workflow_artifact_required,
+                    "execution_contract": {
+                        "workers": copy.deepcopy(
+                            staged_execution_plan.get("workers") or {}
+                        ),
+                        "aggregation": copy.deepcopy(
+                            staged_execution_plan.get(
+                                "aggregation_steps"
+                            ) or []
+                        ),
+                        "output_contract": copy.deepcopy(
+                            workflow_output_contract
+                        ),
+                    },
+                }
+                if workflow_artifact_required:
+                    (
+                        staged_artifact_plan,
+                        staged_artifact_bindings,
+                    ) = _compile_run_artifact_plan(
+                        staged_workflow_contract,
+                        run_state.original_user_text,
+                        output_contract=workflow_output_contract,
+                        selected_workers=list(
+                            staged_execution_plan.get(
+                                "required_workers"
+                            ) or []
+                        ),
+                    )
+        except Exception as exc:
+            logger.warning(
+                "Standard Skill capability install derivation failed closed "
+                "user=%s session=%s failure_type=%s",
+                user_id,
+                session_id,
+                type(exc).__name__,
+            )
+            return None, {
+                "error_code": "capability_plan_install_derivation_failed",
+                "workflow_error_code": "",
+                "workflow_error_path": "$.runtime_projection",
             }
-            if workflow_artifact_required:
-                artifact_plan, bindings = _compile_run_artifact_plan(
-                    run_state.skill_workflow_contracts[skill_name],
-                    run_state.original_user_text,
-                    output_contract=workflow_output_contract,
-                    selected_workers=list(
-                        installed_workflow_plan.get(
-                            "required_workers"
-                        ) or []
-                    ),
-                )
-                run_state.skill_artifact_plans[skill_name] = artifact_plan
-                if bindings:
-                    run_state.skill_artifact_bindings[skill_name] = bindings
-                if artifact_plan.get("valid") is True:
-                    run_state.skill_completed_artifact_binding.add(
-                        skill_name
-                    )
-                    run_state.skill_failed_artifact_binding.pop(
-                        skill_name,
-                        None,
-                    )
         node_bound_candidate_ids = {
             str(candidate_id)
             for node in (
@@ -19835,7 +20111,7 @@ async def run_stream(
                 and candidate.get("tool_name") == "delegate_task"
             )
         }
-        standard_required_candidates = {
+        staged_required_candidates = {
             str(candidate.get("id") or ""): dict(candidate)
             for candidate in plan.get("required_candidates") or []
             if (
@@ -19849,50 +20125,44 @@ async def run_stream(
                 )
             )
         }
-        standard_required_candidate_receipts = {
+        staged_required_candidate_receipts = {
             candidate_id: receipt
             for candidate_id, receipt in previous_receipts.items()
-            if candidate_id in standard_required_candidates
+            if candidate_id in staged_required_candidates
         }
-        standard_completed_required_candidate_ids = set(
-            standard_required_candidate_receipts
+        staged_completed_required_candidate_ids = set(
+            staged_required_candidate_receipts
         )
-        standard_plan_execution_window_pending = True
         plan["completed_required_candidate_ids"] = sorted(
             candidate_id
             for candidate_id, receipt
-            in standard_required_candidate_receipts.items()
+            in staged_required_candidate_receipts.items()
             if receipt.get("outcome") == "success"
         )
         plan["failed_required_candidate_ids"] = sorted(
             candidate_id
             for candidate_id, receipt
-            in standard_required_candidate_receipts.items()
+            in staged_required_candidate_receipts.items()
             if receipt.get("outcome") != "success"
         )
         plan["required_candidate_receipts"] = [
-            standard_required_candidate_receipts[candidate_id]
-            for candidate_id in sorted(standard_required_candidate_receipts)
+            staged_required_candidate_receipts[candidate_id]
+            for candidate_id in sorted(staged_required_candidate_receipts)
         ]
-        # Exact candidates supersede the legacy bridge-name groups.  Keeping
-        # both would let an earlier main read (skill_view) or optional call on
-        # a shared runner incorrectly satisfy a required exact resource.
-        direct_required_tool_groups = []
         unsupported = list(plan.get("unsupported") or [])
-        direct_missing_requirements = [
+        staged_missing_requirements = [
             "standard_skill_unsupported_instruction:"
             + str(item.get("instruction") or "")[:200]
             for item in unsupported
             if isinstance(item, dict)
         ]
-        direct_mcp_exact_names = tuple(
-            name for name in tools if name.startswith("mcp_")
+        staged_mcp_exact_names = tuple(
+            name for name in selected_tools if name.startswith("mcp_")
         )
-        direct_mcp_policy = "exact" if direct_mcp_exact_names else "none"
-        effective_allow_session_mcp = bool(
-            allow_session_mcp and direct_mcp_exact_names
+        staged_mcp_policy = "exact" if staged_mcp_exact_names else "none"
+        staged_allow_session_mcp = bool(
+            allow_session_mcp and staged_mcp_exact_names
         )
-        allow_all_session_mcp = False
         command_catalog = [
             {
                 "skill_name": granted_skill,
@@ -19908,16 +20178,61 @@ async def run_stream(
             for granted_skill, command_id, executable, prefix
             in allowed_commands
         ]
+        # Commit only after every validation, runtime preflight, projection,
+        # and artifact derivation above succeeded.  The assignments below are
+        # deliberately short and non-fallible so callers never observe a
+        # half-installed capability boundary.
+        tools = selected_tools
+        tool_context = candidate_tool_context
+        run_state.available_tools = set(selected_tools)
+        run_state.skill_capability_plans[skill_name] = plan
+        if staged_execution_plan is not None:
+            run_state.skill_execution_plans[skill_name] = (
+                staged_execution_plan
+            )
+        if staged_workflow_contract is not None:
+            run_state.skill_workflow_contracts[skill_name] = (
+                staged_workflow_contract
+            )
+        if staged_artifact_plan is not None:
+            run_state.skill_artifact_plans[skill_name] = staged_artifact_plan
+            if staged_artifact_bindings:
+                run_state.skill_artifact_bindings[skill_name] = (
+                    staged_artifact_bindings
+                )
+            if staged_artifact_plan.get("valid") is True:
+                run_state.skill_completed_artifact_binding.add(skill_name)
+                run_state.skill_failed_artifact_binding.pop(skill_name, None)
+        standard_required_candidates = staged_required_candidates
+        standard_required_candidate_receipts = (
+            staged_required_candidate_receipts
+        )
+        standard_completed_required_candidate_ids = (
+            staged_completed_required_candidate_ids
+        )
+        standard_plan_execution_window_pending = True
+        # Exact candidates supersede the legacy bridge-name groups.  Keeping
+        # both would let an earlier main read (skill_view) or optional call on
+        # a shared runner incorrectly satisfy a required exact resource.
+        direct_required_tool_groups = []
+        direct_missing_requirements = staged_missing_requirements
+        direct_mcp_exact_names = staged_mcp_exact_names
+        direct_mcp_policy = staged_mcp_policy
+        effective_allow_session_mcp = staged_allow_session_mcp
+        allow_all_session_mcp = False
         return (
-            "[Harness typed standard Skill capability plan accepted] Only the "
-            "selected backend-issued tools and exact resource/script/command/"
-            "HTTP closures are now callable. Required selections must be used; "
-            "optional selections are discretionary. Unsupported instructions "
-            "must be reported as concrete degraded gaps, never simulated. "
-            "Exact commands: "
-            + json.dumps(command_catalog, ensure_ascii=False)
-            + " Unsupported: "
-            + json.dumps(unsupported, ensure_ascii=False)
+            (
+                "[Harness typed standard Skill capability plan accepted] Only the "
+                "selected backend-issued tools and exact resource/script/command/"
+                "HTTP closures are now callable. Required selections must be used; "
+                "optional selections are discretionary. Unsupported instructions "
+                "must be reported as concrete degraded gaps, never simulated. "
+                "Exact commands: "
+                + json.dumps(command_catalog, ensure_ascii=False)
+                + " Unsupported: "
+                + json.dumps(unsupported, ensure_ascii=False)
+            ),
+            None,
         )
 
     def amend_standard_capability_catalog_after_reference(
@@ -19928,6 +20243,7 @@ async def run_stream(
         nonlocal tools, tool_context, forced_workflow_policy
         nonlocal direct_required_tool_groups, direct_missing_requirements
         nonlocal standard_plan_execution_window_pending
+        nonlocal capability_plan_semantic_validation_attempts
 
         if (
             agent_kind != "primary"
@@ -20077,15 +20393,114 @@ async def run_stream(
             previous.get("catalog_sha256") or ""
         )
         amended["added_candidate_ids"] = added_ids[:64]
+        # A complete content-addressed source read is evidence about immutable
+        # bytes, not an execution grant from the superseded planning epoch.
+        # Carry only those receipts whose entire backend-issued resource
+        # candidate is byte-for-byte identical in both catalogs.  Script,
+        # command, HTTP, delegate, write, and name-only planner receipts never
+        # cross an amendment boundary.
+        previous_candidates = {
+            str(candidate.get("id") or ""): candidate
+            for candidate in previous.get("candidates") or []
+            if isinstance(candidate, dict) and candidate.get("id")
+        }
+        amended_candidates = {
+            str(candidate.get("id") or ""): candidate
+            for candidate in amended.get("candidates") or []
+            if isinstance(candidate, dict) and candidate.get("id")
+        }
+        transferable_resource_receipts = {
+            candidate_id: dict(receipt)
+            for candidate_id, receipt
+            in standard_required_candidate_receipts.items()
+            if (
+                isinstance(receipt, dict)
+                and receipt.get("outcome") == "success"
+                and isinstance(previous_candidates.get(candidate_id), dict)
+                and previous_candidates[candidate_id].get("kind")
+                == "skill_resource"
+                and previous_candidates[candidate_id]
+                == amended_candidates.get(candidate_id)
+            )
+        }
+        superseded_plan = run_state.skill_capability_plans.get(skill_name)
+        superseded_tool_names = {
+            str(tool_name)
+            for tool_name in (
+                superseded_plan.get("selected_tools") or []
+                if isinstance(superseded_plan, dict)
+                else []
+            )
+            if isinstance(tool_name, str) and tool_name
+        }
+        # A catalog digest is the planning epoch.  Revoke every plan-derived
+        # runtime projection and name-only planner receipt from the previous
+        # epoch before publishing the replacement catalog.  Exact disclosed
+        # source documents remain available because they are inputs to the new
+        # content-addressed catalog, not execution grants.
+        run_state.skill_capability_plans.pop(skill_name, None)
+        run_state.skill_execution_plans.pop(skill_name, None)
+        run_state.skill_workflow_contracts.pop(skill_name, None)
+        run_state.skill_artifact_plans.pop(skill_name, None)
+        run_state.skill_artifact_bindings.pop(skill_name, None)
+        run_state.skill_artifact_binding_results.pop(skill_name, None)
+        run_state.skill_completed_artifact_binding.discard(skill_name)
+        run_state.skill_failed_artifact_binding.pop(skill_name, None)
+        run_state.skill_completed_intent.discard(skill_name)
+        run_state.skill_failed_intent.pop(skill_name, None)
+        run_state.skill_intent_results.pop(skill_name, None)
+        run_state.skill_intent_selections.pop(skill_name, None)
+        run_state.skill_intent_mappings.pop(skill_name, None)
+        run_state.skill_pending_intent_resource_closure.pop(skill_name, None)
+        for ledger in (
+            run_state.skill_completed_workers,
+            run_state.skill_failed_workers,
+            run_state.skill_worker_results,
+            run_state.skill_completed_bootstrap,
+            run_state.skill_failed_bootstrap,
+            run_state.skill_bootstrap_results,
+            run_state.skill_completed_aggregation,
+            run_state.skill_failed_aggregation,
+            run_state.skill_aggregation_results,
+        ):
+            ledger.pop(skill_name, None)
+        for step_key in list(run_state.delegate_step_attempts):
+            if step_key[0] == skill_name:
+                run_state.delegate_step_attempts.pop(step_key, None)
+                run_state.delegate_step_status.pop(step_key, None)
+        direct_called_tools.difference_update({
+            CAPABILITY_PLAN_TOOL_NAME,
+            *superseded_tool_names,
+        })
+        standard_required_candidates.clear()
+        standard_completed_required_candidate_ids.clear()
+        standard_required_candidate_receipts.clear()
+        standard_required_candidate_receipts.update(
+            transferable_resource_receipts
+        )
+        capability_plan_semantic_validation_attempts = 0
         run_state.skill_capability_catalogs[skill_name] = amended
 
-        tools = list(dict.fromkeys([
-            *tools,
-            CAPABILITY_PLAN_TOOL_NAME,
-        ]))
+        # The amended epoch is plan-only until its own typed plan is accepted.
+        # In particular, no script, delegate, file-write, HTTP, browser, or MCP
+        # grant selected by the previous epoch remains model-visible.
+        tools = [
+            name
+            for name in ("skill_view", CAPABILITY_PLAN_TOOL_NAME)
+            if name in skill_compiler_tool_universe
+        ]
         tool_context = replace(
             tool_context,
             enabled_tools=tuple(tools),
+            allowed_skill_scripts=(),
+            process_only_skill_scripts=(),
+            allowed_skill_script_authorities=(),
+            allowed_skill_package_digests=(),
+            allowed_skill_commands=(),
+            allowed_skill_http_prefixes=(),
+            allowed_skill_http_post_prefixes=(),
+            allowed_skill_sandbox_egress_prefixes=(),
+            allowed_skill_sandbox_egress_rules=(),
             skill_capability_catalog=amended,
         )
         run_state.available_tools = set(tools)
@@ -20707,7 +21122,8 @@ async def run_stream(
                 # required-tool group as a model-authored call. Without this,
                 # the next turn can be forced to repeat an already successful
                 # main Skill inspection merely because it was auto-dispatched.
-                direct_called_tools.add(auto_tool_name)
+                if auto_tool_name != CAPABILITY_PLAN_TOOL_NAME:
+                    direct_called_tools.add(auto_tool_name)
             if auto_actual_dispatch_attempted:
                 record_standard_required_capability_receipts(
                     auto_tool_name,
@@ -20749,11 +21165,21 @@ async def run_stream(
                         auto_boundary_guidance.append(guidance)
             elif auto_completed:
                 if auto_tool_name == CAPABILITY_PLAN_TOOL_NAME:
-                    guidance = install_accepted_standard_capability_plan(
-                        auto_result_data
+                    guidance, _install_failure = (
+                        install_accepted_standard_capability_plan(
+                            auto_result_data
+                        )
                     )
                     if guidance:
                         auto_boundary_guidance.append(guidance)
+                    if (
+                        _install_failure is None
+                        and isinstance(auto_result_data, dict)
+                        and str(auto_result_data.get("skill_name") or "")
+                        in run_state.skill_capability_plans
+                    ):
+                        direct_called_tools.add(auto_tool_name)
+                        capability_plan_semantic_validation_attempts = 0
                 elif auto_tool_name == "skill_view":
                     completed_intent_before = set(
                         run_state.skill_completed_intent
@@ -21158,7 +21584,16 @@ async def run_stream(
                     "artifact.created",
                     {**reconciled, "source_tool_name": "workspace_reconcile"},
                 )
-            auto_needs_more, auto_reason = run_state.needs_more_skill_workflow()
+            # The capability compiler owns the pending-plan phase and will
+            # publish its exact planner-only surface at the next turn.  The
+            # generic post-tool closure must not reopen a broader Skill-view
+            # continuation while that typed frontier is pending.
+            if run_state.pending_standard_capability_plan_skills():
+                auto_needs_more, auto_reason = False, ""
+            else:
+                auto_needs_more, auto_reason = (
+                    run_state.needs_more_skill_workflow()
+                )
             if auto_needs_more:
                 if workflow_continuation_available(auto_reason):
                     record_workflow_continuation(auto_reason)
@@ -22049,6 +22484,13 @@ async def run_stream(
             # terminal phase boundary.
             schema_tool_names.append("read_tool_result")
         tool_schemas = get_schemas(schema_tool_names) if schema_tool_names else []
+        if CAPABILITY_PLAN_TOOL_NAME in schema_tool_names:
+            # The registry retains legacy full-IR input for direct callers;
+            # providers see only the compact semantic range manifest.
+            tool_schemas = _model_facing_capability_plan_schemas(
+                tool_schemas,
+                tool_context.skill_capability_catalog,
+            )
         if iteration_result_footer_repair:
             # Replace the ordinary executable surface with one internal,
             # dynamically closed typed submission. It is intercepted before
@@ -22187,7 +22629,11 @@ async def run_stream(
             # synthesis turn.  Large/unknown argument schemas deliberately do
             # not enter this branch.
             primary_phase_output_token_cap = (
-                _PRIMARY_MANDATORY_FRONTIER_MAX_TOKENS
+                _adaptive_capability_plan_output_tokens(
+                    tool_context.skill_capability_catalog
+                )
+                if CAPABILITY_PLAN_TOOL_NAME in iteration_exposed_tools
+                else _PRIMARY_MANDATORY_FRONTIER_MAX_TOKENS
             )
             requested_max_tokens = min(
                 requested_max_tokens,
@@ -22201,7 +22647,10 @@ async def run_stream(
         if iteration_result_footer_repair:
             requested_max_tokens = min(
                 requested_max_tokens,
-                _DELEGATE_RESULT_FOOTER_REPAIR_MAX_TOKENS,
+                adaptive_result_contract_output_tokens(
+                    delegated_required_result_fields,
+                    delegated_required_result_schema,
+                ),
             )
         structural_atomic_tool_stream_repair = bool(
             iteration_tool_stream_repair is not None
@@ -30428,12 +30877,6 @@ async def run_stream(
                                 tool_call_id,
                             ),
                         )
-                if (
-                    actual_dispatch_attempted
-                    and not exposure_error
-                    and display_tool_name
-                ):
-                    direct_called_tools.add(display_tool_name)
                 hint = (
                     hint_tracker.check(args)
                     if actual_dispatch_attempted else None
@@ -30446,6 +30889,108 @@ async def run_stream(
                 )
                 tool_completed = _tool_outcome_is_completed(outcome)
                 exact_result_data = _json_object(str(result)) or {}
+                semantic_control_accepted = _semantic_control_call_accepted(
+                    display_tool_name,
+                    exact_result_data,
+                )
+                if (
+                    actual_dispatch_attempted
+                    and not exposure_error
+                    and display_tool_name
+                    and semantic_control_accepted
+                    and display_tool_name != CAPABILITY_PLAN_TOOL_NAME
+                ):
+                    direct_called_tools.add(display_tool_name)
+                capability_plan_validation_failure: dict[str, Any] | None = None
+                capability_plan_install_failure: dict[str, Any] | None = None
+                capability_plan_install_guidance: str | None = None
+                if (
+                    display_tool_name == CAPABILITY_PLAN_TOOL_NAME
+                    and exact_result_data.get("status") != "accepted"
+                ):
+                    # Schema/preflight rejection is still a model-correctable
+                    # planning attempt even though the handler was never
+                    # entered.  Count it in the validation controller; do not
+                    # let malformed calls consume the ordinary 160-turn loop.
+                    capability_plan_semantic_validation_attempts += 1
+                    capability_plan_validation_failure = {
+                        "attempt": capability_plan_semantic_validation_attempts,
+                        "max_attempts": (
+                            _CAPABILITY_PLAN_SEMANTIC_VALIDATION_MAX_ATTEMPTS
+                        ),
+                        "error_code": str(
+                            exact_result_data.get("error_code")
+                            or exact_result_data.get("reason")
+                            or "capability_plan_rejected"
+                        )[:256],
+                        "workflow_error_code": str(
+                            exact_result_data.get("workflow_plan_error_code")
+                            or exact_result_data.get("workflow_ir_error_code")
+                            or ""
+                        )[:256],
+                        "workflow_error_path": str(
+                            exact_result_data.get("workflow_plan_error_path")
+                            or exact_result_data.get("workflow_ir_error_path")
+                            or ""
+                        )[:512],
+                    }
+                    for debug_evt in await debug_stream_event(
+                        "capability_plan.validation_rejected",
+                        capability_plan_validation_failure,
+                        tool_name=display_tool_name,
+                        tool_call_id=tool_call_id,
+                    ):
+                        yield debug_evt
+                elif (
+                    actual_dispatch_attempted
+                    and display_tool_name == CAPABILITY_PLAN_TOOL_NAME
+                    and outcome == "success"
+                ):
+                    (
+                        capability_plan_install_guidance,
+                        capability_plan_install_failure,
+                    ) = install_accepted_standard_capability_plan(
+                        exact_result_data
+                    )
+                    if capability_plan_install_failure is None:
+                        direct_called_tools.add(display_tool_name)
+                        capability_plan_semantic_validation_attempts = 0
+                    else:
+                        # Handler validation and runtime installation are
+                        # distinct controllers.  A frozen-authority/profile
+                        # preflight failure is not repaired by asking the
+                        # model to resubmit identical JSON three times.
+                        capability_plan_install_failure = {
+                            **capability_plan_install_failure,
+                            "retry_controller": "runtime_install",
+                            "retryable": False,
+                        }
+                        result = json.dumps(
+                            {
+                                "status": "error",
+                                **capability_plan_install_failure,
+                                "error": (
+                                    "The validated capability plan was not "
+                                    "installed by the runtime authority gate."
+                                ),
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                        exact_result_data = _json_object(str(result)) or {}
+                        outcome, outcome_detail = _tool_outcome_summary(
+                            str(result),
+                            tool_name=display_tool_name,
+                        )
+                        tool_completed = False
+                        semantic_control_accepted = False
+                        for debug_evt in await debug_stream_event(
+                            "capability_plan.install_rejected",
+                            capability_plan_install_failure,
+                            tool_name=display_tool_name,
+                            tool_call_id=tool_call_id,
+                        ):
+                            yield debug_evt
                 effect_receipt = bind_effect_receipt_to_call(
                     exact_result_data.get("effect_receipt"),
                     tool_name=display_tool_name,
@@ -31029,15 +31574,16 @@ async def run_stream(
                     display_tool_name == CAPABILITY_PLAN_TOOL_NAME
                     and outcome == "success"
                 ):
-                    guidance = install_accepted_standard_capability_plan(
-                        _json_object(str(result))
-                    )
-                    if guidance:
-                        boundary_guidance_messages.append(guidance)
+                    plan_result_data = _json_object(str(result))
+                    if capability_plan_install_guidance:
+                        boundary_guidance_messages.append(
+                            capability_plan_install_guidance
+                        )
                     workflow_state_changed = bool(
-                        isinstance(_json_object(str(result)), dict)
+                        capability_plan_install_failure is None
+                        and isinstance(plan_result_data, dict)
                         and str(
-                            (_json_object(str(result)) or {}).get("skill_name")
+                            (plan_result_data or {}).get("skill_name")
                             or ""
                         ) in run_state.skill_capability_plans
                     )
@@ -31725,10 +32271,34 @@ async def run_stream(
                         tool_call_id=tool_call_id,
                     ):
                         yield debug_evt
+                history_result = str(result)
+                if (
+                    display_tool_name == CAPABILITY_PLAN_TOOL_NAME
+                    and exact_result_data.get("status") == "accepted"
+                ):
+                    if capability_plan_validation_failure is not None:
+                        history_result = json.dumps({
+                            "status": "error",
+                            **capability_plan_validation_failure,
+                            "error": (
+                                "The handler accepted the plan, but its "
+                                "runtime-bound authority was not installed. "
+                                "Correct the plan while remaining on the "
+                                "same planning frontier."
+                            ),
+                        }, ensure_ascii=False, separators=(",", ":"))
+                    else:
+                        history_result = json.dumps(
+                            _capability_plan_history_projection(
+                                exact_result_data
+                            ),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
                 wrapped, generic_result_handle = (
                     await run_sync_cancellation_safe(
                         lambda: wrap_result_with_receipt(
-                            str(result),
+                            history_result,
                             display_tool_name,
                             user_id=user_id,
                             session_id=session_id,
@@ -31745,7 +32315,7 @@ async def run_stream(
                             "handle_sha256": hashlib.sha256(
                                 generic_result_handle.encode("utf-8")
                             ).hexdigest(),
-                            "result_chars": len(str(result)),
+                            "result_chars": len(history_result),
                         },
                         tool_name=display_tool_name,
                         tool_call_id=tool_call_id,
@@ -31778,6 +32348,81 @@ async def run_stream(
                         "role": "user",
                         "content": boundary_guidance,
                     })
+                if capability_plan_install_failure is not None:
+                    failure = capability_plan_install_failure
+                    error_code = str(
+                        failure.get("error_code")
+                        or "capability_plan_runtime_install_failed"
+                    )
+                    msg = (
+                        "The validated Skill capability/workflow plan failed "
+                        "the runtime installation boundary ("
+                        + error_code
+                        + (
+                            f" at {failure.get('workflow_error_path')}"
+                            if failure.get("workflow_error_path")
+                            else ""
+                        )
+                        + "). No execution grant was installed."
+                    )
+                    yield await emit_agent_event(
+                        "run.failed",
+                        {
+                            **failure,
+                            "error": msg,
+                            "finish_reason": error_code,
+                            "terminal_reason": (
+                                "capability_plan_runtime_install_failed"
+                            ),
+                        },
+                    )
+                    yield {"type": "error", "msg": msg}
+                    return
+                if (
+                    capability_plan_validation_failure is not None
+                    and capability_plan_semantic_validation_attempts
+                    >= _CAPABILITY_PLAN_SEMANTIC_VALIDATION_MAX_ATTEMPTS
+                ):
+                    failure = capability_plan_validation_failure
+                    msg = (
+                        "The typed Skill capability/workflow plan remained "
+                        "semantically invalid after "
+                        f"{failure['attempt']} bounded validation attempts "
+                        f"({failure['error_code']}"
+                        + (
+                            f"/{failure['workflow_error_code']}"
+                            if failure["workflow_error_code"]
+                            else ""
+                        )
+                        + (
+                            f" at {failure['workflow_error_path']}"
+                            if failure["workflow_error_path"]
+                            else ""
+                        )
+                        + "). No execution grant was installed."
+                    )
+                    for debug_evt in await debug_stream_event(
+                        "capability_plan.validation_exhausted",
+                        failure,
+                        tool_name=display_tool_name,
+                        tool_call_id=tool_call_id,
+                    ):
+                        yield debug_evt
+                    yield await emit_agent_event(
+                        "run.failed",
+                        {
+                            **failure,
+                            "error": msg,
+                            "finish_reason": (
+                                "capability_plan_validation_exhausted"
+                            ),
+                            "terminal_reason": (
+                                "capability_plan_semantic_validation_exhausted"
+                            ),
+                        },
+                    )
+                    yield {"type": "error", "msg": msg}
+                    return
                 if delegated_subtask and actual_dispatch_attempted:
                     delegate_dispatched_tool_result_count += 1
                     delegate_attempted_tool_names.add(display_tool_name)
@@ -32384,7 +33029,16 @@ async def run_stream(
                     {**reconciled, "source_tool_name": "workspace_reconcile"},
                 )
 
-            needs_workflow_gate_after_tools, workflow_reason_after_tools = run_state.needs_more_skill_workflow()
+            if run_state.pending_standard_capability_plan_skills():
+                (
+                    needs_workflow_gate_after_tools,
+                    workflow_reason_after_tools,
+                ) = (False, "")
+            else:
+                (
+                    needs_workflow_gate_after_tools,
+                    workflow_reason_after_tools,
+                ) = run_state.needs_more_skill_workflow()
             if needs_workflow_gate_after_tools:
                 if workflow_continuation_available(workflow_reason_after_tools):
                     record_workflow_continuation(workflow_reason_after_tools)
@@ -33314,6 +33968,11 @@ async def run_stream(
                     "artifact.created",
                     {**reconciled, "source_tool_name": "workspace_reconcile"},
                 )
+            length_workflow_incomplete, length_workflow_reason = (
+                run_state.needs_more_skill_workflow()
+                if run_state.skill_workflow_is_active()
+                else (False, "")
+            )
             length_verifier_payload = _runtime_artifact_verifier_payload(
                 run_state,
                 artifact_policy_text=artifact_policy_text,
@@ -33359,6 +34018,8 @@ async def run_stream(
                     "finish_reason": "length_loop",
                     "usage": run_usage,
                     "verifier": length_verifier_payload,
+                    "workflow_incomplete": length_workflow_incomplete,
+                    "workflow_reason": length_workflow_reason,
                 })
                 yield {"type": "error", "msg": msg}
                 return
@@ -33418,6 +34079,11 @@ async def run_stream(
     # Register any skill-declared merge/worker outputs produced out-of-band before
     # the final verdict, so a completed report is not reported as a failure.
     _reconcile_workspace_artifacts(run_state, list(run_state.skill_workflow_contracts.values()))
+    exhausted_workflow_incomplete, exhausted_workflow_reason = (
+        run_state.needs_more_skill_workflow()
+        if run_state.skill_workflow_is_active()
+        else (False, "")
+    )
     exhausted_verifier_payload = _runtime_artifact_verifier_payload(
         run_state,
         artifact_policy_text=artifact_policy_text,
@@ -33435,6 +34101,8 @@ async def run_stream(
         "successful_write_sizes": run_state.successful_write_sizes[-10:],
         "viewed_skill_names": sorted(run_state.viewed_skill_names),
         "continuation_reasons_tail": run_state.continuation_reasons[-10:],
+        "workflow_incomplete": exhausted_workflow_incomplete,
+        "workflow_reason": exhausted_workflow_reason,
         "verifier": exhausted_verifier_payload,
     }):
         yield debug_evt
@@ -33464,7 +34132,13 @@ async def run_stream(
             })
             yield {"type": "done", "finish_reason": "stop"}
             return
-    yield await emit_agent_event("run.failed", {"error": msg, "usage": run_usage, "verifier": exhausted_verifier_payload})
+    yield await emit_agent_event("run.failed", {
+        "error": msg,
+        "usage": run_usage,
+        "verifier": exhausted_verifier_payload,
+        "workflow_incomplete": exhausted_workflow_incomplete,
+        "workflow_reason": exhausted_workflow_reason,
+    })
     yield {"type": "error", "msg": msg}
 
 
@@ -36803,6 +37477,17 @@ def _runtime_artifact_verifier_payload(
     explicit artifact patterns supplied by the caller.  When declarations are
     available, incidental files are excluded from the verifier target set.
     """
+    workflow_incomplete, _workflow_reason = (
+        run_state.needs_more_skill_workflow()
+        if enforce_session_skill_workflow
+        else (False, "")
+    )
+    if workflow_incomplete:
+        # Artifact verification is a post-workflow phase.  It must never
+        # substitute for an uninstalled plan, an unresolved predecessor, or
+        # any other mandatory workflow frontier, including from the special
+        # length- and iteration-budget terminal branches.
+        return None
     explicit_patterns = _dedupe_paths([
         str(pattern).strip()
         for pattern in (declared_artifact_patterns or [])
@@ -38135,6 +38820,29 @@ def _standard_skill_uses_semantic_capability_plan(
         or execution.get("aggregation")
         or execution.get("output_contract")
         or execution.get("intent_classification")
+    )
+
+
+def _standard_capability_catalog_requires_plan(
+    catalog: Any,
+) -> bool:
+    """Return whether a compiled standard-Skill catalog needs a model plan.
+
+    A fully disclosed instruction-only Skill can legitimately have neither an
+    executable capability nor a declared delegated workflow.  Its prose is
+    already the complete authority, so requiring an empty control-tool call
+    would add protocol risk without narrowing any execution grant.  Any
+    candidate, mandatory group, or compiled Workflow IR requirement still
+    makes typed planning mandatory.
+    """
+
+    return bool(
+        isinstance(catalog, dict)
+        and (
+            catalog.get("workflow_ir_required") is True
+            or bool(catalog.get("candidates"))
+            or bool(catalog.get("required_candidate_groups"))
+        )
     )
 
 

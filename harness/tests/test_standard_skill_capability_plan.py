@@ -10,10 +10,15 @@ from unittest.mock import AsyncMock, patch
 from agent_loop import (
     HarnessRunState,
     SessionSkillRelevanceDecision,
+    _adaptive_capability_plan_output_tokens,
+    _capability_plan_history_projection,
     _build_standard_skill_capability_catalog,
+    _model_facing_capability_plan_schemas,
     _preflight_standard_skill_runtime_selection,
     _safe_build_standard_skill_capability_catalog,
     _standard_skill_catalog_failure_terminal,
+    _semantic_control_call_accepted,
+    _tool_debug_result,
     run_stream,
 )
 from skill_capability_plan import (
@@ -33,7 +38,10 @@ from skills.command_grants import (
 )
 from skills.loader import load_skill_content
 from skills.scanner import skill_runnable_script_resources
-from tools.skill_capability_plan import submit_skill_capability_plan
+from tools.skill_capability_plan import (
+    SUBMIT_SKILL_CAPABILITY_PLAN_SCHEMA,
+    submit_skill_capability_plan,
+)
 from tools.context import ToolContext
 from tools.isolated_skill_executor import compute_skill_package_digest
 from tools.registry import (
@@ -99,6 +107,113 @@ class _Response:
 
 
 class StandardSkillCapabilityPlanTests(unittest.TestCase):
+    def test_model_facing_workflow_planner_is_compact_and_acceptance_gated(self):
+        registry_schema = {
+            "type": "function",
+            "function": SUBMIT_SKILL_CAPABILITY_PLAN_SCHEMA,
+        }
+        catalog = {
+            "workflow_ir_required": True,
+            "instruction_plan_catalog": {"catalog_sha256": "a" * 64},
+        }
+
+        narrowed = _model_facing_capability_plan_schemas(
+            [registry_schema], catalog
+        )
+        parameters = narrowed[0]["function"]["parameters"]
+        self.assertNotIn("workflow_ir", parameters["properties"])
+        self.assertIn("workflow_plan", parameters["properties"])
+        self.assertIn("workflow_plan", parameters["required"])
+        self.assertIn(
+            "workflow_ir",
+            registry_schema["function"]["parameters"]["properties"],
+        )
+        self.assertFalse(_semantic_control_call_accepted(
+            "submit_skill_capability_plan", {"status": "error"}
+        ))
+        self.assertTrue(_semantic_control_call_accepted(
+            "submit_skill_capability_plan", {"status": "accepted"}
+        ))
+        self.assertTrue(_semantic_control_call_accepted(
+            "skill_view", {"status": "error"}
+        ))
+
+    def test_compact_workflow_plan_budget_uses_structural_tiers(self):
+        def catalog(unit_count):
+            return {
+                "instruction_plan_catalog": {
+                    "counts": {"instruction_units": unit_count},
+                },
+            }
+
+        self.assertEqual(8_192, _adaptive_capability_plan_output_tokens(None))
+        self.assertEqual(
+            8_192, _adaptive_capability_plan_output_tokens(catalog(96))
+        )
+        self.assertEqual(
+            16_384, _adaptive_capability_plan_output_tokens(catalog(97))
+        )
+        self.assertEqual(
+            32_768, _adaptive_capability_plan_output_tokens(catalog(385))
+        )
+
+    def test_accepted_plan_history_keeps_receipt_not_runtime_ir(self):
+        result = {
+            "status": "accepted",
+            "schema_version": "2",
+            "skill_name": "portable-workflow",
+            "body_sha256": "a" * 64,
+            "catalog_sha256": "b" * 64,
+            "catalog_revision": 2,
+            "required": ["cap-a", "cap-b"],
+            "optional": ["cap-c"],
+            "unsupported": [],
+            "selected_tools": ["delegate_task", "web_search"],
+            "workflow_ir_required": True,
+            "workflow_ir": {
+                "ir_sha256": "c" * 64,
+                "nodes": [{"id": "worker-a"}, {"id": "worker-b"}],
+                "coverage": [{"instruction_id": "iu-a"}] * 500,
+                "outputs": [{"id": "report"}],
+            },
+            "worker_plan": {
+                "required_workers": ["worker-a"],
+                "aggregation_steps": [{"id": "worker-b"}],
+                "workers": {"worker-a": {"goal": "large runtime data"}},
+            },
+            "diagnostic": "accepted",
+        }
+
+        projection = _capability_plan_history_projection(result)
+
+        self.assertNotIn("workflow_ir", projection)
+        self.assertNotIn("worker_plan", projection)
+        self.assertEqual("c" * 64, projection["workflow_ir_sha256"])
+        self.assertEqual(2, projection["workflow_node_count"])
+        self.assertEqual(1, projection["aggregation_step_count"])
+        self.assertLess(len(json.dumps(projection)), 2_000)
+
+    def test_plan_validation_debug_keeps_only_stable_coordinates(self):
+        result = _tool_debug_result(json.dumps({
+            "status": "error",
+            "error_code": "capability_plan_workflow_ir_invalid",
+            "workflow_plan_error_code": "reversed_instruction_range",
+            "workflow_plan_error_path": (
+                "$.nodes[2].instruction_ranges[1]"
+            ),
+            "workflow_ir_error": "package-controlled prose must not persist",
+        }))
+
+        self.assertEqual(
+            "reversed_instruction_range",
+            result["workflow_plan_error_code"],
+        )
+        self.assertEqual(
+            "$.nodes[2].instruction_ranges[1]",
+            result["workflow_plan_error_path"],
+        )
+        self.assertNotIn("workflow_ir_error", result)
+
     def test_frozen_skill_static_url_grants_native_browser_exact_rule(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "browser-skill"
@@ -2505,6 +2620,482 @@ class StandardSkillCapabilityPlanTests(unittest.TestCase):
 
 
 class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rejected_compact_plan_keeps_frontier_and_fails_bounded(self):
+        provider = {
+            "id": "mock-bounded-workflow-plan-validation",
+            "base_url": "http://model.invalid/v1",
+            "api_model": "mock-bounded-workflow-plan-validation",
+            "api_key": "EMPTY",
+            "protocol": "openai",
+            "provider": "mock",
+            "context_length": 64_000,
+            "is_multimodal": True,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "portable-workflow"
+            root.mkdir()
+            (root / "SKILL.md").write_text(
+                "---\nname: portable-workflow\n"
+                "description: Coordinate a generic delegated review.\n---\n"
+                "# Procedure\n\n"
+                "Delegate independent worker agents to inspect the input.\n\n"
+                "Aggregate their typed evidence into one answer.\n",
+                encoding="utf-8",
+            )
+            package = load_skill_content(root / "SKILL.md", skill_dir=str(root))
+            enabled = [
+                "skill_view",
+                "submit_skill_capability_plan",
+                "delegate_task",
+            ]
+            catalog = _build_standard_skill_capability_catalog(
+                "portable-workflow", package, enabled, (),
+            )
+            self.assertTrue(catalog["workflow_ir_required"])
+            delegate_id = next(
+                item["id"]
+                for item in catalog["candidates"]
+                if item.get("tool_name") == "delegate_task"
+            )
+            invalid_plan = {
+                "schema_version": "1",
+                "nodes": [{
+                    "id": "worker-review",
+                    "kind": "delegate",
+                    "instruction_ranges": [{
+                        "start_instruction_id": (
+                            "iu-000000000000000000000000"
+                        ),
+                        "end_instruction_id": (
+                            "iu-000000000000000000000000"
+                        ),
+                    }],
+                    "depends_on": [],
+                    "capability_ids": [],
+                }],
+            }
+            plan_args = {
+                "skill_name": "portable-workflow",
+                "body_sha256": catalog["body_sha256"],
+                "catalog_sha256": catalog["catalog_sha256"],
+                "required": [delegate_id],
+                "optional": [],
+                "unsupported": [],
+                "workflow_plan": invalid_plan,
+            }
+            responses = [
+                _tool_response(
+                    "main", "skill_view", {"name": "portable-workflow"}
+                ),
+                *[
+                    _tool_response(
+                        f"bad-plan-{attempt}",
+                        "submit_skill_capability_plan",
+                        plan_args,
+                    )
+                    for attempt in range(1, 4)
+                ],
+            ]
+            request_bodies: list[dict] = []
+
+            class Client:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, exc_type, exc, tb):
+                    return False
+
+                def stream(self, method, url, **kwargs):
+                    request_bodies.append(kwargs["json"])
+                    return _Response(responses.pop(0))
+
+            async def fake_dispatch(name, args, *, context):
+                if name == "skill_view":
+                    return json.dumps({
+                        **package,
+                        "success": True,
+                        "skill_dir": str(root),
+                    }, ensure_ascii=False)
+                if name == "submit_skill_capability_plan":
+                    return await submit_skill_capability_plan(
+                        **args, context=context
+                    )
+                raise AssertionError(f"unexpected dispatch: {name}")
+
+            skill_record = {
+                "name": "portable-workflow",
+                "description": package["description"],
+                "scope": "session",
+                "path": str(root / "SKILL.md"),
+                "skill_dir": str(root),
+            }
+            with (
+                patch("workspace_context.WORKSPACE_ROOT", Path(temp_dir) / "ws"),
+                patch("agent_loop.httpx.AsyncClient", Client),
+                patch("agent_loop.dispatch", fake_dispatch),
+                patch("agent_loop.build_system_prompt", return_value="system"),
+                patch("agent_loop.load_workspace_context", return_value=""),
+                patch("agent_loop._fetch_goal", AsyncMock(return_value=None)),
+                patch(
+                    "agent_loop._safe_build_standard_skill_capability_catalog",
+                    return_value=(catalog, None),
+                ),
+                patch(
+                    "skills.scanner.find_all_skills",
+                    return_value=[skill_record],
+                ),
+            ):
+                events = [event async for event in run_stream(
+                    "mock-bounded-workflow-plan-validation",
+                    [{"role": "user", "content": "运行 portable-workflow"}],
+                    enabled,
+                    provider_override=provider,
+                    allow_session_mcp=False,
+                    user_id="u-bounded-workflow-plan-validation",
+                    session_id="s-bounded-workflow-plan-validation",
+                    max_iterations=8,
+                )]
+
+        self.assertFalse(responses)
+        self.assertEqual(4, len(request_bodies))
+        for body in request_bodies[1:]:
+            exposed = {
+                item["function"]["name"] for item in body.get("tools") or []
+            }
+            self.assertIn("submit_skill_capability_plan", exposed)
+            self.assertNotIn("delegate_task", exposed)
+            self.assertEqual("required", body.get("tool_choice"))
+            plan_schema = next(
+                item
+                for item in body["tools"]
+                if item["function"]["name"]
+                == "submit_skill_capability_plan"
+            )
+            parameters = plan_schema["function"]["parameters"]
+            self.assertIn("workflow_plan", parameters["required"])
+            self.assertNotIn("workflow_ir", parameters["properties"])
+        self.assertEqual("error", events[-1]["type"])
+        self.assertIn("semantically invalid", events[-1]["msg"])
+        terminal = next(
+            event for event in events if event.get("event_type") == "run.failed"
+        )
+        self.assertEqual(3, terminal["payload"]["attempt"])
+        self.assertEqual(
+            "unknown_workflow_plan_instruction_id",
+            terminal["payload"]["workflow_error_code"],
+        )
+        self.assertEqual(
+            "capability_plan_semantic_validation_exhausted",
+            terminal["payload"]["terminal_reason"],
+        )
+        self.assertFalse(any(
+            str(event.get("event_type") or "").startswith("verifier.")
+            for event in events
+        ))
+
+    async def test_pending_plan_budget_terminal_never_runs_artifact_verifier(self):
+        provider = {
+            "id": "mock-pending-plan-budget-terminal",
+            "base_url": "http://model.invalid/v1",
+            "api_model": "mock-pending-plan-budget-terminal",
+            "api_key": "EMPTY",
+            "protocol": "openai",
+            "provider": "mock",
+            "context_length": 64_000,
+            "is_multimodal": True,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "portable-budget-workflow"
+            root.mkdir()
+            (root / "SKILL.md").write_text(
+                "---\nname: portable-budget-workflow\n"
+                "description: Coordinate a generic delegated review.\n---\n"
+                "Delegate an independent worker and aggregate its evidence "
+                "into one durable report.\n",
+                encoding="utf-8",
+            )
+            package = load_skill_content(
+                root / "SKILL.md", skill_dir=str(root)
+            )
+            enabled = [
+                "skill_view",
+                "submit_skill_capability_plan",
+                "delegate_task",
+            ]
+            catalog = _build_standard_skill_capability_catalog(
+                "portable-budget-workflow", package, enabled, (),
+            )
+            delegate_id = next(
+                item["id"]
+                for item in catalog["candidates"]
+                if item.get("tool_name") == "delegate_task"
+            )
+            invalid_plan = {
+                "schema_version": "1",
+                "nodes": [{
+                    "id": "worker-review",
+                    "kind": "delegate",
+                    "instruction_ranges": [{
+                        "start_instruction_id": (
+                            "iu-000000000000000000000000"
+                        ),
+                        "end_instruction_id": (
+                            "iu-000000000000000000000000"
+                        ),
+                    }],
+                    "depends_on": [],
+                    "capability_ids": [],
+                }],
+            }
+            plan_args = {
+                "skill_name": "portable-budget-workflow",
+                "body_sha256": catalog["body_sha256"],
+                "catalog_sha256": catalog["catalog_sha256"],
+                "required": [delegate_id],
+                "optional": [],
+                "unsupported": [],
+                "workflow_plan": invalid_plan,
+            }
+            responses = [
+                _tool_response(
+                    "main", "skill_view",
+                    {"name": "portable-budget-workflow"},
+                ),
+                _tool_response(
+                    "bad-plan", "submit_skill_capability_plan", plan_args,
+                ),
+            ]
+            request_bodies: list[dict] = []
+
+            class Client:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, exc_type, exc, tb):
+                    return False
+
+                def stream(self, method, url, **kwargs):
+                    request_bodies.append(kwargs["json"])
+                    return _Response(responses.pop(0))
+
+            async def fake_dispatch(name, args, *, context):
+                if name == "skill_view":
+                    return json.dumps({
+                        **package,
+                        "success": True,
+                        "skill_dir": str(root),
+                    }, ensure_ascii=False)
+                if name == "submit_skill_capability_plan":
+                    return await submit_skill_capability_plan(
+                        **args, context=context
+                    )
+                raise AssertionError(f"unexpected dispatch: {name}")
+
+            skill_record = {
+                "name": "portable-budget-workflow",
+                "description": package["description"],
+                "scope": "session",
+                "path": str(root / "SKILL.md"),
+                "skill_dir": str(root),
+            }
+            with (
+                patch("workspace_context.WORKSPACE_ROOT", Path(temp_dir) / "ws"),
+                patch("agent_loop.httpx.AsyncClient", Client),
+                patch("agent_loop.dispatch", fake_dispatch),
+                patch("agent_loop.build_system_prompt", return_value="system"),
+                patch("agent_loop.load_workspace_context", return_value=""),
+                patch("agent_loop._fetch_goal", AsyncMock(return_value=None)),
+                patch(
+                    "agent_loop._safe_build_standard_skill_capability_catalog",
+                    return_value=(catalog, None),
+                ),
+                patch(
+                    "skills.scanner.find_all_skills",
+                    return_value=[skill_record],
+                ),
+            ):
+                events = [event async for event in run_stream(
+                    "mock-pending-plan-budget-terminal",
+                    [{
+                        "role": "user",
+                        "content": "运行 portable-budget-workflow",
+                    }],
+                    enabled,
+                    provider_override=provider,
+                    allow_session_mcp=False,
+                    user_id="u-pending-plan-budget-terminal",
+                    session_id="s-pending-plan-budget-terminal",
+                    max_iterations=2,
+                )]
+
+        self.assertFalse(responses)
+        self.assertEqual(2, len(request_bodies))
+        event_types = [event.get("event_type") for event in events]
+        self.assertNotIn("verifier.requested", event_types)
+        self.assertNotIn("verifier.completed", event_types)
+        self.assertFalse(any(
+            event.get("type") == "tool_progress"
+            and "artifact" in str(event.get("msg") or "").casefold()
+            for event in events
+        ))
+        terminal = next(
+            event for event in events if event.get("event_type") == "run.failed"
+        )
+        self.assertTrue(terminal["payload"]["workflow_incomplete"])
+        self.assertIn(
+            "submit and install the typed capability plan",
+            terminal["payload"]["workflow_reason"],
+        )
+        self.assertIsNone(terminal["payload"]["verifier"])
+
+    async def test_schema_invalid_plan_calls_are_bounded_without_dispatch(self):
+        provider = {
+            "id": "mock-bounded-plan-schema-validation",
+            "base_url": "http://model.invalid/v1",
+            "api_model": "mock-bounded-plan-schema-validation",
+            "api_key": "EMPTY",
+            "protocol": "openai",
+            "provider": "mock",
+            "context_length": 64_000,
+            "is_multimodal": True,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "portable-schema-workflow"
+            root.mkdir()
+            (root / "SKILL.md").write_text(
+                "---\nname: portable-schema-workflow\n"
+                "description: Coordinate a generic delegated review.\n---\n"
+                "Delegate one independent worker and aggregate its result.\n",
+                encoding="utf-8",
+            )
+            package = load_skill_content(
+                root / "SKILL.md", skill_dir=str(root)
+            )
+            enabled = [
+                "skill_view",
+                "submit_skill_capability_plan",
+                "delegate_task",
+            ]
+            catalog = _build_standard_skill_capability_catalog(
+                "portable-schema-workflow", package, enabled, (),
+            )
+            # Missing every required plan field after skill_name.  This is
+            # rejected by the pure registry preflight and must still consume
+            # the bounded model-correctable plan-validation budget.
+            invalid_args = {"skill_name": "portable-schema-workflow"}
+            responses = [
+                _tool_response(
+                    "main", "skill_view",
+                    {"name": "portable-schema-workflow"},
+                ),
+                *[
+                    _tool_response(
+                        f"bad-schema-plan-{attempt}",
+                        "submit_skill_capability_plan",
+                        invalid_args,
+                    )
+                    for attempt in range(1, 4)
+                ],
+            ]
+            request_bodies: list[dict] = []
+            plan_dispatch_count = 0
+
+            class Client:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, exc_type, exc, tb):
+                    return False
+
+                def stream(self, method, url, **kwargs):
+                    request_bodies.append(kwargs["json"])
+                    return _Response(responses.pop(0))
+
+            async def fake_dispatch(name, args, *, context):
+                nonlocal plan_dispatch_count
+                if name == "skill_view":
+                    return json.dumps({
+                        **package,
+                        "success": True,
+                        "skill_dir": str(root),
+                    }, ensure_ascii=False)
+                if name == "submit_skill_capability_plan":
+                    plan_dispatch_count += 1
+                    return await submit_skill_capability_plan(
+                        **args, context=context
+                    )
+                raise AssertionError(f"unexpected dispatch: {name}")
+
+            skill_record = {
+                "name": "portable-schema-workflow",
+                "description": package["description"],
+                "scope": "session",
+                "path": str(root / "SKILL.md"),
+                "skill_dir": str(root),
+            }
+            with (
+                patch("workspace_context.WORKSPACE_ROOT", Path(temp_dir) / "ws"),
+                patch("agent_loop.httpx.AsyncClient", Client),
+                patch("agent_loop.dispatch", fake_dispatch),
+                patch("agent_loop.build_system_prompt", return_value="system"),
+                patch("agent_loop.load_workspace_context", return_value=""),
+                patch("agent_loop._fetch_goal", AsyncMock(return_value=None)),
+                patch(
+                    "agent_loop._safe_build_standard_skill_capability_catalog",
+                    return_value=(catalog, None),
+                ),
+                patch(
+                    "skills.scanner.find_all_skills",
+                    return_value=[skill_record],
+                ),
+            ):
+                events = [event async for event in run_stream(
+                    "mock-bounded-plan-schema-validation",
+                    [{"role": "user", "content": "运行 portable-schema-workflow"}],
+                    enabled,
+                    provider_override=provider,
+                    allow_session_mcp=False,
+                    user_id="u-bounded-plan-schema-validation",
+                    session_id="s-bounded-plan-schema-validation",
+                    max_iterations=8,
+                )]
+
+        self.assertFalse(responses)
+        self.assertEqual(0, plan_dispatch_count)
+        self.assertEqual(4, len(request_bodies))
+        for body in request_bodies[1:]:
+            exposed = {
+                item["function"]["name"] for item in body.get("tools") or []
+            }
+            self.assertIn("submit_skill_capability_plan", exposed)
+            self.assertLessEqual(
+                exposed,
+                {"skill_view", "submit_skill_capability_plan"},
+            )
+            self.assertEqual("required", body.get("tool_choice"))
+        terminal = next(
+            event for event in events if event.get("event_type") == "run.failed"
+        )
+        self.assertEqual(3, terminal["payload"]["attempt"])
+        self.assertEqual(
+            "tool_schema_validation_failed",
+            terminal["payload"]["error_code"],
+        )
+        self.assertEqual(
+            "capability_plan_semantic_validation_exhausted",
+            terminal["payload"]["terminal_reason"],
+        )
+        self.assertEqual("error", events[-1]["type"])
+
     async def test_direct_browser_continuation_has_exact_user_authority(self):
         provider = {
             "id": "mock-direct-browser-policy",
@@ -3279,6 +3870,18 @@ class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
                     "name": "portable-skill",
                     "file_path": "references/runtime.md",
                 }),
+                _tool_response(
+                    "amended-plan-invalid",
+                    "submit_skill_capability_plan",
+                    {
+                        "skill_name": "portable-skill",
+                        "body_sha256": amended["body_sha256"],
+                        "catalog_sha256": amended["catalog_sha256"],
+                        "required": ["cap-not-issued-by-this-catalog"],
+                        "optional": [],
+                        "unsupported": [],
+                    },
+                ),
                 _tool_response("amended-plan", "submit_skill_capability_plan", {
                     "skill_name": "portable-skill",
                     "body_sha256": amended["body_sha256"],
@@ -3417,7 +4020,12 @@ class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
             {"submit_skill_capability_plan"},
             exposed[3],
         )
-        self.assertIn("run_skill_script", exposed[4])
+        self.assertEqual(
+            {"skill_view", "submit_skill_capability_plan"},
+            exposed[4],
+            "a rejected amended plan must not revive the superseded epoch",
+        )
+        self.assertIn("run_skill_script", exposed[5])
         self.assertEqual({"type": "done", "finish_reason": "stop"}, events[-1])
 
     async def test_plan_is_required_before_selected_tools_and_exact_boundary_install(self):
@@ -3587,6 +4195,469 @@ class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
             set(dispatch_context.enabled_tools),
         )
         self.assertEqual({"type": "done", "finish_reason": "stop"}, events[-1])
+
+    async def test_handler_acceptance_does_not_consume_plan_frontier_when_runtime_install_fails(self):
+        provider = {
+            "id": "mock-capability-plan-install-failure",
+            "base_url": "http://model.invalid/v1",
+            "api_model": "mock-capability-plan-install-failure",
+            "api_key": "EMPTY",
+            "protocol": "openai",
+            "provider": "mock",
+            "context_length": 64_000,
+            "is_multimodal": True,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "portable-skill"
+            root.mkdir()
+            (root / "SKILL.md").write_text(
+                "---\nname: portable-skill\n"
+                "description: Inspect one local input.\n---\n"
+                "Use `read_file` to inspect the requested input.\n",
+                encoding="utf-8",
+            )
+            package = load_skill_content(
+                root / "SKILL.md", skill_dir=str(root)
+            )
+            enabled = [
+                "skill_view", "submit_skill_capability_plan", "read_file",
+            ]
+            catalog = _build_standard_skill_capability_catalog(
+                "portable-skill", package, enabled, (),
+            )
+            read_id = next(
+                item["id"] for item in catalog["candidates"]
+                if item.get("kind") == "native_tool"
+                and item.get("tool_name") == "read_file"
+            )
+            plan_args = {
+                "skill_name": "portable-skill",
+                "body_sha256": catalog["body_sha256"],
+                "required": [read_id],
+                "optional": [],
+                "unsupported": [],
+            }
+            responses = [
+                _tool_response(
+                    "read-main", "skill_view", {"name": "portable-skill"}
+                ),
+                _tool_response(
+                    "submit-plan-1", "submit_skill_capability_plan", plan_args
+                ),
+            ]
+            request_bodies: list[dict] = []
+
+            class Client:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, exc_type, exc, tb):
+                    return False
+
+                def stream(self, method, url, **kwargs):
+                    request_bodies.append(kwargs["json"])
+                    return _Response(responses.pop(0))
+
+            async def fake_dispatch(name, args, *, context):
+                if name == "skill_view":
+                    return json.dumps({
+                        **package,
+                        "success": True,
+                        "skill_dir": str(root),
+                    }, ensure_ascii=False)
+                if name == "submit_skill_capability_plan":
+                    return await submit_skill_capability_plan(
+                        **args, context=context
+                    )
+                raise AssertionError(name)
+
+            skill_record = {
+                "name": "portable-skill",
+                "description": package["description"],
+                "scope": "session",
+                "path": str(root / "SKILL.md"),
+                "skill_dir": str(root),
+            }
+            with (
+                patch("workspace_context.WORKSPACE_ROOT", Path(temp_dir) / "ws"),
+                patch("agent_loop.httpx.AsyncClient", Client),
+                patch("agent_loop.dispatch", fake_dispatch),
+                patch("agent_loop.build_system_prompt", return_value="system"),
+                patch("agent_loop.load_workspace_context", return_value=""),
+                patch("agent_loop._fetch_goal", AsyncMock(return_value=None)),
+                patch(
+                    "agent_loop._preflight_standard_skill_runtime_selection",
+                    return_value={
+                        "valid": False,
+                        "blockers": [{"reason": "runtime_profile_unavailable"}],
+                    },
+                ),
+                patch(
+                    "skills.scanner.find_all_skills",
+                    return_value=[skill_record],
+                ),
+            ):
+                events = [event async for event in run_stream(
+                    "mock-capability-plan-install-failure",
+                    [{"role": "user", "content": "运行 portable-skill"}],
+                    enabled,
+                    provider_override=provider,
+                    allow_session_mcp=False,
+                    user_id="u-capability-plan-install-failure",
+                    session_id="s-capability-plan-install-failure",
+                    max_iterations=5,
+                )]
+
+        self.assertFalse(responses)
+        for body in request_bodies[1:]:
+            exposed = {
+                item["function"]["name"]
+                for item in body.get("tools") or []
+            }
+            self.assertIn("submit_skill_capability_plan", exposed)
+            self.assertNotIn("read_file", exposed)
+            self.assertEqual("required", body.get("tool_choice"))
+        failed = [
+            event for event in events
+            if event.get("event_type") == "run.failed"
+        ]
+        self.assertEqual(1, len(failed))
+        payload = failed[0]["payload"]
+        self.assertEqual(
+            "capability_plan_runtime_preflight_failed",
+            payload["error_code"],
+        )
+        self.assertEqual(
+            "capability_plan_runtime_install_failed",
+            payload["terminal_reason"],
+        )
+        plan_completed = [
+            event for event in events
+            if event.get("event_type") == "tool.completed"
+            and event.get("tool_name") == "submit_skill_capability_plan"
+        ]
+        plan_failed = [
+            event for event in events
+            if event.get("event_type") == "tool.failed"
+            and event.get("tool_name") == "submit_skill_capability_plan"
+        ]
+        self.assertFalse(plan_completed)
+        self.assertEqual(1, len(plan_failed))
+        self.assertEqual(
+            "error", plan_failed[0]["payload"]["outcome"]
+        )
+        self.assertEqual("error", events[-1]["type"])
+
+    async def test_live_skill_change_after_handler_acceptance_blocks_install(self):
+        provider = {
+            "id": "mock-capability-plan-toctou",
+            "base_url": "http://model.invalid/v1",
+            "api_model": "mock-capability-plan-toctou",
+            "api_key": "EMPTY",
+            "protocol": "openai",
+            "provider": "mock",
+            "context_length": 64_000,
+            "is_multimodal": True,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "portable-skill"
+            root.mkdir()
+            main = root / "SKILL.md"
+            main.write_text(
+                "---\nname: portable-skill\n"
+                "description: Inspect one local input.\n---\n"
+                "Use `read_file` to inspect the requested input.\n",
+                encoding="utf-8",
+            )
+            package = load_skill_content(main, skill_dir=str(root))
+            enabled = [
+                "skill_view", "submit_skill_capability_plan", "read_file",
+            ]
+            catalog = _build_standard_skill_capability_catalog(
+                "portable-skill", package, enabled, (),
+            )
+            read_id = next(
+                item["id"] for item in catalog["candidates"]
+                if item.get("kind") == "native_tool"
+                and item.get("tool_name") == "read_file"
+            )
+            plan_args = {
+                "skill_name": "portable-skill",
+                "body_sha256": catalog["body_sha256"],
+                "required": [read_id],
+                "optional": [],
+                "unsupported": [],
+            }
+            responses = [
+                _tool_response(
+                    "read-main", "skill_view", {"name": "portable-skill"}
+                ),
+                _tool_response(
+                    "submit-plan", "submit_skill_capability_plan", plan_args
+                ),
+            ]
+            request_bodies: list[dict] = []
+
+            class Client:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, exc_type, exc, tb):
+                    return False
+
+                def stream(self, method, url, **kwargs):
+                    request_bodies.append(kwargs["json"])
+                    return _Response(responses.pop(0))
+
+            async def fake_dispatch(name, args, *, context):
+                if name == "skill_view":
+                    return json.dumps({
+                        **package,
+                        "success": True,
+                        "skill_dir": str(root),
+                    }, ensure_ascii=False)
+                if name == "submit_skill_capability_plan":
+                    accepted = await submit_skill_capability_plan(
+                        **args, context=context
+                    )
+                    # Deterministic fault injection at the exact handler-to-
+                    # installer boundary. The accepted payload must not mint
+                    # authority over bytes that changed before commit.
+                    main.write_text(
+                        "---\nname: portable-skill\n"
+                        "description: changed concurrently\n---\n"
+                        "Do something else.\n",
+                        encoding="utf-8",
+                    )
+                    return accepted
+                raise AssertionError(name)
+
+            skill_record = {
+                "name": "portable-skill",
+                "description": package["description"],
+                "scope": "session",
+                "path": str(main),
+                "skill_dir": str(root),
+            }
+            with (
+                patch("workspace_context.WORKSPACE_ROOT", Path(temp_dir) / "ws"),
+                patch("agent_loop.httpx.AsyncClient", Client),
+                patch("agent_loop.dispatch", fake_dispatch),
+                patch("agent_loop.build_system_prompt", return_value="system"),
+                patch("agent_loop.load_workspace_context", return_value=""),
+                patch("agent_loop._fetch_goal", AsyncMock(return_value=None)),
+                patch("skills.scanner.find_all_skills", return_value=[skill_record]),
+            ):
+                events = [event async for event in run_stream(
+                    "mock-capability-plan-toctou",
+                    [{"role": "user", "content": "运行 portable-skill"}],
+                    enabled,
+                    provider_override=provider,
+                    allow_session_mcp=False,
+                    user_id="u-capability-plan-toctou",
+                    session_id="s-capability-plan-toctou",
+                    max_iterations=5,
+                )]
+
+        self.assertFalse(responses)
+        self.assertEqual(2, len(request_bodies))
+        failed = [
+            event for event in events
+            if event.get("event_type") == "run.failed"
+        ]
+        self.assertEqual(1, len(failed))
+        self.assertEqual(
+            "capability_plan_document_changed",
+            failed[0]["payload"]["error_code"],
+        )
+        self.assertEqual(
+            "capability_plan_runtime_install_failed",
+            failed[0]["payload"]["terminal_reason"],
+        )
+        self.assertFalse(any(
+            event.get("event_type") == "tool.completed"
+            and event.get("tool_name") == "submit_skill_capability_plan"
+            for event in events
+        ))
+        self.assertTrue(any(
+            event.get("event_type") == "tool.failed"
+            and event.get("tool_name") == "submit_skill_capability_plan"
+            for event in events
+        ))
+        self.assertEqual("error", events[-1]["type"])
+
+    async def test_runtime_projection_failure_never_commits_plan_authority(self):
+        provider = {
+            "id": "mock-capability-plan-atomic-install",
+            "base_url": "http://model.invalid/v1",
+            "api_model": "mock-capability-plan-atomic-install",
+            "api_key": "EMPTY",
+            "protocol": "openai",
+            "provider": "mock",
+            "context_length": 64_000,
+            "is_multimodal": True,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "portable-artifact-workflow"
+            root.mkdir()
+            main = root / "SKILL.md"
+            main.write_text(
+                "---\nname: portable-artifact-workflow\n"
+                "description: Produce one generic delegated artifact.\n---\n"
+                "Delegate one worker to inspect the input and use `write_file` "
+                "to create `report.md`.\n",
+                encoding="utf-8",
+            )
+            package = load_skill_content(main, skill_dir=str(root))
+            enabled = [
+                "skill_view",
+                "submit_skill_capability_plan",
+                "delegate_task",
+                "write_file",
+            ]
+            catalog = _build_standard_skill_capability_catalog(
+                "portable-artifact-workflow", package, enabled, (),
+            )
+            self.assertTrue(catalog["workflow_ir_required"])
+            by_tool = {
+                item["tool_name"]: item["id"]
+                for item in catalog["candidates"]
+                if item.get("kind") == "native_tool"
+            }
+            units = [
+                unit
+                for document in catalog["instruction_documents"]
+                for unit in document.units
+                if unit.kind != "heading"
+            ]
+            self.assertTrue(units)
+            plan_args = {
+                "skill_name": "portable-artifact-workflow",
+                "body_sha256": catalog["body_sha256"],
+                "catalog_sha256": catalog["catalog_sha256"],
+                "required": [
+                    by_tool["delegate_task"], by_tool["write_file"],
+                ],
+                "optional": [],
+                "unsupported": [],
+                "workflow_plan": {
+                    "schema_version": "1",
+                    "nodes": [{
+                        "id": "artifact-package",
+                        "kind": "artifact",
+                        "instruction_ranges": [{
+                            "start_instruction_id": units[0].id,
+                            "end_instruction_id": units[-1].id,
+                        }],
+                        "depends_on": [],
+                        "capability_ids": [by_tool["write_file"]],
+                    }],
+                    "outputs": [{
+                        "id": "report.md",
+                        "producer_node_ids": ["artifact-package"],
+                    }],
+                },
+            }
+            responses = [
+                _tool_response(
+                    "read-main", "skill_view",
+                    {"name": "portable-artifact-workflow"},
+                ),
+                _tool_response(
+                    "submit-plan", "submit_skill_capability_plan", plan_args,
+                ),
+            ]
+            request_bodies: list[dict] = []
+
+            class Client:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, exc_type, exc, tb):
+                    return False
+
+                def stream(self, method, url, **kwargs):
+                    request_bodies.append(kwargs["json"])
+                    return _Response(responses.pop(0))
+
+            async def fake_dispatch(name, args, *, context):
+                if name == "skill_view":
+                    return json.dumps({
+                        **package,
+                        "success": True,
+                        "skill_dir": str(root),
+                    }, ensure_ascii=False)
+                if name == "submit_skill_capability_plan":
+                    return await submit_skill_capability_plan(
+                        **args, context=context
+                    )
+                raise AssertionError(name)
+
+            skill_record = {
+                "name": "portable-artifact-workflow",
+                "description": package["description"],
+                "scope": "session",
+                "path": str(main),
+                "skill_dir": str(root),
+            }
+            projection_fault = RuntimeError("synthetic projection fault")
+            with (
+                patch("workspace_context.WORKSPACE_ROOT", Path(temp_dir) / "ws"),
+                patch("agent_loop.httpx.AsyncClient", Client),
+                patch("agent_loop.dispatch", fake_dispatch),
+                patch("agent_loop.build_system_prompt", return_value="system"),
+                patch("agent_loop.load_workspace_context", return_value=""),
+                patch("agent_loop._fetch_goal", AsyncMock(return_value=None)),
+                patch(
+                    "agent_loop._compile_run_artifact_plan",
+                    side_effect=projection_fault,
+                ) as compile_artifacts,
+                patch("skills.scanner.find_all_skills", return_value=[skill_record]),
+            ):
+                events = [event async for event in run_stream(
+                    "mock-capability-plan-atomic-install",
+                    [{
+                        "role": "user",
+                        "content": "运行 portable-artifact-workflow",
+                    }],
+                    enabled,
+                    provider_override=provider,
+                    allow_session_mcp=False,
+                    user_id="u-capability-plan-atomic-install",
+                    session_id="s-capability-plan-atomic-install",
+                    max_iterations=5,
+                )]
+
+        self.assertFalse(responses)
+        self.assertEqual(2, len(request_bodies))
+        compile_artifacts.assert_called_once()
+        terminal = next(
+            event for event in events if event.get("event_type") == "run.failed"
+        )
+        self.assertEqual(
+            "capability_plan_install_derivation_failed",
+            terminal["payload"]["error_code"],
+        )
+        self.assertFalse(any(
+            event.get("event_type") == "tool.completed"
+            and event.get("tool_name") == "submit_skill_capability_plan"
+            for event in events
+        ))
+        self.assertTrue(any(
+            event.get("event_type") == "tool.failed"
+            and event.get("tool_name") == "submit_skill_capability_plan"
+            for event in events
+        ))
+        self.assertEqual("error", events[-1]["type"])
 
     async def test_selected_write_capability_is_reusable_for_three_files(self):
         provider = {

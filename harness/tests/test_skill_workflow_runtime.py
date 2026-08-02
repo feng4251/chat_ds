@@ -1989,6 +1989,114 @@ class SkillWorkflowRuntimeTests(unittest.TestCase):
         self.assertNotIn("results/review.txt", review_paths)
         self.assertNotIn("results/independent.txt", review_paths)
 
+    def test_workflow_ir_aggregation_reads_only_exact_dag_predecessors(self):
+        plan = {
+            "selection": "workflow_ir",
+            "aggregation_steps": [
+                {
+                    "id": "selected-aggregate",
+                    "input_worker_ids": ["declared-worker"],
+                    "depends_on": [],
+                },
+                {
+                    "id": "final-synthesis",
+                    "input_worker_ids": [],
+                    "depends_on": ["selected-aggregate"],
+                },
+            ],
+        }
+        state = HarnessRunState(original_user_text="run exact DAG")
+        state.skill_worker_results["generic"] = {
+            "declared-worker": {
+                "status": "completed",
+                "result_path": "results/declared.json",
+            },
+            "unrelated-worker": {
+                "status": "completed",
+                "result_path": "results/unrelated.json",
+            },
+        }
+        state.skill_aggregation_results["generic"] = {
+            "selected-aggregate": {
+                "status": "completed",
+                "result_path": "results/selected-aggregate.json",
+            },
+            "unrelated-aggregate": {
+                "status": "completed",
+                "result_path": "results/unrelated-aggregate.json",
+            },
+        }
+
+        selected_paths = _prerequisite_result_paths(
+            state,
+            "generic",
+            plan,
+            "aggregation",
+            step_id="selected-aggregate",
+        )
+        self.assertEqual(["results/declared.json"], selected_paths)
+
+        synthesis_paths = _prerequisite_result_paths(
+            state,
+            "generic",
+            plan,
+            "synthesis",
+            step_id="final-synthesis",
+        )
+        self.assertEqual(
+            ["results/selected-aggregate.json"],
+            synthesis_paths,
+        )
+
+    def test_workflow_ir_wave_barrier_does_not_expand_worker_data_dependencies(self):
+        plan = {
+            "selection": "workflow_ir",
+            "workers": {
+                "worker-a": {"dependencies": []},
+                "worker-b": {"dependencies": []},
+                "worker-c": {"dependencies": ["worker-a"]},
+            },
+            "waves": [
+                {
+                    "id": "parallel-a-b",
+                    "workers": ["worker-a", "worker-b"],
+                    "dependencies": [],
+                },
+                {
+                    "id": "after-barrier",
+                    "workers": ["worker-c"],
+                    "dependencies": ["parallel-a-b"],
+                },
+            ],
+        }
+        state = HarnessRunState(original_user_text="run exact worker DAG")
+        state.skill_worker_results["generic"] = {
+            "worker-a": {
+                "status": "completed",
+                "result_path": "results/a.json",
+            },
+            "worker-b": {
+                "status": "completed",
+                "result_path": "results/b.json",
+            },
+        }
+        wave = plan["waves"][1]
+        self.assertEqual(
+            ["worker-a"],
+            _declared_worker_dependencies(plan, wave, "worker-c"),
+        )
+        self.assertEqual(
+            ["results/a.json"],
+            _prerequisite_result_paths(
+                state,
+                "generic",
+                plan,
+                "worker",
+                worker_id="worker-c",
+                wave=wave,
+            ),
+        )
+
     def test_out_of_order_worker_and_aggregation_results_are_not_credited(self):
         contract = _generic_contract()
         contract["execution_contract"]["aggregation"] = {

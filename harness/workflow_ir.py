@@ -30,8 +30,11 @@ from dataclasses import dataclass, replace
 from pathlib import PurePosixPath
 from typing import Any
 
+from delegated_result_contract import project_object_result_contract
+
 
 WORKFLOW_IR_SCHEMA_VERSION = "1"
+WORKFLOW_PLAN_SCHEMA_VERSION = "1"
 
 MAX_DOCUMENT_CHARS = 1_000_000
 MAX_DOCUMENT_LINES = 50_000
@@ -40,6 +43,7 @@ MAX_INSTRUCTION_UNITS = 4_096
 MAX_INSTRUCTION_UNIT_CHARS = 32_768
 MAX_SOURCE_PATH_CHARS = 1_024
 MAX_IR_JSON_BYTES = 1_000_000
+MAX_WORKFLOW_PLAN_JSON_BYTES = 128 * 1024
 MAX_IR_JSON_DEPTH = 32
 MAX_IR_JSON_VALUES = 100_000
 MAX_JSON_STRING_CHARS = 131_072
@@ -56,6 +60,10 @@ MAX_RESULT_SCHEMA_BYTES = 65_536
 MAX_PARALLELISM = 64
 MAX_ROUND = 128
 MAX_ITERATIONS_PER_NODE = 128
+MAX_INSTRUCTION_RANGES_PER_NODE = 512
+MAX_TOTAL_INSTRUCTION_RANGES = 4_096
+MAX_INSTRUCTION_PREVIEW_CHARS = 64
+MAX_NODES_PER_INSTRUCTION = 16
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._:@/-]{0,159}$")
@@ -153,6 +161,36 @@ _COUNT_FIELDS = frozenset(
     {"documents", "instruction_units", "nodes", "coverage", "outputs"}
 )
 _RECEIPT_FIELDS = frozenset({"node_id", "status", "result_sha256"})
+_WORKFLOW_PLAN_FIELDS = frozenset({"schema_version", "nodes", "outputs"})
+_WORKFLOW_PLAN_NODE_FIELDS = frozenset(
+    {
+        "id",
+        "kind",
+        "title",
+        "role",
+        "phase",
+        "round",
+        "instruction_ranges",
+        "depends_on",
+        "capability_ids",
+        "result_schema",
+    }
+)
+_WORKFLOW_PLAN_RANGE_FIELDS = frozenset(
+    {"start_instruction_id", "end_instruction_id"}
+)
+_WORKFLOW_PLAN_OUTPUT_FIELDS = frozenset({"id", "producer_node_ids"})
+_CHILD_AGENT_NODE_KINDS = frozenset(
+    {
+        "classify",
+        "retrieve",
+        "delegate",
+        "aggregate",
+        "verify",
+        "synthesize",
+        "artifact",
+    }
+)
 
 
 class InstructionDocumentError(ValueError):
@@ -767,6 +805,60 @@ def instruction_catalog_payload(
     }
 
 
+def workflow_plan_instruction_catalog_payload(
+    documents: Sequence[InstructionDocument],
+) -> dict[str, Any]:
+    """Return the compact semantic-planning projection of exact authority.
+
+    The full instruction text and every content/digest binding stay runtime
+    owned.  The model already received the authoritative documents through
+    ``skill_view``; it needs only stable unit coordinates plus a short preview
+    to group adjacent instructions into semantic workflow nodes.  The exact
+    catalog digest binds this projection to the immutable runtime documents.
+    """
+
+    normalized, units = _validate_authoritative_documents(documents)
+    digest = _sha256_text(
+        _canonical_json([document.binding_dict() for document in normalized])
+    )
+
+    def preview(text: str) -> str:
+        collapsed = " ".join(str(text or "").split())
+        return collapsed[:MAX_INSTRUCTION_PREVIEW_CHARS]
+
+    return {
+        "schema_version": WORKFLOW_PLAN_SCHEMA_VERSION,
+        "catalog_sha256": digest,
+        "documents": [
+            {
+                "path": document.source_path,
+                "unit_count": len(document.units),
+                "units": [
+                    {
+                        "id": unit.id,
+                        "kind": unit.kind,
+                        "start_line": unit.start_line,
+                        "end_line": unit.end_line,
+                        "preview": preview(unit.text),
+                    }
+                    for unit in document.units
+                ],
+            }
+            for document in normalized
+        ],
+        "counts": {
+            "documents": len(normalized),
+            "instruction_units": len(units),
+        },
+        "policy": {
+            "emit_compact_workflow_plan_only": True,
+            "coalesce_adjacent_units_into_ranges": True,
+            "runtime_expands_and_validates_complete_ir": True,
+            "unknown_or_stale_ids_rejected": True,
+        },
+    }
+
+
 def _validate_authoritative_documents(
     documents: Sequence[InstructionDocument],
 ) -> tuple[tuple[InstructionDocument, ...], tuple[InstructionUnit, ...]]:
@@ -1019,6 +1111,32 @@ def _parse_result_schema(value: Any, path: str) -> str:
         _raise_ir(
             "result_schema_too_large",
             f"result schema exceeds {MAX_RESULT_SCHEMA_BYTES} bytes",
+            path,
+        )
+    # Delegate execution uses the native registry's bounded JSON-Schema
+    # dialect.  Validate that exact dialect before a workflow can be accepted
+    # or installed, rather than discovering an invalid schema only after its
+    # child has entered the execution queue.
+    from tools.registry import json_schema_shape_error
+
+    schema_error = json_schema_shape_error(
+        schema,
+        schema_path=path,
+        reject_unsupported_keywords=True,
+    )
+    if schema_error is not None:
+        _raise_ir(
+            "invalid_result_schema",
+            "result schema is not executable by the bounded runtime: "
+            + schema_error,
+            path,
+        )
+    try:
+        project_object_result_contract(schema, schema_path=path)
+    except ValueError as exc:
+        _raise_ir(
+            "result_contract_transport_incompatible",
+            str(exc),
             path,
         )
     return encoded
@@ -1883,6 +2001,662 @@ def validate_workflow_ir(
     return replace(provisional, ir_sha256=ir_sha256)
 
 
+def _default_workflow_plan_result_schema() -> dict[str, Any]:
+    """Return a domain-neutral typed child-result envelope."""
+
+    return {
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string"},
+            "evidence": {"type": "array", "items": {}},
+            "gaps": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["summary", "evidence", "gaps"],
+        "additionalProperties": False,
+    }
+
+
+def compile_workflow_plan(
+    payload: Mapping[str, Any],
+    *,
+    documents: Sequence[InstructionDocument],
+    skill_name: str,
+    capability_catalog_sha256: str,
+    available_capability_ids: Iterable[str],
+    mandatory_node_capability_ids: Iterable[str] = (),
+    skill_version: str = "",
+    strict_instruction_execution: bool = True,
+) -> WorkflowIR:
+    """Compile a compact semantic plan into the complete authoritative IR.
+
+    The model groups exact instruction coordinates and declares only semantic
+    dependencies/capability needs.  Runtime-owned bindings, coverage, node
+    execution policy, result identities, output mappings, counts, and digest
+    are derived here and then revalidated through :func:`validate_workflow_ir`.
+    No model-authored plan can grant a tool or weaken mandatory coverage.
+    """
+
+    if not isinstance(strict_instruction_execution, bool):
+        _raise_ir(
+            "invalid_runtime_policy",
+            "strict_instruction_execution must be a runtime-owned boolean",
+        )
+    _assert_finite_bounded_json(payload)
+    try:
+        encoded = _canonical_json(payload).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise WorkflowIRValidationError(
+            "invalid_workflow_plan_json",
+            "workflow plan is not finite JSON",
+        ) from exc
+    if len(encoded) > MAX_WORKFLOW_PLAN_JSON_BYTES:
+        _raise_ir(
+            "workflow_plan_too_large",
+            (
+                "semantic workflow plan exceeds the "
+                f"{MAX_WORKFLOW_PLAN_JSON_BYTES} byte bound"
+            ),
+        )
+
+    authoritative_documents, instruction_units = _validate_authoritative_documents(
+        documents
+    )
+    root = _mapping(payload, "$")
+    _known_fields(root, _WORKFLOW_PLAN_FIELDS, "$")
+    if _text(
+        _required(root, "schema_version", "$"),
+        "$.schema_version",
+    ) != WORKFLOW_PLAN_SCHEMA_VERSION:
+        _raise_ir(
+            "unsupported_workflow_plan_schema_version",
+            f"schema_version must be {WORKFLOW_PLAN_SCHEMA_VERSION!r}",
+            "$.schema_version",
+        )
+
+    if isinstance(available_capability_ids, (str, bytes)) or not isinstance(
+        available_capability_ids, Iterable
+    ):
+        _raise_ir(
+            "invalid_capability_catalog",
+            "available_capability_ids must be an iterable of exact IDs",
+        )
+    available_ids_list: list[Any] = []
+    for raw_capability_id in available_capability_ids:
+        available_ids_list.append(raw_capability_id)
+        if len(available_ids_list) > MAX_CAPABILITY_IDS:
+            _raise_ir(
+                "too_many_capability_ids",
+                (
+                    "available capability selection exceeds the "
+                    f"{MAX_CAPABILITY_IDS} ID bound"
+                ),
+                "available_capability_ids",
+            )
+    available_ids = tuple(available_ids_list)
+    if isinstance(mandatory_node_capability_ids, (str, bytes)) or not isinstance(
+        mandatory_node_capability_ids, Iterable
+    ):
+        _raise_ir(
+            "invalid_capability_catalog",
+            "mandatory_node_capability_ids must be an iterable of exact IDs",
+        )
+    raw_mandatory_values: list[Any] = []
+    for raw_capability_id in mandatory_node_capability_ids:
+        raw_mandatory_values.append(raw_capability_id)
+        if len(raw_mandatory_values) > MAX_CAPABILITIES_PER_NODE:
+            _raise_ir(
+                "too_many_references",
+                (
+                    "mandatory node capability selection exceeds the "
+                    f"{MAX_CAPABILITIES_PER_NODE} ID bound"
+                ),
+                "mandatory_node_capability_ids",
+            )
+    raw_mandatory_ids = _id_list(
+        raw_mandatory_values,
+        "mandatory_node_capability_ids",
+        max_items=MAX_CAPABILITIES_PER_NODE,
+    )
+    mandatory_ids = tuple(sorted(raw_mandatory_ids))
+    available_id_set: set[str] = set()
+    for index, raw_id in enumerate(available_ids):
+        capability_id = _identifier(
+            raw_id, f"available_capability_ids[{index}]"
+        )
+        if capability_id in available_id_set:
+            _raise_ir(
+                "duplicate_capability_id",
+                f"duplicate available capability ID {capability_id!r}",
+                f"available_capability_ids[{index}]",
+            )
+        available_id_set.add(capability_id)
+    unknown_mandatory = sorted(set(mandatory_ids) - available_id_set)
+    if unknown_mandatory:
+        _raise_ir(
+            "unknown_mandatory_node_capability_id",
+            "runtime mandatory node capabilities are outside the selection",
+            "mandatory_node_capability_ids",
+        )
+
+    location_by_id: dict[str, tuple[int, int]] = {}
+    unit_by_id: dict[str, InstructionUnit] = {}
+    for document_index, document in enumerate(authoritative_documents):
+        for unit_index, unit in enumerate(document.units):
+            location_by_id[unit.id] = (document_index, unit_index)
+            unit_by_id[unit.id] = unit
+
+    raw_nodes = _list(_required(root, "nodes", "$"), "$.nodes")
+    if not raw_nodes:
+        _raise_ir(
+            "workflow_plan_missing_nodes",
+            "at least one semantic workflow node is required",
+            "$.nodes",
+        )
+    if len(raw_nodes) > MAX_NODES:
+        _raise_ir(
+            "too_many_nodes",
+            f"workflow plan exceeds the {MAX_NODES} node bound",
+            "$.nodes",
+        )
+
+    plan_nodes: list[dict[str, Any]] = []
+    seen_node_ids: set[str] = set()
+    total_ranges = 0
+    for node_index, raw_node in enumerate(raw_nodes):
+        prefix = f"$.nodes[{node_index}]"
+        item = _mapping(raw_node, prefix)
+        _known_fields(item, _WORKFLOW_PLAN_NODE_FIELDS, prefix)
+        node_id = _identifier(_required(item, "id", prefix), f"{prefix}.id")
+        if node_id in seen_node_ids:
+            _raise_ir(
+                "duplicate_node_id",
+                f"duplicate workflow node {node_id!r}",
+                f"{prefix}.id",
+            )
+        seen_node_ids.add(node_id)
+        kind = _text(_required(item, "kind", prefix), f"{prefix}.kind")
+        if kind not in _CHILD_AGENT_NODE_KINDS:
+            _raise_ir(
+                "unsupported_workflow_plan_node_kind",
+                (
+                    "compact workflow nodes must be executable by the "
+                    f"child-agent runtime: {sorted(_CHILD_AGENT_NODE_KINDS)}"
+                ),
+                f"{prefix}.kind",
+            )
+
+        raw_ranges = _list(
+            _required(item, "instruction_ranges", prefix),
+            f"{prefix}.instruction_ranges",
+        )
+        if not raw_ranges:
+            _raise_ir(
+                "workflow_plan_node_missing_instruction_range",
+                "every workflow node requires at least one instruction range",
+                f"{prefix}.instruction_ranges",
+            )
+        if len(raw_ranges) > MAX_INSTRUCTION_RANGES_PER_NODE:
+            _raise_ir(
+                "too_many_instruction_ranges",
+                (
+                    "node exceeds the "
+                    f"{MAX_INSTRUCTION_RANGES_PER_NODE} range bound"
+                ),
+                f"{prefix}.instruction_ranges",
+            )
+        total_ranges += len(raw_ranges)
+        if total_ranges > MAX_TOTAL_INSTRUCTION_RANGES:
+            _raise_ir(
+                "too_many_instruction_ranges",
+                (
+                    "workflow exceeds the "
+                    f"{MAX_TOTAL_INSTRUCTION_RANGES} total range bound"
+                ),
+                "$.nodes",
+            )
+
+        expanded_ids: list[str] = []
+        expanded_seen: set[str] = set()
+        for range_index, raw_range in enumerate(raw_ranges):
+            range_prefix = f"{prefix}.instruction_ranges[{range_index}]"
+            range_item = _mapping(raw_range, range_prefix)
+            _known_fields(
+                range_item, _WORKFLOW_PLAN_RANGE_FIELDS, range_prefix
+            )
+            start_id = _identifier(
+                _required(range_item, "start_instruction_id", range_prefix),
+                f"{range_prefix}.start_instruction_id",
+            )
+            end_id = _identifier(
+                _required(range_item, "end_instruction_id", range_prefix),
+                f"{range_prefix}.end_instruction_id",
+            )
+            if start_id not in location_by_id:
+                _raise_ir(
+                    "unknown_workflow_plan_instruction_id",
+                    "range start is unknown or stale",
+                    f"{range_prefix}.start_instruction_id",
+                )
+            if end_id not in location_by_id:
+                _raise_ir(
+                    "unknown_workflow_plan_instruction_id",
+                    "range end is unknown or stale",
+                    f"{range_prefix}.end_instruction_id",
+                )
+            start_document, start_index = location_by_id[start_id]
+            end_document, end_index = location_by_id[end_id]
+            if start_document != end_document:
+                _raise_ir(
+                    "cross_document_instruction_range",
+                    "one instruction range cannot cross document boundaries",
+                    range_prefix,
+                )
+            if start_index > end_index:
+                _raise_ir(
+                    "reversed_instruction_range",
+                    "instruction range start follows its end",
+                    range_prefix,
+                )
+            for unit in authoritative_documents[start_document].units[
+                start_index : end_index + 1
+            ]:
+                if unit.id in expanded_seen:
+                    _raise_ir(
+                        "overlapping_instruction_range",
+                        "ranges within one node must not overlap",
+                        range_prefix,
+                    )
+                expanded_seen.add(unit.id)
+                expanded_ids.append(unit.id)
+        if not any(unit_by_id[item].kind != "heading" for item in expanded_ids):
+            _raise_ir(
+                "workflow_plan_node_has_no_executable_instruction",
+                "a required child node cannot contain headings only",
+                f"{prefix}.instruction_ranges",
+            )
+        # Range order is a model presentation choice, not workflow semantics.
+        # Canonicalize against the frozen document coordinates so equivalent
+        # compact plans compile to one content-addressed runtime IR.
+        expanded_ids.sort(key=location_by_id.__getitem__)
+
+        dependencies = _id_list(
+            _required(item, "depends_on", prefix),
+            f"{prefix}.depends_on",
+            max_items=MAX_DEPENDENCIES_PER_NODE,
+        )
+        selected_capabilities = _id_list(
+            _required(item, "capability_ids", prefix),
+            f"{prefix}.capability_ids",
+            max_items=MAX_CAPABILITIES_PER_NODE,
+        )
+        node_capabilities = tuple(
+            sorted(set(selected_capabilities) | set(mandatory_ids))
+        )
+        unknown_capabilities = sorted(set(node_capabilities) - available_id_set)
+        if unknown_capabilities:
+            _raise_ir(
+                "unknown_capability_id",
+                "workflow node references an unselected capability ID",
+                f"{prefix}.capability_ids",
+            )
+        result_schema = item.get("result_schema")
+        if result_schema is None:
+            result_schema = _default_workflow_plan_result_schema()
+        _parse_result_schema(result_schema, f"{prefix}.result_schema")
+        plan_nodes.append(
+            {
+                "id": node_id,
+                "kind": kind,
+                "title": _text(
+                    item.get("title"),
+                    f"{prefix}.title",
+                    required=False,
+                    max_chars=MAX_SHORT_TEXT_CHARS,
+                ),
+                "role": _text(
+                    item.get("role"),
+                    f"{prefix}.role",
+                    required=False,
+                    max_chars=MAX_SHORT_TEXT_CHARS,
+                ),
+                "phase": _text(
+                    item.get("phase"),
+                    f"{prefix}.phase",
+                    required=False,
+                    max_chars=MAX_IDENTIFIER_CHARS,
+                ),
+                "round": (
+                    _bounded_int(
+                        item["round"], f"{prefix}.round", 1, MAX_ROUND
+                    )
+                    if "round" in item
+                    else None
+                ),
+                "instruction_ids": tuple(expanded_ids),
+                "depends_on": tuple(sorted(dependencies)),
+                "capability_ids": node_capabilities,
+                "result_schema": result_schema,
+            }
+        )
+
+    raw_outputs = _list(root.get("outputs", []), "$.outputs")
+    if len(raw_outputs) > MAX_OUTPUTS:
+        _raise_ir(
+            "too_many_outputs",
+            f"workflow plan exceeds the {MAX_OUTPUTS} output bound",
+            "$.outputs",
+        )
+    plan_outputs: list[dict[str, Any]] = []
+    seen_output_ids: set[str] = set()
+    for output_index, raw_output in enumerate(raw_outputs):
+        prefix = f"$.outputs[{output_index}]"
+        item = _mapping(raw_output, prefix)
+        _known_fields(item, _WORKFLOW_PLAN_OUTPUT_FIELDS, prefix)
+        output_id = _identifier(_required(item, "id", prefix), f"{prefix}.id")
+        if output_id in seen_output_ids:
+            _raise_ir(
+                "duplicate_output_id",
+                f"duplicate workflow output {output_id!r}",
+                f"{prefix}.id",
+            )
+        seen_output_ids.add(output_id)
+        producers = _id_list(
+            _required(item, "producer_node_ids", prefix),
+            f"{prefix}.producer_node_ids",
+            allow_empty=False,
+        )
+        unknown_producers = sorted(set(producers) - seen_node_ids)
+        if unknown_producers:
+            _raise_ir(
+                "unknown_output_producer",
+                "workflow output references undeclared producer nodes",
+                f"{prefix}.producer_node_ids",
+            )
+        plan_outputs.append(
+            {
+                "id": output_id,
+                "producer_node_ids": tuple(sorted(producers)),
+            }
+        )
+
+    plan_nodes.sort(key=lambda item: item["id"])
+    plan_outputs.sort(key=lambda item: item["id"])
+    output_ids_by_node: dict[str, list[str]] = {
+        item["id"]: [] for item in plan_nodes
+    }
+    node_instruction_ids = {
+        item["id"]: tuple(item["instruction_ids"]) for item in plan_nodes
+    }
+    complete_outputs: list[dict[str, Any]] = []
+    for output in plan_outputs:
+        output_instruction_ids = {
+            instruction_id
+            for producer_id in output["producer_node_ids"]
+            for instruction_id in node_instruction_ids[producer_id]
+        }
+        ordered_output_instruction_ids = [
+            unit.id
+            for unit in instruction_units
+            if unit.id in output_instruction_ids
+        ]
+        for producer_id in output["producer_node_ids"]:
+            output_ids_by_node[producer_id].append(output["id"])
+        complete_outputs.append(
+            {
+                "id": output["id"],
+                "required": True,
+                "instruction_ids": ordered_output_instruction_ids,
+                "producer_node_ids": list(output["producer_node_ids"]),
+            }
+        )
+
+    node_ids_by_instruction: dict[str, list[str]] = {
+        unit.id: [] for unit in instruction_units
+    }
+    for node in plan_nodes:
+        for instruction_id in node["instruction_ids"]:
+            node_ids_by_instruction[instruction_id].append(node["id"])
+    excessive_fanout = next(
+        (
+            instruction_id
+            for instruction_id, mapped_node_ids
+            in node_ids_by_instruction.items()
+            if len(mapped_node_ids) > MAX_NODES_PER_INSTRUCTION
+        ),
+        None,
+    )
+    if excessive_fanout is not None:
+        _raise_ir(
+            "instruction_fanout_too_large",
+            (
+                "one instruction may be assigned to at most "
+                f"{MAX_NODES_PER_INSTRUCTION} workflow nodes"
+            ),
+            f"coverage.{excessive_fanout}",
+        )
+    missing_executable = [
+        unit.id
+        for unit in instruction_units
+        if unit.kind != "heading" and not node_ids_by_instruction[unit.id]
+    ]
+    if strict_instruction_execution and missing_executable:
+        _raise_ir(
+            "runtime_required_instruction_unmapped",
+            "compact workflow plan leaves executable instruction units unmapped",
+            f"coverage.{missing_executable[0]}",
+        )
+
+    output_ids_by_instruction: dict[str, list[str]] = {
+        unit.id: [] for unit in instruction_units
+    }
+    for output in complete_outputs:
+        for instruction_id in output["instruction_ids"]:
+            output_ids_by_instruction[instruction_id].append(output["id"])
+
+    complete_nodes: list[dict[str, Any]] = []
+    for node in plan_nodes:
+        natural_result_id = f"result-{node['id']}"
+        result_id = (
+            natural_result_id
+            if len(natural_result_id) <= MAX_IDENTIFIER_CHARS
+            else "result-" + _sha256_text(node["id"])[:32]
+        )
+        complete_node = {
+            "id": node["id"],
+            "kind": node["kind"],
+            "executor": "child_agent",
+            "title": node["title"] or node["id"],
+            "role": node["role"] or node["title"] or node["id"],
+            "phase": node["phase"] or "workflow",
+            "required": True,
+            "instruction_ids": list(node["instruction_ids"]),
+            "depends_on": list(node["depends_on"]),
+            "capability_ids": list(node["capability_ids"]),
+            "result_id": result_id,
+            "result_schema": node["result_schema"],
+            "output_ids": sorted(output_ids_by_node[node["id"]]),
+            "join_policy": "all",
+        }
+        if node["round"] is not None:
+            complete_node["round"] = node["round"]
+        complete_nodes.append(complete_node)
+
+    coverage: list[dict[str, Any]] = []
+    for unit in instruction_units:
+        mapped_nodes = sorted(node_ids_by_instruction[unit.id])
+        if mapped_nodes:
+            coverage.append(
+                {
+                    "instruction_id": unit.id,
+                    "requirement": (
+                        "advisory" if unit.kind == "heading" else "required"
+                    ),
+                    "disposition": "mapped",
+                    "node_ids": mapped_nodes,
+                    "output_ids": sorted(output_ids_by_instruction[unit.id]),
+                    "reason": "",
+                }
+            )
+        else:
+            coverage.append(
+                {
+                    "instruction_id": unit.id,
+                    "requirement": "advisory",
+                    "disposition": "not_applicable",
+                    "node_ids": [],
+                    "output_ids": [],
+                    "reason": "Structural heading not assigned to an execution node.",
+                }
+            )
+
+    full_payload: dict[str, Any] = {
+        "schema_version": WORKFLOW_IR_SCHEMA_VERSION,
+        "complete": True,
+        "skill": {
+            "name": _text(
+                skill_name, "skill_name", max_chars=MAX_IDENTIFIER_CHARS
+            ),
+            **(
+                {"version": _text(skill_version, "skill_version", max_chars=128)}
+                if str(skill_version or "").strip()
+                else {}
+            ),
+        },
+        "documents": [
+            document.binding_dict() for document in authoritative_documents
+        ],
+        "capability_catalog_sha256": _sha256(
+            capability_catalog_sha256, "capability_catalog_sha256"
+        ),
+        "nodes": complete_nodes,
+        "coverage": coverage,
+        "outputs": complete_outputs,
+        "policies": {
+            "completion_policy": "all_required",
+            "failure_policy": "fail_closed",
+            "max_parallelism": min(
+                MAX_PARALLELISM, max(1, min(8, len(complete_nodes)))
+            ),
+            "max_iterations_per_node": 32,
+        },
+        "counts": {
+            "documents": len(authoritative_documents),
+            "instruction_units": len(instruction_units),
+            "nodes": len(complete_nodes),
+            "coverage": len(coverage),
+            "outputs": len(complete_outputs),
+        },
+    }
+    return validate_workflow_ir(
+        full_payload,
+        documents=authoritative_documents,
+        skill_name=skill_name,
+        capability_catalog_sha256=capability_catalog_sha256,
+        available_capability_ids=available_ids,
+        strict_instruction_execution=strict_instruction_execution,
+    )
+
+
+def workflow_plan_json_schema() -> dict[str, Any]:
+    """Return the bounded model-facing compact semantic-plan schema."""
+
+    identifier = {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": MAX_IDENTIFIER_CHARS,
+        "pattern": _IDENTIFIER_RE.pattern,
+    }
+
+    def id_array(max_items: int, *, min_items: int = 0) -> dict[str, Any]:
+        return {
+            "type": "array",
+            "items": dict(identifier),
+            "minItems": min_items,
+            "maxItems": max_items,
+        }
+
+    def strict_object(
+        properties: Mapping[str, Any], required: Sequence[str]
+    ) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": dict(properties),
+            "required": list(required),
+            "additionalProperties": False,
+        }
+
+    range_schema = strict_object(
+        {
+            "start_instruction_id": dict(identifier),
+            "end_instruction_id": dict(identifier),
+        },
+        ("start_instruction_id", "end_instruction_id"),
+    )
+    node_schema = strict_object(
+        {
+            "id": dict(identifier),
+            "kind": {
+                "type": "string",
+                "enum": sorted(_CHILD_AGENT_NODE_KINDS),
+            },
+            "title": {"type": "string", "maxLength": MAX_SHORT_TEXT_CHARS},
+            "role": {"type": "string", "maxLength": MAX_SHORT_TEXT_CHARS},
+            "phase": {"type": "string", "maxLength": MAX_IDENTIFIER_CHARS},
+            "round": {"type": "integer", "minimum": 1, "maximum": MAX_ROUND},
+            "instruction_ranges": {
+                "type": "array",
+                "items": range_schema,
+                "minItems": 1,
+                "maxItems": MAX_INSTRUCTION_RANGES_PER_NODE,
+                "description": (
+                    "Inclusive same-document ranges. Coalesce adjacent units; "
+                    "the runtime expands exact IDs and proves full coverage."
+                ),
+            },
+            "depends_on": id_array(MAX_DEPENDENCIES_PER_NODE),
+            "capability_ids": id_array(MAX_CAPABILITIES_PER_NODE),
+            "result_schema": {
+                "type": "object",
+                "maxProperties": MAX_REFERENCES_PER_ITEM,
+                "description": (
+                    "Optional typed child result schema. Omit to use the "
+                    "runtime's generic summary/evidence/gaps envelope."
+                ),
+            },
+        },
+        ("id", "kind", "instruction_ranges", "depends_on", "capability_ids"),
+    )
+    output_schema = strict_object(
+        {
+            "id": dict(identifier),
+            "producer_node_ids": id_array(
+                MAX_REFERENCES_PER_ITEM, min_items=1
+            ),
+        },
+        ("id", "producer_node_ids"),
+    )
+    return strict_object(
+        {
+            "schema_version": {
+                "type": "string",
+                "const": WORKFLOW_PLAN_SCHEMA_VERSION,
+            },
+            "nodes": {
+                "type": "array",
+                "items": node_schema,
+                "minItems": 1,
+                "maxItems": MAX_NODES,
+            },
+            "outputs": {
+                "type": "array",
+                "items": output_schema,
+                "maxItems": MAX_OUTPUTS,
+            },
+        },
+        ("schema_version", "nodes"),
+    )
+
+
 def workflow_ir_json_schema() -> dict[str, Any]:
     """Return a fresh strict tool-input schema matching Workflow IR v1.
 
@@ -2327,8 +3101,11 @@ def compile_worker_wave_plan(workflow_ir: WorkflowIR) -> dict[str, Any]:
     This first adapter is deliberately conservative: the legacy runtime
     delegates both workers and aggregation steps to child agents, so nodes
     owned by another executor are rejected instead of silently rerouted.
-    ``aggregate`` is the only node kind lowered to ``aggregation_steps``;
-    every other required node becomes a worker.
+    Explicit aggregate nodes and every required node downstream of one are
+    lowered to ``aggregation_steps``; nodes that only depend on ordinary
+    workers remain workers.  This topology-aware closure preserves an early
+    verifier as a worker while allowing aggregate -> verify/synthesize/
+    artifact chains without accepting a graph that the adapter later rejects.
     """
 
     if not isinstance(workflow_ir, WorkflowIR):
@@ -2348,8 +3125,23 @@ def compile_worker_wave_plan(workflow_ir: WorkflowIR) -> dict[str, Any]:
             )
 
     required_node_ids = {node.id for node in required_nodes}
-    aggregate_ids = {node.id for node in required_nodes if node.kind == "aggregate"}
-    worker_nodes = [node for node in required_nodes if node.kind != "aggregate"]
+    aggregate_ids = {
+        node.id for node in required_nodes if node.kind == "aggregate"
+    }
+    changed = True
+    while changed:
+        changed = False
+        for node in required_nodes:
+            if (
+                node.id not in aggregate_ids
+                and any(
+                    dependency in aggregate_ids
+                    for dependency in node.depends_on
+                )
+            ):
+                aggregate_ids.add(node.id)
+                changed = True
+    worker_nodes = [node for node in required_nodes if node.id not in aggregate_ids]
     worker_ids = {node.id for node in worker_nodes}
     for node in worker_nodes:
         aggregate_dependencies = [

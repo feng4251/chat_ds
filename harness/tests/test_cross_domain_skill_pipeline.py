@@ -782,6 +782,34 @@ class CrossDomainSkillPipelineTests(unittest.IsolatedAsyncioTestCase):
                     {item["path"] for item in state.artifacts},
                 )
 
+    def test_persistent_process_raw_sync_and_close_results_project_artifacts(self):
+        artifact = {
+            "path": "generated/process-output.json",
+            "size_bytes": 37,
+            "sha256": "b" * 64,
+        }
+        for operation in ("sync", "close"):
+            raw = json.dumps({
+                "status": "success",
+                "operation": operation,
+                "artifacts": [artifact],
+            })
+            with self.subTest(operation=operation):
+                self.assertEqual(
+                    [{
+                        "kind": "file",
+                        "title": "process-output.json",
+                        "path": "generated/process-output.json",
+                        "source_tool": "run_skill_process",
+                        "size_bytes": 37,
+                        "sha256": "b" * 64,
+                    }],
+                    _artifact_payloads_from_tool_result(
+                        "run_skill_process",
+                        raw,
+                    ),
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

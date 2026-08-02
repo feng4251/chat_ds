@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from agent_loop import _artifact_payloads_from_tool_result
 from delegated_result_contract import (
     audit_raw_tool_protocol as _raw_pseudo_tool_protocol_audit,
     canonical_result_fields_footer_from_json,
@@ -16,6 +17,7 @@ from tools.context import ToolContext
 from tools.delegation import (
     DELEGATE_TASK_SCHEMA,
     _adaptive_delegate_output_tokens,
+    _merge_child_usage,
     _child_failure_fields,
     _canonicalize_machine_gap_ledger,
     _canonicalize_machine_knowledge_gate_check_ledger,
@@ -109,6 +111,186 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
                 {field: {"type": "object"} for field in large_fields},
             ),
         )
+
+    def test_child_usage_merge_is_monotonic_alias_aware_and_idempotent(self):
+        usage = _merge_child_usage({}, {
+            "prompt_tokens": 120,
+            "completion_tokens": 30,
+            "total_tokens": 150,
+        })
+        self.assertEqual({
+            "input_tokens": 120,
+            "output_tokens": 30,
+            "total_tokens": 150,
+        }, usage)
+        self.assertEqual(usage, _merge_child_usage(usage, {
+            "input_tokens": 120,
+            "output_tokens": 30,
+            "total_tokens": 150,
+        }))
+        self.assertEqual({
+            "input_tokens": 125,
+            "output_tokens": 35,
+            "total_tokens": 160,
+        }, _merge_child_usage(usage, {
+            "input_tokens": 125,
+            "output_tokens": 35,
+            "total_tokens": 10,
+        }))
+        self.assertEqual({
+            "input_tokens": 140,
+            "output_tokens": 40,
+            "total_tokens": 180,
+        }, _merge_child_usage(usage, {
+            "input_tokens": -1,
+            "prompt_tokens": 140,
+            "output_tokens": -2,
+            "completion_tokens": 40,
+            "total_tokens": 180,
+        }))
+
+    async def test_child_uses_large_budget_at_exact_contract_score_boundary(self):
+        fields = [f"field_{index}" for index in range(12)]
+        schemas = {field: {"type": "object"} for field in fields}
+        footer = "RESULT_FIELDS_JSON: " + json.dumps(
+            {field: {"value": "bounded"} for field in fields},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        observed: dict[str, int] = {}
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            observed["max_tokens"] = kwargs["max_tokens"]
+            terminal = {
+                "type": "agent_event",
+                "event_type": "run.completed",
+                "run_id": kwargs["run_id"],
+                "payload": {"finish_reason": "stop"},
+            }
+            yield {"type": "delta", "content": footer}
+            await kwargs["event_sink"](terminal)
+            yield terminal
+            yield {"type": "done", "finish_reason": "stop"}
+
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                return_value="results/large-contract.json",
+            ),
+        ):
+            result = await _run_child(
+                {
+                    "goal": "return the exact generic typed fields",
+                    "required_result_fields": fields,
+                    "required_result_schema": schemas,
+                },
+                _context(),
+                0,
+            )
+
+        # 12*8 field points + 25 schema nodes = 121, the first score above
+        # the shared 16K tier. This exercises the actual child run boundary,
+        # not only the helper in isolation.
+        self.assertEqual(32_768, observed["max_tokens"])
+        self.assertEqual("completed", result["status"], result)
+        self.assertTrue(result["result_field_audit"]["footer_valid"])
+
+    async def test_failed_child_terminal_preserves_usage_and_manifest(self):
+        observed_events: list[dict] = []
+
+        async def capture(event):
+            observed_events.append(dict(event))
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            terminal = {
+                "type": "agent_event",
+                "event_type": "run.failed",
+                "run_id": kwargs["run_id"],
+                "payload": {
+                    "error": "bounded provider failure",
+                    "finish_reason": "provider_failed",
+                    "terminal_reason": "provider_failed",
+                    "failure_class": "provider",
+                    "retryable": True,
+                    "usage": {
+                        "input_tokens": -1,
+                        "prompt_tokens": 321,
+                        "output_tokens": -1,
+                        "completion_tokens": 45,
+                        "total_tokens": 366,
+                    },
+                },
+            }
+            await kwargs["event_sink"](terminal)
+            yield terminal
+            yield {"type": "done", "finish_reason": "provider_failed"}
+
+        with patch("agent_loop.run_stream", fake_run_stream):
+            result = await _run_child(
+                {"goal": "return bounded evidence"},
+                _context(event_sink=capture),
+                0,
+            )
+
+        expected_usage = {
+            "input_tokens": 321,
+            "output_tokens": 45,
+            "total_tokens": 366,
+        }
+        self.assertEqual("error", result["status"])
+        self.assertEqual(expected_usage, result["usage"])
+        terminal = observed_events[-1]
+        self.assertEqual("run.failed", terminal["event_type"])
+        self.assertEqual(expected_usage, terminal["payload"]["usage"])
+        self.assertEqual(
+            result["artifact_manifest"],
+            terminal["payload"]["artifact_manifest"],
+        )
+        self.assertEqual(
+            0, terminal["payload"]["artifact_manifest"]["receipt_count"]
+        )
+
+    async def test_child_captures_terminal_usage_without_standalone_usage_event(self):
+        body = json.dumps({"status": "ok", "evidence": ["bounded"]})
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            terminal = {
+                "type": "agent_event",
+                "event_type": "run.completed",
+                "run_id": kwargs["run_id"],
+                "payload": {
+                    "finish_reason": "stop",
+                    "usage": {
+                        "prompt_tokens": 321,
+                        "completion_tokens": 45,
+                        "total_tokens": 366,
+                    },
+                },
+            }
+            yield {"type": "delta", "content": body}
+            await kwargs["event_sink"](terminal)
+            yield terminal
+            yield {"type": "done", "finish_reason": "stop"}
+
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                return_value="results/terminal-usage.json",
+            ),
+        ):
+            result = await _run_child(
+                {"goal": "return bounded evidence"},
+                _context(),
+                0,
+            )
+
+        self.assertEqual({
+            "input_tokens": 321,
+            "output_tokens": 45,
+            "total_tokens": 366,
+        }, result["usage"])
 
     def test_machine_gap_ledger_is_receipt_owned_and_footer_stays_terminal(self):
         content = (
@@ -568,6 +750,14 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             "committed",
             terminal["payload"]["output_transaction"]["status"],
+        )
+        self.assertEqual(
+            result["artifact_manifest"],
+            terminal["payload"]["artifact_manifest"],
+        )
+        self.assertEqual(
+            hashlib.sha256(b"[]").hexdigest(),
+            terminal["payload"]["artifact_manifest"]["sha256"],
         )
         self.assertEqual(1, len(provisional_terminals))
         self.assertFalse(
@@ -5653,6 +5843,11 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
         get_workspace.assert_not_called()
 
     async def test_artifact_receipts_must_match_real_declared_workspace_files(self):
+        observed_events: list[dict] = []
+
+        async def capture(event):
+            observed_events.append(dict(event))
+
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
 
@@ -5698,7 +5893,7 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
                         ],
                         "tools": ["write_file"],
                     },
-                    _context("write_file"),
+                    _context("write_file", event_sink=capture),
                     0,
                 )
 
@@ -5711,6 +5906,124 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
             receipt["source_tool"] == "write_file"
             for receipt in result["artifact_receipts"]
         ))
+        terminal = observed_events[-1]
+        self.assertEqual("run.completed", terminal["event_type"])
+        self.assertEqual(
+            result["artifact_manifest"],
+            terminal["payload"]["artifact_manifest"],
+        )
+        self.assertEqual(
+            2, terminal["payload"]["artifact_manifest"]["receipt_count"]
+        )
+
+    async def test_run_skill_process_raw_artifact_enters_terminal_manifest(self):
+        for operation in ("sync", "close"):
+            with self.subTest(operation=operation):
+                observed_events: list[dict] = []
+
+                async def capture(event):
+                    observed_events.append(dict(event))
+
+                with tempfile.TemporaryDirectory() as tmp:
+                    workspace = Path(tmp)
+                    body = "# Process report\n" + "verified evidence\n" * 20
+                    artifact_path = workspace / "process_report.md"
+                    artifact_path.write_text(body, encoding="utf-8")
+                    raw_result = json.dumps({
+                        "status": "success",
+                        "operation": operation,
+                        "artifacts": [{
+                            "path": "process_report.md",
+                            "size_bytes": artifact_path.stat().st_size,
+                            "sha256": hashlib.sha256(
+                                body.encode("utf-8")
+                            ).hexdigest(),
+                        }],
+                    })
+                    emitted_artifacts = _artifact_payloads_from_tool_result(
+                        "run_skill_process",
+                        raw_result,
+                    )
+                    self.assertEqual(1, len(emitted_artifacts), raw_result)
+
+                    async def fake_run_stream(
+                        model_id, messages, tools, **kwargs
+                    ):
+                        call_id = f"process-{operation}"
+                        yield _tool_started(
+                            "run_skill_process",
+                            call_id,
+                            operation=operation,
+                            process_id="process-1",
+                        )
+                        yield {
+                            "type": "agent_event",
+                            "event_type": "tool.completed",
+                            "tool_name": "run_skill_process",
+                            "tool_call_id": call_id,
+                            "payload": {
+                                "tool_name": "run_skill_process",
+                                "tool_call_id": call_id,
+                                "outcome": "success",
+                                "artifacts": emitted_artifacts,
+                            },
+                        }
+                        yield {
+                            "type": "delta",
+                            "content": (
+                                "# Completion ledger\n"
+                                "The persistent process was synchronized; "
+                                "process_report.md contains the verified "
+                                "result and provenance. " * 6
+                            ),
+                        }
+                        yield {"type": "done", "finish_reason": "stop"}
+
+                    with (
+                        patch("agent_loop.run_stream", fake_run_stream),
+                        patch(
+                            "tools.delegation.get_workspace",
+                            return_value=workspace,
+                        ),
+                        patch(
+                            "tools.delegation.persist_result_for_history",
+                            return_value=(
+                                "results/delegate_process_artifacts.md"
+                            ),
+                        ),
+                    ):
+                        result = await _run_child(
+                            {
+                                "goal": (
+                                    f"{operation} the process and synthesize "
+                                    "its artifact"
+                                ),
+                                "step_type": "artifact_synthesis",
+                                "required_output_ids": ["process_report.md"],
+                                "tools": ["run_skill_process"],
+                            },
+                            _context(
+                                "run_skill_process",
+                                event_sink=capture,
+                            ),
+                            0,
+                        )
+
+                self.assertEqual(
+                    "completed", result["status"], result.get("error")
+                )
+                self.assertEqual(
+                    ["process_report.md"],
+                    [item["path"] for item in result["artifact_receipts"]],
+                )
+                self.assertEqual(
+                    "run_skill_process",
+                    result["artifact_receipts"][0]["source_tool"],
+                )
+                self.assertEqual(
+                    result["artifact_manifest"],
+                    observed_events[-1]["payload"]["artifact_manifest"],
+                )
 
     async def test_artifact_receipt_uses_preflight_normalized_audit_path(self):
         with tempfile.TemporaryDirectory() as tmp:

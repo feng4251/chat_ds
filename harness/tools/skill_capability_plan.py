@@ -2,42 +2,32 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
 from skill_capability_plan import validate_capability_plan
 from tools.context import ToolContext
-from workflow_ir import InstructionDocument, workflow_ir_json_schema
+from workflow_ir import (
+    InstructionDocument,
+    workflow_ir_json_schema,
+    workflow_plan_json_schema,
+)
 
 
-async def submit_skill_capability_plan(
+def revalidate_capability_plan_live_authority(
     skill_name: str,
-    body_sha256: str,
-    required: list[str],
-    optional: list[str],
-    unsupported: list[dict[str, str]],
-    catalog_sha256: str | None = None,
-    workflow_ir: dict[str, Any] | None = None,
-    context: ToolContext | None = None,
-) -> str:
-    """Select only capabilities issued in the current runtime catalog."""
+    catalog: dict[str, Any],
+    context: ToolContext,
+) -> dict[str, Any] | None:
+    """Revalidate every live file bound by one frozen capability catalog.
 
-    catalog = (
-        context.skill_capability_catalog
-        if context is not None else None
-    )
-    if context is None or not isinstance(catalog, dict):
-        result = validate_capability_plan(
-            catalog,
-            skill_name=skill_name,
-            body_sha256=body_sha256,
-            required=required,
-            optional=optional,
-            unsupported=unsupported,
-            catalog_sha256=catalog_sha256,
-            workflow_ir=workflow_ir,
-        )
-        return json.dumps(result.payload, ensure_ascii=False)
+    The planning handler and the outer atomic installer call this same helper.
+    The second check closes the handler-to-install TOCTOU window: no grant is
+    committed from a catalog whose main document, disclosed authority, or
+    runtime instruction document changed after the handler returned.
+    """
+
     try:
         from skills.scanner import resolve_skill_path
 
@@ -49,17 +39,15 @@ async def submit_skill_capability_plan(
         )
         if current_main is None:
             raise ValueError("the selected Skill is no longer installed/enabled")
-        current_digest = __import__("hashlib").sha256(
-            current_main.read_bytes()
-        ).hexdigest()
+        current_digest = hashlib.sha256(current_main.read_bytes()).hexdigest()
     except (OSError, RuntimeError, ValueError) as exc:
-        return json.dumps({
+        return {
             "status": "error",
             "error_code": "capability_plan_revalidation_failed",
             "error": f"Cannot revalidate the canonical SKILL.md: {exc}",
-        }, ensure_ascii=False)
+        }
     if current_digest != str(catalog.get("body_sha256") or ""):
-        return json.dumps({
+        return {
             "status": "error",
             "error_code": "capability_plan_document_changed",
             "error": (
@@ -68,7 +56,8 @@ async def submit_skill_capability_plan(
             ),
             "expected_body_sha256": catalog.get("body_sha256"),
             "current_body_sha256": current_digest,
-        }, ensure_ascii=False)
+        }
+
     authority_documents = catalog.get("authority_documents") or []
     if authority_documents:
         try:
@@ -90,7 +79,7 @@ async def submit_skill_capability_plan(
                     raise ValueError(
                         f"authority resource is unavailable: {resource_path}"
                     )
-                actual_digest = __import__("hashlib").sha256(
+                actual_digest = hashlib.sha256(
                     checked.path.read_bytes()
                 ).hexdigest()
                 if actual_digest != expected_digest:
@@ -98,14 +87,15 @@ async def submit_skill_capability_plan(
                         f"authority resource changed: {resource_path}"
                     )
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
-            return json.dumps({
+            return {
                 "status": "error",
                 "error_code": "capability_plan_authority_changed",
                 "error": (
                     "A content-addressed reference changed after disclosure; "
                     f"read it again before amending the plan: {exc}"
                 ),
-            }, ensure_ascii=False)
+            }
+
     instruction_documents = catalog.get("instruction_documents")
     if instruction_documents is not None:
         try:
@@ -135,26 +125,63 @@ async def submit_skill_capability_plan(
                             + document.source_path
                         )
                     checked_path = checked.path
-                actual_digest = (
-                    __import__("hashlib").sha256(checked_path.read_bytes()).hexdigest()
-                )
+                actual_digest = hashlib.sha256(
+                    checked_path.read_bytes()
+                ).hexdigest()
                 if actual_digest != document.source_sha256:
                     raise ValueError(
                         "instruction resource changed: " + document.source_path
                     )
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
-            return json.dumps(
-                {
-                    "status": "error",
-                    "error_code": ("capability_plan_instruction_document_changed"),
-                    "error": (
-                        "A runtime-owned Workflow IR instruction document "
-                        "changed after disclosure; read it again before "
-                        f"submitting a plan: {exc}"
-                    ),
-                },
-                ensure_ascii=False,
-            )
+            return {
+                "status": "error",
+                "error_code": "capability_plan_instruction_document_changed",
+                "error": (
+                    "A runtime-owned Workflow IR instruction document "
+                    "changed after disclosure; read it again before "
+                    f"submitting a plan: {exc}"
+                ),
+            }
+    return None
+
+
+async def submit_skill_capability_plan(
+    skill_name: str,
+    body_sha256: str,
+    required: list[str],
+    optional: list[str],
+    unsupported: list[dict[str, str]],
+    catalog_sha256: str | None = None,
+    workflow_ir: dict[str, Any] | None = None,
+    workflow_plan: dict[str, Any] | None = None,
+    context: ToolContext | None = None,
+) -> str:
+    """Select only capabilities issued in the current runtime catalog."""
+
+    catalog = (
+        context.skill_capability_catalog
+        if context is not None else None
+    )
+    if context is None or not isinstance(catalog, dict):
+        result = validate_capability_plan(
+            catalog,
+            skill_name=skill_name,
+            body_sha256=body_sha256,
+            required=required,
+            optional=optional,
+            unsupported=unsupported,
+            catalog_sha256=catalog_sha256,
+            workflow_ir=workflow_ir,
+            workflow_plan=workflow_plan,
+        )
+        return json.dumps(result.payload, ensure_ascii=False)
+    authority_failure = revalidate_capability_plan_live_authority(
+        skill_name,
+        catalog,
+        context,
+    )
+    if authority_failure is not None:
+        return json.dumps(authority_failure, ensure_ascii=False)
     result = validate_capability_plan(
         catalog,
         skill_name=skill_name,
@@ -164,6 +191,7 @@ async def submit_skill_capability_plan(
         unsupported=unsupported,
         catalog_sha256=catalog_sha256,
         workflow_ir=workflow_ir,
+        workflow_plan=workflow_plan,
     )
     return json.dumps(result.payload, ensure_ascii=False)
 
@@ -177,8 +205,9 @@ SUBMIT_SKILL_CAPABILITY_PLAN_SCHEMA: dict[str, Any] = {
         "If the Harness later exposes a content-addressed catalog amendment, "
         "submit one replacement plan with its exact catalog_sha256. This tool "
         "cannot create grants. When the catalog says workflow_ir_required, "
-        "also submit the complete typed graph against its exact instruction "
-        "catalog; optional simple catalogs remain backward compatible."
+        "submit the compact workflow_plan against its exact instruction "
+        "index; the runtime compiles the complete Workflow IR. Legacy direct "
+        "callers may still submit workflow_ir, but never both."
     ),
     "parameters": {
         "type": "object",
@@ -232,6 +261,7 @@ SUBMIT_SKILL_CAPABILITY_PLAN_SCHEMA: dict[str, Any] = {
                 "maxItems": 64,
             },
             "workflow_ir": workflow_ir_json_schema(),
+            "workflow_plan": workflow_plan_json_schema(),
         },
         "required": [
             "skill_name",

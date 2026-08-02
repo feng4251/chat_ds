@@ -10,6 +10,12 @@ from typing import Any, Sequence
 
 RESULT_FIELDS_JSON_PREFIX = "RESULT_FIELDS_JSON:"
 MAX_RESULT_FIELDS_JSON_CHARS = 64 * 1024
+MAX_REQUIRED_RESULT_FIELDS = 128
+MAX_REQUIRED_RESULT_FIELD_CHARS = 256
+MAX_REQUIRED_RESULT_SCHEMA_BYTES = 16 * 1024
+DEFAULT_RESULT_CONTRACT_OUTPUT_TOKENS = 8_192
+MEDIUM_RESULT_CONTRACT_OUTPUT_TOKENS = 16_384
+LARGE_RESULT_CONTRACT_OUTPUT_TOKENS = 32_768
 
 _RAW_TOOL_CALL_OPEN_PATTERN = re.compile(
     r"(?i)<tool_call\b(?P<attributes>[^>\r\n]*)>",
@@ -34,6 +40,282 @@ _RAW_TOOL_PROTOCOL_RESERVED_TAGS = {
     "parameters",
     "parameter",
 }
+
+
+def is_formal_object_result_schema(value: Any) -> bool:
+    """Disambiguate formal JSON Schema from legacy field mappings.
+
+    Legacy Skills may legitimately declare a result field named ``type`` with
+    the example value ``object``.  Treat that as a formal root only when the
+    remaining keys are JSON-Schema keywords; an explicit ``properties`` object
+    remains an unambiguous formal declaration.
+    """
+
+    if not isinstance(value, dict):
+        return False
+    if isinstance(value.get("properties"), dict):
+        return True
+    if value.get("type") != "object":
+        return False
+    from tools.registry import JSON_SCHEMA_LOSSLESS_KEYWORDS
+
+    return set(value).issubset(JSON_SCHEMA_LOSSLESS_KEYWORDS)
+
+
+def validate_result_field_names(
+    required_fields: Sequence[Any],
+    *,
+    field_path: str = "required_result_fields",
+) -> list[str]:
+    """Validate exact field identifiers without repairing their spelling."""
+
+    if isinstance(required_fields, (str, bytes)) or not isinstance(
+        required_fields, Sequence
+    ):
+        raise ValueError(f"{field_path} must be an array of strings")
+    fields: list[str] = []
+    for index, item in enumerate(required_fields):
+        if (
+            not isinstance(item, str)
+            or not item
+            or item != item.strip()
+            or "\n" in item
+            or "\r" in item
+            or "\x00" in item
+        ):
+            raise ValueError(
+                f"{field_path}[{index}] must be a non-empty, single-line "
+                "string without surrounding whitespace"
+            )
+        if len(item) > MAX_REQUIRED_RESULT_FIELD_CHARS:
+            raise ValueError(
+                f"{field_path}[{index}] exceeds the "
+                f"{MAX_REQUIRED_RESULT_FIELD_CHARS}-character field-name limit"
+            )
+        fields.append(item)
+    if len(fields) > MAX_REQUIRED_RESULT_FIELDS:
+        raise ValueError(
+            f"{field_path} may declare at most "
+            f"{MAX_REQUIRED_RESULT_FIELDS} exact fields"
+        )
+    if len(set(fields)) != len(fields):
+        raise ValueError(f"{field_path} must list each exact field once")
+    return fields
+
+
+def validate_projected_result_contract(
+    required_fields: Sequence[Any],
+    field_schema: Any,
+    *,
+    field_path: str = "required_result_fields",
+    schema_path: str = "required_result_schema",
+) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    """Validate the exact metadata accepted by delegated child transport."""
+
+    fields = validate_result_field_names(
+        required_fields,
+        field_path=field_path,
+    )
+    if not isinstance(field_schema, dict):
+        raise ValueError(f"{schema_path} must be an object")
+    if set(field_schema) != set(fields):
+        raise ValueError(
+            f"{schema_path} keys must exactly match {field_path}"
+        )
+    if any(not isinstance(value, dict) for value in field_schema.values()):
+        raise ValueError(
+            f"Every {schema_path} value must be a JSON-schema object"
+        )
+
+    from tools.registry import json_schema_shape_error
+
+    for field_name in fields:
+        schema_error = json_schema_shape_error(
+            field_schema[field_name],
+            schema_path=f"{schema_path}.{field_name}",
+            reject_unsupported_keywords=True,
+        )
+        if schema_error is not None:
+            raise ValueError(schema_error)
+    try:
+        encoded = json.dumps(
+            field_schema,
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ValueError(
+            f"{schema_path} must contain only finite, acyclic JSON values"
+        ) from exc
+    if len(encoded) > MAX_REQUIRED_RESULT_SCHEMA_BYTES:
+        raise ValueError(
+            f"{schema_path} exceeds the "
+            f"{MAX_REQUIRED_RESULT_SCHEMA_BYTES // 1024} KiB delegation "
+            "metadata limit"
+        )
+    return fields, json.loads(encoded.decode("utf-8"))
+
+
+def project_object_result_contract(
+    schema: Any,
+    *,
+    schema_path: str = "declared_result_schema",
+) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    """Project one object JSON Schema to the exact delegated wire contract.
+
+    Workflow compilation and child dispatch must share this boundary.  A plan
+    is not executable when its root schema cannot be represented by the
+    delegation protocol's exact top-level field list and per-field schemas, so
+    reject it before any authority is installed or worker is scheduled.
+    """
+
+    if not isinstance(schema, dict):
+        raise ValueError(f"{schema_path} must be a JSON-schema object")
+
+    from tools.registry import (
+        JSON_SCHEMA_LOSSLESS_KEYWORDS,
+        json_schema_shape_error,
+    )
+
+    root_error = json_schema_shape_error(
+        schema,
+        schema_path=schema_path,
+        reject_unsupported_keywords=True,
+    )
+    if root_error is not None:
+        raise ValueError(root_error)
+    raw_required = schema.get("required", [])
+    required_fields = validate_result_field_names(
+        raw_required,
+        field_path=f"{schema_path}.required",
+    )
+
+    annotation_keywords = JSON_SCHEMA_LOSSLESS_KEYWORDS - {
+        "type",
+        "enum",
+        "const",
+        "required",
+        "properties",
+        "additionalProperties",
+        "items",
+        "minItems",
+        "maxItems",
+        "minLength",
+        "maxLength",
+        "minProperties",
+        "maxProperties",
+        "pattern",
+        "minimum",
+        "maximum",
+        "anyOf",
+        "oneOf",
+    }
+    projectable_root_keywords = {
+        "type",
+        "properties",
+        "required",
+        "additionalProperties",
+        *annotation_keywords,
+    }
+    unprojectable = sorted(set(schema) - projectable_root_keywords)
+    if unprojectable:
+        raise ValueError(
+            f"{schema_path}.{unprojectable[0]} cannot be losslessly projected "
+            "into per-field result metadata"
+        )
+
+    declared_root_type = schema.get("type")
+    if declared_root_type is None and not required_fields:
+        # A properties-only schema with no required names admits the empty
+        # object, so it creates no exact terminal-ledger obligation. Preserve
+        # this standards-compliant compatibility form without manufacturing
+        # optional fields.
+        return [], {}
+    if declared_root_type != "object":
+        raise ValueError(
+            f"{schema_path}.type must be exactly 'object' for a delegated "
+            "result contract"
+        )
+
+    properties = schema.get("properties", {})
+    if not isinstance(properties, dict):
+        raise ValueError(f"{schema_path}.properties must be an object")
+    additional = schema.get("additionalProperties", True)
+    projected: dict[str, dict[str, Any]] = {}
+    for field_name in required_fields:
+        if field_name in properties:
+            declaration = properties[field_name]
+        elif isinstance(additional, dict):
+            declaration = additional
+        elif additional is False:
+            raise ValueError(
+                f"{schema_path}.required names property {field_name!r}, but "
+                "additionalProperties is false and no property schema is declared"
+            )
+        else:
+            declaration = {}
+
+        if declaration is True:
+            field_schema: dict[str, Any] = {}
+        elif declaration is False:
+            raise ValueError(
+                f"{schema_path}.properties.{field_name} is boolean false and "
+                "cannot yield a required result value"
+            )
+        elif isinstance(declaration, dict):
+            field_error = json_schema_shape_error(
+                declaration,
+                schema_path=f"{schema_path}.properties.{field_name}",
+                reject_unsupported_keywords=True,
+            )
+            if field_error is not None:
+                raise ValueError(field_error)
+            field_schema = declaration
+        else:
+            raise ValueError(
+                f"{schema_path}.properties.{field_name} must be an object or "
+                "boolean JSON Schema"
+            )
+        projected[field_name] = field_schema
+
+    # Detach runtime metadata from loader/model-owned mutable structures while
+    # applying the exact same field/schema transport boundary used by child
+    # dispatch.
+    return validate_projected_result_contract(
+        required_fields,
+        projected,
+        field_path=f"{schema_path}.required",
+        schema_path=f"{schema_path}.projection",
+    )
+
+
+def adaptive_result_contract_output_tokens(
+    required_fields: Sequence[str],
+    field_schema: dict[str, Any],
+) -> int:
+    """Choose one shared structural output tier for child and finalizer.
+
+    The score is independent of domain, filename, model, and provider.  Both
+    the original delegated response and its one bounded typed-footer repair
+    must receive the same schema-complexity tier; otherwise a contract that
+    legitimately needed 16K/32K can be truncated only during finalization.
+    """
+
+    node_count = 0
+    stack: list[Any] = [field_schema]
+    while stack and node_count < 2_000:
+        value = stack.pop()
+        node_count += 1
+        if isinstance(value, dict):
+            stack.extend(value.values())
+        elif isinstance(value, (list, tuple)):
+            stack.extend(value)
+    score = (len(tuple(required_fields)) * 8) + node_count
+    if score <= 48:
+        return DEFAULT_RESULT_CONTRACT_OUTPUT_TOKENS
+    if score <= 120:
+        return MEDIUM_RESULT_CONTRACT_OUTPUT_TOKENS
+    return LARGE_RESULT_CONTRACT_OUTPUT_TOKENS
 
 
 def normalize_result_field_schema(

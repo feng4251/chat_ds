@@ -29,9 +29,11 @@ from workflow_ir import (
     InstructionDocument,
     WorkflowIRValidationError,
     WorkflowPlanAdapterError,
+    compile_workflow_plan,
     compile_worker_wave_plan,
     instruction_catalog_payload,
     validate_workflow_ir,
+    workflow_plan_instruction_catalog_payload,
 )
 
 
@@ -793,7 +795,11 @@ def _validated_workflow_instruction_documents(
     body_sha256: str,
     authority_documents: Iterable[dict[str, str]],
     workflow_ir_required: bool,
-) -> tuple[tuple[InstructionDocument, ...], dict[str, Any] | None]:
+) -> tuple[
+    tuple[InstructionDocument, ...],
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+]:
     """Bind runtime-owned IR authority to the exact disclosed Skill closure."""
 
     if not isinstance(workflow_ir_required, bool):
@@ -808,10 +814,13 @@ def _validated_workflow_instruction_documents(
             "workflow_ir_required needs runtime-owned instruction_documents"
         )
     if not normalized:
-        return (), None
+        return (), None, None
 
     try:
         projection = instruction_catalog_payload(normalized)
+        planning_projection = workflow_plan_instruction_catalog_payload(
+            normalized
+        )
     except WorkflowIRValidationError as exc:
         raise ValueError(
             f"invalid workflow instruction documents ({exc.code}): {exc}"
@@ -837,7 +846,7 @@ def _validated_workflow_instruction_documents(
             )
 
     encoded = json.dumps(
-        projection,
+        planning_projection,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -847,7 +856,7 @@ def _validated_workflow_instruction_documents(
             "workflow instruction catalog exceeds the bounded model-visible "
             f"limit of {MAX_WORKFLOW_INSTRUCTION_CATALOG_BYTES} bytes"
         )
-    return normalized, projection
+    return normalized, projection, planning_projection
 
 
 def build_capability_catalog(
@@ -1444,7 +1453,11 @@ def build_capability_catalog(
         }
         for document in root_linked_documents
     ]
-    runtime_instruction_documents, instruction_catalog = (
+    (
+        runtime_instruction_documents,
+        instruction_catalog,
+        instruction_plan_catalog,
+    ) = (
         _validated_workflow_instruction_documents(
             instruction_documents,
             body_sha256=body_sha256,
@@ -1526,6 +1539,7 @@ def build_capability_catalog(
             {
                 "instruction_documents": runtime_instruction_documents,
                 "instruction_catalog": instruction_catalog,
+                "instruction_plan_catalog": instruction_plan_catalog,
                 "workflow_ir_required": workflow_ir_required,
             }
         )
@@ -1545,39 +1559,40 @@ def build_capability_catalog(
 def catalog_prompt_payload(catalog: dict[str, Any]) -> dict[str, Any]:
     """Return the bounded model-visible projection of one catalog."""
 
-    instruction_catalog = catalog.get("instruction_catalog")
-    workflow_ir_available = isinstance(instruction_catalog, dict)
+    runtime_instruction_catalog = catalog.get("instruction_catalog")
+    instruction_catalog = catalog.get("instruction_plan_catalog")
+    workflow_ir_available = (
+        isinstance(runtime_instruction_catalog, dict)
+        and isinstance(instruction_catalog, dict)
+    )
     workflow_ir_required = (
         workflow_ir_available and catalog.get("workflow_ir_required") is True
     )
     workflow_guidance = ""
     if workflow_ir_available:
         workflow_guidance = (
-            " The runtime also issued a content-addressed instruction catalog. "
-            "If you submit workflow_ir, copy every exact document binding and "
-            "provide exactly one coverage record for every instruction unit. "
-            "Every workflow node capability_ids entry must come from this "
-            "plan's required+optional selections; sharing one selected "
-            "delegate capability does not merge distinct workflow nodes. "
-            "Dependencies must form a finite acyclic graph, every required "
-            "instruction must map bidirectionally to required nodes, and the "
-            "IR complete/count fields must be exact."
+            " The runtime also issued a compact content-addressed instruction "
+            "index. Submit workflow_plan, not the runtime-owned Workflow IR. "
+            "Group exact adjacent instruction IDs with inclusive same-document "
+            "ranges, coalescing adjacent units whenever possible. Declare only "
+            "semantic child nodes, dependencies, selected capability IDs, and "
+            "optional typed result schemas/output producers. The runtime expands "
+            "bindings, coverage, execution policy, counts, receipts, and digest "
+            "and rejects unknown, stale, reversed, cross-document, incomplete, "
+            "cyclic, unselected, or non-lowerable plans."
         )
         if workflow_ir_required:
             workflow_guidance += (
-                " workflow_ir is mandatory for this catalog; omitting it "
+                " workflow_plan is mandatory for this catalog; omitting it "
                 "fails closed and no capability plan is installed. Every "
-                "non-heading instruction unit is runtime-required: classify "
-                "it as required or conditional, map it bidirectionally to at "
-                "least one required child_agent node, and bind every required "
-                "node to the required delegate_task candidate. Headings alone "
-                "may be advisory/not_applicable. The parent consumes "
-                "delegate_task; other node-bound candidates form that exact "
-                "child's capability/resource boundary."
+                "non-heading instruction unit must occur in at least one node "
+                "range. The runtime injects the selected delegate_task candidate "
+                "into every node; capability_ids should contain only additional "
+                "selected candidates needed by that exact child."
             )
         else:
             workflow_guidance += (
-                " workflow_ir is optional for this simple catalog; omit it "
+                " workflow_plan is optional for this simple catalog; omit it "
                 "unless the disclosed instructions require an explicit graph."
             )
 
@@ -1603,8 +1618,11 @@ def catalog_prompt_payload(catalog: dict[str, Any]) -> dict[str, Any]:
             :MAX_UNSUPPORTED_ITEMS
         ],
         "instructions": (
-            "After reading every SKILL.md page, call submit_skill_capability_plan "
-            "once. Put capability IDs needed to satisfy mandatory instructions in "
+            "After reading every SKILL.md page, submit one complete "
+            "submit_skill_capability_plan call for the current attempt. If the "
+            "runtime returns a typed validation code/path, remain on this planning "
+            "frontier and correct that exact finding; do not proceed to execution. "
+            "Put capability IDs needed to satisfy mandatory instructions in "
             "required, discretionary/supporting IDs in optional, and describe any "
             "instruction that no candidate can support in unsupported. Selected "
             "entries remain reusable during this bounded Skill run: required means "
@@ -1638,7 +1656,7 @@ def catalog_prompt_payload(catalog: dict[str, Any]) -> dict[str, Any]:
         payload.update(
             {
                 "workflow_ir_required": workflow_ir_required,
-                "instruction_catalog": instruction_catalog,
+                "workflow_plan_catalog": instruction_catalog,
             }
         )
     return payload
@@ -1824,6 +1842,7 @@ def validate_capability_plan(
     unsupported: Any,
     catalog_sha256: Any = None,
     workflow_ir: Any = None,
+    workflow_plan: Any = None,
 ) -> CapabilityPlanResult:
     """Validate a model selection and derive its exact effective closure."""
 
@@ -1994,6 +2013,11 @@ def validate_capability_plan(
             current_instruction_catalog = instruction_catalog_payload(
                 runtime_instruction_documents
             )
+            current_instruction_plan_catalog = (
+                workflow_plan_instruction_catalog_payload(
+                    runtime_instruction_documents
+                )
+            )
         except WorkflowIRValidationError as exc:
             return _error(
                 "capability_catalog_workflow_ir_invalid",
@@ -2002,7 +2026,7 @@ def validate_capability_plan(
                 workflow_ir_error_path=exc.path,
             )
         if len(json.dumps(
-            current_instruction_catalog,
+            current_instruction_plan_catalog,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -2018,18 +2042,32 @@ def validate_capability_plan(
                 "The model-visible instruction catalog no longer matches "
                 "runtime-owned instruction documents.",
             )
-    elif workflow_ir is not None:
+        if (
+            catalog.get("instruction_plan_catalog")
+            != current_instruction_plan_catalog
+        ):
+            return _error(
+                "capability_catalog_workflow_ir_invalid",
+                "The compact planning index no longer matches runtime-owned "
+                "instruction documents.",
+            )
+    elif workflow_ir is not None or workflow_plan is not None:
         return _error(
             "capability_plan_workflow_ir_not_authorized",
             "This simple catalog did not issue instruction-document authority "
-            "for a model-authored Workflow IR.",
+            "for a model-authored workflow plan.",
         )
 
-    workflow_payload = workflow_ir
+    if workflow_ir is not None and workflow_plan is not None:
+        return _error(
+            "capability_plan_workflow_payload_conflict",
+            "Submit workflow_plan or legacy workflow_ir, never both.",
+        )
+    workflow_payload = workflow_plan if workflow_plan is not None else workflow_ir
     if workflow_flag and workflow_payload is None:
         return _error(
             "capability_plan_workflow_ir_required",
-            "This content-addressed instruction catalog requires workflow_ir.",
+            "This content-addressed instruction catalog requires workflow_plan.",
             instruction_catalog_sha256=(
                 (catalog.get("instruction_catalog") or {}).get("catalog_sha256")
             ),
@@ -2042,36 +2080,12 @@ def validate_capability_plan(
         if not runtime_instruction_documents:
             return _error(
                 "capability_plan_workflow_ir_not_authorized",
-                "No runtime-owned instruction documents authorize workflow_ir.",
+                "No runtime-owned instruction documents authorize a workflow plan.",
             )
         if not isinstance(workflow_payload, dict):
             return _error(
                 "capability_plan_workflow_ir_invalid",
-                "workflow_ir must be one complete JSON object.",
-            )
-        try:
-            validated_workflow_ir = validate_workflow_ir(
-                workflow_payload,
-                documents=runtime_instruction_documents,
-                skill_name=expected_skill,
-                capability_catalog_sha256=expected_catalog_digest,
-                # Passing only the exact current selections prevents the graph
-                # from widening the capability plan.
-                available_capability_ids=all_ids,
-                strict_instruction_execution=workflow_flag,
-            )
-        except WorkflowIRValidationError as exc:
-            error_code = (
-                "capability_plan_workflow_ir_unselected_capability"
-                if exc.code == "unknown_capability_id"
-                else "capability_plan_workflow_ir_invalid"
-            )
-            return _error(
-                error_code,
-                "The submitted Workflow IR failed deterministic validation.",
-                workflow_ir_error_code=exc.code,
-                workflow_ir_error_path=exc.path,
-                workflow_ir_error=str(exc)[:1_000],
+                "workflow plan must be one complete JSON object.",
             )
         delegate_candidate_ids = {
             identifier
@@ -2081,6 +2095,56 @@ def validate_capability_plan(
                 and candidate.get("tool_name") == "delegate_task"
             )
         }
+        try:
+            if workflow_plan is not None:
+                validated_workflow_ir = compile_workflow_plan(
+                    workflow_payload,
+                    documents=runtime_instruction_documents,
+                    skill_name=expected_skill,
+                    capability_catalog_sha256=expected_catalog_digest,
+                    # Passing only exact current selections prevents the
+                    # semantic plan from widening the capability boundary.
+                    available_capability_ids=all_ids,
+                    mandatory_node_capability_ids=(
+                        delegate_candidate_ids.intersection(required)
+                    ),
+                    strict_instruction_execution=workflow_flag,
+                )
+            else:
+                validated_workflow_ir = validate_workflow_ir(
+                    workflow_payload,
+                    documents=runtime_instruction_documents,
+                    skill_name=expected_skill,
+                    capability_catalog_sha256=expected_catalog_digest,
+                    available_capability_ids=all_ids,
+                    strict_instruction_execution=workflow_flag,
+                )
+        except WorkflowIRValidationError as exc:
+            error_code = (
+                "capability_plan_workflow_ir_unselected_capability"
+                if exc.code == "unknown_capability_id"
+                else "capability_plan_workflow_ir_invalid"
+            )
+            return _error(
+                error_code,
+                (
+                    "The submitted compact workflow plan failed deterministic "
+                    "compilation."
+                    if workflow_plan is not None
+                    else "The submitted Workflow IR failed deterministic validation."
+                ),
+                workflow_ir_error_code=exc.code,
+                workflow_ir_error_path=exc.path,
+                workflow_ir_error=str(exc)[:1_000],
+                **(
+                    {
+                        "workflow_plan_error_code": exc.code,
+                        "workflow_plan_error_path": exc.path,
+                    }
+                    if workflow_plan is not None
+                    else {}
+                ),
+            )
         if workflow_flag and not delegate_candidate_ids.intersection(required):
             return _error(
                 "capability_plan_workflow_delegate_not_required",
