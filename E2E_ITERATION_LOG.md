@@ -845,3 +845,154 @@ Backend→Harness health/models 均为 200，工具注册成功、严重启动�
 
 Round 7 仍未产生 strong-final artifact。按用户授权，下一轮为全新 conversation/root 的
 Round 8；它是本 campaign 最后一轮模型重型 E2E，不能复用失败 run。
+
+## Round 8（最终轮）：producer ceiling、兄弟 frontier 与 terminal phase 泄漏
+
+### 冻结身份、exact Skill 与 durable terminal
+
+- 被测 Harness 生产 revision 为
+  `064391529b767a2bb0228a5e74088d4572ad37c0`；Conversation：
+  `9ff98843e980458d832629ba9964ec96`；root run：
+  `ad98fb353fb240f2b3ab84f345ceb247`。维护端消费 4,132 条 SSE，并从 SSE 收到唯一
+  `run.failed`；root 从 2026-08-01 21:10:20 到 2026-08-02 00:13:01 UTC，约 3 小时
+  3 分钟。不是页面断线、Harness/provider timeout、人工取消、共同网络故障或沙箱缺失。
+- 同一轮的 Attempt A 在任何模型 dispatch 之前发现 Harness `/app/data` 与 canonical host
+  data bind 不一致并 fail closed；修复 mount 后仍沿用同一个 Round 8 编号重新创建干净
+  conversation/root。该启动前失败不计为 Round 9。通用永久闭环是提交
+  `c3f9f582d246d6e63c0af2a6f60e471b9c628267`：Backend/Harness health 发布相同目录
+  inode 的 path-free identity，Backend 启动/健康严格比对，Compose 强制 canonical
+  `CHATDS_DATA_ROOT/CHATDS_MEMORY_ROOT` 且禁止静默创建错误 bind source。
+- ZIP SHA-256 仍为
+  `78b890eab57ff516c20a39a565631caa5d784f839b42f6ad9efbdbdd951eb0a0`；19 个 Skill
+  完整安装，primary route 正确选择
+  `healthsim-trialsim/composite_full_protocol_design`。实际 API model 为 `AgentModel`，
+  provider metadata context 为 250,368；没有退回 Qwen 或按旧 8K 上下文运行。
+- intent、7 路 bootstrap、PICO、Safety、Termination 与 Competitive deep-analysis 共
+  11 个 child 成功；Target deep-analysis 和 AE adjudication 两个 required worker 失败。
+  required barrier 因而正确 fail closed，I/E、Literature、fan-in、模块报告、strong-final
+  与 post-merge verifier 未启动。workspace 只有 Skill ZIP、系统文件和两个 FDA cache，
+  没有报告 Markdown；Artifact row 为 2，不能冒充最终交付物。
+
+### delegate 时间线与逐项结论
+
+| Run | 语义身份 | 终态 | input/output tokens | 结论 |
+|---|---|---|---:|---|
+| `8cb8b84b...` | Intent classification | succeeded | 1,547 / 701 | route 正常 |
+| `7b11ff1a...` | ClinicalTrials.gov bootstrap | succeeded | 178,832 / 1,907 | 收敛 |
+| `5b19711c...` | PubMed bootstrap | succeeded | 195,699 / 2,273 | 收敛 |
+| `259ed530...` | ICH bootstrap | succeeded | 151,339 / 3,926 | 收敛 |
+| `9c760c3c...` | FDA bootstrap | succeeded | 230,690 / 5,840 | 收敛 |
+| `dcc88704...` | EMA bootstrap | succeeded | 189,261 / 4,421 | 收敛 |
+| `e45bea0f...` | Target Biology bootstrap | succeeded | 238,374 / 2,449 | 收敛 |
+| `d6b11031...` | Competitive bootstrap | succeeded | 36,168 / 1,525 | 收敛 |
+| `9926ef21...` | PICO/standards/simulation worker | succeeded | 694,254 / 15,553 | typed result 已持久化 |
+| `9cb29bfa...` | Safety worker | succeeded | 564,549 / 14,183 | typed result 已持久化 |
+| `c9e65c41...` | Termination worker | succeeded | 1,432,625 / 25,552 | typed result 已持久化 |
+| `75611ddd...` | Target biology deep analysis | failed | outer 0 / 0 | 433,287-byte wire body 被 400K producer cap 截断 |
+| `b87044fb...` | AE adjudication | failed | 1,857,573 / 85,860 | tools-closed phase 被动态回读 schema 重新打开，footer finalizer 未运行 |
+| `306805b9...` | Competitive deep analysis | succeeded | 1,617,825 / 16,125 | 大结果 spill/readback 后正常收敛 |
+
+Round 7 的无损 spill 在本轮得到正面生产证明：多个 110K--191K 字符的完整 HTTP body 和
+delegate result 成功写入内容句柄，`read_tool_result` 能回读 bounded slice，伪造句柄仍被拒绝。
+Competitive worker 在多次大结果 spill 后仍成功，说明不是统一网络、provider 或 spill store
+故障。
+
+### 模拟人工追问后的三项通用根因
+
+1. **producer ceiling 与 lossless store 上限不一致。** Target 第三个 HTTP response 实际读到
+   433,287 bytes，但 `skill_http_get/post_json` 的 producer 固定只保留 400,000 bytes；5 MiB
+   spill store 因此永远看不到完整 payload。minified body 又没有可证明的 page/cursor window，
+   tracker 只能以 `response_exceeds_wire_byte_limit_no_safe_page_window` fail closed。正确修复是
+   区分较小的模型 inline `max_chars` 与较大的完整 wire capture hard ceiling，而不是盲目放大
+   context。
+2. **一个 terminal retrieval family 错误消费了整个 child 的 degraded synthesis turn。**
+   Target 的机器 gap 在其他 exact Knowledge Gate/required sibling frontier 尚未结算时就进入
+   tools-closed synthesis；后续 sibling 仍需调用时，唯一 degraded fan-in 已被消费，最后报
+   “no remaining synthesis turn”。terminal family 应成为不可变 gap/pending write，不能取消
+   独立 DAG sibling。
+3. **动态辅助能力绕过了当前 phase policy。** AE 第 18/19 turn 的
+   `workflow_forced_tools=[]` 已声明 final synthesis，但此前 spill 产生的 handle 让
+   `read_tool_result` 在 schema 构建后被无条件追加，所以 debug 同时出现
+   `delegate_forced_synthesis=true`、forced tools `[]` 和 `tool_schema_count=1`。模型返回
+   92,526 字符 stop body 与 malformed `RESULT_FIELDS_JSON`；footer repair 明明
+   `repair_count=0`、remaining=1，却被 catch-all incompatible gate 拒绝。能力 authority
+   不能覆盖 step/phase policy；结构化 output validation 也必须有独立、可观察的一次预算。
+
+### 成熟 session-wise Harness 调研与 adopt/adapt/reject
+
+| 本轮问题 | 成熟官方机制 | 决策 |
+|---|---|---|
+| 完整大输出在 producer 先丢失 | Pydantic AI Harness `OverflowingToolOutput/Spill` 在工具返回产生时无损保存，再给 preview + opaque handle + bounded reader | **adopt**：GET/POST producer 与 spill store 使用同一硬上限；inline cap 独立 |
+| 并行节点之一失败时兄弟状态被吞 | LangGraph checkpoint `pending writes` 在同一 super-step 保存已完成 sibling，恢复时不重跑或取消它们 | **adopt**：terminal family gap 持久保留，exact siblings 先结算，最后 exactly-one degraded fan-in |
+| malformed structured terminal | Pydantic AI 将 output retry 与 tool retry 分开，validator finding 可触发独立 bounded output retry | **adopt**：保留现有 exact-one internal footer submitter；phase policy 优先于动态 tool authority |
+| 长 run 的 step/event 与 crash 恢复 | Pydantic Harness Step Persistence 记录 append-only boundary/snapshot，但明确不是完整 graph checkpoint；Inspect 在 turn boundary 同时保存 agent、sandbox 与 events，明确不捕获 in-flight tool/external effect | **adapt**：继续使用 durable events/effect ledger/fence；不声称可重放不确定外部 effect |
+| session filesystem/shell | Deep Agents backend/sandbox 支持 thread namespace、VFS 与 sandbox-as-tool，并明确 path permission 不能限制 shell/network exfiltration | **adapt**：保留现有统一四槽、session snapshot、无直连网络和签名 egress，不使用 host LocalShell |
+| stream 与 UI 观察者生命周期 | OpenAI Agents SDK 要求持续 drain stream，最终输出/持久化可能在最后 visible token 后完成；Semantic Kernel 的 result timeout 不取消后台 orchestration | 已采用：SSE subscriber 与 durable producer 解耦，terminal barrier 独立 |
+| 团队状态 | AutoGen 提供 `save_state/load_state`，但警告 running team snapshot 可能不一致 | 参考；现有 per-event durability 与 settled boundary 更严格 |
+
+官方参考：
+
+- <https://pydantic.dev/docs/ai/harness/overflowing-tool-output/>
+- <https://pydantic.dev/docs/ai/harness/step-persistence/>
+- <https://pydantic.dev/docs/ai/harness/subagents/>
+- <https://pydantic.dev/docs/ai/core-concepts/agent/>
+- <https://docs.langchain.com/oss/python/langgraph/persistence>
+- <https://docs.langchain.com/oss/python/langgraph/fault-tolerance>
+- <https://docs.langchain.com/oss/python/deepagents/backends>
+- <https://docs.langchain.com/oss/python/deepagents/sandboxes>
+- <https://openai.github.io/openai-agents-python/streaming/>
+- <https://inspect.aisi.org.uk/checkpointing.html>
+- <https://microsoft.github.io/autogen/stable/reference/python/autogen_agentchat.teams.html>
+- <https://learn.microsoft.com/en-us/semantic-kernel/frameworks/agent/agent-orchestration/advanced-topics>
+
+生产 Harness 容器实测 `pydantic_ai`、`pydantic_ai_harness`、`langgraph`、`deepagents`、
+`agents`、`autogen`、`temporalio`、`semantic_kernel` 和 `inspect_ai` 均未安装。整体迁移会引入
+第二套 agent loop、authority、checkpoint、sandbox、effect 与 terminal 控制面，而本轮三项
+问题都有清晰的现有 seam。因此决定保留现有 Harness，采用上述成熟状态语义；Inspect AI 可在
+未来作为外部 E2E runner 评估，不作为生产 runtime 替换。
+
+### 通用修复、确定性回归、提交与生产部署
+
+- `MAX_LOSSLESS_SPILL_BYTES` 成为公开的 5 MiB 完整 payload ceiling；GET/POST 共用一个
+  bounded async reader。`max_chars` 仍最多 100K，只控制模型 inline 展示；超过 5 MiB 仍明确
+  partial-wire fail closed。
+- post-dispatch retrieval terminal 先重算 exact KG、standard required 与 legacy required
+  frontier。有独立 sibling 时只写
+  `http_retrieval.degraded_synthesis_deferred`；所有 sibling 结算后才消费 exactly-one
+  tools-closed degraded synthesis。
+- 动态 `read_tool_result` 只在 ordinary open phase 自动加入；任何当前
+  `iteration_workflow_policy`（尤其 `tools=[]`）都优先。footer unavailable debug 现在列出
+  精确 `incompatible_reasons`，不再用一个 catch-all 隐藏 phase 泄漏。
+- 新增非临床 inventory holdout：两组 exact HTTPS Knowledge Gate 中第一 family terminal、
+  第二 sibling 仍必须 dispatch 后再 degraded fan-in；另一用例先产生 spill handle、完成 bounded
+  readback，再进入 tools-closed synthesis，malformed footer 必须获得一次 internal submitter，
+  且 terminal turn 不暴露回读工具。GET/POST >410K complete body 和 >hard-cap partial-wire 也有
+  确定性测试。
+- 聚焦组合为 `137 passed, 62 subtests passed`。完整只读源码、隔离生产 NFS 的 Harness
+  `unittest` 共 1,877 项：1,871 通过、5 项因 runtime/reference assets 跳过，唯一 CommonJS
+  环境项因 Harness image 无 Node 未通过；同一项在宿主 Node 22.23.1 下 `1 passed`，因此组合
+  证据为 1,872 passed + 5 skipped。Backend 全量 235 项中一个既有 multiprocessing timing
+  assertion 首轮抖动，隔离单项复跑通过。`py_compile`、diff、staged secret/scope/genericity
+  scan 通过；生产代码无 V2.3、疾病、包/session/route/worker/KG/报告名/固定数量特判。
+
+功能提交为
+`1d2b7d9ce412f58e9d21acf6f18a56c1ebef419d fix: preserve generic terminal workflow phases`，
+并包含其父提交
+`c3f9f582d246d6e63c0af2a6f60e471b9c628267 fix: attest shared storage across services`。
+clean archive：`/tmp/chat_ds_deploy_1d2b7d9c.lBwXUs`，文件数与 tracked tree 均为 22,452。
+生产 Harness/Backend image 分别为
+`sha256:d335a4d9afd8becc19ae797330cd0c8f13ebd15128207b7f2ec591e1ac3a3d75` 和
+`sha256:c763e8e9d55875117a9a7fa54b9242e5923d23cf77315118229f6ca73c5ba501`，revision label
+均精确匹配 `1d2b7d9c...`；旧镜像分别保留 `rollback-pre-1d2b7d9c`。
+
+切换前两次确认 active/nonterminal root、enabled/running schedule 与 5173 established
+connection 均为 0，SQLite `quick_check=ok`、FK 0。按 Harness -> Backend 顺序仅
+force-recreate 两个服务；Frontend、四槽、Proxy、Browser、SearXNG/Valkey 和数据卷均未重建。
+部署后三入口 `/api/health`、Harness 与 Backend->Harness `/health`/`/v1/models` 全 200；
+两端 storage identity SHA-256 完全一致且 available，两个容器 healthy/restart 0，数据库仍
+健康空闲，严重启动日志 0，三个 HTTP/回读工具均注册。
+
+Round 8 未产生 strong-final artifact，因此业务级 V2.3 验收仍未通过；但它已经到唯一 durable
+terminal，三项新暴露的缺陷均完成跨领域复现、通用修复、回归、commit 与生产部署。本 campaign
+到此达到用户授权的 8 轮绝对上限：**不得自动创建 Round 9**。下一次模型重型 V2.3 E2E 必须由
+用户明确重新授权或手工发起。

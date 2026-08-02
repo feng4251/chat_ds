@@ -6,6 +6,42 @@
 
 - 工作目录：`/nfs/yangbb/codes/chat_ds`。
 - 分支：`fix/generic-skill-harness-20260717`。
+- 自动 E2E campaign Round 8（最终轮）为 Conversation
+  `9ff98843e980458d832629ba9964ec96` / root
+  `ad98fb353fb240f2b3ab84f345ceb247`。它运行约 3 小时 3 分并从 SSE 收到唯一 durable
+  failed terminal；exact Skill 正确选择
+  `healthsim-trialsim/composite_full_protocol_design`，intent、7 路 bootstrap、PICO、Safety、
+  Termination 和 Competitive deep-analysis 共 11 个 child 成功。Target deep-analysis 因
+  433,287-byte 完整 response 在旧 400K producer ceiling 被先截断而失败；AE 的
+  tools-closed final synthesis 又被先前 spill handle 动态追加的 `read_tool_result` schema
+  重新打开，92,526 字符 stop body 的 malformed footer 因 phase-incompatible gate 未获得
+  独立 output finalizer。required barrier 正确 fail closed，fan-in、模块报告和 strong-final
+  未启动；没有报告 Markdown。
+- Round 8 通用修复提交
+  `1d2b7d9ce412f58e9d21acf6f18a56c1ebef419d fix: preserve generic terminal workflow phases`：
+  GET/POST 完整 wire capture 与 5 MiB lossless store 使用同一 hard ceiling，较小 `max_chars`
+  仍只控制 inline 展示；terminal retrieval gap 在 exact sibling frontier 结算前只持久化/defer，
+  不抢唯一 degraded fan-in；动态回读能力服从当前 phase policy，footer unavailable debug
+  输出具体 incompatible reasons。确定性回归使用非临床 inventory Skill，没有 V2.3、疾病、
+  包/session/route/worker/KG/文件名或固定数量特判。
+- Round 8 Attempt A 在零模型 dispatch 前发现 Harness data bind 与 canonical host root 不一致。
+  永久闭环父提交
+  `c3f9f582d246d6e63c0af2a6f60e471b9c628267 fix: attest shared storage across services`：
+  Backend/Harness health 发布 path-free dev/inode identity，Backend 严格比对，Compose 强制
+  canonical data/memory roots 并禁止静默创建错误 bind source。
+- Round 8 聚焦为 `137 passed, 62 subtests passed`。完整隔离 Harness 为 1,877 项：
+  1,871 通过、5 项资源型 skip，唯一 Harness-image-without-Node holdout 在宿主 Node 22.23.1
+  下单独通过，组合为 1,872 pass + 5 skip。Backend 235 项中一个既有 multiprocessing
+  timing assertion 首轮抖动，单项复跑通过。`py_compile`、diff、secret 与 genericity scan
+  通过。
+- `1d2b7d9c` 已从 clean archive `/tmp/chat_ds_deploy_1d2b7d9c.lBwXUs` 构建并按
+  Harness -> Backend 顺序部署。两镜像分别为
+  `sha256:d335a4d9afd8becc19ae797330cd0c8f13ebd15128207b7f2ec591e1ac3a3d75`、
+  `sha256:c763e8e9d55875117a9a7fa54b9242e5923d23cf77315118229f6ca73c5ba501`；revision
+  label 均为完整提交，旧镜像保留 `rollback-pre-1d2b7d9c`。三入口、Backend->Harness
+  health/models 全 200，两端 storage identity 相同，restart 0、严重日志 0、数据库健康空闲。
+  Round 8 是本 campaign 绝对最后一轮，**不得自动创建 Round 9**；下一次模型重型 V2.3
+  验收必须由用户重新明确授权或手工发起。
 - 自动 E2E campaign Round 7 为 Conversation
   `67119645fa874ecba689c8a61e3874de` / root
   `5e494f191ead47a6ad640295cd48e36e`。它从 2026-08-01 17:37:13 到 20:17:14 UTC
@@ -37,8 +73,8 @@
   `sha256:63ddfc85f83dc8aa1d89fc2e51ec80dba42831df6546370f8670a7e9cfdbe95b`，revision label
   精确匹配完整提交，旧镜像保留为 `rollback-pre-06439152`。Harness healthy/restart 0；
   三入口、Harness 与 Backend→Harness health/models 全 200；新回读工具已注册，严重日志 0，
-  SQLite quick_check/FK 正常且生产空闲。下一项是全新 conversation/root 的 Round 8，也是本
-  campaign 最后一轮模型重型 E2E。
+  SQLite quick_check/FK 正常且生产空闲。该部署随后用于全新 conversation/root 的 Round 8；
+  Round 8 已完成并成为本 campaign 最后一轮模型重型 E2E。
 - 自动 E2E campaign Round 6 为 Conversation
   `862eb37670634f5394fab116429fa948` / root
   `88d0fd14ec01449cace347fcde4d6858`。它从 SSE 收到明确 durable failed terminal；intent 与
@@ -262,9 +298,8 @@
   `2486f008b19f760d0fe63111137feb9d103a1a45`，健康且 restart 0；三个 Frontend
   `/api/health` 入口均为 200。Backend、Frontend、四个 session-sandbox 和 legacy
   browser 未重建。
-- 当前生产 Harness 功能 revision 为
-  `064391529b767a2bb0228a5e74088d4572ad37c0`，Backend 功能 revision 为
-  `3987613c43405b0347bc8606260abde078b707ba`。交接文档可另有 docs-only HEAD。
+- 当前生产 Harness/Backend 功能 revision 均为
+  `1d2b7d9ce412f58e9d21acf6f18a56c1ebef419d`。交接文档可另有 docs-only HEAD。
 - 2026-07-30 其他基础功能提交：
   - `b4e8dc18 fix: require durable delete intent for orphan cleanup`
   - `c62a4a69 feat: unify session sandbox and harden session lifecycle`
@@ -1088,6 +1123,21 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 - 前端：`http://10.10.132.126:5173`、`http://172.30.100.126:5173`。
 - Harness 使用同机 SearXNG `http://10.10.132.126:8088`；既有 SearXNG/Valkey 在切换
   中未重建，健康状态和数据卷保持不变。
+- 2026-08-02 完成 `1d2b7d9c` terminal workflow phase 与 shared-storage attestation 更新：
+  - 部署前连续两次确认 active/nonterminal root、enabled/running schedule 与 5173
+    established connection 均为 0；SQLite `quick_check=ok`、foreign-key violation 0；
+  - 候选来自 clean archive `/tmp/chat_ds_deploy_1d2b7d9c.lBwXUs`，archive 与 tracked tree
+    均为 22,452 个文件；Harness/Backend revision label 精确匹配完整 Git SHA；镜像内
+    compileall 通过；
+  - 按 Harness -> Backend 顺序 force-recreate，旧镜像分别保留
+    `rollback-pre-1d2b7d9c`。Frontend、四槽、Proxy、Browser、SearXNG/Valkey 和数据库卷均
+    未替换；
+  - 部署后 Harness/Backend image 分别为
+    `sha256:d335a4d9afd8becc19ae797330cd0c8f13ebd15128207b7f2ec591e1ac3a3d75`、
+    `sha256:c763e8e9d55875117a9a7fa54b9242e5923d23cf77315118229f6ca73c5ba501`，revision
+    均为 `1d2b7d9ce412f58e9d21acf6f18a56c1ebef419d`，healthy/restart 0；三个 Frontend
+    入口、Harness 与 Backend->Harness health/models 均为 200；两端 path-free storage
+    identity 完全一致，HTTP/回读工具已注册，严重启动日志 0，数据库健康且生产空闲。
 - 2026-08-02 完成 `06439152` lossless tool-result spill/readback 更新：
   - 部署前连续两次确认 active AgentRun/root、running/enabled schedule 与 5173
     established connection 均为 0；SQLite `quick_check=ok`、foreign-key violation 0；
@@ -1263,12 +1313,12 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 
 | 服务 | Image ID | 状态 |
 |---|---|---|
-| `chat_acits_executor` ～ `_4` | `sha256:08996fb6e1da586de9ee57d1812dda75826145bdf07d86dfa784f24b35ec004a` | 4 个同质槽 / healthy / restart 0 / revision `f1e59c20` |
+| `chat_acits_executor` ～ `_4` | `sha256:7eb2b7a0526aa6b9a2560d5b722c2bf3ae44fc72fdb83c65d3e834050056d17a` | 4 个同质槽 / healthy / restart 0 / revision `f3be516b` |
 | `chat_acits_skill_egress_proxy` | `sha256:6f23e97983ace0c4855af3dbf65967678902d2cd8d5c5b33e92eeecb2cec072f` | healthy / restart 0 / revision `f1e59c20` |
 | `chat_acits_browser` | `sha256:08bcf8860c10ba8fcd647b6d1a96c2c12e13e46db800c812acea82e17007240c` | healthy / restart 0 / revision `7bbc0809` |
-| `chat_acits_harness` | `sha256:63ddfc85f83dc8aa1d89fc2e51ec80dba42831df6546370f8670a7e9cfdbe95b` | healthy / restart 0 / revision `06439152` |
-| `chat_acits_backend` | `sha256:817390d6069315d69aef3bcd471f60d3f91f16ceac8e55cbb3d777127bfd1767` | running / restart 0 / revision `3987613c` / `/api/health` 200 |
-| `chat_acits_frontend` | `sha256:907c5abb41a5288c852ae55d2bbc3258196e4fc03fe0305ce072366f9255cb24` | running / restart 0 / revision `c62a4a69` / `/` 200 |
+| `chat_acits_harness` | `sha256:d335a4d9afd8becc19ae797330cd0c8f13ebd15128207b7f2ec591e1ac3a3d75` | healthy / restart 0 / revision `1d2b7d9c` |
+| `chat_acits_backend` | `sha256:c763e8e9d55875117a9a7fa54b9242e5923d23cf77315118229f6ca73c5ba501` | healthy / restart 0 / revision `1d2b7d9c` / `/api/health` 200 |
+| `chat_acits_frontend` | `sha256:ffedcc8db1373f454e5650404ab724be884b6a70a0c8027fc7e99c06a530b0d8` | running / restart 0 / revision `f3be516b` / `/` 200 |
 
 生产 smoke 证据：
 
@@ -1277,27 +1327,34 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 - 四个 session-sandbox、browser、skill egress proxy 健康；Harness `/health` 与
   Backend `/api/health` 为 200。四槽 capability probe 的 runtime build 完全一致。
 - 生产 SQLite `quick_check=ok`、foreign-key violation 为 0；当前计数为
-  conversations/messages/runs/events/tasks =
-  `201 / 773 / 436 / 63014 / 391`，nonterminal agent run 为 0，enabled schedule 为 0。
+  conversations/messages/runs/events/tasks/artifacts =
+  `214 / 797 / 566 / 78652 / 522 / 829`，nonterminal agent run、active root、running/enabled
+  schedule 均为 0。
 - `task_items` 中有 18 条历史 `running` 投影，但其对应 root AgentRun 均已终态
   （10 succeeded、8 failed），不是当前活跃执行；判断运行态应以 durable AgentRun
   和 terminal event 为准。
 - SearXNG 真实 `OpenAI GPT` 查询返回 27 条结果，命中 `360search`、`bing`、`mojeek`；
   SearXNG/Valkey 均 healthy。免费上游仍可能动态出现 unresponsive engine，不属于
   Harness 执行环境缺失。
-- Harness revision label 当前为完整提交
-  `064391529b767a2bb0228a5e74088d4572ad37c0`，Backend 保持
-  `3987613c43405b0347bc8606260abde078b707ba`；proxy/四槽为
-  `f1e59c20129d9c3ba91b0f80850983e93d24d9dc`；Frontend 为
-  `c62a4a69cfbbfb46404cfa1eb51b5f8e0498dce2`；legacy Browser 保持兼容基线。
+- Harness/Backend revision label 当前均为完整提交
+  `1d2b7d9ce412f58e9d21acf6f18a56c1ebef419d`；四槽与 Frontend 为
+  `f3be516bdfc13c82e00fba66ac327364a585bb15`；Proxy 为
+  `f1e59c20129d9c3ba91b0f80850983e93d24d9dc`；legacy Browser 为
+  `7bbc08097a75c618fc8a7338ff96b6577b8772d4`。
   所有长期容器 restart 均为 0。
 - executor/proxy/browser/Harness/Backend/Frontend 日志未发现 traceback、
   critical、fatal、unhandled、ProtocolError 或 exception。
-- Round 7 已到 durable failed terminal 并完成通用修复、回归与部署。按本 campaign 的
-  明确授权，下一项是使用全新 conversation/root 自动执行最后一轮 Round 8。
+- Round 8 已到 durable failed terminal，并完成三项通用修复、回归、本地 commit 与部署。
+  它是本 campaign 的最后一轮；不得自动执行 Round 9。下一次模型重型 V2.3 E2E 只能由用户
+  明确重新授权或手工发起。
 
 回滚点：
 
+- `1d2b7d9c` 切换前 Harness/Backend 分别保留
+  `chat_ds-harness:rollback-pre-1d2b7d9c`、
+  `chat_ds-backend:rollback-pre-1d2b7d9c`；候选/部署 tag 为
+  `candidate-1d2b7d9c` / `deploy-1d2b7d9c`，clean archive build 目录为
+  `/tmp/chat_ds_deploy_1d2b7d9c.lBwXUs`。
 - `06439152` 切换前 Harness 保留
   `chat_ds-harness:rollback-pre-06439152`；候选/部署 tag 为
   `candidate-06439152` / `deploy-06439152`，clean archive build 目录为
@@ -1521,17 +1578,20 @@ revision/image 与生产 smoke 统一记录在 `E2E_ITERATION_LOG.md`。Round 1 
 `862eb37670634f5394fab116429fa948`，root 为
 `88d0fd14ec01449cace347fcde4d6858`；Round 7 为
 `67119645fa874ecba689c8a61e3874de`，root 为
-`5e494f191ead47a6ad640295cd48e36e`。七轮均已到 durable failed terminal，各自通用修复
-已在 `26d65158`、`aac60951`、`3987613c`、`867ebdd9`、`36e8ea43` 完成回归、
-本地 commit、clean-archive 部署与生产 smoke；Round 6 修复在 `70df8b51`，Round 7
-修复在 `06439152`。生产当前空闲；因 Round 7 尚未产生 strong-final artifact，campaign
-可按用户授权创建全新 conversation/root 执行 Round 8。Round 8 是最后一轮，不能复用失败
-run、把同一 run 的重试计为新一轮或继续创建 Round 9。
+`5e494f191ead47a6ad640295cd48e36e`；Round 8 为
+`9ff98843e980458d832629ba9964ec96`，root 为
+`ad98fb353fb240f2b3ab84f345ceb247`。八轮均已到 durable failed terminal，各自通用修复
+已在 `26d65158`、`aac60951`、`3987613c`、`867ebdd9`、`36e8ea43`、`70df8b51`、
+`06439152` 和 `1d2b7d9c` 完成回归、本地 commit、clean-archive 部署与生产 smoke。
+Round 8 还包含 shared-storage attestation 父提交 `c3f9f582`。生产当前健康空闲，但 campaign
+已经达到用户授权的 8 轮绝对上限；不得复用失败 run、把同一 run 的重试计为新轮或创建
+Round 9。下一次模型重型 V2.3 E2E 必须由用户重新明确授权或手工发起。
 
 ## 10. 已知非 blocker 边界
 
 - V2.3 与 ground truth 的业务级一致性仍需真实模型重型 E2E；基础回归不能替代这项验收。
-  当前自动 campaign 已获用户明确授权，Round 8 可由维护代理继续发起，且是最后一轮。
+  当前自动 campaign 已完成用户授权的八轮上限，不得自动创建 Round 9；下一次模型重型
+  V2.3 E2E 必须由用户重新明确授权或手工发起。
 - Legacy `knowledge_gate.checks[].tools` 只能安全解释为单个 OR 组；需要多个独立
   必须条件的 Skill 应显式使用 `tool_groups` 或 `tools: {all_of: ...}`。Harness 不从
   自然语言 action 猜 AND/OR。
