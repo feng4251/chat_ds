@@ -9925,6 +9925,77 @@ def _delegated_child_iteration_limit(
     return min(30, max(default_limit, declared_complexity_limit))
 
 
+_EXACT_DELEGATE_LIST_POLICY_FIELDS = {
+    "required_capability_tools": "expected_required_capability_tools",
+    "required_result_paths": "expected_required_result_paths",
+    "required_output_ids": "expected_required_output_ids",
+    "required_skill_files_to_inspect": "expected_skill_files_to_inspect",
+}
+
+
+def _freeze_exact_delegate_task_policy(
+    policy: dict[str, Any] | None,
+    task: dict[str, Any],
+    *,
+    list_fields: tuple[str, ...],
+) -> None:
+    """Bind one compiler-owned delegate task to its exact gate metadata.
+
+    The generated task and its fail-closed gate must be two projections of the
+    same immutable node input.  Copying fields ad hoc at each call site lets a
+    new prerequisite or output contract appear in the task without appearing
+    in the gate, which makes the harness reject its own deterministic dispatch.
+    This helper deliberately supports only bounded list metadata whose policy
+    semantics are exact equality; authority still comes from the compiled task
+    and can never be widened by a model-authored value.
+    """
+
+    if policy is None:
+        return
+    step_id = str(task.get("step_id") or "").strip()
+    if not step_id:
+        raise ValueError("compiler-owned delegate task is missing step_id")
+    policy["expected_step_ids"] = [step_id]
+    for field_name in list_fields:
+        policy_name = _EXACT_DELEGATE_LIST_POLICY_FIELDS.get(field_name)
+        if policy_name is None:
+            raise ValueError(
+                f"unsupported exact delegate list policy field: {field_name}"
+            )
+        value = task.get(field_name, [])
+        if not isinstance(value, list):
+            raise ValueError(
+                f"compiler-owned delegate task {field_name} must be a list"
+            )
+        policy[policy_name] = {step_id: copy.deepcopy(value)}
+
+
+def _terminal_compiled_auto_dispatch_preflight_error(
+    policy: dict[str, Any] | None,
+    tool_name: str,
+    *,
+    actual_dispatch_attempted: bool,
+    policy_error: str = "",
+    registry_preflight_reason: str = "",
+) -> str:
+    """Return a fail-fast compiler invariant error for a closed delegate node.
+
+    A compiler-owned ``delegate_task`` rejected before its handler boundary is
+    deterministic: replaying the identical node cannot make progress and only
+    burns workflow continuation budget.  Handler-entered child failures remain
+    governed by the ordinary bounded retry/failure taxonomy.
+    """
+
+    if (
+        actual_dispatch_attempted
+        or tool_name != "delegate_task"
+        or not isinstance(policy, dict)
+        or not str(policy.get("delegate_step_type") or "").strip()
+    ):
+        return ""
+    return str(policy_error or registry_preflight_reason or "").strip()
+
+
 def _workflow_gate_call_error(
     policy: dict[str, Any] | None,
     tool_name: str,
@@ -10408,6 +10479,24 @@ def _workflow_gate_call_error(
             "required_result_paths metadata was not declared for this exact "
             "workflow gate and may not be added or changed."
         )
+
+    expected_output_ids = policy.get("expected_required_output_ids")
+    if isinstance(expected_output_ids, dict):
+        for task in delegated_tasks:
+            task_id = str(task.get("step_id") or "")
+            expected = expected_output_ids.get(task_id, [])
+            supplied = task.get("required_output_ids", [])
+            if not isinstance(expected, list) or not isinstance(supplied, list):
+                return (
+                    "Declared workflow output metadata must remain an exact "
+                    "list supplied by the harness."
+                )
+            if supplied != expected:
+                return (
+                    f"Declared step {task_id or '<missing>'} requires exact "
+                    f"required_output_ids metadata {expected}; received "
+                    f"{supplied}."
+                )
 
     expected_result_fields = policy.get("expected_required_result_fields")
     if isinstance(expected_result_fields, dict):
@@ -16931,13 +17020,16 @@ async def run_stream(
                     )
                 run_state.apply_delegate_retry_feedback(synthesis_task)
                 if forced_workflow_policy is not None:
-                    forced_workflow_policy["expected_step_ids"] = [synthesis_step_id]
-                    forced_workflow_policy[
-                        "expected_required_capability_tools"
-                    ] = {synthesis_step_id: synthesis_capabilities}
-                    forced_workflow_policy[
-                        "expected_skill_files_to_inspect"
-                    ] = {synthesis_step_id: required_synthesis_skill_files}
+                    _freeze_exact_delegate_task_policy(
+                        forced_workflow_policy,
+                        synthesis_task,
+                        list_fields=(
+                            "required_capability_tools",
+                            "required_result_paths",
+                            "required_output_ids",
+                            "required_skill_files_to_inspect",
+                        ),
+                    )
                 pending_workflow_auto_call = {
                     "name": "delegate_task",
                     "arguments": synthesis_task,
@@ -22094,6 +22186,56 @@ async def run_stream(
             if safe_auto_detail:
                 progress += f" — {safe_auto_detail[:240]}"
             yield {"type": "tool_progress", "msg": progress}
+
+            compiled_preflight_error = (
+                _terminal_compiled_auto_dispatch_preflight_error(
+                    auto_policy,
+                    auto_tool_name,
+                    actual_dispatch_attempted=(
+                        auto_actual_dispatch_attempted
+                    ),
+                    policy_error=auto_error,
+                    registry_preflight_reason=(
+                        str(auto_preflight.reason or "")
+                        if auto_preflight is not None
+                        and not auto_preflight.ok
+                        else ""
+                    ),
+                )
+            )
+            if compiled_preflight_error:
+                msg = (
+                    "Compiled Skill workflow auto-dispatch failed its exact "
+                    "preflight before any child was dispatched: "
+                    + compiled_preflight_error
+                )
+                diagnostic = {
+                    "tool_name": auto_tool_name,
+                    "delegate_step_type": (
+                        str(auto_policy.get("delegate_step_type") or "")
+                        if isinstance(auto_policy, dict)
+                        else ""
+                    ),
+                    "error": compiled_preflight_error,
+                    "actual_dispatch_attempted": False,
+                    "retry_suppressed": True,
+                    "failure_class": "compiler_gate_invariant",
+                }
+                for debug_evt in await debug_stream_event(
+                    "skill_workflow.auto_dispatch_preflight_failed",
+                    diagnostic,
+                ):
+                    yield debug_evt
+                yield await emit_agent_event("run.failed", {
+                    "error": msg,
+                    "finish_reason": (
+                        "skill_workflow_auto_dispatch_preflight_failed"
+                    ),
+                    "contract_diagnostic": diagnostic,
+                    "actual_dispatch_attempted": False,
+                })
+                yield {"type": "error", "msg": msg}
+                return
 
             if pending_capability_catalog_compilation_failure is not None:
                 # The successful read-only prerequisite remains observable,

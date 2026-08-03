@@ -29,6 +29,7 @@ from agent_loop import (
     _explicit_skill_workflow_request,
     _explicit_required_child_capability_tools,
     _explicit_declared_intent_selections,
+    _freeze_exact_delegate_task_policy,
     _is_repeated_length_response,
     _knowledge_gate_activated_frontier_payload,
     _looks_like_complex_artifact_request,
@@ -42,6 +43,7 @@ from agent_loop import (
     _session_skill_relevance_inspection_exposure,
     _skill_workflow_activation_for_request,
     _stream_retry_is_safe,
+    _terminal_compiled_auto_dispatch_preflight_error,
     _workflow_gate_call_error,
     _workflow_gate_tool_policy,
     run_stream,
@@ -1352,13 +1354,6 @@ class WorkflowGateToolPolicyTests(unittest.TestCase):
             "generate declared modular/checklist artifacts for session skill 'generic'",
             self.available,
         )
-        policy["expected_step_ids"] = ["modular-package"]
-        policy["expected_required_capability_tools"] = {
-            "modular-package": ["write_file"],
-        }
-        policy["expected_skill_files_to_inspect"] = {
-            "modular-package": ["formats/a.md", "formats/b.md"],
-        }
         exact = {
             "goal": "synthesize",
             "skill_name": "generic",
@@ -1366,10 +1361,28 @@ class WorkflowGateToolPolicyTests(unittest.TestCase):
             "step_id": "modular-package",
             "tools": ["skill_view", "write_file"],
             "required_capability_tools": ["write_file"],
+            "required_result_paths": [
+                "results/fetch.txt",
+                "results/normalize.txt",
+            ],
+            "required_output_ids": [
+                "summary.md",
+                "evidence.csv",
+            ],
             "required_skill_files_to_inspect": [
                 "formats/a.md", "formats/b.md",
             ],
         }
+        _freeze_exact_delegate_task_policy(
+            policy,
+            exact,
+            list_fields=(
+                "required_capability_tools",
+                "required_result_paths",
+                "required_output_ids",
+                "required_skill_files_to_inspect",
+            ),
+        )
 
         self.assertEqual(
             _workflow_gate_call_error(
@@ -1385,6 +1398,60 @@ class WorkflowGateToolPolicyTests(unittest.TestCase):
             "exact required_skill_files_to_inspect",
             _workflow_gate_call_error(
                 policy, "delegate_task", missing, prior_call_count=0
+            ),
+        )
+        wrong_paths = {
+            **exact,
+            "required_result_paths": ["results/fetch.txt"],
+        }
+        self.assertIn(
+            "exact required_result_paths metadata",
+            _workflow_gate_call_error(
+                policy, "delegate_task", wrong_paths, prior_call_count=0
+            ),
+        )
+        wrong_outputs = {
+            **exact,
+            "required_output_ids": ["summary.md"],
+        }
+        self.assertIn(
+            "exact required_output_ids metadata",
+            _workflow_gate_call_error(
+                policy, "delegate_task", wrong_outputs, prior_call_count=0
+            ),
+        )
+
+    def test_compiler_owned_delegate_preflight_failure_is_terminal(self):
+        policy = _workflow_gate_tool_policy(
+            "generate declared modular/checklist artifacts for session skill "
+            "'warehouse-reconcile'",
+            self.available,
+        )
+        self.assertEqual(
+            "required_result_paths mismatch",
+            _terminal_compiled_auto_dispatch_preflight_error(
+                policy,
+                "delegate_task",
+                actual_dispatch_attempted=False,
+                policy_error="required_result_paths mismatch",
+            ),
+        )
+        self.assertEqual(
+            "",
+            _terminal_compiled_auto_dispatch_preflight_error(
+                policy,
+                "delegate_task",
+                actual_dispatch_attempted=True,
+                policy_error="child failed after dispatch",
+            ),
+        )
+        self.assertEqual(
+            "",
+            _terminal_compiled_auto_dispatch_preflight_error(
+                {"tools": ["browser_navigate"]},
+                "browser_navigate",
+                actual_dispatch_attempted=False,
+                policy_error="optional browser fallback unavailable",
             ),
         )
 
