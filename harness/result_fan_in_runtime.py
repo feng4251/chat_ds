@@ -39,13 +39,13 @@ DEFAULT_REDUCTION_OUTPUT_BYTES = 32 * 1024
 DEFAULT_REDUCTION_STEP_TIMEOUT_SECONDS = 300.0
 DEFAULT_MAX_WAVE_CONCURRENCY = 8
 FAN_IN_OUTPUT_REPAIR_POLICY_VERSION = (
-    "fan-in-complete-replacement-v3"
+    "fan-in-complete-replacement-v4"
 )
 # Compatibility export for callers/tests which used the narrower v1 name.
 FAN_IN_LENGTH_FINALIZATION_POLICY_VERSION = (
     FAN_IN_OUTPUT_REPAIR_POLICY_VERSION
 )
-MAX_REDUCER_LENGTH_ATTEMPTS = 2
+MAX_REDUCER_LENGTH_ATTEMPTS = 3
 REDUCTION_PROMPT_RESERVE_BYTES = 8 * 1024
 REDUCTION_PROMPT_RESERVE_TOKENS = 2 * 1024
 _COVERAGE_FOOTER_PREFIX = "FAN_IN_COVERAGE_JSON:"
@@ -79,6 +79,7 @@ class ReductionRequest:
     # all reducers can use the second to detect an impossible output budget.
     timeout_seconds: float | None = None
     minimum_output_bytes: int = 0
+    minimum_output_tokens: int = 0
     # The runtime owns the semantic/coverage contract.  A reducer which can
     # safely resample a pure zero-tool response may invoke this validator
     # before accepting an attempt.  The runtime invokes it again after return,
@@ -93,12 +94,15 @@ def build_complete_replacement_prompt(
     request: ReductionRequest,
     *,
     reason_code: str,
+    attempt_number: int = 2,
+    previous_output_bytes: int | None = None,
+    previous_output_tokens: int | None = None,
 ) -> str:
-    """Build the sole complete-replacement prompt for a pure output failure.
+    """Build one bounded complete-replacement prompt for a pure output failure.
 
     A rejected reducer body is never a continuation anchor: appending another
     sample could preserve truncation, duplicate prose/ledgers, or retain raw
-    protocol.  The sole recovery replays the same immutable inputs with a
+    protocol.  Each bounded recovery replays the same immutable inputs with a
     stricter output policy.  ``reason_code`` is a bounded machine category,
     never provider/model text or rejected content.
     """
@@ -114,19 +118,48 @@ def build_complete_replacement_prompt(
     if normalized_reason not in allowed_reasons:
         raise ValueError("unsupported fan-in complete-replacement reason")
 
+    if isinstance(attempt_number, bool) or int(attempt_number) not in (2, 3):
+        raise ValueError("fan-in replacement attempt must be 2 or 3")
+    normalized_attempt = int(attempt_number)
     hard_bytes = max(1, int(request.max_output_bytes))
     hard_tokens = max(1, int(request.max_output_tokens))
     minimum_bytes = max(0, int(request.minimum_output_bytes))
+    minimum_tokens = max(0, int(request.minimum_output_tokens))
+    # Provider tokens and UTF-8 bytes are independent, especially for CJK.
+    # Give the model a preferred target materially inside both hard bounds so
+    # token-estimator drift cannot turn a nominally compliant answer into a
+    # repeated byte-bound failure.  The final replacement is intentionally
+    # denser than the first while still leaving room for the coverage ledger.
+    target_denominator = 2 if normalized_attempt == 2 else 3
     target_bytes = min(
         hard_bytes,
-        max(minimum_bytes, (hard_bytes * 3) // 4),
+        max(minimum_bytes, hard_bytes // target_denominator),
     )
-    target_tokens = max(1, (hard_tokens * 3) // 4)
+    target_tokens = min(
+        hard_tokens,
+        max(1, minimum_tokens, hard_tokens // target_denominator),
+    )
+    observation_lines = ""
+    if previous_output_bytes is not None:
+        observed_bytes = max(0, int(previous_output_bytes))
+        observation_lines += (
+            f"Discarded complete output measured by Harness: {observed_bytes} "
+            "UTF-8 bytes.\n"
+        )
+    if previous_output_tokens is not None:
+        observed_tokens = max(0, int(previous_output_tokens))
+        observation_lines += (
+            "Discarded complete output conservative estimate: "
+            f"{observed_tokens} tokens.\n"
+        )
     return (
         "[Harness bounded fan-in complete replacement]\n"
         f"Policy: {FAN_IN_OUTPUT_REPAIR_POLICY_VERSION}\n"
+        f"Replacement attempt: {normalized_attempt} of "
+        f"{MAX_REDUCER_LENGTH_ATTEMPTS}\n"
         f"Rejected-attempt category: {normalized_reason}\n"
-        "The preceding reducer attempt failed the bounded output contract and "
+        + observation_lines
+        + "The preceding reducer attempt failed the bounded output contract and "
         "was discarded in full. Produce one complete replacement from the same "
         "immutable input records below; do not continue, quote, or refer to the "
         "discarded prefix. Keep the semantic body compact, preserve every "
@@ -138,7 +171,8 @@ def build_complete_replacement_prompt(
         f"tokens and {target_bytes} UTF-8 bytes.\n"
         f"Absolute accepted-output token bound: {hard_tokens} estimated tokens.\n"
         f"Absolute complete-output hard bound: {hard_bytes} UTF-8 bytes.\n"
-        f"Minimum structural/coverage footprint: {minimum_bytes} UTF-8 bytes.\n\n"
+        "Minimum structural/coverage footprint: "
+        f"{minimum_tokens} estimated tokens and {minimum_bytes} UTF-8 bytes.\n\n"
         + request.prompt
     )
 
@@ -149,6 +183,7 @@ def build_length_finalization_prompt(request: ReductionRequest) -> str:
     return build_complete_replacement_prompt(
         request,
         reason_code="length",
+        attempt_number=2,
     )
 
 
@@ -1596,6 +1631,7 @@ async def _reduce_and_write(
         max_output_bytes=max_semantic_bytes,
         timeout_seconds=call_timeout,
         minimum_output_bytes=minimum_output_bytes,
+        minimum_output_tokens=minimum_output_tokens,
         acceptance_validator=lambda candidate: _validate_semantic_reduction(
             str(candidate or "").strip(),
             inputs,

@@ -1344,6 +1344,12 @@ _QUARANTINED_DELEGATE_EVENT_TYPES = {
     "run.completed",
     "run.failed",
 }
+_PARENT_OWNED_WORKSPACE_AUDIT_EVENT_TYPES = {
+    "fan_in.planned",
+    "fan_in.reducer_attempt_started",
+    "fan_in.reducer_finalization_requested",
+    "fan_in.completed",
+}
 
 
 def _is_parent_owned_workspace_lifecycle(event: dict[str, Any]) -> bool:
@@ -1375,6 +1381,14 @@ def _is_parent_owned_workspace_lifecycle(event: dict[str, Any]) -> bool:
         # which case absence still means parent-owned.
         return payload.get("authoritative") is not False
     return False
+
+
+def _is_parent_owned_workspace_audit(event: dict[str, Any]) -> bool:
+    """Persist deterministic delegation audit events absent from child runs."""
+
+    return str(event.get("event_type") or "") in (
+        _PARENT_OWNED_WORKSPACE_AUDIT_EVENT_TYPES
+    )
 
 _NON_RETRYABLE_CHILD_TERMINAL_REASONS = {
     "prerequisite_preload_failed",
@@ -8364,7 +8378,10 @@ async def _run_child(
         dispatch_receipts.observe_event(forwarded)
         if (
             bool(getattr(settings, "agent_debug_trace", False))
-            and _is_parent_owned_workspace_lifecycle(forwarded)
+            and (
+                _is_parent_owned_workspace_lifecycle(forwarded)
+                or _is_parent_owned_workspace_audit(forwarded)
+            )
         ):
             lifecycle_key = (
                 str(forwarded.get("run_id") or ""),
@@ -10229,7 +10246,9 @@ async def _run_child(
                                 "max_attempts": (
                                     MAX_REDUCER_LENGTH_ATTEMPTS
                                 ),
-                                "retryable_terminal": "length",
+                                "retryable_terminal": (
+                                    "bounded_pure_output_contract_failure"
+                                ),
                                 "complete_replacement_on_retry": True,
                                 "side_effects": "none",
                                 "planned_max_input_tokens": (
@@ -10293,6 +10312,8 @@ async def _run_child(
                                 time.monotonic() + request_timeout
                             )
                             replacement_reason_code = ""
+                            replacement_previous_output_bytes: int | None = None
+                            replacement_previous_output_tokens: int | None = None
                             for attempt_index in range(
                                 MAX_REDUCER_LENGTH_ATTEMPTS
                             ):
@@ -10304,6 +10325,13 @@ async def _run_child(
                                         request,
                                         reason_code=(
                                             replacement_reason_code
+                                        ),
+                                        attempt_number=attempt_number,
+                                        previous_output_bytes=(
+                                            replacement_previous_output_bytes
+                                        ),
+                                        previous_output_tokens=(
+                                            replacement_previous_output_tokens
                                         ),
                                     )
                                 )
@@ -10380,6 +10408,15 @@ async def _run_child(
                                             0,
                                             generation_output_tokens
                                             - request.max_output_tokens,
+                                        ),
+                                        "replacement_reason_code": (
+                                            replacement_reason_code or None
+                                        ),
+                                        "previous_output_bytes": (
+                                            replacement_previous_output_bytes
+                                        ),
+                                        "previous_output_estimated_tokens": (
+                                            replacement_previous_output_tokens
                                         ),
                                     },
                                 })
@@ -10605,6 +10642,14 @@ async def _run_child(
                                         "one exact run.failed(length) terminal"
                                     )
                                 retryable_output_failure = ""
+                                observed_output_bytes = len(
+                                    reduction_content.encode("utf-8")
+                                )
+                                observed_output_tokens = (
+                                    estimate_mixed_text_tokens(
+                                        reduction_content
+                                    )
+                                )
                                 if completed_payloads:
                                     completed_reason = str(
                                         completed_payloads[0].get(
@@ -10717,16 +10762,28 @@ async def _run_child(
                                                 "reason_code": (
                                                     retryable_output_failure
                                                 ),
+                                                "discarded_output_bytes": (
+                                                    observed_output_bytes
+                                                ),
+                                                "discarded_output_estimated_tokens": (
+                                                    observed_output_tokens
+                                                ),
                                             },
                                         })
                                         replacement_reason_code = (
                                             retryable_output_failure
                                         )
+                                        replacement_previous_output_bytes = (
+                                            observed_output_bytes
+                                        )
+                                        replacement_previous_output_tokens = (
+                                            observed_output_tokens
+                                        )
                                         continue
                                     raise FanInExecutionError(
                                         "internal fan-in reducer repeated an "
-                                        "invalid bounded output after the "
-                                        "single complete-replacement attempt "
+                                        "invalid bounded output after its "
+                                        "bounded complete-replacement budget "
                                         f"({retryable_output_failure})"
                                     )
                             raise FanInExecutionError(

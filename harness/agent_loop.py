@@ -2188,6 +2188,8 @@ _NON_SENSITIVE_DEBUG_TOKEN_KEYS = {
     "accepted_output_tokens",
     "generation_output_tokens",
     "generation_headroom_tokens",
+    "previous_output_estimated_tokens",
+    "discarded_output_estimated_tokens",
     "accepted_output_policy_max_tokens",
     "generation_output_policy_max_tokens",
     "context_length",

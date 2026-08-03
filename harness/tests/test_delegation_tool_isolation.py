@@ -21,12 +21,17 @@ from tools.delegation import (
     _fan_in_generation_output_tokens,
     _fan_in_retryable_output_failure,
     _fan_in_weighted_wave_concurrency,
+    _is_parent_owned_workspace_audit,
     _run_child,
     _tool_allowed_in_child,
     delegate_task,
 )
 from provider_admission import ProviderAdmissionLimits
-from result_fan_in_runtime import FanInExecutionError, ReductionRequest
+from result_fan_in_runtime import (
+    MAX_REDUCER_LENGTH_ATTEMPTS,
+    FanInExecutionError,
+    ReductionRequest,
+)
 from tools.registry import json_schema_value_error
 
 
@@ -164,6 +169,21 @@ def _catalog_for_bindings(
 
 
 class DelegationToolPolicyTests(unittest.TestCase):
+    def test_fan_in_control_events_are_durable_workspace_audit_records(self):
+        for event_type in (
+            "fan_in.planned",
+            "fan_in.reducer_attempt_started",
+            "fan_in.reducer_finalization_requested",
+            "fan_in.completed",
+        ):
+            with self.subTest(event_type=event_type):
+                self.assertTrue(_is_parent_owned_workspace_audit({
+                    "event_type": event_type,
+                }))
+        self.assertFalse(_is_parent_owned_workspace_audit({
+            "event_type": "agent.delta",
+        }))
+
     def test_fan_in_wire_generation_headroom_uses_declared_provider_cap(self):
         accepted = 9_977
         unknown = _context()
@@ -2693,10 +2713,30 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
                 yield terminal
                 yield {"type": "error", "msg": "bounded length"}
                 return
+            if step_id.endswith("step-0001") and attempts[step_id] == 2:
+                # Reproduce a multilingual provider completing normally under
+                # its wire-token budget while still exceeding the independent
+                # UTF-8 artifact bound.  The first replacement is discarded in
+                # full and a denser final replacement replays immutable inputs.
+                yield {
+                    "type": "delta",
+                    "content": "多语言证据压缩" * 20_000,
+                }
+                terminal = {
+                    "type": "agent_event",
+                    "event_type": "run.completed",
+                    "run_id": kwargs["run_id"],
+                    "agent_kind": kwargs["agent_kind"],
+                    "payload": {"finish_reason": "stop"},
+                }
+                await kwargs["event_sink"](terminal)
+                yield terminal
+                yield {"type": "done", "finish_reason": "stop"}
+                return
             if step_id.endswith("step-0002") and attempts[step_id] == 1:
                 # A clean stop is still only a transport success. The runtime
                 # coverage validator must reject this body before artifact
-                # persistence and spend the same sole replacement budget.
+                # persistence and spend the same bounded replacement budget.
                 yield {
                     "type": "delta",
                     "content": "semantic prose with no coverage footer",
@@ -2762,6 +2802,8 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
                     "tools.delegation.persist_result_for_history",
                     return_value="results/renamed-final.txt",
                 ),
+                patch("tools.delegation.settings.agent_debug_trace", True),
+                patch("agent_loop._append_workspace_debug_event") as debug_append,
             ):
                 context = _context("read_file", event_sink=events.append)
                 context = replace(
@@ -2785,7 +2827,7 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
         first_step = next(
             step for step in attempts if step.endswith("step-0001")
         )
-        self.assertEqual(2, attempts[first_step])
+        self.assertEqual(3, attempts[first_step])
         second_step = next(
             step for step in attempts if step.endswith("step-0002")
         )
@@ -2795,14 +2837,18 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
             for prompt in reducer_prompts
             if "bounded fan-in complete replacement" in prompt
         ]
-        self.assertEqual(2, len(finalization_prompts))
+        self.assertEqual(3, len(finalization_prompts))
         self.assertTrue(all(
             "discarded in full" in prompt
             and "DISCARDED_REDUCER_PREFIX" not in prompt
             for prompt in finalization_prompts
         ))
         self.assertEqual(
-            {"length", "structured_output_contract_invalid"},
+            {
+                "length",
+                "byte_bound_exceeded",
+                "structured_output_contract_invalid",
+            },
             {
                 prompt.split("Rejected-attempt category: ", 1)[1]
                 .splitlines()[0]
@@ -2878,6 +2924,34 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
             )
             for event in reducer_attempt_starts
         ))
+        final_replacement = next(
+            event
+            for event in reducer_attempt_starts
+            if event["payload"].get("attempt") == 3
+        )
+        self.assertEqual(
+            "byte_bound_exceeded",
+            final_replacement["payload"]["replacement_reason_code"],
+        )
+        self.assertGreater(
+            int(final_replacement["payload"]["previous_output_bytes"]),
+            int(final_replacement["payload"]["accepted_output_bytes"]),
+        )
+        self.assertGreater(
+            int(final_replacement["payload"]["previous_output_estimated_tokens"]),
+            0,
+        )
+        persisted_event_types = [
+            call.args[2]["event_type"]
+            for call in debug_append.call_args_list
+        ]
+        self.assertIn("fan_in.planned", persisted_event_types)
+        self.assertIn("fan_in.reducer_attempt_started", persisted_event_types)
+        self.assertIn(
+            "fan_in.reducer_finalization_requested",
+            persisted_event_types,
+        )
+        self.assertIn("fan_in.completed", persisted_event_types)
 
     async def test_repeated_fan_in_length_fails_after_bounded_replacement(self):
         bodies = {
@@ -2940,8 +3014,14 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("(length)", result["error"])
         self.assertFalse(main_called)
         self.assertTrue(attempts)
-        self.assertTrue(all(value <= 2 for value in attempts.values()))
-        self.assertTrue(any(value == 2 for value in attempts.values()))
+        self.assertTrue(all(
+            value <= MAX_REDUCER_LENGTH_ATTEMPTS
+            for value in attempts.values()
+        ))
+        self.assertTrue(any(
+            value == MAX_REDUCER_LENGTH_ATTEMPTS
+            for value in attempts.values()
+        ))
         persist.assert_not_called()
 
     async def test_second_required_result_failure_preserves_prior_audit_and_stops(self):
