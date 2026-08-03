@@ -1,6 +1,7 @@
 import unittest
 
 from model_routing import (
+    DEFAULT_AGENT_MODEL_ID,
     canonical_agent_model_id,
     filter_agentic_fallback_model_ids,
     is_agentic_auxiliary_only_model,
@@ -8,6 +9,12 @@ from model_routing import (
 
 
 class BackendModelRoutingTests(unittest.TestCase):
+    def test_new_default_does_not_rebind_historic_agent_model_alias(self):
+        self.assertEqual("shaiengine_glm_5_2", DEFAULT_AGENT_MODEL_ID)
+        self.assertEqual(
+            "deepseek_v4_pro", canonical_agent_model_id("AgentModel")
+        )
+
     def test_historic_primary_alias_is_canonicalized(self):
         self.assertEqual(
             "deepseek_v4_pro", canonical_agent_model_id("AgentModel")

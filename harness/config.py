@@ -6,6 +6,8 @@ class Settings(BaseSettings):
     # vLLM provider endpoints (from env)
     deepseek_pro_url: str = "http://10.10.132.2:1025/v1"
     qwen3_5_url: str = "http://10.10.132.128:1025/v1"
+    shaiengine_base_url: str = "https://api.shaiengine.com/v1"
+    shaiengine_api_key: str = ""
 
     # Internal model for context compression (auxiliary summarization)
     compressor_model: str = "qwen3_5"
@@ -102,14 +104,52 @@ settings = Settings()
 
 # All providers keyed by model_id (the "frontend choice")
 PROVIDERS: dict[str, dict] = {
+    "shaiengine_glm_5_2": {
+        "base_url": settings.shaiengine_base_url,
+        "api_model": "glm-5.2",
+        "api_key": settings.shaiengine_api_key,
+        "provider": "Shaiengine",
+        "display_name": "GLM-5.2 (Shaiengine · 默认测试)",
+        "is_multimodal": False,
+        "is_default": True,
+        "agentic_auxiliary_only": False,
+        "capabilities": ["text", "tools", "reasoning"],
+        "supports_thinking_toggle": True,
+        "thinking_enabled_by_default": True,
+        "thinking_request_format": "thinking_object",
+        "thinking_send_enabled_explicitly": True,
+        "protocol": "openai",
+        # The compatible /models catalog currently omits capacity fields.
+        # Keep a conservative static bound and still discover future metadata.
+        "context_length": 200000,
+        "discover_runtime_metadata": True,
+    },
+    "shaiengine_deepseek_v4_pro": {
+        "base_url": settings.shaiengine_base_url,
+        "api_model": "deepseek-v4-pro",
+        "api_key": settings.shaiengine_api_key,
+        "provider": "Shaiengine",
+        "display_name": "DeepSeek V4 Pro (Shaiengine)",
+        "is_multimodal": False,
+        "is_default": False,
+        "agentic_auxiliary_only": False,
+        "capabilities": ["text", "tools", "reasoning"],
+        "supports_thinking_toggle": True,
+        "thinking_enabled_by_default": True,
+        "thinking_request_format": "thinking_object",
+        "thinking_send_enabled_explicitly": True,
+        "protocol": "openai",
+        "context_length": 200000,
+        "discover_runtime_metadata": True,
+    },
     "deepseek_v4_pro": {
         "base_url": settings.deepseek_pro_url,
         "api_model": "AgentModel",
         "api_key": "EMPTY",
         "provider": "ZhipuAI",
-        "display_name": "GLM-5.2 (主模型)",
+        "display_name": "GLM-5.2 (本地 AgentModel)",
         "is_multimodal": False,
-        "is_default": True,
+        "is_default": False,
         "agentic_auxiliary_only": False,
         "capabilities": ["text", "tools", "reasoning"],
         # This vLLM chat template accepts
@@ -118,6 +158,7 @@ PROVIDERS: dict[str, dict] = {
         # no-tool recovery/final-synthesis turns that must emit visible text.
         "supports_thinking_toggle": True,
         "thinking_enabled_by_default": True,
+        "thinking_request_format": "chat_template_kwargs",
         "protocol": "openai",
         "context_length": 303872,
         "discover_runtime_metadata": True,
@@ -137,6 +178,7 @@ PROVIDERS: dict[str, dict] = {
         "capabilities": ["text", "vision", "tools"],
         "supports_thinking_toggle": True,
         "thinking_enabled_by_default": False,
+        "thinking_request_format": "chat_template_kwargs",
         "protocol": "openai",
         "context_length": 262144,
         "discover_runtime_metadata": True,
@@ -157,7 +199,7 @@ DEFAULT_AGENT_MODEL_ID = _default_provider_ids[0]
 PROVIDER_ALIASES = {
     # Historic API/persisted identifier. Aliases are normalized at ingress and
     # never appear as duplicate entries in the model catalog.
-    "AgentModel": DEFAULT_AGENT_MODEL_ID,
+    "AgentModel": "deepseek_v4_pro",
 }
 
 

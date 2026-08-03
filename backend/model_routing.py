@@ -9,6 +9,11 @@ from collections.abc import Iterable
 # It must not enter an agentic failover chain, because a fallback is neither an
 # explicit visual selection nor a stable execution model for delegated work.
 AGENTIC_AUXILIARY_ONLY_MODEL_IDS = frozenset({"qwen3_5"})
+# New conversations use the externally hosted GLM-5.2 test route.  Keep the
+# historic ``AgentModel`` alias pinned to the original local route: changing a
+# deployment default must never silently rebind an already persisted model
+# identity to another provider, credential, or capacity envelope.
+DEFAULT_AGENT_MODEL_ID = "shaiengine_glm_5_2"
 AGENT_MODEL_ID_ALIASES = {"AgentModel": "deepseek_v4_pro"}
 
 

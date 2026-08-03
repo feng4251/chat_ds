@@ -16,6 +16,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from database import Base
+from model_routing import DEFAULT_AGENT_MODEL_ID
 
 
 def generate_uuid() -> str:
@@ -50,7 +51,7 @@ class Conversation(Base):
     )
     title: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
     model_id: Mapped[str] = mapped_column(
-        String(64), nullable=False, default="deepseek_v4_pro"
+        String(64), nullable=False, default=DEFAULT_AGENT_MODEL_ID
     )
     enabled_tools: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     fallback_model_ids: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

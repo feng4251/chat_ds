@@ -38,6 +38,7 @@ from workspace import (
 from hooks import emit_event
 from native_tools import DEFAULT_NATIVE_TOOLS
 from model_routing import (
+    DEFAULT_AGENT_MODEL_ID,
     canonical_agent_model_id,
     filter_agentic_fallback_model_ids,
 )
@@ -2558,18 +2559,61 @@ def _spawn_persist_then_emit(
 
 
 BUILTIN = {
-    # 10.10.132.2 GLM-5.2 (303872 ctx) — 主模型
+    # External OpenAI-compatible routes.  The provider also exposes an
+    # Anthropic Messages facade, but its OpenAI stream preserves
+    # ``reasoning_content`` and native tool-call deltas, so that is the
+    # authoritative Harness transport.
+    "shaiengine_glm_5_2": {
+        "api_model": "glm-5.2",
+        "base_url": settings.shaiengine_base_url,
+        "api_key": settings.shaiengine_api_key,
+        "is_multimodal": False,
+        "max_tokens": 86400,
+        "display_name": "GLM-5.2 (Shaiengine · 默认测试)",
+        "is_default": True,
+        "agentic_auxiliary_only": False,
+        "supports_thinking_toggle": True,
+        "thinking_enabled_by_default": True,
+        "thinking_request_format": "thinking_object",
+        "thinking_send_enabled_explicitly": True,
+        "capabilities": ["text", "tools", "reasoning"],
+        "provider": "shaiengine",
+        "protocol": "openai",
+        "context_length": 200000,
+        "discover_runtime_metadata": True,
+    },
+    "shaiengine_deepseek_v4_pro": {
+        "api_model": "deepseek-v4-pro",
+        "base_url": settings.shaiengine_base_url,
+        "api_key": settings.shaiengine_api_key,
+        "is_multimodal": False,
+        "max_tokens": 86400,
+        "display_name": "DeepSeek V4 Pro (Shaiengine)",
+        "is_default": False,
+        "agentic_auxiliary_only": False,
+        "supports_thinking_toggle": True,
+        "thinking_enabled_by_default": True,
+        "thinking_request_format": "thinking_object",
+        "thinking_send_enabled_explicitly": True,
+        "capabilities": ["text", "tools", "reasoning"],
+        "provider": "shaiengine",
+        "protocol": "openai",
+        "context_length": 200000,
+        "discover_runtime_metadata": True,
+    },
+    # 10.10.132.2 local GLM-5.2 (303872 ctx) — retained for existing sessions
     "deepseek_v4_pro": {
         "api_model": "AgentModel",
         "base_url": settings.deepseek_pro_base_url,
         "api_key": settings.deepseek_pro_api_key,
         "is_multimodal": False,
         "max_tokens": 262144,
-        "display_name": "GLM-5.2 (主模型)",
-        "is_default": True,
+        "display_name": "GLM-5.2 (本地 AgentModel)",
+        "is_default": False,
         "agentic_auxiliary_only": False,
         "supports_thinking_toggle": True,
         "thinking_enabled_by_default": True,
+        "thinking_request_format": "chat_template_kwargs",
         "capabilities": ["text", "tools", "reasoning"],
         "provider": "builtin",
         "protocol": "openai",
@@ -2588,6 +2632,7 @@ BUILTIN = {
         "agentic_auxiliary_only": True,
         "supports_thinking_toggle": True,
         "thinking_enabled_by_default": False,
+        "thinking_request_format": "chat_template_kwargs",
         "capabilities": ["text", "vision", "tools"],
         "provider": "builtin",
         "protocol": "openai",
@@ -2598,6 +2643,17 @@ BUILTIN = {
 
 # Backward-compatible alias for existing conversations
 BUILTIN["AgentModel"] = BUILTIN["deepseek_v4_pro"]
+
+_default_builtin_ids = [
+    model_id
+    for model_id, config in BUILTIN.items()
+    if model_id != "AgentModel" and config.get("is_default") is True
+]
+if _default_builtin_ids != [DEFAULT_AGENT_MODEL_ID]:
+    raise RuntimeError(
+        "Backend and Harness default model identities diverged: "
+        + repr(_default_builtin_ids)
+    )
 
 DEFAULT_CUSTOM_MAX_TOKENS = 32768
 
@@ -2644,6 +2700,12 @@ async def resolve_model_config(model_id: str, cur_user: User, db: AsyncSession) 
             ),
             "thinking_enabled_by_default": cfg.get(
                 "thinking_enabled_by_default", True
+            ),
+            "thinking_request_format": cfg.get(
+                "thinking_request_format", ""
+            ),
+            "thinking_send_enabled_explicitly": bool(
+                cfg.get("thinking_send_enabled_explicitly", False)
             ),
         }
     custom = (await db.execute(
@@ -2720,14 +2782,14 @@ async def _detect_model(req: ChatRequest, user_id: str) -> str:
     """Auto-detect model based on message content.
 
     Routing rules:
-    1. Image → deepseek_v4_pro (agent discovers session skills/MCP tools and decides:
+    1. Image → the configured primary model (agent discovers session skills/MCP tools and decides:
        call MCP tool for specialized processing, or use vision_analyze tool
        which internally calls qwen3_5 for visual recognition)
-    2. Plain text → deepseek_v4_pro (default main model)
+    2. Plain text → the configured primary model
     """
     if req.model_id:
         return req.model_id
-    return "deepseek_v4_pro"
+    return DEFAULT_AGENT_MODEL_ID
 
 
 async def _generate_title(

@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     deepseek_pro_api_key: str = "EMPTY"
     qwen3_5_base_url: str = "http://10.10.132.128:1025/v1"
     qwen3_5_api_key: str = "EMPTY"
+    shaiengine_base_url: str = "https://api.shaiengine.com/v1"
+    shaiengine_api_key: str = ""
 
     # Application
     app_title: str = "Chat ACITS"
