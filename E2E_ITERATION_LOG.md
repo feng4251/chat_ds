@@ -1384,3 +1384,114 @@ Round 9 至此完成“两项独立 E2E terminal → exact 三源诊断 → 官�
 
 Round10 至此完成两个 Skill terminal 的三源诊断、通用修复、成熟官方实现对照、完整回归、本地
 提交、clean-archive 部署与生产 smoke。按用户最新要求在此暂停 campaign，不启动 Round11。
+
+## Round 11：same-package planned-resource closure 与 child quality 单一权威页脚
+
+### 两个独立 case、exact Skill 与唯一终态
+
+- V2.3 使用 Conversation `49791ec4ef37449c84b7c1611e256a06`、root
+  `b75a71b3dbdd48f58dd76ec31a4a3b46`，从 2026-08-03 03:42:27 到 03:57:04 UTC 达到唯一
+  durable `run.failed/delegate_retry_exhausted`。持久化用户输入仍为 64 字符基线，实际冻结
+  `healthsim-trialsim` primary 与 orchestration 声明了 intent、7 路 bootstrap、后续 worker DAG、
+  11 模块和 `_FULL_REPORT.md` merge。debug/AgentRun 证明 intent 与
+  ClinicalTrials/PubMed/ICH/FDA/EMA/Target Biology 六项来源均成功；最后的
+  `competitive_intel` attempt `53a54038...` 因填充 `drug_name/drug_type/mechanism/target_genes/max_phase`
+  却没有 evidence receipt 被正确拒绝。fresh retry `2d505060...` 已改为无事实漂白的降级内容，
+  但模型同时输出两个各自严格合法的 `COMPLETION_QUALITY_JSON`，旧 exact-one parser 将整项拒绝。
+  mandatory bootstrap barrier 因而 fail closed，worker/fan-in/final artifact 均未启动，Artifact 为 0。
+- 肺癌 MDT 使用 Conversation `b830029d282447cf8abcce196c7d6b41`、root
+  `941e09a080694159ac6d45c205b2d7e0`，从 03:58:32 到 04:02:35 UTC 达到唯一 durable
+  `run.failed/skill_result_contract_invalid`。持久化输入 raw SHA 仍为
+  `eefb885294e6849d1e5ab5ce9f6799a30dfff1b9520761bd403138b7f4b135b7`，exact User Skill
+  `SKILL.md` SHA 为 `2955c00a...`、36-file tree digest 为 `200708f8...`。前两次 compact semantic
+  plan 被 IR validator 拒绝，第三次已 accepted；随后在零 child/tool/artifact dispatch 前，runtime
+  installer 报 `unconditional_capability_selector_unresolved`：`round0_data_gating` 的
+  `SKILL.md` 与四个 `references/*.md` exact path 均真实存在于同一冻结 package，但旧 selected-resource
+  closure 只收集 `local_resources`，没有把 accepted worker capability 中的 path-shaped selector
+  转换为 run-owned resource authority。Artifact 为 0。
+- 两项均按持久化对话、exact immutable Skill/package/resource、debug/AgentRun/tool/provider/artifact
+  三源交叉取证。V2.3 不是共同网络或沙箱失败；肺癌 MDT 更在零执行 dispatch 前失败。前端文案、
+  模型 prose 与网站动态状态均未被提升为控制面事实。
+
+### 模拟人工追问后的跨领域不变量与逐 attempt 归因
+
+1. **accepted plan 引用的同包精确资源必须在 install 前形成 authority closure。** 只有形如安全
+   relative file path 的 ordinary worker selector、且能在同一 immutable package 中精确解析并绑定
+   content digest，才可进入 selected resources。`skill:*`、command-like selector、目录、glob、
+   traversal、symlink 或未选择文件均不得借此获权；加入所有来源后还要重新检查完整 256-resource
+   上限。accepted plan 与 runtime install 必须使用同一冻结 generation。
+2. **机器完成质量应只有一个 canonical authority，但多个严格合法的候选不应触发整工作流重放。**
+   若每个可见候选都通过 exact schema，可在 typed boundary 收敛为一个 canonical ledger；状态冲突
+   保守取 `degraded`。任一 malformed/oversize 候选都保持原样并由 strict parser fail closed；code
+   fence 中的示例不算候选。canonicalization 不能越过 evidence receipt audit，也不能把 populated
+   unverifiable facts 洗成合法降级结果。
+3. **校验恢复与外部副作用重试分权。** 本轮 V2.3 attempt 1 的事实/证据冲突仍失败，attempt 2 的
+   页脚重复只在 final typed-output transaction 内 canonicalize；不会重跑已成功的六项 bootstrap，
+   也不会扩大工具、网络、文件或 Skill authority。肺癌 plan install 则必须在任何 worker dispatch
+   前原子失败或成功，不能留下半安装能力。
+
+逐 attempt 结论：V2.3 的 intent `d9ff5bb5...` 与六个 bootstrap child 均 succeeded；
+`53a54038...` 是正确的 evidence-contract failure；`2d505060...` 是 provider 输出冗余但可确定性
+收敛的 typed-footer failure。肺癌 MDT 没有 delegate attempt；其 122,386 input / 12,951 output
+tokens 全用于 root planning，失败发生于 accepted semantic plan 的 runtime install boundary。
+
+### 成熟官方实现对照与取舍
+
+本轮沿用并复核冻结的官方源码 revisions：Deep Agents
+`46ee772b45e1d80e65c26524b0ef05914a503533`、Codex
+`2b5bdcf67547860f2e5c5a605009a70026796b2b`、Pydantic AI
+`2375e5a3120d19b12bd6b2706815bb61dfbbf66e`、OpenAI Agents Python
+`fc084ae29cd751b801c2779c9ebd23ff6bad1668`、Temporal Python SDK
+`646d69e12e1f9a134f3abc1eb3a9c750e5ddfe32`，并继续以 OpenClaw/Hermes/LangGraph 的既有
+冻结源码作为 durable event/retry 对照。
+
+| 本轮问题 | 官方模式 | 决策 |
+|---|---|---|
+| plan path 与 runtime authority 脱节 | Deep Agents `FilesystemMiddleware`、`CompositeBackend`、`StateBackend` 将路径操作绑定当前 backend；Codex workspace-write policy 将可写/可读路径限制在 canonical roots | **adapt** exact same-package selector→content-digest authority；比普通 root containment 更严格，继续拒绝 directory/glob 隐式授权 |
+| provider 产生重复 structured footer | Pydantic AI output validation/`ModelRetry` 与 OpenAI Agents `output_type`/`AgentOutputSchema` 在最终 typed boundary 验证模型输出 | **adapt** 在 final typed transaction 内做保守 canonicalization；不把 raw prose 或重复页脚本身升级为完整 child 重放理由 |
+| completed predecessors 被局部校验问题牵连 | Temporal Activity `RetryPolicy` 与 durable activity state 把重试绑定当前 activity/attempt，不重跑已完成 predecessor | **adopt** 当前 child/output transaction 的 retry ownership；保留 ChatDS exact receipt、effect ledger 和 root terminal |
+| 是否整体换栈 | 上述库没有同时提供 content-addressed arbitrary Skill compiler、session workspace、exact egress、evidence/artifact receipt 与 durable terminal | **reject** whole-stack replacement；继续在现有 authority/receipt contract 后组件级吸收 |
+
+官方入口：Deep Agents filesystem/subagents
+<https://github.com/langchain-ai/deepagents/blob/master/libs/deepagents/deepagents/middleware/filesystem.py>、
+<https://github.com/langchain-ai/deepagents/blob/main/libs/deepagents/deepagents/middleware/subagents.py>；
+Codex Python workspace sandbox
+<https://github.com/openai/codex/blob/main/sdk/python/docs/api-reference.md>；OpenAI Agents typed output
+<https://openai.github.io/openai-agents-python/agents/>；Temporal retry
+<https://docs.temporal.io/develop/python/failure-detection>；Pydantic AI output
+<https://ai.pydantic.dev/output/>。
+
+### 通用实现、确定性复现、回归与生产切换
+
+- `harness/knowledge_gate_runtime.py` 从普通 worker 的同一 normalized capability surface 派生
+  path-shaped resource selector；排除 `skill:*` 和 parenthesized command selector。
+  `harness/agent_loop.py` 在 runtime compile 前将其加入 exact selected-resource closure，仍经过 lexical
+  path、immutable package snapshot、digest lowering，并在 worker/bootstrap/aggregate 来源全部加入后
+  再执行 256 项全量上限。
+- `harness/tools/delegation.py` 只 canonicalize 多个严格合法的 completion-quality ledger，冲突状态
+  保守选择 `degraded`，canonical ledger 位于 terminal `RESULT_FIELDS_JSON` 前。malformed duplicate
+  不变、code-fenced fake 忽略；safe debug 只记录候选数、状态和是否 canonicalized，不持久化 reason。
+  既有 evidence audit 仍先于成功终态。
+- 确定性非医疗 `inventory-review` holdout 首先复现 accepted worker 同包 reference install failure，
+  修复后证明 selected file 得到 digest authority、未选择文件不获权。Scripted/typed-output 测试证明
+  complete+degraded 两页脚收敛为一个 degraded，malformed duplicate 继续失败，code-fenced fake 忽略，
+  populated facts 无 receipt 仍失败。
+- 受影响组合最终 `260 passed, 182 subtests passed`。默认宿主 full run 的 19 个失败全部为不可读生产
+  NFS tombstone 的既有环境噪声；使用 tmpfs `/nfs/temp/chat_ds` 的隔离 Harness full run 为
+  `1929 passed, 3 warnings`。clean candidate 组合为 `259 passed, 1 skipped`，skip 仅因 clean tracked
+  archive 不包含未跟踪 V2.3 reference archive。`py_compile`、`git diff --check`、staged secret、
+  protected-deletion 与 genericity scan 全部通过。
+- 通用修复提交为
+  `ca9f5eac235cb924d3860826482df032d2a542fb fix: bind planned resources and canonicalize child quality`。
+  clean archive `/tmp/chat_ds_deploy_ca9f5eac.paRTS7` 与 tracked tree 均为 22,452 files；candidate image
+  `sha256:c5b07eabae3e4a8af182965c9c0268558e4c37e87647e9e13d4131375b61282d` 通过 compile/import/test，
+  revision label 精确匹配完整提交。
+- 部署前连续两次确认 nonterminal root/run、schedule 与 5173 established connection 全 0，SQLite
+  `quick_check=ok`、FK 0。仅 force-recreate Harness；旧 image 保留
+  `rollback-pre-ca9f5eac`，Backend/Frontend/四槽/Proxy/Browser/SearXNG/Valkey/数据卷均未重建。
+  部署后三入口、Harness、Backend→Harness health/models 全 200，storage identity 相同，Harness
+  healthy/restart 0，严重日志 0，数据库仍健康空闲。
+
+Round 11 至此完成双 Skill terminal、三源诊断、逐 attempt 解释、成熟官方实现对照、通用复现与
+跨领域修复、完整回归、本地 commit、clean-archive 部署和生产 smoke。用户已明确授权继续
+Round 12--15；每轮仍使用全新 conversation/root 且两项顺序运行。
