@@ -16,6 +16,40 @@ from result_fan_in import (
 
 
 class ResultFanInPlannerTests(unittest.TestCase):
+    def test_single_reducer_output_accounts_for_exact_source_identifiers(self):
+        """Planner-issued output bounds must fit their real final envelope.
+
+        This deliberately uses an unrelated release-ledger domain and long,
+        numerous result identifiers.  Every source fits one independent
+        reducer request, while the exact sources do not fit the smaller final
+        child.  The planner must reserve metadata for the *actual* leaf
+        lineage rather than a fixed two-ID dummy artifact.
+        """
+
+        results = [
+            {
+                "result_id": f"release-ledger-{index:02d}-" + "x" * 100,
+                "path": f"results/releases/{index:02d}.md",
+                "content": "release evidence\n" * 1_000,
+            }
+            for index in range(8)
+        ]
+
+        plan = plan_persisted_result_fan_in(
+            results,
+            token_allowance=48_000,
+            byte_allowance=64_000,
+            reduction_token_allowance=190_000,
+            reduction_byte_allowance=1024 * 1024,
+            reduction_output_reserve_tokens=32 * 1024,
+        )
+
+        self.assertEqual("rolling_reduction", plan.mode)
+        self.assertEqual(1, len(plan.source_batches))
+        self.assertEqual(1, len(plan.reduction_steps))
+        self.assertTrue(plan.reduction_steps[0].input_batch.fits_budget)
+        self.assertIsNotNone(plan.final_artifact)
+
     def test_fifteen_source_long_context_shape_uses_byte_safe_output_policy(self):
         def build(prefix: str):
             return plan_persisted_result_fan_in(
