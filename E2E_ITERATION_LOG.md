@@ -1495,3 +1495,80 @@ Codex Python workspace sandbox
 Round 11 至此完成双 Skill terminal、三源诊断、逐 attempt 解释、成熟官方实现对照、通用复现与
 跨领域修复、完整回归、本地 commit、clean-archive 部署和生产 smoke。用户已明确授权继续
 Round 12--15；每轮仍使用全新 conversation/root 且两项顺序运行。
+
+## Round 12：真实 fan-in 元数据包络与 semantic root package authority
+
+### 两个全新顺序 E2E 与三源诊断
+
+- V2.3 使用 conversation `9bb4a0173fc44c5b94cb4258b2a17ab7`、root
+  `f96df86c12744cc5bd4cafc176ec6a8f`、原始 64 字符 prompt 和默认
+  `shaiengine_glm_5_2`。ZIP 安装仍正确呈现 1 个 primary + 18 个 supporting Skills。
+  Intent 和 7 个 bootstrap 全部成功，包含 Round 11 曾失败的 `competitive_intel`；worker wave 中
+  Safety、Termination、AE、Target、Competitive 和 Literature 全部成功。PICO 首次 attempt
+  `12ca8512a61e48d49522febae47bb919` 与唯一 clean retry
+  `685df30f0b744cbb820415c15bd1dc9f` 均为 0 input/0 output token，父级 lossless spill 保留同一
+  retryable structured error：`internal fan-in planning error: final reduction artifact does not fit the
+  final child budget`。最终 14 succeeded child attempts、2 failed attempts、288 completed tools、
+  0 artifact；required barrier 正确 fail closed，没有伪造最终报告。
+- 精确源码路径证明旧 `_safe_reduction_output_allowance` 用固定两个短 `immediate_input_ids`、固定
+  dummy path/range 和 0 数字宽度估算，而真实单 reducer leaf 将同批全部长 result IDs 写入 metadata。
+  output body 吃满旧虚拟 cap 后，真实 final batch 必然超限。错误发生于本地 deterministic planner，
+  不是 provider、网络、sandbox、timeout、前端 disconnect 或 remote database。
+- 肺癌 MDT 使用 conversation `265ffb56b04141fe99e1281ab2811e7d`、root
+  `424100dd5ffd4d10afbc1224f1a7f877` 和与历史 user case 完全相同的 7,089 字符 prompt。完整
+  `SKILL.md` digest 为 `2955c00a...`，semantic plan 一次 accepted，随后在首个 sequential worker
+  `overview` 前以 `skill_result_contract_invalid` 终止：ordinary selector `SKILL.md` 没能 lower 为
+  exact run-owned candidate，0 child/0 artifact。
+- Debug 显示安装后的 `allowed_skill_resources` 已有 exact main，但 native-only selection 的
+  `allowed_skill_package_digests` 为空；`_resource_candidate` 同时要求 main digest、complete package
+  digest 和 live snapshot，因而正确拒绝。它不是 path validator 拒绝 main，也不是网络/模型问题。
+
+### 成熟官方实现对照与取舍
+
+| 对照 | 官方实现要点 | 本轮吸收 |
+|---|---|---|
+| Deep Agents FilesystemMiddleware | State/Store/Sandbox/Composite backend 明确分离，large tool result 和 conversation history 以 backend 路径 materialize | fan-in body 与 metadata 分账，persisted result 不回灌成无边界 prose |
+| LangGraph durable execution | task/subgraph result checkpoint 后恢复，side-effect task 要求 deterministic/idempotent | deterministic planner bug 不做第二次相同 model retry；用本地复现修 planner |
+| Temporal Python SDK | ApplicationError 可显式 non-retryable；错误分类决定 workflow/task retry | 将 0-token 相同 planner exception 认定为代码类 deterministic failure，而非 provider retry |
+| OpenAI Agents SDK | RunContext 与 model-visible context 分离；Sandbox manifest/path grant 由 runtime 持有 | package snapshot/digest 保留在 runtime authority，不要求模型复制或自签根包身份 |
+
+官方源码/文档：Deep Agents filesystem
+<https://github.com/langchain-ai/deepagents/blob/master/libs/deepagents/deepagents/middleware/filesystem.py>；
+LangGraph durable functional API
+<https://docs.langchain.com/oss/javascript/langgraph/functional-api>；Temporal Python SDK
+<https://github.com/temporalio/sdk-python>；OpenAI Agents context/sandbox
+<https://openai.github.io/openai-agents-python/context/>、
+<https://github.com/openai/openai-agents-python>。访问日期均为 2026-08-03。
+
+### 通用实现、复现、回归和生产切换
+
+- `harness/result_fan_in.py` 升级 planner v3/output policy v4。根据真实 source batches 构造固定宽
+  placeholder plan 下的 exact leaf IDs/path/source range/immediate lineage，再构造相同的 stable
+  ordered balanced-tree；按最终 artifact metadata 和每一对 merge input metadata 分别计算 token/byte
+  body cap。数字字段使用 final budget 上界的位宽 envelope，实际值只能更短；placeholder/final hash
+  字符串同为 ASCII 固定宽，因此两次 content-addressed 计算一致。没有扩大 provider context、删来源或
+  捕获后继续。
+- `harness/agent_loop.py` 在 accepted standard semantic plan 的 live-authority revalidation 后再次检查
+  run-frozen root snapshot。安装 closure 无条件加入 exact `(skill, SKILL.md)` 与同一冻结 package
+  digest；supporting files 仍只能由已选 candidate/route 精确加入，directory/glob/ambient package browse
+  均未开放。
+- 非医疗 `release-ledger` 8-source holdout 在修复前稳定重现 single-reducer final overflow，修复后生成
+  1 source batch/1 reduction step/final artifact。通用 `portable-skill` native-only semantic plan 在修复
+  前证明 main resource 存在但 package digest 为空，修复后 exact resource+package authority 同时存在。
+  精确肺癌 package 的零模型 compiler probe 也解析为 content-addressed `skill_resource` candidate。
+- 定向组合为 `133 passed, 22 subtests passed`，跨域 pipeline、execution compiler 和相关 AgentLoop
+  组合通过。完整 clean tmpfs 容器为 `1929 passed, 1 failed, 800 subtests`，唯一失败是 Harness image
+  按部署设计不含 Node 的 CommonJS executor test；同一项在宿主 Node 22.23.1 单独 `1 passed`，所以
+  本轮覆盖的全部 1930 项逻辑均通过。候选 clean image 的 133+22、compileall/import 均通过。
+- 代码提交为 `0406ab72ae48069f923304798f4b34003b82c107`。clean archive
+  `/tmp/chat_ds_deploy_0406ab72.fclvYr` 精确包含 22,452 tracked files；candidate/production image
+  `sha256:48dfa72457b2db76284a18f4bf11f241c354b218241825227f902f9e63cfcbad`。
+- 部署前两次确认 nonterminal Agent/Schedule、5173 established connection 均为 0，SQLite
+  `quick_check=ok`、FK 0。只 force-recreate Harness；Backend/Frontend/四槽/Proxy/Browser/
+  SearXNG/Valkey/数据卷均未重建，旧 image 保留 `rollback-pre-0406ab72`。部署后 Harness
+  healthy/restart 0/revision 精确，三入口均 200，容器内与 Backend→Harness health/models、storage
+  identity、数据库 idle 和严重日志 smoke 全部通过。
+
+Round 12 至此闭环。下一项是从生产 `0406ab72` 开始 Round 13，仍必须先 V2.3、后肺癌 MDT，使用
+两个全新 conversation/root；若出现问题继续按 exact Skill + conversation + debug/tool/result 三源、
+确定性复现、成熟官方方法对照、跨域 holdout、通用修复、完整回归、local commit 和 clean deploy 闭环。

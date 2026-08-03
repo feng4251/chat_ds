@@ -10,6 +10,35 @@
   替代 Round 10 后的暂停要求与旧 Round 13 上限。每轮仍顺序运行 V2.3 和 `yangbb` User Skill
   `lung-cancer-mdt` 的全新 conversation/root，并完成三源诊断、通用复现、官方成熟实现对照、
   跨领域修复、回归、本地 commit、clean-archive 部署与生产 smoke。Round 15 是当前硬上限。
+- Round 12 已完成。V2.3 `9bb4a0173fc44c5b94cb4258b2a17ab7` / root
+  `f96df86c12744cc5bd4cafc176ec6a8f` 完成 intent、7 路 bootstrap 和除 PICO 外的全部
+  worker；PICO 的首次与唯一 clean retry 均在 0 provider token 前触发同一确定性内部错误：独立
+  reducer 预算能一次预载全部前序结果，但旧 fan-in output allowance 用两个短 ID 的虚拟 artifact
+  估算元数据，真实 leaf 携带更多、更长的 immediate source IDs，最终 child 校验无法容纳规划器自己
+  批准的 artifact。该 case 为 14 succeeded child attempts、2 failed attempts、0 artifact；不是网络、
+  provider、沙箱、timeout 或用户断线。肺癌 MDT `265ffb56b04141fe99e1281ab2811e7d` / root
+  `424100dd5ffd4d10afbc1224f1a7f877` 在 semantic plan accepted 后、0 child/0 artifact 时失败：
+  worker `overview` 的普通 capability 精确指向 `SKILL.md`，文件资源仍在 authority 中，但 native-only
+  plan 安装丢失了冻结根包 digest，runtime compiler 因无法构成 exact file+package identity 而正确
+  fail closed。两项均通过 conversation、exact Skill、root/child debug、tool event 与 result spill
+  三源关联后定位。
+- Round 12 通用修复提交为
+  `0406ab72ae48069f923304798f4b34003b82c107 fix: bind semantic roots and account fan-in metadata`：
+  fan-in planner v3/output policy v4 从实际 source partition 构造与执行完全相同的 leaf/balanced-tree
+  metadata envelope，逐 final/merge request 计算 token/byte body 上限；固定宽 placeholder/final plan ID
+  保持 content-address stability，不增加预算、不截断来源。standard semantic plan 安装时重新验证
+  run-frozen root snapshot，并始终保留且只保留 exact `SKILL.md` 与完整 package digest；不授予 sibling、
+  directory 或 glob。production diff 没有疾病、V2.3、Skill/session/worker/文件名或固定数量特判。
+- Round 12 定向组合为 `133 passed, 22 subtests passed`，跨域/契约扩展组合通过；完整 clean tmpfs
+  Harness 为 1929 passed + 唯一 CommonJS runtime 环境项。该项因 Harness image 按设计不预装 Node
+  而失败，在宿主 Node 22.23.1 单独 `1 passed`，因此全部 1930 项逻辑覆盖通过。clean candidate 同一
+  133+22 通过；`py_compile`、diff、secret、genericity 与 protected-deletion 检查通过。
+- `0406ab72` 已从精确 clean archive `/tmp/chat_ds_deploy_0406ab72.fclvYr`（22,452 tracked files）
+  构建并只替换生产 Harness。当前 image 为
+  `sha256:48dfa72457b2db76284a18f4bf11f241c354b218241825227f902f9e63cfcbad`，revision 精确匹配，
+  healthy/restart 0；Backend 保持 `0108c664`。三入口现均 200，容器内/Backend→Harness、models、
+  storage identity、SQLite/FK/idle root/schedule 和严重日志 smoke 均通过；旧 Harness image 保留
+  `rollback-pre-0406ab72`。Round 13 是下一项已授权双 Skill 测试。
 - Round 11 已完成。V2.3 `49791ec4ef37449c84b7c1611e256a06` / root
   `b75a71b3dbdd48f58dd76ec31a4a3b46` 在 7 路 bootstrap 的最后一项
   `competitive_intel` 重试中，第一次因无 evidence receipt 却填充 typed facts 被正确拒绝，
@@ -70,7 +99,7 @@
   800 subtests passed`，唯一 deselected CommonJS 环境项在宿主 Node 22.23.1 单独 passed，组合覆盖
   全部 1,926 项。
 - Round 10 后的暂停要求已被用户最新五轮双 Skill 明确授权替代；不得复用旧 run，也不得并发运行
-  同一轮两个根任务。当前从已部署的 `ca9f5eac` 开始 Round 12。
+  同一轮两个根任务。当前从已部署的 `0406ab72` 开始 Round 13。
 - Round 9 的两个 case 均已到唯一 durable failed terminal；该轮开始时生产仍为 `1d2b7d9c`。V2.3 case
   `24239b8bef374c8e9663a0849adafa05` / root
   `0d3a0e9ee41e4153b129cbc4728d7761` 已于 2026-08-02 07:00:36 UTC 到唯一 durable
