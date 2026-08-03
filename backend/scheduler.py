@@ -21,6 +21,7 @@ from config import settings
 from database import async_session
 from hooks import emit_event
 from model_routing import (
+    DEFAULT_AGENT_MODEL_ID,
     canonical_agent_model_id,
     filter_agentic_fallback_model_ids,
 )
@@ -184,6 +185,12 @@ def _provider_payload(model_id: str, config: dict) -> dict:
         ),
         "thinking_enabled_by_default": config.get(
             "thinking_enabled_by_default", True
+        ),
+        "thinking_request_format": config.get(
+            "thinking_request_format", ""
+        ),
+        "thinking_send_enabled_explicitly": bool(
+            config.get("thinking_send_enabled_explicitly", False)
         ),
     }
 
@@ -364,7 +371,7 @@ async def _execute_job_once(
                 conv = Conversation(
                     user_id=job.user_id,
                     title=f"定时任务 · {job.name}",
-                    model_id=job.model_id or "deepseek_v4_pro",
+                    model_id=job.model_id or DEFAULT_AGENT_MODEL_ID,
                 )
                 db.add(conv)
                 await db.flush()
@@ -500,7 +507,7 @@ async def _execute_job_bound(
 
         await ensure_workspace_async(job.user_id, conv.id)
         model_id = canonical_agent_model_id(
-            job.model_id or conv.model_id or "deepseek_v4_pro"
+            job.model_id or conv.model_id or DEFAULT_AGENT_MODEL_ID
         )
         provider_config = await _resolve_job_model(db, job.user_id, model_id)
         fallback_configs: list[dict] = []

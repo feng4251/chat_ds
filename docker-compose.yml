@@ -400,6 +400,8 @@ services:
       # Backward-compatible env key; this endpoint serves AgentModel (GLM-5.2).
       DEEPSEEK_PRO_URL: ${DEEPSEEK_PRO_URL:-http://10.10.132.2:1025/v1}
       QWEN3_5_URL: ${QWEN3_5_URL:-http://10.10.132.128:1025/v1}
+      SHAIENGINE_BASE_URL: ${SHAIENGINE_BASE_URL:-https://api.shaiengine.com/v1}
+      SHAIENGINE_API_KEY: ${SHAIENGINE_API_KEY:-}
       BACKEND_INTERNAL_URL: http://backend:8010
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-chat-ds-internal-token}
       AGENT_DEBUG_TRACE: ${AGENT_DEBUG_TRACE:-true}
@@ -519,6 +521,8 @@ services:
       # Primary AgentModel (GLM-5.2) and auxiliary multimodal endpoint.
       DEEPSEEK_PRO_BASE_URL: ${DEEPSEEK_PRO_BASE_URL:-http://10.10.132.2:1025/v1}
       QWEN3_5_BASE_URL: ${QWEN3_5_BASE_URL:-http://10.10.132.128:1025/v1}
+      SHAIENGINE_BASE_URL: ${SHAIENGINE_BASE_URL:-https://api.shaiengine.com/v1}
+      SHAIENGINE_API_KEY: ${SHAIENGINE_API_KEY:-}
       AGENT_DEBUG_TRACE: ${AGENT_DEBUG_TRACE:-true}
       AGENT_EVENT_IMMEDIATE_PERSIST: ${AGENT_EVENT_IMMEDIATE_PERSIST:-true}
       # Backend UI/upload/bootstrap mutations share Harness's local lock plane.

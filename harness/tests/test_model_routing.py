@@ -4,8 +4,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
-from agent_loop import _judge_goal, run_stream
-from config import DEFAULT_AGENT_MODEL_ID, PROVIDERS
+from agent_loop import _apply_provider_thinking_mode, _judge_goal, run_stream
+from config import (
+    DEFAULT_AGENT_MODEL_ID,
+    PROVIDER_ALIASES,
+    PROVIDERS,
+)
 from model_routing import resolve_agentic_model_routing
 
 
@@ -20,6 +24,11 @@ QWEN = {
 
 
 class AgenticModelRoutingDecisionTests(unittest.TestCase):
+    def test_default_remote_model_does_not_rebind_historic_alias(self):
+        self.assertEqual("shaiengine_glm_5_2", DEFAULT_AGENT_MODEL_ID)
+        self.assertEqual("glm-5.2", PRIMARY["api_model"])
+        self.assertEqual("deepseek_v4_pro", PROVIDER_ALIASES["AgentModel"])
+
     def _resolve(self, **overrides):
         kwargs = {
             "requested_model_id": "qwen3_5",
@@ -39,7 +48,7 @@ class AgenticModelRoutingDecisionTests(unittest.TestCase):
         decision = self._resolve()
         self.assertTrue(decision.normalized)
         self.assertEqual(DEFAULT_AGENT_MODEL_ID, decision.effective_provider_id)
-        self.assertEqual("AgentModel", decision.provider["api_model"])
+        self.assertEqual(PRIMARY["api_model"], decision.provider["api_model"])
         self.assertEqual(
             "agentic_or_skill_workflow_requires_primary_model",
             decision.reason,
@@ -185,7 +194,12 @@ class AgenticModelRoutingRunStreamTests(unittest.IsolatedAsyncioTestCase):
             if isinstance(request.get("body"), dict)
             and request["url"].endswith("/chat/completions")
         ]
-        self.assertEqual("AgentModel", model_requests[0]["body"]["model"])
+        self.assertEqual(PRIMARY["api_model"], model_requests[0]["body"]["model"])
+        self.assertEqual(
+            {"type": "enabled"},
+            model_requests[0]["body"]["thinking"],
+        )
+        self.assertNotIn("chat_template_kwargs", model_requests[0]["body"])
         started = next(
             event for event in events
             if event.get("event_type") == "run.started"
@@ -224,6 +238,10 @@ class AgenticModelRoutingRunStreamTests(unittest.IsolatedAsyncioTestCase):
             and request["url"].endswith("/chat/completions")
         ]
         self.assertEqual("qwen3_5", model_requests[0]["body"]["model"])
+        self.assertEqual(
+            {"enable_thinking": False},
+            model_requests[0]["body"]["chat_template_kwargs"],
+        )
         started = next(
             event for event in events
             if event.get("event_type") == "run.started"
@@ -279,7 +297,54 @@ class GoalJudgeRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("continue", status)
         self.assertEqual("more work", reason)
         self.assertFalse(parse_failed)
-        self.assertEqual("AgentModel", requests[0]["body"]["model"])
+        self.assertEqual(PRIMARY["api_model"], requests[0]["body"]["model"])
+        self.assertEqual(
+            {"type": "disabled"},
+            requests[0]["body"]["thinking"],
+        )
+
+
+class ThinkingRequestProjectionTests(unittest.TestCase):
+    def test_projects_vllm_chat_template_toggle(self):
+        body = {}
+        self.assertTrue(_apply_provider_thinking_mode(
+            body,
+            {
+                "supports_thinking_toggle": True,
+                "thinking_request_format": "chat_template_kwargs",
+            },
+            enabled=False,
+        ))
+        self.assertEqual(
+            {"chat_template_kwargs": {"enable_thinking": False}},
+            body,
+        )
+
+    def test_projects_openai_thinking_object(self):
+        body = {}
+        self.assertTrue(_apply_provider_thinking_mode(
+            body,
+            {
+                "supports_thinking_toggle": True,
+                "thinking_request_format": "thinking_object",
+            },
+            enabled=True,
+        ))
+        self.assertEqual({"thinking": {"type": "enabled"}}, body)
+
+    def test_unknown_thinking_wire_format_fails_closed(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "Unsupported provider thinking_request_format",
+        ):
+            _apply_provider_thinking_mode(
+                {},
+                {
+                    "supports_thinking_toggle": True,
+                    "thinking_request_format": "ambient_magic",
+                },
+                enabled=False,
+            )
 
 
 if __name__ == "__main__":

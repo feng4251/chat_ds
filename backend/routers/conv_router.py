@@ -31,6 +31,7 @@ from workspace import (
 )
 from hooks import emit_event
 from config import settings
+from model_routing import DEFAULT_AGENT_MODEL_ID
 from workspace_reconciler import cleanup_deleted_session_workspace
 
 logger = logging.getLogger(__name__)
@@ -148,7 +149,7 @@ async def create_conversation(
     db=Depends(get_db),
 ):
     """Create a new empty conversation."""
-    conv = Conversation(user_id=cur_user.id, model_id="deepseek_v4_pro")
+    conv = Conversation(user_id=cur_user.id, model_id=DEFAULT_AGENT_MODEL_ID)
     db.add(conv)
     await db.commit()
     await db.refresh(conv)

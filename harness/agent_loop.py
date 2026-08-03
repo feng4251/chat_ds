@@ -200,6 +200,41 @@ logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 3
 DEFAULT_MAX_TOKENS = 8192
+
+
+def _apply_provider_thinking_mode(
+    body: dict[str, Any],
+    provider: dict[str, Any],
+    *,
+    enabled: bool,
+) -> bool:
+    """Project one logical thinking toggle into the provider wire dialect.
+
+    A capability bit alone is insufficient: vLLM chat templates use
+    ``chat_template_kwargs.enable_thinking`` while Z.AI-compatible gateways
+    use ``thinking.type``.  Keeping the projection explicit prevents a model
+    switch from silently sending an accepted-looking but ineffective toggle.
+    The empty format retains compatibility with older in-process provider
+    fixtures, which historically meant the vLLM dialect.
+    """
+
+    if provider.get("supports_thinking_toggle") is not True:
+        return False
+    request_format = str(
+        provider.get("thinking_request_format") or "chat_template_kwargs"
+    ).strip().casefold()
+    if request_format == "chat_template_kwargs":
+        body["chat_template_kwargs"] = {"enable_thinking": bool(enabled)}
+        return True
+    if request_format == "thinking_object":
+        body["thinking"] = {
+            "type": "enabled" if enabled else "disabled",
+        }
+        return True
+    raise ValueError(
+        "Unsupported provider thinking_request_format: "
+        + request_format[:64]
+    )
 # A primary mandatory control/tool frontier needs only enough room to
 # serialize a *known-small* native call, not the caller's report-sized
 # generation allowance (or the provider's entire context window).  The cap is
@@ -23267,7 +23302,21 @@ async def run_stream(
             )
         )
         if disable_thinking_for_turn:
-            body["chat_template_kwargs"] = {"enable_thinking": False}
+            _apply_provider_thinking_mode(
+                body,
+                provider,
+                enabled=False,
+            )
+        elif (
+            thinking_toggle_supported
+            and thinking_enabled_by_default
+            and provider.get("thinking_send_enabled_explicitly") is True
+        ):
+            _apply_provider_thinking_mode(
+                body,
+                provider,
+                enabled=True,
+            )
         iteration_stream_deadline_plan = provider_stream_deadline_plan(
             input_tokens=estimated_input_tokens,
             output_tokens=int(body["max_tokens"]),
@@ -34513,8 +34562,12 @@ async def _judge_goal(
         "temperature": 0,
         "max_tokens": 180,
         "stream": False,
-        "chat_template_kwargs": {"enable_thinking": False},
     }
+    _apply_provider_thinking_mode(
+        request_body,
+        judge_cfg,
+        enabled=False,
+    )
     try:
         admission_lease = await provider_admission.acquire(
             endpoint=str(judge_cfg["base_url"]),
@@ -40748,8 +40801,11 @@ async def _request_semantic_skill_selector_page(
             },
             "parallel_tool_calls": False,
         }
-        if provider.get("supports_thinking_toggle") is True:
-            request_body["chat_template_kwargs"] = {"enable_thinking": False}
+        _apply_provider_thinking_mode(
+            request_body,
+            provider,
+            enabled=False,
+        )
     headers = {
         "Content-Type": "application/json",
         **(provider.get("extra_headers") or {}),

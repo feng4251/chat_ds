@@ -54,6 +54,7 @@ from tools.skill_runtime_profile import (
 from context.compressor import ContextCompressor, _estimate_messages_tokens
 from config import (
     DEFAULT_AGENT_MODEL_ID,
+    PROVIDER_ALIASES,
     PROVIDERS,
     canonical_provider_id,
 )
@@ -2378,7 +2379,14 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
             ],
             [DEFAULT_AGENT_MODEL_ID],
         )
+        # A deployment default is not a durable provider identity.  Historic
+        # persisted aliases remain pinned to their original route instead of
+        # silently switching endpoint/credential when the default changes.
         self.assertEqual(
+            PROVIDER_ALIASES["AgentModel"],
+            canonical_provider_id("AgentModel"),
+        )
+        self.assertNotEqual(
             DEFAULT_AGENT_MODEL_ID,
             canonical_provider_id("AgentModel"),
         )
