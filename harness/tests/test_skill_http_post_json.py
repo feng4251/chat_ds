@@ -626,9 +626,11 @@ class SkillHttpPostCapabilityTests(unittest.TestCase):
         self.assertIsInstance(schema, dict)
         properties = schema["parameters"]["properties"]
         self.assertEqual(
-            {"url", "body", "max_chars", "timeout"},
+            {"url", "body", "max_chars", "timeout", "candidate_id"},
             set(properties),
         )
+        self.assertNotIn("candidate_id", schema["parameters"]["required"])
+        self.assertEqual(128, properties["candidate_id"]["maxLength"])
         self.assertFalse(schema["parameters"]["additionalProperties"])
         metadata = get_metadata("skill_http_post_json")
         self.assertFalse(metadata["read_only"])

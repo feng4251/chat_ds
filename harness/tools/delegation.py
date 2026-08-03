@@ -60,6 +60,7 @@ from result_fan_in import (
 )
 from result_fan_in_runtime import (
     DEFAULT_REDUCTION_OUTPUT_BYTES,
+    DEFAULT_REDUCTION_OUTPUT_TOKENS,
     FanInExecutionError,
     MAX_REDUCER_LENGTH_ATTEMPTS,
     MAX_EXACT_RESULT_BYTES,
@@ -5984,16 +5985,32 @@ def _preload_prompt_token_allowance(
 
 def _fan_in_reducer_output_allowances(
     context: ToolContext,
-) -> tuple[int, int]:
-    """Derive the reducer token/byte contract from provider capabilities.
+    *,
+    downstream_token_allowance: int,
+) -> tuple[int, int | None]:
+    """Derive the reducer contract from its provider and downstream consumer.
 
-    The UTF-8 byte bound remains the durable artifact policy.  A provider may
-    advertise a smaller completion-token cap; otherwise one token per allowed
-    byte is the conservative ceiling needed to avoid under-allocating CJK or
-    compact structured output.
+    A semantic fan-in artifact exists only to be consumed by the delegated
+    child.  Its accepted token ceiling therefore cannot exceed that child's
+    actual prerequisite allowance or the provider's declared completion cap.
+    When provider metadata omits a completion cap, retain the historical
+    conservative fallback (one possible token per legacy output byte).
+
+    Do not manufacture a fixed UTF-8 artifact cap here.  The planner owns the
+    independent byte contract and derives it from the accepted token ceiling,
+    the downstream byte allowance, exact artifact metadata, and every internal
+    merge envelope.  This keeps CJK/compact structured output from being
+    rejected by an unrelated 32 KiB constant while remaining fail-closed.
     """
 
-    output_bytes = DEFAULT_REDUCTION_OUTPUT_BYTES
+    if (
+        isinstance(downstream_token_allowance, bool)
+        or not isinstance(downstream_token_allowance, int)
+        or downstream_token_allowance <= 0
+    ):
+        raise ValueError(
+            "downstream_token_allowance must be a positive integer"
+        )
     provider_caps: list[int] = []
     provider_config = context.provider_config
     if isinstance(provider_config, dict):
@@ -6007,8 +6024,34 @@ def _fan_in_reducer_output_allowances(
                 continue
             if parsed > 0:
                 provider_caps.append(parsed)
-    output_tokens = min([output_bytes, *provider_caps])
-    return output_tokens, output_bytes
+    fallback_token_cap = max(
+        DEFAULT_REDUCTION_OUTPUT_TOKENS,
+        # A UTF-8 response cannot contain more tokens than bytes.  Preserve
+        # the pre-existing 32 KiB unknown-provider ceiling without imposing
+        # the same number as an accepted artifact byte limit.
+        DEFAULT_REDUCTION_OUTPUT_BYTES,
+    )
+    if provider_caps:
+        provider_wire_cap = min(provider_caps)
+        # ``max_output_tokens`` is the provider wire ceiling, not the durable
+        # artifact ceiling.  Keep the artifact target inside two thirds of the
+        # wire budget so the existing bounded generation policy can terminate
+        # naturally with measurable headroom.  A one-token provider cannot
+        # offer headroom but remains a valid fail-closed contract.
+        provider_token_cap = max(
+            1,
+            min(
+                provider_wire_cap,
+                (provider_wire_cap * 2) // 3,
+            ),
+        )
+    else:
+        provider_token_cap = fallback_token_cap
+    output_tokens = min(
+        downstream_token_allowance,
+        provider_token_cap,
+    )
+    return output_tokens, None
 
 
 def _fan_in_generation_output_tokens(
@@ -9997,13 +10040,28 @@ async def _run_child(
                     (
                         reduction_output_tokens,
                         reduction_output_bytes,
-                    ) = _fan_in_reducer_output_allowances(context)
+                    ) = _fan_in_reducer_output_allowances(
+                        context,
+                        downstream_token_allowance=(
+                            result_token_allowance
+                        ),
+                    )
+                    reduction_generation_reserve_tokens = (
+                        _fan_in_generation_output_tokens(
+                            context,
+                            accepted_output_tokens=(
+                                reduction_output_tokens
+                            ),
+                        )
+                    )
                     (
                         reduction_token_allowance,
                         reduction_byte_allowance,
                     ) = _fan_in_reducer_input_allowances(
                         context,
-                        output_reserve_tokens=reduction_output_tokens,
+                        output_reserve_tokens=(
+                            reduction_generation_reserve_tokens
+                        ),
                     )
                     fan_in_plan = plan_persisted_result_fan_in(
                         planned_results,
@@ -10016,7 +10074,7 @@ async def _run_child(
                         ),
                         reduction_byte_allowance=reduction_byte_allowance,
                         reduction_output_reserve_tokens=(
-                            reduction_output_tokens
+                            reduction_generation_reserve_tokens
                         ),
                         target_worker=worker_id or step_id or agent_name,
                         execution_namespace=child_run_id,
@@ -10056,6 +10114,23 @@ async def _run_child(
                             "bytes": (
                                 fan_in_plan.reduction_budget
                                 .input_byte_allowance
+                            ),
+                        },
+                        "reducer_output_contract": {
+                            "accepted_token_ceiling": (
+                                reduction_output_tokens
+                            ),
+                            "accepted_byte_policy": (
+                                "downstream_capacity_derived"
+                            ),
+                            "provider_wire_reserve_tokens": (
+                                reduction_generation_reserve_tokens
+                            ),
+                            "effective_max_tokens": (
+                                fan_in_plan.output_policy.max_tokens
+                            ),
+                            "effective_max_bytes": (
+                                fan_in_plan.output_policy.max_bytes
                             ),
                         },
                     }

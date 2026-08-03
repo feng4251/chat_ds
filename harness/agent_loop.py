@@ -1263,6 +1263,80 @@ def _knowledge_gate_activated_frontier_payload(
     }
 
 
+def _model_facing_knowledge_gate_http_schemas(
+    schemas: list[dict[str, Any]],
+    frontier: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Bind shared HTTP bridges to exact pending capability handles.
+
+    Different Skill adapters can intentionally share one public bridge and
+    even the same literal HTTPS prefix.  A tool name or URL is therefore not
+    always a unique capability coordinate.  Project the runtime-owned pending
+    candidate IDs into the provider schema as a required enum.  Registry
+    schemas remain backwards-compatible for ordinary non-gated calls; the
+    AgentLoop still validates the handle and narrows authority before dispatch.
+    """
+
+    candidate_ids_by_tool: dict[str, list[str]] = {
+        "skill_http_get": [],
+        "skill_http_post_json": [],
+    }
+    if isinstance(frontier, dict):
+        for group in frontier.get("groups") or []:
+            if not isinstance(group, dict):
+                continue
+            for candidate in group.get("candidates") or []:
+                if not isinstance(candidate, dict):
+                    continue
+                tool_name = str(candidate.get("tool_name") or "")
+                candidate_id = str(candidate.get("candidate_id") or "")
+                if (
+                    tool_name in candidate_ids_by_tool
+                    and candidate_id
+                    and candidate_id not in candidate_ids_by_tool[tool_name]
+                ):
+                    candidate_ids_by_tool[tool_name].append(candidate_id)
+
+    projected = copy.deepcopy(schemas)
+    for schema in projected:
+        function = schema.get("function") if isinstance(schema, dict) else None
+        if not isinstance(function, dict):
+            continue
+        tool_name = str(function.get("name") or "")
+        candidate_ids = candidate_ids_by_tool.get(tool_name) or []
+        if not candidate_ids:
+            continue
+        parameters = function.get("parameters")
+        if not isinstance(parameters, dict):
+            continue
+        properties = parameters.get("properties")
+        if not isinstance(properties, dict):
+            continue
+        existing = properties.get("candidate_id")
+        candidate_schema = (
+            copy.deepcopy(existing) if isinstance(existing, dict) else {}
+        )
+        candidate_schema.update({
+            "type": "string",
+            "enum": candidate_ids,
+            "description": (
+                "Required exact handle from the current runtime-owned pending "
+                "Knowledge Gate frontier. Choose the candidate whose declared "
+                "coordinate this call is intended to satisfy."
+            ),
+        })
+        properties["candidate_id"] = candidate_schema
+        required = [
+            str(name)
+            for name in parameters.get("required") or []
+            if isinstance(name, str) and name
+        ]
+        if "candidate_id" not in required:
+            required.append("candidate_id")
+        parameters["required"] = required
+    return projected
+
+
 def _knowledge_gate_pending_resource_coordinate_matches(
     plan: dict[str, Any] | None,
     pending_group_ids: Iterable[str],
@@ -1534,6 +1608,8 @@ def _dispatch_audit_args(tool_name: str, args: Any) -> dict[str, Any]:
         "run_skill_script": ("script_path",),
         "run_declared_command": ("skill_name", "command_id", "cwd"),
         "merge_files": ("output_filepath", "input_files"),
+        "skill_http_get": ("candidate_id",),
+        "skill_http_post_json": ("candidate_id",),
     }
     fields = fields_by_tool.get(str(tool_name or ""), ())
     audit: dict[str, Any] = {}
@@ -9146,6 +9222,42 @@ def _canonical_tool_argument_fingerprint(arguments: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _deterministic_http_client_failure(
+    tool_name: str,
+    result_data: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Classify one non-retryable HTTP 4xx receipt without retaining its URL.
+
+    Transport failures, rate limits, request timeouts, conflict/early-data
+    races, and server failures may change on retry.  The remaining client
+    errors are stable for identical arguments during one delegated run, so a
+    second network dispatch only burns quota and repeats the same evidence gap.
+    """
+
+    if (
+        tool_name not in {"skill_http_get", "skill_http_post_json"}
+        or not isinstance(result_data, dict)
+        or result_data.get("request_sent") is not True
+    ):
+        return None
+    status = result_data.get("http_status")
+    if (
+        not isinstance(status, int)
+        or isinstance(status, bool)
+        or not 400 <= status < 500
+        or status in {408, 409, 425, 429}
+    ):
+        return None
+    return {
+        "http_status": status,
+        "error_code": str(result_data.get("error_code") or ""),
+        "matched_skill": str(result_data.get("matched_skill") or ""),
+        "matched_prefix_sha256": str(
+            result_data.get("matched_prefix_sha256") or ""
+        ),
+    }
+
+
 _MANAGED_CHILD_CAPABILITY_TOOLS = frozenset({
     "run_skill_process",
     "run_skill_script",
@@ -14082,6 +14194,12 @@ async def run_stream(
     action_promise_continuations = 0
     tool_failure_continuations = 0
     delegate_tool_failure_signatures: dict[tuple[str, str], int] = {}
+    # Exact delegated HTTP invocations that already produced a stable 4xx are
+    # terminal for this run.  Values retain only safe receipt identities; raw
+    # URLs/bodies remain exclusively in model history and handler storage.
+    delegate_terminal_http_invocations: dict[
+        tuple[str, str], dict[str, Any]
+    ] = {}
     delegate_cross_tool_failure_streak = 0
     delegate_cross_tool_failure_samples: list[dict[str, Any]] = []
     delegate_cross_tool_failure_budget_exhausted = False
@@ -14279,6 +14397,183 @@ async def run_stream(
                     return True
         return False
 
+    def knowledge_gate_http_candidate_binding(
+        tool_name: str,
+        args: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Resolve one shared HTTP call to an exact pending candidate.
+
+        A URL can match overlapping prefixes, and two activated Skills can
+        legitimately declare the same endpoint.  In that shape, silently
+        choosing the first context grant attributes a real response to the
+        wrong OR-group.  An explicit candidate handle resolves the ambiguity;
+        legacy calls are auto-bound only when their coordinate identifies one
+        unique activated candidate.
+        """
+
+        if (
+            tool_name not in {"skill_http_get", "skill_http_post_json"}
+            or not isinstance(args, dict)
+            or knowledge_gate_decision_receipt is None
+        ):
+            return None
+        pending_group_ids = set(pending_knowledge_gate_group_ids())
+        if not pending_group_ids:
+            return None
+        activated_group_ids = {
+            str(group_id)
+            for group_id in (
+                knowledge_gate_decision_receipt.get("activated_group_ids")
+                or []
+            )
+            if str(group_id) in knowledge_gate_group_by_id
+        }
+        pending_candidate_ids = {
+            str(candidate_id)
+            for group_id in pending_group_ids
+            for candidate_id in (
+                knowledge_gate_group_by_id[group_id].get("candidate_ids")
+                or []
+            )
+            if str(candidate_id)
+        }
+        activated_candidate_ids = list(dict.fromkeys(
+            str(candidate_id)
+            for group_id in activated_group_ids
+            for candidate_id in (
+                knowledge_gate_group_by_id[group_id].get("candidate_ids")
+                or []
+            )
+            if str(candidate_id)
+        ))
+
+        targeted_candidate_ids = [
+            candidate_id
+            for candidate_id in activated_candidate_ids
+            for candidate in [
+                knowledge_gate_candidate_by_id.get(candidate_id)
+            ]
+            if (
+                isinstance(candidate, dict)
+                and capability_call_targets_candidate(
+                    candidate,
+                    tool_name=tool_name,
+                    args=args,
+                    allowed_skill_scripts=(
+                        tool_context.allowed_skill_scripts
+                    ),
+                    allowed_skill_commands=(
+                        tool_context.allowed_skill_commands
+                    ),
+                    allowed_skill_http_prefixes=(
+                        tool_context.allowed_skill_http_prefixes
+                    ),
+                    allowed_skill_http_post_prefixes=(
+                        tool_context.allowed_skill_http_post_prefixes
+                    ),
+                )
+            )
+        ]
+        raw_candidate_id = args.get("candidate_id")
+        explicit_candidate_id = (
+            raw_candidate_id
+            if isinstance(raw_candidate_id, str)
+            and raw_candidate_id
+            and raw_candidate_id == raw_candidate_id.strip()
+            and len(raw_candidate_id) <= 128
+            else ""
+        )
+        base = {
+            "required": True,
+            "tool_name": tool_name,
+            "pending_candidate_ids": sorted(pending_candidate_ids),
+            "targeted_candidate_ids": targeted_candidate_ids,
+            "binding_source": "explicit" if raw_candidate_id is not None else "auto",
+        }
+        if raw_candidate_id is not None and not explicit_candidate_id:
+            return {
+                **base,
+                "accepted": False,
+                "reason": "invalid_candidate_id",
+            }
+        if explicit_candidate_id:
+            if explicit_candidate_id not in pending_candidate_ids:
+                return {
+                    **base,
+                    "accepted": False,
+                    "candidate_id": explicit_candidate_id,
+                    "reason": "candidate_not_pending",
+                }
+            if explicit_candidate_id not in targeted_candidate_ids:
+                return {
+                    **base,
+                    "accepted": False,
+                    "candidate_id": explicit_candidate_id,
+                    "reason": "candidate_coordinate_mismatch",
+                }
+            return {
+                **base,
+                "accepted": True,
+                "candidate_id": explicit_candidate_id,
+                "reason": "exact_candidate_bound",
+            }
+        if len(targeted_candidate_ids) == 1:
+            candidate_id = targeted_candidate_ids[0]
+            if candidate_id in pending_candidate_ids:
+                return {
+                    **base,
+                    "accepted": True,
+                    "candidate_id": candidate_id,
+                    "reason": "unique_candidate_auto_bound",
+                }
+        return {
+            **base,
+            "accepted": False,
+            "reason": (
+                "ambiguous_candidate_binding"
+                if len(targeted_candidate_ids) > 1
+                else "candidate_not_on_pending_frontier"
+            ),
+        }
+
+    def knowledge_gate_http_dispatch_context(
+        context: ToolContext,
+        binding: dict[str, Any] | None,
+    ) -> ToolContext:
+        """Narrow one validated HTTP dispatch to its exact existing grant."""
+
+        if not isinstance(binding, dict) or binding.get("accepted") is not True:
+            return context
+        candidate = knowledge_gate_candidate_by_id.get(
+            str(binding.get("candidate_id") or "")
+        )
+        if not isinstance(candidate, dict):
+            return context
+        exact_grant = (
+            str(candidate.get("skill_name") or ""),
+            str(candidate.get("url_prefix") or ""),
+        )
+        tool_name = str(binding.get("tool_name") or "")
+        if (
+            tool_name == "skill_http_get"
+            and exact_grant in set(context.allowed_skill_http_prefixes)
+        ):
+            return replace(
+                context,
+                allowed_skill_http_prefixes=(exact_grant,),
+            )
+        if (
+            tool_name == "skill_http_post_json"
+            and exact_grant in set(context.allowed_skill_http_post_prefixes)
+        ):
+            return replace(
+                context,
+                allowed_skill_http_post_prefixes=(exact_grant,),
+            )
+        # The binding verifier above checks the same immutable grant ledger,
+        # so this branch is defensive and never widens authority.
+        return context
+
     def mandatory_frontier_phase_payload() -> dict[str, Any]:
         """Project the current machine-owned mandatory phase for repair."""
 
@@ -14401,20 +14696,32 @@ async def run_stream(
             row: dict[str, Any],
         ) -> str:
             group = knowledge_gate_group_by_id[group_id]
+            row_args = (
+                row.get("args")
+                if isinstance(row.get("args"), dict)
+                else {}
+            )
+            bound_http_candidate_id = (
+                str(row_args.get("candidate_id") or "")
+                if str(row.get("tool_name") or "")
+                in {"skill_http_get", "skill_http_post_json"}
+                else ""
+            )
             for candidate_id in group.get("candidate_ids") or []:
                 candidate = knowledge_gate_candidate_by_id.get(
                     str(candidate_id)
                 )
                 if not isinstance(candidate, dict):
                     continue
+                if (
+                    bound_http_candidate_id
+                    and str(candidate_id) != bound_http_candidate_id
+                ):
+                    continue
                 if capability_call_satisfies_candidate(
                     candidate,
                     tool_name=str(row.get("tool_name") or ""),
-                    args=(
-                        row.get("args")
-                        if isinstance(row.get("args"), dict)
-                        else {}
-                    ),
+                    args=row_args,
                     result_data=(
                         row.get("result_data")
                         if isinstance(row.get("result_data"), dict)
@@ -22866,6 +23173,20 @@ async def run_stream(
                 tool_schemas,
                 tool_context.skill_capability_catalog,
             )
+        if (
+            knowledge_gate_decision_receipt is not None
+            and pending_knowledge_gate_group_ids()
+        ):
+            tool_schemas = _model_facing_knowledge_gate_http_schemas(
+                tool_schemas,
+                _knowledge_gate_activated_frontier_payload(
+                    delegated_knowledge_gate_plan,
+                    knowledge_gate_decision_receipt,
+                    completed_group_ids=set(
+                        knowledge_gate_group_receipts
+                    ),
+                ),
+            )
         if iteration_result_footer_repair:
             # Replace the ordinary executable surface with one internal,
             # dynamically closed typed submission. It is intercepted before
@@ -30941,6 +31262,53 @@ async def run_stream(
                     if tc.name not in iteration_exposed_tools else ""
                 )
                 workflow_batch_error = workflow_batch_errors.get(tool_call_id)
+                knowledge_gate_http_binding = (
+                    knowledge_gate_http_candidate_binding(
+                        tc.name,
+                        args if isinstance(args, dict) else {},
+                    )
+                    if not workflow_batch_error
+                    and not exposure_error
+                    and not has_parse_error
+                    else None
+                )
+                if (
+                    isinstance(knowledge_gate_http_binding, dict)
+                    and knowledge_gate_http_binding.get("accepted") is True
+                    and isinstance(args, dict)
+                ):
+                    # Preserve the exact runtime binding in dispatch/receipt
+                    # arguments even for a legacy uniquely-addressed call that
+                    # omitted the now model-visible handle.
+                    args = dict(args)
+                    args["candidate_id"] = str(
+                        knowledge_gate_http_binding.get("candidate_id") or ""
+                    )
+                    executed_args = args
+                terminal_http_invocation_key = (
+                    (
+                        tc.name,
+                        _canonical_tool_argument_fingerprint(args),
+                    )
+                    if delegated_subtask
+                    and tc.name
+                    in {"skill_http_get", "skill_http_post_json"}
+                    and isinstance(args, dict)
+                    else None
+                )
+                terminal_http_replay_receipt = (
+                    delegate_terminal_http_invocations.get(
+                        terminal_http_invocation_key
+                    )
+                    if terminal_http_invocation_key is not None
+                    else None
+                )
+                terminal_http_replay_denied = bool(
+                    terminal_http_replay_receipt is not None
+                    and not workflow_batch_error
+                    and not exposure_error
+                    and not has_parse_error
+                )
                 mandatory_frontier_preflight_denied = bool(
                     not workflow_batch_error
                     and not exposure_error
@@ -30948,9 +31316,16 @@ async def run_stream(
                     and knowledge_gate_decision_receipt is not None
                     and pending_knowledge_gate_group_ids()
                     and tc.name != "read_tool_result"
-                    and not pending_knowledge_gate_call_targets_frontier(
-                        tc.name,
-                        args if isinstance(args, dict) else {},
+                    and (
+                        (
+                            knowledge_gate_http_binding.get("accepted")
+                            is not True
+                        )
+                        if isinstance(knowledge_gate_http_binding, dict)
+                        else not pending_knowledge_gate_call_targets_frontier(
+                            tc.name,
+                            args if isinstance(args, dict) else {},
+                        )
                     )
                 )
                 knowledge_gate_frontier_preflight_observation: (
@@ -30971,18 +31346,32 @@ async def run_stream(
                         ),
                         "actual_dispatch_attempted": False,
                         "reason": (
-                            "mandatory_exact_candidate_coordinate_mismatch"
+                            str(
+                                (
+                                    knowledge_gate_http_binding or {}
+                                ).get("reason")
+                                or "mandatory_exact_candidate_coordinate_mismatch"
+                            )
                         ),
+                        "candidate_binding": knowledge_gate_http_binding,
                     }
                 mandatory_frontier_error = (
-                    "The proposed call does not target any still-pending "
-                    "exact mandatory candidate and was not dispatched."
+                    "The proposed call does not bind one still-pending exact "
+                    "mandatory candidate and was not dispatched. Use the "
+                    "candidate_id enum from the current runtime-owned schema."
                     if mandatory_frontier_preflight_denied else ""
                 )
                 workflow_gate_error = (
                     str((workflow_batch_error or {}).get("error") or "")
                     or exposure_error
                     or mandatory_frontier_error
+                    or (
+                        "This exact HTTP invocation already returned a "
+                        "deterministic terminal client error in this delegated "
+                        "run and was not dispatched again. Change the exact "
+                        "arguments/candidate or preserve a degraded evidence gap."
+                        if terminal_http_replay_denied else ""
+                    )
                     or _workflow_gate_call_error(
                         iteration_workflow_policy,
                         tc.name,
@@ -31018,6 +31407,10 @@ async def run_stream(
                 }, tool_name=tc.name, tool_call_id=tool_call_id):
                     yield debug_evt
 
+                call_dispatch_context = knowledge_gate_http_dispatch_context(
+                    _tool_dispatch_context(tool_context, tool_call_id),
+                    knowledge_gate_http_binding,
+                )
                 actual_dispatch_attempted = False
                 native_preflight = None
                 if workflow_batch_error:
@@ -31036,9 +31429,20 @@ async def run_stream(
                         "reason": (
                             "knowledge_gate_candidate_not_on_pending_frontier"
                             if mandatory_frontier_preflight_denied
+                            else "deterministic_http_failure_replay"
+                            if terminal_http_replay_denied
                             else "workflow_gate_tool_not_allowed"
                         ),
                         "required_policy": iteration_workflow_policy,
+                        **(
+                            {
+                                "prior_failure": (
+                                    terminal_http_replay_receipt
+                                ),
+                                "actual_dispatch_attempted": False,
+                            }
+                            if terminal_http_replay_denied else {}
+                        ),
                     }, ensure_ascii=False)
                 elif tc.name == "tool_search" and deferred_catalog is not None:
                     result = json.dumps(
@@ -31084,10 +31488,7 @@ async def run_stream(
                             result = await dispatch(
                                 display_tool_name,
                                 native_preflight.args,
-                                context=_tool_dispatch_context(
-                                    tool_context,
-                                    tool_call_id,
-                                ),
+                                context=call_dispatch_context,
                             )
                     elif display_tool_name.startswith("mcp_"):
                         from tools.mcp_client import (
@@ -31131,10 +31532,7 @@ async def run_stream(
                                 ),
                                 expected_descriptor=expected_mcp_descriptor,
                                 frozen_catalog=run_mcp_catalog,
-                                context=_tool_dispatch_context(
-                                    tool_context,
-                                    tool_call_id,
-                                ),
+                                context=call_dispatch_context,
                             )
                     else:
                         native_preflight = preflight_native_tool_call(
@@ -31157,10 +31555,7 @@ async def run_stream(
                             result = await dispatch(
                                 display_tool_name,
                                 native_preflight.args,
-                                context=_tool_dispatch_context(
-                                    tool_context,
-                                    tool_call_id,
-                                ),
+                                context=call_dispatch_context,
                             )
                 elif tc.name in ("mcp_server_list", "mcp_server_status"):
                     native_preflight = preflight_native_tool_call(
@@ -31183,10 +31578,7 @@ async def run_stream(
                         result = await dispatch(
                             tc.name,
                             native_preflight.args,
-                            context=_tool_dispatch_context(
-                                tool_context,
-                                tool_call_id,
-                            ),
+                            context=call_dispatch_context,
                         )
                 elif tc.name.startswith("mcp_"):
                     from tools.mcp_client import (
@@ -31230,10 +31622,7 @@ async def run_stream(
                             ),
                             expected_descriptor=expected_mcp_descriptor,
                             frozen_catalog=run_mcp_catalog,
-                            context=_tool_dispatch_context(
-                                tool_context,
-                                tool_call_id,
-                            ),
+                            context=call_dispatch_context,
                         )
                 else:
                     native_preflight = preflight_native_tool_call(
@@ -31256,10 +31645,7 @@ async def run_stream(
                         result = await dispatch(
                             tc.name,
                             native_preflight.args,
-                            context=_tool_dispatch_context(
-                                tool_context,
-                                tool_call_id,
-                            ),
+                            context=call_dispatch_context,
                         )
                 hint = (
                     hint_tracker.check(args)
@@ -31273,6 +31659,30 @@ async def run_stream(
                 )
                 tool_completed = _tool_outcome_is_completed(outcome)
                 exact_result_data = _json_object(str(result)) or {}
+                terminal_http_failure_observation: dict[str, Any] | None = None
+                if (
+                    delegated_subtask
+                    and actual_dispatch_attempted
+                    and terminal_http_invocation_key is not None
+                ):
+                    terminal_http_failure = _deterministic_http_client_failure(
+                        display_tool_name,
+                        exact_result_data,
+                    )
+                    if terminal_http_failure is not None:
+                        terminal_http_failure_observation = {
+                            **terminal_http_failure,
+                            "tool_name": display_tool_name,
+                            "argument_sha256": (
+                                terminal_http_invocation_key[1]
+                            ),
+                            "actual_dispatch_attempted": True,
+                            "replay_policy": "block_identical_within_run",
+                        }
+                        delegate_terminal_http_invocations.setdefault(
+                            terminal_http_invocation_key,
+                            terminal_http_failure_observation,
+                        )
                 semantic_control_accepted = _semantic_control_call_accepted(
                     display_tool_name,
                     exact_result_data,
@@ -31861,6 +32271,21 @@ async def run_stream(
                             run_state.successful_write_sizes.append(size)
                 workflow_state_changed = False
                 boundary_guidance_messages: list[str] = []
+                if terminal_http_failure_observation is not None:
+                    boundary_guidance_messages.append(
+                        "The exact preceding HTTP invocation returned a "
+                        "deterministic terminal client error (HTTP "
+                        + str(
+                            terminal_http_failure_observation.get(
+                                "http_status"
+                            )
+                        )
+                        + "). The Harness will not send the identical request "
+                        "again in this delegated run. Change the exact "
+                        "arguments or candidate if another declared route is "
+                        "available; otherwise preserve this as an explicit "
+                        "WARN/degraded evidence gap."
+                    )
                 if (
                     display_tool_name == KNOWLEDGE_GATE_DECISION_TOOL_NAME
                     and outcome == "success"
@@ -32377,6 +32802,70 @@ async def run_stream(
                             else "knowledge_gate.candidate.dispatch_unmatched"
                         ),
                         knowledge_gate_candidate_mismatch_observation,
+                        tool_name=display_tool_name,
+                        tool_call_id=tool_call_id,
+                    ):
+                        yield debug_evt
+                if (
+                    isinstance(knowledge_gate_http_binding, dict)
+                    and knowledge_gate_http_binding.get("accepted") is True
+                    and actual_dispatch_attempted
+                ):
+                    for debug_evt in await debug_stream_event(
+                        "knowledge_gate.candidate.bound",
+                        {
+                            "plan_sha256": (
+                                delegated_knowledge_gate_plan_sha256
+                            ),
+                            "tool_name": display_tool_name,
+                            "candidate_id": str(
+                                knowledge_gate_http_binding.get(
+                                    "candidate_id"
+                                ) or ""
+                            ),
+                            "binding_source": str(
+                                knowledge_gate_http_binding.get(
+                                    "binding_source"
+                                ) or ""
+                            ),
+                            "reason": str(
+                                knowledge_gate_http_binding.get("reason")
+                                or ""
+                            ),
+                            "actual_dispatch_attempted": True,
+                            "matched_skill": exact_result_data.get(
+                                "matched_skill"
+                            ),
+                            "matched_prefix_sha256": exact_result_data.get(
+                                "matched_prefix_sha256"
+                            ),
+                        },
+                        tool_name=display_tool_name,
+                        tool_call_id=tool_call_id,
+                    ):
+                        yield debug_evt
+                if terminal_http_failure_observation is not None:
+                    for debug_evt in await debug_stream_event(
+                        "http.invocation_terminal",
+                        terminal_http_failure_observation,
+                        tool_name=display_tool_name,
+                        tool_call_id=tool_call_id,
+                    ):
+                        yield debug_evt
+                if terminal_http_replay_denied:
+                    for debug_evt in await debug_stream_event(
+                        "http.invocation_replay_blocked",
+                        {
+                            "tool_name": display_tool_name,
+                            "argument_sha256": (
+                                terminal_http_invocation_key[1]
+                                if terminal_http_invocation_key is not None
+                                else ""
+                            ),
+                            "prior_failure": terminal_http_replay_receipt,
+                            "actual_dispatch_attempted": False,
+                            "reason": "deterministic_http_failure_replay",
+                        },
                         tool_name=display_tool_name,
                         tool_call_id=tool_call_id,
                     ):
