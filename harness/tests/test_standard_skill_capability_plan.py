@@ -4231,6 +4231,7 @@ class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
                 encoding="utf-8",
             )
             package = load_skill_content(root / "SKILL.md", skill_dir=str(root))
+            package_digest = compute_skill_package_digest(root)
             enabled = [
                 "skill_view",
                 "submit_skill_capability_plan",
@@ -4373,6 +4374,19 @@ class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             {"skill_view", "read_file", "write_file"},
             set(dispatch_context.enabled_tools),
+        )
+        self.assertIn(
+            ("portable-skill", "SKILL.md"),
+            set(dispatch_context.allowed_skill_resources),
+            "accepted semantic execution must retain its exact main instructions",
+        )
+        self.assertIn(
+            (
+                "portable-skill",
+                package_digest,
+            ),
+            set(dispatch_context.allowed_skill_package_digests),
+            "main-instruction authority must remain bound to one package digest",
         )
         self.assertEqual({"type": "done", "finish_reason": "stop"}, events[-1])
 

@@ -24,9 +24,9 @@ from typing import Any, Mapping, Sequence
 
 
 DEFAULT_PRELOAD_BYTE_ALLOWANCE = 512 * 1024
-FAN_IN_PLANNER_VERSION = "fan-in-planner-v2"
+FAN_IN_PLANNER_VERSION = "fan-in-planner-v3"
 FAN_IN_CONTRACT_VERSION = "chatds-bounded-fan-in-v1"
-FAN_IN_OUTPUT_POLICY_VERSION = "semantic-reduction-policy-v3"
+FAN_IN_OUTPUT_POLICY_VERSION = "semantic-reduction-policy-v4"
 _BATCH_FIXED_TOKENS = 64
 _BATCH_FIXED_BYTES = 256
 _ITEM_FRAMING_TOKENS = 32
@@ -659,11 +659,9 @@ def plan_persisted_result_fan_in(
             final_budget=budget,
             plan_id=placeholder_plan_id,
             manifest=placeholder_manifest,
+            source_batches=probe_batches,
             requested_tokens=reduction_output_tokens,
             requested_bytes=reduction_output_bytes,
-            requires_pairwise_merge=(
-                len(probe_batches) > 1 or bool(probe_oversize)
-            ),
         )
         output_policy = FanInOutputPolicy(
             version=FAN_IN_OUTPUT_POLICY_VERSION,
@@ -771,9 +769,9 @@ def plan_persisted_result_fan_in(
         final_budget=budget,
         plan_id=plan_id,
         manifest=manifest,
+        source_batches=source_batches,
         requested_tokens=reduction_output_tokens,
         requested_bytes=reduction_output_bytes,
-        requires_pairwise_merge=(len(source_batches) > 1 or bool(oversize)),
     )
     if verified_output != (output_tokens, output_bytes):
         raise RuntimeError(
@@ -1286,13 +1284,24 @@ def _item_cost(item: FanInItem) -> tuple[int, int]:
         body_tokens = item.token_estimate
         body_bytes = item.byte_size
     else:
-        metadata = item.to_dict()
         body_tokens = item.estimated_tokens
         body_bytes = item.max_bytes
+        metadata_tokens, metadata_bytes = _artifact_metadata_cost(item)
+        return body_tokens + metadata_tokens, body_bytes + metadata_bytes
     serialized = _canonical_json(metadata)
     return (
         body_tokens + estimate_mixed_text_tokens(serialized) + _ITEM_FRAMING_TOKENS,
         body_bytes + len(serialized.encode("utf-8")) + _ITEM_FRAMING_BYTES,
+    )
+
+
+def _artifact_metadata_cost(item: ReductionArtifact) -> tuple[int, int]:
+    """Return serialized/framing cost without charging the artifact body."""
+
+    serialized = _canonical_json(item.to_dict())
+    return (
+        estimate_mixed_text_tokens(serialized) + _ITEM_FRAMING_TOKENS,
+        len(serialized.encode("utf-8")) + _ITEM_FRAMING_BYTES,
     )
 
 
@@ -1302,22 +1311,91 @@ def _safe_reduction_output_allowance(
     final_budget: FanInBudget,
     plan_id: str,
     manifest: ProvenanceManifest,
+    source_batches: Sequence[FanInBatch],
     requested_tokens: int | None,
     requested_bytes: int | None,
-    requires_pairwise_merge: bool,
 ) -> tuple[int, int]:
-    dummy = ReductionArtifact(
-        artifact_id=f"{plan_id}-reduction-0000",
-        path=f"results/.chatds/fan_in/{plan_id}/rolling_0000.md",
-        estimated_tokens=0,
-        max_bytes=0,
-        source_start=0,
-        source_end=1,
-        provenance_manifest_path=manifest.path,
-        provenance_manifest_checksum_sha256=manifest.checksum_sha256,
-        immediate_input_ids=(f"{plan_id}-input-0000", f"{plan_id}-input-0001"),
-    )
-    metadata_tokens, metadata_bytes = _item_cost(dummy)
+    """Derive a body bound from the exact planned metadata topology.
+
+    Artifact identifiers, paths, source ranges, and immediate lineage all add
+    request cost.  A fixed dummy artifact cannot safely represent a leaf that
+    names many source IDs or a later balanced-tree merge.  Build the same
+    zero-body topology as the real plan and use conservative numeric-width
+    envelopes for ``estimated_tokens``/``max_bytes``.  Placeholder and final
+    plan IDs have the same fixed width, so both planning passes remain
+    content-address stable.
+    """
+
+    if not source_batches:
+        raise ValueError("fan-in reduction requires at least one source batch")
+
+    token_envelope = max(1, final_budget.input_token_allowance)
+    byte_envelope = max(1, final_budget.input_byte_allowance)
+
+    def artifact(
+        *,
+        artifact_id: str,
+        path: str,
+        source_start: int,
+        source_end: int,
+        immediate_input_ids: tuple[str, ...],
+    ) -> ReductionArtifact:
+        return ReductionArtifact(
+            artifact_id=artifact_id,
+            path=path,
+            estimated_tokens=token_envelope,
+            max_bytes=byte_envelope,
+            source_start=source_start,
+            source_end=source_end,
+            provenance_manifest_path=manifest.path,
+            provenance_manifest_checksum_sha256=manifest.checksum_sha256,
+            immediate_input_ids=immediate_input_ids,
+        )
+
+    current_wave: list[ReductionArtifact] = []
+    for index, batch in enumerate(source_batches, start=1):
+        start, end = _source_range(batch.items)
+        current_wave.append(artifact(
+            artifact_id=f"{plan_id}-leaf-{index:04d}",
+            path=(
+                f"results/.chatds/fan_in/{plan_id}/"
+                f"leaf_{index:04d}.md"
+            ),
+            source_start=start,
+            source_end=end,
+            immediate_input_ids=tuple(_item_id(item) for item in batch.items),
+        ))
+
+    merge_inputs: list[tuple[ReductionArtifact, ReductionArtifact]] = []
+    wave = 2
+    while len(current_wave) > 1:
+        next_wave: list[ReductionArtifact] = []
+        pair_ordinal = 0
+        for cursor in range(0, len(current_wave), 2):
+            left = current_wave[cursor]
+            if cursor + 1 >= len(current_wave):
+                next_wave.append(left)
+                continue
+            right = current_wave[cursor + 1]
+            pair_ordinal += 1
+            merge_inputs.append((left, right))
+            next_wave.append(artifact(
+                artifact_id=(
+                    f"{plan_id}-merge-w{wave:04d}-{pair_ordinal:04d}"
+                ),
+                path=(
+                    f"results/.chatds/fan_in/{plan_id}/"
+                    f"merge_w{wave:04d}_{pair_ordinal:04d}.md"
+                ),
+                source_start=left.source_start,
+                source_end=right.source_end,
+                immediate_input_ids=(left.artifact_id, right.artifact_id),
+            ))
+        current_wave = next_wave
+        wave += 1
+
+    final_artifact = current_wave[0]
+    metadata_tokens, metadata_bytes = _artifact_metadata_cost(final_artifact)
     # The final child must be able to receive one complete reduction artifact.
     # This is a distinct constraint from the internal reducer's input budget.
     final_token_cap = (
@@ -1333,20 +1411,23 @@ def _safe_reduction_output_allowance(
     token_cap = final_token_cap
     byte_cap = final_byte_cap
 
-    if requires_pairwise_merge:
-        # Two reduction artifacts must fit an internal merge. Divide the
-        # remaining capacity by three rather than two to retain headroom for
-        # longer materialized identifiers and concrete prompt metadata.
+    for left, right in merge_inputs:
+        left_tokens, left_bytes = _artifact_metadata_cost(left)
+        right_tokens, right_bytes = _artifact_metadata_cost(right)
+        # Every balanced merge receives two artifacts with the same bounded
+        # body allowance.  Reserve their exact metadata independently.
         merge_token_cap = (
             reduction_budget.input_token_allowance
             - _BATCH_FIXED_TOKENS
-            - 2 * metadata_tokens
-        ) // 3
+            - left_tokens
+            - right_tokens
+        ) // 2
         merge_byte_cap = (
             reduction_budget.input_byte_allowance
             - _BATCH_FIXED_BYTES
-            - 2 * metadata_bytes
-        ) // 3
+            - left_bytes
+            - right_bytes
+        ) // 2
         token_cap = min(token_cap, merge_token_cap)
         byte_cap = min(byte_cap, merge_byte_cap)
     if token_cap <= 0 or byte_cap <= 0:

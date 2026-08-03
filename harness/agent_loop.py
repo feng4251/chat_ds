@@ -20130,6 +20130,30 @@ async def run_stream(
                 },
             )
         plan = validated.payload
+        root_identity = loaded_package_snapshot_identities.get(skill_name)
+        root_snapshot_error = frozen_skill_package_snapshot_error(skill_name)
+        if (
+            root_snapshot_error
+            or not isinstance(root_identity, tuple)
+            or len(root_identity) != 3
+            or not all(
+                isinstance(item, str) and item for item in root_identity
+            )
+        ):
+            return (
+                "[Harness capability plan rejected after dispatch] "
+                "The selected Skill root package is no longer identical to "
+                "the run-frozen instruction snapshot.",
+                {
+                    "error_code": (
+                        root_snapshot_error
+                        or "capability_plan_root_snapshot_unavailable"
+                    ),
+                    "workflow_error_code": "",
+                    "workflow_error_path": "$.catalog_authority",
+                },
+            )
+        root_package_digest = root_identity[2]
         runtime_preflight = _preflight_standard_skill_runtime_selection(
             catalog,
             [
@@ -20221,15 +20245,23 @@ async def run_stream(
                 command_rows.append((row[0], row[1], row[2], tuple(row[3])))
         allowed_resources = tuple(dict.fromkeys([
             *pair_rows(plan.get("allowed_skill_resources")),
+            # Every semantic node is derived from the canonical main
+            # instructions. Retain that exact file as executable knowledge;
+            # this grants neither its sibling directory nor any linked file.
+            (skill_name, "SKILL.md"),
             (skill_name, "__manifest__"),
         ]))
         allowed_scripts = tuple(dict.fromkeys(script_rows))
         allowed_script_authorities = tuple(dict.fromkeys(
             script_authority_rows
         ))
-        allowed_package_digests = pair_rows(
-            plan.get("allowed_skill_package_digests")
-        )
+        allowed_package_digests = tuple(dict.fromkeys([
+            *pair_rows(plan.get("allowed_skill_package_digests")),
+            # Resource lowering checks both the file digest and its complete
+            # immutable package identity. Native-only semantic selections used
+            # to drop this root digest and made SKILL.md impossible to preload.
+            (skill_name, root_package_digest),
+        ]))
         allowed_commands = tuple(dict.fromkeys(command_rows))
         allowed_http = pair_rows(plan.get("allowed_skill_http_prefixes"))
         allowed_http_post = pair_rows(
