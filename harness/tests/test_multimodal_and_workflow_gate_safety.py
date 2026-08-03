@@ -59,6 +59,10 @@ from config import (
     canonical_provider_id,
 )
 from prompt.builder import IMAGE_SKILL_MCP_GUIDANCE, SESSION_SKILL_USAGE_GUIDANCE
+from knowledge_gate_runtime import (
+    compile_runtime_unconditional_capability_plan,
+    ordinary_worker_capability_selectors,
+)
 from skills.loader import load_skill_content
 from tools.web_extract import web_extract
 
@@ -2657,6 +2661,115 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
         self.assertIn("run_skill_script", web_augmented.tools)
         self.assertIn("web_search", web_augmented.tools)
         self.assertIn(("web_search",), web_augmented.required_groups)
+
+    def test_planned_same_package_resource_selectors_receive_exact_authority(self):
+        """A valid accepted plan can bind exact same-package references at install."""
+
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        root = Path(tempdir.name) / "inventory-review"
+        (root / "references").mkdir(parents=True)
+        (root / "SKILL.md").write_text(
+            "---\nname: inventory-review\n"
+            "description: Review inventory policy.\n---\n"
+            "# Inventory review\nUse the selected policy references.\n",
+            encoding="utf-8",
+        )
+        (root / "references/inventory-policy.md").write_text(
+            "# Inventory policy\nVerify every counted item.\n",
+            encoding="utf-8",
+        )
+        (root / "references/unselected-policy.md").write_text(
+            "# Unselected policy\nThis file is outside the selected node.\n",
+            encoding="utf-8",
+        )
+        loaded = dict(load_skill_content(
+            root / "SKILL.md",
+            skill_dir=str(root),
+        ))
+        loaded["_chatds_scope"] = "session"
+        loaded["workflow_contract"] = {
+            "execution_contract": {
+                "schema_version": 1,
+                "workers": {},
+            },
+        }
+        worker = {
+            "id": "policy-review",
+            "capabilities": [
+                "SKILL.md",
+                "references/inventory-policy.md",
+            ],
+        }
+        plan = {
+            "selection": "matched",
+            "route_id": "policy-review",
+            "workers": {"policy-review": worker},
+            "required_workers": ["policy-review"],
+            "waves": [{
+                "id": "wave-1",
+                "mode": "sequential",
+                "workers": ["policy-review"],
+            }],
+            "bootstrap_sources": [],
+            "aggregation_steps": [],
+        }
+        available = ["skill_view", "delegate_task"]
+
+        exposure = _bounded_skill_execution_exposure(
+            "Use inventory-review",
+            available,
+            {"inventory-review"},
+            {"inventory-review": loaded},
+            {"inventory-review": ()},
+            selected_skill_names=("inventory-review",),
+            compiled_plans={"inventory-review": plan},
+        )
+
+        self.assertFalse(exposure.missing_requirements)
+        self.assertIn(
+            ("inventory-review", "references/inventory-policy.md"),
+            exposure.allowed_skill_resources,
+        )
+        self.assertNotIn(
+            ("inventory-review", "references/unselected-policy.md"),
+            exposure.allowed_skill_resources,
+        )
+        selectors = ordinary_worker_capability_selectors(
+            worker,
+            available_tools=available,
+            resolve_tool_selector=lambda _selector, _available: [],
+        )
+        static_plan, static_digest = (
+            compile_runtime_unconditional_capability_plan(
+                selectors,
+                worker_id="policy-review",
+                owner_skill="inventory-review",
+                available_tools=available,
+                loaded_packages={"inventory-review": loaded},
+                allowed_resources=exposure.allowed_skill_resources,
+                allowed_scripts=(),
+                process_only_scripts=(),
+                allowed_package_digests=(
+                    exposure.allowed_skill_package_digests
+                ),
+                allowed_commands=(),
+                allowed_http_get=(),
+                allowed_http_post=(),
+                allowed_sandbox_egress=(),
+                frozen_mcp_catalog=None,
+                resolve_tool_selector=lambda _selector, _available: [],
+            )
+        )
+        self.assertIsNotNone(static_digest)
+        assert static_plan is not None
+        self.assertEqual(
+            {"SKILL.md", "references/inventory-policy.md"},
+            {
+                candidate["resource_path"]
+                for candidate in static_plan["candidates"]
+            },
+        )
 
     def test_structured_supporting_skill_hides_network_isolated_script(self):
         tempdir = tempfile.TemporaryDirectory()
