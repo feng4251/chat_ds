@@ -10,6 +10,39 @@
   替代 Round 10 后的暂停要求与旧 Round 13 上限。每轮仍顺序运行 V2.3 和 `yangbb` User Skill
   `lung-cancer-mdt` 的全新 conversation/root，并完成三源诊断、通用复现、官方成熟实现对照、
   跨领域修复、回归、本地 commit、clean-archive 部署与生产 smoke。Round 15 是当前硬上限。
+- Round 13 正在进行。首个 V2.3 case 为 conversation
+  `a1fb209ffa0f4e7d8135f2959242b1b1` / root `ac3e33dfb62b46ba8a8ee67bff3738c0`，
+  约 73 分钟后达到唯一 durable `run.failed/delegate_step_failed`：15 个 child/reducer attempt
+  succeeded，只有 Target Biology `945d95019cc746fb86a1058a64b10a3f` 因
+  `required_capability_not_attempted` failed；0 业务 Markdown。PICO 首个 reducer 的 37,574-byte /
+  9,440-token 完整结果实际能被 10,330-token/676,388-byte downstream consumer 消费，却被历史
+  31,457-byte 静态 semantic ceiling 拒绝并做了一次无必要 complete replacement。Target 的最后
+  `skill_http_get` 实际 HTTP 200，但 shared NCBI bridge 没有 model-visible candidate handle，handler
+  回执匹配 `clinvar-database` 后 maximum matching 将成功调用重新记给已完成组，唯一 pending group
+  未前进；这不是网络、timeout、沙箱或 provider stream failure。完整 Skill/对话/debug/tool/result
+  三源与逐 attempt 证据见 `E2E_ITERATION_LOG.md` Round 13。
+- 上述通用修复已提交并部署为
+  `98882f0b18abed5b207c520b3b63ab852a93bc6d fix: bind exact evidence calls and fan-in capacity`：
+  pending Knowledge Gate 的 HTTP schema 动态要求 exact `candidate_id` enum；pre-dispatch 验证其仍
+  pending 且命中 URL/method，再把 call-local ToolContext 缩窄到唯一已有 grant，receipt 只能记给
+  bound candidate。无 gate 的 HTTP 保持兼容，唯一坐标可安全 auto-bind，歧义/完成/无效 handle 在发网
+  前 typed reject。fan-in accepted token/byte envelope 改由 downstream 与 provider capacity 推导，wire
+  generation reserve 仍独立；未知 provider、coverage、manifest、token/byte 双校验均保持 fail closed。
+  delegated exact HTTP request 得到稳定 4xx 后会阻止同参真实 replay，但 408/409/425/429、5xx、transport
+  与 changed args/candidate 仍可尝试。生产代码没有疾病、V2.3、Skill/session/worker/KG ID、数据库、
+  固定数值或报告文件名特判。
+- 当前生产 Harness image 为
+  `sha256:5536a15f50658dec43090db9c6a7e8ef419f29095709d90e28e2a26c74b8ec14`，revision 精确为
+  `98882f0b...`，healthy/restart 0；Backend 仍为 `0108c664`。clean archive
+  `/tmp/chat_ds_deploy_98882f0b.cU1tKE` 与 tracked tree 均为 22,452 files。受影响组合为
+  `399 passed, 209 subtests`；隔离 tmpfs 完整 Harness 为 1939 passed + 唯一无 Node 的 CommonJS
+  环境项，该 exact test 在宿主 Node v22.23.1 passed，覆盖全部 1,940 项；candidate 组合为
+  `398 passed, 1 skipped, 205 subtests`，唯一 skip 是 clean Git archive 不含未跟踪 reference ZIP。
+  部署后三入口、Harness/Backend health/models、storage identity、SQLite/FK、严重日志均正常；生产
+  GLM-5.2 thinking smoke 为 200、reasoning 非空、terminal stop。
+- Round 13 尚未闭环。下一步必须从 `98882f0b` 用新的 conversation/root 重跑 V2.3；其到 durable
+  terminal 并完成三源验收后，再顺序运行肺癌 MDT 全新 case。两个 case 都结束后才计 Round 13 完成，
+  不能复用 `a1fb...`、把重复解读算新轮，或并发污染 provider capacity。
 - Round 12 已完成。V2.3 `9bb4a0173fc44c5b94cb4258b2a17ab7` / root
   `f96df86c12744cc5bd4cafc176ec6a8f` 完成 intent、7 路 bootstrap 和除 PICO 外的全部
   worker；PICO 的首次与唯一 clean retry 均在 0 provider token 前触发同一确定性内部错误：独立
@@ -33,12 +66,12 @@
   Harness 为 1929 passed + 唯一 CommonJS runtime 环境项。该项因 Harness image 按设计不预装 Node
   而失败，在宿主 Node 22.23.1 单独 `1 passed`，因此全部 1930 项逻辑覆盖通过。clean candidate 同一
   133+22 通过；`py_compile`、diff、secret、genericity 与 protected-deletion 检查通过。
-- `0406ab72` 已从精确 clean archive `/tmp/chat_ds_deploy_0406ab72.fclvYr`（22,452 tracked files）
-  构建并只替换生产 Harness。当前 image 为
+- `0406ab72` 当时从精确 clean archive `/tmp/chat_ds_deploy_0406ab72.fclvYr`（22,452 tracked files）
+  构建并只替换生产 Harness。当时 image 为
   `sha256:48dfa72457b2db76284a18f4bf11f241c354b218241825227f902f9e63cfcbad`，revision 精确匹配，
   healthy/restart 0；Backend 保持 `0108c664`。三入口现均 200，容器内/Backend→Harness、models、
   storage identity、SQLite/FK/idle root/schedule 和严重日志 smoke 均通过；旧 Harness image 保留
-  `rollback-pre-0406ab72`。Round 13 是下一项已授权双 Skill 测试。
+  `rollback-pre-0406ab72`。该状态随后已由 Round 13 前置修复和 `98882f0b` 生产切换取代。
 - Round 11 已完成。V2.3 `49791ec4ef37449c84b7c1611e256a06` / root
   `b75a71b3dbdd48f58dd76ec31a4a3b46` 在 7 路 bootstrap 的最后一项
   `competitive_intel` 重试中，第一次因无 evidence receipt 却填充 typed facts 被正确拒绝，

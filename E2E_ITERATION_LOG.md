@@ -1572,3 +1572,97 @@ LangGraph durable functional API
 Round 12 至此闭环。下一项是从生产 `0406ab72` 开始 Round 13，仍必须先 V2.3、后肺癌 MDT，使用
 两个全新 conversation/root；若出现问题继续按 exact Skill + conversation + debug/tool/result 三源、
 确定性复现、成熟官方方法对照、跨域 holdout、通用修复、完整回归、local commit 和 clean deploy 闭环。
+
+## Round 13（进行中）：downstream-capacity fan-in 与 exact evidence handle
+
+### V2.3 首个验收 run、三源诊断与逐 attempt 结论
+
+- 本轮开始前生产已先后部署通用提交 `7031d8b3`（分离 reducer wire generation budget 与 accepted
+  artifact contract）和 `b819f41f`（收敛多语言 fan-in token/byte 校验），Harness image 为
+  `sha256:652362287696d4a2249fcbaf286178ab9b2cc775d85cd6ff09b9a781f16b2960`。V2.3 使用全新
+  conversation `a1fb209ffa0f4e7d8135f2959242b1b1`、root
+  `ac3e33dfb62b46ba8a8ee67bff3738c0`、历史 64 字符原始 prompt、默认
+  `shaiengine_glm_5_2`，冻结 ZIP SHA-256 为
+  `78b890eab57ff516c20a39a565631caa5d784f839b42f6ad9efbdbdd951eb0a0`。exact route 只选中
+  `healthsim-trialsim/composite_full_protocol_design`，没有错误激活 sibling Skill。
+- run 从 09:14:24 到 10:27:46 UTC 运行约 73 分钟并达到唯一 durable
+  `run.failed/delegate_step_failed`。Intent、7 路 bootstrap、PICO、Safety、Termination、AE 与
+  Competitive 共 15 个 child/reducer attempt succeeded；Target Biology
+  `945d95019cc746fb86a1058a64b10a3f` 是唯一 failed child（1,177,301 input / 32,046 output tokens，
+  `required_capability_not_attempted`）。根任务正确 fail closed，workspace 没有业务 Markdown，results
+  仍保留全部成功 child、HTTP body spill、execute receipt 和 fan-in 输入，因而不是前端断线、容器重启、
+  总 timeout、sandbox 断网或“所有网站不可达”。
+- PICO 的 8-source reducer 首次 attempt `e7fdac1e...` 返回 37,574 UTF-8 bytes / 9,440 conservative
+  tokens。它小于真实 final consumer 的 676,388-byte / 10,330-token allowance，也小于 10,076-token
+  semantic ceiling，却只因旧 32 KiB 常量扣除 coverage/footer 后形成 31,457-byte semantic ceiling 而
+  被拒绝；唯一 complete replacement `6d11de85...` 压到 8,293 tokens 后 accepted。首次 body 没有被错误
+  commit，source manifest/checksum 也未丢失，但这次重跑没有容量依据：31,457 来自历史静态 artifact
+  byte contract，不是 GLM-5.2 的 300K context、provider max output 或 downstream consumer 容量。
+- Target Biology 的 Knowledge Gate 共 7 个 activated group。debug 序列证明前六组已有机器回执；剩余
+  mandatory frontier 时，模型第一次返回 prose，Harness 正确给一次 context-isolated non-call recovery。
+  随后 `skill_http_get` 实际 HTTP 200，安全回执显示 `matched_skill=clinvar-database`，但公共 schema 只有
+  URL、没有 pending candidate handle；同一 NCBI bridge/prefix 可对应多个 supporting Skill/candidate，
+  maximum matching 因而把该成功 dispatch 重新记到已完成的
+  `gate-group-42e93...`，唯一待完成的 `gate-group-c1bafa...` 不前进。下一次模型又只返回 prose，bounded
+  recovery 耗尽后 child/root 才失败。这个故障不是最大匹配算法本身，也不是 HTTP 200 不算证据，而是
+  model-visible call 无法表达“本次调用要满足哪个 exact pending candidate”，handler 又从多个 grant 中
+  按顺序选择 `matched_skill`。
+- 同一 run 还观察到 FDA 的完全相同请求得到两次确定性 404；UniProt/OpenTargets 的 400 属于上游请求/
+  查询形状错误。它们与 Target 的 200 错误归属分别处理：不能把动态 429/5xx/transport 当永久失败，也
+  不应为完全相同的稳定 4xx 再消耗一次真实网络 quota。
+
+### 跨领域不变量、成熟实现对照与通用修复
+
+1. **shared bridge 必须 late-bind exact capability handle。** 当前 pending Knowledge Gate 的 HTTP schema
+   现在从 immutable frontier 动态投影 `candidate_id` enum 并设为 required；pre-dispatch 重新证明 handle
+   属于仍待完成组且 URL/method 命中该候选，再把 call-local `ToolContext` 缩窄为唯一已有 grant。handle
+   只能缩权，不能凭模型参数创设网络 authority；无 gate 的普通 HTTP 调用兼容，旧调用仅在其坐标唯一
+   命中一个 activated candidate 时自动绑定。receipt matching 也只接受该 bound candidate，完成组 handle、
+   无效 handle、坐标不匹配和共享坐标无 handle 均在发网前 typed reject。
+2. **artifact acceptance envelope 必须由 provider 与 downstream capacity 联合推导。** reducer wire
+   generation reserve 继续独立且给 JSON/多语言字节留传输余量；accepted semantic token ceiling 取
+   downstream consumer 与 provider accepted capacity 的较小值，byte ceiling再由 token capacity、最终/
+   merge byte budget 和真实 metadata envelope 推导。未知 provider 保留原保守 fallback；token、byte、
+   coverage、manifest 与 materialization 前后双校验均未删除。37,574-byte body 在本次真实容量中会通过，
+   不是把所有大小上限放开。
+3. **确定性 HTTP client error 对 exact invocation 单调终止。** delegated run 内第一次真实 dispatch 得到
+   request-sent 4xx 后，仅保存 tool + normalized-argument SHA + safe grant/status receipt；同参第二次在发网
+   前拦截，并要求换 exact args/candidate 或输出 degraded gap。408/409/425/429、5xx、transport/DNS 与不同
+   candidate/args 仍可按各自策略尝试，不把临时错误过度 quarantine。
+
+本轮继续采用已冻结官方源码/文档中的组件级模式：OpenClaw Tool Search 与 Codex tool-search/context
+都把 compact selection late-bind 到 canonical tool/schema；Temporal Activity retry 将 non-retryable
+failure 绑定当前 exact activity/arguments；Deep Agents/LangGraph 将大结果 materialize 后按下游 state/
+consumer 合同传递。决策仍是 **adapt exact handle + typed receipt + downstream capacity contract**，拒绝整体
+换栈、grant-order 猜测、按疾病/数据库/文件名特判或把 provider context length 当 artifact byte cap。
+官方入口与冻结 revisions 见 Round 10--12 的成熟实现表，本轮没有引入二手来源。
+
+### 确定性复现、回归、提交与生产切换
+
+- 新增非医疗 `portable-adapter` 复现：两个独立 OR-group 共享同一 HTTPS coordinate。无 handle 调用在
+  dispatch 前以 `ambiguous_candidate_binding` 拒绝；`candidate-alpha` 成功后重复 handle 以
+  `candidate_not_pending` 拒绝；`candidate-beta` 独立 dispatch 后两个 group 各有唯一 receipt。fake handler
+  同时断言 call-local context 只有一个 exact grant。另一个 vendor-records 复现证明 404 同参 replay 不
+  再进入 handler，但 changed URL 正常 dispatch；classifier 明确保留 408/409/425/429/5xx 可重试性。非临床
+  warehouse fan-in holdout 证明 37,574 bytes 在 10,330-token/676,388-byte consumer 下可接受。
+- 受影响首轮为 `120 passed, 77 subtests`；Knowledge Gate compiler/runtime、delegation、HTTP、workflow、
+  convergence 与 fan-in 联合为 `399 passed, 209 subtests`。隔离 tmpfs 完整 Harness 为
+  `1939 passed, 1 failed, 807 subtests`；唯一 failure 是生产 Harness image 按设计不含 Node 的 CommonJS
+  interpreter 环境项，同一 exact test 在宿主 Node v22.23.1 下 `1 passed`，组合覆盖全部 1,940 项。
+  clean candidate 联合为 `398 passed, 1 skipped, 205 subtests`，skip 仅因 tracked archive 不包含未跟踪
+  V2.3 reference ZIP。`py_compile`、diff、credential-like added-line、genericity 与 protected-deletion
+  检查均通过。
+- 通用代码提交为
+  `98882f0b18abed5b207c520b3b63ab852a93bc6d fix: bind exact evidence calls and fan-in capacity`。
+  clean archive `/tmp/chat_ds_deploy_98882f0b.cU1tKE` 与 tracked tree 都为 22,452 files；candidate/production
+  image 为 `sha256:5536a15f50658dec43090db9c6a7e8ef419f29095709d90e28e2a26c74b8ec14`。
+  部署前两次确认 nonterminal run、schedule、5173 established connection 均为 0；只 force-recreate
+  Harness，旧 image 保留 `rollback-pre-98882f0b`，Backend/Frontend/四槽/Proxy/Browser/Search/数据卷
+  未重建。部署后三入口、Harness 与 Backend→Harness health/models 均 200，storage identity 相同，
+  SQLite quick/FK 正常，healthy/restart 0、严重日志 0；生产 Harness 直接请求默认 GLM-5.2 为 200，
+  thinking reasoning 非空且 visible response 以 `stop` 完成。
+
+Round 13 尚未闭环：以上是 V2.3 首个失败 case 的完整诊断、修复和部署，不把同一失败 run 的重复解读
+计为新一轮，也未伪造肺癌 MDT case。下一步从生产 `98882f0b` 使用新的 conversation/root 重跑 V2.3，
+达到 durable terminal 并完成三源验收后，再顺序运行肺癌 MDT 的全新 case；两个 case 都结束后才关闭
+Round 13。
