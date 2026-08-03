@@ -18,6 +18,7 @@ from tools.delegation import (
     _render_preloaded_prerequisites,
     _required_output_has_status,
     _fan_in_provider_deadline_seconds,
+    _fan_in_generation_output_tokens,
     _fan_in_retryable_output_failure,
     _fan_in_weighted_wave_concurrency,
     _run_child,
@@ -163,6 +164,47 @@ def _catalog_for_bindings(
 
 
 class DelegationToolPolicyTests(unittest.TestCase):
+    def test_fan_in_wire_generation_headroom_uses_declared_provider_cap(self):
+        accepted = 9_977
+        unknown = _context()
+        self.assertEqual(
+            accepted,
+            _fan_in_generation_output_tokens(
+                unknown,
+                accepted_output_tokens=accepted,
+            ),
+        )
+
+        declared = replace(
+            unknown,
+            provider_config={
+                **unknown.provider_config,
+                "max_output_tokens": 86_400,
+            },
+        )
+        self.assertEqual(
+            14_966,
+            _fan_in_generation_output_tokens(
+                declared,
+                accepted_output_tokens=accepted,
+            ),
+        )
+
+        narrow = replace(
+            unknown,
+            provider_config={
+                **unknown.provider_config,
+                "max_output_tokens": 11_000,
+            },
+        )
+        self.assertEqual(
+            11_000,
+            _fan_in_generation_output_tokens(
+                narrow,
+                accepted_output_tokens=accepted,
+            ),
+        )
+
     def test_fan_in_deadline_scales_with_current_long_context_shape(self):
         with (
             patch(
@@ -2603,6 +2645,7 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
         }
         attempts: dict[str, int] = {}
         reducer_prompts: list[str] = []
+        reducer_wire_budgets: list[int] = []
         main_prompt = ""
         events: list[dict] = []
 
@@ -2622,6 +2665,7 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
                 kwargs.get("output_lifecycle_policy"),
             )
             self.assertEqual([], tools)
+            reducer_wire_budgets.append(int(kwargs["max_tokens"]))
             step_id = prompt.split("Step ID: ", 1)[1].splitlines()[0]
             attempts[step_id] = attempts.get(step_id, 0) + 1
             reducer_prompts.append(prompt)
@@ -2719,13 +2763,21 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
                     return_value="results/renamed-final.txt",
                 ),
             ):
+                context = _context("read_file", event_sink=events.append)
+                context = replace(
+                    context,
+                    provider_config={
+                        **context.provider_config,
+                        "max_output_tokens": 65_536,
+                    },
+                )
                 result = await _run_child(
                     {
                         "goal": "combine every renamed persisted prerequisite",
                         "required_result_paths": list(bodies),
                         "tools": ["read_file"],
                     },
-                    _context("read_file", event_sink=events.append),
+                    context,
                     0,
                 )
 
@@ -2801,6 +2853,31 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
             "fan_in.reducer_finalization_requested",
             [event.get("event_type") for event in events],
         )
+        reducer_attempt_starts = [
+            event
+            for event in events
+            if event.get("event_type")
+            == "fan_in.reducer_attempt_started"
+        ]
+        self.assertEqual(len(reducer_wire_budgets), len(reducer_attempt_starts))
+        self.assertTrue(reducer_attempt_starts)
+        self.assertEqual(
+            reducer_wire_budgets,
+            [
+                int(event["payload"]["generation_output_tokens"])
+                for event in reducer_attempt_starts
+            ],
+        )
+        self.assertTrue(all(
+            int(event["payload"]["generation_output_tokens"])
+            > int(event["payload"]["accepted_output_tokens"])
+            and int(event["payload"]["generation_headroom_tokens"])
+            == (
+                int(event["payload"]["generation_output_tokens"])
+                - int(event["payload"]["accepted_output_tokens"])
+            )
+            for event in reducer_attempt_starts
+        ))
 
     async def test_repeated_fan_in_length_fails_after_bounded_replacement(self):
         bodies = {

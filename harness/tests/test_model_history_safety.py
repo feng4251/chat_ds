@@ -342,12 +342,26 @@ class ModelHistorySafetyTests(unittest.TestCase):
         payload = _debug_payload({
             "estimated_input_tokens": 293188,
             "requested_max_tokens": 262144,
+            "max_output_tokens": 86400,
+            "accepted_output_tokens": 9977,
+            "generation_output_tokens": 14966,
+            "generation_headroom_tokens": 4989,
+            "nested": {
+                "max_output_tokens": "secret-shaped-nonnumeric-value",
+                "max_completion_tokens": None,
+            },
             "access_token": "secret-value",
             "api_key": "secret-key",
         })
 
         self.assertEqual(293188, payload["estimated_input_tokens"])
         self.assertEqual(262144, payload["requested_max_tokens"])
+        self.assertEqual(86400, payload["max_output_tokens"])
+        self.assertEqual(9977, payload["accepted_output_tokens"])
+        self.assertEqual(14966, payload["generation_output_tokens"])
+        self.assertEqual(4989, payload["generation_headroom_tokens"])
+        self.assertEqual("[redacted]", payload["nested"]["max_output_tokens"])
+        self.assertIsNone(payload["nested"]["max_completion_tokens"])
         self.assertEqual("[redacted]", payload["access_token"])
         self.assertEqual("[redacted]", payload["api_key"])
 

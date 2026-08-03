@@ -49,6 +49,16 @@ def _terminal(event_type: str, run_id: str, seq: int) -> dict:
 
 
 class ChatStreamFailureClassificationTests(unittest.TestCase):
+    def test_builtin_model_config_exposes_independent_completion_capability(self):
+        config = asyncio.run(chat_router.resolve_model_config(
+            "shaiengine_glm_5_2",
+            None,
+            None,
+        ))
+
+        self.assertEqual(200_000, config["context_length"])
+        self.assertEqual(86_400, config["max_output_tokens"])
+
     def test_child_and_provisional_failures_do_not_override_root_success(self):
         child_failed = _terminal("run.failed", "child", 90)
         child_failed["payload"].update({

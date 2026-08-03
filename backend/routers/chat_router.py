@@ -2689,6 +2689,13 @@ async def resolve_model_config(model_id: str, cur_user: User, db: AsyncSession) 
             "protocol": cfg.get("protocol", "openai"),
             "is_multimodal": cfg["is_multimodal"],
             "context_length": cfg.get("context_length", 262144),
+            # The context window and the per-response completion ceiling are
+            # independent provider capabilities.  The Harness needs both: a
+            # large context does not imply that one reduction/report response
+            # may consume the whole remaining window.  Keep the wire name
+            # aligned with Harness provider metadata rather than exposing the
+            # Backend's historical request-field name (``max_tokens``).
+            "max_output_tokens": cfg.get("max_tokens"),
             "discover_runtime_metadata": bool(
                 cfg.get("discover_runtime_metadata", False)
             ),
