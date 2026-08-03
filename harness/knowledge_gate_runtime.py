@@ -287,6 +287,40 @@ def ordinary_worker_capability_selectors(
     ))
 
 
+def ordinary_worker_resource_selectors(
+    worker: dict[str, Any] | None,
+    *,
+    available_tools: Iterable[str],
+    resolve_tool_selector: Callable[[str, Iterable[str]], list[str]],
+) -> list[str]:
+    """Return path-shaped static selectors from one normalized worker.
+
+    Semantic capability planners may retain an exact same-package file in the
+    generic ``capabilities`` field rather than duplicating it into
+    ``local_resources``.  Runtime lowering already treats those values as
+    resource candidates, so the outer run authority must bind the same exact
+    paths before lowering.  This helper does not validate existence or mint
+    directory/glob authority; the package snapshot and resource compiler keep
+    ownership of those checks.
+    """
+
+    resource_selectors: list[str] = []
+    for selector in ordinary_worker_capability_selectors(
+        worker,
+        available_tools=available_tools,
+        resolve_tool_selector=resolve_tool_selector,
+    ):
+        if (
+            selector.casefold().startswith("skill:")
+            or "(" in selector
+        ):
+            continue
+        suffix = PurePosixPath(selector).suffix.casefold()
+        if "/" in selector or suffix in _RESOURCE_SUFFIXES:
+            resource_selectors.append(selector)
+    return list(dict.fromkeys(resource_selectors))
+
+
 def _execution_contract(loaded: dict[str, Any]) -> dict[str, Any]:
     workflow = loaded.get("workflow_contract")
     if not isinstance(workflow, dict):

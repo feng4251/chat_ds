@@ -833,6 +833,95 @@ def _completion_quality_declaration(
     }
 
 
+def _canonicalize_duplicate_completion_quality_ledgers(
+    content: str,
+) -> tuple[str, dict[str, Any]]:
+    """Collapse valid duplicate quality records to one conservative ledger.
+
+    Providers and bounded output repairs can append a corrected control footer
+    without deleting the earlier model footer.  Duplicate serialization is a
+    representation defect, not an independent reason to replay an otherwise
+    machine-auditable child.  Every visible candidate must still be a strict
+    valid ledger; any malformed candidate leaves the body untouched so the
+    existing fail-closed parser rejects it.  When valid statuses conflict,
+    degraded wins.
+    """
+
+    value = str(content or "")
+    raw_lines = value.splitlines(keepends=True)
+    masked_lines = _mask_markdown_code_for_protocol_audit(value).splitlines()
+    candidate_indexes = [
+        index
+        for index, line in enumerate(masked_lines)
+        if line.strip().startswith("COMPLETION_QUALITY_JSON:")
+    ]
+    audit: dict[str, Any] = {
+        "candidate_count": len(candidate_indexes),
+        "candidate_statuses": [],
+        "canonicalized": False,
+        "invalid_candidate_count": 0,
+        "resolution": "unchanged",
+    }
+    if len(candidate_indexes) <= 1:
+        return value, audit
+
+    statuses: list[str] = []
+    invalid_count = 0
+    for index in candidate_indexes:
+        declaration = _completion_quality_declaration(
+            raw_lines[index].rstrip("\r\n"),
+            allow_legacy_status=False,
+        )
+        status = declaration.get("status")
+        if declaration.get("error") or status not in {"complete", "degraded"}:
+            invalid_count += 1
+            continue
+        statuses.append(str(status))
+    audit["candidate_statuses"] = statuses
+    audit["invalid_candidate_count"] = invalid_count
+    if invalid_count:
+        audit["resolution"] = "strict_parser_rejection"
+        return value, audit
+
+    resolved_status = "degraded" if "degraded" in statuses else "complete"
+    payload: dict[str, str] = {"status": resolved_status}
+    if resolved_status == "degraded":
+        payload["reason"] = (
+            "one or more declared completion records reported degraded quality"
+        )
+    canonical_line = (
+        "COMPLETION_QUALITY_JSON: "
+        + json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    candidate_index_set = set(candidate_indexes)
+    retained = [
+        line for index, line in enumerate(raw_lines)
+        if index not in candidate_index_set
+    ]
+    insert_at = next(
+        (
+            index for index in range(len(retained) - 1, -1, -1)
+            if retained[index].strip().startswith("RESULT_FIELDS_JSON:")
+        ),
+        len(retained),
+    )
+    if insert_at > 0 and not retained[insert_at - 1].endswith(("\n", "\r")):
+        retained[insert_at - 1] += "\n"
+    retained.insert(insert_at, canonical_line)
+    audit.update({
+        "canonicalized": True,
+        "resolution": "degraded_wins" if resolved_status == "degraded" else "deduplicated",
+        "resolved_status": resolved_status,
+    })
+    return "".join(retained), audit
+
+
 def _content_declares_degraded_completion(content: str) -> bool:
     """Compatibility wrapper around the strict quality declaration parser."""
 
@@ -11352,6 +11441,14 @@ async def _run_child(
             content,
             runtime_unresolved_retrieval,
         )
+    content, completion_quality_canonicalization = (
+        _canonicalize_duplicate_completion_quality_ledgers(content)
+    )
+    if completion_quality_canonicalization.get("candidate_count"):
+        await forward_event(child_event(
+            "debug.completion_quality.canonicalized",
+            completion_quality_canonicalization,
+        ))
     # A child result is not reusable data until its complete output contract
     # has passed.  Keep the model body in memory while validating and persist
     # only after runtime/contract arbitration selects a completed result.
@@ -12310,6 +12407,20 @@ async def _run_child(
             "degraded completion declaration or exact machine gap ledger."
         )
     completion_quality_audit = {
+        "candidate_count": completion_quality_canonicalization.get(
+            "candidate_count", 0,
+        ),
+        "candidate_statuses": list(
+            completion_quality_canonicalization.get(
+                "candidate_statuses", [],
+            )
+        ),
+        "canonicalized": bool(
+            completion_quality_canonicalization.get("canonicalized")
+        ),
+        "canonicalization_resolution": (
+            completion_quality_canonicalization.get("resolution")
+        ),
         "declared_status": completion_quality_declaration.get("status"),
         "declaration_source": completion_quality_declaration.get("source"),
         "declaration_reason_receipt": (

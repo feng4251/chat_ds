@@ -73,6 +73,7 @@ from knowledge_gate_runtime import (
     compile_runtime_unconditional_capability_plan,
     decision_tool_schema as knowledge_gate_decision_tool_schema,
     ordinary_worker_capability_selectors,
+    ordinary_worker_resource_selectors,
     plan_prompt_payload as knowledge_gate_plan_prompt_payload,
     validate_knowledge_gate_candidate_authority,
 )
@@ -41348,6 +41349,21 @@ def _bounded_skill_execution_exposure(
                             for path in (worker.get("local_resources") or [])
                             if isinstance(path, str)
                         )
+                        # A typed semantic planner may retain an exact package
+                        # path in ``capabilities`` instead of redundantly
+                        # copying it to ``local_resources``. Runtime lowering
+                        # resolves both fields identically, so install the
+                        # path-shaped selectors into the same run-owned exact
+                        # resource boundary before any delegate dispatch.
+                        declared_resource_paths.extend(
+                            ordinary_worker_resource_selectors(
+                                worker,
+                                available_tools=available,
+                                resolve_tool_selector=(
+                                    _resolve_declared_tool_selector
+                                ),
+                            )
+                        )
                         # Conditional local candidates are parent authority
                         # material but are not ordinary worker preloads or
                         # unconditional capabilities.  Keep them in the root
@@ -41374,9 +41390,20 @@ def _bounded_skill_execution_exposure(
                             for path in (step.get("local_resources") or [])
                             if isinstance(path, str)
                         )
+        declared_resource_paths = _dedupe_paths(declared_resource_paths)
+        if len(declared_resource_paths) > _MAX_REQUIRED_WORKFLOW_FILES:
+            missing.append(
+                "skill_resource_closure_limit:"
+                f"{skill_name}: selected Skill runtime resource closure "
+                f"contains {len(declared_resource_paths)} files, exceeding "
+                "the runtime limit of "
+                f"{_MAX_REQUIRED_WORKFLOW_FILES}; no delegate or workspace "
+                "mutation was authorized"
+            )
+            continue
         allowed_resources.update(
             (skill_name, path)
-            for path in _dedupe_paths(declared_resource_paths)
+            for path in declared_resource_paths
             if _safe_compiled_skill_resource_path(path)
         )
         from skills.command_grants import grant_tuple, selected_plan_command_grants

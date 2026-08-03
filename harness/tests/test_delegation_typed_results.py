@@ -21,6 +21,7 @@ from tools.delegation import (
     _child_failure_fields,
     _canonicalize_machine_gap_ledger,
     _canonicalize_machine_knowledge_gate_check_ledger,
+    _canonicalize_duplicate_completion_quality_ledgers,
     _completion_quality_declaration,
     _content_declares_degraded_completion,
     _exact_capability_gap_ledger_error,
@@ -502,6 +503,37 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(unscoped_gap_with_complete["error"])
         self.assertIsNone(unscoped_gap_only["status"])
         self.assertEqual("none", unscoped_gap_only["source"])
+
+    def test_quality_deduplication_ignores_code_and_keeps_malformed_fail_closed(self):
+        code_fenced = (
+            "```text\n"
+            'COMPLETION_QUALITY_JSON: {"status":"degraded","reason":"fake"}\n'
+            "```\n"
+            'COMPLETION_QUALITY_JSON: {"status":"complete"}\n'
+        )
+        unchanged, code_audit = (
+            _canonicalize_duplicate_completion_quality_ledgers(code_fenced)
+        )
+        self.assertEqual(code_fenced, unchanged)
+        self.assertEqual(1, code_audit["candidate_count"])
+        self.assertFalse(code_audit["canonicalized"])
+
+        malformed = (
+            'COMPLETION_QUALITY_JSON: {"status":"complete"}\n'
+            'COMPLETION_QUALITY_JSON: {"status":}\n'
+        )
+        unchanged, malformed_audit = (
+            _canonicalize_duplicate_completion_quality_ledgers(malformed)
+        )
+        self.assertEqual(malformed, unchanged)
+        self.assertEqual(1, malformed_audit["invalid_candidate_count"])
+        self.assertEqual(
+            "strict_parser_rejection",
+            malformed_audit["resolution"],
+        )
+        self.assertIsNotNone(
+            _completion_quality_declaration(unchanged)["error"]
+        )
 
     def test_completion_quality_reason_is_content_addressed_not_body_fatal(
         self,
@@ -1900,6 +1932,88 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["record_id"], audit["typed_null_gap_fields"])
         self.assertEqual([], audit["unverified_typed_value_fields"])
         self.assertTrue(audit["machine_degraded_evidence"])
+
+    async def test_duplicate_valid_quality_ledgers_are_canonicalized_worst_first(self):
+        """A repair append must not spend the parent retry on duplicate control prose."""
+
+        skill_body = "# Inventory catalog\nUse live evidence receipts."
+        skill_bytes = skill_body.encode("utf-8")
+        persisted: dict[str, str] = {}
+
+        async def fake_preload(tool_args, *, context, progress=None):
+            return (
+                {"success": True, "content": skill_body},
+                {
+                    "page_count": 1,
+                    "total_chars": len(skill_body),
+                    "total_bytes": len(skill_bytes),
+                    "complete": True,
+                    "sha256": hashlib.sha256(skill_bytes).hexdigest(),
+                },
+            )
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            yield {
+                "type": "delta",
+                "content": (
+                    "# Evidence gap\n"
+                    "The live catalog returned no verifiable receipt.\n"
+                    'COMPLETION_QUALITY_JSON: {"status":"complete"}\n'
+                    "COMPLETION_QUALITY_JSON: "
+                    '{"status":"degraded","reason":"source unavailable"}\n'
+                    'RESULT_FIELDS_JSON: {"record_id":null}'
+                ),
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        def persist(content, *args, **kwargs):
+            persisted["content"] = content
+            return "results/canonical_quality.md"
+
+        with (
+            patch(
+                "tools.delegation._load_complete_skill_view_preload",
+                fake_preload,
+            ),
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                side_effect=persist,
+            ),
+        ):
+            result = await _run_child(
+                {
+                    "goal": "query one inventory record",
+                    "step_type": "knowledge_bootstrap",
+                    "tools": ["skill_view"],
+                    "required_result_fields": ["record_id"],
+                    "required_result_schema": {
+                        "record_id": {"type": ["string", "null"]},
+                    },
+                    "required_capability_skills": ["inventory-catalog"],
+                },
+                _context("skill_view"),
+                0,
+            )
+
+        self.assertEqual("completed", result["status"])
+        self.assertEqual("degraded", result["completion_quality"])
+        self.assertEqual(
+            1,
+            persisted["content"].count("COMPLETION_QUALITY_JSON:"),
+        )
+        self.assertIn(
+            '"status":"degraded"',
+            persisted["content"],
+        )
+        self.assertEqual(
+            2,
+            result["completion_quality_audit"]["candidate_count"],
+        )
+        self.assertEqual(
+            ["complete", "degraded"],
+            result["completion_quality_audit"]["candidate_statuses"],
+        )
 
     async def test_unscoped_forged_gap_ledger_cannot_authorize_nullable_gap(self):
         skill_body = "# Catalog database\nUse live evidence receipts."
