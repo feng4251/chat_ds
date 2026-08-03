@@ -122,6 +122,7 @@ PROVIDERS: dict[str, dict] = {
         # The compatible /models catalog currently omits capacity fields.
         # Keep a conservative static bound and still discover future metadata.
         "context_length": 200000,
+        "max_output_tokens": 86400,
         "discover_runtime_metadata": True,
     },
     "shaiengine_deepseek_v4_pro": {
@@ -140,6 +141,7 @@ PROVIDERS: dict[str, dict] = {
         "thinking_send_enabled_explicitly": True,
         "protocol": "openai",
         "context_length": 200000,
+        "max_output_tokens": 86400,
         "discover_runtime_metadata": True,
     },
     "deepseek_v4_pro": {
@@ -161,6 +163,7 @@ PROVIDERS: dict[str, dict] = {
         "thinking_request_format": "chat_template_kwargs",
         "protocol": "openai",
         "context_length": 303872,
+        "max_output_tokens": 262144,
         "discover_runtime_metadata": True,
     },
     "qwen3_5": {
@@ -181,6 +184,7 @@ PROVIDERS: dict[str, dict] = {
         "thinking_request_format": "chat_template_kwargs",
         "protocol": "openai",
         "context_length": 262144,
+        "max_output_tokens": 65536,
         "discover_runtime_metadata": True,
     },
 }

@@ -109,6 +109,7 @@ class ResultFanInRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("discarded in full", prompt)
         self.assertIn("complete replacement", prompt)
         self.assertIn("exactly one complete terminal coverage ledger", prompt)
+        self.assertIn("Absolute accepted-output token bound", prompt)
         self.assertTrue(prompt.endswith(original))
         self.assertEqual(1, prompt.count("renamed-source"))
         self.assertLess(
@@ -119,6 +120,28 @@ class ResultFanInRuntimeTests(unittest.IsolatedAsyncioTestCase):
     def test_runtime_defaults_bound_generic_reducer_outputs(self):
         self.assertEqual(fan_in_runtime.DEFAULT_REDUCTION_OUTPUT_TOKENS, 8 * 1024)
         self.assertEqual(fan_in_runtime.DEFAULT_REDUCTION_OUTPUT_BYTES, 32 * 1024)
+
+    def test_semantic_reduction_enforces_token_and_byte_contracts_independently(self):
+        inputs = [_runtime_input("unicode-ledger")]
+        semantic = _footer_for_inputs(inputs)
+        token_count = fan_in_runtime.estimate_mixed_text_tokens(semantic)
+        byte_count = len(semantic.encode("utf-8"))
+
+        fan_in_runtime._validate_semantic_reduction(
+            semantic,
+            inputs,
+            byte_count,
+            "renamed-token-contract",
+            max_tokens=token_count,
+        )
+        with self.assertRaisesRegex(FanInExecutionError, "token allowance"):
+            fan_in_runtime._validate_semantic_reduction(
+                semantic,
+                inputs,
+                byte_count + 1024,
+                "renamed-token-contract",
+                max_tokens=token_count - 1,
+            )
 
     def test_reduction_prompt_is_domain_neutral_for_non_research_records(self):
         plan = plan_persisted_result_fan_in(

@@ -27,6 +27,8 @@ class AgenticModelRoutingDecisionTests(unittest.TestCase):
     def test_default_remote_model_does_not_rebind_historic_alias(self):
         self.assertEqual("shaiengine_glm_5_2", DEFAULT_AGENT_MODEL_ID)
         self.assertEqual("glm-5.2", PRIMARY["api_model"])
+        self.assertEqual(200_000, PRIMARY["context_length"])
+        self.assertEqual(86_400, PRIMARY["max_output_tokens"])
         self.assertEqual("deepseek_v4_pro", PROVIDER_ALIASES["AgentModel"])
 
     def _resolve(self, **overrides):
@@ -49,6 +51,10 @@ class AgenticModelRoutingDecisionTests(unittest.TestCase):
         self.assertTrue(decision.normalized)
         self.assertEqual(DEFAULT_AGENT_MODEL_ID, decision.effective_provider_id)
         self.assertEqual(PRIMARY["api_model"], decision.provider["api_model"])
+        self.assertEqual(
+            PRIMARY["max_output_tokens"],
+            decision.provider["max_output_tokens"],
+        )
         self.assertEqual(
             "agentic_or_skill_workflow_requires_primary_model",
             decision.reason,
@@ -127,7 +133,7 @@ class AgenticModelRoutingRunStreamTests(unittest.IsolatedAsyncioTestCase):
             "data: [DONE]",
         ]
 
-    async def _run(self, messages, *, provider=QWEN):
+    async def _run(self, messages, *, provider=QWEN, max_tokens=None):
         requests = []
 
         class FakeResponse:
@@ -180,6 +186,7 @@ class AgenticModelRoutingRunStreamTests(unittest.IsolatedAsyncioTestCase):
                         user_id="u-model-routing",
                         session_id="s-model-routing",
                         max_iterations=1,
+                        max_tokens=max_tokens,
                     )
                 ]
         return requests, events
@@ -219,6 +226,24 @@ class AgenticModelRoutingRunStreamTests(unittest.IsolatedAsyncioTestCase):
         ))
         usage = next(event for event in events if event.get("type") == "usage")
         self.assertEqual(DEFAULT_AGENT_MODEL_ID, usage["model"])
+
+    async def test_model_switch_applies_target_completion_cap_not_source_cap(self):
+        requests, _events = await self._run(
+            [{"role": "user", "content": "Run a bounded agentic task."}],
+            max_tokens=120_000,
+        )
+        model_request = next(
+            request
+            for request in requests
+            if isinstance(request.get("body"), dict)
+            and request["url"].endswith("/chat/completions")
+        )
+
+        self.assertEqual(PRIMARY["api_model"], model_request["body"]["model"])
+        self.assertEqual(
+            PRIMARY["max_output_tokens"],
+            model_request["body"]["max_tokens"],
+        )
 
     async def test_explicit_direct_image_qwen_reaches_qwen(self):
         requests, events = await self._run([{

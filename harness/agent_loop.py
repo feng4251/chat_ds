@@ -2182,6 +2182,14 @@ _NON_SENSITIVE_DEBUG_TOKEN_KEYS = {
     "primary_phase_max_tokens",
     "effective_max_tokens",
     "available_output_tokens",
+    "max_output_tokens",
+    "max_completion_tokens",
+    "minimum_output_tokens",
+    "accepted_output_tokens",
+    "generation_output_tokens",
+    "generation_headroom_tokens",
+    "accepted_output_policy_max_tokens",
+    "generation_output_policy_max_tokens",
     "context_length",
     "threshold_tokens",
     "max_tokens",
@@ -2729,7 +2737,29 @@ def _debug_payload(value: Any, *, cap: int | None = None) -> Any:
         cleaned: dict[str, Any] = {}
         for key, item in value.items():
             key_text = str(key)
-            if _is_sensitive_debug_key(key_text):
+            normalized_key = re.sub(
+                r"[^a-z0-9]",
+                "",
+                key_text.casefold(),
+            )
+            if (
+                normalized_key
+                in _NON_SENSITIVE_DEBUG_TOKEN_KEYS_NORMALIZED
+                and (
+                    item is not None
+                    and (
+                        isinstance(item, bool)
+                        or not isinstance(item, (int, float))
+                        or not math.isfinite(float(item))
+                    )
+                )
+            ):
+                # Token-shaped keys are otherwise sensitive by default.  The
+                # narrow allow-list above is intended only for finite numeric
+                # capacity/accounting metrics, never arbitrary strings that a
+                # caller could use to smuggle credentials into debug traces.
+                cleaned[key_text] = "[redacted]"
+            elif _is_sensitive_debug_key(key_text):
                 cleaned[key_text] = "[redacted]"
             elif key_text.lower() in _DEBUG_LITERAL_PAYLOAD_KEYS and isinstance(item, str):
                 cleaned[f"{key_text}_omitted"] = {

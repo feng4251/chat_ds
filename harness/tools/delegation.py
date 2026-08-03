@@ -5997,6 +5997,48 @@ def _fan_in_reducer_output_allowances(
     return output_tokens, output_bytes
 
 
+def _fan_in_generation_output_tokens(
+    context: ToolContext,
+    *,
+    accepted_output_tokens: int,
+) -> int:
+    """Return a provider-bounded wire budget above the artifact contract.
+
+    A model asked to produce an artifact of at most ``N`` tokens must not also
+    be mechanically stopped at exactly ``N``: normal token estimation error
+    and the terminal coverage footer otherwise turn a valid size target into a
+    deterministic ``finish_reason=length`` boundary.  Grant bounded generation
+    headroom only when the provider advertises a distinct completion ceiling;
+    the fan-in runtime still validates the accepted token and byte contracts
+    before any output is committed.
+    """
+
+    accepted = max(1, int(accepted_output_tokens))
+    provider_caps: list[int] = []
+    provider_config = context.provider_config
+    if isinstance(provider_config, dict):
+        for key in ("max_output_tokens", "max_completion_tokens"):
+            value = provider_config.get(key)
+            if isinstance(value, bool):
+                continue
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if parsed > 0:
+                provider_caps.append(parsed)
+    if not provider_caps:
+        # Unknown provider capability: preserve the historical fail-closed
+        # request rather than inventing a larger wire contract.
+        return accepted
+    provider_cap = min(provider_caps)
+    desired = max(
+        accepted + 2_048,
+        (accepted * 3 + 1) // 2,
+    )
+    return max(1, min(provider_cap, desired))
+
+
 def _fan_in_reducer_input_allowances(
     context: ToolContext,
     *,
@@ -10015,6 +10057,14 @@ async def _run_child(
                     if fan_in_plan.requires_reduction:
                         from agent_loop import run_stream as fan_in_run_stream
 
+                        fan_in_generation_max_tokens = (
+                            _fan_in_generation_output_tokens(
+                                context,
+                                accepted_output_tokens=(
+                                    fan_in_plan.output_policy.max_tokens
+                                ),
+                            )
+                        )
                         critical_path_depth = max(
                             int(step.wave)
                             for step in fan_in_plan.reduction_steps
@@ -10042,7 +10092,7 @@ async def _run_child(
                                 planned_reducer_input_tokens
                             ),
                             max_output_tokens=(
-                                fan_in_plan.output_policy.max_tokens
+                                fan_in_generation_max_tokens
                             ),
                             requested_concurrency=(
                                 requested_wave_concurrency
@@ -10122,7 +10172,7 @@ async def _run_child(
                                 worst_reducer_input_tokens
                             ),
                             max_output_tokens=(
-                                fan_in_plan.output_policy.max_tokens
+                                fan_in_generation_max_tokens
                             ),
                             caller_hard_cap_seconds=(
                                 configured_stream_timeout
@@ -10194,6 +10244,17 @@ async def _run_child(
                                 "output_policy": (
                                     fan_in_plan.output_policy.to_dict()
                                 ),
+                                "accepted_output_policy_max_tokens": (
+                                    fan_in_plan.output_policy.max_tokens
+                                ),
+                                "generation_output_policy_max_tokens": (
+                                    fan_in_generation_max_tokens
+                                ),
+                                "generation_headroom_tokens": max(
+                                    0,
+                                    fan_in_generation_max_tokens
+                                    - fan_in_plan.output_policy.max_tokens,
+                                ),
                             },
                             "lossy_semantic_reduction": True,
                             "coverage_scope": (
@@ -10204,6 +10265,14 @@ async def _run_child(
                         async def reduce_fan_in(
                             request: ReductionRequest,
                         ) -> str:
+                            generation_output_tokens = (
+                                _fan_in_generation_output_tokens(
+                                    context,
+                                    accepted_output_tokens=(
+                                        request.max_output_tokens
+                                    ),
+                                )
+                            )
                             request_timeout = min(
                                 fan_in_step_timeout,
                                 fan_in_plan_timeout,
@@ -10256,7 +10325,7 @@ async def _run_child(
                                         )
                                     ),
                                     max_output_tokens=(
-                                        request.max_output_tokens
+                                        generation_output_tokens
                                     ),
                                     caller_hard_cap_seconds=min(
                                         configured_stream_timeout,
@@ -10277,6 +10346,43 @@ async def _run_child(
                                 terminal_identity_error = ""
                                 terminal_authority_error = ""
                                 reduction_run_id = uuid.uuid4().hex
+
+                                await forward_event({
+                                    "type": "agent_event",
+                                    "event_type": (
+                                        "fan_in.reducer_attempt_started"
+                                    ),
+                                    "run_id": child_run_id,
+                                    "root_run_id": root_run_id,
+                                    "parent_run_id": parent_run_id,
+                                    "agent_kind": "delegate",
+                                    "agent_name": agent_name,
+                                    "depth": child_depth,
+                                    "workspace_scope": workspace_scope,
+                                    "payload": {
+                                        "plan_id": fan_in_plan.plan_id,
+                                        "step_id": request.step_id,
+                                        "request_id": request.request_id,
+                                        "attempt": attempt_number,
+                                        "max_attempts": (
+                                            MAX_REDUCER_LENGTH_ATTEMPTS
+                                        ),
+                                        "accepted_output_tokens": (
+                                            request.max_output_tokens
+                                        ),
+                                        "accepted_output_bytes": (
+                                            request.max_output_bytes
+                                        ),
+                                        "generation_output_tokens": (
+                                            generation_output_tokens
+                                        ),
+                                        "generation_headroom_tokens": max(
+                                            0,
+                                            generation_output_tokens
+                                            - request.max_output_tokens,
+                                        ),
+                                    },
+                                })
 
                                 async def reduction_event_sink(
                                     reduction_event: dict[str, Any],
@@ -10368,7 +10474,7 @@ async def _run_child(
                                     session_id=context.session_id,
                                     timeout=attempt_timeout,
                                     max_iterations=1,
-                                    max_tokens=request.max_output_tokens,
+                                    max_tokens=generation_output_tokens,
                                     provider_override=(
                                         context.provider_config
                                     ),
