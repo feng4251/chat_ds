@@ -388,6 +388,26 @@ description: A generic instruction-only workflow.
             ],
         }
 
+    def _ordinal_workflow_plan(self, document, catalog):
+        plan = self._workflow_plan(document)
+        catalog_document = catalog["instruction_plan_catalog"]["documents"][0]
+        ordinal_by_id = {
+            unit.id: unit_index + 1
+            for unit_index, unit in enumerate(document.units)
+        }
+        for node in plan["nodes"]:
+            node["instruction_ranges"] = [
+                {
+                    "document_id": catalog_document["document_id"],
+                    "start_ordinal": ordinal_by_id[
+                        item["start_instruction_id"]
+                    ],
+                    "end_ordinal": ordinal_by_id[item["end_instruction_id"]],
+                }
+                for item in node["instruction_ranges"]
+            ]
+        return plan
+
     def _validate(
         self,
         catalog,
@@ -426,9 +446,20 @@ description: A generic instruction-only workflow.
             '"text":',
             json.dumps(projection["workflow_plan_catalog"], ensure_ascii=False),
         )
+        self.assertNotIn(
+            '"id":',
+            json.dumps(projection["workflow_plan_catalog"], ensure_ascii=False),
+        )
+        self.assertIn(
+            "document_id",
+            projection["workflow_plan_catalog"]["documents"][0],
+        )
         self.assertNotIn("instruction_documents", projection)
         self.assertIn("workflow_plan is mandatory", projection["instructions"])
         self.assertRegex(catalog["catalog_sha256"], r"^[0-9a-f]{64}$")
+        self.assertTrue(
+            catalog["policy"]["workflow_plan_catalog_content_addressed"]
+        )
 
     def test_compact_workflow_plan_is_compiled_before_grants_are_installed(self):
         _root, _main, document, catalog, delegate_id = self._fixture()
@@ -452,6 +483,17 @@ description: A generic instruction-only workflow.
             result.payload["worker_plan"]["required_workers"],
         )
 
+        ordinal_result = self._validate(
+            catalog,
+            delegate_id,
+            workflow_plan=self._ordinal_workflow_plan(document, catalog),
+        )
+        self.assertTrue(ordinal_result.valid, ordinal_result.payload)
+        self.assertEqual(
+            result.payload["workflow_ir"]["ir_sha256"],
+            ordinal_result.payload["workflow_ir"]["ir_sha256"],
+        )
+
         conflict = self._validate(
             catalog,
             delegate_id,
@@ -462,6 +504,25 @@ description: A generic instruction-only workflow.
         self.assertEqual(
             "capability_plan_workflow_payload_conflict",
             conflict.payload["error_code"],
+        )
+
+    def test_ordinal_workflow_plan_rejects_stale_outer_catalog_epoch(self):
+        _root, _main, document, catalog, delegate_id = self._fixture()
+        result = validate_capability_plan(
+            catalog,
+            skill_name="portable-workflow",
+            body_sha256=catalog["body_sha256"],
+            catalog_sha256="f" * 64,
+            required=[delegate_id],
+            optional=[],
+            unsupported=[],
+            workflow_plan=self._ordinal_workflow_plan(document, catalog),
+        )
+
+        self.assertFalse(result.valid)
+        self.assertEqual(
+            "capability_plan_catalog_identity_mismatch",
+            result.payload["error_code"],
         )
 
     def test_compact_plan_validation_error_exposes_stable_code_and_path(self):

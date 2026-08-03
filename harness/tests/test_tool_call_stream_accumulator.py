@@ -1120,6 +1120,7 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
         requested_max_tokens=None,
         provider_context_length=64_000,
         fallback_overrides=None,
+        output_lifecycle_policy="agent",
     ):
         """Run provider turns with an optional explicit-repair fallback."""
         requests = []
@@ -1277,6 +1278,13 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
                         ),
                         max_tokens=requested_max_tokens,
                         fallback_overrides=fallback_overrides,
+                        output_lifecycle_policy=output_lifecycle_policy,
+                        include_session_context=(
+                            output_lifecycle_policy != "internal_bounded_text"
+                        ),
+                        enforce_session_skill_workflow=(
+                            output_lifecycle_policy != "internal_bounded_text"
+                        ),
                     )
                 ]
         return requests, dispatch_mock, events
@@ -1310,6 +1318,38 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
                 for item in contract["lifecycle"]["recent_history"]
             ],
         )
+
+    async def test_internal_bounded_text_never_invokes_artifact_verifier(self):
+        with patch(
+            "agent_loop._runtime_artifact_verifier_payload",
+            wraps=__import__("agent_loop")._runtime_artifact_verifier_payload,
+        ) as artifact_verifier:
+            requests, dispatch_mock, events = await self._run_stream_sequence(
+                [self._stop_lines("bounded reducer body")],
+                max_iterations=1,
+                enabled_tool="",
+                task_text="reduce records that mention report.md and files",
+                requested_max_tokens=1_024,
+                output_lifecycle_policy="internal_bounded_text",
+            )
+
+        dispatch_mock.assert_not_awaited()
+        artifact_verifier.assert_not_called()
+        self.assertEqual(1, len(requests))
+        self.assertFalse(any(
+            event.get("event_type") in {
+                "verifier.requested",
+                "verifier.completed",
+            }
+            for event in events
+        ))
+        terminal = next(
+            event
+            for event in events
+            if event.get("event_type") == "run.completed"
+        )
+        self.assertIs(True, terminal["payload"]["authoritative"])
+        self.assertIs(False, terminal["payload"]["provisional_terminal"])
 
     async def test_completion_receipt_failure_never_publishes_pass_or_success(self):
         with patch(

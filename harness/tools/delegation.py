@@ -54,20 +54,29 @@ from tools.registry import dispatch as registry_dispatch, get_metadata
 from tools.tool_result_storage import persist_result_for_history
 from tools.workspace_lock import run_sync_cancellation_safe
 from workspace_context import get_workspace
-from result_fan_in import plan_persisted_result_fan_in
+from result_fan_in import (
+    estimate_mixed_text_tokens,
+    plan_persisted_result_fan_in,
+)
 from result_fan_in_runtime import (
     DEFAULT_REDUCTION_OUTPUT_BYTES,
-    DEFAULT_REDUCTION_OUTPUT_TOKENS,
     FanInExecutionError,
+    MAX_REDUCER_LENGTH_ATTEMPTS,
     MAX_EXACT_RESULT_BYTES,
     MAX_TOTAL_EXACT_RESULT_BYTES,
     REDUCTION_PROMPT_RESERVE_BYTES,
     REDUCTION_PROMPT_RESERVE_TOKENS,
     ReductionRequest,
+    build_complete_replacement_prompt,
     estimate_fan_in_reducer_schedule,
     load_exact_result_text,
     materialize_fan_in_plan,
 )
+from provider_admission import (
+    ProviderAdmissionLimits,
+    estimate_admission_tokens,
+)
+from provider_stream_deadline import build_provider_stream_deadline_plan
 from skill_capability_plan import (
     CALLABLE_SKILL_RESULT_RECEIPT_VERSION,
     callable_skill_result_receipt_is_failure,
@@ -158,6 +167,7 @@ _WEAK_DELEGATE_NAME_PATTERN = re.compile(
 _MAX_AGENT_DISPLAY_NAME_CHARS = 160
 _DELEGATION_BATCH_SOFT_LEASE_HARD_MAX_SECONDS = 14_400.0
 _DELEGATION_BATCH_HARD_CAP_HARD_MAX_SECONDS = 86_400.0
+_FAN_IN_PLAN_FIXED_OVERHEAD_SECONDS = 60.0
 
 
 def _bounded_display_label(value: Any) -> str:
@@ -5809,6 +5819,7 @@ def _preload_prompt_token_allowance(
     context: ToolContext,
     *,
     base_prompt: str,
+    minimum_output_tokens: int = _PRELOAD_MIN_OUTPUT_TOKENS,
 ) -> int:
     """Return a conservative provider-aware prerequisite token budget.
 
@@ -5841,9 +5852,15 @@ def _preload_prompt_token_allowance(
         16_384,
         max(1_024, int(context_length * 0.10)),
     )
+    if (
+        isinstance(minimum_output_tokens, bool)
+        or not isinstance(minimum_output_tokens, int)
+        or minimum_output_tokens <= 0
+    ):
+        raise ValueError("minimum_output_tokens must be a positive integer")
     reserved_tokens = (
         _PRELOAD_SYSTEM_AND_TOOL_RESERVE_TOKENS
-        + _PRELOAD_MIN_OUTPUT_TOKENS
+        + minimum_output_tokens
         + _PRELOAD_MESSAGE_FRAMING_RESERVE_TOKENS
         + safety_margin_tokens
     )
@@ -5856,14 +5873,45 @@ def _preload_prompt_token_allowance(
         raise ValueError(
             "provider context window leaves no deterministic prerequisite "
             f"allowance after reserving {reserved_tokens} tokens for the "
-            "system/tool prompt, safety margin, framing, and at least 8192 "
-            "output tokens"
+            "system/tool prompt, safety margin, framing, and "
+            f"at least {minimum_output_tokens} output tokens"
         )
     return available_tokens
 
 
+def _fan_in_reducer_output_allowances(
+    context: ToolContext,
+) -> tuple[int, int]:
+    """Derive the reducer token/byte contract from provider capabilities.
+
+    The UTF-8 byte bound remains the durable artifact policy.  A provider may
+    advertise a smaller completion-token cap; otherwise one token per allowed
+    byte is the conservative ceiling needed to avoid under-allocating CJK or
+    compact structured output.
+    """
+
+    output_bytes = DEFAULT_REDUCTION_OUTPUT_BYTES
+    provider_caps: list[int] = []
+    provider_config = context.provider_config
+    if isinstance(provider_config, dict):
+        for key in ("max_output_tokens", "max_completion_tokens"):
+            value = provider_config.get(key)
+            if isinstance(value, bool):
+                continue
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if parsed > 0:
+                provider_caps.append(parsed)
+    output_tokens = min([output_bytes, *provider_caps])
+    return output_tokens, output_bytes
+
+
 def _fan_in_reducer_input_allowances(
     context: ToolContext,
+    *,
+    output_reserve_tokens: int,
 ) -> tuple[int, int]:
     """Return independent input allowances for a zero-tool fan-in reducer.
 
@@ -5877,7 +5925,11 @@ def _fan_in_reducer_input_allowances(
     """
 
     token_allowance = (
-        _preload_prompt_token_allowance(context, base_prompt="")
+        _preload_prompt_token_allowance(
+            context,
+            base_prompt="",
+            minimum_output_tokens=output_reserve_tokens,
+        )
         - REDUCTION_PROMPT_RESERVE_TOKENS
     )
     if token_allowance <= 0:
@@ -5907,6 +5959,167 @@ def _fan_in_reducer_input_allowances(
         [_MAX_PRELOADED_PREREQUISITE_CHARS, *configured_byte_limits]
     )
     return token_allowance, byte_allowance
+
+
+def _fan_in_provider_deadline_seconds(
+    *,
+    estimated_input_tokens: int,
+    max_output_tokens: int,
+    caller_hard_cap_seconds: float,
+) -> tuple[float, dict[str, int | float | None]]:
+    """Derive one reducer-attempt deadline from its concrete token envelope."""
+
+    deadline = build_provider_stream_deadline_plan(
+        estimated_input_tokens=max(0, int(estimated_input_tokens)),
+        max_output_tokens=max(1, int(max_output_tokens)),
+        initial_lease_seconds=(
+            settings.llm_stream_initial_timeout_seconds
+        ),
+        progress_grace_seconds=(
+            settings.llm_stream_progress_grace_seconds
+        ),
+        configured_hard_cap_seconds=(
+            settings.llm_stream_total_timeout_seconds
+        ),
+        caller_hard_cap_seconds=caller_hard_cap_seconds,
+        input_planning_tokens_per_second=(
+            settings.llm_stream_input_planning_tokens_per_second
+        ),
+        output_planning_tokens_per_second=(
+            settings.llm_stream_output_planning_tokens_per_second
+        ),
+        planning_safety_factor=(
+            settings.llm_stream_planning_safety_factor
+        ),
+        fixed_overhead_seconds=(
+            settings.llm_stream_fixed_overhead_seconds
+        ),
+    )
+    return deadline.planned_deadline_seconds, deadline.debug_payload()
+
+
+def _fan_in_weighted_wave_concurrency(
+    *,
+    estimated_input_tokens: list[int] | tuple[int, ...],
+    max_output_tokens: int,
+    requested_concurrency: int,
+    admission_limits: ProviderAdmissionLimits | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """Derive safe reducer concurrency from the provider's exact weight rule.
+
+    The fan-in semaphore must not admit more sibling calls than the provider
+    can admit immediately, otherwise their admission queue wait is charged to
+    reducer Schedule-to-Close while the deadline planner incorrectly treats
+    them as a concurrent cohort.  Use the same normalized limits and
+    ``estimate_admission_tokens`` function as :mod:`provider_admission`.
+
+    A reducer request larger than the configured aggregate token cap follows
+    the authoritative admission controller's existing exclusive-oversize
+    semantics: effective concurrency becomes one and the plan-level absolute
+    deadline remains the final bound.
+    """
+
+    if isinstance(requested_concurrency, bool):
+        raise TypeError("requested fan-in concurrency must be a positive integer")
+    try:
+        requested = int(requested_concurrency)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise TypeError(
+            "requested fan-in concurrency must be a positive integer"
+        ) from exc
+    if requested <= 0:
+        raise ValueError("requested fan-in concurrency must be positive")
+    inputs = tuple(max(1, int(value)) for value in estimated_input_tokens)
+    if not inputs:
+        raise ValueError("fan-in weighted admission requires reducer inputs")
+    limits = (
+        admission_limits
+        if admission_limits is not None
+        else ProviderAdmissionLimits(
+            max_inflight_requests=getattr(
+                settings,
+                "provider_admission_max_inflight_requests",
+                0,
+            ),
+            max_inflight_estimated_tokens=getattr(
+                settings,
+                "provider_admission_max_inflight_estimated_tokens",
+                0,
+            ),
+            estimate_safety_factor=getattr(
+                settings,
+                "provider_admission_estimate_safety_factor",
+                1.0,
+            ),
+            wait_timeout_seconds=getattr(
+                settings,
+                "provider_admission_wait_timeout_seconds",
+                0.0,
+            ),
+        )
+    ).normalized()
+    weights = tuple(
+        estimate_admission_tokens(
+            value,
+            max(1, int(max_output_tokens)),
+            safety_factor=limits.estimate_safety_factor,
+        )
+        for value in inputs
+    )
+    maximum_weight = max(weights)
+    effective = requested
+    oversize_exclusive = False
+    if limits.max_inflight_requests > 0:
+        effective = min(effective, limits.max_inflight_requests)
+    token_slots: int | None = None
+    if limits.max_inflight_estimated_tokens > 0:
+        if maximum_weight > limits.max_inflight_estimated_tokens:
+            oversize_exclusive = True
+            token_slots = 1
+        else:
+            token_slots = max(
+                1,
+                limits.max_inflight_estimated_tokens // maximum_weight,
+            )
+        effective = min(effective, token_slots)
+    effective = max(1, effective)
+    return effective, {
+        "version": "fan-in-weighted-provider-admission-v1",
+        "requested_concurrency": requested,
+        "effective_concurrency": effective,
+        "planned_request_count": len(weights),
+        "minimum_request_weight": min(weights),
+        "maximum_request_weight": maximum_weight,
+        "max_inflight_requests": limits.max_inflight_requests,
+        "max_inflight_estimated_tokens": (
+            limits.max_inflight_estimated_tokens
+        ),
+        "estimate_safety_factor": limits.estimate_safety_factor,
+        "token_capacity_slots_at_maximum_weight": token_slots,
+        "oversize_exclusive": oversize_exclusive,
+    }
+
+
+def _fan_in_retryable_output_failure(
+    content: str,
+    request: ReductionRequest,
+) -> str:
+    """Classify pure reducer output failures safe for one full resample."""
+
+    rendered = str(content or "")
+    if not rendered.strip():
+        return "empty_output"
+    if len(rendered.encode("utf-8")) > request.max_output_bytes:
+        return "byte_bound_exceeded"
+    protocol_audit = audit_raw_tool_protocol(rendered, ())
+    if int(protocol_audit["detected_count"] or 0) > 0:
+        return "raw_tool_protocol"
+    if request.acceptance_validator is not None:
+        try:
+            request.acceptance_validator(rendered)
+        except FanInExecutionError:
+            return "structured_output_contract_invalid"
+    return ""
 
 
 def _render_preloaded_prerequisites(
@@ -9634,9 +9847,16 @@ async def _run_child(
                         unframed_byte_allowance - framing_byte_overhead,
                     )
                     (
+                        reduction_output_tokens,
+                        reduction_output_bytes,
+                    ) = _fan_in_reducer_output_allowances(context)
+                    (
                         reduction_token_allowance,
                         reduction_byte_allowance,
-                    ) = _fan_in_reducer_input_allowances(context)
+                    ) = _fan_in_reducer_input_allowances(
+                        context,
+                        output_reserve_tokens=reduction_output_tokens,
+                    )
                     fan_in_plan = plan_persisted_result_fan_in(
                         planned_results,
                         provider_config=context.provider_config,
@@ -9647,19 +9867,16 @@ async def _run_child(
                             reduction_token_allowance
                         ),
                         reduction_byte_allowance=reduction_byte_allowance,
+                        reduction_output_reserve_tokens=(
+                            reduction_output_tokens
+                        ),
                         target_worker=worker_id or step_id or agent_name,
                         execution_namespace=child_run_id,
-                        # Semantic reductions must be substantive, but allowing
-                        # each internal leaf to consume the provider's entire
-                        # long-context output budget makes multi-level fan-in
-                        # unbounded in latency. The planner still selects a
-                        # smaller value whenever its pairwise rolling budget
-                        # requires one.
                         reduction_output_tokens=(
-                            DEFAULT_REDUCTION_OUTPUT_TOKENS
+                            reduction_output_tokens
                         ),
                         reduction_output_bytes=(
-                            DEFAULT_REDUCTION_OUTPUT_BYTES
+                            reduction_output_bytes
                         ),
                     )
                     prerequisite_fan_in = {
@@ -9713,17 +9930,33 @@ async def _run_child(
                             int(step.wave)
                             for step in fan_in_plan.reduction_steps
                         )
-                        configured_admission_concurrency = int(
-                            settings.provider_admission_max_inflight_requests
-                            or 0
+                        planned_reducer_input_tokens = tuple(
+                            min(
+                                int(step.input_batch.estimated_tokens),
+                                int(
+                                    fan_in_plan.reduction_budget
+                                    .input_token_allowance
+                                ),
+                            )
+                            + REDUCTION_PROMPT_RESERVE_TOKENS
+                            for step in fan_in_plan.reduction_steps
                         )
-                        fan_in_wave_concurrency = min(
+                        requested_wave_concurrency = min(
                             8,
                             max(1, int(settings.delegation_max_concurrent)),
-                            (
-                                max(1, configured_admission_concurrency)
-                                if configured_admission_concurrency > 0
-                                else 8
+                        )
+                        (
+                            fan_in_wave_concurrency,
+                            fan_in_admission_audit,
+                        ) = _fan_in_weighted_wave_concurrency(
+                            estimated_input_tokens=(
+                                planned_reducer_input_tokens
+                            ),
+                            max_output_tokens=(
+                                fan_in_plan.output_policy.max_tokens
+                            ),
+                            requested_concurrency=(
+                                requested_wave_concurrency
                             ),
                         )
                         reducer_schedule = estimate_fan_in_reducer_schedule(
@@ -9746,19 +9979,25 @@ async def _run_child(
                                 ),
                             )
                         )
-                        configured_stream_timeout = max(
-                            0.001,
-                            float(settings.llm_stream_total_timeout_seconds),
-                        )
-                        fan_in_step_timeout = min(
-                            240.0,
-                            configured_stream_timeout,
-                        )
                         # A reducer plan is preprocessing for the actual child,
                         # not the child itself. Reserve one third of the outer
                         # batch (at most ten minutes) for final synthesis and
-                        # contract verification, and size the reducer deadline
-                        # by critical-path depth rather than raw step count.
+                        # contract verification.  Each reducer-call lifecycle is
+                        # then derived from its largest planned input, versioned
+                        # output policy, and the provider's configured rates. A
+                        # fair share of the immutable outer cap prevents an early
+                        # wave from consuming the complete plan budget.
+                        configured_stream_timeout = _bounded_batch_timeout(
+                            getattr(
+                                settings,
+                                "llm_stream_total_timeout_seconds",
+                                14_400.0,
+                            ),
+                            default=14_400.0,
+                            hard_maximum=(
+                                _DELEGATION_BATCH_HARD_CAP_HARD_MAX_SECONDS
+                            ),
+                        )
                         worker_reserve = min(
                             600.0,
                             max(60.0, configured_batch_hard_cap / 3.0),
@@ -9768,15 +10007,56 @@ async def _run_child(
                             - (time.monotonic() - child_started_monotonic)
                             - worker_reserve
                         )
-                        desired_plan_timeout = (
-                            60.0
-                            + fan_in_step_timeout * scheduled_wave_cohorts
-                        )
-                        fan_in_plan_timeout = min(
+                        available_plan_timeout = min(
                             configured_batch_hard_cap * (2.0 / 3.0),
-                            desired_plan_timeout,
                             outer_remaining,
                         )
+                        if (
+                            not math.isfinite(available_plan_timeout)
+                            or available_plan_timeout
+                            <= _FAN_IN_PLAN_FIXED_OVERHEAD_SECONDS
+                            or scheduled_wave_cohorts <= 0
+                        ):
+                            raise FanInExecutionError(
+                                "delegated batch deadline leaves no bounded "
+                                "fan-in preprocessing allowance while preserving "
+                                "time for the target worker"
+                            )
+                        worst_reducer_input_tokens = max(
+                            planned_reducer_input_tokens
+                        )
+                        (
+                            planned_attempt_timeout,
+                            planned_attempt_deadline_audit,
+                        ) = _fan_in_provider_deadline_seconds(
+                            estimated_input_tokens=(
+                                worst_reducer_input_tokens
+                            ),
+                            max_output_tokens=(
+                                fan_in_plan.output_policy.max_tokens
+                            ),
+                            caller_hard_cap_seconds=(
+                                configured_stream_timeout
+                            ),
+                        )
+                        derived_reducer_lifecycle_timeout = (
+                            planned_attempt_timeout
+                            * MAX_REDUCER_LENGTH_ATTEMPTS
+                        )
+                        estimated_schedule_seconds = (
+                            _FAN_IN_PLAN_FIXED_OVERHEAD_SECONDS
+                            + derived_reducer_lifecycle_timeout
+                            * scheduled_wave_cohorts
+                        )
+                        # The plan-level absolute deadline is the authoritative
+                        # Schedule-to-Close boundary.  A per-step fair-share
+                        # starts before provider admission and can therefore
+                        # kill a healthy queued reducer even though later
+                        # siblings finished quickly. Give every reducer the
+                        # immutable remaining plan envelope; the outer plan
+                        # timeout still cancels all waves exactly once.
+                        fan_in_plan_timeout = available_plan_timeout
+                        fan_in_step_timeout = fan_in_plan_timeout
                         if (
                             not math.isfinite(fan_in_plan_timeout)
                             or fan_in_plan_timeout <= 0
@@ -9793,9 +10073,39 @@ async def _run_child(
                                 reducer_schedule.reducer_call_count
                             ),
                             "max_wave_concurrency": fan_in_wave_concurrency,
+                            "provider_admission_schedule": (
+                                fan_in_admission_audit
+                            ),
                             "step_timeout_seconds": fan_in_step_timeout,
                             "plan_timeout_seconds": fan_in_plan_timeout,
+                            "estimated_schedule_seconds": (
+                                estimated_schedule_seconds
+                            ),
+                            "estimated_schedule_fits_plan_deadline": (
+                                estimated_schedule_seconds
+                                <= fan_in_plan_timeout
+                            ),
                             "worker_reserve_seconds": worker_reserve,
+                            "reducer_lifecycle_policy": {
+                                "max_attempts": (
+                                    MAX_REDUCER_LENGTH_ATTEMPTS
+                                ),
+                                "retryable_terminal": "length",
+                                "complete_replacement_on_retry": True,
+                                "side_effects": "none",
+                                "planned_max_input_tokens": (
+                                    worst_reducer_input_tokens
+                                ),
+                                "planned_attempt_deadline": (
+                                    planned_attempt_deadline_audit
+                                ),
+                                "derived_lifecycle_timeout_seconds": (
+                                    derived_reducer_lifecycle_timeout
+                                ),
+                                "output_policy": (
+                                    fan_in_plan.output_policy.to_dict()
+                                ),
+                            },
                             "lossy_semantic_reduction": True,
                             "coverage_scope": (
                                 "source_participation_and_provenance"
@@ -9805,14 +10115,6 @@ async def _run_child(
                         async def reduce_fan_in(
                             request: ReductionRequest,
                         ) -> str:
-                            reduction_content = ""
-                            reduction_error = ""
-                            completed_terminals = 0
-                            failed_terminals = 0
-                            cancelled_terminals = 0
-                            done_reasons: list[str] = []
-                            unexpected_tool_boundary = ""
-                            reduction_run_id = uuid.uuid4().hex
                             request_timeout = min(
                                 fan_in_step_timeout,
                                 fan_in_plan_timeout,
@@ -9829,157 +10131,413 @@ async def _run_child(
                                     "fan-in reducer request has no positive "
                                     "remaining wall-clock allowance"
                                 )
+                            lifecycle_deadline = (
+                                time.monotonic() + request_timeout
+                            )
+                            replacement_reason_code = ""
+                            for attempt_index in range(
+                                MAX_REDUCER_LENGTH_ATTEMPTS
+                            ):
+                                attempt_number = attempt_index + 1
+                                attempt_prompt = (
+                                    request.prompt
+                                    if attempt_index == 0
+                                    else build_complete_replacement_prompt(
+                                        request,
+                                        reason_code=(
+                                            replacement_reason_code
+                                        ),
+                                    )
+                                )
+                                remaining = (
+                                    lifecycle_deadline - time.monotonic()
+                                )
+                                if remaining <= 0:
+                                    raise FanInExecutionError(
+                                        "fan-in reducer exhausted its bounded "
+                                        "lifecycle before a complete terminal"
+                                    )
+                                (
+                                    attempt_timeout,
+                                    _attempt_deadline_audit,
+                                ) = _fan_in_provider_deadline_seconds(
+                                    estimated_input_tokens=(
+                                        estimate_mixed_text_tokens(
+                                            attempt_prompt
+                                        )
+                                    ),
+                                    max_output_tokens=(
+                                        request.max_output_tokens
+                                    ),
+                                    caller_hard_cap_seconds=min(
+                                        configured_stream_timeout,
+                                        remaining,
+                                    ),
+                                )
+                                reduction_content = ""
+                                reduction_error = ""
+                                completed_payloads: list[
+                                    dict[str, Any]
+                                ] = []
+                                failed_payloads: list[
+                                    dict[str, Any]
+                                ] = []
+                                cancelled_terminals = 0
+                                done_reasons: list[str] = []
+                                unexpected_boundary = ""
+                                terminal_identity_error = ""
+                                terminal_authority_error = ""
+                                reduction_run_id = uuid.uuid4().hex
 
-                            async def reduction_event_sink(
-                                reduction_event: dict[str, Any],
-                            ) -> None:
-                                # Model deltas are transactional fan-in input:
-                                # they are not parent-visible until the stream
-                                # reaches a complete stop terminal and the
-                                # runtime validates its coverage contract.
-                                event_type = str(
-                                    reduction_event.get("event_type") or ""
-                                )
-                                raw_type = str(
-                                    reduction_event.get("type") or ""
-                                )
-                                if (
-                                    raw_type in {"delta", "reasoning_delta"}
-                                    or event_type in {
-                                        "agent.delta",
-                                        "agent.reasoning_delta",
-                                    }
-                                ):
-                                    return
-                                if event_type in {
-                                    "run.completed",
-                                    "run.failed",
-                                    "run.cancelled",
-                                }:
+                                async def reduction_event_sink(
+                                    reduction_event: dict[str, Any],
+                                ) -> None:
+                                    nonlocal unexpected_boundary
+                                    # Model deltas are transactional fan-in
+                                    # input: no attempt becomes parent-visible
+                                    # content before exact terminal, coverage,
+                                    # and byte validation.
+                                    event_type = str(
+                                        reduction_event.get("event_type") or ""
+                                    )
+                                    raw_type = str(
+                                        reduction_event.get("type") or ""
+                                    )
+                                    if (
+                                        raw_type in {
+                                            "delta",
+                                            "reasoning_delta",
+                                        }
+                                        or event_type in {
+                                            "agent.delta",
+                                            "agent.reasoning_delta",
+                                        }
+                                    ):
+                                        return
                                     payload = reduction_event.get("payload")
                                     if not isinstance(payload, dict):
                                         payload = {}
                                     payload = dict(payload)
-                                    payload["provisional_terminal"] = True
-                                    payload["authoritative"] = False
+                                    payload.setdefault(
+                                        "fan_in_reducer_attempt",
+                                        attempt_number,
+                                    )
+                                    payload.setdefault(
+                                        "fan_in_reducer_max_attempts",
+                                        MAX_REDUCER_LENGTH_ATTEMPTS,
+                                    )
+                                    if event_type in {
+                                        "run.completed",
+                                        "run.failed",
+                                        "run.cancelled",
+                                    }:
+                                        # Every reducer attempt owns a fresh
+                                        # run identity and therefore closes
+                                        # that identity authoritatively.  The
+                                        # outer child separately decides
+                                        # whether the completed reducer body
+                                        # satisfies coverage/byte contracts;
+                                        # it must not leave this nested run in
+                                        # a durable provisional/running state.
+                                        payload["provisional_terminal"] = False
+                                        payload["authoritative"] = True
                                     reduction_event["payload"] = payload
-                                await forward_event(reduction_event)
-
-                            async for reduction_event in fan_in_run_stream(
-                                context.model_id,
-                                [{"role": "user", "content": request.prompt}],
-                                [],
-                                user_id=context.user_id,
-                                session_id=context.session_id,
-                                timeout=request_timeout,
-                                max_iterations=1,
-                                max_tokens=request.max_output_tokens,
-                                provider_override=context.provider_config,
-                                fallback_overrides=list(
-                                    context.fallback_configs
-                                ),
-                                source="delegate_fan_in_reduction",
-                                enabled_user_skills=[],
-                                run_id=reduction_run_id,
-                                root_run_id=root_run_id,
-                                parent_run_id=child_run_id,
-                                agent_kind="delegate_reducer",
-                                agent_name=(
-                                    f"{agent_name}-fan-in-{request.step_id}"
-                                )[:160],
-                                depth=child_depth + 1,
-                                workspace_scope=workspace_scope,
-                                event_schema="chatds.agent.v2",
-                                event_sink=reduction_event_sink,
-                                enforce_session_skill_workflow=False,
-                                allow_session_mcp=False,
-                                include_session_context=False,
-                                thinking_policy="off_if_supported",
-                                temperature_override=0.0,
-                                _execution_fence=context.execution_fence,
-                                _execution_fence_generation=(
-                                    context.execution_fence_generation
-                                ),
-                            ):
-                                if reduction_event.get("type") == "delta":
-                                    reduction_content += str(
-                                        reduction_event.get("content") or ""
-                                    )
-                                elif reduction_event.get("type") == "done":
-                                    done_reasons.append(str(
-                                        reduction_event.get("finish_reason")
-                                        or ""
-                                    ).casefold())
-                                elif reduction_event.get("type") == "error":
-                                    reduction_error = str(
-                                        reduction_event.get("msg")
-                                        or "internal fan-in reducer failed"
-                                    )
-                                elif reduction_event.get("type") == "agent_event":
-                                    event_type = str(
-                                        reduction_event.get("event_type") or ""
-                                    )
-                                    payload = reduction_event.get("payload")
-                                    if event_type == "run.completed":
-                                        completed_terminals += 1
-                                    elif event_type == "run.failed":
-                                        failed_terminals += 1
-                                        reduction_error = str(
-                                            (
-                                                payload.get("error")
-                                                if isinstance(payload, dict)
-                                                else ""
+                                    if event_type in {
+                                        "verifier.requested",
+                                        "verifier.completed",
+                                    }:
+                                        if not (
+                                            payload.get("harness_generated")
+                                            is True
+                                            and payload.get("verifier_kind")
+                                            == (
+                                                "run_contract_terminal_"
+                                                "preflight"
                                             )
+                                        ):
+                                            unexpected_boundary = event_type
+                                    elif (
+                                        event_type.startswith("tool.")
+                                        or event_type.startswith("artifact.")
+                                        or event_type
+                                        in {
+                                            "verifier.failed",
+                                            "verifier.followup_requested",
+                                        }
+                                    ):
+                                        unexpected_boundary = event_type
+                                    await forward_event(reduction_event)
+
+                                async for reduction_event in fan_in_run_stream(
+                                    context.model_id,
+                                    [{
+                                        "role": "user",
+                                        "content": attempt_prompt,
+                                    }],
+                                    [],
+                                    user_id=context.user_id,
+                                    session_id=context.session_id,
+                                    timeout=attempt_timeout,
+                                    max_iterations=1,
+                                    max_tokens=request.max_output_tokens,
+                                    provider_override=(
+                                        context.provider_config
+                                    ),
+                                    fallback_overrides=list(
+                                        context.fallback_configs
+                                    ),
+                                    source="delegate_fan_in_reduction",
+                                    enabled_user_skills=[],
+                                    run_id=reduction_run_id,
+                                    root_run_id=root_run_id,
+                                    parent_run_id=child_run_id,
+                                    agent_kind="delegate_reducer",
+                                    agent_name=(
+                                        f"{agent_name}-fan-in-"
+                                        f"{request.step_id}-attempt-"
+                                        f"{attempt_number}"
+                                    )[:160],
+                                    depth=child_depth + 1,
+                                    workspace_scope=workspace_scope,
+                                    event_schema="chatds.agent.v2",
+                                    event_sink=reduction_event_sink,
+                                    enforce_session_skill_workflow=False,
+                                    allow_session_mcp=False,
+                                    include_session_context=False,
+                                    output_lifecycle_policy=(
+                                        "internal_bounded_text"
+                                    ),
+                                    thinking_policy="off_if_supported",
+                                    temperature_override=0.0,
+                                    _execution_fence=(
+                                        context.execution_fence
+                                    ),
+                                    _execution_fence_generation=(
+                                        context.execution_fence_generation
+                                    ),
+                                ):
+                                    raw_type = str(
+                                        reduction_event.get("type") or ""
+                                    )
+                                    if raw_type == "delta":
+                                        reduction_content += str(
+                                            reduction_event.get("content")
+                                            or ""
+                                        )
+                                    elif raw_type == "done":
+                                        done_reasons.append(str(
+                                            reduction_event.get(
+                                                "finish_reason"
+                                            )
+                                            or ""
+                                        ).casefold())
+                                    elif raw_type == "error":
+                                        reduction_error = str(
+                                            reduction_event.get("msg")
                                             or "internal fan-in reducer failed"
                                         )
-                                    elif event_type == "run.cancelled":
-                                        cancelled_terminals += 1
-                                        reduction_error = (
-                                            "internal fan-in reducer was cancelled"
+                                    elif raw_type == "agent_event":
+                                        event_type = str(
+                                            reduction_event.get("event_type")
+                                            or ""
                                         )
-                                    elif event_type in {
-                                        "tool.started",
-                                        "tool.dispatch_started",
-                                        "tool.completed",
-                                        "tool.failed",
-                                    }:
-                                        unexpected_tool_boundary = event_type
-                            if reduction_error:
-                                raise FanInExecutionError(reduction_error)
-                            if unexpected_tool_boundary:
-                                raise FanInExecutionError(
-                                    "zero-tool fan-in reducer emitted an "
-                                    f"unexpected {unexpected_tool_boundary} boundary"
+                                        payload = (
+                                            reduction_event.get("payload")
+                                            if isinstance(
+                                                reduction_event.get("payload"),
+                                                dict,
+                                            )
+                                            else {}
+                                        )
+                                        if event_type in {
+                                            "run.completed",
+                                            "run.failed",
+                                            "run.cancelled",
+                                        }:
+                                            if str(
+                                                reduction_event.get("run_id")
+                                                or ""
+                                            ) != reduction_run_id:
+                                                terminal_identity_error = (
+                                                    "fan-in reducer terminal "
+                                                    "run_id mismatch"
+                                                )
+                                            if (
+                                                payload.get("authoritative")
+                                                is not True
+                                                or payload.get(
+                                                    "provisional_terminal"
+                                                )
+                                                is not False
+                                            ):
+                                                terminal_authority_error = (
+                                                    "fan-in reducer terminal "
+                                                    "was not authoritative"
+                                                )
+                                        if event_type == "run.completed":
+                                            completed_payloads.append(
+                                                dict(payload)
+                                            )
+                                        elif event_type == "run.failed":
+                                            failed_payloads.append(
+                                                dict(payload)
+                                            )
+                                        elif event_type == "run.cancelled":
+                                            cancelled_terminals += 1
+                                if terminal_identity_error:
+                                    raise FanInExecutionError(
+                                        terminal_identity_error
+                                    )
+                                if terminal_authority_error:
+                                    raise FanInExecutionError(
+                                        terminal_authority_error
+                                    )
+                                if unexpected_boundary:
+                                    raise FanInExecutionError(
+                                        "internal bounded-text fan-in reducer "
+                                        "emitted an unexpected "
+                                        f"{unexpected_boundary} boundary"
+                                    )
+                                terminal_count = (
+                                    len(completed_payloads)
+                                    + len(failed_payloads)
+                                    + cancelled_terminals
                                 )
-                            if failed_terminals or cancelled_terminals:
-                                raise FanInExecutionError(
-                                    "fan-in reducer emitted a conflicting failure "
-                                    "or cancellation terminal"
-                                )
-                            if completed_terminals != 1:
-                                raise FanInExecutionError(
-                                    "fan-in reducer must emit exactly one "
-                                    "run.completed terminal"
-                                )
-                            if done_reasons != ["stop"]:
-                                raise FanInExecutionError(
-                                    "fan-in reducer must finish with exactly one "
-                                    "done(stop) transport terminal"
-                                )
-                            if not reduction_content.strip():
-                                raise FanInExecutionError(
-                                    "fan-in reducer returned an empty completed body"
-                                )
-                            protocol_audit = audit_raw_tool_protocol(
-                                reduction_content,
-                                (),
+                                if terminal_count != 1:
+                                    raise FanInExecutionError(
+                                        "fan-in reducer attempt must emit "
+                                        "exactly one run.completed terminal or "
+                                        "one exact run.failed(length) terminal"
+                                    )
+                                retryable_output_failure = ""
+                                if completed_payloads:
+                                    completed_reason = str(
+                                        completed_payloads[0].get(
+                                            "finish_reason"
+                                        )
+                                        or ""
+                                    ).casefold()
+                                    if completed_reason != "stop":
+                                        raise FanInExecutionError(
+                                            "fan-in reducer completion terminal "
+                                            "must declare finish_reason=stop"
+                                        )
+                                    if done_reasons != ["stop"]:
+                                        raise FanInExecutionError(
+                                            "fan-in reducer must finish with "
+                                            "exactly one done(stop) transport "
+                                            "terminal"
+                                        )
+                                    if reduction_error:
+                                        raise FanInExecutionError(
+                                            reduction_error
+                                        )
+                                    retryable_output_failure = (
+                                        _fan_in_retryable_output_failure(
+                                            reduction_content,
+                                            request,
+                                        )
+                                    )
+                                    if not retryable_output_failure:
+                                        return reduction_content
+
+                                else:
+                                    failed_payload = (
+                                        failed_payloads[0]
+                                        if failed_payloads
+                                        else {}
+                                    )
+                                    failed_finish_reason = str(
+                                        failed_payload.get("finish_reason")
+                                        or ""
+                                    ).casefold()
+                                    failed_terminal_reason = str(
+                                        failed_payload.get("terminal_reason")
+                                        or ""
+                                    ).casefold()
+                                    exact_length_terminal = bool(
+                                        len(failed_payloads) == 1
+                                        and cancelled_terminals == 0
+                                        and failed_finish_reason == "length"
+                                        and failed_terminal_reason
+                                        == "model_hit_max_output_tokens"
+                                        and done_reasons in ([], ["length"])
+                                    )
+                                    if exact_length_terminal:
+                                        retryable_output_failure = "length"
+                                    elif cancelled_terminals:
+                                        raise FanInExecutionError(
+                                            "internal fan-in reducer was "
+                                            "cancelled"
+                                        )
+                                    else:
+                                        raise FanInExecutionError(
+                                            reduction_error
+                                            or str(
+                                                failed_payload.get("error")
+                                                or ""
+                                            )
+                                            or (
+                                                "internal fan-in reducer "
+                                                "failed"
+                                            )
+                                        )
+
+                                if retryable_output_failure:
+                                    if (
+                                        attempt_number
+                                        < MAX_REDUCER_LENGTH_ATTEMPTS
+                                    ):
+                                        await forward_event({
+                                            "type": "agent_event",
+                                            "event_type": (
+                                                "fan_in.reducer_"
+                                                "finalization_requested"
+                                            ),
+                                            "run_id": child_run_id,
+                                            "root_run_id": root_run_id,
+                                            "parent_run_id": parent_run_id,
+                                            "agent_kind": "delegate",
+                                            "agent_name": agent_name,
+                                            "depth": child_depth,
+                                            "workspace_scope": (
+                                                workspace_scope
+                                            ),
+                                            "payload": {
+                                                "plan_id": (
+                                                    fan_in_plan.plan_id
+                                                ),
+                                                "step_id": request.step_id,
+                                                "discarded_attempt": (
+                                                    attempt_number
+                                                ),
+                                                "next_attempt": (
+                                                    attempt_number + 1
+                                                ),
+                                                "max_attempts": (
+                                                    MAX_REDUCER_LENGTH_ATTEMPTS
+                                                ),
+                                                "complete_replacement": True,
+                                                "side_effects": "none",
+                                                "reason_code": (
+                                                    retryable_output_failure
+                                                ),
+                                            },
+                                        })
+                                        replacement_reason_code = (
+                                            retryable_output_failure
+                                        )
+                                        continue
+                                    raise FanInExecutionError(
+                                        "internal fan-in reducer repeated an "
+                                        "invalid bounded output after the "
+                                        "single complete-replacement attempt "
+                                        f"({retryable_output_failure})"
+                                    )
+                            raise FanInExecutionError(
+                                "internal fan-in reducer exhausted its bounded "
+                                "attempt budget without a complete result"
                             )
-                            if int(protocol_audit["detected_count"] or 0) > 0:
-                                raise FanInExecutionError(
-                                    "zero-tool fan-in reducer returned serialized "
-                                    "raw tool-call protocol"
-                                )
-                            return reduction_content
 
                         materialized = await materialize_fan_in_plan(
                             fan_in_plan,
