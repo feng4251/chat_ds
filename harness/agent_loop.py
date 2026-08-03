@@ -127,6 +127,7 @@ from skill_capability_plan import (
 )
 from workflow_ir import (
     InstructionDocument,
+    MAX_WORKFLOW_DOCUMENTS,
     WorkflowIRValidationError,
     canonicalize_skill_markdown,
     validate_workflow_ir,
@@ -217,6 +218,10 @@ _MAX_SSE_EVENT_DATA_LINES = 262_144
 _RUN_STREAM_THINKING_POLICIES = frozenset({
     "provider_default",
     "off_if_supported",
+})
+_RUN_STREAM_OUTPUT_LIFECYCLE_POLICIES = frozenset({
+    "agent",
+    "internal_bounded_text",
 })
 _MIN_PROVIDER_TEMPERATURE = 0.0
 _MAX_PROVIDER_TEMPERATURE = 2.0
@@ -2826,11 +2831,123 @@ def _model_facing_capability_plan_schemas(
     """Replace legacy full-IR input with the compact run-scoped plan schema."""
 
     copied = [copy.deepcopy(schema) for schema in schemas]
-    if not (
+    exact_skill_name = ""
+    exact_body_sha256 = ""
+    exact_catalog_sha256 = ""
+    catalog_revision = 0
+    candidate_ids: list[str] = []
+    if isinstance(catalog, dict):
+        exact_skill_name = catalog.get("skill_name")
+        exact_body_sha256 = catalog.get("body_sha256")
+        exact_catalog_sha256 = catalog.get("catalog_sha256")
+        raw_catalog_revision = catalog.get("catalog_revision", 0)
+        if not (
+            isinstance(exact_skill_name, str)
+            and exact_skill_name
+            and exact_skill_name == exact_skill_name.strip()
+            and len(exact_skill_name) <= 64
+        ):
+            raise ValueError(
+                "model-facing capability catalog has an invalid exact skill_name"
+            )
+        if not (
+            isinstance(exact_body_sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", exact_body_sha256)
+        ):
+            raise ValueError(
+                "model-facing capability catalog has an invalid body_sha256"
+            )
+        if not (
+            isinstance(exact_catalog_sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", exact_catalog_sha256)
+        ):
+            raise ValueError(
+                "model-facing capability catalog has an invalid catalog_sha256"
+            )
+        if (
+            isinstance(raw_catalog_revision, bool)
+            or not isinstance(raw_catalog_revision, int)
+            or raw_catalog_revision < 0
+        ):
+            raise ValueError(
+                "model-facing capability catalog has an invalid catalog_revision"
+            )
+        catalog_revision = raw_catalog_revision
+        raw_candidates = catalog.get("candidates")
+        if not isinstance(raw_candidates, list):
+            raise ValueError(
+                "model-facing capability catalog must declare candidates"
+            )
+        seen_candidate_ids: set[str] = set()
+        for index, raw_candidate in enumerate(raw_candidates):
+            candidate_id = (
+                raw_candidate.get("id")
+                if isinstance(raw_candidate, dict)
+                else None
+            )
+            if not (
+                isinstance(candidate_id, str)
+                and candidate_id
+                and candidate_id == candidate_id.strip()
+                and len(candidate_id) <= 64
+            ):
+                raise ValueError(
+                    f"model-facing capability candidate {index} has an invalid id"
+                )
+            if candidate_id in seen_candidate_ids:
+                raise ValueError(
+                    "model-facing capability catalog contains duplicate candidate ids"
+                )
+            seen_candidate_ids.add(candidate_id)
+            candidate_ids.append(candidate_id)
+    has_instruction_plan_catalog = bool(
         isinstance(catalog, dict)
         and isinstance(catalog.get("instruction_plan_catalog"), dict)
+    )
+    document_handles: list[str] = []
+    seen_document_handles: set[str] = set()
+    if has_instruction_plan_catalog:
+        instruction_plan_catalog = catalog["instruction_plan_catalog"]
+        raw_documents = instruction_plan_catalog.get("documents")
+        if not isinstance(raw_documents, list):
+            raise ValueError(
+                "model-facing workflow plan catalog must declare documents"
+            )
+        if len(raw_documents) > MAX_WORKFLOW_DOCUMENTS:
+            raise ValueError(
+                "model-facing workflow plan catalog exceeds the bounded "
+                "document count"
+            )
+        for index, raw_document in enumerate(raw_documents):
+            if not isinstance(raw_document, dict):
+                raise ValueError(
+                    f"model-facing workflow plan document {index} must be an "
+                    "object"
+                )
+            document_id = raw_document.get("document_id")
+            if not (
+                isinstance(document_id, str)
+                and re.fullmatch(r"doc-[0-9a-f]{24}", document_id)
+            ):
+                raise ValueError(
+                    f"model-facing workflow plan document {index} has an invalid "
+                    "snapshot handle"
+                )
+            if document_id in seen_document_handles:
+                raise ValueError(
+                    "model-facing workflow plan catalog contains duplicate "
+                    "document handles"
+                )
+            seen_document_handles.add(document_id)
+            document_handles.append(document_id)
+    if (
+        isinstance(catalog, dict)
+        and catalog.get("workflow_ir_required") is True
+        and not document_handles
     ):
-        return copied
+        raise ValueError(
+            "required model-facing workflow plan catalog has no document handles"
+        )
     for candidate in copied:
         function = (
             candidate.get("function")
@@ -2850,9 +2967,95 @@ def _model_facing_capability_plan_schemas(
         )
         if not isinstance(properties, dict):
             continue
+        if isinstance(catalog, dict):
+            for field, exact_value in (
+                ("skill_name", exact_skill_name),
+                ("body_sha256", exact_body_sha256),
+                ("catalog_sha256", exact_catalog_sha256),
+            ):
+                field_schema = properties.get(field)
+                if not isinstance(field_schema, dict):
+                    raise RuntimeError(
+                        f"capability planner schema is missing {field}"
+                    )
+                field_schema["enum"] = [exact_value]
+            for field in ("required", "optional"):
+                selection_schema = properties.get(field)
+                if not isinstance(selection_schema, dict):
+                    raise RuntimeError(
+                        f"capability planner schema is missing {field}"
+                    )
+                if candidate_ids:
+                    item_schema = selection_schema.get("items")
+                    if not isinstance(item_schema, dict):
+                        raise RuntimeError(
+                            f"capability planner schema has invalid {field} items"
+                        )
+                    item_schema["enum"] = list(candidate_ids)
+                    selection_schema["uniqueItems"] = True
+                else:
+                    selection_schema["maxItems"] = 0
         properties.pop("workflow_ir", None)
-        properties["workflow_plan"] = workflow_plan_json_schema()
         required_fields = list(parameters.get("required") or [])
+        required_fields = [
+            field for field in required_fields if field != "workflow_ir"
+        ]
+        if catalog_revision > 0 and "catalog_sha256" not in required_fields:
+            required_fields.append("catalog_sha256")
+        if not has_instruction_plan_catalog:
+            properties.pop("workflow_plan", None)
+            parameters["required"] = [
+                field for field in required_fields
+                if field != "workflow_plan"
+            ]
+            continue
+        workflow_plan_schema = workflow_plan_json_schema(
+            include_legacy_instruction_id_ranges=False
+        )
+        try:
+            range_schema = (
+                workflow_plan_schema["properties"]["nodes"]["items"]
+                ["properties"]["instruction_ranges"]["items"]
+            )
+            document_id_schema = range_schema["properties"]["document_id"]
+        except (KeyError, TypeError) as exc:
+            raise RuntimeError(
+                "model-facing workflow plan schema no longer exposes the "
+                "ordinal document selector"
+            ) from exc
+        if document_handles:
+            document_id_schema["enum"] = list(document_handles)
+            document_id_schema["description"] = (
+                "Must equal one document_id from this exact frozen catalog "
+                "snapshot; the runtime late-binds it without fuzzy repair."
+            )
+        try:
+            node_capability_schema = (
+                workflow_plan_schema["properties"]["nodes"]["items"]
+                ["properties"]["capability_ids"]
+            )
+        except (KeyError, TypeError) as exc:
+            raise RuntimeError(
+                "model-facing workflow plan schema no longer exposes node "
+                "capability selectors"
+            ) from exc
+        if candidate_ids:
+            node_capability_items = node_capability_schema.get("items")
+            if not isinstance(node_capability_items, dict):
+                raise RuntimeError(
+                    "model-facing workflow plan capability selector is invalid"
+                )
+            node_capability_items["enum"] = list(candidate_ids)
+            node_capability_schema["uniqueItems"] = True
+        else:
+            node_capability_schema["maxItems"] = 0
+        properties["workflow_plan"] = workflow_plan_schema
+        function["description"] = (
+            str(function.get("description") or "").rstrip()
+            + " In the provider-facing workflow_plan, every document_id must "
+            "come from the exact snapshot-local enum; model-authored opaque "
+            "instruction IDs are not accepted."
+        )
         if catalog.get("workflow_ir_required") is True:
             if "workflow_plan" not in required_fields:
                 required_fields.append("workflow_plan")
@@ -12865,6 +13068,7 @@ async def run_stream(
         list[dict[str, Any]] | None
     ) = None,
     declared_artifact_patterns: list[str] | None = None,
+    output_lifecycle_policy: str = "agent",
     thinking_policy: str = "provider_default",
     temperature_override: float | None = None,
     session_skill_registry: list[dict[str, Any]] | None = None,
@@ -12906,6 +13110,49 @@ async def run_stream(
         raise ValueError(
             f"thinking_policy must be one of: {supported}"
         )
+    if not isinstance(output_lifecycle_policy, str):
+        raise TypeError("output_lifecycle_policy must be a string")
+    if output_lifecycle_policy not in _RUN_STREAM_OUTPUT_LIFECYCLE_POLICIES:
+        supported = ", ".join(sorted(
+            _RUN_STREAM_OUTPUT_LIFECYCLE_POLICIES
+        ))
+        raise ValueError(
+            "output_lifecycle_policy must be one of: " + supported
+        )
+    internal_bounded_text = (
+        output_lifecycle_policy == "internal_bounded_text"
+    )
+    if internal_bounded_text:
+        # This contract is a pure control-plane model call.  It is intentionally
+        # stricter than merely passing an empty tool schema: session catalogs,
+        # Skill activation, durable artifact contracts, or session context must
+        # not silently widen the call or make it inherit user-level lifecycle
+        # policy.  The caller owns the bounded semantic/terminal validator.
+        incompatible: list[str] = []
+        if enabled_tools:
+            incompatible.append("enabled_tools")
+        if allow_session_mcp:
+            incompatible.append("allow_session_mcp")
+        if include_session_context:
+            incompatible.append("include_session_context")
+        if enforce_session_skill_workflow:
+            incompatible.append("enforce_session_skill_workflow")
+        if enabled_user_skills:
+            incompatible.append("enabled_user_skills")
+        if required_result_fields or required_result_schema:
+            incompatible.append("required_result_contract")
+        if required_capability_tools:
+            incompatible.append("required_capability_tools")
+        if knowledge_gate_plan is not None:
+            incompatible.append("knowledge_gate_plan")
+        if declared_artifact_patterns:
+            incompatible.append("declared_artifact_patterns")
+        if incompatible:
+            raise ValueError(
+                "internal_bounded_text requires a tools-closed, session-closed "
+                "call without artifact/result authority; incompatible: "
+                + ", ".join(incompatible)
+            )
     delegated_retrieval_completeness_policy = (
         normalize_retrieval_completeness_policy(
             retrieval_completeness_policy
@@ -13383,6 +13630,18 @@ async def run_stream(
             # contradictory authoritative lifecycle snapshot.
             event_payload["provisional_terminal"] = True
             event_payload["authoritative"] = False
+        elif (
+            internal_bounded_text
+            and event_type in {"run.completed", "run.failed", "run.cancelled"}
+        ):
+            # An internal bounded-text call is a self-contained, tools-closed
+            # run.  Its caller may reject the returned body under a stronger
+            # semantic contract, but there is no outer arbiter which will
+            # later close this run_id.  Normalize the attempt terminal before
+            # applying lifecycle state so debug rehydration cannot leave an
+            # orphaned provisional run.
+            event_payload["provisional_terminal"] = False
+            event_payload["authoritative"] = True
         # A terminal lifecycle event is the durable accounting boundary for
         # this run.  Some failure paths cannot emit a separate ``usage`` item
         # before returning, so make cumulative usage part of every terminal
@@ -13715,7 +13974,11 @@ async def run_stream(
     # Delegated prompts often quote the parent's full artifact request as
     # bounded input context.  That quoted request is not a second user-level
     # artifact contract: the outer delegate wrapper validates this child step.
-    artifact_policy_text = "" if delegated_subtask else original_user_text
+    artifact_policy_text = (
+        ""
+        if delegated_subtask or internal_bounded_text
+        else original_user_text
+    )
     run_state = HarnessRunState(
         user_id=user_id,
         session_id=session_id,
@@ -13730,6 +13993,18 @@ async def run_stream(
         started_at_epoch=datetime.now(timezone.utc).timestamp(),
         workspace_baseline_paths=_snapshot_workspace_paths(user_id, session_id),
     )
+
+    def runtime_artifact_verifier_payload() -> dict[str, Any] | None:
+        """Return the ordinary artifact verdict only for artifact-owning runs."""
+
+        if internal_bounded_text:
+            return None
+        return _runtime_artifact_verifier_payload(
+            run_state,
+            artifact_policy_text=artifact_policy_text,
+            enforce_session_skill_workflow=enforce_session_skill_workflow,
+            declared_artifact_patterns=artifact_scope_patterns,
+        )
     artifact_enforcement_continuations = 0
     verifier_continuations = 0
     skill_enforcement_continuations = 0
@@ -29870,12 +30145,7 @@ async def run_stream(
                 yield {"type": "delta", "content": "\n\n"}
                 continue
 
-            verifier_payload = _runtime_artifact_verifier_payload(
-                run_state,
-                artifact_policy_text=artifact_policy_text,
-                enforce_session_skill_workflow=enforce_session_skill_workflow,
-                declared_artifact_patterns=artifact_scope_patterns,
-            )
+            verifier_payload = runtime_artifact_verifier_payload()
             if verifier_payload is not None:
                 yield await emit_agent_event("verifier.requested", {
                     "verifier_kind": verifier_payload["verifier_kind"],
@@ -33216,6 +33486,35 @@ async def run_stream(
             consecutive_length_continuations += 1
             previous_length_content = full_content
             forced_workflow_policy = iteration_workflow_policy
+            if internal_bounded_text:
+                # The caller supplied an immutable input contract and owns the
+                # only permitted complete-replacement attempt.  Never reinterpret
+                # this pure reducer as an artifact request and never splice a
+                # truncated prefix into an internal continuation.
+                msg = (
+                    "Internal bounded-text model call reached its provider "
+                    "output limit; returning the discarded attempt boundary "
+                    "to the caller-owned finalization policy."
+                )
+                yield await emit_agent_event("usage.updated", {
+                    **run_usage,
+                    "model": provider.get("id") or api_model,
+                })
+                yield {
+                    "type": "usage",
+                    **run_usage,
+                    "model": provider.get("id") or api_model,
+                }
+                yield await emit_agent_event("run.failed", {
+                    "error": msg,
+                    "finish_reason": "length",
+                    "terminal_reason": "model_hit_max_output_tokens",
+                    "partial_content_chars": len(full_content),
+                    "output_lifecycle_policy": output_lifecycle_policy,
+                    "usage": run_usage,
+                })
+                yield {"type": "error", "msg": msg}
+                return
             if delegated_subtask:
                 if post_dispatch_synthesis_reasoning_only_length_recoverable:
                     # The emergency synthesis already owns the sole
@@ -33973,12 +34272,7 @@ async def run_stream(
                 if run_state.skill_workflow_is_active()
                 else (False, "")
             )
-            length_verifier_payload = _runtime_artifact_verifier_payload(
-                run_state,
-                artifact_policy_text=artifact_policy_text,
-                enforce_session_skill_workflow=enforce_session_skill_workflow,
-                declared_artifact_patterns=artifact_scope_patterns,
-            )
+            length_verifier_payload = runtime_artifact_verifier_payload()
             if length_verifier_payload is not None and not length_verifier_payload.get("needs_more_work"):
                 yield await emit_agent_event("verifier.requested", {
                     "verifier_kind": length_verifier_payload["verifier_kind"],
@@ -34084,12 +34378,7 @@ async def run_stream(
         if run_state.skill_workflow_is_active()
         else (False, "")
     )
-    exhausted_verifier_payload = _runtime_artifact_verifier_payload(
-        run_state,
-        artifact_policy_text=artifact_policy_text,
-        enforce_session_skill_workflow=enforce_session_skill_workflow,
-        declared_artifact_patterns=artifact_scope_patterns,
-    )
+    exhausted_verifier_payload = runtime_artifact_verifier_payload()
     for debug_evt in await debug_stream_event("budget.exhausted", {
         "used": budget.used,
         "max_iterations": budget.max_total,

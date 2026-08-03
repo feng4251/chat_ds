@@ -16,6 +16,69 @@ from result_fan_in import (
 
 
 class ResultFanInPlannerTests(unittest.TestCase):
+    def test_fifteen_source_long_context_shape_uses_byte_safe_output_policy(self):
+        def build(prefix: str):
+            return plan_persisted_result_fan_in(
+                [
+                    {
+                        "result_id": f"{prefix}-node-{index:02d}",
+                        "path": f"results/{prefix}/part-{index:02d}.md",
+                        "content": (
+                            f"{prefix}-record-{index} field=value evidence.\n"
+                            * 1_000
+                        ),
+                    }
+                    for index in range(15)
+                ],
+                provider_config={
+                    "provider": "long-context-test",
+                    "context_length": 303_872,
+                },
+                # The bounded semantic reducer output must itself fit the
+                # final consumer. Reduction is forced by the independent byte
+                # allowance, not by constructing an impossible 12K-in/32K-out
+                # final contract.
+                token_allowance=48_000,
+                byte_allowance=64_000,
+                reduction_provider_config={
+                    "provider": "long-context-test",
+                    "context_length": 303_872,
+                },
+                reduction_token_allowance=190_000,
+                reduction_byte_allowance=1024 * 1024,
+                reduction_output_reserve_tokens=32 * 1024,
+                reduction_output_tokens=32 * 1024,
+                reduction_output_bytes=32 * 1024,
+            )
+
+        current = build("ledger")
+        renamed = build("inventory")
+
+        for plan in (current, renamed):
+            self.assertTrue(plan.requires_reduction)
+            self.assertEqual(15, len(plan.source_results))
+            self.assertEqual(1, len(plan.source_batches))
+            self.assertEqual(1, len(plan.reduction_steps))
+            self.assertGreater(
+                plan.reduction_steps[0].input_batch.estimated_tokens,
+                90_000,
+            )
+            self.assertEqual(32 * 1024, plan.output_policy.max_bytes)
+            self.assertEqual(
+                plan.output_policy.max_bytes,
+                plan.output_policy.max_tokens,
+            )
+            self.assertEqual(
+                32 * 1024,
+                plan.reduction_budget.output_reserve_tokens,
+            )
+        self.assertNotEqual(current.plan_id, renamed.plan_id)
+        self.assertEqual(
+            [step.strategy for step in current.reduction_steps],
+            [step.strategy for step in renamed.reduction_steps],
+            "renaming IDs/paths/domain labels must not change lifecycle topology",
+        )
+
     def test_direct_plan_retains_order_exact_content_and_provenance(self):
         first = "完整中文证据。" * 20
         second = "complete ascii evidence\n" * 20

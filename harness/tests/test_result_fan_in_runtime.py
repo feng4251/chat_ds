@@ -11,6 +11,8 @@ import result_fan_in_runtime as fan_in_runtime
 from result_fan_in import plan_persisted_result_fan_in
 from result_fan_in_runtime import (
     FanInExecutionError,
+    ReductionRequest,
+    build_length_finalization_prompt,
     materialize_fan_in_plan,
 )
 
@@ -87,6 +89,33 @@ def _footer_for_inputs(inputs, *, records=None) -> str:
 
 
 class ResultFanInRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    def test_length_finalization_is_complete_replacement_with_same_inputs(self):
+        original = (
+            "[Harness internal bounded fan-in reduction]\n"
+            "UNTRUSTED_INPUT_RECORDS_JSON:\n"
+            '[{"input_id":"renamed-source","content":"value"}]'
+        )
+        request = ReductionRequest(
+            request_id="request-renamed",
+            step_id="step-renamed",
+            prompt=original,
+            max_output_tokens=32_768,
+            max_output_bytes=32_768,
+            minimum_output_bytes=2_048,
+        )
+
+        prompt = build_length_finalization_prompt(request)
+
+        self.assertIn("discarded in full", prompt)
+        self.assertIn("complete replacement", prompt)
+        self.assertIn("exactly one complete terminal coverage ledger", prompt)
+        self.assertTrue(prompt.endswith(original))
+        self.assertEqual(1, prompt.count("renamed-source"))
+        self.assertLess(
+            len(prompt.encode("utf-8")) - len(original.encode("utf-8")),
+            fan_in_runtime.REDUCTION_PROMPT_RESERVE_BYTES,
+        )
+
     def test_runtime_defaults_bound_generic_reducer_outputs(self):
         self.assertEqual(fan_in_runtime.DEFAULT_REDUCTION_OUTPUT_TOKENS, 8 * 1024)
         self.assertEqual(fan_in_runtime.DEFAULT_REDUCTION_OUTPUT_BYTES, 32 * 1024)
@@ -1061,6 +1090,59 @@ class ResultFanInRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 .read_text(encoding="utf-8")
             )
             self.assertEqual(failure["error"], "timeout")
+
+    async def test_plan_absolute_deadline_does_not_reset_for_queued_steps(self):
+        plan = plan_persisted_result_fan_in(
+            [
+                {
+                    "result_id": f"queued-{index}",
+                    "path": f"results/queued-{index}.json",
+                    "content": (f'{{"queued":{index},"ready":true}}\n' * 180),
+                }
+                for index in range(4)
+            ],
+            token_allowance=2_200,
+            byte_allowance=12_000,
+            reduction_output_tokens=1_000,
+            reduction_output_bytes=8_000,
+        )
+        calls = 0
+        queued_step_started = asyncio.Event()
+        queued_step_cancelled = asyncio.Event()
+
+        async def reducer(request):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                await asyncio.sleep(0.02)
+                return _audited_reduction(request.prompt)
+            queued_step_started.set()
+            try:
+                await asyncio.sleep(60)
+            finally:
+                queued_step_cancelled.set()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "results"
+            root.mkdir()
+            with self.assertRaisesRegex(
+                FanInExecutionError,
+                "fan-in plan .* exceeded",
+            ):
+                await materialize_fan_in_plan(
+                    plan,
+                    results_root=root,
+                    reducer=reducer,
+                    timeout_seconds=0.15,
+                    # A fresh per-call deadline is intentionally longer than
+                    # the plan. Only the immutable plan deadline may terminate
+                    # the queued second call here.
+                    step_timeout_seconds=1.0,
+                    max_wave_concurrency=1,
+                )
+        self.assertTrue(queued_step_started.is_set())
+        self.assertTrue(queued_step_cancelled.is_set())
+        self.assertEqual(2, calls)
 
     async def test_external_cancellation_propagates_and_stops_reducer(self):
         plan = plan_persisted_result_fan_in(

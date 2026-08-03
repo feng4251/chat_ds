@@ -1387,11 +1387,12 @@ def _project_task_event(
     event_type = str(event.get("event_type") or "")
     now = datetime.utcnow()
     agent_kind = str(event.get("agent_kind") or "primary")
+    nested_agent = bool(event.get("parent_run_id")) or agent_kind != "primary"
     if event_type.startswith("verifier."):
         kind = "verification"
         title = str(payload.get("verifier_kind") or "Verifier")[:256]
     else:
-        kind = "delegate" if agent_kind == "delegate" else "primary"
+        kind = "delegate" if nested_agent else "primary"
         title = str(event.get("agent_name") or payload.get("goal") or agent_kind or "Run")[:256]
     task = task_items.get(task_key)
     if (
@@ -1615,6 +1616,12 @@ async def _persist_agent_events(
         if defer_this_root_terminal:
             project_lifecycle = False
         if run_id not in existing_runs:
+            incoming_agent_kind = str(
+                event.get("agent_kind") or "delegate"
+            )
+            nested_agent = bool(event.get("parent_run_id")) or (
+                incoming_agent_kind != "primary"
+            )
             child_run = AgentRun(
                 id=run_id,
                 user_id=user_id,
@@ -1625,11 +1632,11 @@ async def _persist_agent_events(
                     payload.get("delegation_batch_id")
                     or payload.get("delegation_tool_call_id")
                 ),
-                agent_kind=str(event.get("agent_kind") or "delegate"),
+                agent_kind=incoming_agent_kind,
                 agent_name=event.get("agent_name"),
                 depth=int(event.get("depth") or 0),
                 workspace_scope=str(event.get("workspace_scope") or "shared_session"),
-                source="delegate" if event.get("agent_kind") == "delegate" else "chat",
+                source="delegate" if nested_agent else "chat",
                 requested_model_id=str(payload.get("model_id") or requested_model_id),
                 resolved_model_id=resolved_model_id,
                 status="running",

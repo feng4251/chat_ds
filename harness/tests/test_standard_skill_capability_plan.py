@@ -48,6 +48,10 @@ from tools.registry import (
     delegated_resource_boundary_error,
     registry as native_tool_registry,
 )
+from workflow_ir import (
+    canonicalize_skill_markdown,
+    workflow_plan_instruction_catalog_payload,
+)
 
 
 def _tool_response(call_id: str, name: str, arguments: dict) -> list[str]:
@@ -113,8 +117,24 @@ class StandardSkillCapabilityPlanTests(unittest.TestCase):
             "function": SUBMIT_SKILL_CAPABILITY_PLAN_SCHEMA,
         }
         catalog = {
+            "skill_name": "portable-workflow",
+            "body_sha256": "b" * 64,
+            "catalog_sha256": "c" * 64,
+            "catalog_revision": 1,
+            "candidates": [
+                {"id": "candidate-alpha"},
+                {"id": "candidate-beta"},
+            ],
             "workflow_ir_required": True,
-            "instruction_plan_catalog": {"catalog_sha256": "a" * 64},
+            "instruction_plan_catalog": {
+                "catalog_sha256": "a" * 64,
+                "documents": [{
+                    "document_id": "doc-" + "1" * 24,
+                    "path": "SKILL.md",
+                    "unit_count": 1,
+                    "units": [],
+                }],
+            },
         }
 
         narrowed = _model_facing_capability_plan_schemas(
@@ -124,9 +144,57 @@ class StandardSkillCapabilityPlanTests(unittest.TestCase):
         self.assertNotIn("workflow_ir", parameters["properties"])
         self.assertIn("workflow_plan", parameters["properties"])
         self.assertIn("workflow_plan", parameters["required"])
+        self.assertIn("catalog_sha256", parameters["required"])
+        self.assertEqual(
+            ["portable-workflow"],
+            parameters["properties"]["skill_name"]["enum"],
+        )
+        self.assertEqual(
+            ["b" * 64],
+            parameters["properties"]["body_sha256"]["enum"],
+        )
+        self.assertEqual(
+            ["c" * 64],
+            parameters["properties"]["catalog_sha256"]["enum"],
+        )
+        self.assertEqual(
+            ["candidate-alpha", "candidate-beta"],
+            parameters["properties"]["required"]["items"]["enum"],
+        )
+        range_schema = (
+            parameters["properties"]["workflow_plan"]["properties"]
+            ["nodes"]["items"]["properties"]["instruction_ranges"]["items"]
+        )
+        self.assertEqual(
+            ["doc-" + "1" * 24],
+            range_schema["properties"]["document_id"]["enum"],
+        )
+        node_schema = (
+            parameters["properties"]["workflow_plan"]["properties"]
+            ["nodes"]["items"]
+        )
+        self.assertEqual(
+            ["candidate-alpha", "candidate-beta"],
+            node_schema["properties"]["capability_ids"]["items"]["enum"],
+        )
+        self.assertNotIn("start_instruction_id", json.dumps(range_schema))
+        self.assertIn("must", narrowed[0]["function"]["description"].casefold())
+        provider_plan_schema = parameters["properties"]["workflow_plan"]
+        self.assertNotIn(
+            "start_instruction_id", json.dumps(provider_plan_schema)
+        )
+        self.assertIn("start_ordinal", json.dumps(provider_plan_schema))
         self.assertIn(
             "workflow_ir",
             registry_schema["function"]["parameters"]["properties"],
+        )
+        self.assertIn(
+            "start_instruction_id",
+            json.dumps(
+                registry_schema["function"]["parameters"]["properties"][
+                    "workflow_plan"
+                ]
+            ),
         )
         self.assertFalse(_semantic_control_call_accepted(
             "submit_skill_capability_plan", {"status": "error"}
@@ -137,6 +205,118 @@ class StandardSkillCapabilityPlanTests(unittest.TestCase):
         self.assertTrue(_semantic_control_call_accepted(
             "skill_view", {"status": "error"}
         ))
+
+    def test_model_facing_document_enum_is_snapshot_local_and_fail_closed(self):
+        registry_schema = {
+            "type": "function",
+            "function": SUBMIT_SKILL_CAPABILITY_PLAN_SCHEMA,
+        }
+
+        def projected_handle(markdown: str, *, path: str) -> str:
+            document = canonicalize_skill_markdown(
+                markdown,
+                source_path=path,
+            )
+            plan_catalog = workflow_plan_instruction_catalog_payload([document])
+            narrowed = _model_facing_capability_plan_schemas(
+                [registry_schema],
+                {
+                    "skill_name": "portable-workflow",
+                    "body_sha256": "a" * 64,
+                    "catalog_sha256": "b" * 64,
+                    "catalog_revision": 1,
+                    "candidates": [{"id": "candidate-a"}],
+                    "workflow_ir_required": True,
+                    "instruction_plan_catalog": plan_catalog,
+                },
+            )
+            return (
+                narrowed[0]["function"]["parameters"]["properties"]
+                ["workflow_plan"]["properties"]["nodes"]["items"]
+                ["properties"]["instruction_ranges"]["items"]
+                ["properties"]["document_id"]["enum"][0]
+            )
+
+        original = projected_handle(
+            "# Portable workflow\n\n1. Inspect the record.\n",
+            path="SKILL.md",
+        )
+        renamed = projected_handle(
+            "# Portable workflow\n\n1. Inspect the record.\n",
+            path="RENAMED.md",
+        )
+        mutated = projected_handle(
+            "# Portable workflow\n\n1. Inspect the record twice.\n",
+            path="SKILL.md",
+        )
+        self.assertEqual(28, len(original))
+        self.assertEqual(3, len({original, renamed, mutated}))
+
+        malformed_catalog = {
+            "skill_name": "portable-workflow",
+            "body_sha256": "a" * 64,
+            "catalog_sha256": "b" * 64,
+            "catalog_revision": 1,
+            "candidates": [],
+            "workflow_ir_required": True,
+            "instruction_plan_catalog": {
+                "documents": [{"document_id": "doc-guessed"}],
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "invalid snapshot handle"):
+            _model_facing_capability_plan_schemas(
+                [registry_schema], malformed_catalog
+            )
+        duplicate_catalog = {
+            "skill_name": "portable-workflow",
+            "body_sha256": "a" * 64,
+            "catalog_sha256": "b" * 64,
+            "catalog_revision": 1,
+            "candidates": [],
+            "workflow_ir_required": True,
+            "instruction_plan_catalog": {
+                "documents": [
+                    {"document_id": "doc-" + "2" * 24},
+                    {"document_id": "doc-" + "2" * 24},
+                ],
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "duplicate document handles"):
+            _model_facing_capability_plan_schemas(
+                [registry_schema], duplicate_catalog
+            )
+
+    def test_model_facing_simple_skill_exposes_no_unbindable_workflow_payload(self):
+        registry_schema = {
+            "type": "function",
+            "function": SUBMIT_SKILL_CAPABILITY_PLAN_SCHEMA,
+        }
+        narrowed = _model_facing_capability_plan_schemas(
+            [registry_schema],
+            {
+                "skill_name": "simple-skill",
+                "body_sha256": "a" * 64,
+                "catalog_sha256": "b" * 64,
+                "catalog_revision": 0,
+                "candidates": [],
+                "workflow_ir_required": False,
+            },
+        )
+        properties = narrowed[0]["function"]["parameters"]["properties"]
+        required = narrowed[0]["function"]["parameters"]["required"]
+        self.assertNotIn("workflow_ir", properties)
+        self.assertNotIn("workflow_plan", properties)
+        self.assertNotIn("workflow_ir", required)
+        self.assertNotIn("workflow_plan", required)
+        self.assertEqual(
+            ["simple-skill"], properties["skill_name"]["enum"]
+        )
+        self.assertEqual(0, properties["required"]["maxItems"])
+        registry_properties = (
+            registry_schema["function"]["parameters"]["properties"]
+        )
+        self.assertIn("workflow_ir", registry_properties)
+        self.assertIn("workflow_plan", registry_properties)
 
     def test_compact_workflow_plan_budget_uses_structural_tiers(self):
         def catalog(unit_count):

@@ -1469,6 +1469,12 @@ def build_capability_catalog(
         {
             "workflow_ir_required": workflow_ir_required,
             "instruction_catalog_sha256": instruction_catalog["catalog_sha256"],
+            "workflow_plan_catalog_sha256": hashlib.sha256(json.dumps(
+                instruction_plan_catalog,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")).hexdigest(),
             "instruction_documents": [
                 document.binding_dict() for document in runtime_instruction_documents
             ],
@@ -1546,6 +1552,7 @@ def build_capability_catalog(
         catalog["policy"].update(
             {
                 "workflow_ir_content_addressed": True,
+                "workflow_plan_catalog_content_addressed": True,
                 "workflow_ir_unknown_or_omitted_units_rejected": True,
                 "workflow_ir_selected_capabilities_only": True,
                 "max_instruction_catalog_bytes": (
@@ -1573,8 +1580,14 @@ def catalog_prompt_payload(catalog: dict[str, Any]) -> dict[str, Any]:
         workflow_guidance = (
             " The runtime also issued a compact content-addressed instruction "
             "index. Submit workflow_plan, not the runtime-owned Workflow IR. "
-            "Group exact adjacent instruction IDs with inclusive same-document "
-            "ranges, coalescing adjacent units whenever possible. Declare only "
+            "For every node, use inclusive same-document ranges using the "
+            "catalog's exact document_id and one-based start_ordinal/end_ordinal; "
+            "those selectors are valid only for the exact outer catalog_sha256 "
+            "copied into this submit_skill_capability_plan call. "
+            "The runtime deterministically late-binds them to frozen opaque "
+            "instruction IDs. Do not invent or submit instruction IDs. Coalesce "
+            "adjacent units whenever practical; redundant adjacent or overlapping "
+            "ranges in one document are normalized by the runtime. Declare only "
             "semantic child nodes, dependencies, selected capability IDs, and "
             "optional typed result schemas/output producers. The runtime expands "
             "bindings, coverage, execution policy, counts, receipts, and digest "

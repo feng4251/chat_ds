@@ -177,6 +177,18 @@ _WORKFLOW_PLAN_NODE_FIELDS = frozenset(
     }
 )
 _WORKFLOW_PLAN_RANGE_FIELDS = frozenset(
+    {
+        "document_id",
+        "start_ordinal",
+        "end_ordinal",
+        "start_instruction_id",
+        "end_instruction_id",
+    }
+)
+_WORKFLOW_PLAN_ORDINAL_RANGE_FIELDS = frozenset(
+    {"document_id", "start_ordinal", "end_ordinal"}
+)
+_WORKFLOW_PLAN_LEGACY_RANGE_FIELDS = frozenset(
     {"start_instruction_id", "end_instruction_id"}
 )
 _WORKFLOW_PLAN_OUTPUT_FIELDS = frozenset({"id", "producer_node_ids"})
@@ -274,6 +286,19 @@ class InstructionDocument:
             "canonical_sha256": self.canonical_sha256,
             "units": [unit.to_dict() for unit in self.units],
         }
+
+
+def _instruction_document_id(document: InstructionDocument) -> str:
+    """Return a compact content-addressed handle for one frozen document.
+
+    The full catalog digest remains the epoch authority.  The bounded handle
+    merely lets a model select exact positions without copying opaque unit
+    hashes; collisions are checked across the complete frozen document set
+    before a catalog is disclosed or a plan is compiled.
+    """
+
+    digest = _sha256_text(_canonical_json(document.binding_dict()))
+    return f"doc-{digest[:24]}"
 
 
 @dataclass(frozen=True)
@@ -826,25 +851,39 @@ def workflow_plan_instruction_catalog_payload(
         collapsed = " ".join(str(text or "").split())
         return collapsed[:MAX_INSTRUCTION_PREVIEW_CHARS]
 
+    document_ids: list[str] = []
+    seen_document_ids: set[str] = set()
+    for document_index, document in enumerate(normalized):
+        document_id = _instruction_document_id(document)
+        if document_id in seen_document_ids:
+            raise WorkflowIRValidationError(
+                "instruction_document_id_collision",
+                "content-addressed document handles must be unique",
+                path=f"documents[{document_index}].document_id",
+            )
+        seen_document_ids.add(document_id)
+        document_ids.append(document_id)
+
     return {
         "schema_version": WORKFLOW_PLAN_SCHEMA_VERSION,
         "catalog_sha256": digest,
         "documents": [
             {
+                "document_id": document_ids[document_index],
                 "path": document.source_path,
                 "unit_count": len(document.units),
                 "units": [
                     {
-                        "id": unit.id,
+                        "ordinal": unit_index + 1,
                         "kind": unit.kind,
                         "start_line": unit.start_line,
                         "end_line": unit.end_line,
                         "preview": preview(unit.text),
                     }
-                    for unit in document.units
+                    for unit_index, unit in enumerate(document.units)
                 ],
             }
-            for document in normalized
+            for document_index, document in enumerate(normalized)
         ],
         "counts": {
             "documents": len(normalized),
@@ -852,7 +891,14 @@ def workflow_plan_instruction_catalog_payload(
         },
         "policy": {
             "emit_compact_workflow_plan_only": True,
+            "preferred_range_selector": (
+                "document_id_and_one_based_inclusive_ordinals"
+            ),
+            "catalog_epoch_bound_by": (
+                "submit_skill_capability_plan.catalog_sha256"
+            ),
             "coalesce_adjacent_units_into_ranges": True,
+            "same_document_adjacent_or_overlapping_ranges_are_normalized": True,
             "runtime_expands_and_validates_complete_ir": True,
             "unknown_or_stale_ids_rejected": True,
         },
@@ -977,6 +1023,19 @@ def _identifier(value: Any, path: str) -> str:
         _raise_ir(
             "invalid_identifier",
             "identifier must use the bounded portable identifier alphabet",
+            path,
+        )
+    return result
+
+
+def _exact_selector_identifier(value: Any, path: str) -> str:
+    """Validate a catalog selector without repairing its string form."""
+
+    result = _identifier(value, path)
+    if value != result:
+        _raise_ir(
+            "invalid_identifier",
+            "catalog selector identifiers must be copied exactly",
             path,
         )
     return result
@@ -2140,7 +2199,16 @@ def compile_workflow_plan(
 
     location_by_id: dict[str, tuple[int, int]] = {}
     unit_by_id: dict[str, InstructionUnit] = {}
+    document_index_by_id: dict[str, int] = {}
     for document_index, document in enumerate(authoritative_documents):
+        document_id = _instruction_document_id(document)
+        if document_id in document_index_by_id:
+            _raise_ir(
+                "instruction_document_id_collision",
+                "content-addressed document handles must be unique",
+                f"documents[{document_index}].document_id",
+            )
+        document_index_by_id[document_id] = document_index
         for unit_index, unit in enumerate(document.units):
             location_by_id[unit.id] = (document_index, unit_index)
             unit_by_id[unit.id] = unit
@@ -2215,40 +2283,91 @@ def compile_workflow_plan(
                 "$.nodes",
             )
 
-        expanded_ids: list[str] = []
-        expanded_seen: set[str] = set()
+        coordinate_ranges: list[tuple[int, int, int]] = []
         for range_index, raw_range in enumerate(raw_ranges):
             range_prefix = f"{prefix}.instruction_ranges[{range_index}]"
             range_item = _mapping(raw_range, range_prefix)
             _known_fields(
                 range_item, _WORKFLOW_PLAN_RANGE_FIELDS, range_prefix
             )
-            start_id = _identifier(
-                _required(range_item, "start_instruction_id", range_prefix),
-                f"{range_prefix}.start_instruction_id",
-            )
-            end_id = _identifier(
-                _required(range_item, "end_instruction_id", range_prefix),
-                f"{range_prefix}.end_instruction_id",
-            )
-            if start_id not in location_by_id:
-                _raise_ir(
-                    "unknown_workflow_plan_instruction_id",
-                    "range start is unknown or stale",
+            range_fields = frozenset(range_item)
+            if range_fields == _WORKFLOW_PLAN_ORDINAL_RANGE_FIELDS:
+                document_id = _exact_selector_identifier(
+                    _required(range_item, "document_id", range_prefix),
+                    f"{range_prefix}.document_id",
+                )
+                if document_id not in document_index_by_id:
+                    _raise_ir(
+                        "unknown_workflow_plan_document_id",
+                        "document selector is unknown or stale",
+                        f"{range_prefix}.document_id",
+                    )
+                start_ordinal = _bounded_int(
+                    _required(range_item, "start_ordinal", range_prefix),
+                    f"{range_prefix}.start_ordinal",
+                    1,
+                    MAX_INSTRUCTION_UNITS,
+                )
+                end_ordinal = _bounded_int(
+                    _required(range_item, "end_ordinal", range_prefix),
+                    f"{range_prefix}.end_ordinal",
+                    1,
+                    MAX_INSTRUCTION_UNITS,
+                )
+                start_document = end_document = document_index_by_id[document_id]
+                document_unit_count = len(
+                    authoritative_documents[start_document].units
+                )
+                if start_ordinal > document_unit_count:
+                    _raise_ir(
+                        "unknown_workflow_plan_instruction_ordinal",
+                        "range start ordinal is outside the frozen document",
+                        f"{range_prefix}.start_ordinal",
+                    )
+                if end_ordinal > document_unit_count:
+                    _raise_ir(
+                        "unknown_workflow_plan_instruction_ordinal",
+                        "range end ordinal is outside the frozen document",
+                        f"{range_prefix}.end_ordinal",
+                    )
+                start_index = start_ordinal - 1
+                end_index = end_ordinal - 1
+            elif range_fields == _WORKFLOW_PLAN_LEGACY_RANGE_FIELDS:
+                start_id = _exact_selector_identifier(
+                    _required(range_item, "start_instruction_id", range_prefix),
                     f"{range_prefix}.start_instruction_id",
                 )
-            if end_id not in location_by_id:
-                _raise_ir(
-                    "unknown_workflow_plan_instruction_id",
-                    "range end is unknown or stale",
+                end_id = _exact_selector_identifier(
+                    _required(range_item, "end_instruction_id", range_prefix),
                     f"{range_prefix}.end_instruction_id",
                 )
-            start_document, start_index = location_by_id[start_id]
-            end_document, end_index = location_by_id[end_id]
-            if start_document != end_document:
+                if start_id not in location_by_id:
+                    _raise_ir(
+                        "unknown_workflow_plan_instruction_id",
+                        "range start is unknown or stale",
+                        f"{range_prefix}.start_instruction_id",
+                    )
+                if end_id not in location_by_id:
+                    _raise_ir(
+                        "unknown_workflow_plan_instruction_id",
+                        "range end is unknown or stale",
+                        f"{range_prefix}.end_instruction_id",
+                    )
+                start_document, start_index = location_by_id[start_id]
+                end_document, end_index = location_by_id[end_id]
+                if start_document != end_document:
+                    _raise_ir(
+                        "cross_document_instruction_range",
+                        "one instruction range cannot cross document boundaries",
+                        range_prefix,
+                    )
+            else:
                 _raise_ir(
-                    "cross_document_instruction_range",
-                    "one instruction range cannot cross document boundaries",
+                    "invalid_workflow_plan_instruction_selector",
+                    (
+                        "use exactly document_id/start_ordinal/end_ordinal or "
+                        "the legacy start_instruction_id/end_instruction_id"
+                    ),
                     range_prefix,
                 )
             if start_index > end_index:
@@ -2257,28 +2376,43 @@ def compile_workflow_plan(
                     "instruction range start follows its end",
                     range_prefix,
                 )
-            for unit in authoritative_documents[start_document].units[
+            coordinate_ranges.append(
+                (start_document, start_index, end_index)
+            )
+
+        # Range ordering and redundant splits are presentation choices.  Bind
+        # every exact selector to frozen coordinates, then canonicalize
+        # overlapping or adjacent ranges within the same document.  Ranges are
+        # never merged across nodes or document boundaries, so fan-out and full
+        # coverage checks below retain their original authority.
+        coordinate_ranges.sort()
+        normalized_ranges: list[list[int]] = []
+        for document_index, start_index, end_index in coordinate_ranges:
+            if (
+                normalized_ranges
+                and normalized_ranges[-1][0] == document_index
+                and start_index <= normalized_ranges[-1][2] + 1
+            ):
+                normalized_ranges[-1][2] = max(
+                    normalized_ranges[-1][2], end_index
+                )
+            else:
+                normalized_ranges.append(
+                    [document_index, start_index, end_index]
+                )
+        expanded_ids = [
+            unit.id
+            for document_index, start_index, end_index in normalized_ranges
+            for unit in authoritative_documents[document_index].units[
                 start_index : end_index + 1
-            ]:
-                if unit.id in expanded_seen:
-                    _raise_ir(
-                        "overlapping_instruction_range",
-                        "ranges within one node must not overlap",
-                        range_prefix,
-                    )
-                expanded_seen.add(unit.id)
-                expanded_ids.append(unit.id)
+            ]
+        ]
         if not any(unit_by_id[item].kind != "heading" for item in expanded_ids):
             _raise_ir(
                 "workflow_plan_node_has_no_executable_instruction",
                 "a required child node cannot contain headings only",
                 f"{prefix}.instruction_ranges",
             )
-        # Range order is a model presentation choice, not workflow semantics.
-        # Canonicalize against the frozen document coordinates so equivalent
-        # compact plans compile to one content-addressed runtime IR.
-        expanded_ids.sort(key=location_by_id.__getitem__)
-
         dependencies = _id_list(
             _required(item, "depends_on", prefix),
             f"{prefix}.depends_on",
@@ -2557,8 +2691,21 @@ def compile_workflow_plan(
     )
 
 
-def workflow_plan_json_schema() -> dict[str, Any]:
-    """Return the bounded model-facing compact semantic-plan schema."""
+def workflow_plan_json_schema(
+    *,
+    include_legacy_instruction_id_ranges: bool = True,
+) -> dict[str, Any]:
+    """Return the bounded compact semantic-plan schema.
+
+    The static/runtime contract keeps exact legacy hashed-ID ranges for direct
+    caller compatibility.  Provider-facing schema projection disables that
+    branch so a model sees only snapshot-scoped readable handles and ordinals.
+    """
+
+    if not isinstance(include_legacy_instruction_id_ranges, bool):
+        raise TypeError(
+            "include_legacy_instruction_id_ranges must be a boolean"
+        )
 
     identifier = {
         "type": "string",
@@ -2585,13 +2732,48 @@ def workflow_plan_json_schema() -> dict[str, Any]:
             "additionalProperties": False,
         }
 
-    range_schema = strict_object(
+    ordinal_range_schema = strict_object(
+        {
+            "document_id": dict(identifier),
+            "start_ordinal": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_INSTRUCTION_UNITS,
+            },
+            "end_ordinal": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_INSTRUCTION_UNITS,
+            },
+        },
+        ("document_id", "start_ordinal", "end_ordinal"),
+    )
+    legacy_range_schema = strict_object(
         {
             "start_instruction_id": dict(identifier),
             "end_instruction_id": dict(identifier),
         },
         ("start_instruction_id", "end_instruction_id"),
     )
+    if include_legacy_instruction_id_ranges:
+        range_schema: dict[str, Any] = {
+            "oneOf": [ordinal_range_schema, legacy_range_schema],
+            "description": (
+                "Prefer the content-addressed document_id with one-based inclusive "
+                "start_ordinal/end_ordinal from the current catalog. Legacy exact "
+                "instruction-ID boundaries remain accepted. Never guess, shorten, "
+                "or fuzzily repair an identifier."
+            ),
+        }
+    else:
+        range_schema = {
+            **ordinal_range_schema,
+            "description": (
+                "Prefer the content-addressed document_id with one-based inclusive "
+                "start_ordinal/end_ordinal from the current catalog. The runtime "
+                "late-binds exact opaque IDs; model-authored IDs are not accepted."
+            ),
+        }
     node_schema = strict_object(
         {
             "id": dict(identifier),
@@ -2609,8 +2791,10 @@ def workflow_plan_json_schema() -> dict[str, Any]:
                 "minItems": 1,
                 "maxItems": MAX_INSTRUCTION_RANGES_PER_NODE,
                 "description": (
-                    "Inclusive same-document ranges. Coalesce adjacent units; "
-                    "the runtime expands exact IDs and proves full coverage."
+                    "Inclusive same-document ranges. Prefer document_id plus "
+                    "one-based ordinals. The runtime late-binds exact IDs, "
+                    "normalizes adjacent/overlapping same-document ranges, and "
+                    "proves full coverage."
                 ),
             },
             "depends_on": id_array(MAX_DEPENDENCIES_PER_NODE),

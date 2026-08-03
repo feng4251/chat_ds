@@ -38,6 +38,14 @@ DEFAULT_REDUCTION_OUTPUT_TOKENS = 8 * 1024
 DEFAULT_REDUCTION_OUTPUT_BYTES = 32 * 1024
 DEFAULT_REDUCTION_STEP_TIMEOUT_SECONDS = 300.0
 DEFAULT_MAX_WAVE_CONCURRENCY = 8
+FAN_IN_OUTPUT_REPAIR_POLICY_VERSION = (
+    "fan-in-complete-replacement-v2"
+)
+# Compatibility export for callers/tests which used the narrower v1 name.
+FAN_IN_LENGTH_FINALIZATION_POLICY_VERSION = (
+    FAN_IN_OUTPUT_REPAIR_POLICY_VERSION
+)
+MAX_REDUCER_LENGTH_ATTEMPTS = 2
 REDUCTION_PROMPT_RESERVE_BYTES = 8 * 1024
 REDUCTION_PROMPT_RESERVE_TOKENS = 2 * 1024
 _COVERAGE_FOOTER_PREFIX = "FAN_IN_COVERAGE_JSON:"
@@ -66,9 +74,73 @@ class ReductionRequest:
     # all reducers can use the second to detect an impossible output budget.
     timeout_seconds: float | None = None
     minimum_output_bytes: int = 0
+    # The runtime owns the semantic/coverage contract.  A reducer which can
+    # safely resample a pure zero-tool response may invoke this validator
+    # before accepting an attempt.  The runtime invokes it again after return,
+    # so legacy reducer callables remain fail-closed.
+    acceptance_validator: Callable[[str], None] | None = None
 
 
 Reducer = Callable[[ReductionRequest], Awaitable[str]]
+
+
+def build_complete_replacement_prompt(
+    request: ReductionRequest,
+    *,
+    reason_code: str,
+) -> str:
+    """Build the sole complete-replacement prompt for a pure output failure.
+
+    A rejected reducer body is never a continuation anchor: appending another
+    sample could preserve truncation, duplicate prose/ledgers, or retain raw
+    protocol.  The sole recovery replays the same immutable inputs with a
+    stricter output policy.  ``reason_code`` is a bounded machine category,
+    never provider/model text or rejected content.
+    """
+
+    allowed_reasons = {
+        "length",
+        "empty_output",
+        "byte_bound_exceeded",
+        "raw_tool_protocol",
+        "structured_output_contract_invalid",
+    }
+    normalized_reason = str(reason_code or "").strip().casefold()
+    if normalized_reason not in allowed_reasons:
+        raise ValueError("unsupported fan-in complete-replacement reason")
+
+    hard_bytes = max(1, int(request.max_output_bytes))
+    minimum_bytes = max(0, int(request.minimum_output_bytes))
+    target_bytes = min(
+        hard_bytes,
+        max(minimum_bytes, (hard_bytes * 3) // 4),
+    )
+    return (
+        "[Harness bounded fan-in complete replacement]\n"
+        f"Policy: {FAN_IN_OUTPUT_REPAIR_POLICY_VERSION}\n"
+        f"Rejected-attempt category: {normalized_reason}\n"
+        "The preceding reducer attempt failed the bounded output contract and "
+        "was discarded in full. Produce one complete replacement from the same "
+        "immutable input records below; do not continue, quote, or refer to the "
+        "discarded prefix. Keep the semantic body compact, preserve every "
+        "material value required by the original reduction contract, and reserve "
+        "space for exactly one complete terminal coverage ledger before writing "
+        "prose. No tools, artifact operations, or future-action narration are "
+        "permitted.\n"
+        f"Preferred complete-output target: at most {target_bytes} UTF-8 bytes.\n"
+        f"Absolute complete-output hard bound: {hard_bytes} UTF-8 bytes.\n"
+        f"Minimum structural/coverage footprint: {minimum_bytes} UTF-8 bytes.\n\n"
+        + request.prompt
+    )
+
+
+def build_length_finalization_prompt(request: ReductionRequest) -> str:
+    """Compatibility wrapper for the original exact-length repair entrypoint."""
+
+    return build_complete_replacement_prompt(
+        request,
+        reason_code="length",
+    )
 
 
 @dataclass(frozen=True)
@@ -1513,6 +1585,12 @@ async def _reduce_and_write(
         max_output_bytes=max_semantic_bytes,
         timeout_seconds=call_timeout,
         minimum_output_bytes=minimum_output_bytes,
+        acceptance_validator=lambda candidate: _validate_semantic_reduction(
+            str(candidate or "").strip(),
+            inputs,
+            max_semantic_bytes,
+            step_id,
+        ),
     )
     try:
         semantic_value = await asyncio.wait_for(
@@ -1985,6 +2063,9 @@ __all__ = [
     "DEFAULT_REDUCTION_OUTPUT_TOKENS",
     "DEFAULT_REDUCTION_STEP_TIMEOUT_SECONDS",
     "DEFAULT_MAX_WAVE_CONCURRENCY",
+    "FAN_IN_LENGTH_FINALIZATION_POLICY_VERSION",
+    "FAN_IN_OUTPUT_REPAIR_POLICY_VERSION",
+    "MAX_REDUCER_LENGTH_ATTEMPTS",
     "MAX_EXACT_RESULT_BYTES",
     "MAX_TOTAL_EXACT_RESULT_BYTES",
     "FanInScheduleEstimate",
@@ -1995,6 +2076,8 @@ __all__ = [
     "REDUCTION_PROMPT_RESERVE_BYTES",
     "REDUCTION_PROMPT_RESERVE_TOKENS",
     "ReductionRequest",
+    "build_complete_replacement_prompt",
+    "build_length_finalization_prompt",
     "estimate_fan_in_reducer_schedule",
     "load_exact_result_text",
     "materialize_fan_in_plan",

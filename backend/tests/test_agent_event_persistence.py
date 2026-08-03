@@ -224,6 +224,100 @@ class AgentEventPersistenceTests(unittest.IsolatedAsyncioTestCase):
             )).scalar_one()
             self.assertEqual(duplicate_count, len(events))
 
+    async def test_internal_reducer_attempts_rehydrate_as_closed_nested_runs(self):
+        def reducer_event(
+            run_id: str,
+            event_type: str,
+            seq: int,
+            *,
+            attempt: int,
+        ) -> dict:
+            payload = {
+                "fan_in_reducer_attempt": attempt,
+                "fan_in_reducer_max_attempts": 2,
+            }
+            if event_type == "run.started":
+                payload.update({"model_id": "model", "enabled_tools": []})
+            elif event_type == "run.failed":
+                payload.update({
+                    "error": "bounded output rejected",
+                    "finish_reason": "length",
+                    "terminal_reason": "model_hit_max_output_tokens",
+                    "provisional_terminal": False,
+                    "authoritative": True,
+                })
+            elif event_type == "run.completed":
+                payload.update({
+                    "finish_reason": "stop",
+                    "provisional_terminal": False,
+                    "authoritative": True,
+                })
+            return {
+                "type": "agent_event",
+                "event_type": event_type,
+                "run_id": run_id,
+                "root_run_id": "root",
+                "parent_run_id": "delegated-worker",
+                "agent_kind": "delegate_reducer",
+                "agent_name": f"Evidence fan-in attempt {attempt}",
+                "depth": 2,
+                "workspace_scope": "shared_session",
+                "seq": seq,
+                "payload": payload,
+            }
+
+        events = [
+            reducer_event("reducer-attempt-1", "run.started", 0, attempt=1),
+            reducer_event("reducer-attempt-1", "run.failed", 1, attempt=1),
+            reducer_event("reducer-attempt-2", "run.started", 0, attempt=2),
+            reducer_event("reducer-attempt-2", "run.completed", 1, attempt=2),
+        ]
+        async with self.sessions() as session:
+            await chat_router._persist_agent_events(
+                session,
+                conv_id="conversation",
+                user_id="user",
+                root_run_id="root",
+                requested_model_id="model",
+                resolved_model_id="model",
+                events=events,
+            )
+            await session.commit()
+
+        async with self.sessions() as session:
+            failed = await session.get(AgentRun, "reducer-attempt-1")
+            completed = await session.get(AgentRun, "reducer-attempt-2")
+            root = await session.get(AgentRun, "root")
+            self.assertEqual("failed", failed.status)
+            self.assertEqual("succeeded", completed.status)
+            self.assertIsNotNone(failed.ended_at)
+            self.assertIsNotNone(completed.ended_at)
+            self.assertEqual("delegate", failed.source)
+            self.assertEqual("delegate", completed.source)
+            self.assertEqual("delegate_reducer", failed.agent_kind)
+            self.assertEqual("delegated-worker", failed.parent_run_id)
+            self.assertEqual("running", root.status)
+            tasks = (await session.execute(
+                select(TaskItem)
+                .where(TaskItem.run_id.in_([
+                    "reducer-attempt-1", "reducer-attempt-2",
+                ]))
+                .order_by(TaskItem.run_id)
+            )).scalars().all()
+            self.assertEqual(2, len(tasks))
+            self.assertEqual(["delegate", "delegate"], [task.kind for task in tasks])
+            self.assertEqual(
+                ["failed", "succeeded"],
+                [task.status for task in tasks],
+            )
+            running_reducers = (await session.execute(
+                select(func.count(AgentRun.id)).where(
+                    AgentRun.agent_kind == "delegate_reducer",
+                    AgentRun.status == "running",
+                )
+            )).scalar_one()
+            self.assertEqual(0, running_reducers)
+
     async def test_final_tool_surface_and_terminal_projection_are_monotonic(self):
         started = _event("run.started", 1, run_id="root")
         surface = _event("tool_surface.resolved", 2, run_id="root")

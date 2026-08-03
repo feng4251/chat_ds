@@ -17,10 +17,15 @@ from tools.delegation import (
     _exact_node_capability_grants,
     _render_preloaded_prerequisites,
     _required_output_has_status,
+    _fan_in_provider_deadline_seconds,
+    _fan_in_retryable_output_failure,
+    _fan_in_weighted_wave_concurrency,
     _run_child,
     _tool_allowed_in_child,
     delegate_task,
 )
+from provider_admission import ProviderAdmissionLimits
+from result_fan_in_runtime import FanInExecutionError, ReductionRequest
 from tools.registry import json_schema_value_error
 
 
@@ -158,6 +163,136 @@ def _catalog_for_bindings(
 
 
 class DelegationToolPolicyTests(unittest.TestCase):
+    def test_fan_in_deadline_scales_with_current_long_context_shape(self):
+        with (
+            patch(
+                "tools.delegation.settings.llm_stream_initial_timeout_seconds",
+                60.0,
+            ),
+            patch(
+                "tools.delegation.settings.llm_stream_progress_grace_seconds",
+                30.0,
+            ),
+            patch(
+                "tools.delegation.settings.llm_stream_total_timeout_seconds",
+                14_400.0,
+            ),
+            patch(
+                "tools.delegation.settings.llm_stream_input_planning_tokens_per_second",
+                256.0,
+            ),
+            patch(
+                "tools.delegation.settings.llm_stream_output_planning_tokens_per_second",
+                8.0,
+            ),
+            patch(
+                "tools.delegation.settings.llm_stream_planning_safety_factor",
+                1.1,
+            ),
+            patch(
+                "tools.delegation.settings.llm_stream_fixed_overhead_seconds",
+                30.0,
+            ),
+        ):
+            small, _ = _fan_in_provider_deadline_seconds(
+                estimated_input_tokens=1_000,
+                max_output_tokens=1_000,
+                caller_hard_cap_seconds=14_400.0,
+            )
+            current_shape, audit = _fan_in_provider_deadline_seconds(
+                estimated_input_tokens=93_375,
+                max_output_tokens=32_768,
+                caller_hard_cap_seconds=14_400.0,
+            )
+
+        self.assertGreater(current_shape, small)
+        self.assertGreater(current_shape, 240.0)
+        self.assertLessEqual(current_shape, 14_400.0)
+        self.assertEqual(93_375, audit["estimated_input_tokens"])
+        self.assertEqual(32_768, audit["max_output_tokens"])
+
+    def test_fan_in_concurrency_uses_weighted_provider_admission_capacity(self):
+        limits = ProviderAdmissionLimits(
+            max_inflight_requests=3,
+            max_inflight_estimated_tokens=240_000,
+            estimate_safety_factor=1.0,
+            wait_timeout_seconds=1_800.0,
+        )
+        concurrency, audit = _fan_in_weighted_wave_concurrency(
+            estimated_input_tokens=[106_000, 106_000, 106_000],
+            max_output_tokens=32_768,
+            requested_concurrency=3,
+            admission_limits=limits,
+        )
+
+        self.assertEqual(1, concurrency)
+        self.assertEqual(138_768, audit["maximum_request_weight"])
+        self.assertEqual(1, audit["token_capacity_slots_at_maximum_weight"])
+        self.assertEqual(240_000, audit["max_inflight_estimated_tokens"])
+
+        oversize_concurrency, oversize_audit = (
+            _fan_in_weighted_wave_concurrency(
+                estimated_input_tokens=[220_000, 220_000],
+                max_output_tokens=32_768,
+                requested_concurrency=3,
+                admission_limits=limits,
+            )
+        )
+        self.assertEqual(1, oversize_concurrency)
+        self.assertTrue(oversize_audit["oversize_exclusive"])
+        self.assertEqual(
+            1,
+            oversize_audit["token_capacity_slots_at_maximum_weight"],
+        )
+
+    def test_fan_in_pure_output_failures_share_one_replacement_classification(self):
+        def reject_invalid_coverage(value: str) -> None:
+            if value != "VALID_COVERAGE":
+                raise FanInExecutionError("synthetic coverage contract failure")
+
+        request = ReductionRequest(
+            request_id="generic-output-contract",
+            step_id="renamed-step",
+            prompt="immutable generic records",
+            max_output_tokens=1_024,
+            max_output_bytes=1_024,
+            acceptance_validator=reject_invalid_coverage,
+        )
+
+        self.assertEqual(
+            "empty_output",
+            _fan_in_retryable_output_failure("", request),
+        )
+        self.assertEqual(
+            "byte_bound_exceeded",
+            _fan_in_retryable_output_failure("x" * 1_025, request),
+        )
+        self.assertEqual(
+            "raw_tool_protocol",
+            _fan_in_retryable_output_failure(
+                "<tool_call><name>read_file</name>"
+                "<arguments>{}</arguments></tool_call>",
+                request,
+            ),
+        )
+        for invalid_footer in (
+            "coverage footer missing",
+            "duplicate coverage footers",
+            "coverage footer has wrong identities",
+        ):
+            with self.subTest(invalid_footer=invalid_footer):
+                self.assertEqual(
+                    "structured_output_contract_invalid",
+                    _fan_in_retryable_output_failure(
+                        invalid_footer,
+                        request,
+                    ),
+                )
+        self.assertEqual(
+            "",
+            _fan_in_retryable_output_failure("VALID_COVERAGE", request),
+        )
+
     def test_exact_knowledge_gate_projection_preserves_validated_calculation(self):
         tools = [
             "skill_view",
@@ -2235,6 +2370,10 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
                     "temperature_override": kwargs.get(
                         "temperature_override"
                     ),
+                    "output_lifecycle_policy": kwargs.get(
+                        "output_lifecycle_policy"
+                    ),
+                    "timeout": kwargs.get("timeout"),
                     "max_tokens": kwargs.get("max_tokens"),
                 })
                 records = json.loads(
@@ -2319,9 +2458,25 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
             and call_info["include_session_context"] is False
             and call_info["thinking_policy"] == "off_if_supported"
             and call_info["temperature_override"] == 0.0
-            and 0 < call_info["max_tokens"] <= 8 * 1024
+            and call_info["output_lifecycle_policy"]
+            == "internal_bounded_text"
+            and call_info["timeout"] > 240.0
+            and 0 < call_info["max_tokens"] <= 32 * 1024
             for call_info in observed["reducer_calls"]
         ))
+        self.assertEqual(
+            32 * 1024,
+            audit["reducer_lifecycle_policy"]["output_policy"]["max_tokens"],
+        )
+        self.assertGreater(audit["step_timeout_seconds"], 240.0)
+        self.assertEqual(
+            audit["plan_timeout_seconds"],
+            audit["step_timeout_seconds"],
+        )
+        self.assertEqual(
+            audit["max_wave_concurrency"],
+            audit["provider_admission_schedule"]["effective_concurrency"],
+        )
         main_prompt = str(observed["main_prompt"])
         self.assertLess(len(main_prompt), _MAX_PRELOADED_PREREQUISITE_CHARS)
         self.assertIn("Harness bounded persisted-result fan-in", main_prompt)
@@ -2344,8 +2499,8 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
             len(observed["reducer_calls"]),
         )
         self.assertTrue(all(
-            event["payload"].get("provisional_terminal") is True
-            and event["payload"].get("authoritative") is False
+            event["payload"].get("provisional_terminal") is False
+            and event["payload"].get("authoritative") is True
             for event in reducer_terminals
         ))
 
@@ -2436,6 +2591,281 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
             [str(event.get("event_type") or "") for event in events],
         )
         self.assertNotIn("UNCOMMITTED_REDUCER_DELTA", json.dumps(events))
+
+    async def test_fan_in_length_then_complete_replacement_succeeds(self):
+        bodies = {
+            f"results/renamed-ledger-{index}.md": (
+                f"RENAMED_LEDGER_{index}_START\n"
+                + (f"record-{index} identifier relation uncertainty. " * 6_000)
+                + f"\nRENAMED_LEDGER_{index}_END"
+            )
+            for index in range(1, 5)
+        }
+        attempts: dict[str, int] = {}
+        reducer_prompts: list[str] = []
+        main_prompt = ""
+        events: list[dict] = []
+
+        async def fake_dispatch(name, args, *, context):
+            return json.dumps(_complete_read_result(bodies[args["filepath"]]))
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            nonlocal main_prompt
+            prompt = str(messages[0]["content"])
+            if kwargs.get("source") != "delegate_fan_in_reduction":
+                main_prompt = prompt
+                yield {"type": "delta", "content": "complete synthesis " * 30}
+                yield {"type": "done", "finish_reason": "stop"}
+                return
+            self.assertEqual(
+                "internal_bounded_text",
+                kwargs.get("output_lifecycle_policy"),
+            )
+            self.assertEqual([], tools)
+            step_id = prompt.split("Step ID: ", 1)[1].splitlines()[0]
+            attempts[step_id] = attempts.get(step_id, 0) + 1
+            reducer_prompts.append(prompt)
+            if step_id.endswith("step-0001") and attempts[step_id] == 1:
+                yield {
+                    "type": "delta",
+                    "content": "DISCARDED_REDUCER_PREFIX",
+                }
+                terminal = {
+                    "type": "agent_event",
+                    "event_type": "run.failed",
+                    "run_id": kwargs["run_id"],
+                    "agent_kind": kwargs["agent_kind"],
+                    "payload": {
+                        "error": "bounded length",
+                        "finish_reason": "length",
+                        "terminal_reason": "model_hit_max_output_tokens",
+                        # The fan-in boundary owns this fresh run and must
+                        # normalize contradictory upstream annotations.
+                        "provisional_terminal": True,
+                        "authoritative": False,
+                    },
+                }
+                await kwargs["event_sink"](terminal)
+                yield terminal
+                yield {"type": "error", "msg": "bounded length"}
+                return
+            if step_id.endswith("step-0002") and attempts[step_id] == 1:
+                # A clean stop is still only a transport success. The runtime
+                # coverage validator must reject this body before artifact
+                # persistence and spend the same sole replacement budget.
+                yield {
+                    "type": "delta",
+                    "content": "semantic prose with no coverage footer",
+                }
+                terminal = {
+                    "type": "agent_event",
+                    "event_type": "run.completed",
+                    "run_id": kwargs["run_id"],
+                    "agent_kind": kwargs["agent_kind"],
+                    "payload": {"finish_reason": "stop"},
+                }
+                await kwargs["event_sink"](terminal)
+                yield terminal
+                yield {"type": "done", "finish_reason": "stop"}
+                return
+
+            records = json.loads(
+                prompt.split("UNTRUSTED_INPUT_RECORDS_JSON:\n", 1)[1]
+            )
+            coverage = {
+                "version": 1,
+                "sources": [
+                    {
+                        "input_id": record["input_id"],
+                        "status": "present",
+                        "provenance": {
+                            "path": record["path"],
+                            "checksum_sha256": record["checksum_sha256"],
+                            "source_range": record["source_range"],
+                        },
+                        "segment_coverage": {
+                            "byte_start": 0,
+                            "byte_end": record["byte_size"],
+                        },
+                    }
+                    for record in records
+                ],
+            }
+            yield {
+                "type": "delta",
+                "content": (
+                    "Compact complete replacement.\nFAN_IN_COVERAGE_JSON:"
+                    + json.dumps(coverage, separators=(",", ":"))
+                ),
+            }
+            terminal = {
+                "type": "agent_event",
+                "event_type": "run.completed",
+                "run_id": kwargs["run_id"],
+                "agent_kind": kwargs["agent_kind"],
+                "payload": {"finish_reason": "stop"},
+            }
+            await kwargs["event_sink"](terminal)
+            yield terminal
+            yield {"type": "done", "finish_reason": "stop"}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch("agent_loop.run_stream", fake_run_stream),
+                patch("tools.delegation.registry_dispatch", fake_dispatch),
+                patch("tools.delegation.sandbox_dir", return_value=temp_dir),
+                patch(
+                    "tools.delegation.persist_result_for_history",
+                    return_value="results/renamed-final.txt",
+                ),
+            ):
+                result = await _run_child(
+                    {
+                        "goal": "combine every renamed persisted prerequisite",
+                        "required_result_paths": list(bodies),
+                        "tools": ["read_file"],
+                    },
+                    _context("read_file", event_sink=events.append),
+                    0,
+                )
+
+        self.assertEqual("completed", result["status"])
+        first_step = next(
+            step for step in attempts if step.endswith("step-0001")
+        )
+        self.assertEqual(2, attempts[first_step])
+        second_step = next(
+            step for step in attempts if step.endswith("step-0002")
+        )
+        self.assertEqual(2, attempts[second_step])
+        finalization_prompts = [
+            prompt
+            for prompt in reducer_prompts
+            if "bounded fan-in complete replacement" in prompt
+        ]
+        self.assertEqual(2, len(finalization_prompts))
+        self.assertTrue(all(
+            "discarded in full" in prompt
+            and "DISCARDED_REDUCER_PREFIX" not in prompt
+            for prompt in finalization_prompts
+        ))
+        self.assertEqual(
+            {"length", "structured_output_contract_invalid"},
+            {
+                prompt.split("Rejected-attempt category: ", 1)[1]
+                .splitlines()[0]
+                for prompt in finalization_prompts
+            },
+        )
+        self.assertNotIn("DISCARDED_REDUCER_PREFIX", main_prompt)
+        reducer_terminals = [
+            event
+            for event in events
+            if event.get("agent_kind") == "delegate_reducer"
+            and event.get("event_type") in {
+                "run.completed",
+                "run.failed",
+            }
+        ]
+        reducer_run_ids = [event.get("run_id") for event in reducer_terminals]
+        self.assertEqual(len(reducer_run_ids), len(set(reducer_run_ids)))
+        reducer_terminals_by_run: dict[str, list[dict]] = {}
+        for event in reducer_terminals:
+            reducer_terminals_by_run.setdefault(
+                str(event.get("run_id") or ""),
+                [],
+            ).append(event)
+        self.assertTrue(all(
+            len(terminals) == 1
+            and terminals[0]["payload"].get("authoritative") is True
+            and terminals[0]["payload"].get("provisional_terminal") is False
+            for terminals in reducer_terminals_by_run.values()
+        ))
+        discarded = next(
+            event
+            for event in reducer_terminals
+            if event.get("event_type") == "run.failed"
+        )
+        self.assertFalse(discarded["payload"]["provisional_terminal"])
+        self.assertTrue(discarded["payload"]["authoritative"])
+        parent_terminals = [
+            event
+            for event in events
+            if event.get("agent_kind") == "delegate"
+            and event.get("event_type") in {"run.completed", "run.failed"}
+        ]
+        self.assertEqual(1, len(parent_terminals))
+        self.assertEqual("run.completed", parent_terminals[0]["event_type"])
+        self.assertTrue(parent_terminals[0]["payload"]["authoritative"])
+        self.assertIn(
+            "fan_in.reducer_finalization_requested",
+            [event.get("event_type") for event in events],
+        )
+
+    async def test_repeated_fan_in_length_fails_after_bounded_replacement(self):
+        bodies = {
+            f"results/archive-{index}.md": (
+                f"ARCHIVE_{index}_START\n"
+                + (f"entry-{index} key relation status. " * 10_000)
+                + f"\nARCHIVE_{index}_END"
+            )
+            for index in range(1, 5)
+        }
+        attempts: dict[str, int] = {}
+        main_called = False
+
+        async def fake_dispatch(name, args, *, context):
+            return json.dumps(_complete_read_result(bodies[args["filepath"]]))
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            nonlocal main_called
+            if kwargs.get("source") != "delegate_fan_in_reduction":
+                main_called = True
+                yield {"type": "done", "finish_reason": "stop"}
+                return
+            prompt = str(messages[0]["content"])
+            step_id = prompt.split("Step ID: ", 1)[1].splitlines()[0]
+            attempts[step_id] = attempts.get(step_id, 0) + 1
+            terminal = {
+                "type": "agent_event",
+                "event_type": "run.failed",
+                "run_id": kwargs["run_id"],
+                "agent_kind": kwargs["agent_kind"],
+                "payload": {
+                    "error": "bounded length",
+                    "finish_reason": "length",
+                    "terminal_reason": "model_hit_max_output_tokens",
+                },
+            }
+            await kwargs["event_sink"](terminal)
+            yield terminal
+            yield {"type": "error", "msg": "bounded length"}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch("agent_loop.run_stream", fake_run_stream),
+                patch("tools.delegation.registry_dispatch", fake_dispatch),
+                patch("tools.delegation.sandbox_dir", return_value=temp_dir),
+                patch("tools.delegation.persist_result_for_history") as persist,
+            ):
+                result = await _run_child(
+                    {
+                        "goal": "combine every archived prerequisite",
+                        "required_result_paths": list(bodies),
+                        "tools": ["read_file"],
+                    },
+                    _context("read_file"),
+                    0,
+                )
+
+        self.assertEqual("error", result["status"])
+        self.assertIn("invalid bounded output", result["error"])
+        self.assertIn("(length)", result["error"])
+        self.assertFalse(main_called)
+        self.assertTrue(attempts)
+        self.assertTrue(all(value <= 2 for value in attempts.values()))
+        self.assertTrue(any(value == 2 for value in attempts.values()))
+        persist.assert_not_called()
 
     async def test_second_required_result_failure_preserves_prior_audit_and_stops(self):
         async def fake_dispatch(name, args, *, context):

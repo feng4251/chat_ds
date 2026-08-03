@@ -254,6 +254,29 @@ version: "1"
             ],
         }
 
+    def _ordinal_compact_plan(self, document=None):
+        document = document or self._document()
+        plan = self._compact_plan(document)
+        catalog_document = workflow_plan_instruction_catalog_payload(
+            [document]
+        )["documents"][0]
+        ordinal_by_id = {
+            unit.id: unit_index + 1
+            for unit_index, unit in enumerate(document.units)
+        }
+        for node in plan["nodes"]:
+            node["instruction_ranges"] = [
+                {
+                    "document_id": catalog_document["document_id"],
+                    "start_ordinal": ordinal_by_id[
+                        item["start_instruction_id"]
+                    ],
+                    "end_ordinal": ordinal_by_id[item["end_instruction_id"]],
+                }
+                for item in node["instruction_ranges"]
+            ]
+        return plan
+
     def _validate(self, payload=None, document=None):
         document = document or self._document()
         return validate_workflow_ir(
@@ -401,10 +424,64 @@ version: "1"
         )
         self.assertLess(len(planning), len(exact))
         self.assertNotIn('"text":', planning)
+        self.assertNotIn('"id":', planning)
         self.assertIn("preview", planning)
+        compact_catalog = workflow_plan_instruction_catalog_payload([document])
+        compact_document = compact_catalog["documents"][0]
+        self.assertRegex(compact_document["document_id"], r"^doc-[0-9a-f]{24}$")
+        self.assertNotIn("source_sha256", compact_document)
+        self.assertNotIn("instruction_set_sha256", compact_document)
+        self.assertEqual(
+            list(range(1, len(document.units) + 1)),
+            [unit["ordinal"] for unit in compact_document["units"]],
+        )
+        self.assertEqual(
+            "document_id_and_one_based_inclusive_ordinals",
+            compact_catalog["policy"]["preferred_range_selector"],
+        )
         schema = workflow_plan_json_schema()
         self.assertNotIn("workflow_ir", json.dumps(schema))
         self.assertNotIn("coverage", schema["properties"])
+        range_schema = schema["properties"]["nodes"]["items"]["properties"][
+            "instruction_ranges"
+        ]["items"]
+        self.assertEqual(2, len(range_schema["oneOf"]))
+        self.assertEqual(
+            ["document_id", "start_ordinal", "end_ordinal"],
+            range_schema["oneOf"][0]["required"],
+        )
+        provider_schema = workflow_plan_json_schema(
+            include_legacy_instruction_id_ranges=False
+        )
+        provider_range_schema = provider_schema["properties"]["nodes"][
+            "items"
+        ]["properties"]["instruction_ranges"]["items"]
+        self.assertNotIn("oneOf", provider_range_schema)
+        self.assertNotIn(
+            "start_instruction_id", json.dumps(provider_range_schema)
+        )
+
+    def test_ordinal_selectors_late_bind_to_same_canonical_ir_as_legacy_ids(self):
+        document = self._document()
+        legacy = compile_workflow_plan(
+            self._compact_plan(document),
+            documents=[document],
+            skill_name="multilingual-workflow",
+            capability_catalog_sha256=CATALOG_SHA256,
+            available_capability_ids=CAPABILITIES,
+            mandatory_node_capability_ids=["cap-delegate"],
+        )
+        ordinal = compile_workflow_plan(
+            self._ordinal_compact_plan(document),
+            documents=[document],
+            skill_name="multilingual-workflow",
+            capability_catalog_sha256=CATALOG_SHA256,
+            available_capability_ids=CAPABILITIES,
+            mandatory_node_capability_ids=["cap-delegate"],
+        )
+
+        self.assertEqual(legacy.ir_sha256, ordinal.ir_sha256)
+        self.assertEqual(legacy.to_dict(), ordinal.to_dict())
 
     def test_compact_plan_permutations_compile_to_one_canonical_ir(self):
         document = self._document()
@@ -439,7 +516,7 @@ version: "1"
         self.assertEqual(canonical.ir_sha256, permuted.ir_sha256)
         self.assertEqual(canonical.to_dict(), permuted.to_dict())
 
-    def test_compact_plan_rejects_stale_cross_document_reversed_and_overlap(self):
+    def test_compact_plan_rejects_stale_cross_document_and_reversed_ranges(self):
         first = self._document()
         second = canonicalize_skill_markdown(
             "# Second\n\nRun a separate operation.\n",
@@ -454,6 +531,23 @@ version: "1"
         with self.assertRaises(WorkflowIRValidationError) as raised:
             compile_workflow_plan(
                 stale,
+                documents=[first],
+                skill_name="multilingual-workflow",
+                capability_catalog_sha256=CATALOG_SHA256,
+                available_capability_ids=CAPABILITIES,
+                mandatory_node_capability_ids=["cap-delegate"],
+            )
+        self.assertEqual(
+            "unknown_workflow_plan_instruction_id", raised.exception.code
+        )
+
+        hallucinated = copy.deepcopy(base)
+        hallucinated["nodes"][0]["instruction_ranges"][0][
+            "start_instruction_id"
+        ] = "iu-211"
+        with self.assertRaises(WorkflowIRValidationError) as raised:
+            compile_workflow_plan(
+                hallucinated,
                 documents=[first],
                 skill_name="multilingual-workflow",
                 capability_catalog_sha256=CATALOG_SHA256,
@@ -496,28 +590,213 @@ version: "1"
             )
         self.assertEqual("reversed_instruction_range", raised.exception.code)
 
-        overlap = copy.deepcopy(base)
-        executable = [unit for unit in first.units if unit.kind != "heading"]
-        overlap["nodes"][0]["instruction_ranges"] = [
-            {
-                "start_instruction_id": executable[0].id,
-                "end_instruction_id": executable[1].id,
-            },
-            {
-                "start_instruction_id": executable[1].id,
-                "end_instruction_id": executable[1].id,
-            },
-        ]
+        ordinal_reversed = self._ordinal_compact_plan(first)
+        ordinal_reversed["nodes"][0]["instruction_ranges"][0].update({
+            "start_ordinal": len(first.units),
+            "end_ordinal": 1,
+        })
         with self.assertRaises(WorkflowIRValidationError) as raised:
             compile_workflow_plan(
-                overlap,
+                ordinal_reversed,
                 documents=[first],
                 skill_name="multilingual-workflow",
                 capability_catalog_sha256=CATALOG_SHA256,
                 available_capability_ids=CAPABILITIES,
                 mandatory_node_capability_ids=["cap-delegate"],
             )
-        self.assertEqual("overlapping_instruction_range", raised.exception.code)
+        self.assertEqual("reversed_instruction_range", raised.exception.code)
+
+    def test_same_document_overlapping_and_adjacent_ranges_are_canonicalized(self):
+        document = self._document()
+        base = self._compact_plan(document)
+        executable = [unit for unit in document.units if unit.kind != "heading"]
+
+        coalesced = copy.deepcopy(base)
+        coalesced["nodes"][0]["instruction_ranges"] = [{
+            "start_instruction_id": executable[0].id,
+            "end_instruction_id": executable[1].id,
+        }]
+        overlapping = copy.deepcopy(coalesced)
+        overlapping["nodes"][0]["instruction_ranges"].append({
+            "start_instruction_id": executable[1].id,
+            "end_instruction_id": executable[1].id,
+        })
+        adjacent = copy.deepcopy(base)
+        adjacent["nodes"][0]["instruction_ranges"] = [
+            {
+                "start_instruction_id": executable[0].id,
+                "end_instruction_id": executable[0].id,
+            },
+            {
+                "start_instruction_id": executable[1].id,
+                "end_instruction_id": executable[1].id,
+            },
+        ]
+
+        compiled = [
+            compile_workflow_plan(
+                plan,
+                documents=[document],
+                skill_name="multilingual-workflow",
+                capability_catalog_sha256=CATALOG_SHA256,
+                available_capability_ids=CAPABILITIES,
+                mandatory_node_capability_ids=["cap-delegate"],
+            )
+            for plan in (coalesced, overlapping, adjacent)
+        ]
+        self.assertEqual(
+            {item.ir_sha256 for item in compiled},
+            {compiled[0].ir_sha256},
+        )
+
+        ordinal = self._ordinal_compact_plan(document)
+        catalog_document = workflow_plan_instruction_catalog_payload(
+            [document]
+        )["documents"][0]
+        ordinal["nodes"][0]["instruction_ranges"] = [
+            {
+                "document_id": catalog_document["document_id"],
+                "start_ordinal": 1,
+                "end_ordinal": 3,
+            },
+            {
+                "document_id": catalog_document["document_id"],
+                "start_ordinal": 3,
+                "end_ordinal": 4,
+            },
+        ]
+        compile_workflow_plan(
+            ordinal,
+            documents=[document],
+            skill_name="multilingual-workflow",
+            capability_catalog_sha256=CATALOG_SHA256,
+            available_capability_ids=CAPABILITIES,
+            mandatory_node_capability_ids=["cap-delegate"],
+        )
+
+    def test_ordinal_selector_rejects_stale_mixed_and_out_of_bounds_coordinates(self):
+        document = self._document()
+        base = self._ordinal_compact_plan(document)
+
+        stale = copy.deepcopy(base)
+        stale["nodes"][0]["instruction_ranges"][0]["document_id"] = (
+            "doc-000000000000000000000000"
+        )
+        with self.assertRaises(WorkflowIRValidationError) as raised:
+            compile_workflow_plan(
+                stale,
+                documents=[document],
+                skill_name="multilingual-workflow",
+                capability_catalog_sha256=CATALOG_SHA256,
+                available_capability_ids=CAPABILITIES,
+                mandatory_node_capability_ids=["cap-delegate"],
+            )
+        self.assertEqual(
+            "unknown_workflow_plan_document_id", raised.exception.code
+        )
+
+        fuzzy = copy.deepcopy(base)
+        fuzzy_range = fuzzy["nodes"][0]["instruction_ranges"][0]
+        fuzzy_range["document_id"] = " " + fuzzy_range["document_id"]
+        with self.assertRaises(WorkflowIRValidationError) as raised:
+            compile_workflow_plan(
+                fuzzy,
+                documents=[document],
+                skill_name="multilingual-workflow",
+                capability_catalog_sha256=CATALOG_SHA256,
+                available_capability_ids=CAPABILITIES,
+                mandatory_node_capability_ids=["cap-delegate"],
+            )
+        self.assertEqual("invalid_identifier", raised.exception.code)
+
+        mixed = copy.deepcopy(base)
+        mixed_range = mixed["nodes"][0]["instruction_ranges"][0]
+        mixed_range["start_instruction_id"] = document.units[0].id
+        with self.assertRaises(WorkflowIRValidationError) as raised:
+            compile_workflow_plan(
+                mixed,
+                documents=[document],
+                skill_name="multilingual-workflow",
+                capability_catalog_sha256=CATALOG_SHA256,
+                available_capability_ids=CAPABILITIES,
+                mandatory_node_capability_ids=["cap-delegate"],
+            )
+        self.assertEqual(
+            "invalid_workflow_plan_instruction_selector", raised.exception.code
+        )
+
+        outside = copy.deepcopy(base)
+        outside["nodes"][0]["instruction_ranges"][0]["end_ordinal"] = (
+            len(document.units) + 1
+        )
+        with self.assertRaises(WorkflowIRValidationError) as raised:
+            compile_workflow_plan(
+                outside,
+                documents=[document],
+                skill_name="multilingual-workflow",
+                capability_catalog_sha256=CATALOG_SHA256,
+                available_capability_ids=CAPABILITIES,
+                mandatory_node_capability_ids=["cap-delegate"],
+            )
+        self.assertEqual(
+            "unknown_workflow_plan_instruction_ordinal", raised.exception.code
+        )
+
+    def test_document_handles_fail_closed_across_rename_and_content_mutation(self):
+        original = canonicalize_skill_markdown(
+            "# Archive\n\nVerify the sealed accession record.\n",
+            source_path="references/archive.md",
+        )
+        renamed = canonicalize_skill_markdown(
+            "# Archive\n\nVerify the sealed accession record.\n",
+            source_path="references/renamed-archive.md",
+        )
+        mutated = canonicalize_skill_markdown(
+            "# Archive\n\nVerify the amended accession record.\n",
+            source_path="references/archive.md",
+        )
+        original_catalog = workflow_plan_instruction_catalog_payload([original])
+        original_id = original_catalog["documents"][0]["document_id"]
+        self.assertNotEqual(
+            original_id,
+            workflow_plan_instruction_catalog_payload([renamed])["documents"][0][
+                "document_id"
+            ],
+        )
+        self.assertNotEqual(
+            original_id,
+            workflow_plan_instruction_catalog_payload([mutated])["documents"][0][
+                "document_id"
+            ],
+        )
+        stale_plan = {
+            "schema_version": "1",
+            "nodes": [{
+                "id": "archive-review",
+                "kind": "verify",
+                "instruction_ranges": [{
+                    "document_id": original_id,
+                    "start_ordinal": 1,
+                    "end_ordinal": len(original.units),
+                }],
+                "depends_on": [],
+                "capability_ids": [],
+            }],
+        }
+        for current_document in (renamed, mutated):
+            with self.subTest(path=current_document.source_path):
+                with self.assertRaises(WorkflowIRValidationError) as raised:
+                    compile_workflow_plan(
+                        stale_plan,
+                        documents=[current_document],
+                        skill_name="archive-review",
+                        capability_catalog_sha256=CATALOG_SHA256,
+                        available_capability_ids=["cap-delegate"],
+                        mandatory_node_capability_ids=["cap-delegate"],
+                    )
+                self.assertEqual(
+                    "unknown_workflow_plan_document_id", raised.exception.code
+                )
 
     def test_nonmedical_long_skill_compiles_from_coalesced_ranges(self):
         sections = []

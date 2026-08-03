@@ -206,8 +206,10 @@ SUBMIT_SKILL_CAPABILITY_PLAN_SCHEMA: dict[str, Any] = {
         "submit one replacement plan with its exact catalog_sha256. This tool "
         "cannot create grants. When the catalog says workflow_ir_required, "
         "submit the compact workflow_plan against its exact instruction "
-        "index; the runtime compiles the complete Workflow IR. Legacy direct "
-        "callers may still submit workflow_ir, but never both."
+        "index. Prefer its content-addressed document_id plus one-based ordinal "
+        "ranges; the runtime late-binds exact frozen instruction IDs and compiles "
+        "the complete Workflow IR. Direct callers may still submit workflow_ir, "
+        "but never both workflow payloads."
     ),
     "parameters": {
         "type": "object",

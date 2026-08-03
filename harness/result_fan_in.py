@@ -26,7 +26,7 @@ from typing import Any, Mapping, Sequence
 DEFAULT_PRELOAD_BYTE_ALLOWANCE = 512 * 1024
 FAN_IN_PLANNER_VERSION = "fan-in-planner-v2"
 FAN_IN_CONTRACT_VERSION = "chatds-bounded-fan-in-v1"
-FAN_IN_OUTPUT_POLICY_VERSION = "semantic-reduction-policy-v2"
+FAN_IN_OUTPUT_POLICY_VERSION = "semantic-reduction-policy-v3"
 _BATCH_FIXED_TOKENS = 64
 _BATCH_FIXED_BYTES = 256
 _ITEM_FRAMING_TOKENS = 32
@@ -443,6 +443,7 @@ def _derive_reduction_budget(
     reduction_byte_allowance: int | None,
     base_prompt_tokens: int,
     output_reserve_tokens: int,
+    reduction_output_reserve_tokens: int | None,
     system_tool_reserve_tokens: int,
     framing_reserve_tokens: int,
 ) -> FanInBudget:
@@ -454,6 +455,7 @@ def _derive_reduction_budget(
             reduction_provider_config,
             reduction_token_allowance,
             reduction_byte_allowance,
+            reduction_output_reserve_tokens,
         )
     )
     if not independent:
@@ -497,12 +499,21 @@ def _derive_reduction_budget(
             else final_budget.input_byte_allowance
         )
 
+    effective_output_reserve_tokens = (
+        output_reserve_tokens
+        if reduction_output_reserve_tokens is None
+        else _nonnegative_int(
+            reduction_output_reserve_tokens,
+            "reduction_output_reserve_tokens",
+        )
+    )
+
     return derive_fan_in_budget(
         config,
         token_allowance=reducer_tokens,
         byte_allowance=reducer_bytes,
         base_prompt_tokens=base_prompt_tokens,
-        output_reserve_tokens=output_reserve_tokens,
+        output_reserve_tokens=effective_output_reserve_tokens,
         system_tool_reserve_tokens=system_tool_reserve_tokens,
         framing_reserve_tokens=framing_reserve_tokens,
     )
@@ -519,6 +530,7 @@ def plan_persisted_result_fan_in(
     reduction_byte_allowance: int | None = None,
     base_prompt_tokens: int = 0,
     output_reserve_tokens: int = _DEFAULT_OUTPUT_RESERVE_TOKENS,
+    reduction_output_reserve_tokens: int | None = None,
     system_tool_reserve_tokens: int = _DEFAULT_SYSTEM_TOOL_RESERVE_TOKENS,
     framing_reserve_tokens: int = _DEFAULT_MESSAGE_FRAMING_RESERVE_TOKENS,
     workspace_root: str | Path | None = None,
@@ -568,6 +580,7 @@ def plan_persisted_result_fan_in(
         reduction_byte_allowance=reduction_byte_allowance,
         base_prompt_tokens=base_prompt_tokens,
         output_reserve_tokens=output_reserve_tokens,
+        reduction_output_reserve_tokens=reduction_output_reserve_tokens,
         system_tool_reserve_tokens=system_tool_reserve_tokens,
         framing_reserve_tokens=framing_reserve_tokens,
     )
@@ -1347,8 +1360,19 @@ def _safe_reduction_output_allowance(
     explicit_bytes = _optional_positive_int(
         requested_bytes, "reduction_output_bytes"
     )
-    output_tokens = min(explicit_tokens or token_cap, token_cap)
-    output_bytes = min(explicit_bytes or output_tokens * 4, byte_cap)
+    # UTF-8 bytes and provider tokens are independent bounds.  In particular,
+    # CJK and compact JSON can consume roughly one token per character while
+    # each character occupies multiple UTF-8 bytes.  When the caller declares
+    # only a byte contract, deriving the token ceiling as ``bytes / 4`` (or
+    # retaining an unrelated 8K default) can therefore truncate an otherwise
+    # byte-valid result.  A response cannot contain more tokens than bytes, so
+    # the byte allowance is a conservative, provider-neutral token ceiling.
+    provisional_tokens = min(explicit_tokens or token_cap, token_cap)
+    output_bytes = min(
+        explicit_bytes or provisional_tokens * 4,
+        byte_cap,
+    )
+    output_tokens = min(provisional_tokens, output_bytes)
     return output_tokens, output_bytes
 
 
