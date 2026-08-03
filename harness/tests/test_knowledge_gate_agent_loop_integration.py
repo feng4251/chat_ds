@@ -984,6 +984,219 @@ class KnowledgeGateAgentLoopIntegrationTests(
             event.get("event_type") == "run.failed" for event in events
         ), events)
 
+    async def test_shared_http_coordinate_requires_exact_pending_candidate(self):
+        """One URL shared by two OR-groups cannot be assigned by grant order."""
+
+        skill_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(skill_temp.cleanup)
+        skill_root = Path(skill_temp.name) / "portable-adapter"
+        skill_root.mkdir()
+        skill_main = skill_root / "SKILL.md"
+        skill_main.write_text("# Portable Adapter\n", encoding="utf-8")
+        main_sha256 = hashlib.sha256(skill_main.read_bytes()).hexdigest()
+        package_sha256 = compute_skill_package_digest(skill_root)
+        shared_prefix = "https://shared.example.test:443/api/"
+        shared_url = shared_prefix + "records?topic=portable"
+        candidates = [
+            {
+                "candidate_id": candidate_id,
+                "kind": "skill_http_prefix",
+                "tool_name": "skill_http_get",
+                "tool_names": ["skill_http_get"],
+                "skill_name": "portable-adapter",
+                "skill_md_sha256": main_sha256,
+                "package_sha256": package_sha256,
+                "url_prefix": shared_prefix,
+                "http_method": "GET",
+            }
+            for candidate_id in ("candidate-alpha", "candidate-beta")
+        ]
+        plan = {
+            "schema_version": 1,
+            "worker_id": "worker-portable",
+            "owner_skill": "portable-adapter",
+            "checks": [{
+                "id": "independent-evidence",
+                "question": "Are both independent receipts required?",
+                "branches": [{
+                    "outcome": "yes",
+                    "action": "Acquire two separately attributed receipts.",
+                    "group_ids": ["group-alpha", "group-beta"],
+                }],
+                "legacy_ambiguous": False,
+            }],
+            "groups": [
+                {
+                    "id": "group-alpha",
+                    "check_id": "independent-evidence",
+                    "outcome": "yes",
+                    "mode": "one_of",
+                    "candidate_ids": ["candidate-alpha"],
+                    "selectors": ["alpha-source"],
+                    "unresolved_selectors": [],
+                },
+                {
+                    "id": "group-beta",
+                    "check_id": "independent-evidence",
+                    "outcome": "yes",
+                    "mode": "one_of",
+                    "candidate_ids": ["candidate-beta"],
+                    "selectors": ["beta-source"],
+                    "unresolved_selectors": [],
+                },
+            ],
+            "candidates": candidates,
+        }
+        digest = canonical_json_sha256(plan)
+        authority = _empty_authority(candidates)
+        authority["http_get_grants"] = [
+            ("portable-adapter", shared_prefix),
+        ]
+        authority["package_grants"] = [
+            ("portable-adapter", package_sha256),
+        ]
+        dispatched_candidate_ids: list[str] = []
+
+        async def fake_dispatch(name, args, *, context):
+            if name != "skill_http_get":
+                return await native_registry_dispatch(
+                    name, args, context=context,
+                )
+            dispatched_candidate_ids.append(str(args.get("candidate_id") or ""))
+            self.assertEqual(
+                (("portable-adapter", shared_prefix),),
+                context.allowed_skill_http_prefixes,
+            )
+            return json.dumps({
+                "status": "success",
+                "request_sent": True,
+                "request_number": len(dispatched_candidate_ids),
+                "root_request_number": len(dispatched_candidate_ids),
+                "matched_skill": "portable-adapter",
+                "matched_prefix_sha256": hashlib.sha256(
+                    canonical_https_prefix(shared_prefix).encode("utf-8")
+                ).hexdigest(),
+                "http_status": 200,
+            })
+
+        bodies, events = await self._run(
+            [
+                _tool_call_response(
+                    "submit_knowledge_gate_decisions",
+                    {
+                        "plan_sha256": digest,
+                        "decisions": [{
+                            "check_id": "independent-evidence",
+                            "outcome": "yes",
+                            "reason": "Both receipts are independently required.",
+                        }],
+                    },
+                    call_id="call-decision",
+                ),
+                _tool_call_response(
+                    "skill_http_get",
+                    {"url": shared_url, "max_chars": 10_000},
+                    call_id="call-ambiguous",
+                ),
+                _tool_call_response(
+                    "skill_http_get",
+                    {
+                        "url": shared_url,
+                        "max_chars": 10_000,
+                        "candidate_id": "candidate-alpha",
+                    },
+                    call_id="call-alpha",
+                ),
+                _tool_call_response(
+                    "skill_http_get",
+                    {
+                        "url": shared_url,
+                        "max_chars": 10_000,
+                        "candidate_id": "candidate-alpha",
+                    },
+                    call_id="call-completed-alpha",
+                ),
+                _tool_call_response(
+                    "skill_http_get",
+                    {
+                        "url": shared_url,
+                        "max_chars": 10_000,
+                        "candidate_id": "candidate-beta",
+                    },
+                    call_id="call-beta",
+                ),
+                _stop_response(
+                    "status: PASS\nBoth exact candidate receipts are present."
+                ),
+            ],
+            plan=plan,
+            authority=authority,
+            allow_session_mcp=False,
+            enabled_tools=[
+                "skill_http_get",
+                "submit_knowledge_gate_decisions",
+            ],
+            extra_run_kwargs={
+                "allowed_skill_http_prefixes": (
+                    ("portable-adapter", shared_prefix),
+                ),
+            },
+            native_dispatch=fake_dispatch,
+            max_iterations=6,
+            resolved_skill_path=skill_main,
+            debug_trace=True,
+        )
+
+        self.assertEqual(
+            ["candidate-alpha", "candidate-beta"],
+            dispatched_candidate_ids,
+        )
+        first_http_schema = bodies[1]["tools"][0]["function"]["parameters"]
+        self.assertIn("candidate_id", first_http_schema["required"])
+        self.assertEqual(
+            ["candidate-alpha", "candidate-beta"],
+            first_http_schema["properties"]["candidate_id"]["enum"],
+        )
+        after_alpha_schema = bodies[3]["tools"][0]["function"]["parameters"]
+        self.assertEqual(
+            ["candidate-beta"],
+            after_alpha_schema["properties"]["candidate_id"]["enum"],
+        )
+        rejected = [
+            event["payload"] for event in events
+            if event.get("event_type")
+            == "debug.knowledge_gate.candidate.preflight_rejected"
+        ]
+        self.assertEqual(
+            ["ambiguous_candidate_binding", "candidate_not_pending"],
+            [event["reason"] for event in rejected],
+        )
+        bound = [
+            event["payload"] for event in events
+            if event.get("event_type")
+            == "debug.knowledge_gate.candidate.bound"
+        ]
+        self.assertEqual(
+            ["candidate-alpha", "candidate-beta"],
+            [event["candidate_id"] for event in bound],
+        )
+        receipts = [
+            event["payload"] for event in events
+            if event.get("event_type")
+            == "debug.knowledge_gate.group.receipt"
+        ]
+        self.assertEqual(
+            {"candidate-alpha", "candidate-beta"},
+            {
+                str(event.get("candidate_id") or "")
+                for event in receipts
+                if event.get("first_transition") is True
+            },
+        )
+        self.assertFalse(any(
+            event.get("event_type") == "run.failed" for event in events
+        ), events)
+
     async def test_corrupt_replan_preserves_pending_mandatory_gate_frontier(self):
         candidates = [
             {

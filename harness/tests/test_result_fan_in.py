@@ -16,6 +16,41 @@ from result_fan_in import (
 
 
 class ResultFanInPlannerTests(unittest.TestCase):
+    def test_derived_byte_envelope_preserves_multilingual_downstream_capacity(self):
+        """A consumer-fit body must not be rejected by a fixed 32 KiB cap."""
+
+        plan = plan_persisted_result_fan_in(
+            [
+                {
+                    "result_id": f"warehouse-ledger-{index}",
+                    "path": f"results/warehouse/{index}.md",
+                    "content": (
+                        f"库存批次{index} 状态 关系 不确定性。\n" * 1_200
+                    ),
+                }
+                for index in range(8)
+            ],
+            token_allowance=10_330,
+            byte_allowance=676_388,
+            reduction_token_allowance=100_000,
+            reduction_byte_allowance=1024 * 1024,
+            reduction_output_reserve_tokens=15_495,
+            reduction_output_tokens=10_330,
+            # No unrelated artifact byte constant: the planner derives the
+            # byte envelope from token capacity and the exact downstream and
+            # merge metadata budgets.
+            reduction_output_bytes=None,
+        )
+
+        self.assertEqual("rolling_reduction", plan.mode)
+        self.assertGreater(plan.output_policy.max_tokens, 9_440)
+        self.assertLessEqual(plan.output_policy.max_tokens, 10_330)
+        self.assertEqual(
+            plan.output_policy.max_tokens * 4,
+            plan.output_policy.max_bytes,
+        )
+        self.assertGreater(plan.output_policy.max_bytes, 37_574)
+
     def test_single_reducer_output_accounts_for_exact_source_identifiers(self):
         """Planner-issued output bounds must fit their real final envelope.
 

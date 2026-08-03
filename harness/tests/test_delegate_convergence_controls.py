@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 from agent_loop import (
     DirectToolExposure,
+    _deterministic_http_client_failure,
     _delegated_success_no_progress_candidate,
     _workspace_debug_record,
     run_stream,
@@ -342,6 +343,31 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
             **common,
         ))
 
+    def test_terminal_http_classifier_preserves_retryable_failures(self):
+        base = {
+            "status": "error",
+            "request_sent": True,
+            "error_code": "http_status_error",
+        }
+        for status in (400, 401, 403, 404, 422, 451):
+            self.assertEqual(
+                status,
+                _deterministic_http_client_failure(
+                    "skill_http_get", {**base, "http_status": status}
+                )["http_status"],
+            )
+        for status in (408, 409, 425, 429, 500, 503):
+            self.assertIsNone(_deterministic_http_client_failure(
+                "skill_http_get", {**base, "http_status": status}
+            ))
+        self.assertIsNone(_deterministic_http_client_failure(
+            "skill_http_get",
+            {**base, "http_status": 404, "request_sent": False},
+        ))
+        self.assertIsNone(_deterministic_http_client_failure(
+            "web_extract", {**base, "http_status": 404}
+        ))
+
     def test_workspace_debug_renames_inner_terminal_candidate(self):
         record = _workspace_debug_record({
             "event_type": "run.completed",
@@ -453,6 +479,94 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
             event.get("event_type") == "run.failed"
             for event in events
         ))
+
+    async def test_identical_terminal_http_4xx_is_blocked_before_replay(self):
+        first_url = "https://api.vendor.test/records?query=portable"
+        changed_url = first_url + "&page=2"
+        responses = [
+            _tool_call_response(
+                "call-terminal-404",
+                tool_name="skill_http_get",
+                arguments={"url": first_url, "max_chars": 40_000},
+            ),
+            _tool_call_response(
+                "call-terminal-404-replay",
+                tool_name="skill_http_get",
+                arguments={"url": first_url, "max_chars": 40_000},
+            ),
+            _tool_call_response(
+                "call-changed-http-request",
+                tool_name="skill_http_get",
+                arguments={"url": changed_url, "max_chars": 40_000},
+            ),
+            _stop_response(
+                "status: WARN\nEvidence: changed bounded request succeeded\n"
+                "Gap: the original exact request returned HTTP 404"
+            ),
+        ]
+        first_failure = json.dumps({
+            "status": "error",
+            "request_sent": True,
+            "request_number": 1,
+            "root_request_number": 1,
+            "matched_skill": "evidence-api",
+            "matched_prefix_sha256": hashlib.sha256(
+                "https://api.vendor.test:443/records".encode("utf-8")
+            ).hexdigest(),
+            "url": first_url,
+            "http_status": 404,
+            "error_code": "http_status_error",
+            "error": "Skill endpoint returned HTTP 404.",
+        })
+        changed_success = _http_success_result(
+            changed_url,
+            '{"items":[{"id":"portable"}]}',
+            request_number=2,
+        )
+
+        request_bodies, dispatch_mock, events, _persisted = await self._run(
+            responses,
+            max_iterations=5,
+            dispatch_result="",
+            dispatch_results=[first_failure, changed_success],
+            tools=["skill_http_get"],
+            schemas=self.http_schema,
+            allowed_skill_http_prefixes=[(
+                "evidence-api", "https://api.vendor.test/records"
+            )],
+        )
+
+        self.assertFalse(responses)
+        self.assertEqual(2, dispatch_mock.await_count)
+        self.assertEqual(
+            [first_url, changed_url],
+            [call.args[1]["url"] for call in dispatch_mock.await_args_list],
+        )
+        terminal = [
+            event["payload"] for event in events
+            if event.get("event_type")
+            == "debug.http.invocation_terminal"
+        ]
+        blocked = [
+            event["payload"] for event in events
+            if event.get("event_type")
+            == "debug.http.invocation_replay_blocked"
+        ]
+        self.assertEqual(1, len(terminal))
+        self.assertEqual(404, terminal[0]["http_status"])
+        self.assertEqual(1, len(blocked))
+        self.assertFalse(blocked[0]["actual_dispatch_attempted"])
+        self.assertEqual(
+            terminal[0]["argument_sha256"],
+            blocked[0]["argument_sha256"],
+        )
+        self.assertIn(
+            "deterministic_http_failure_replay",
+            json.dumps(request_bodies[2]["messages"], ensure_ascii=False),
+        )
+        self.assertFalse(any(
+            event.get("event_type") == "run.failed" for event in events
+        ), events)
         self.assertEqual(
             {"type": "done", "finish_reason": "stop"},
             events[-1],

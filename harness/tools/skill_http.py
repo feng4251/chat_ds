@@ -627,9 +627,19 @@ async def skill_http_get(
     url: str,
     max_chars: int = DEFAULT_MAX_CHARS,
     timeout: int = DEFAULT_TIMEOUT,
+    candidate_id: str | None = None,
     context: ToolContext | None = None,
 ) -> str:
-    """GET one exact Skill-declared HTTPS endpoint through a pinned resolver."""
+    """GET one exact Skill-declared HTTPS endpoint through a pinned resolver.
+
+    ``candidate_id`` is a model-visible routing handle only.  The AgentLoop
+    validates it against the immutable active Knowledge Gate frontier and
+    narrows ``context`` to that candidate's already-authorized grant before
+    this handler is entered.  It can never create or widen HTTP authority.
+    Ordinary non-gated calls may omit it.
+    """
+
+    del candidate_id
 
     try:
         require_execution_authority(
@@ -954,6 +964,7 @@ async def skill_http_get(
                     current,
                     max_chars=max_chars,
                     timeout=retry_timeout,
+                    candidate_id=None,
                     context=context,
                 )
             finally:
@@ -986,6 +997,7 @@ async def skill_http_post_json(
     body: dict[str, Any],
     max_chars: int = DEFAULT_MAX_CHARS,
     timeout: int = DEFAULT_TIMEOUT,
+    candidate_id: str | None = None,
     context: ToolContext | None = None,
 ) -> str:
     """POST one bounded JSON object to an exact Skill-declared HTTPS grant.
@@ -995,6 +1007,10 @@ async def skill_http_post_json(
     redirects fail closed because 301/302/303 can rewrite the method and even
     307/308 would repeat a potentially state-changing request.
     """
+
+    # See ``skill_http_get``: this identifier is validated and consumed by
+    # orchestration.  The bridge relies only on runtime-owned narrowed grants.
+    del candidate_id
 
     try:
         require_execution_authority(
@@ -1313,6 +1329,17 @@ RUN_SKILL_HTTP_GET_SCHEMA = {
                 "maximum": MAX_TIMEOUT,
                 "default": DEFAULT_TIMEOUT,
             },
+            "candidate_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+                "description": (
+                    "Exact runtime-listed Knowledge Gate candidate handle. "
+                    "Required only when the current pending frontier schema "
+                    "marks it required; it never grants network authority."
+                ),
+            },
         },
         "required": ["url"],
         "additionalProperties": False,
@@ -1358,6 +1385,17 @@ RUN_SKILL_HTTP_POST_JSON_SCHEMA = {
                 "minimum": 1,
                 "maximum": MAX_TIMEOUT,
                 "default": DEFAULT_TIMEOUT,
+            },
+            "candidate_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+                "description": (
+                    "Exact runtime-listed Knowledge Gate candidate handle. "
+                    "Required only when the current pending frontier schema "
+                    "marks it required; it never grants network authority."
+                ),
             },
         },
         "required": ["url", "body"],

@@ -19,6 +19,7 @@ from tools.delegation import (
     _required_output_has_status,
     _fan_in_provider_deadline_seconds,
     _fan_in_generation_output_tokens,
+    _fan_in_reducer_output_allowances,
     _fan_in_retryable_output_failure,
     _fan_in_weighted_wave_concurrency,
     _is_parent_owned_workspace_audit,
@@ -169,6 +170,62 @@ def _catalog_for_bindings(
 
 
 class DelegationToolPolicyTests(unittest.TestCase):
+    def test_fan_in_output_contract_follows_downstream_and_provider_capacity(self):
+        unknown = _context()
+        self.assertEqual(
+            (10_330, None),
+            _fan_in_reducer_output_allowances(
+                unknown,
+                downstream_token_allowance=10_330,
+            ),
+        )
+        self.assertEqual(
+            (32 * 1024, None),
+            _fan_in_reducer_output_allowances(
+                unknown,
+                downstream_token_allowance=90_000,
+            ),
+        )
+
+        declared = replace(
+            unknown,
+            provider_config={
+                **unknown.provider_config,
+                "max_output_tokens": 86_400,
+            },
+        )
+        self.assertEqual(
+            (42_000, None),
+            _fan_in_reducer_output_allowances(
+                declared,
+                downstream_token_allowance=42_000,
+            ),
+        )
+        narrow = replace(
+            unknown,
+            provider_config={
+                **unknown.provider_config,
+                "max_completion_tokens": 9_000,
+            },
+        )
+        self.assertEqual(
+            (6_000, None),
+            _fan_in_reducer_output_allowances(
+                narrow,
+                downstream_token_allowance=42_000,
+            ),
+        )
+        for invalid in (0, -1, True):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "downstream_token_allowance",
+                ):
+                    _fan_in_reducer_output_allowances(
+                        unknown,
+                        downstream_token_allowance=invalid,
+                    )
+
     def test_fan_in_control_events_are_durable_workspace_audit_records(self):
         for event_type in (
             "fan_in.planned",
