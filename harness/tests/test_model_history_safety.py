@@ -346,6 +346,8 @@ class ModelHistorySafetyTests(unittest.TestCase):
             "accepted_output_tokens": 9977,
             "generation_output_tokens": 14966,
             "generation_headroom_tokens": 4989,
+            "previous_output_estimated_tokens": 13236,
+            "discarded_output_estimated_tokens": 9971,
             "nested": {
                 "max_output_tokens": "secret-shaped-nonnumeric-value",
                 "max_completion_tokens": None,
@@ -360,6 +362,8 @@ class ModelHistorySafetyTests(unittest.TestCase):
         self.assertEqual(9977, payload["accepted_output_tokens"])
         self.assertEqual(14966, payload["generation_output_tokens"])
         self.assertEqual(4989, payload["generation_headroom_tokens"])
+        self.assertEqual(13236, payload["previous_output_estimated_tokens"])
+        self.assertEqual(9971, payload["discarded_output_estimated_tokens"])
         self.assertEqual("[redacted]", payload["nested"]["max_output_tokens"])
         self.assertIsNone(payload["nested"]["max_completion_tokens"])
         self.assertEqual("[redacted]", payload["access_token"])
