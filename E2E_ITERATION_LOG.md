@@ -1273,3 +1273,114 @@ projection/validation 问题。
 Round 9 至此完成“两项独立 E2E terminal → exact 三源诊断 → 官方成熟实现对照 → 通用复现与修复
 → 完整回归 → local commit → clean-archive 生产切换”的闭环。生产当前空闲，可开始 Round 10；
 新的两个 case 必须继续顺序运行并使用全新 conversation/root。
+
+## Round 10：snapshot-local 计划选择器与可恢复 fan-in attempt
+
+### 两个独立 case 与唯一终态
+
+- V2.3 case 使用 Conversation `bc632e897c384f34bfec3433fd477bbe`、root
+  `d66b7e4017234ff1853fa7f35dc9224f`。它达到唯一 durable `run.failed`，不是浏览器断线、
+  根任务取消、网站统一不可达或普通 worker 未启动：前序 worker 均已成功，最终 I/E Criteria
+  child 在读取 required predecessors 的 fan-in 阶段失败。旧 reducer 一次收到约 93,375 input
+  tokens，却仍被固定为 8,192 output tokens 与 240 秒 step timeout；provider 实际运行约
+  235.86 秒后以 `length` 结束。旧主循环还把内部 reducer 当成普通 Agent 回复，错误启动了
+  artifact/report verifier，混淆了“内部 reduction attempt 终止”和“外层 Skill 产物可验收”。
+- 肺癌 MDT case 使用 Conversation `cb7515fad602405da4b873ccc37a9ecc`、root
+  `09b907e90e534e139bf81424220d3abb`。它在零 worker/tool/artifact dispatch 前耗尽三次
+  capability-plan semantic budget：模型第一次复制 unknown opaque instruction ID，第二次形成
+  overlapping range，第三次又幻觉出 `iu-211`。模型表达的角色/依赖意图总体合理；失败边界是
+  provider schema 要求模型复制 Harness 内部 hash-like identity，而不是 Skill route、沙箱、网络
+  或子 Agent 运行失败。
+- 两个 case 都按持久化对话、当时 exact Skill/package/resource、workspace debug/AgentRun/tool/
+  provider/artifact event 三源交叉取证；本轮没有把前端最后一条提示当根因，也没有把其中一个
+  case 的业务名、疾病、文件名、session ID、worker 数或 93,375-token 样本写进生产策略。
+
+### 模拟人工追问后的通用不变量
+
+1. **模型可见选择器只能引用冻结 snapshot 内的短身份。** instruction range 的首选 wire contract
+   改为 `{document_id,start_ordinal,end_ordinal}`；`document_id` 由冻结 document binding
+   内容寻址生成，ordinal 只在该 snapshot 内有效。runtime 再精确 late-bind 到 canonical
+   instruction ID。unknown/stale/fuzzy/mixed/reversed/cross-document 均 fail closed；同节点同文档
+   相邻/重叠区间由编译器 canonicalize。旧 internal ID contract 只保留给兼容直接调用者，不再
+   暴露给 provider planner。
+2. **provider schema 必须精确约束当前 catalog generation。** model-facing schema 以 enum/const
+   固定 `skill_name`、`body_sha256`、`catalog_sha256`、可选 document handle、候选 capability ID；
+   无候选数组的 `maxItems=0`。纯 instruction/simple Skill 完全不暴露 `workflow_plan`，不制造无法
+   收窄 authority 的空控制事务。任何 rename/content mutation 都产生新的 document handle，旧
+   ordinal 不能静默重绑。
+3. **fan-in attempt 与外层 Agent 生命周期分权。** 每个 reducer attempt 有独立 run ID、input/
+   output budget、deadline、权威 failed/succeeded terminal；Backend 将其持久化为 nested
+   `delegate_reducer`，不会覆盖 root primary。reducer 使用 `internal_bounded_text` lifecycle：
+   tools/session/MCP/artifact authority 全关、ordinary artifact verifier 禁止。
+4. **大 fan-in 的 deadline 必须覆盖 admission queue。** output cap 由 provider capacity 与 32 KiB
+   byte contract 推导，不再固定 8K；absolute Schedule-to-Close 是唯一最终边界，排队不重置期限，
+   单步 fair-share 不会提前杀死健康请求。weighted concurrency 与普通 provider admission 使用同一
+   `ProviderAdmissionLimits + estimate_admission_tokens` 公式；超大请求保留 controller 语义并独占
+   一个 slot，而不是在 fan-in 前新增特判拒绝。
+5. **只有纯 output-contract failure 可做一次 complete replacement。** length、empty、byte
+   oversize、raw tool protocol 和 structured coverage invalid 可在 tools-closed reducer 上做一次
+   全量替换；rejected body 从不成为 continuation anchor。network/cancel/unknown 不重放，已完成
+   predecessor 与外层副作用不重跑。acceptance validator 在 materialization 前后各验证一次。
+
+### 成熟官方源码/文档对照
+
+本轮扩展并复核的冻结官方 revisions 为 Deep Agents
+`46ee772b45e1d80e65c26524b0ef05914a503533`、OpenClaw
+`98c0d9deca5dff8346677c2a5ae5824301cb3516`、Hermes Agent
+`a4a91610b05acc75b4d76c077a5cd89c1ee066ba`、Codex
+`2b5bdcf67547860f2e5c5a605009a70026796b2b`；Claude Code runtime 没有官方完整开源实现，
+因此只使用 2026-08-03 的官方文档，不把第三方复刻当源码 ground truth。
+
+| 问题 | 官方实现证据 | 本轮决策 |
+|---|---|---|
+| 大 catalog 延迟披露 | OpenClaw `tool-search.ts` / `tool-search-catalog.ts` / `tool-search-runtime.ts` 使用 compact id、search/describe/call、exact-or-unique binding 和执行前后 schema validation；Codex `tool_search.rs`/`tools/context.rs` 把选中完整 schema 注入下一轮并最终绑定 raw MCP server/tool；Hermes `tools/tool_search.py` 做预算式 full→names→group disclosure 和 current-scope late binding；Claude Code Tool Search 文档声明 top 3–5 与按需 schema | **adopt/adapt** compact shortlist、constrained selection、canonical/raw 两段 binding；ChatDS 自行持久化 snapshot digest/epoch/receipt。拒绝让模型复制 hash suffix 或把 ordinal 当跨版本永久身份 |
+| typed subagent 与大结果 | Deep Agents `middleware/subagents.py` 支持 `response_format`，`_message_eviction.py` 将大 tool result 落盘；Hermes `delegate_tool.py` 稳定排序、父余量÷N、完整 summary spill | **adapt** typed partial/artifact pointer；保留 ChatDS 自己的 path/size/SHA/current-attempt receipt，拒绝最后一条 AI prose 作为完成证明 |
+| reducer deadline/terminal | OpenClaw `subagent-run-timeout.ts`、`subagent-registry-run-manager.ts` 与 completion capture 提供 absolute deadline、typed timeout/output-limit、execution/outcome/capture settle；Hermes `subagent_lifecycle.py` 有 immutable handle/result hash/typed terminal | **adopt** absolute deadline 和 attempt terminal；ChatDS 编译 exact all-of barrier 与局部 reducer recovery，拒绝 execution-ok 等同 reducer acceptance |
+| barrier/checkpoint | Codex legacy `multi_agents/wait.rs` 是 first-final，不是 all-of；Claude Code agent teams 有 dependency/claim，但官方明确 status 可滞后且 in-process teammate 不可完整 resume；其 checkpoint 只覆盖直接文件编辑 | **reject** 把 `wait_agent`、task files 或 rewind 当 durable reducer checkpoint；继续使用 ChatDS WorkflowIR、predecessor receipt、durable event 与 exactly-one root terminal |
+| 现成框架替换 | Deep Agents 顶层 `create_deep_agent` 仍把完整 tools 交给 agent，checkpointer 只是传给 LangGraph；上述实现都不自动生成 hierarchical reducer tree，也不同时提供 Skill content authority、session filesystem boundary、egress policy 与 artifact receipt | 继续组件级 **adapt behind existing authority/receipt contracts**，不整体换栈、不再闭门猜机制 |
+
+官方入口：
+
+- Deep Agents：<https://github.com/langchain-ai/deepagents>
+- OpenClaw：<https://github.com/openclaw/openclaw>
+- Hermes：<https://github.com/NousResearch/hermes-agent>
+- Codex：<https://github.com/openai/codex>
+- Claude Code Tool Search / Agent Teams / Checkpointing：
+  <https://code.claude.com/docs/en/agent-sdk/tool-search>、
+  <https://code.claude.com/docs/en/agent-teams>、
+  <https://code.claude.com/docs/en/checkpointing>
+
+### 回归、提交、模型兼容性与生产切换
+
+- Round10 通用修复提交为
+  `45e131e3422dbb611ea79b3578dda8d5ad65ae82 fix: bound generic planning and fan-in lifecycles`。
+  生产代码 genericity scan 对业务/会话/固定样本字面量为 0；credential-like added line 为 0。
+- Backend 全量为 `237 passed`。隔离 root Harness 在排除生产 Harness 镜像按设计不含 Node 的
+  唯一 CommonJS 环境项后为 `1925 passed, 1 deselected, 800 subtests passed`；该 exact 项在
+  宿主 Node 22.23.1 下 `1 passed`，组合覆盖全部 1,926 项。定向 planning/fan-in/schema/lifecycle
+  组合、`py_compile`、Compose config 与 `git diff --check` 通过。
+- 用户随后要求暂停下一轮双 Skill E2E，增加 Shaiengine 的 `glm-5.2` 与
+  `deepseek-v4-pro`。两模型的 OpenAI nonstream/stream、强制 tool call、完整 JSON arguments、
+  usage terminal 与 thinking enabled/disabled 均真实通过；启用时返回 `reasoning_content`，禁用时
+  reasoning 为 0。Anthropic Messages 的 text/tool stream 也可用，但 tools turn 对
+  `thinking.type=disabled` 仍发 `thinking_delta`，且 nonstream 不披露 thinking block，因此生产主
+  transport 选择 OpenAI compatibility。wire projection 按 provider 显式区分
+  `thinking_object` 与 vLLM `chat_template_kwargs`，不再用一个 capability bit 猜请求格式。
+- 模型接入提交为
+  `0108c664443665b5748f2c3933f420ac79f9190d feat: add compatible remote agent models`。
+  新默认为 `shaiengine_glm_5_2 -> glm-5.2`；历史 `AgentModel` 永久保留
+  `deepseek_v4_pro -> local AgentModel`，默认切换不会重绑旧会话。API key 只存在于权限 0600
+  的生产 `.env`/受限 local secret，不在 Git、文档、日志或 debug 中。
+- clean archive `/tmp/chat_ds_deploy_0108c664.BpAKFl` 与 Git tree 均为精确 22,452 files。
+  Harness/Backend 候选 image 分别为
+  `sha256:10d65e46efb53a7698a92d2c4835f149131e485bce5855276aff56cf6af457a8`、
+  `sha256:1adb71c272df3b3f52cec172e4df7cbdac24d9b8c6d877e7fe9be841c5505b3d`，revision label
+  都精确为 `0108c664...`。部署前连续两次确认 nonterminal root/run、running/enabled schedule、
+  5173 established connection 均为 0，SQLite/FK 正常；只按 Harness→Backend force-recreate，
+  旧镜像保留 `rollback-pre-0108c664`，其他服务/数据卷未重建。
+- 部署后三入口 200、Backend→Harness health/default catalog 正常、storage identity 相同；两模型
+  从生产 Harness 真实请求均为 200 并返回 reasoning，所有长期容器 restart 0，Harness/Backend
+  严重日志 0，数据库仍 `quick_check=ok`、FK 0、nonterminal root/run 与 schedule 0。
+
+Round10 至此完成两个 Skill terminal 的三源诊断、通用修复、成熟官方实现对照、完整回归、本地
+提交、clean-archive 部署与生产 smoke。按用户最新要求在此暂停 campaign，不启动 Round11。

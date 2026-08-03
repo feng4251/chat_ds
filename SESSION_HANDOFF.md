@@ -6,7 +6,42 @@
 
 - 工作目录：`/nfs/yangbb/codes/chat_ds`。
 - 分支：`fix/generic-skill-harness-20260717`。
-- Round 9 的两个 case 均已到唯一 durable failed terminal，生产仍为 `1d2b7d9c`。V2.3 case
+- Round 10 的两个独立 case 已到唯一 durable failed terminal并完成三源诊断。V2.3
+  `bc632e897c384f34bfec3433fd477bbe` / root
+  `d66b7e4017234ff1853fa7f35dc9224f` 的前序 worker 均成功，最终 I/E child 在 required
+  predecessor fan-in 中被旧固定 8K output/240 秒 reducer step 截断；肺癌 MDT
+  `cb7515fad602405da4b873ccc37a9ecc` / root
+  `09b907e90e534e139bf81424220d3abb` 在零 dispatch 前因 provider schema 要求模型复制 opaque
+  instruction ID，三次分别产生 unknown、overlap 与 hallucinated ID 后 fail closed。它们不是共同
+  网络、沙箱、浏览器或用户断线问题。
+- Round 10 通用修复已提交为
+  `45e131e3422dbb611ea79b3578dda8d5ad65ae82 fix: bound generic planning and fan-in lifecycles`：
+  provider planner 只见 frozen snapshot-local `document_id + ordinal range` 和 exact enum/const
+  catalog identity，runtime 再 late-bind canonical instruction；simple Skill 不暴露空 workflow
+  schema。fan-in reducer 拥有独立 32 KiB-aware output reserve、provider-budget deadline、weighted
+  admission、Schedule-to-Close、attempt run/authoritative terminal 与仅一次 pure-output complete
+  replacement；ordinary artifact verifier 不再进入 reducer 生命周期。Backend 将 reducer attempts
+  持久化为 nested delegate，不覆盖 primary/root。生产逻辑没有业务、疾病、Skill/session、worker、
+  文件名、固定数量或 93,375-token 样本特判。
+- 用户随后要求把 Shaiengine `glm-5.2` 与 `deepseek-v4-pro` 加入模型目录，并把前者设为默认测试
+  模型。OpenAI 与 Anthropic 两个兼容面均已实测；OpenAI stream 能稳定保留 reasoning、tool-call
+  fragments、usage 和 thinking enabled/disabled，Anthropic tools stream 对 disabled 仍发送
+  `thinking_delta`，所以生产主 route 使用 OpenAI compatibility。接入提交为
+  `0108c664443665b5748f2c3933f420ac79f9190d feat: add compatible remote agent models`；
+  `shaiengine_glm_5_2` 是唯一新默认，历史 `AgentModel` 继续精确绑定本地
+  `deepseek_v4_pro`，不会因默认变化重绑旧会话。凭据只存在于权限 0600 的部署配置/受限 secret，
+  未进入 Git、文档、日志或 debug。
+- `0108c664` 已从精确 22,452-file clean archive 构建并只替换生产 Harness/Backend。镜像分别为
+  `sha256:10d65e46efb53a7698a92d2c4835f149131e485bce5855276aff56cf6af457a8`、
+  `sha256:1adb71c272df3b3f52cec172e4df7cbdac24d9b8c6d877e7fe9be841c5505b3d`，revision label
+  精确匹配完整提交，healthy/restart 0。三入口、Backend→Harness、两模型生产请求、storage
+  identity、SQLite/FK/idle terminal/schedule 和严重日志 smoke 全部通过；旧镜像保留
+  `rollback-pre-0108c664`。Backend 全量 `237 passed`；隔离 Harness `1925 passed, 1 deselected,
+  800 subtests passed`，唯一 deselected CommonJS 环境项在宿主 Node 22.23.1 单独 passed，组合覆盖
+  全部 1,926 项。
+- 用户明确要求本轮闭环后先暂停。因此不得自动启动 Round 11 双 Skill E2E；下一步等待用户的新
+  手工测试或明确恢复指令。
+- Round 9 的两个 case 均已到唯一 durable failed terminal；该轮开始时生产仍为 `1d2b7d9c`。V2.3 case
   `24239b8bef374c8e9663a0849adafa05` / root
   `0d3a0e9ee41e4153b129cbc4728d7761` 已于 2026-08-02 07:00:36 UTC 到唯一 durable
   failed terminal：14 个 child succeeded，Literature synthesis 的复杂 typed footer 在旧实现中
@@ -365,7 +400,7 @@
   `/api/health` 入口均为 200。Backend、Frontend、四个 session-sandbox 和 legacy
   browser 未重建。
 - 当前生产 Harness/Backend 功能 revision 均为
-  `1d2b7d9ce412f58e9d21acf6f18a56c1ebef419d`。交接文档可另有 docs-only HEAD。
+  `0108c664443665b5748f2c3933f420ac79f9190d`。交接文档可另有 docs-only HEAD。
 - 2026-07-30 其他基础功能提交：
   - `b4e8dc18 fix: require durable delete intent for orphan cleanup`
   - `c62a4a69 feat: unify session sandbox and harden session lifecycle`
@@ -1189,6 +1224,20 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 - 前端：`http://10.10.132.126:5173`、`http://172.30.100.126:5173`。
 - Harness 使用同机 SearXNG `http://10.10.132.126:8088`；既有 SearXNG/Valkey 在切换
   中未重建，健康状态和数据卷保持不变。
+- 2026-08-03 完成 `45e131e3 + 0108c664` Round10 generic planner/fan-in 与远端模型更新：
+  - 部署前连续两次确认 nonterminal AgentRun/root、enabled/running schedule 与 5173
+    established connection 均为 0；SQLite `quick_check=ok`、foreign-key violation 0；
+  - 候选来自 clean archive `/tmp/chat_ds_deploy_0108c664.BpAKFl`，archive/tracked tree
+    均为 22,452 files；candidate compileall/import、默认/legacy alias、两模型真实主循环均通过，
+    revision label 精确匹配完整 Git SHA；
+  - 只按 Harness → Backend 顺序 force-recreate；Frontend、四槽、Proxy、Browser、
+    SearXNG/Valkey 和数据卷均未重建；旧镜像保留 `rollback-pre-0108c664`；
+  - 部署后 Harness/Backend image 分别为
+    `sha256:10d65e46efb53a7698a92d2c4835f149131e485bce5855276aff56cf6af457a8`、
+    `sha256:1adb71c272df3b3f52cec172e4df7cbdac24d9b8c6d877e7fe9be841c5505b3d`，revision
+    均为 `0108c664443665b5748f2c3933f420ac79f9190d`，healthy/restart 0；三个入口、
+    Backend→Harness health/model catalog、storage identity、两模型 thinking 请求、数据库与日志
+    smoke 均通过。
 - 2026-08-03 完成 `6657f374` generic compact-plan/compiler/terminal-boundary 更新：
   - 部署前连续两次确认 nonterminal AgentRun/root、enabled/running schedule 与 5173
     established connection 均为 0；SQLite `quick_check=ok`、foreign-key violation 0；
@@ -1394,8 +1443,8 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 | `chat_acits_executor` ～ `_4` | `sha256:7eb2b7a0526aa6b9a2560d5b722c2bf3ae44fc72fdb83c65d3e834050056d17a` | 4 个同质槽 / healthy / restart 0 / revision `f3be516b` |
 | `chat_acits_skill_egress_proxy` | `sha256:6f23e97983ace0c4855af3dbf65967678902d2cd8d5c5b33e92eeecb2cec072f` | healthy / restart 0 / revision `f1e59c20` |
 | `chat_acits_browser` | `sha256:08bcf8860c10ba8fcd647b6d1a96c2c12e13e46db800c812acea82e17007240c` | healthy / restart 0 / revision `7bbc0809` |
-| `chat_acits_harness` | `sha256:3fbcb23d2c26dbf70fd5469faea7a3418db02faa7d53428b83a392ac79ed5d8a` | healthy / restart 0 / revision `6657f374` |
-| `chat_acits_backend` | `sha256:c763e8e9d55875117a9a7fa54b9242e5923d23cf77315118229f6ca73c5ba501` | healthy / restart 0 / revision `1d2b7d9c` / `/api/health` 200 |
+| `chat_acits_harness` | `sha256:10d65e46efb53a7698a92d2c4835f149131e485bce5855276aff56cf6af457a8` | healthy / restart 0 / revision `0108c664` |
+| `chat_acits_backend` | `sha256:1adb71c272df3b3f52cec172e4df7cbdac24d9b8c6d877e7fe9be841c5505b3d` | healthy / restart 0 / revision `0108c664` / `/api/health` 200 |
 | `chat_acits_frontend` | `sha256:ffedcc8db1373f454e5650404ab724be884b6a70a0c8027fc7e99c06a530b0d8` | running / restart 0 / revision `f3be516b` / `/` 200 |
 
 生产 smoke 证据：
@@ -1406,7 +1455,7 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
   Backend `/api/health` 为 200。四槽 capability probe 的 runtime build 完全一致。
 - 生产 SQLite `quick_check=ok`、foreign-key violation 为 0；当前计数为
   conversations/messages/runs/events/tasks/artifacts =
-  `216 / 801 / 583 / 81955 / 540 / 832`，nonterminal agent run、active root、running/enabled
+  `218 / 805 / 602 / 84463 / 560 / 832`，nonterminal agent run、active root、running/enabled
   schedule 均为 0。
 - `task_items` 中有 18 条历史 `running` 投影，但其对应 root AgentRun 均已终态
   （10 succeeded、8 failed），不是当前活跃执行；判断运行态应以 durable AgentRun
@@ -1414,20 +1463,25 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 - SearXNG 真实 `OpenAI GPT` 查询返回 27 条结果，命中 `360search`、`bing`、`mojeek`；
   SearXNG/Valkey 均 healthy。免费上游仍可能动态出现 unresponsive engine，不属于
   Harness 执行环境缺失。
-- Harness revision label 当前为完整提交
-  `6657f3741ae0bb399333e5039dd2da994864e84b`，Backend 为
-  `1d2b7d9ce412f58e9d21acf6f18a56c1ebef419d`；四槽与 Frontend 为
+- Harness 与 Backend revision label 当前均为完整提交
+  `0108c664443665b5748f2c3933f420ac79f9190d`；四槽与 Frontend 为
   `f3be516bdfc13c82e00fba66ac327364a585bb15`；Proxy 为
   `f1e59c20129d9c3ba91b0f80850983e93d24d9dc`；legacy Browser 为
   `7bbc08097a75c618fc8a7338ff96b6577b8772d4`。
   所有长期容器 restart 均为 0。
 - executor/proxy/browser/Harness/Backend/Frontend 日志未发现 traceback、
   critical、fatal、unhandled、ProtocolError 或 exception。
-- Round 9 两个 case 均已到 durable failed terminal，通用修复、回归、本地 commit 与生产部署
-  已闭环；当前生产空闲，可按顺序启动 Round 10 的全新 V2.3 与肺癌 MDT roots。
+- Round 10 两个 case 均已到 durable failed terminal，通用修复、回归、本地 commit 与生产部署
+  已闭环；Shaiengine 两模型也已加入目录并完成协议/生产 smoke。当前生产空闲，但用户要求暂停，
+  不得自动启动 Round 11。
 
 回滚点：
 
+- `0108c664` 切换前 Harness/Backend 分别保留
+  `chat_ds-harness:rollback-pre-0108c664`、
+  `chat_ds-backend:rollback-pre-0108c664`；候选/部署 tag 为
+  `candidate-0108c664` / `deploy-0108c664`，clean archive build 目录为
+  `/tmp/chat_ds_deploy_0108c664.BpAKFl`。
 - `6657f374` 切换前 Harness 保留
   `chat_ds-harness:rollback-pre-6657f374`；候选/部署 tag 为
   `candidate-6657f374` / `deploy-6657f374`，clean archive build 目录为
@@ -1570,6 +1624,8 @@ checkout 分离或完成一次审计后的 untrack/migration。
 
 - 生产凭据：`.local_secrets/remote_10.10.130.178.env`。
 - 搜索机凭据：`.local_secrets/remote_10.10.132.126.env`。
+- Shaiengine provider 凭据：`.local_secrets/shaiengine.env`；生产 `.env` 仅同步同名
+  `SHAIENGINE_API_KEY`，两者均为 0600，不得输出值。
 - `.local_secrets` 保持 0700，文件保持 0600；生产 `.env` 保持 0600。
 - 当前执行用户不能直接读取 `.local_secrets`；需要时只允许用临时只读容器把内容送入当前 shell 的 `source`，绝不打印、复制或持久化。
 - SSH 使用 `sshpass -e` 和环境变量，命令结束立即 unset；禁止 `set -x`、`echo` secret 或输出容器环境。
@@ -1683,13 +1739,18 @@ revision/image 与生产 smoke 统一记录在 `E2E_ITERATION_LOG.md`。Round 1 
 Round 8 还包含 shared-storage attestation 父提交 `c3f9f582`。用户已明确追加 5 轮；Round 9
 的 V2.3 与肺癌 MDT case 均已到 durable failed terminal，并已按 exact Skill、对话、debug/
 AgentRun/tool/provider/artifact 完成三源诊断。Round 9 通用修复已提交 `6657f374`、从 clean archive
-部署并通过生产 smoke；当前可启动 Round 10，最多继续到 Round 13。不得复用失败 run，或把同一
-run 的重试、补跑和重复解读计为新轮。
+部署并通过生产 smoke。Round 10 的 V2.3/肺癌 MDT case 分别为
+`bc632e897c384f34bfec3433fd477bbe` / `d66b7e4017234ff1853fa7f35dc9224f` 与
+`cb7515fad602405da4b873ccc37a9ecc` / `09b907e90e534e139bf81424220d3abb`；两者均已到
+durable terminal，三源诊断、通用修复 `45e131e3`、回归、本地 commit、clean-archive
+`0108c664` 部署与生产 smoke 已闭环。用户最新要求本轮后暂停，因此不得自动创建 Round 11；
+收到明确恢复指令后仍不得复用失败 run，或把同一 run 的重试、补跑和重复解读计为新轮。
 
 ## 10. 已知非 blocker 边界
 
 - V2.3 与 ground truth 的业务级一致性仍需真实模型重型 E2E；基础回归不能替代这项验收。
-  用户已明确授权继续 Round 9--13；Round 13 后如仍需模型重型 E2E，必须重新获得授权。
+  用户此前授权继续 Round 9--13，但已在 Round 10 闭环后明确要求暂停；恢复 Round 11 前必须有
+  新的明确指令。Round 13 后如仍需模型重型 E2E，必须重新获得授权。
 - Legacy `knowledge_gate.checks[].tools` 只能安全解释为单个 OR 组；需要多个独立
   必须条件的 Skill 应显式使用 `tool_groups` 或 `tools: {all_of: ...}`。Harness 不从
   自然语言 action 猜 AND/OR。
