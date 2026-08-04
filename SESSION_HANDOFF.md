@@ -19,16 +19,35 @@
 - ChatDS 原创贡献现采用根目录 `LICENSE` 中未经修改的 PolyForm Noncommercial 1.0.0；
   `THIRD_PARTY_NOTICES.md` 明确排除了第三方目录、独立参考仓库、运行时数据、上传 Skill 和生成产物。
   该许可证没有、也不会重新授权 `claude-code/` 等第三方内容。
-- 2026-08-04 最新状态：当前数据库没有 `pending/planned/queued/running/committing` AgentRun，
-  旧 Round 13 “正在运行”的描述已经失效；本轮按用户要求只完成通用 Harness 收敛、回归、提交和
-  生产部署，没有自动启动高成本 V2.3/MDT E2E。用户下一次手工 E2E 应从当前生产版本建立全新
-  conversation/root，诊断时继续同时核对 exact Skill、对话上下文与 session debug/tool/result。
+- 2026-08-04 最新权威状态：Round 13 已完成两个新的顺序 E2E、三源诊断、通用修复、全量回归、
+  本地代码 commit 和生产切换。V2.3 conversation `2ca049506d0249418815b64bab500ead` / root
+  `5e635b2d7e4b4486bdeb37d88690d34b` 暴露“schema-valid structured tool call 内字段类型错误但旧
+  output validator 只给一次提交”的通用缺陷；肺癌 MDT conversation
+  `7143d3304a6643c6aa3ff888d63a56d6` / root `01236e10499d43898c0a1ab96cbe4598`
+  虽生成 75,337-byte 报告并 durable succeeded，却有 0 child/0 `delegate_task`，暴露显式
+  fan-out/fan-in Skill 在 progressive 路径未进入 semantic Workflow IR、动态 boundary 漏装 mandatory
+  receipt groups 的通用缺陷。完整 exact Skill/对话/debug/tool/result/artifact 证据见
+  `E2E_ITERATION_LOG.md` Round 13。
+- 通用修复代码提交为
+  `d23c7e4387d43709086e07d7b3f52bc33bcaaf57 fix: validate structured results and explicit agent workflows`：
+  delegated typed output 现在是最多 5 次、带 validator feedback、零 registry dispatch/零副作用重放的
+  独立 transaction；portable Skill 若结构上明确声明多角色独立/并行执行与汇总/共识，则无论生产默认
+  progressive/legacy 都进入已有 content-addressed semantic Workflow IR；动态 capability boundary 原子
+  安装 tools、required groups 和 missing requirements。生产逻辑没有 V2.3、疾病、Skill/session/worker、
+  固定角色数或报告文件名特判。
+- 受影响组合为 `444 passed, 134 subtests passed`；完整隔离回归为
+  `1970 passed, 1 skipped, 810 subtests passed`，bubblewrap 用户命名空间内仅两个 trusted
+  `/usr/bin/prlimit` 环境校验项失败，同两项在真实宿主 namespace `2 passed`，所以 1,972 项逻辑覆盖
+  全部通过。clean archive 与 Git tree 均为 22,456 files。生产 Harness 当前 image 为
+  `sha256:c2713d3c08056d549e0d7b5080de561c4d431e12322269a34763a71c60e53ed6`，revision 精确为
+  `d23c7e43...`，healthy/restart 0；旧镜像为 `rollback-pre-d23c7e43`。三入口、Harness 内部、
+  Backend→Harness、storage identity、SQLite quick/FK、idle AgentRun 和严重日志 smoke 全部通过。
 - 用户提供的第二个 `claude-code/` 仓库是本地唯一成熟 Harness 参考；是否官方不作为本项目选择
   参考路径的条件。对照只以冻结 commit 中实际存在的代码为证据，stub 不算实现证据，ChatDS 继续
   采用 clean-room 的独立实现。此前从该仓库吸收的通用不变量是：一次 assistant tool-call batch
   与其全部 tool result 构成不可拆分的 Provider API round；普通 guidance 必须在整批 result 之后；
   发送前必须审计；历史修复不能伪造成功或副作用；压缩只能按完整 round 切割。
-- 最新通用修复已提交为
+- 本日较早的 provider transcript 通用修复提交为
   `b38390c5ef83f2f7ddc52c5b2c70e324017a7583 fix: make provider tool rounds transactional`。
   新增独立 `provider_transcript` 协议层，统一执行 transcript audit、旧历史 canonicalization、
   whole-round compaction boundary、active batch fail-closed close，以及 outbound-only tool-call ID
@@ -38,25 +57,25 @@
   transport 在任何 SDK 请求前做最后一层严格审计；durable history、artifact receipt 与副作用身份
   不因兼容严格 Provider 的 outbound ID 投影而改变。生产逻辑没有 V2.3、疾病、报告名、Skill、
   session 或 worker 特判。
-- 本轮从隔离的 workspace/data root 完成全部 Harness 回归：
+- 该较早提交从隔离的 workspace/data root 完成全部 Harness 回归：
   `1965 passed, 1 skipped, 809 subtests passed`；唯一 skip 是既有环境条件，3 条 warning 是 Python
   multiprocessing/fork deprecation。三组扩展回归分别为 `44 passed, 49 subtests`、
   `269 passed, 86 subtests`、`278 passed, 127 subtests`；最后一组在默认生产 NFS 根出现的 9 个
   subtest failure 仅由不可读 tombstone 引起，同一 exact test 在隔离根为 `1 passed, 9 subtests`。
   `py_compile`、`git diff --check`、secret scan、genericity scan 与 protected-deletion staging 检查
   均通过。
-- `b38390c5` 已从精确 clean Git archive（tracked/archive 均 22,454 files）构建并只滚动替换生产
-  Harness。当前 image 为
+- `b38390c5` 当时从精确 clean Git archive（tracked/archive 均 22,454 files）构建并只滚动替换生产
+  Harness。当时 image 为
   `sha256:099a4fbce03bcfb155dc2b56edff9b6942cfb220f9721d5e4053c7184ba55231`，revision label
   精确匹配完整提交，healthy/restart 0；旧镜像保留为 `rollback-pre-b38390c5-local`。Backend、
   Frontend、四个 Executor、Browser、skill-egress proxy、SearXNG 均未重建。Harness 内部 health、
   Backend→Harness、模型目录（4 个模型）、两块本机地址的 `:5173`、storage identity、SQLite
   quick/FK、idle AgentRun 与部署后严重日志检查全部通过。
-- 用户于 2026-08-03 再次明确授权五轮双 Skill 自动 E2E，当前授权范围为 Round 11--15，
-  替代 Round 10 后的暂停要求与旧 Round 13 上限。每轮仍顺序运行 V2.3 和 `yangbb` User Skill
+- 用户在 Round 13 闭环前再次明确授权从下一轮继续五轮双 Skill 自动 E2E，当前授权范围为
+  Round 14--18，替代此前 Round 15 上限。每轮仍顺序运行 V2.3 和 `yangbb` User Skill
   `lung-cancer-mdt` 的全新 conversation/root，并完成三源诊断、通用复现、官方成熟实现对照、
-  跨领域修复、回归、本地 commit、clean-archive 部署与生产 smoke。Round 15 是当前硬上限。
-- Round 13 正在进行。首个 V2.3 case 为 conversation
+  跨领域修复、回归、本地 commit、clean-archive 部署与生产 smoke。Round 18 是当前硬上限。
+- Round 13 较早的首个 V2.3 case 为 conversation
   `a1fb209ffa0f4e7d8135f2959242b1b1` / root `ac3e33dfb62b46ba8a8ee67bff3738c0`，
   约 73 分钟后达到唯一 durable `run.failed/delegate_step_failed`：15 个 child/reducer attempt
   succeeded，只有 Target Biology `945d95019cc746fb86a1058a64b10a3f` 因
@@ -86,9 +105,8 @@
   `398 passed, 1 skipped, 205 subtests`，唯一 skip 是 clean Git archive 不含未跟踪 reference ZIP。
   部署后三入口、Harness/Backend health/models、storage identity、SQLite/FK、严重日志均正常；生产
   GLM-5.2 thinking smoke 为 200、reasoning 非空、terminal stop。
-- Round 13 尚未闭环。下一步必须从 `98882f0b` 用新的 conversation/root 重跑 V2.3；其到 durable
-  terminal 并完成三源验收后，再顺序运行肺癌 MDT 全新 case。两个 case 都结束后才计 Round 13 完成，
-  不能复用 `a1fb...`、把重复解读算新轮，或并发污染 provider capacity。
+- Round 13 的上述第一阶段后来已由 `2ca049...` V2.3 与 `7143d3...` 肺癌 MDT 两个全新 case、
+  `d23c7e43` 通用修复和生产部署闭环；不得再把 `a1fb...` 或这两个已终态 run 复用为新轮。
 - Round 12 已完成。V2.3 `9bb4a0173fc44c5b94cb4258b2a17ab7` / root
   `f96df86c12744cc5bd4cafc176ec6a8f` 完成 intent、7 路 bootstrap 和除 PICO 外的全部
   worker；PICO 的首次与唯一 clean retry 均在 0 provider token 前触发同一确定性内部错误：独立
@@ -1802,12 +1820,12 @@ checkout 分离或完成一次审计后的 untrack/migration。
 4. 将终稿与 ground truth 做结构、覆盖、证据链、表格、附录、traceability 和可用性对比，不要求逐字节相同。
 5. 只修复跨领域可复现的通用根因，并增加非 V2.3 特定回归。
 
-### 9.1 最多十五轮 E2E 迭代协议（用户于 2026-07-31/08-01/08-02/08-03 明确授权）
+### 9.1 最多十八轮 E2E 迭代协议（用户于 2026-07-31 至 08-04 多次明确授权）
 
 用户此前明确授权执行到 Round 8；Round 8 闭环后于 2026-08-02 追加 Round 9--13，
-又于 2026-08-03 在 Round 10 暂停后明确追加五轮。因此当前可按同一协议继续 Round 11--15，
-这项最新授权替代“下一轮必须由用户手工发起”的默认限制和旧 Round 13 上限，Round 15 是当前
-绝对上限。Round 11--15 每轮由两个独立
+又于 2026-08-03 在 Round 10 暂停后追加五轮。Round 13 闭环前，用户最新再次授权从下一轮继续
+五轮，因此当前可按同一协议继续 Round 14--18；该最新授权替代“下一轮必须由用户手工发起”的
+默认限制和旧 Round 15 上限，Round 18 是当前绝对上限。Round 14--18 每轮由两个独立
 acceptance case 组成：V2.3 与 `yangbb` 账户 User Skill registry 中的肺癌 MDT Skill
 分别使用全新 conversation/root；只有两个
 case 都达到 durable terminal 并分别完成三源诊断，才算该轮结束。两个 root 默认顺序
@@ -1871,7 +1889,7 @@ Skill/package/workflow digest，provider/model/context/max-output/finish/elapsed
 tool_choice、dispatch/preflight/receipt，recovery 原因与次数，fan-in cohort，artifact 路径/大小/
 摘要/合同结果，inner/outer terminal 关联，以及成熟方案的 problem-to-pattern-to-decision 对照。
 
-### 9.2 当前最多十五轮 campaign 状态
+### 9.2 当前最多十八轮 campaign 状态
 
 逐轮证据、模拟人工追问链、delegate 明细、成熟实现对照、通用不变量、确定性复现、
 revision/image 与生产 smoke 统一记录在 `E2E_ITERATION_LOG.md`。Round 1 的新会话为
@@ -1904,13 +1922,20 @@ durable terminal，三源诊断、通用修复 `45e131e3`、回归、本地 comm
 V2.3/肺癌 MDT case 分别为 `49791ec4ef37449c84b7c1611e256a06` /
 `b75a71b3dbdd48f58dd76ec31a4a3b46` 与 `b830029d282447cf8abcce196c7d6b41` /
 `941e09a080694159ac6d45c205b2d7e0`；两者均已到 durable terminal，三源诊断、通用修复
-`ca9f5eac`、完整回归、本地 commit、clean-archive 部署与生产 smoke 已闭环。Round 12--15
-仍获授权；不得复用失败 run，或把同一 run 的重试、补跑和重复解读计为新轮。
+`ca9f5eac`、完整回归、本地 commit、clean-archive 部署与生产 smoke 已闭环。Round 12 的
+V2.3/肺癌 MDT 分别为 `9bb4a0173fc44c5b94cb4258b2a17ab7` /
+`f96df86c12744cc5bd4cafc176ec6a8f` 与 `265ffb56b04141fe99e1281ab2811e7d` /
+`424100dd5ffd4d10afbc1224f1a7f877`，通用修复为 `0406ab72`。Round 13 最终验收的
+V2.3/肺癌 MDT 分别为 `2ca049506d0249418815b64bab500ead` /
+`5e635b2d7e4b4486bdeb37d88690d34b` 与 `7143d3304a6643c6aa3ff888d63a56d6` /
+`01236e10499d43898c0a1ab96cbe4598`，通用修复为 `d23c7e43`，生产已切换并通过 smoke。
+Round 14--18 仍获授权；下一项是从 `d23c7e43` 顺序建立 Round 14 的两个全新 case。不得复用
+任何已终态 run，或把同一 run 的重试、补跑和重复解读计为新轮。
 
 ## 10. 已知非 blocker 边界
 
 - V2.3 与 ground truth 的业务级一致性仍需真实模型重型 E2E；基础回归不能替代这项验收。
-  用户最新授权继续 Round 11--15；Round 11 已闭环。Round 15 后如仍需模型重型 E2E，必须
+  用户最新授权继续 Round 14--18；Round 13 已闭环。Round 18 后如仍需模型重型 E2E，必须
   重新获得授权。
 - Legacy `knowledge_gate.checks[].tools` 只能安全解释为单个 OR 组；需要多个独立
   必须条件的 Skill 应显式使用 `tool_groups` 或 `tools: {all_of: ...}`。Harness 不从

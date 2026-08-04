@@ -1669,7 +1669,80 @@ consumer 合同传递。决策仍是 **adapt exact handle + typed receipt + down
   SQLite quick/FK 正常，healthy/restart 0、严重日志 0；生产 Harness 直接请求默认 GLM-5.2 为 200，
   thinking reasoning 非空且 visible response 以 `stop` 完成。
 
-Round 13 尚未闭环：以上是 V2.3 首个失败 case 的完整诊断、修复和部署，不把同一失败 run 的重复解读
-计为新一轮，也未伪造肺癌 MDT case。下一步从生产 `98882f0b` 使用新的 conversation/root 重跑 V2.3，
-达到 durable terminal 并完成三源验收后，再顺序运行肺癌 MDT 的全新 case；两个 case 都结束后才关闭
-Round 13。
+### Round 13 第二组顺序验收：typed output transaction 与显式 multi-agent workflow
+
+- V2.3 使用新的 conversation `2ca049506d0249418815b64bab500ead`、root
+  `5e635b2d7e4b4486bdeb37d88690d34b` 和 `shaiengine_deepseek_v4_pro`。run 从
+  2026-08-04 09:05:11 到 09:45:52 UTC 达到唯一 durable
+  `run.failed/delegate_step_failed`；Intent、7 路 bootstrap、一次竞争情报 clean retry 和 Termination
+  worker 均到达受约束终态。PICO `39b816d7...` 与 Safety `295bfcc9...` 已完成证据读取/检索并生成
+  substantive body，却都在独立 `submit_result_fields` 页脚投影中把 schema 声明为 object 的
+  `pico_metadata` / `extraction_metadata` 等字段编码成 string。调用结构本身完整，旧 Harness 只给一次
+  submission、不给 validator error，因此两个 child 分别以
+  `delegated_result_footer_structured_repair_failed` 终止。根级没有 artifact，失败没有重放任何已完成
+  evidence side effect；它不是网络、沙箱、context、总 timeout 或 corrupt stream。
+- 肺癌 MDT 随后使用新的 conversation `7143d3304a6643c6aa3ff888d63a56d6`、root
+  `01236e10499d43898c0a1ab96cbe4598`、同一 DeepSeek provider 和历史精确 7,089 字符 prompt。
+  root 在约 15 分钟后 `succeeded/stop`，输入/输出为 971,079 / 26,639 tokens，并生成
+  `mdt_report_TEST-LC-MDT-001.md`：75,337 UTF-8 bytes、1,576 行、SHA-256
+  `b3f69235af270ea5a6c85b3c3128518d0ac3179db67fe1f28a9587c135b88472`。报告覆盖 16 个章节、11 个
+  Round-1 角色区块、Round-2 交叉评论、冲突代码和可追溯表，但整个 root 有 0 child AgentRun、0
+  `delegate_task`。模型在单一 primary context 中模拟了所有角色，违反 exact Skill 声明的 11 个独立
+  specialist、并行 Round 1、Round 2 cross-review 和 coordinator consensus；所以 durable success 不等于
+  procedure success。
+- exact Skill、对话和 debug 的交叉证据显示肺癌 Skill 已被正确选中，动态工具面也含
+  `delegate_task`，但 `direct_required_unsatisfied` 始终为空。生产配置的 progressive 路径绕过了已有
+  semantic Workflow IR；同时动态 boundary 安装只替换 `exposure.tools`，没有原子替换同一 exposure 的
+  `required_groups`/`missing_requirements`。因此 stop gate 无法证明显式委派步骤尚未执行。这不是模型
+  自由选择“直接 chat 也可以”，而是 Harness 暴露能力却漏装 mandatory receipt obligation。
+
+### 本轮跨领域不变量、`claude-code/` 对照与通用实现
+
+1. **structured output 校验是独立、无副作用、可反馈的有界 transaction。** registry dispatch、证据读取
+   和 artifact 写入不得因 JSON type mismatch 重放；失败 submission 本身不进入 durable tool history。
+   validator 返回精确 path/type error，最多重新投影 5 次，成功只提交一个 harness-canonical footer，
+   五次仍失败则确定性终止。
+2. **显式 fan-out/fan-in 是 Skill 的执行语义，不是可选提示。** 普通 instruction-only Skill 继续走
+   progressive disclosure；package-owned declarative contract 继续走 deterministic DAG；任何语言、领域、
+   名称的 portable Skill 若结构上明确声明多角色独立/并行执行与汇总/共识，则必须进入已有
+   content-addressed semantic Workflow IR。模型只映射 frozen instruction units，runtime 校验完整覆盖、
+   lowering、dependency、receipt 和 terminal barrier。
+3. **动态 capability boundary 必须原子安装 surface 与 obligations。** `tools`、`required_groups` 和
+   `missing_requirements` 来自同一 immutable exposure 并一次替换；不允许“工具可见但 required receipt
+   不存在”的半安装状态。
+
+本轮唯一成熟 Harness 对照固定为本地 `claude-code/` commit
+`6f6f12b37f529488b10e53928dd5508bb93535c7`：
+
+| 问题 | 实际源码模式 | ChatDS 取舍 |
+|---|---|---|
+| schema-valid tool call但字段类型错误 | `src/tools/SyntheticOutputTool/SyntheticOutputTool.ts` 用 AJV 对 synthetic structured-output tool 做 exact schema validation；`src/QueryEngine.ts` 以 `MAX_STRUCTURED_OUTPUT_RETRIES` 默认 5 次形成独立有界重试 | **adapt** 为 delegated result footer 的无副作用 control-plane transaction；保留 ChatDS exact evidence/receipt 外审计，不把模型提交当普通可执行工具 |
+| Skill 明确要求并行 Agent，却由 primary 模拟 | `src/tools/AgentTool/prompt.ts` 要求并行请求在同一 assistant batch 发出多个 Agent calls，并强调给 child 完整任务；`src/skills/bundled/skillify.ts` 将每步 execution 明确区分 Direct / Task agent / Teammate | **adapt** 执行类型进入 typed semantic Workflow IR 与 receipt barrier；不依赖提示词自觉，也不整体复制其 UI/runtime |
+| 是否切换整套 Harness | 参考仓库没有 ChatDS 的 package digest、Knowledge Gate、session workspace、egress 和 artifact contract | **reject** whole-stack replacement；只吸收上述通用 control-plane pattern |
+
+生产实现提交为
+`d23c7e4387d43709086e07d7b3f52bc33bcaaf57 fix: validate structured results and explicit agent workflows`：
+
+- `harness/agent_loop.py` 增加最多 5 次的 validator-feedback typed submission；错误 submission 原子丢弃，
+  既不进入 registry，也不重放 evidence/tool side effect。object-as-string 的精确非医疗复现先失败后纠正；
+  连续五次错误严格失败且 registry dispatch 为 0；wrong executable tool fragment 仍立即 fail closed。
+- 同文件将已有 `_standard_skill_declares_delegated_workflow` 的通用结构分类真正接入 engine selection：
+  显式 multi-agent portable Skill 在 progressive/legacy 配置下都走 semantic plan。动态 progressive boundary
+  同时安装 `required_groups` 与 `missing_requirements`。非医疗 portable-note holdout 证明模型提前 stop 时
+  required tool frontier 会阻止伪成功并要求实际写文件。
+- 受影响组合为 `444 passed, 134 subtests passed`；NFS tombstone 相关的 12 项在隔离 root 全部通过。
+  完整 bubblewrap/tmpfs 回归为 `1970 passed, 1 skipped, 810 subtests passed`，仅两项因 user namespace
+  映射 root-owned `/usr/bin/prlimit` 而触发 trusted-launcher 环境校验；这两项在真实宿主 namespace 单独
+  `2 passed`，即全部 1,972 项逻辑覆盖通过。`py_compile`、diff、secret、genericity 和 protected-deletion
+  staging 检查均通过。
+- clean archive `/tmp/chat_ds_deploy_d23c7e43.bCAsME` 与 Git tree 均为 22,456 files；生产 Harness image
+  为 `sha256:c2713d3c08056d549e0d7b5080de561c4d431e12322269a34763a71c60e53ed6`，revision label 精确匹配
+  `d23c7e43...`，旧镜像保留 `rollback-pre-d23c7e43`。部署前 nonterminal run/root/schedule 与 5173
+  established connection 均为 0；只 force-recreate Harness。部署后三入口、Harness 内部与
+  Backend→Harness health/models 均 200，storage identity 一致，SQLite quick/FK 正常，healthy/restart 0、
+  严重日志 0。
+
+Round 13 至此完成两个新 case 的 durable terminal、exact Skill/对话/debug/tool/result/artifact 三源诊断、
+逐 attempt 归因、冻结 `claude-code/` 实现对照、通用复现与跨领域修复、完整回归、本地代码 commit、
+clean-archive 部署和生产 smoke。Round 14 从生产 `d23c7e43` 开始，仍先 V2.3、后肺癌 MDT，必须使用
+两个全新 conversation/root。
