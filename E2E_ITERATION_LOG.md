@@ -1824,3 +1824,76 @@ clean-archive 部署和生产 smoke。Round 14 从生产 `d23c7e43` 开始，仍
 
 Round 14 至此闭环；代码没有 V2.3、疾病、Skill/session/worker、固定角色数、route 或报告文件名特判。
 Round 15 从生产 `cfc0e09d` 开始，仍须先 V2.3、后肺癌 MDT，使用两个全新 conversation/root。
+
+## Round 15：子任务终态语义事务与一源多角色预加载
+
+### 两个顺序 E2E 与逐节点归因
+
+- V2.3 使用全新 conversation `9f83f64f7f4f4b87b6e057f6891cd780`、root
+  `159c979c17564922a0d735a02def3f74`、`shaiengine_deepseek_v4_pro`，上传 ZIP SHA-256
+  `78b890eab57ff516c20a39a565631caa5d784f839b42f6ad9efbdbdd951eb0a0`，安装 19 个 Skill 且
+  attachment 已复制到 session workspace。2026-08-04 12:02:34--12:20:11 UTC 达到唯一 durable
+  `failed/delegate_retry_exhausted`，0 业务 artifact。
+- Intent `b7a078f1...`、PubMed `4ab1fc87...`、ClinicalTrials.gov `f3819052...`、ICH
+  `f4995242...`、Target Biology `5f24be3d...`、FDA `91943f4f...`、EMA `fe18e08a...` 均
+  succeeded；只有 Competitive Landscape 的首次 `50346e05...` 与精确父级 retry
+  `e1c03a63...` failed。两个 attempt 都在 tools-closed 终态只返回“让我继续搜索/下一步比较/随后给出
+  结果”的过程叙述。已有 typed footer 投影只能投影字段，不能把非结果正文变成结果；旧 Harness 要到
+  child 返回外层后才做同一 semantic rejection，于是父级只能昂贵地重跑整个 child。不是网络、沙箱、
+  timeout、context、tool-call corruption 或网站失败。
+- 肺癌 MDT 随后使用全新 conversation `369e8a816594454598fd9c8c9a5c1f8a`、root
+  `2fa0eb88bb454203877a424f6bafe9ce`、同一 provider、历史精确 7,089 字符 prompt（SHA-256
+  `eefb885294e6849d1e5ab5ce9f6799a30dfff1b9520761bd403138b7f4b135b7`）和 exact User Skill
+  `SKILL.md` SHA-256 `2955c00a456f7ca4215e27091c55ceeca6c84d170e4af99560adb54e0d5b4d42`。
+  12:21:10--12:37:34 UTC 达到 durable `failed/delegate_step_failed`；Round 14 的五次计划 transaction
+  生效，模型第三次 submission 已成功安装执行 grant，故障已前移到首个真实 worker，而非再次卡在计划。
+- Coordinator Round 0 `c4042d82...` 已成功调用 `execute_code` 并生成实质结果，随后却被外层以
+  `Delegated worker did not inspect its exact Skill contract with skill_view: SKILL.md` 拒绝。该 worker 的
+  `worker_file` 与 `required_capability_skills` main 恰为同一个 `(skill_view, lung-cancer-mdt, SKILL.md)`。
+  deterministic preload 实际已在首个模型 turn 前成功读取一次，但旧代码用互斥 `elif` 只把 receipt 计入
+  capability ledger，未同时计入 worker-contract ledger，并且 preload list 还为同一 immutable coordinate
+  构造了重复请求。故障不是模型漏调工具，也不是 Skill 要求 Playwright/Selenium、网络或执行器缺失。
+
+### `claude-code/` 源码与真实 CLI 对照
+
+唯一成熟参考仍冻结为本地 `claude-code/` commit
+`6f6f12b37f529488b10e53928dd5508bb93535c7`。除静态源码外，本轮在隔离目录用已安装
+Claude Code 2.1.152 做了两个黑盒实验：
+
+| 问题 | 源码/运行证据 | ChatDS 决策 |
+|---|---|---|
+| agent 的 Skill/定义是否依赖模型首轮自行读工具 | `src/tools/AgentTool/loadAgentsDir.ts`、`AgentTool.tsx`、`runAgent.ts` 在 query 前构造 agent system prompt，并将 declared Skills 并发预载为 initial messages；工具池另行解析。自定义 agent 的 tool allowlist 为空仍在首轮准确返回只存在于 agent definition 的随机 nonce | **adapt**：compiled authority 在模型首轮前确定性加载；是否把 `skill_view` 暴露给模型是另一条 capability 边界 |
+| 同一 authority resource 承担多个角色 | `runAgent.ts` 按 source identity 装配初始上下文，而不是要求模型为每个消费角色重复读取 | **adapt**：按 exact `(tool, skill, path)` 去重 preload；一次成功 receipt 独立满足 compiler 赋予该 source 的 worker/capability 多个 ledger role |
+| schema-valid 但语义无效的终态是否应退出子查询再重跑 | `SyntheticOutputTool.ts` 用 AJV 返回 exact errors；`QueryEngine.ts` 在同一 query transaction 内保留 structured-output retry state，默认 `MAX_STRUCTURED_OUTPUT_RETRIES || 5`。黑盒中首次 StructuredOutput 缺字段/长度错误后，validator error 作为 tool result 回到同一 query，第二次提交成功 | **adapt**：把现有 process-narration semantic validator 前移到 child 内的 bounded tools-closed correction；丢弃 rejected prose，保留任务、预加载 authority 和已提交 receipts，不重开工具或重放副作用 |
+| 由 Harness 自动替模型搜索或补结果 | 参考实现纠正结构化提交但不伪造业务结果 | **reject**：连续无效仍 fail closed；不放松 outer contract，不为特定 Skill 生成内容 |
+
+### 通用修复、不变量与回归
+
+- `delegated_result_contract.py` 现在拥有内外层共享的 process-narration predicate 和“剥离
+  RESULT_FIELDS/quality/gap/receipt 机器账本后的实质正文”投影。合法 `degraded` 审计词不能掩盖正文仍只是
+  future-action narration；inner transaction 与 outer commit boundary 不再有两个语义版本。
+- delegated child 在 terminal audit 命中该语义错误时，使用已有唯一 bounded output-contract correction：
+  工具关闭、拒绝正文/推理/参数不进入下一请求、保留 original task/preloaded resources/structured tool receipts，
+  给出 exact validator feedback 后完整重生成。typed footer projector 只用于实质正文已成立、仅 footer 非法的
+  情况；第二次仍非法则按既有边界 fail closed。
+- deterministic preload 按 exact resource coordinate 去重。成功 `skill_view` receipt 分别检查每个已编译角色，
+  因此同一 `SKILL.md` 可同时满足 worker inspection 与 required capability main；读取次数仍为一，模型有效工具
+  列表保持为空，authority 没有扩大。
+- 两项新确定性测试分别覆盖“process narration + 合法 degraded/typed machine ledgers 在同一 child transaction
+  内纠正，零工具派发”和“一个 immutable Skill main 一次 preload 同时满足两个角色”。高风险联合为
+  `454 passed`。宿主 full 为 `1913 passed, 2 failed, 18 errors, 1 skipped`，20 个红灯均在被测逻辑前
+  命中不可读生产 NFS tombstone；bubblewrap clean tmpfs 为 `1973 passed, 2 errors, 1 skipped`，两项只因
+  namespace 改变 trusted executor identity，回到真实宿主为 `2 passed`。即新增后的 1,975 项可执行逻辑
+  全部通过，唯一 skip 仍为权限转换环境条件。`py_compile`、diff、secret/genericity 和受保护删除 staging
+  检查均通过。
+- 通用代码提交为
+  `86609068727337b88b0af564b935c85daba6a88e fix: make delegated contracts transactional`。
+  clean archive `/tmp/chat_ds_deploy_86609068.pOBTG0` 与 Git tree 均为 22,456 files；candidate/deploy image
+  `sha256:7af086170febee367a1c8ca42b6e0f0e763b699f53e15ff934777fff2e19130d`，revision label 精确匹配
+  完整 commit，旧镜像保留 `rollback-pre-86609068`。部署前两次 nonterminal run/root/schedule 和
+  `:5173` established connection 均为 0；仅 force-recreate Harness。部署后 healthy/restart 0，三入口、
+  Harness 内部、Backend→Harness health/models、storage identity、SQLite quick/FK、idle run 与严重日志
+  smoke 全通过。
+
+Round 15 至此闭环；代码没有 V2.3、疾病、Skill/session/worker、固定角色数、route 或报告名特判。
+Round 16 从生产 `86609068` 开始，仍须先 V2.3、后肺癌 MDT，使用两个全新 conversation/root。

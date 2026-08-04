@@ -19,7 +19,34 @@
 - ChatDS 原创贡献现采用根目录 `LICENSE` 中未经修改的 PolyForm Noncommercial 1.0.0；
   `THIRD_PARTY_NOTICES.md` 明确排除了第三方目录、独立参考仓库、运行时数据、上传 Skill 和生成产物。
   该许可证没有、也不会重新授权 `claude-code/` 等第三方内容。
-- 2026-08-04 最新权威状态：Round 14 已完成两个全新顺序 E2E、exact Skill/对话/debug/tool/provider/
+- 2026-08-04 最新权威状态：Round 15 已完成两个全新顺序 E2E、exact Skill/对话/debug/tool/provider/
+  artifact 三源诊断、`claude-code/` 源码与真实 CLI 对照、通用修复、全量回归、本地代码 commit 和
+  生产切换。V2.3 conversation `9f83f64f7f4f4b87b6e057f6891cd780` / root
+  `159c979c17564922a0d735a02def3f74` 的 Competitive Landscape 两次 attempt 都在 tools-closed 终态
+  只返回未来搜索/比较叙述；旧 Harness 到 child 返回外层才做 semantic rejection，typed footer 投影无法
+  修复正文，导致整个 child 重跑后仍失败。肺癌 MDT conversation
+  `369e8a816594454598fd9c8c9a5c1f8a` / root `2fa0eb88bb454203877a424f6bafe9ce` 已通过
+  capability plan 并进入 Coordinator Round 0；同一个 `(skill_view, Skill, SKILL.md)` 被编译为 worker
+  contract 与 required capability main，实际预载成功但旧互斥 ledger 只记后者，错误拒绝已完成 worker。
+  逐 child、provider、tool、artifact 与 exact Skill 证据见 `E2E_ITERATION_LOG.md` Round 15。
+- Round 15 通用代码提交为
+  `86609068727337b88b0af564b935c85daba6a88e fix: make delegated contracts transactional`：
+  inner/outer delegation 共用“剥离机器账本后的 substantive body”与 process-narration validator；该错误在
+  同一 child 的 bounded tools-closed output transaction 中接收 exact feedback 后完整重生成，rejected draft
+  被丢弃，任务/预加载 authority/已提交 receipts 保留，工具与副作用不重开。deterministic preload 按 exact
+  resource coordinate 去重，一次成功 receipt 可独立满足 compiler 赋予该 source 的多个角色 ledger，
+  authority 不扩大。生产逻辑没有 V2.3、疾病、Skill/session/worker、固定角色数、route 或报告名特判。
+- Round 15 高风险联合 `454 passed`；bubblewrap clean tmpfs 为 `1973 passed, 2 errors, 1 skipped`，
+  两个 error 只因 namespace 改变 trusted executor identity，真实宿主精确复跑 `2 passed`。宿主 full 的
+  20 个红灯全由不可读生产 NFS tombstone 在被测逻辑前触发。因此本轮新增后的 1,975 项可执行逻辑全部
+  通过，唯一 skip 仍为环境条件。clean archive 与 Git tree 均为 22,456 files。生产 Harness image
+  `sha256:7af086170febee367a1c8ca42b6e0f0e763b699f53e15ff934777fff2e19130d`，revision 精确为
+  `86609068...`，healthy/restart 0，旧镜像为 `rollback-pre-86609068`；三入口、Harness 内部、
+  Backend→Harness、storage identity、SQLite quick/FK、idle AgentRun 与严重日志 smoke 全通过。
+- Round 16 是下一项，继续使用 `shaiengine_deepseek_v4_pro`，必须先全新 V2.3、再全新肺癌 MDT，
+  两个 root 顺序运行且各自达到唯一 durable terminal 后，按同一诊断/复现/`claude-code/` 对照/
+  通用修复/回归/commit/clean-deploy 闭环推进。当前用户授权上限仍是 Round 18。
+- Round 14 历史状态：已完成两个全新顺序 E2E、exact Skill/对话/debug/tool/provider/
   artifact 三源诊断、通用修复、全量回归、本地代码 commit 与生产切换。V2.3 conversation
   `ad60a1cd11fc448e844c8198080d2ccc` / root `9f4747b4fbe348ef8d5b61d0a923e589` 的唯一失败 child
   `c42014306d01498b9f3e299eaef98910` 已有 6 个成功 HTTP receipt，却在 tools-closed final synthesis
@@ -43,9 +70,6 @@
   `sha256:d05f6f92ae094e0a7f4fc43d2f09bd175316a7484a1b9d8846c8640462b2397d`，revision 精确为
   `cfc0e09d...`，healthy/restart 0，旧镜像为 `rollback-pre-cfc0e09d`；三入口、Harness 内部、
   Backend→Harness、storage identity、SQLite quick/FK、idle AgentRun 和严重日志 smoke 全通过。
-- Round 15 是下一项，继续使用 `shaiengine_deepseek_v4_pro`，必须先全新 V2.3、再全新肺癌 MDT，
-  两个 root 顺序运行且各自达到唯一 durable terminal 后，按同一诊断/复现/`claude-code/` 对照/
-  通用修复/回归/commit/clean-deploy 闭环推进。当前用户授权上限仍是 Round 18。
 - Round 13 历史状态：已完成两个新的顺序 E2E、三源诊断、通用修复、全量回归、
   本地代码 commit 和生产切换。V2.3 conversation `2ca049506d0249418815b64bab500ead` / root
   `5e635b2d7e4b4486bdeb37d88690d34b` 暴露“schema-valid structured tool call 内字段类型错误但旧
