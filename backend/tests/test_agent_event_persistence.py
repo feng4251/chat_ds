@@ -318,6 +318,53 @@ class AgentEventPersistenceTests(unittest.IsolatedAsyncioTestCase):
             )).scalar_one()
             self.assertEqual(0, running_reducers)
 
+    async def test_fan_in_progress_is_durable_before_root_terminal(self):
+        fan_in_event = _event(
+            "fan_in.reducer_attempt_started",
+            17,
+            run_id="root",
+        )
+        fan_in_event["payload"] = {
+            "plan_id": "plan-generic",
+            "step_id": "merge-generic",
+            "attempt": 2,
+            "replacement_input_mode": "previous_complete_output_compaction",
+        }
+        with (
+            patch.object(chat_router, "async_session", self.sessions),
+            patch.object(
+                chat_router.settings,
+                "agent_event_immediate_persist",
+                True,
+            ),
+            patch.object(chat_router.settings, "agent_debug_trace", False),
+        ):
+            persisted = await chat_router._persist_agent_event_immediate(
+                conv_id="conversation",
+                user_id="user",
+                root_run_id="root",
+                requested_model_id="model",
+                resolved_model_id="model",
+                event=fan_in_event,
+            )
+        self.assertTrue(persisted)
+
+        async with self.sessions() as session:
+            row = (await session.execute(
+                select(AgentRunEvent).where(
+                    AgentRunEvent.run_id == "root",
+                    AgentRunEvent.event_type
+                    == "fan_in.reducer_attempt_started",
+                    AgentRunEvent.seq == 17,
+                )
+            )).scalar_one()
+            self.assertEqual(
+                "previous_complete_output_compaction",
+                json.loads(row.payload)["replacement_input_mode"],
+            )
+            root = await session.get(AgentRun, "root")
+            self.assertEqual("running", root.status)
+
     async def test_final_tool_surface_and_terminal_projection_are_monotonic(self):
         started = _event("run.started", 1, run_id="root")
         surface = _event("tool_surface.resolved", 2, run_id="root")

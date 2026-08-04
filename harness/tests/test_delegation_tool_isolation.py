@@ -2773,11 +2773,38 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
             if step_id.endswith("step-0001") and attempts[step_id] == 2:
                 # Reproduce a multilingual provider completing normally under
                 # its wire-token budget while still exceeding the independent
-                # UTF-8 artifact bound.  The first replacement is discarded in
-                # full and a denser final replacement replays immutable inputs.
+                # UTF-8 artifact bound.  Its exact coverage ledger is valid, so
+                # the next attempt can compact this complete stage boundary
+                # instead of replaying the much larger immutable inputs again.
+                records = json.loads(
+                    prompt.split("UNTRUSTED_INPUT_RECORDS_JSON:\n", 1)[1]
+                )
+                coverage = {
+                    "version": 1,
+                    "sources": [
+                        {
+                            "input_id": record["input_id"],
+                            "status": "present",
+                            "provenance": {
+                                "path": record["path"],
+                                "checksum_sha256": record["checksum_sha256"],
+                                "source_range": record["source_range"],
+                            },
+                            "segment_coverage": {
+                                "byte_start": 0,
+                                "byte_end": record["byte_size"],
+                            },
+                        }
+                        for record in records
+                    ],
+                }
                 yield {
                     "type": "delta",
-                    "content": "多语言证据压缩" * 20_000,
+                    "content": (
+                        "多语言证据压缩" * 20_000
+                        + "\nFAN_IN_COVERAGE_JSON:"
+                        + json.dumps(coverage, separators=(",", ":"))
+                    ),
                 }
                 terminal = {
                     "type": "agent_event",
@@ -2809,35 +2836,77 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
                 yield terminal
                 yield {"type": "done", "finish_reason": "stop"}
                 return
+            if step_id.endswith("step-0001") and attempts[step_id] == 3:
+                self.assertIn(
+                    "UNTRUSTED_PREVIOUS_COMPLETE_REDUCTION_JSON:\n",
+                    prompt,
+                )
+                yield {
+                    "type": "delta",
+                    "content": "COMPACTION_PARTIAL_MUST_NOT_REPLAY",
+                }
+                terminal = {
+                    "type": "agent_event",
+                    "event_type": "run.failed",
+                    "run_id": kwargs["run_id"],
+                    "agent_kind": kwargs["agent_kind"],
+                    "payload": {
+                        "error": "bounded compaction length",
+                        "finish_reason": "length",
+                        "terminal_reason": "model_hit_max_output_tokens",
+                    },
+                }
+                await kwargs["event_sink"](terminal)
+                yield terminal
+                yield {"type": "error", "msg": "bounded compaction length"}
+                return
 
-            records = json.loads(
-                prompt.split("UNTRUSTED_INPUT_RECORDS_JSON:\n", 1)[1]
-            )
-            coverage = {
-                "version": 1,
-                "sources": [
-                    {
-                        "input_id": record["input_id"],
-                        "status": "present",
-                        "provenance": {
-                            "path": record["path"],
-                            "checksum_sha256": record["checksum_sha256"],
-                            "source_range": record["source_range"],
-                        },
-                        "segment_coverage": {
-                            "byte_start": 0,
-                            "byte_end": record["byte_size"],
-                        },
-                    }
-                    for record in records
-                ],
-            }
-            yield {
-                "type": "delta",
-                "content": (
+            if "UNTRUSTED_PREVIOUS_COMPLETE_REDUCTION_JSON:\n" in prompt:
+                previous_record = json.loads(
+                    prompt.split(
+                        "UNTRUSTED_PREVIOUS_COMPLETE_REDUCTION_JSON:\n",
+                        1,
+                    )[1]
+                )
+                previous = previous_record["content"]
+                coverage_line = previous.rsplit(
+                    "\nFAN_IN_COVERAGE_JSON:",
+                    1,
+                )[1]
+                compact_content = (
+                    "Compact completed stage boundary.\nFAN_IN_COVERAGE_JSON:"
+                    + coverage_line
+                )
+            else:
+                records = json.loads(
+                    prompt.split("UNTRUSTED_INPUT_RECORDS_JSON:\n", 1)[1]
+                )
+                coverage = {
+                    "version": 1,
+                    "sources": [
+                        {
+                            "input_id": record["input_id"],
+                            "status": "present",
+                            "provenance": {
+                                "path": record["path"],
+                                "checksum_sha256": record["checksum_sha256"],
+                                "source_range": record["source_range"],
+                            },
+                            "segment_coverage": {
+                                "byte_start": 0,
+                                "byte_end": record["byte_size"],
+                            },
+                        }
+                        for record in records
+                    ],
+                }
+                compact_content = (
                     "Compact complete replacement.\nFAN_IN_COVERAGE_JSON:"
                     + json.dumps(coverage, separators=(",", ":"))
-                ),
+                )
+            yield {
+                "type": "delta",
+                "content": compact_content,
             }
             terminal = {
                 "type": "agent_event",
@@ -2884,21 +2953,36 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
         first_step = next(
             step for step in attempts if step.endswith("step-0001")
         )
-        self.assertEqual(3, attempts[first_step])
+        self.assertEqual(4, attempts[first_step])
         second_step = next(
             step for step in attempts if step.endswith("step-0002")
         )
         self.assertEqual(2, attempts[second_step])
-        finalization_prompts = [
+        original_replacement_prompts = [
             prompt
             for prompt in reducer_prompts
             if "bounded fan-in complete replacement" in prompt
         ]
-        self.assertEqual(3, len(finalization_prompts))
+        compaction_prompts = [
+            prompt
+            for prompt in reducer_prompts
+            if "bounded fan-in completed-output compaction" in prompt
+        ]
+        self.assertEqual(2, len(original_replacement_prompts))
+        self.assertEqual(2, len(compaction_prompts))
         self.assertTrue(all(
             "discarded in full" in prompt
             and "DISCARDED_REDUCER_PREFIX" not in prompt
-            for prompt in finalization_prompts
+            for prompt in original_replacement_prompts
+        ))
+        self.assertNotIn(
+            "UNTRUSTED_INPUT_RECORDS_JSON:\n",
+            compaction_prompts[0],
+        )
+        self.assertTrue(all(
+            "DISCARDED_REDUCER_PREFIX" not in prompt
+            and "COMPACTION_PARTIAL_MUST_NOT_REPLAY" not in prompt
+            for prompt in compaction_prompts
         ))
         self.assertEqual(
             {
@@ -2909,7 +2993,9 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
             {
                 prompt.split("Rejected-attempt category: ", 1)[1]
                 .splitlines()[0]
-                for prompt in finalization_prompts
+                for prompt in (
+                    original_replacement_prompts + compaction_prompts
+                )
             },
         )
         self.assertNotIn("DISCARDED_REDUCER_PREFIX", main_prompt)
@@ -2971,32 +3057,62 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
                 for event in reducer_attempt_starts
             ],
         )
+        immutable_attempts = [
+            event
+            for event in reducer_attempt_starts
+            if event["payload"].get("replacement_input_mode")
+            == "immutable_original"
+        ]
         self.assertTrue(all(
             int(event["payload"]["generation_output_tokens"])
             > int(event["payload"]["accepted_output_tokens"])
-            and int(event["payload"]["generation_headroom_tokens"])
-            == (
-                int(event["payload"]["generation_output_tokens"])
-                - int(event["payload"]["accepted_output_tokens"])
-            )
-            for event in reducer_attempt_starts
+            for event in immutable_attempts
         ))
-        final_replacement = next(
+        first_compaction = next(
             event
             for event in reducer_attempt_starts
             if event["payload"].get("attempt") == 3
         )
         self.assertEqual(
             "byte_bound_exceeded",
-            final_replacement["payload"]["replacement_reason_code"],
+            first_compaction["payload"]["replacement_reason_code"],
         )
         self.assertGreater(
-            int(final_replacement["payload"]["previous_output_bytes"]),
-            int(final_replacement["payload"]["accepted_output_bytes"]),
+            int(first_compaction["payload"]["previous_output_bytes"]),
+            int(first_compaction["payload"]["accepted_output_bytes"]),
         )
         self.assertGreater(
-            int(final_replacement["payload"]["previous_output_estimated_tokens"]),
+            int(first_compaction["payload"]["previous_output_estimated_tokens"]),
             0,
+        )
+        self.assertEqual(
+            "previous_complete_output_compaction",
+            first_compaction["payload"]["replacement_input_mode"],
+        )
+        self.assertLess(
+            int(first_compaction["payload"]["generation_output_tokens"]),
+            int(first_compaction["payload"]["accepted_output_tokens"]),
+        )
+        self.assertRegex(
+            str(first_compaction["payload"]["previous_complete_output_sha256"]),
+            r"^[a-f0-9]{64}$",
+        )
+        final_compaction = next(
+            event
+            for event in reducer_attempt_starts
+            if event["payload"].get("attempt") == 4
+        )
+        self.assertEqual(
+            "length",
+            final_compaction["payload"]["replacement_reason_code"],
+        )
+        self.assertEqual(
+            first_compaction["payload"]["previous_complete_output_sha256"],
+            final_compaction["payload"]["previous_complete_output_sha256"],
+        )
+        self.assertLess(
+            int(final_compaction["payload"]["generation_output_tokens"]),
+            int(first_compaction["payload"]["generation_output_tokens"]),
         )
         persisted_event_types = [
             call.args[2]["event_type"]

@@ -1818,6 +1818,7 @@ def _should_persist_agent_event_immediately(event_type: str) -> bool:
         "tool_surface.",
         "artifact.",
         "verifier.",
+        "fan_in.",
         "agent.spawned",
     )):
         return True

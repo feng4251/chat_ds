@@ -68,6 +68,8 @@ from result_fan_in_runtime import (
     REDUCTION_PROMPT_RESERVE_BYTES,
     REDUCTION_PROMPT_RESERVE_TOKENS,
     ReductionRequest,
+    bounded_compaction_generation_output_tokens,
+    build_bounded_compaction_prompt,
     build_complete_replacement_prompt,
     estimate_fan_in_reducer_schedule,
     load_exact_result_text,
@@ -6297,11 +6299,18 @@ def _fan_in_retryable_output_failure(
     rendered = str(content or "")
     if not rendered.strip():
         return "empty_output"
-    if len(rendered.encode("utf-8")) > request.max_output_bytes:
-        return "byte_bound_exceeded"
     protocol_audit = audit_raw_tool_protocol(rendered, ())
     if int(protocol_audit["detected_count"] or 0) > 0:
         return "raw_tool_protocol"
+    if request.structure_validator is not None:
+        try:
+            request.structure_validator(rendered)
+        except FanInExecutionError:
+            return "structured_output_contract_invalid"
+    if len(rendered.encode("utf-8")) > request.max_output_bytes:
+        return "byte_bound_exceeded"
+    if estimate_mixed_text_tokens(rendered) > request.max_output_tokens:
+        return "token_bound_exceeded"
     if request.acceptance_validator is not None:
         try:
             request.acceptance_validator(rendered)
@@ -10325,6 +10334,7 @@ async def _run_child(
                                     "bounded_pure_output_contract_failure"
                                 ),
                                 "complete_replacement_on_retry": True,
+                                "compact_complete_oversize_on_retry": True,
                                 "side_effects": "none",
                                 "planned_max_input_tokens": (
                                     worst_reducer_input_tokens
@@ -10389,18 +10399,33 @@ async def _run_child(
                             replacement_reason_code = ""
                             replacement_previous_output_bytes: int | None = None
                             replacement_previous_output_tokens: int | None = None
+                            replacement_previous_complete_output: str | None = None
+                            replacement_previous_complete_sha256: str | None = None
+                            replacement_input_mode = "immutable_original"
                             for attempt_index in range(
                                 MAX_REDUCER_LENGTH_ATTEMPTS
                             ):
                                 attempt_number = attempt_index + 1
-                                attempt_prompt = (
-                                    request.prompt
-                                    if attempt_index == 0
-                                    else build_complete_replacement_prompt(
+                                if attempt_index == 0:
+                                    attempt_prompt = request.prompt
+                                elif (
+                                    replacement_input_mode
+                                    == "previous_complete_output_compaction"
+                                    and replacement_previous_complete_output
+                                    is not None
+                                ):
+                                    attempt_prompt = build_bounded_compaction_prompt(
                                         request,
-                                        reason_code=(
-                                            replacement_reason_code
+                                        previous_complete_output=(
+                                            replacement_previous_complete_output
                                         ),
+                                        reason_code=replacement_reason_code,
+                                        attempt_number=attempt_number,
+                                    )
+                                else:
+                                    attempt_prompt = build_complete_replacement_prompt(
+                                        request,
+                                        reason_code=replacement_reason_code,
                                         attempt_number=attempt_number,
                                         previous_output_bytes=(
                                             replacement_previous_output_bytes
@@ -10409,6 +10434,17 @@ async def _run_child(
                                             replacement_previous_output_tokens
                                         ),
                                     )
+                                attempt_generation_output_tokens = (
+                                    bounded_compaction_generation_output_tokens(
+                                        request,
+                                        attempt_number=attempt_number,
+                                        generation_ceiling_tokens=(
+                                            generation_output_tokens
+                                        ),
+                                    )
+                                    if replacement_input_mode
+                                    == "previous_complete_output_compaction"
+                                    else generation_output_tokens
                                 )
                                 remaining = (
                                     lifecycle_deadline - time.monotonic()
@@ -10428,7 +10464,7 @@ async def _run_child(
                                         )
                                     ),
                                     max_output_tokens=(
-                                        generation_output_tokens
+                                        attempt_generation_output_tokens
                                     ),
                                     caller_hard_cap_seconds=min(
                                         configured_stream_timeout,
@@ -10477,12 +10513,15 @@ async def _run_child(
                                             request.max_output_bytes
                                         ),
                                         "generation_output_tokens": (
-                                            generation_output_tokens
+                                            attempt_generation_output_tokens
                                         ),
                                         "generation_headroom_tokens": max(
                                             0,
-                                            generation_output_tokens
+                                            attempt_generation_output_tokens
                                             - request.max_output_tokens,
+                                        ),
+                                        "replacement_input_mode": (
+                                            replacement_input_mode
                                         ),
                                         "replacement_reason_code": (
                                             replacement_reason_code or None
@@ -10492,6 +10531,9 @@ async def _run_child(
                                         ),
                                         "previous_output_estimated_tokens": (
                                             replacement_previous_output_tokens
+                                        ),
+                                        "previous_complete_output_sha256": (
+                                            replacement_previous_complete_sha256
                                         ),
                                     },
                                 })
@@ -10586,7 +10628,7 @@ async def _run_child(
                                     session_id=context.session_id,
                                     timeout=attempt_timeout,
                                     max_iterations=1,
-                                    max_tokens=generation_output_tokens,
+                                    max_tokens=attempt_generation_output_tokens,
                                     provider_override=(
                                         context.provider_config
                                     ),
@@ -10803,6 +10845,21 @@ async def _run_child(
                                         attempt_number
                                         < MAX_REDUCER_LENGTH_ATTEMPTS
                                     ):
+                                        can_compact_complete_output = bool(
+                                            completed_payloads
+                                            and retryable_output_failure
+                                            in {
+                                                "byte_bound_exceeded",
+                                                "token_bound_exceeded",
+                                            }
+                                        )
+                                        next_attempt_input_mode = (
+                                            "previous_complete_output_compaction"
+                                            if can_compact_complete_output
+                                            or replacement_previous_complete_output
+                                            is not None
+                                            else "immutable_original"
+                                        )
                                         await forward_event({
                                             "type": "agent_event",
                                             "event_type": (
@@ -10837,6 +10894,9 @@ async def _run_child(
                                                 "reason_code": (
                                                     retryable_output_failure
                                                 ),
+                                                "next_attempt_input_mode": (
+                                                    next_attempt_input_mode
+                                                ),
                                                 "discarded_output_bytes": (
                                                     observed_output_bytes
                                                 ),
@@ -10854,6 +10914,33 @@ async def _run_child(
                                         replacement_previous_output_tokens = (
                                             observed_output_tokens
                                         )
+                                        if can_compact_complete_output:
+                                            complete_stage_output = (
+                                                reduction_content.strip()
+                                            )
+                                            replacement_input_mode = (
+                                                "previous_complete_output_compaction"
+                                            )
+                                            replacement_previous_complete_output = (
+                                                complete_stage_output
+                                            )
+                                            replacement_previous_complete_sha256 = (
+                                                hashlib.sha256(
+                                                    complete_stage_output.encode(
+                                                        "utf-8"
+                                                    )
+                                                ).hexdigest()
+                                            )
+                                        else:
+                                            replacement_input_mode = (
+                                                next_attempt_input_mode
+                                            )
+                                            if (
+                                                next_attempt_input_mode
+                                                == "immutable_original"
+                                            ):
+                                                replacement_previous_complete_output = None
+                                                replacement_previous_complete_sha256 = None
                                         continue
                                     raise FanInExecutionError(
                                         "internal fan-in reducer repeated an "

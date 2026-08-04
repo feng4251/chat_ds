@@ -110,7 +110,7 @@ class ResultFanInRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("complete replacement", prompt)
         self.assertIn("exactly one complete terminal coverage ledger", prompt)
         self.assertIn("Absolute accepted-output token bound", prompt)
-        self.assertIn("Replacement attempt: 2 of 3", prompt)
+        self.assertIn("Replacement attempt: 2 of 4", prompt)
         self.assertTrue(prompt.endswith(original))
         self.assertEqual(1, prompt.count("renamed-source"))
         self.assertLess(
@@ -149,6 +149,69 @@ class ResultFanInRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("36939 UTF-8 bytes", third)
         self.assertTrue(second.endswith(request.prompt))
         self.assertTrue(third.endswith(request.prompt))
+
+    def test_complete_oversize_compaction_uses_only_validated_stage_output(self):
+        request = ReductionRequest(
+            request_id="request-stage-boundary",
+            step_id="step-stage-boundary",
+            prompt="ORIGINAL_IMMUTABLE_INPUT_MUST_NOT_BE_REPLAYED",
+            max_output_tokens=12_000,
+            max_output_bytes=48_000,
+            minimum_output_tokens=1_000,
+            minimum_output_bytes=4_000,
+        )
+        previous = (
+            "Complete semantic stage output.\n"
+            'FAN_IN_COVERAGE_JSON:{"version":1,"sources":[]}'
+        )
+
+        prompt = fan_in_runtime.build_bounded_compaction_prompt(
+            request,
+            previous_complete_output=previous,
+            reason_code="byte_bound_exceeded",
+            attempt_number=3,
+        )
+
+        self.assertIn("previous_complete_output_compaction", prompt)
+        self.assertIn("Step ID: step-stage-boundary", prompt)
+        self.assertIn("at most 4000 estimated tokens and 16000 UTF-8 bytes", prompt)
+        self.assertNotIn(request.prompt, prompt)
+        record = json.loads(
+            prompt.split(
+                "UNTRUSTED_PREVIOUS_COMPLETE_REDUCTION_JSON:\n",
+                1,
+            )[1]
+        )
+        self.assertEqual(previous, record["content"])
+        self.assertEqual(
+            hashlib.sha256(previous.encode("utf-8")).hexdigest(),
+            record["sha256"],
+        )
+        self.assertEqual(
+            5_024,
+            fan_in_runtime.bounded_compaction_generation_output_tokens(
+                request,
+                attempt_number=3,
+                generation_ceiling_tokens=18_000,
+            ),
+        )
+
+    def test_compaction_rejects_unknown_failure_categories(self):
+        request = ReductionRequest(
+            request_id="request-incomplete",
+            step_id="step-incomplete",
+            prompt="immutable",
+            max_output_tokens=8_000,
+            max_output_bytes=32_000,
+        )
+
+        with self.assertRaisesRegex(ValueError, "unsupported.*compaction reason"):
+            fan_in_runtime.build_bounded_compaction_prompt(
+                request,
+                previous_complete_output="retained complete stage",
+                reason_code="provider_failure",
+                attempt_number=2,
+            )
 
     def test_runtime_defaults_bound_generic_reducer_outputs(self):
         self.assertEqual(fan_in_runtime.DEFAULT_REDUCTION_OUTPUT_TOKENS, 8 * 1024)
