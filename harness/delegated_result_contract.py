@@ -41,6 +41,70 @@ _RAW_TOOL_PROTOCOL_RESERVED_TAGS = {
     "parameter",
 }
 
+_PROCESS_NARRATION_PATTERN = re.compile(
+    r"(?:\b(?:let me|i will|i'll|i need to|i should|i am going to|i'm going to|"
+    r"next\s*,?\s*i(?:\s+will|'ll|\s+need to)?|now\s+i(?:\s+will|'ll|\s+need to)?|"
+    r"we need to|we will|continue (?:searching|researching|retrieving|checking)|"
+    r"going to (?:search|retrieve|inspect|check|query))\b|"
+    r"\u8ba9\u6211(?:\u5148|\u518d)?|\u6211(?:\u5c06|\u4f1a|\u8981|\u9700\u8981|\u51c6\u5907)(?:\u5148|\u518d)?|\u63a5\u4e0b\u6765(?:\u6211)?|"
+    r"\u4e0b\u4e00\u6b65(?:\u6211)?|\u73b0\u5728(?:\u6211)?(?:\u8981|\u9700\u8981|\u5c06)|\u7ee7\u7eed(?:\u641c\u7d22|\u68c0\u7d22|\u67e5\u8be2|\u7814\u7a76|\u68c0\u67e5))",
+    re.IGNORECASE,
+)
+
+_SUBSTANTIVE_RESULT_SIGNAL_PATTERN = re.compile(
+    r"(?:^|\n)\s*(?:#{1,6}\s+(?:findings?|results?|evidence|analysis|"
+    r"provenance|gaps?|verification|conclusions?|recommendations?|"
+    r"\u53d1\u73b0|\u7ed3\u679c|\u8bc1\u636e|\u5206\u6790|\u6765\u6e90|\u7f3a\u53e3|\u9a8c\u8bc1|\u7ed3\u8bba|\u5efa\u8bae)\b|"
+    r"(?:sources?|provenance|verification|\u6765\u6e90|\u8bc1\u636e\u6765\u6e90|\u9a8c\u8bc1)\s*:|"
+    r"\|[^\n]+\|\s*$)"
+    r"|\b(?:pass(?:ed)?|warn(?:ing)?|fail(?:ed|ure)?|degraded|verified)\b"
+    r"|\u901a\u8fc7|\u8b66\u544a|\u5931\u8d25|\u964d\u7ea7|\u9a8c\u8bc1",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def is_process_narration_only(content: str) -> bool:
+    """Return whether a terminal draft only promises future work.
+
+    The inner output transaction and outer delegated-result commit boundary
+    share this exact semantic predicate.  Several future-action markers are
+    required, while ordinary report structure, provenance, citations, or an
+    explicit completion/degraded status make the draft non-matching.
+    """
+
+    value = str(content or "").strip()
+    if not value:
+        return False
+    process_markers = _PROCESS_NARRATION_PATTERN.findall(value)
+    if len(process_markers) < 3:
+        return False
+    return _SUBSTANTIVE_RESULT_SIGNAL_PATTERN.search(value) is None
+
+
+def delegated_result_substantive_body(content: str) -> str:
+    """Return model-authored result prose without terminal machine ledgers.
+
+    Result-field, quality, gap, and receipt records are authoritative audit
+    metadata, but none can make future-action narration substantive.  Every
+    delegated semantic gate uses this same projection so an inner transaction
+    and its outer commit boundary cannot disagree merely because a valid
+    machine ledger contains a status word.
+    """
+
+    retained, _removed = strip_result_fields_candidate_tail(content)
+    machine_prefixes = (
+        "[HARNESS_",
+        "CAPABILITY_GAPS_JSON:",
+        "COMPLETION_QUALITY_JSON:",
+        "KNOWLEDGE_GATE_CHECKS_JSON:",
+        "KNOWLEDGE_GATE_GAPS_JSON:",
+    )
+    return "\n".join(
+        line
+        for line in retained.splitlines()
+        if not line.strip().startswith(machine_prefixes)
+    ).strip()
+
 
 def is_formal_object_result_schema(value: Any) -> bool:
     """Disambiguate formal JSON Schema from legacy field mappings.

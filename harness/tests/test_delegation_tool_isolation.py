@@ -2059,6 +2059,71 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_one_skill_main_preload_satisfies_worker_and_capability_roles(self):
+        order: list[str] = []
+        observed: dict[str, object] = {}
+
+        async def fake_dispatch(name, args, *, context):
+            order.append(f"{name}:{args.get('name')}:{args.get('file_path')}")
+            return json.dumps({
+                "success": True,
+                "content": "ONE_IMMUTABLE_MAIN_WITH_TWO_COMPILED_ROLES",
+            })
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            order.append("llm")
+            observed["prompt"] = str(messages[0]["content"])
+            observed["tools"] = list(tools)
+            yield {
+                "type": "delta",
+                "content": "## Findings\nEvidence: the shared authority was applied.",
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch("tools.delegation.registry_dispatch", fake_dispatch),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                return_value="results/delegate_shared_main.txt",
+            ),
+        ):
+            result = await _run_child(
+                {
+                    "goal": "apply one Skill main as the exact worker contract",
+                    "skill_name": "generic-skill",
+                    "worker_id": "coordinator",
+                    "worker_file": "SKILL.md",
+                    "step_type": "worker",
+                    "tools": ["skill_view"],
+                    "required_capability_skills": ["generic-skill"],
+                },
+                replace(
+                    _context("skill_view"),
+                    allowed_skill_resources=(("generic-skill", "SKILL.md"),),
+                ),
+                0,
+            )
+
+        self.assertEqual("completed", result["status"], result)
+        self.assertEqual(
+            ["skill_view:generic-skill:SKILL.md", "llm"],
+            order,
+        )
+        self.assertEqual([], observed["tools"])
+        self.assertIn(
+            "ONE_IMMUTABLE_MAIN_WITH_TWO_COMPILED_ROLES",
+            observed["prompt"],
+        )
+        self.assertEqual(
+            ["SKILL.md"],
+            result["tool_audit"]["inspected_skill_files"],
+        )
+        self.assertEqual(
+            ["generic-skill"],
+            result["tool_audit"]["inspected_capability_skills"],
+        )
+
     async def test_missing_capability_skill_fails_closed_without_model(self):
         async def fake_dispatch(name, args, *, context):
             return json.dumps({
