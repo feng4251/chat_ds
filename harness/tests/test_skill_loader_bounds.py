@@ -203,6 +203,45 @@ class SkillLoaderBoundsTests(unittest.TestCase):
         )
         self.assertIn("scripts/example.py", workflow.get("script_candidates") or [])
 
+    def test_portable_hub_install_path_binds_selected_package_script(self):
+        """Canonical Hub install spellings remain package-local authority."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write(
+                root,
+                "SKILL.md",
+                "---\n"
+                "name: portable-cards\n"
+                "description: portable helper fixture\n"
+                "---\n"
+                "Run `python3 ~/.hermes/skills/productivity/portable-cards/"
+                "scripts/cards.py stats` and report the result.\n",
+            )
+            self._write(
+                root,
+                "scripts/cards.py",
+                "print('ok')\n",
+            )
+
+            loaded = load_skill_content(
+                root / "SKILL.md",
+                skill_dir=str(root),
+            )
+
+        workflow = loaded.get("workflow_contract") or {}
+        self.assertEqual(
+            ["scripts/cards.py"],
+            workflow.get("script_candidates"),
+        )
+        authority = workflow.get("resource_authority") or {}
+        self.assertIn(
+            "scripts/cards.py",
+            authority.get("blocking_resources") or [],
+        )
+        manifest = loaded.get("runtime_profile_manifest") or {}
+        self.assertTrue(manifest.get("valid"), manifest)
+
     def test_exact_runtime_manifest_declares_content_addressed_entrypoint(
         self,
     ):

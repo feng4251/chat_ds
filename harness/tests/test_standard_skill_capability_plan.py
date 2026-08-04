@@ -7,20 +7,26 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from pydantic import ValidationError
+
 from agent_loop import (
     HarnessRunState,
     SessionSkillRelevanceDecision,
     _adaptive_capability_plan_output_tokens,
+    _bounded_skill_execution_exposure,
     _capability_plan_history_projection,
     _build_standard_skill_capability_catalog,
     _model_facing_capability_plan_schemas,
     _preflight_standard_skill_runtime_selection,
     _safe_build_standard_skill_capability_catalog,
     _standard_skill_catalog_failure_terminal,
+    _standard_skill_execution_engine,
+    _standard_skill_uses_semantic_capability_plan,
     _semantic_control_call_accepted,
     _tool_debug_result,
     run_stream,
 )
+from config import Settings
 from skill_capability_plan import (
     build_capability_catalog,
     build_callable_skill_result_receipt,
@@ -111,6 +117,160 @@ class _Response:
 
 
 class StandardSkillCapabilityPlanTests(unittest.TestCase):
+    def test_standard_skill_engine_setting_is_canonical_and_fail_closed(self):
+        self.assertEqual(
+            "progressive",
+            Settings(
+                _env_file=None,
+                standard_skill_execution_engine="progressive-disclosure",
+            ).standard_skill_execution_engine,
+        )
+        self.assertEqual(
+            "legacy_semantic_plan",
+            Settings(
+                _env_file=None,
+                standard_skill_execution_engine="legacy",
+            ).standard_skill_execution_engine,
+        )
+        with self.assertRaises(ValidationError):
+            Settings(
+                _env_file=None,
+                standard_skill_execution_engine="progessive",
+            )
+
+    def test_progressive_engine_skips_model_authored_plan_for_free_form_skill(self):
+        package = {
+            "content": "# Instructions\nUse the packaged helper and verify output.\n",
+            "workflow_contract": {},
+        }
+        with patch(
+            "agent_loop.settings.standard_skill_execution_engine",
+            "legacy_semantic_plan",
+        ):
+            self.assertTrue(
+                _standard_skill_uses_semantic_capability_plan(package)
+            )
+        with patch(
+            "agent_loop.settings.standard_skill_execution_engine",
+            "progressive",
+        ):
+            self.assertFalse(
+                _standard_skill_uses_semantic_capability_plan(package)
+            )
+
+    def test_declarative_workflow_never_uses_model_authored_plan(self):
+        package = {
+            "content": "# Instructions\nRun the declared workflow.\n",
+            "workflow_contract": {
+                "execution_contract": {
+                    "schema_version": 1,
+                    "workers": [{"id": "worker-a"}],
+                }
+            },
+        }
+        for engine in ("legacy_semantic_plan", "progressive"):
+            with self.subTest(engine=engine), patch(
+                "agent_loop.settings.standard_skill_execution_engine",
+                engine,
+            ):
+                self.assertFalse(
+                    _standard_skill_uses_semantic_capability_plan(package)
+                )
+                self.assertEqual(
+                    "deterministic_workflow",
+                    _standard_skill_execution_engine(package),
+                )
+
+    def test_progressive_free_form_skill_keeps_exact_profiled_helper(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "portable-helper"
+            root.mkdir()
+            (root / "scripts").mkdir()
+            (root / "SKILL.md").write_text(
+                "---\n"
+                "name: portable-helper\n"
+                "description: Run a package-local helper.\n"
+                "---\n"
+                "Run `python3 ~/.hermes/skills/productivity/portable-helper/"
+                "scripts/check.py` and report its result.\n",
+                encoding="utf-8",
+            )
+            helper = root / "scripts" / "check.py"
+            helper.write_text("print('ok')\n", encoding="utf-8")
+            package = load_skill_content(
+                root / "SKILL.md",
+                skill_dir=str(root),
+            )
+            inventory = ((
+                "scripts/check.py",
+                hashlib.sha256(helper.read_bytes()).hexdigest(),
+            ),)
+
+            exposure = _bounded_skill_execution_exposure(
+                "Use portable-helper and run its packaged helper.",
+                [
+                    "skills_list",
+                    "skill_view",
+                    "run_skill_process",
+                    "run_skill_python",
+                    "run_skill_script",
+                ],
+                {"portable-helper"},
+                {"portable-helper": package},
+                {"portable-helper": inventory},
+                selected_skill_names=("portable-helper",),
+            )
+
+        self.assertIn("run_skill_python", exposure.tools)
+        self.assertIn(
+            "run_skill_script",
+            exposure.tools,
+        )
+        self.assertEqual(
+            [("portable-helper", "scripts/check.py")],
+            [(name, path) for name, path, _digest in exposure.allowed_skill_scripts],
+        )
+
+    def test_free_form_skill_only_requires_structural_delegation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "portable-review"
+            root.mkdir()
+            (root / "SKILL.md").write_text(
+                "---\n"
+                "name: portable-review\n"
+                "description: Coordinate independent reviews.\n"
+                "---\n"
+                "# Workflow\n"
+                "- Delegate three independent reviewer agents to assess the "
+                "input.\n"
+                "- If the user requests an export, write the synthesis to a "
+                "file.\n"
+                "- Use code execution only when calculations need checking.\n",
+                encoding="utf-8",
+            )
+            package = load_skill_content(
+                root / "SKILL.md",
+                skill_dir=str(root),
+            )
+            exposure = _bounded_skill_execution_exposure(
+                "Use portable-review to assess this text in chat.",
+                [
+                    "skill_view",
+                    "delegate_task",
+                    "write_file",
+                    "execute_code",
+                ],
+                {"portable-review"},
+                {"portable-review": package},
+                {"portable-review": ()},
+                selected_skill_names=("portable-review",),
+            )
+
+        self.assertIn("delegate_task", exposure.tools)
+        self.assertNotIn("write_file", exposure.tools)
+        self.assertIn("execute_code", exposure.tools)
+        self.assertEqual((("delegate_task",),), exposure.required_groups)
+
     def test_model_facing_workflow_planner_is_compact_and_acceptance_gated(self):
         registry_schema = {
             "type": "function",
@@ -2800,6 +2960,150 @@ class StandardSkillCapabilityPlanTests(unittest.TestCase):
 
 
 class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
+    async def test_progressive_run_reads_skill_before_direct_execution(self):
+        provider = {
+            "id": "mock-progressive-standard-skill",
+            "base_url": "http://model.invalid/v1",
+            "api_model": "mock-progressive-standard-skill",
+            "api_key": "EMPTY",
+            "protocol": "openai",
+            "provider": "mock",
+            "context_length": 64_000,
+            "is_multimodal": True,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "portable-notes"
+            root.mkdir()
+            (root / "SKILL.md").write_text(
+                "---\nname: portable-notes\n"
+                "description: Produce a small durable note.\n---\n"
+                "Use `write_file` to create `note.md`, then summarize it.\n",
+                encoding="utf-8",
+            )
+            package = load_skill_content(
+                root / "SKILL.md",
+                skill_dir=str(root),
+            )
+            enabled = [
+                "skill_view",
+                "submit_skill_capability_plan",
+                "write_file",
+            ]
+            responses = [
+                _tool_response(
+                    "read-main",
+                    "skill_view",
+                    {"name": "portable-notes"},
+                ),
+                _tool_response(
+                    "write-note",
+                    "write_file",
+                    {"filepath": "note.md", "content": "# Note\nready\n"},
+                ),
+                _stop_response("已按 Skill 生成 note.md。"),
+            ]
+            request_bodies: list[dict] = []
+            dispatch_names: list[str] = []
+
+            class Client:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, exc_type, exc, tb):
+                    return False
+
+                def stream(self, method, url, **kwargs):
+                    request_bodies.append(kwargs["json"])
+                    return _Response(responses.pop(0))
+
+            async def fake_dispatch(name, args, *, context):
+                dispatch_names.append(name)
+                if name == "skill_view":
+                    return json.dumps({
+                        **package,
+                        "success": True,
+                        "skill_dir": str(root),
+                    }, ensure_ascii=False)
+                if name == "write_file":
+                    return json.dumps({
+                        "status": "written",
+                        "path": args.get("filepath"),
+                        "size": len(
+                            str(args.get("content") or "").encode("utf-8")
+                        ),
+                    })
+                raise AssertionError(name)
+
+            skill_record = {
+                "name": "portable-notes",
+                "description": package["description"],
+                "scope": "session",
+                "path": str(root / "SKILL.md"),
+                "skill_dir": str(root),
+            }
+            with (
+                patch(
+                    "workspace_context.WORKSPACE_ROOT",
+                    Path(temp_dir) / "ws",
+                ),
+                patch("agent_loop.httpx.AsyncClient", Client),
+                patch("agent_loop.dispatch", fake_dispatch),
+                patch("agent_loop.build_system_prompt", return_value="system"),
+                patch("agent_loop.load_workspace_context", return_value=""),
+                patch("agent_loop._fetch_goal", AsyncMock(return_value=None)),
+                patch(
+                    "agent_loop.settings.standard_skill_execution_engine",
+                    "progressive",
+                ),
+                patch(
+                    "skills.scanner.find_all_skills",
+                    return_value=[skill_record],
+                ),
+                patch(
+                    "skills.scanner.skill_runnable_script_resources",
+                    return_value=(),
+                ),
+            ):
+                events = [event async for event in run_stream(
+                    "mock-progressive-standard-skill",
+                    [{
+                        "role": "user",
+                        "content": "请运行 portable-notes Skill 完成任务",
+                    }],
+                    enabled,
+                    provider_override=provider,
+                    allow_session_mcp=False,
+                    user_id="u-progressive-standard-skill",
+                    session_id="s-progressive-standard-skill",
+                    max_iterations=6,
+                )]
+
+        self.assertFalse(responses)
+        self.assertEqual(["skill_view", "write_file"], dispatch_names)
+        exposed = [
+            {
+                item["function"]["name"]
+                for item in (body.get("tools") or [])
+            }
+            for body in request_bodies
+        ]
+        self.assertEqual({"skill_view"}, exposed[0])
+        self.assertIn("write_file", exposed[1])
+        self.assertNotIn("submit_skill_capability_plan", exposed[1])
+        self.assertNotIn("submit_skill_capability_plan", exposed[2])
+        started = next(
+            event for event in events
+            if event.get("event_type") == "run.started"
+        )
+        self.assertEqual(
+            [{"skill_name": "portable-notes", "engine": "progressive"}],
+            started["payload"]["skill_execution_engines"],
+        )
+        self.assertEqual({"type": "done", "finish_reason": "stop"}, events[-1])
+
     async def test_rejected_compact_plan_keeps_frontier_and_fails_bounded(self):
         provider = {
             "id": "mock-bounded-workflow-plan-validation",

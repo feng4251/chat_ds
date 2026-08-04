@@ -5173,14 +5173,9 @@ def _intent_bootstrap_capabilities(resolved_mappings: dict[str, Any]) -> list[st
     return _dedupe_paths(capabilities)
 
 
-def _intent_local_resource_paths(resolved_mappings: dict[str, Any]) -> list[str]:
-    """Return selected references that must resolve inside the current Skill.
+def _local_resource_paths_from_intent_value(value: Any) -> list[str]:
+    """Extract local-looking paths from one declarative intent-map value."""
 
-    Intent maps may mix local files with external Skill/tool/web capabilities.
-    Keep the original local path spelling until the runtime can validate it
-    against the selected Skill: stripping arbitrary leading ``.``/``/`` here
-    would turn a traversal or absolute path into an apparently safe one.
-    """
     paths: list[str] = []
 
     def collect(item: Any) -> None:
@@ -5221,6 +5216,20 @@ def _intent_local_resource_paths(resolved_mappings: dict[str, Any]) -> list[str]
         ):
             paths.append(candidate)
 
+    collect(value)
+    return _dedupe_paths(paths)
+
+
+def _intent_local_resource_paths(resolved_mappings: dict[str, Any]) -> list[str]:
+    """Return selected references that must resolve inside the current Skill.
+
+    Intent maps may mix local files with external Skill/tool/web capabilities.
+    Keep the original local path spelling until the runtime can validate it
+    against the selected Skill: stripping arbitrary leading ``.``/``/`` here
+    would turn a traversal or absolute path into an apparently safe one.
+    """
+    paths: list[str] = []
+
     for mapping_path, value in resolved_mappings.items():
         mapping_name = mapping_path.rsplit(".", 1)[-1].casefold()
         if not any(
@@ -5231,8 +5240,73 @@ def _intent_local_resource_paths(resolved_mappings: dict[str, Any]) -> list[str]
             )
         ):
             continue
-        collect(value)
+        paths.extend(_local_resource_paths_from_intent_value(value))
     return _dedupe_paths(paths)
+
+
+def _intent_alternative_local_resource_paths(plan: dict[str, Any]) -> list[str]:
+    """Return every local resource reachable across declared intent choices.
+
+    These paths form an explicit alternative universe supplied by the Skill;
+    they are not inferred from directory names or prose.  A selected intent
+    value can therefore project a worker's broad resource catalog without
+    silently loading resources that belong to a different declared choice.
+    """
+
+    paths: list[str] = []
+    for dimension in _intent_dimensions(plan):
+        mappings = dimension.get("mappings")
+        if not isinstance(mappings, dict):
+            mappings = {
+                str(key): value
+                for key, value in dimension.items()
+                if str(key).endswith(("_map", "_mapping", "_rules"))
+                and isinstance(value, dict)
+            }
+        for mapping_name, mapping in mappings.items():
+            normalized_name = str(mapping_name).casefold()
+            if not isinstance(mapping, dict) or not any(
+                token in normalized_name
+                for token in (
+                    "knowledge", "resource", "source", "reference",
+                    "phase", "file", "skill",
+                )
+            ):
+                continue
+            for value in mapping.values():
+                paths.extend(_local_resource_paths_from_intent_value(value))
+    return _dedupe_paths(paths)
+
+
+def _project_intent_scoped_local_resources(
+    plan: dict[str, Any],
+    resolved_mappings: dict[str, Any],
+    declared_paths: list[str] | tuple[str, ...],
+) -> list[str]:
+    """Keep unconditional resources plus only selected intent alternatives."""
+
+    declared = _dedupe_paths([
+        str(path) for path in declared_paths
+        if isinstance(path, str) and path.strip()
+    ])
+    alternatives = {
+        _normalize_skill_file_path(path)
+        for path in _intent_alternative_local_resource_paths(plan)
+        if _normalize_skill_file_path(path)
+    }
+    if not alternatives:
+        return declared
+    selected = {
+        _normalize_skill_file_path(path)
+        for path in _intent_local_resource_paths(resolved_mappings)
+        if _normalize_skill_file_path(path)
+    }
+    return [
+        path
+        for path in declared
+        if _normalize_skill_file_path(path) not in alternatives
+        or _normalize_skill_file_path(path) in selected
+    ]
 
 
 def _apply_intent_selections_to_plan(
@@ -16234,13 +16308,23 @@ async def run_stream(
                         }
                         forced_workflow_policy = None
                         return
+                    declared_worker_resources = [
+                        str(path)
+                        for path in (meta.get("local_resources") or [])
+                        if isinstance(path, str) and path.strip()
+                    ]
+                    intent_scoped_worker_resources = (
+                        _project_intent_scoped_local_resources(
+                            plan,
+                            run_state.skill_intent_mappings.get(
+                                selected_skill
+                            ) or {},
+                            declared_worker_resources,
+                        )
+                    )
                     required_worker_resources = _dedupe_paths(
                         list(selected_intent_resources)
-                        + [
-                            str(path)
-                            for path in (meta.get("local_resources") or [])
-                            if isinstance(path, str) and path.strip()
-                        ]
+                        + intent_scoped_worker_resources
                     )
                     worker_goal = (
                         f"Execute only worker {worker_id} exactly as declared"
@@ -17930,7 +18014,10 @@ async def run_stream(
         if len(selected_skill_names) == 1:
             standard_name = selected_skill_names[0]
             standard_package = loaded_packages.get(standard_name)
-            if _standard_skill_uses_semantic_capability_plan(standard_package):
+            standard_engine = _standard_skill_execution_engine(
+                standard_package
+            )
+            if standard_engine == "legacy_semantic_plan":
                 standard_catalog, catalog_failure = (
                     _safe_build_standard_skill_capability_catalog(
                         standard_name,
@@ -17959,6 +18046,13 @@ async def run_stream(
                             skill_compiler_tool_universe,
                         )
                     )
+            elif standard_engine == "progressive":
+                bounded_skill_exposure = (
+                    _standard_skill_progressive_disclosure_exposure(
+                        standard_name,
+                        skill_compiler_tool_universe,
+                    )
+                )
         # Keep workflow completion scoped to explicitly named roots.  The full
         # catalog remains separately available above for compiling declared
         # capability Skills.
@@ -18274,6 +18368,19 @@ async def run_stream(
         "max_iterations": max_iterations,
         "execution_mode": run_state.execution_mode(),
         "skill_workflow_activation": run_state.skill_workflow_activation,
+        "skill_execution_engines": [
+            {
+                "skill_name": skill_name,
+                "engine": _standard_skill_execution_engine(
+                    loaded_packages.get(skill_name)
+                ),
+            }
+            for skill_name in dict.fromkeys([
+                *explicit_selected_skill_names,
+                *session_skill_relevance_decision.selected_skill_names,
+            ])
+            if skill_name in loaded_packages
+        ][:16],
         "effective_model_id": model_routing.effective_provider_id,
         "model_routing": model_routing_payload,
         "session_skill_relevance": {
@@ -39836,28 +39943,57 @@ def _standard_skill_declares_delegated_workflow(content: Any) -> bool:
     )
 
 
-def _standard_skill_uses_semantic_capability_plan(
-    loaded_package: Any,
-) -> bool:
-    """Return whether a selected package is a free-form instruction Skill."""
+def _standard_skill_execution_engine(loaded_package: Any) -> str:
+    """Return the structural execution engine for one selected Skill.
+
+    Package-owned declarative contracts use the deterministic compiler.
+    Ordinary Agent Skills use progressive disclosure unless the deployment
+    explicitly enables the legacy model-authored capability-plan rollback.
+    No Skill name, domain, prompt, or filename participates in this choice.
+    """
 
     if not isinstance(loaded_package, dict) or loaded_package.get("error"):
-        return False
+        return "unavailable"
     workflow = loaded_package.get("workflow_contract")
     if not isinstance(workflow, dict):
         workflow = {}
     execution = _execution_contract_from_workflow(workflow)
-    # A real route/worker/bootstrap/aggregation/output contract is already a
-    # typed capability plan and stays on the deterministic compiler path.
-    if _has_primary_workflow_contract(workflow):
-        return False
-    return not bool(
+    if _has_primary_workflow_contract(workflow) or bool(
         execution.get("workers")
         or execution.get("routes")
         or execution.get("knowledge_bootstrap")
         or execution.get("aggregation")
         or execution.get("output_contract")
         or execution.get("intent_classification")
+    ):
+        return "deterministic_workflow"
+    configured = str(
+        getattr(
+            settings,
+            "standard_skill_execution_engine",
+            "legacy_semantic_plan",
+        )
+        or "legacy_semantic_plan"
+    ).strip().casefold().replace("-", "_")
+    if configured in {"progressive", "progressive_disclosure"}:
+        return "progressive"
+    return "legacy_semantic_plan"
+
+
+def _standard_skill_uses_semantic_capability_plan(
+    loaded_package: Any,
+) -> bool:
+    """Return whether a free-form Skill uses the legacy model planning gate.
+
+    Portable Agent Skills run through progressive disclosure by default when
+    the deployment selects the ``progressive`` engine.  Only the rollback
+    engine asks the model to restate a compiler-owned capability catalog.
+    Authoritative structured workflows stay on the deterministic DAG path in
+    either mode.
+    """
+
+    return _standard_skill_execution_engine(loaded_package) == (
+        "legacy_semantic_plan"
     )
 
 
@@ -40829,6 +40965,28 @@ def _standard_skill_planning_exposure(
         allowed_skill_script_authorities=(),
         allowed_skill_package_digests=(),
         allowed_skill_commands=(),
+    )
+
+
+def _standard_skill_progressive_disclosure_exposure(
+    skill_name: str,
+    available_tools: list[str] | tuple[str, ...] | set[str],
+) -> SkillExecutionExposure:
+    """Expose only canonical SKILL.md inspection before ordinary execution.
+
+    Progressive disclosure removes the model-authored capability-plan turn,
+    not the requirement that the model receive the complete authoritative
+    instructions before any runner, delegation, network, or workspace
+    mutation becomes callable.
+    """
+
+    exposure = _standard_skill_planning_exposure(
+        skill_name,
+        available_tools,
+    )
+    return replace(
+        exposure,
+        reasons=("standard_skill_progressive_disclosure_pending",),
     )
 
 
@@ -41938,6 +42096,7 @@ def _bounded_skill_execution_exposure(
     optional_gate_capability_skills: set[str] = set()
     selected_main_tools_explicitly_empty = False
     standard_body_capability_plans: list[DirectToolExposure] = []
+    standard_declared_delegated_workflow = False
 
     for skill_name in selected:
         loaded = loaded_packages.get(skill_name)
@@ -42169,9 +42328,29 @@ def _bounded_skill_execution_exposure(
                     available_order,
                 )
             )
+            package_declares_delegated_workflow = (
+                _standard_skill_declares_delegated_workflow(
+                    loaded.get("content")
+                )
+            )
+            standard_declared_delegated_workflow = bool(
+                standard_declared_delegated_workflow
+                or package_declares_delegated_workflow
+            )
+            if (
+                package_declares_delegated_workflow
+                and "delegate_task" in available
+            ):
+                requested.add("delegate_task")
             selected_script_paths = (
                 set(_selected_plan_script_resources(workflow, plan))
-                if execution else None
+                # Environment/profile metadata alone is not a workflow route.
+                # Free-form Agent Skills often name an exact helper in
+                # SKILL.md and ship only a runtime profile; filtering that
+                # helper through an undeclared empty plan would silently erase
+                # the package's sole executable capability. Declarative
+                # workflows still intersect scripts with the selected route.
+                if _has_primary_workflow_contract(workflow) else None
             )
             profiled = _profiled_skill_script_grants(
                 skill_name,
@@ -42603,13 +42782,22 @@ def _bounded_skill_execution_exposure(
 
     body_required_groups: tuple[tuple[str, ...], ...] = ()
     if not has_compiled_orchestration and not capability_resource_error:
-        body_groups: list[tuple[str, ...]] = []
         for body_plan in standard_body_capability_plans:
             requested.update(body_plan.tools)
             reasons.extend(body_plan.reasons)
             missing.extend(body_plan.missing_requirements)
-            body_groups.extend(body_plan.required_groups)
-        body_required_groups = tuple(dict.fromkeys(body_groups))
+        # Portable Agent-Skill instructions describe how the model should use
+        # its disclosed tool surface; they are not a declaration that every
+        # mentioned (often conditional) tool must produce a receipt on every
+        # invocation.  User-requested actions are enforced separately below.
+        # The one structural exception is an explicitly declared delegated
+        # workflow: without at least one real delegate dispatch its fan-out /
+        # fan-in contract cannot have executed at all.
+        if (
+            standard_declared_delegated_workflow
+            and "delegate_task" in requested
+        ):
+            body_required_groups = (("delegate_task",),)
 
     runner_names = {
         "run_skill_process", "run_skill_script", "run_skill_python",

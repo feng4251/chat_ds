@@ -1911,7 +1911,10 @@ class WorkflowActivationBoundaryTests(unittest.TestCase):
         self.assertNotIn("web_search", exposure.tools)
         self.assertNotIn("skill_manage", exposure.tools)
         self.assertIn(("delegate_task",), exposure.required_groups)
-        self.assertIn(("execute_code",), exposure.required_groups)
+        # The instruction makes code available for the model's verification
+        # procedure, but portable Skill prose is not a per-run receipt schema.
+        # Only the structurally declared fan-out is unconditionally required.
+        self.assertNotIn(("execute_code",), exposure.required_groups)
 
     def test_standard_allowed_tools_grant_only_existing_capabilities(self):
         package = self._materialized_skill_package(

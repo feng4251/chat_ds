@@ -424,6 +424,11 @@ services:
       # Absolute ceiling for a stream that continues making real progress.
       # Initial-response and read-stall leases remain independently shorter.
       LLM_STREAM_TOTAL_TIMEOUT_SECONDS: ${LLM_STREAM_TOTAL_TIMEOUT_SECONDS:-14400}
+      # Ordinary standard Skills use the same progressive-disclosure loop as
+      # mature Agent-Skills Harnesses. Explicit declarative contracts continue
+      # to compile into deterministic DAGs. The legacy model-authored
+      # capability-plan gate remains available only as a rollback switch.
+      STANDARD_SKILL_EXECUTION_ENGINE: ${STANDARD_SKILL_EXECUTION_ENGINE:-progressive}
       WEB_SEARCH_PROVIDERS: ${WEB_SEARCH_PROVIDERS:-searxng}
       SEARXNG_BASE_URL: ${SEARXNG_BASE_URL:-http://searxng:8080}
       SEARXNG_TIMEOUT_SECONDS: ${SEARXNG_TIMEOUT_SECONDS:-10}
