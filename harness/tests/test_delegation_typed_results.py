@@ -5492,6 +5492,158 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(semantic["empty_ledger_justified"])
         persist.assert_not_called()
 
+    async def test_empty_typed_inventory_is_justified_by_degraded_machine_reason(
+        self,
+    ):
+        body = (
+            "# Inventory query result\n"
+            "The bounded supplier-registry query completed with verified "
+            "provenance receipt REG-17."
+        )
+        quality = (
+            'COMPLETION_QUALITY_JSON: {"status":"degraded",'
+            '"reason":"Zero matching inventory records were returned by the '
+            'verified bounded registry query; one optional pagination frontier '
+            'remained unavailable."}'
+        )
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            yield {
+                "type": "delta",
+                "content": (
+                    body + "\n" + quality
+                    + '\nRESULT_FIELDS_JSON: {"rows":[]}'
+                ),
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        persist = MagicMock(return_value="results/delegate_zero_inventory.md")
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                persist,
+            ),
+        ):
+            result = await _run_child(
+                {
+                    "goal": "return the bounded supplier inventory rows",
+                    "required_result_fields": ["rows"],
+                    "required_result_schema": {
+                        "rows": {"type": "array"},
+                    },
+                },
+                _context(),
+                0,
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["completion_quality"], "degraded")
+        semantic = result["result_shape"]["typed_result_semantic_audit"]
+        self.assertTrue(semantic["substantive_body"])
+        self.assertTrue(semantic["empty_ledger_justified"])
+        self.assertTrue(
+            semantic["declaration_reason_justifies_empty_ledger"]
+        )
+        self.assertNotIn(
+            "_reason_text",
+            result["completion_quality_audit"],
+        )
+        persist.assert_called_once()
+
+    async def test_empty_typed_inventory_with_unrelated_degraded_reason_is_rejected(
+        self,
+    ):
+        body = (
+            "# Inventory query result\n"
+            "The retained evidence supports a material supplier finding. "
+            "Provenance: registry receipt REG-18."
+        )
+        quality = (
+            'COMPLETION_QUALITY_JSON: {"status":"degraded",'
+            '"reason":"An optional presentation template could not be loaded."}'
+        )
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            yield {
+                "type": "delta",
+                "content": (
+                    body + "\n" + quality
+                    + '\nRESULT_FIELDS_JSON: {"rows":[]}'
+                ),
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        persist = MagicMock(return_value="results/delegate_empty_inventory.md")
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                persist,
+            ),
+        ):
+            result = await _run_child(
+                {
+                    "goal": "return the bounded supplier inventory rows",
+                    "required_result_fields": ["rows"],
+                    "required_result_schema": {
+                        "rows": {"type": "array"},
+                    },
+                },
+                _context(),
+                0,
+            )
+
+        self.assertEqual(result["status"], "error")
+        semantic = result["result_shape"]["typed_result_semantic_audit"]
+        self.assertFalse(semantic["empty_ledger_justified"])
+        self.assertFalse(
+            semantic["declaration_reason_justifies_empty_ledger"]
+        )
+        persist.assert_not_called()
+
+    async def test_degraded_reason_without_substantive_body_cannot_justify_empty_ledger(
+        self,
+    ):
+        content = (
+            'COMPLETION_QUALITY_JSON: {"status":"degraded",'
+            '"reason":"No matching records were returned by the weather source."}\n'
+            'RESULT_FIELDS_JSON: {"observations":[]}'
+        )
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            yield {"type": "delta", "content": content}
+            yield {"type": "done", "finish_reason": "stop"}
+
+        persist = MagicMock(return_value="results/delegate_empty_weather.md")
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                persist,
+            ),
+        ):
+            result = await _run_child(
+                {
+                    "goal": "return bounded weather observations",
+                    "required_result_fields": ["observations"],
+                    "required_result_schema": {
+                        "observations": {"type": "array"},
+                    },
+                },
+                _context(),
+                0,
+            )
+
+        self.assertEqual(result["status"], "error")
+        semantic = result["result_shape"]["typed_result_semantic_audit"]
+        self.assertFalse(semantic["substantive_body"])
+        self.assertFalse(semantic["empty_ledger_justified"])
+        self.assertTrue(
+            semantic["declaration_reason_justifies_empty_ledger"]
+        )
+        persist.assert_not_called()
+
     def test_all_provider_stream_corruption_reasons_share_one_failure_class(self):
         for reason in (
             "provider_tool_stream_corrupt",
