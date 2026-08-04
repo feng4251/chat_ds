@@ -1933,6 +1933,168 @@ class DelegationTypedResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], audit["unverified_typed_value_fields"])
         self.assertTrue(audit["machine_degraded_evidence"])
 
+    async def test_receipt_owned_null_gap_adds_machine_quality_ledger(self):
+        skill_body = (
+            "# Catalog database\n"
+            "The live catalog requires credentials that are not available."
+        )
+        skill_bytes = skill_body.encode("utf-8")
+        persisted: dict[str, str] = {}
+        observed_events: list[dict] = []
+
+        async def fake_preload(tool_args, *, context, progress=None):
+            return (
+                {"success": True, "content": skill_body},
+                {
+                    "page_count": 1,
+                    "total_chars": len(skill_body),
+                    "total_bytes": len(skill_bytes),
+                    "complete": True,
+                    "sha256": hashlib.sha256(skill_bytes).hexdigest(),
+                },
+            )
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            yield {
+                "type": "delta",
+                "content": (
+                    "# Evidence gap\n"
+                    "No live database receipt was available, so no identifier "
+                    "is asserted.\n"
+                    'RESULT_FIELDS_JSON: {"record_id":null}'
+                ),
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        async def capture(event):
+            observed_events.append(dict(event))
+
+        def persist(content, *args, **kwargs):
+            persisted["content"] = content
+            return "results/receipt_owned_null_gap.md"
+
+        with (
+            patch(
+                "tools.delegation._load_complete_skill_view_preload",
+                fake_preload,
+            ),
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                side_effect=persist,
+            ),
+        ):
+            result = await _run_child(
+                {
+                    "goal": "query one catalog record",
+                    "step_type": "knowledge_bootstrap",
+                    "tools": ["skill_view"],
+                    "required_result_fields": ["record_id"],
+                    "required_result_schema": {
+                        # An unconstrained declared field is still a typed
+                        # contract; null is the only safe value without a
+                        # verifiable acquisition receipt.
+                        "record_id": {},
+                    },
+                    "required_capability_skills": ["catalog-database"],
+                },
+                _context("skill_view", event_sink=capture),
+                0,
+            )
+
+        self.assertEqual("completed", result["status"])
+        self.assertEqual("degraded", result["completion_quality"])
+        audit = result["completion_quality_audit"]
+        self.assertTrue(audit["receipt_owned_canonicalized"])
+        self.assertEqual(
+            "receipt_owned_complete_typed_gap",
+            audit["receipt_owned_canonicalization_resolution"],
+        )
+        self.assertEqual(["record_id"], audit["typed_null_gap_fields"])
+        self.assertEqual([], audit["unverified_typed_value_fields"])
+        self.assertEqual(
+            1,
+            persisted["content"].count("COMPLETION_QUALITY_JSON:"),
+        )
+        self.assertLess(
+            persisted["content"].index("COMPLETION_QUALITY_JSON:"),
+            persisted["content"].index("RESULT_FIELDS_JSON:"),
+        )
+        self.assertTrue(any(
+            event.get("event_type")
+            == "debug.completion_quality.receipt_canonicalized"
+            for event in observed_events
+        ))
+
+    async def test_receipt_owned_null_gap_upgrades_legacy_degraded_prose(self):
+        skill_body = "# Vendor catalog\nLive access requires an account."
+        skill_bytes = skill_body.encode("utf-8")
+        persisted: dict[str, str] = {}
+
+        async def fake_preload(tool_args, *, context, progress=None):
+            return (
+                {"success": True, "content": skill_body},
+                {
+                    "page_count": 1,
+                    "total_chars": len(skill_body),
+                    "total_bytes": len(skill_bytes),
+                    "complete": True,
+                    "sha256": hashlib.sha256(skill_bytes).hexdigest(),
+                },
+            )
+
+        async def fake_run_stream(model_id, messages, tools, **kwargs):
+            yield {
+                "type": "delta",
+                "content": (
+                    "# Vendor result\n"
+                    "Status: degraded\n"
+                    "No verified source was available.\n"
+                    'RESULT_FIELDS_JSON: {"vendor_record":null}'
+                ),
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        def persist(content, *args, **kwargs):
+            persisted["content"] = content
+            return "results/receipt_owned_legacy_gap.md"
+
+        with (
+            patch(
+                "tools.delegation._load_complete_skill_view_preload",
+                fake_preload,
+            ),
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                side_effect=persist,
+            ),
+        ):
+            result = await _run_child(
+                {
+                    "goal": "query one vendor record",
+                    "step_type": "knowledge_bootstrap",
+                    "tools": ["skill_view"],
+                    "required_result_fields": ["vendor_record"],
+                    "required_result_schema": {
+                        "vendor_record": {"type": ["string", "null"]},
+                    },
+                    "required_capability_skills": ["vendor-catalog"],
+                },
+                _context("skill_view"),
+                0,
+            )
+
+        self.assertEqual("completed", result["status"])
+        self.assertEqual("degraded", result["completion_quality"])
+        audit = result["completion_quality_audit"]
+        self.assertEqual("completion_quality_json", audit["declaration_source"])
+        self.assertTrue(audit["receipt_owned_canonicalized"])
+        self.assertEqual(
+            1,
+            persisted["content"].count("COMPLETION_QUALITY_JSON:"),
+        )
+
     async def test_duplicate_valid_quality_ledgers_are_canonicalized_worst_first(self):
         """A repair append must not spend the parent retry on duplicate control prose."""
 
