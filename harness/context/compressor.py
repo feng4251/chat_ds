@@ -26,6 +26,11 @@ import httpx
 
 from context.engine import ContextEngine
 from context.token_estimator import estimate_message_tokens, is_image_content_part
+from provider_transcript import (
+    align_tool_round_boundary,
+    audit_provider_transcript,
+    canonicalize_legacy_provider_transcript,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1260,21 +1265,20 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         return head + self.protect_first_n
 
     def _align_boundary_forward(self, messages: list[dict[str, Any]], idx: int) -> int:
-        """Push start boundary past orphan tool results."""
-        while idx < len(messages) and messages[idx].get("role") == "tool":
-            idx += 1
-        return idx
+        """Push a start boundary past an indivisible provider tool round."""
+        return align_tool_round_boundary(
+            messages,
+            idx,
+            direction="forward",
+        )
 
     def _align_boundary_backward(self, messages: list[dict[str, Any]], idx: int) -> int:
-        """Pull end boundary back to avoid splitting tool_call/result groups."""
-        if idx <= 0 or idx >= len(messages):
-            return idx
-        check = idx - 1
-        while check >= 0 and messages[check].get("role") == "tool":
-            check -= 1
-        if check >= 0 and messages[check].get("role") == "assistant" and messages[check].get("tool_calls"):
-            idx = check
-        return idx
+        """Pull an end boundary before an indivisible provider tool round."""
+        return align_tool_round_boundary(
+            messages,
+            idx,
+            direction="backward",
+        )
 
     def _find_last_user_message_idx(self, messages: list[dict[str, Any]], head_end: int) -> int:
         for i in range(len(messages) - 1, head_end - 1, -1):
@@ -1325,74 +1329,25 @@ The user has requested that this compaction PRIORITISE preserving all informatio
 
     # -- Tool pair sanitization ------------------------------------------------
 
-    @staticmethod
-    def _get_tool_call_id(tc) -> str:
-        if isinstance(tc, dict):
-            return tc.get("call_id", "") or tc.get("id", "") or ""
-        return getattr(tc, "call_id", "") or getattr(tc, "id", "") or ""
-
     def _sanitize_tool_pairs(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Return native, adjacent one-result-per-call tool groups only."""
-        final: list[dict[str, Any]] = []
-        index = 0
-        while index < len(messages):
-            message = messages[index]
-            if message.get("role") == "tool":
-                # A tool result without the immediately preceding assistant
-                # call group is an orphan even if the same id appears earlier.
-                index += 1
-                continue
-            if message.get("role") != "assistant" or not message.get("tool_calls"):
-                final.append(message)
-                index += 1
-                continue
+        """Return only real, adjacent one-result-per-call provider rounds.
 
-            valid_calls: list[Any] = []
-            expected_ids: list[str] = []
-            seen_ids: set[str] = set()
-            for tool_call in message.get("tool_calls") or []:
-                call_id = self._get_tool_call_id(tool_call)
-                if not call_id or call_id in seen_ids:
-                    continue
-                seen_ids.add(call_id)
-                expected_ids.append(call_id)
-                valid_calls.append(tool_call)
-
-            assistant = message.copy()
-            if valid_calls:
-                assistant["tool_calls"] = valid_calls
-                final.append(assistant)
-            else:
-                assistant.pop("tool_calls", None)
-                if assistant.get("content") not in (None, ""):
-                    final.append(assistant)
-
-            following_results: dict[str, dict[str, Any]] = {}
-            next_index = index + 1
-            while (
-                next_index < len(messages)
-                and messages[next_index].get("role") == "tool"
-            ):
-                tool_result = messages[next_index]
-                call_id = tool_result.get("tool_call_id")
-                if (
-                    isinstance(call_id, str)
-                    and call_id in seen_ids
-                    and call_id not in following_results
-                ):
-                    following_results[call_id] = tool_result
-                next_index += 1
-
-            for call_id in expected_ids:
-                final.append(following_results.get(call_id) or {
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "content": (
-                        "[Result from earlier conversation — see context summary above]"
-                    ),
-                })
-            index = next_index
-
+        Compression must not invent an effect receipt.  If malformed legacy
+        history reaches this final guard, unresolved call envelopes and orphan
+        results are quarantined by the shared transcript canonicalizer.
+        """
+        final, report = canonicalize_legacy_provider_transcript(messages)
+        audit = audit_provider_transcript(final)
+        if not audit.valid:
+            raise RuntimeError(
+                "provider transcript remained invalid after compaction "
+                f"canonicalization: {audit.as_dict()}"
+            )
+        if report.changed:
+            logger.warning(
+                "Compaction canonicalized malformed provider history: %s",
+                report.as_dict(),
+            )
         return final
 
     # -- Main compress entry point --------------------------------------------

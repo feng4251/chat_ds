@@ -4806,6 +4806,34 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(responses)
         self.assertEqual(1, dispatch_mock.await_count)
         self.assertTrue(all("tools" in body for body in bodies[:4]))
+        next_request_messages = bodies[3]["messages"]
+        batch_index = next(
+            index
+            for index, message in enumerate(next_request_messages)
+            if message.get("role") == "assistant"
+            and {
+                call.get("id")
+                for call in message.get("tool_calls") or []
+            } == {
+                "call-replay-quarantined",
+                "call-valid-alternate",
+            }
+        )
+        batch_results = next_request_messages[
+            batch_index + 1:batch_index + 3
+        ]
+        self.assertEqual(["tool", "tool"], [
+            message.get("role") for message in batch_results
+        ])
+        self.assertEqual(
+            {
+                "call-replay-quarantined",
+                "call-valid-alternate",
+            },
+            {
+                message.get("tool_call_id") for message in batch_results
+            },
+        )
         self.assertFalse(any(
             event.get("event_type") == "debug.tool.quarantined"
             for event in events

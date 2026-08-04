@@ -338,6 +338,42 @@ class ModelHistorySafetyTests(unittest.TestCase):
         self.assertEqual(2, len(conversation))
         self.assertEqual("read_file", conversation[0]["tool_calls"][0]["function"]["name"])
 
+    def test_collapsing_large_round_preserves_post_batch_workflow_guidance(self):
+        guidance = (
+            "[Harness workflow state] Continue from the exact pending frontier."
+        )
+        conversation = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call-large",
+                    "type": "function",
+                    "function": {
+                        "name": "execute_code",
+                        "arguments": json.dumps({
+                            "code": "print('bounded')\n" * 400,
+                        }),
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-large",
+                "content": json.dumps({"status": "success"}),
+            },
+            {"role": "user", "content": guidance},
+        ]
+
+        _collapse_tool_turn_history(conversation, 0)
+
+        self.assertEqual(guidance, conversation[-1]["content"])
+        self.assertEqual("user", conversation[-1]["role"])
+        self.assertEqual(1, sum(
+            message.get("content") == guidance for message in conversation
+        ))
+        self.assertFalse(any(message.get("tool_calls") for message in conversation))
+
     def test_debug_keeps_token_metrics_but_redacts_credentials(self):
         payload = _debug_payload({
             "estimated_input_tokens": 293188,
