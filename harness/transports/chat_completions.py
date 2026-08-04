@@ -9,6 +9,10 @@ from __future__ import annotations
 import copy
 from typing import Any, Dict, List, Optional
 
+from provider_transcript import (
+    audit_provider_transcript,
+    project_unique_tool_call_ids,
+)
 from transports.base import (
     NormalizedResponse,
     ProviderTransport,
@@ -95,6 +99,13 @@ class ChatCompletionsTransport(ProviderTransport):
             extra_body: dict | None (e.g. chat_template_kwargs for Qwen)
         """
         sanitized = self.convert_messages(messages)
+        sanitized, _id_projection = project_unique_tool_call_ids(sanitized)
+        transcript_audit = audit_provider_transcript(sanitized)
+        if not transcript_audit.valid:
+            raise ValueError(
+                "refusing invalid provider transcript: "
+                f"{transcript_audit.as_dict()}"
+            )
 
         api_kwargs: Dict[str, Any] = {
             "model": model,

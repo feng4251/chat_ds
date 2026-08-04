@@ -88,6 +88,13 @@ from provider_metadata import (
     record_provider_context_limit,
     resolve_provider_runtime_metadata,
 )
+from provider_transcript import (
+    ToolRoundCloseReport,
+    audit_provider_transcript,
+    canonicalize_legacy_provider_transcript,
+    close_active_tool_round,
+    project_unique_tool_call_ids,
+)
 from provider_stream_deadline import (
     MaterialProgressLease,
     ProviderStreamDeadlineExceeded,
@@ -1967,7 +1974,15 @@ def _collapse_tool_turn_history(
     if not isinstance(tool_calls, list) or not tool_calls:
         return 0
 
-    result_messages = conversation[assistant_index + 1:]
+    result_end = assistant_index + 1
+    while (
+        result_end < len(conversation)
+        and isinstance(conversation[result_end], dict)
+        and conversation[result_end].get("role") == "tool"
+    ):
+        result_end += 1
+    result_messages = conversation[assistant_index + 1:result_end]
+    trailing_messages = conversation[result_end:]
     result_by_id = {
         str(message.get("tool_call_id") or ""): message
         for message in result_messages
@@ -2037,7 +2052,15 @@ def _collapse_tool_turn_history(
         )
     else:
         replacement.append(runtime_record)
-    if add_continuation:
+    # Workflow/frontier guidance belongs after the complete native tool batch.
+    # It is ordinary provider input, so retain it after the non-executable
+    # runtime record rather than silently discarding it during compaction.
+    replacement.extend(trailing_messages)
+    if add_continuation and not (
+        replacement
+        and isinstance(replacement[-1], dict)
+        and replacement[-1].get("role") == "user"
+    ):
         replacement.append({
             "role": "user",
             "content": (
@@ -18877,6 +18900,9 @@ async def run_stream(
     # Work on a copy so we don't mutate the caller's list.
     conversation: list[dict] = list(messages)
     original_user_text = _latest_user_text(conversation)
+    conversation, provider_history_repair = (
+        canonicalize_legacy_provider_transcript(conversation)
+    )
     conversation, historical_calls_collapsed = _sanitize_model_history_tool_payloads(
         conversation
     )
@@ -18940,6 +18966,12 @@ async def run_stream(
             "collapsed_tool_calls": historical_calls_collapsed,
             "message_count": len(conversation),
         }):
+            yield debug_evt
+    if provider_history_repair.changed:
+        for debug_evt in await debug_stream_event(
+            "provider_transcript.history_canonicalized",
+            provider_history_repair.as_dict(),
+        ):
             yield debug_evt
 
     def delegate_result_field_value_instruction() -> str:
@@ -23841,6 +23873,54 @@ async def run_stream(
                 max_token_budget.get("effective_max_tokens"),
                 max_token_budget.get("safety_margin"),
             )
+
+        # The provider boundary is a transaction boundary.  Never rely on a
+        # permissive model server to accept interleaved, missing, duplicate,
+        # or orphaned tool results: another compatible provider may reject the
+        # same transcript, and compaction/resume must remain model invariant.
+        sanitized, tool_call_id_projection = project_unique_tool_call_ids(
+            sanitized
+        )
+        if tool_call_id_projection.renamed_tool_call_ids:
+            for debug_evt in await debug_stream_event(
+                "provider_transcript.tool_call_ids_projected",
+                {
+                    "renamed_tool_call_ids": (
+                        tool_call_id_projection.renamed_tool_call_ids
+                    ),
+                    "iteration": budget.used,
+                    "durable_history_mutated": False,
+                },
+            ):
+                yield debug_evt
+        provider_transcript_audit = audit_provider_transcript(sanitized)
+        if not provider_transcript_audit.valid:
+            audit_payload = provider_transcript_audit.as_dict()
+            for debug_evt in await debug_stream_event(
+                "provider_transcript.validation_failed",
+                {
+                    **audit_payload,
+                    "iteration": budget.used,
+                    "provider_id": provider.get("id") or api_model,
+                    "request_dispatched": False,
+                },
+            ):
+                yield debug_evt
+            msg = (
+                "The Harness refused to send an invalid provider transcript "
+                "because its tool-call transaction was incomplete or "
+                "interleaved. No provider request was dispatched."
+            )
+            yield await emit_agent_event("run.failed", {
+                "error": msg,
+                "finish_reason": "provider_transcript_invalid",
+                "terminal_reason": "provider_transcript_invalid",
+                "provider_transcript_audit": audit_payload,
+                "request_dispatched": False,
+                "usage": run_usage,
+            })
+            yield {"type": "error", "msg": msg}
+            return
 
         body: dict = {
             "model": api_model,
@@ -31601,7 +31681,28 @@ async def run_stream(
             assistant_history_index = len(conversation)
             conversation.append(assistant_msg)
 
-            # Execute each tool and append results
+            # Execute each tool and append results. Ordinary workflow guidance
+            # is buffered until every result in this assistant batch has been
+            # committed, because OpenAI-compatible providers reject a regular
+            # user message interleaved between parallel tool results.
+            tool_round_boundary_guidance: list[str] = []
+            tool_round_close_report: ToolRoundCloseReport | None = None
+
+            def close_current_tool_round(
+                *,
+                abort_reason: str | None = None,
+            ) -> ToolRoundCloseReport:
+                nonlocal tool_round_close_report
+                if tool_round_close_report is not None:
+                    return tool_round_close_report
+                tool_round_close_report = close_active_tool_round(
+                    conversation,
+                    assistant_history_index,
+                    post_round_user_messages=tool_round_boundary_guidance,
+                    abort_reason=abort_reason,
+                )
+                return tool_round_close_report
+
             workflow_gate_call_count = 0
             delegate_quarantine_pending: set[str] = set()
             delegate_exact_preflight_quarantine_pending: dict[
@@ -33613,11 +33714,9 @@ async def run_stream(
                     "tool_call_id": tool_call_id,
                     "content": wrapped,
                 })
-                for boundary_guidance in boundary_guidance_messages:
-                    conversation.append({
-                        "role": "user",
-                        "content": boundary_guidance,
-                    })
+                tool_round_boundary_guidance.extend(
+                    boundary_guidance_messages
+                )
                 if capability_plan_install_failure is not None:
                     failure = capability_plan_install_failure
                     error_code = str(
@@ -33635,6 +33734,14 @@ async def run_stream(
                         )
                         + "). No execution grant was installed."
                     )
+                    aborted_round = close_current_tool_round(
+                        abort_reason=error_code,
+                    )
+                    for debug_evt in await debug_stream_event(
+                        "provider_transcript.tool_round_aborted",
+                        aborted_round.as_dict(),
+                    ):
+                        yield debug_evt
                     yield await emit_agent_event(
                         "run.failed",
                         {
@@ -33671,6 +33778,16 @@ async def run_stream(
                         )
                         + "). No execution grant was installed."
                     )
+                    aborted_round = close_current_tool_round(
+                        abort_reason=(
+                            "capability_plan_semantic_validation_exhausted"
+                        ),
+                    )
+                    for debug_evt in await debug_stream_event(
+                        "provider_transcript.tool_round_aborted",
+                        aborted_round.as_dict(),
+                    ):
+                        yield debug_evt
                     for debug_evt in await debug_stream_event(
                         "capability_plan.validation_exhausted",
                         failure,
@@ -33701,6 +33818,14 @@ async def run_stream(
                     # passed the batch's earlier structural preflight. A
                     # catalog failure revokes that snapshot atomically, so
                     # terminate here before the next call can cross dispatch.
+                    aborted_round = close_current_tool_round(
+                        abort_reason="capability_catalog_compilation_failed",
+                    )
+                    for debug_evt in await debug_stream_event(
+                        "provider_transcript.tool_round_aborted",
+                        aborted_round.as_dict(),
+                    ):
+                        yield debug_evt
                     for failure_event in await capability_catalog_failure_events():
                         yield failure_event
                     return
@@ -33720,6 +33845,14 @@ async def run_stream(
                         "capability dispatch: "
                         + str(failure.get("error") or "identity mismatch")
                     )
+                    aborted_round = close_current_tool_round(
+                        abort_reason="knowledge_gate_activation_failed",
+                    )
+                    for debug_evt in await debug_stream_event(
+                        "provider_transcript.tool_round_aborted",
+                        aborted_round.as_dict(),
+                    ):
+                        yield debug_evt
                     yield await emit_agent_event("run.failed", {
                         **failure,
                         "error": msg,
@@ -33733,6 +33866,14 @@ async def run_stream(
                     yield {"type": "error", "msg": msg}
                     return
                 if placeholder_retry_failure is not None:
+                    aborted_round = close_current_tool_round(
+                        abort_reason="placeholder_retry_exhausted",
+                    )
+                    for debug_evt in await debug_stream_event(
+                        "provider_transcript.tool_round_aborted",
+                        aborted_round.as_dict(),
+                    ):
+                        yield debug_evt
                     _collapse_tool_turn_history(
                         conversation,
                         assistant_history_index,
@@ -33758,6 +33899,13 @@ async def run_stream(
                     })
                     yield {"type": "error", "msg": msg}
                     return
+
+            normal_round_close_report = close_current_tool_round()
+            for debug_evt in await debug_stream_event(
+                "provider_transcript.tool_round_committed",
+                normal_round_close_report.as_dict(),
+            ):
+                yield debug_evt
 
             cross_tool_failure_budget_triggered = bool(
                 delegated_subtask
