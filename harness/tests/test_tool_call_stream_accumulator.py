@@ -2772,6 +2772,64 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
             events[-1],
         )
 
+    async def test_tools_closed_foreign_call_after_dispatch_synthesizes_once(self):
+        requests, dispatch_mock, events = await self._run_stream_sequence(
+            [
+                self._valid_tool_lines("evidence.md"),
+                self._partial_corrupt_lines(
+                    content="discarded terminal draft",
+                    reasoning="discarded terminal reasoning",
+                    argument_secret="discarded-foreign-argument",
+                    tool_name="provider_foreign_tool",
+                ),
+                self._stop_lines(
+                    "status: WARN/degraded\nEvidence: evidence.md retained "
+                    "with provenance; the rejected provider batch did not run."
+                ),
+            ],
+            # The second turn is the delegated final synthesis reserve, so its
+            # model-facing capability surface is deliberately empty.
+            max_iterations=3,
+            delegated=True,
+        )
+
+        self.assertEqual(3, len(requests))
+        dispatch_mock.assert_awaited_once()
+        self.assertIn("tools", requests[0]["body"])
+        self.assertNotIn("tools", requests[1]["body"])
+        self.assertNotIn("tools", requests[2]["body"])
+        self.assertEqual(
+            {"enable_thinking": False},
+            requests[2]["body"].get("chat_template_kwargs"),
+        )
+        recovery = next(
+            event for event in events
+            if event.get("event_type") == "debug.gate.continuation"
+            and event.get("payload", {}).get("gate")
+            == "delegate_post_dispatch_stream_synthesis"
+        )
+        self.assertEqual(
+            "provider_tool_stream_corrupt_after_content",
+            recovery["payload"]["reason"],
+        )
+        self.assertEqual(
+            "no_closed_tool_schema",
+            recovery["payload"]["repair_unavailable_reason"],
+        )
+        self.assertEqual(1, recovery["payload"]["dispatched_tool_result_count"])
+        recovery_history = json.dumps(
+            requests[2]["body"]["messages"], ensure_ascii=False,
+        )
+        self.assertIn("Earlier tool results", recovery_history)
+        self.assertIn("evidence.md", recovery_history)
+        self.assertNotIn("discarded terminal draft", recovery_history)
+        self.assertNotIn("discarded terminal reasoning", recovery_history)
+        self.assertNotIn("discarded-foreign-argument", recovery_history)
+        self.assertFalse(any(
+            event.get("event_type") == "run.failed" for event in events
+        ))
+        self.assertEqual("done", events[-1]["type"])
+
     async def test_post_dispatch_invalid_result_gets_one_closed_contract_repair(self):
         invalid_result = (
             "pending synthesis\n"
