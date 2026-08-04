@@ -925,6 +925,118 @@ def _canonicalize_duplicate_completion_quality_ledgers(
     return "".join(retained), audit
 
 
+def _canonicalize_receipt_owned_degraded_completion(
+    content: str,
+    *,
+    receipt_degraded_reasons: list[str],
+    required_result_fields: list[str],
+    typed_gap_fields: list[str],
+    unverified_typed_value_fields: list[str],
+    verified_exact_capability_gap_ledger: bool,
+    verified_knowledge_gate_gap_ledger: bool,
+    runtime_retrieval_requires_degraded: bool,
+) -> tuple[str, dict[str, Any]]:
+    """Insert one runtime-owned degraded ledger for a safe typed gap.
+
+    Evidence receipts, not model prose, are authoritative for whether an
+    acquisition step completed with gaps.  When every required typed field is
+    already a validated null/degraded envelope and no verifiable value source
+    exists, requiring the model to restate that same receipt state in a
+    ``COMPLETION_QUALITY_JSON`` line adds a second fallible authority.  Insert
+    the control record here while retaining fail-closed behavior for any
+    populated unverified value, explicit machine declaration, or unauthorised
+    model-authored gap ledger.
+    """
+
+    audit: dict[str, Any] = {
+        "canonicalized": False,
+        "resolution": "unchanged",
+        "receipt_degraded_reason_count": len(receipt_degraded_reasons),
+        "required_result_field_count": len(required_result_fields),
+        "typed_gap_field_count": len(typed_gap_fields),
+    }
+    if not receipt_degraded_reasons:
+        audit["resolution"] = "no_receipt_owned_degraded_state"
+        return content, audit
+    if not required_result_fields:
+        audit["resolution"] = "no_typed_result_contract"
+        return content, audit
+    if unverified_typed_value_fields:
+        audit["resolution"] = "unverified_values_present"
+        return content, audit
+    if set(required_result_fields) != set(typed_gap_fields):
+        audit["resolution"] = "typed_gap_not_complete"
+        return content, audit
+    if (
+        verified_exact_capability_gap_ledger
+        or verified_knowledge_gate_gap_ledger
+        or runtime_retrieval_requires_degraded
+    ):
+        audit["resolution"] = "existing_runtime_machine_evidence"
+        return content, audit
+
+    masked = _mask_markdown_code_for_protocol_audit(str(content or ""))
+    if _CAPABILITY_GAPS_JSON_PATTERN.search(masked) or (
+        _KNOWLEDGE_GATE_GAPS_JSON_PATTERN.search(masked)
+    ):
+        # A model-authored ledger without the corresponding exact runtime plan
+        # must still fail closed; do not make it valid by adding another
+        # machine record beside it.
+        audit["resolution"] = "unauthorised_gap_ledger_present"
+        return content, audit
+
+    declaration = _completion_quality_declaration(
+        content,
+        allow_legacy_status=True,
+    )
+    if declaration.get("error"):
+        audit["resolution"] = "invalid_completion_quality_declaration"
+        return content, audit
+    declaration_sources = set(
+        str(declaration.get("source") or "").split("+")
+    )
+    if "completion_quality_json" in declaration_sources:
+        audit["resolution"] = "explicit_machine_declaration_present"
+        return content, audit
+
+    reason_codes = list(dict.fromkeys(
+        str(reason).strip()
+        for reason in receipt_degraded_reasons
+        if str(reason).strip()
+    ))
+    reason = (
+        "Harness evidence receipts require degraded completion: "
+        + ", ".join(reason_codes[:16])
+    )
+    ledger_line = (
+        "COMPLETION_QUALITY_JSON: "
+        + json.dumps(
+            {"status": "degraded", "reason": reason},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    lines = str(content or "").rstrip("\r\n").splitlines()
+    insert_at = next(
+        (
+            index
+            for index in range(len(lines) - 1, -1, -1)
+            if lines[index].strip().startswith("RESULT_FIELDS_JSON:")
+        ),
+        len(lines),
+    )
+    lines.insert(insert_at, ledger_line)
+    normalized = "\n".join(lines)
+    audit.update({
+        "canonicalized": True,
+        "resolution": "receipt_owned_complete_typed_gap",
+        "reason_codes": reason_codes,
+        "content_changed": normalized != str(content or "").rstrip("\r\n"),
+    })
+    return normalized, audit
+
+
 def _content_declares_degraded_completion(content: str) -> bool:
     """Compatibility wrapper around the strict quality declaration parser."""
 
@@ -12693,6 +12805,49 @@ async def _run_child(
         if no_verified_value_source
         else []
     )
+    runtime_retrieval_requires_degraded = (
+        retrieval_receipt_affects_completion_quality(
+            runtime_unresolved_retrieval
+        )
+    )
+    receipt_owned_quality_canonicalization: dict[str, Any] = {
+        "canonicalized": False,
+        "resolution": "not_evaluated",
+    }
+    if validation_error is None:
+        content, receipt_owned_quality_canonicalization = (
+            _canonicalize_receipt_owned_degraded_completion(
+                content,
+                receipt_degraded_reasons=receipt_degraded_reasons,
+                required_result_fields=required_result_fields,
+                typed_gap_fields=list(dict.fromkeys(
+                    typed_null_gap_fields + typed_degraded_gap_fields
+                )),
+                unverified_typed_value_fields=(
+                    unverified_typed_value_fields
+                ),
+                verified_exact_capability_gap_ledger=(
+                    verified_exact_capability_gap_ledger
+                ),
+                verified_knowledge_gate_gap_ledger=(
+                    verified_knowledge_gate_gap_ledger
+                ),
+                runtime_retrieval_requires_degraded=(
+                    runtime_retrieval_requires_degraded
+                ),
+            )
+        )
+        if receipt_owned_quality_canonicalization.get("canonicalized"):
+            completion_quality_declaration = (
+                _completion_quality_declaration(
+                    content,
+                    allow_legacy_status=not is_model_intent_classifier,
+                )
+            )
+            await forward_event(child_event(
+                "debug.completion_quality.receipt_canonicalized",
+                receipt_owned_quality_canonicalization,
+            ))
     declaration_sources = set(
         str(completion_quality_declaration.get("source") or "").split("+")
     )
@@ -12703,9 +12858,7 @@ async def _run_child(
         )
         or verified_exact_capability_gap_ledger
         or verified_knowledge_gate_gap_ledger
-        or retrieval_receipt_affects_completion_quality(
-            runtime_unresolved_retrieval
-        )
+        or runtime_retrieval_requires_degraded
     )
     if (
         validation_error is None
@@ -12745,6 +12898,12 @@ async def _run_child(
         ),
         "canonicalization_resolution": (
             completion_quality_canonicalization.get("resolution")
+        ),
+        "receipt_owned_canonicalized": bool(
+            receipt_owned_quality_canonicalization.get("canonicalized")
+        ),
+        "receipt_owned_canonicalization_resolution": (
+            receipt_owned_quality_canonicalization.get("resolution")
         ),
         "declared_status": completion_quality_declaration.get("status"),
         "declaration_source": completion_quality_declaration.get("source"),
