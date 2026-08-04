@@ -19,7 +19,34 @@
 - ChatDS 原创贡献现采用根目录 `LICENSE` 中未经修改的 PolyForm Noncommercial 1.0.0；
   `THIRD_PARTY_NOTICES.md` 明确排除了第三方目录、独立参考仓库、运行时数据、上传 Skill 和生成产物。
   该许可证没有、也不会重新授权 `claude-code/` 等第三方内容。
-- 2026-08-04 最新权威状态：Round 13 已完成两个新的顺序 E2E、三源诊断、通用修复、全量回归、
+- 2026-08-04 最新权威状态：Round 14 已完成两个全新顺序 E2E、exact Skill/对话/debug/tool/provider/
+  artifact 三源诊断、通用修复、全量回归、本地代码 commit 与生产切换。V2.3 conversation
+  `ad60a1cd11fc448e844c8198080d2ccc` / root `9f4747b4fbe348ef8d5b61d0a923e589` 的唯一失败 child
+  `c42014306d01498b9f3e299eaef98910` 已有 6 个成功 HTTP receipt，却在 tools-closed final synthesis
+  turn 遇到 provider foreign tool 幻觉；坏批次派发 0，但旧 Harness 没有转入已有 post-dispatch
+  synthesis。肺癌 MDT conversation `2ad4efc9047748558006dd1026832d28` / root
+  `80ab4ffa71a34f008c9932c4bd0f319a` 在前三次 typed plan submission 依次纠正 duplicate selection、
+  `round=0` schema error 和仅一个 instruction unit 未映射后耗尽旧三次上限，执行 grant 从未安装。
+  逐 child、请求体、stream fragment、compiler path 和 artifact 证据见 `E2E_ITERATION_LOG.md` Round 14。
+- Round 14 通用代码提交为
+  `cfc0e09d62ff98c2d831dbf0895c9b358fd01a60 fix: recover typed workflows across provider faults`：
+  未暴露/非法 tool call 仍整批丢弃且绝不执行；delegated run 仅在已有提交 receipt、无 pending mandatory
+  frontier、仍有预算时允许一次 tools-closed synthesis，不重开 schema、不保存坏正文/reasoning/fragment。
+  capability-plan schema 与 semantic compiler feedback 现共用五次有限 transaction，成功才原子安装
+  grant，连续五次错误仍 fail closed；validator、coverage 和 authority 均未放松。生产逻辑没有 V2.3、
+  疾病、Skill/session/worker、固定角色数、route 或报告名特判。
+- Round 14 聚焦为 `5 passed`，受影响联合为 `556 passed, 155 subtests passed`。完整隔离主体为
+  `1971 passed, 810 subtests passed`；bubblewrap 用户命名空间的两个 trusted launcher 与一个
+  `setgroups` 环境项在真实宿主对应为 `2 passed, 1 skipped`，即当前 1,973 项可执行逻辑全部通过。
+  宿主 full 的 19 个 failure 全为既有不可读生产 tombstone，隔离精确复跑为
+  `13 passed, 9 subtests passed`。clean archive 与 Git tree 均为 22,456 files。生产 Harness image
+  `sha256:d05f6f92ae094e0a7f4fc43d2f09bd175316a7484a1b9d8846c8640462b2397d`，revision 精确为
+  `cfc0e09d...`，healthy/restart 0，旧镜像为 `rollback-pre-cfc0e09d`；三入口、Harness 内部、
+  Backend→Harness、storage identity、SQLite quick/FK、idle AgentRun 和严重日志 smoke 全通过。
+- Round 15 是下一项，继续使用 `shaiengine_deepseek_v4_pro`，必须先全新 V2.3、再全新肺癌 MDT，
+  两个 root 顺序运行且各自达到唯一 durable terminal 后，按同一诊断/复现/`claude-code/` 对照/
+  通用修复/回归/commit/clean-deploy 闭环推进。当前用户授权上限仍是 Round 18。
+- Round 13 历史状态：已完成两个新的顺序 E2E、三源诊断、通用修复、全量回归、
   本地代码 commit 和生产切换。V2.3 conversation `2ca049506d0249418815b64bab500ead` / root
   `5e635b2d7e4b4486bdeb37d88690d34b` 暴露“schema-valid structured tool call 内字段类型错误但旧
   output validator 只给一次提交”的通用缺陷；肺癌 MDT conversation

@@ -1746,3 +1746,81 @@ Round 13 至此完成两个新 case 的 durable terminal、exact Skill/对话/de
 逐 attempt 归因、冻结 `claude-code/` 实现对照、通用复现与跨领域修复、完整回归、本地代码 commit、
 clean-archive 部署和生产 smoke。Round 14 从生产 `d23c7e43` 开始，仍先 V2.3、后肺癌 MDT，必须使用
 两个全新 conversation/root。
+
+## Round 14：tools-closed provider 幻觉与 typed plan 纠错预算
+
+### 两个顺序 E2E 与逐节点归因
+
+- V2.3 使用全新 conversation `ad60a1cd11fc448e844c8198080d2ccc`、root
+  `9f4747b4fbe348ef8d5b61d0a923e589`、`shaiengine_deepseek_v4_pro`，上传 ZIP SHA-256
+  `78b890eab57ff516c20a39a565631caa5d784f839b42f6ad9efbdbdd951eb0a0`。从
+  2026-08-04 11:10:59 到 11:25:46 UTC 达到唯一 durable
+  `failed/delegate_step_failed`，根级 0 业务 artifact。Intent `fd111030...`、ClinicalTrials
+  `8bd891...`、PubMed `0e1a856...`、ICH `415817...`、FDA `5a2008...`、EMA `dce30f...`
+  均 succeeded；唯一失败是 Target Biology `c420143...`，其 10 个 evidence attempt 中 6 个已有
+  成功、实际派发并提交的 HTTP receipt。
+- Target Biology 最后一个模型 turn 已进入 runtime-owned final synthesis：`tool_schema_count=0`、
+  `workflow_forced_tools=[]`、`delegate_tools_closed_terminal_turn=true`，仍有 1 个现有 iteration。
+  Provider 却在 318 字符正文后发送 44 个 tool fragment，拼出一个未暴露的 foreign tool name 与完整
+  JSON 参数。accumulator 正确标记 `tool_name_conflict/tool_name_unrecognized`，该 turn 派发数为 0；
+  但旧分支因 `no_closed_tool_schema` 直接 `provider_tool_stream_corrupt_after_content`，没有接上已有
+  post-dispatch tools-closed synthesis。故障不是远端网站、沙箱、context 或总 timeout，也不存在本轮
+  副作用不确定性；先前 receipt 可以安全综合，当前幻觉调用不可执行。
+- 肺癌 MDT 随后使用全新 conversation `2ad4efc9047748558006dd1026832d28`、root
+  `80ab4ffa71a34f008c9932c4bd0f319a`、同一 provider、历史精确 7,089 字符 prompt（SHA-256
+  `eefb885294e6849d1e5ab5ce9f6799a30dfff1b9520761bd403138b7f4b135b7`）和 exact User Skill
+  `SKILL.md` SHA-256 `2955c00a456f7ca4215e27091c55ceeca6c84d170e4af99560adb54e0d5b4d42`。
+  11:28:33--11:32:03 UTC 达到 durable `failed/capability_plan_validation_exhausted`，输入/输出
+  122,302 / 12,750 tokens，0 child、0 artifact；失败发生在执行 grant 之前，故没有 worker 被错误派发。
+- semantic capability compiler 确实运行而非回退 direct chat。三次 submission 依次为：required/optional
+  重复 candidate；`workflow_plan.nodes[0].round=0` 的 schema error；覆盖完整、含 11 个 Round-1 Agent、
+  Round-2、coordinator 和 final artifact 的近完成计划，但仅余一个 required instruction unit
+  `coverage.iu-6f0d78b0b2b9b0287328842e` 未映射。旧统一上限 3 把前两次机械/schema 纠错与语义 compiler
+  纠错共同耗尽，导致第三次第一次接近合法的计划无法收到一次 exact feedback。校验器没有误判，缺陷在
+  typed control-plane transaction 的反馈预算，而不是应当猜测或自动补写该 instruction。
+
+### 通用不变量、成熟实现对照与取舍
+
+1. **工具关闭是 authority 边界，不是 provider 行为假设。** 未暴露/非法调用必须整批丢弃且绝不执行；
+   delegated run 若已有提交 receipt、无 pending mandatory frontier 且还有预算，应只允许一次无工具综合，
+   不重开 schema、不重放请求、不保存当前坏批次的正文、reasoning 或参数 fragment。无历史 receipt 或无预算
+   仍 fail closed。
+2. **结构化计划的 schema 与语义纠错属于同一个有限 transaction。** 每次错误都返回 exact path/type/compiler
+   feedback；上限 5 次，成功才原子安装 grant，连续五次失败仍确定性终止。Harness 不静默去重 required/
+   optional、不替模型映射缺失 instruction，也不放松 coverage/DAG/capability validator。
+
+唯一成熟参考仍冻结为本地 `claude-code/` commit
+`6f6f12b37f529488b10e53928dd5508bb93535c7`：
+
+| 问题 | 实际源码路径与模式 | ChatDS 决策 |
+|---|---|---|
+| tools-closed turn 出现未知调用 | `src/services/tools/StreamingToolExecutor.ts` 对 streaming fallback 提供 `discard()`，unknown tool 形成 synthetic error 而不执行；`src/services/tools/toolExecution.ts` 将 unknown tool/input validation error 返回模型 | **adapt** discard-and-continue 原则，但 ChatDS 更窄：只从本 run 已提交 receipt 做一次 tools-closed synthesis，不把 foreign call 注册为普通工具结果 |
+| typed plan 前两次机械错误耗尽三次预算 | `src/tools/SyntheticOutputTool/SyntheticOutputTool.ts` 用 AJV 做 exact structured validation；`src/QueryEngine.ts` 的 `MAX_STRUCTURED_OUTPUT_RETRIES` 默认 5 | **adapt** 为 capability-plan schema+semantic 的统一五次 transaction，保留 ChatDS content-addressed Workflow IR、coverage 与 grant 安装边界 |
+| 自动补齐缺失 instruction 或放宽 validator | 参考实现没有 ChatDS 的 instruction-unit/package-digest authority | **reject** 推测性修补；继续把 exact compiler feedback 交给模型，五次后 fail closed |
+
+### 确定性复现、回归、提交与生产切换
+
+- 新增非医疗 delegated evidence 复现：第一次 `read_file` receipt 已提交；第二次进入 tools-closed final
+  synthesis 时 provider 在正文后幻觉 `provider_foreign_tool`。Harness 证明 foreign call 派发 0，坏正文/
+  reasoning/argument 不进入下一请求，第三 turn 无工具并从 `evidence.md` 完成。原有无预算、无 receipt 用例
+  继续精确 terminal。
+- portable Skill 计划测试证明连续三次 schema-invalid 后第四次合法计划可安装并只开放所选 capability；另两项
+  分别证明 workflow-semantic 与 predispatch-schema 连续五次错误时在第 5 次精确
+  `capability_plan_semantic_validation_exhausted`，registry side effect 为 0。
+- 聚焦 5 项通过；stream/capability/Workflow IR/delegation/Knowledge Gate/side-effect retry 联合为
+  `556 passed, 155 subtests passed`。宿主 full 为 `1963 passed, 1 skipped, 801 subtests passed`，19 个
+  failure 全部是当前用户无法读取生产 tombstone；隔离复跑对应 `13 passed, 9 subtests passed`。完整
+  bubblewrap/tmpfs 为 `1971 passed, 810 subtests passed`，仅两个 trusted launcher 和一个 user-namespace
+  `setgroups` 环境项失败；真实宿主为 `2 passed, 1 skipped`。即本次新增后的 1,973 项可执行逻辑全部
+  通过，skip 仍是环境条件。`py_compile`、diff、secret/genericity 和 protected-deletion staging 检查通过。
+- 通用代码提交为
+  `cfc0e09d62ff98c2d831dbf0895c9b358fd01a60 fix: recover typed workflows across provider faults`。
+  clean archive `/tmp/chat_ds_deploy_cfc0e09d.1cXR1g` 与 Git tree 均为 22,456 files；candidate/deploy image
+  `sha256:d05f6f92ae094e0a7f4fc43d2f09bd175316a7484a1b9d8846c8640462b2397d`，revision label 精确匹配
+  完整 commit，旧镜像保留 `rollback-pre-cfc0e09d`。部署前连续两次确认 nonterminal run/root、schedule、
+  `:5173` established connection 均为 0；仅 force-recreate Harness。部署后三入口、Harness 内部与
+  Backend→Harness health/models 均 200，storage identity 一致，SQLite quick/FK 正常，healthy/restart 0、
+  严重日志 0。
+
+Round 14 至此闭环；代码没有 V2.3、疾病、Skill/session/worker、固定角色数、route 或报告文件名特判。
+Round 15 从生产 `cfc0e09d` 开始，仍须先 V2.3、后肺癌 MDT，使用两个全新 conversation/root。
