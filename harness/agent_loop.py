@@ -3398,6 +3398,49 @@ def _capability_plan_history_projection(
     }
 
 
+def _workflow_plan_correction_debug_projection(
+    value: Any,
+) -> dict[str, Any] | None:
+    """Persist one bounded, content-free compact-plan repair coordinate."""
+
+    if not isinstance(value, dict):
+        return None
+    document_id = str(value.get("document_id") or "")
+    source_path = str(value.get("source_path") or "")
+    kind = str(value.get("kind") or "")
+    action = str(value.get("action") or "")
+    if (
+        re.fullmatch(r"doc-[0-9a-f]{24}", document_id) is None
+        or not source_path
+        or len(source_path) > 4_096
+        or "\x00" in source_path
+        or not kind
+        or len(kind) > 64
+        or action != "include_instruction_in_node_range"
+    ):
+        return None
+    integer_fields: dict[str, int] = {}
+    for key in (
+        "start_ordinal", "end_ordinal", "start_line", "end_line",
+    ):
+        item = value.get(key)
+        if isinstance(item, bool) or not isinstance(item, int) or item < 1:
+            return None
+        integer_fields[key] = item
+    preview = str(value.get("preview") or "")
+    return {
+        "action": action,
+        "document_id": document_id,
+        "source_path": source_path,
+        "kind": kind,
+        **integer_fields,
+        "preview_sha256": hashlib.sha256(
+            preview.encode("utf-8")
+        ).hexdigest(),
+        "preview_chars": len(preview),
+    }
+
+
 def _tool_debug_result(raw: str) -> dict[str, Any]:
     parsed = _json_object(raw)
     payload: dict[str, Any] = {"raw_chars": len(raw or "")}
@@ -3448,10 +3491,21 @@ def _tool_debug_result(raw: str) -> dict[str, Any]:
                 and re.fullmatch(r"[A-Za-z0-9_.:@/-]{1,256}", value)
             ):
                 payload[key] = value
-        for key in ("workflow_ir_error_path", "workflow_plan_error_path"):
+        for key in (
+            "workflow_ir_error_path",
+            "workflow_plan_error_path",
+            "workflow_plan_internal_error_path",
+        ):
             value = parsed.get(key)
             if isinstance(value, str) and 0 < len(value) <= 512:
                 payload[key] = value
+        workflow_plan_correction = (
+            _workflow_plan_correction_debug_projection(
+                parsed.get("workflow_plan_correction")
+            )
+        )
+        if workflow_plan_correction is not None:
+            payload["workflow_plan_correction"] = workflow_plan_correction
         matched_skill = parsed.get("matched_skill")
         if (
             isinstance(matched_skill, str)
@@ -13491,6 +13545,7 @@ async def run_stream(
     required_result_schema: dict[str, dict[str, Any]] | None = None,
     retrieval_completeness_policy: str | None = None,
     required_capability_tools: list[str] | None = None,
+    evidence_acquisition_contract: bool = False,
     knowledge_gate_plan: dict[str, Any] | None = None,
     knowledge_gate_plan_sha256: str | None = None,
     knowledge_gate_candidate_authority: dict[str, Any] | None = None,
@@ -13550,6 +13605,8 @@ async def run_stream(
         raise ValueError(
             "output_lifecycle_policy must be one of: " + supported
         )
+    if not isinstance(evidence_acquisition_contract, bool):
+        raise TypeError("evidence_acquisition_contract must be a boolean")
     internal_bounded_text = (
         output_lifecycle_policy == "internal_bounded_text"
     )
@@ -13574,6 +13631,8 @@ async def run_stream(
             incompatible.append("required_result_contract")
         if required_capability_tools:
             incompatible.append("required_capability_tools")
+        if evidence_acquisition_contract:
+            incompatible.append("evidence_acquisition_contract")
         if knowledge_gate_plan is not None:
             incompatible.append("knowledge_gate_plan")
         if declared_artifact_patterns:
@@ -14359,6 +14418,9 @@ async def run_stream(
         for name in (required_capability_tools or ())
         if isinstance(name, str) and str(name).strip()
     )) if delegated_subtask else ()
+    delegated_evidence_acquisition_contract = bool(
+        delegated_subtask and evidence_acquisition_contract
+    )
     delegated_preloaded_input_receipt = (
         _validated_preloaded_input_receipt(
             verified_preloaded_input_receipt,
@@ -17909,6 +17971,83 @@ async def run_stream(
         dict[str, Any] | None
     ) = None
 
+    def delegated_typed_evidence_terminal_audit(
+        result_field_audit: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Validate evidence-bearing typed values before child commit.
+
+        The outer delegation wrapper remains authoritative, but restarting a
+        complete child merely to change unsupported values to null is both
+        expensive and semantically unsafe.  This read-only stop audit uses the
+        same handler-boundary receipts already owned by the runtime and feeds
+        an exact correction into the isolated structured submitter.
+        """
+
+        audit = (
+            result_field_audit
+            if isinstance(result_field_audit, dict)
+            else {}
+        )
+        snapshot = capability_invocation_ledger.snapshot()
+        required_tool_names = set(delegated_required_capability_tools)
+        legacy_success_count = sum(
+            int(row.get("succeeded") or 0)
+            for row in (snapshot.get("by_tool") or [])
+            if (
+                isinstance(row, dict)
+                and str(row.get("tool_name") or "")
+                in required_tool_names
+            )
+        )
+        knowledge_gate_success_count = sum(
+            1
+            for receipt in knowledge_gate_group_receipts.values()
+            if str(receipt.get("outcome") or "") == "success"
+        )
+        exact_candidate_success_count = sum(
+            1
+            for receipt in standard_required_candidate_receipts.values()
+            if str(receipt.get("outcome") or "") == "success"
+        )
+        verified_receipt_count = (
+            legacy_success_count
+            + knowledge_gate_success_count
+            + exact_candidate_success_count
+        )
+        null_fields = set(audit.get("null_fields") or [])
+        degraded_fields = set(audit.get("degraded") or [])
+        populated_fields = [
+            str(field)
+            for field in (audit.get("present") or [])
+            if str(field) not in null_fields | degraded_fields
+        ]
+        error = ""
+        if (
+            delegated_evidence_acquisition_contract
+            and delegated_required_result_fields
+            and audit.get("footer_valid") is True
+            and verified_receipt_count == 0
+            and populated_fields
+        ):
+            error = (
+                "Delegated typed result contains populated field values without "
+                "verifiable evidence receipts; degraded completion cannot "
+                "launder unverified facts. Return only schema-valid null values "
+                "or declared degraded field envelopes for: "
+                + ", ".join(populated_fields[:30])
+            )
+        return {
+            "contract_active": delegated_evidence_acquisition_contract,
+            "footer_valid": bool(audit.get("footer_valid")),
+            "verified_receipt_count": verified_receipt_count,
+            "legacy_success_count": legacy_success_count,
+            "knowledge_gate_success_count": knowledge_gate_success_count,
+            "exact_candidate_success_count": exact_candidate_success_count,
+            "unverified_populated_fields": populated_fields[:30],
+            "valid": not error,
+            "error": error,
+        }
+
     def seal_capability_catalog_compilation_failure(
         skill_name: str,
         failure: dict[str, Any],
@@ -19311,6 +19450,7 @@ async def run_stream(
         footer_error: Any,
         origin: str,
         replace_invalid_source_turn: bool = False,
+        initial_validation_error: str = "",
     ) -> dict[str, Any]:
         """Queue a run-scoped delegated footer-validation transaction."""
         nonlocal delegate_result_footer_repair_attempted
@@ -19404,10 +19544,13 @@ async def run_stream(
                 replace_invalid_source_turn
             ),
             "submission_attempt": 1,
-            # The first isolated submission has no rejected predecessor.  The
-            # source footer error remains in debug metadata; only an actual
-            # validator rejection is fed back as a previous submission error.
-            "previous_validation_error": "",
+            # Structural framing failures need no model-visible predecessor;
+            # the schema itself is sufficient.  A semantic terminal failure,
+            # however, must be actionable on the first isolated submission or
+            # the model can only repeat the same schema-valid value.
+            "previous_validation_error": str(
+                initial_validation_error or ""
+            )[:2_000],
         }
         previous_length_content = ""
         forced_workflow_policy = None
@@ -30035,17 +30178,121 @@ async def run_stream(
                 )
                 else None
             )
-            if (
-                isinstance(deterministic_footer, dict)
-                and deterministic_footer.get("recovered")
-                and isinstance(deterministic_footer.get("footer"), str)
-            ):
+            canonical_footer = (
+                str(deterministic_footer["footer"])
+                if (
+                    isinstance(deterministic_footer, dict)
+                    and deterministic_footer.get("recovered")
+                    and isinstance(deterministic_footer.get("footer"), str)
+                )
+                else None
+            )
+            evidence_result_field_audit = (
+                audit_result_fields(
+                    canonical_footer,
+                    delegated_required_result_fields,
+                    delegated_required_result_schema,
+                )
+                if canonical_footer is not None
+                else result_footer_audit
+            )
+            terminal_typed_evidence_audit = (
+                delegated_typed_evidence_terminal_audit(
+                    evidence_result_field_audit
+                )
+            )
+            ordinary_typed_evidence_terminal = bool(
+                not terminal_typed_evidence_audit.get("valid")
+                and evidence_result_field_audit.get("footer_valid")
+                and not iteration_result_footer_repair
+                and not iteration_output_contract_repair
+                and not iteration_visible_length_recovery
+                and not iteration_synthesis_length_continuation
+                and not iteration_post_dispatch_stream_synthesis
+                and not iteration_post_dispatch_synthesis_continuation
+            )
+            if ordinary_typed_evidence_terminal:
+                semantic_error = str(
+                    terminal_typed_evidence_audit.get("error") or ""
+                )
+                if not delegate_result_footer_repair_attempted:
+                    origin = "typed_evidence_semantic_validation"
+                    if canonical_footer is not None:
+                        origin += "_after_canonicalization"
+                    repair_debug = queue_delegate_result_footer_repair(
+                        full_content,
+                        footer_error=semantic_error,
+                        origin=origin,
+                        initial_validation_error=semantic_error,
+                    )
+                    repair_debug.update({
+                        "reason": "unverified_populated_typed_values",
+                        "evidence_semantic_contract_active": True,
+                        "deterministic_footer_candidate": bool(
+                            canonical_footer is not None
+                        ),
+                        "verified_evidence_receipt_count": int(
+                            terminal_typed_evidence_audit.get(
+                                "verified_receipt_count"
+                            ) or 0
+                        ),
+                        "unverified_populated_fields": list(
+                            terminal_typed_evidence_audit.get(
+                                "unverified_populated_fields"
+                            ) or []
+                        ),
+                        "terminal_projection_mode": "structured_submitter",
+                    })
+                    await notify_turn_boundary("finished", {
+                        **turn_finished_payload,
+                        "finish_reason": "abandoned",
+                        "abandon_reason": (
+                            "typed_evidence_semantic_validation"
+                        ),
+                        "content_chars": len(full_content),
+                        "reasoning_chars": len(full_reasoning),
+                    })
+                    for debug_evt in await debug_stream_event(
+                        "gate.continuation",
+                        repair_debug,
+                    ):
+                        yield debug_evt
+                    for debug_evt in await debug_stream_event(
+                        "delegate.result_footer_repair.requested",
+                        repair_debug,
+                    ):
+                        yield debug_evt
+                    yield {
+                        "type": "tool_progress",
+                        "msg": (
+                            "↻ Correcting unsupported typed values through "
+                            "the closed result submitter"
+                        ),
+                    }
+                    continue
+                msg = (
+                    "The delegated evidence result remained semantically "
+                    "invalid after the bounded typed-output transaction: "
+                    + semantic_error
+                )
+                yield await emit_agent_event("run.failed", {
+                    "error": msg,
+                    "finish_reason": (
+                        "delegated_typed_evidence_semantic_invalid"
+                    ),
+                    "failure_class": "agent_contract_noncompliance",
+                    "retryable": False,
+                    **terminal_typed_evidence_audit,
+                })
+                yield {"type": "error", "msg": msg}
+                return
+
+            if canonical_footer is not None:
                 # The provider value was strict JSON and already satisfies the
                 # exact typed schema; only its wire framing was non-canonical
                 # (for example pretty-printed or followed by prose). Start an
                 # internal append-only boundary so the outer transaction cuts
                 # the rejected marker/tail and retains the substantive body.
-                canonical_footer = str(deterministic_footer["footer"])
                 await notify_turn_boundary("started", {
                     "iteration": budget.used,
                     "delegate_result_footer_repair": True,
@@ -31522,6 +31769,13 @@ async def run_stream(
                     "candidate_string_count": 0,
                     "rejected_candidate_count": 0,
                 }
+                footer_evidence_audit: dict[str, Any] = {
+                    "contract_active": False,
+                    "valid": True,
+                    "error": "",
+                    "verified_receipt_count": 0,
+                    "unverified_populated_fields": [],
+                }
                 if exact_one_submit:
                     raw_submit_arguments = (
                         assembled_calls[0].arguments or ""
@@ -31559,6 +31813,22 @@ async def run_stream(
                                         "pseudo-tool protocol"
                                     ),
                                 }
+                            else:
+                                footer_evidence_audit = (
+                                    delegated_typed_evidence_terminal_audit(
+                                        footer_submit_audit
+                                    )
+                                )
+                                if not footer_evidence_audit.get("valid"):
+                                    canonical_footer = None
+                                    footer_submit_audit = {
+                                        **footer_submit_audit,
+                                        "footer_valid": False,
+                                        "footer_status": "invalid",
+                                        "footer_error": (
+                                            footer_evidence_audit.get("error")
+                                        ),
+                                    }
                     else:
                         footer_submit_audit = {
                             "footer_valid": False,
@@ -31595,6 +31865,19 @@ async def run_stream(
                     "omission_guard_rejected": omission_path is not None,
                     "raw_protocol_count": int(
                         submit_protocol_audit.get("detected_count") or 0
+                    ),
+                    "evidence_semantic_contract_active": bool(
+                        footer_evidence_audit.get("contract_active")
+                    ),
+                    "verified_evidence_receipt_count": int(
+                        footer_evidence_audit.get(
+                            "verified_receipt_count"
+                        ) or 0
+                    ),
+                    "unverified_populated_fields": list(
+                        footer_evidence_audit.get(
+                            "unverified_populated_fields"
+                        ) or []
                     ),
                     **submit_transport_diagnostics,
                     "required_field_count": len(
@@ -32622,6 +32905,26 @@ async def run_stream(
                             or ""
                         )[:512],
                     }
+                    correction_projection = (
+                        _workflow_plan_correction_debug_projection(
+                            exact_result_data.get(
+                                "workflow_plan_correction"
+                            )
+                        )
+                    )
+                    if correction_projection is not None:
+                        capability_plan_validation_failure[
+                            "workflow_plan_correction"
+                        ] = correction_projection
+                        internal_path = str(
+                            exact_result_data.get(
+                                "workflow_plan_internal_error_path"
+                            ) or ""
+                        )
+                        if 0 < len(internal_path) <= 512:
+                            capability_plan_validation_failure[
+                                "workflow_plan_internal_error_path"
+                            ] = internal_path
                     for debug_evt in await debug_stream_event(
                         "capability_plan.validation_rejected",
                         capability_plan_validation_failure,

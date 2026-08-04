@@ -1684,6 +1684,71 @@ def _error(code: str, message: str, **extra: Any) -> CapabilityPlanResult:
     })
 
 
+def _actionable_workflow_plan_correction(
+    exc: WorkflowIRValidationError,
+    documents: tuple[InstructionDocument, ...],
+    planning_catalog: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Translate a runtime-only instruction ID into model-writable coordinates.
+
+    Provider-facing compact plans deliberately cannot submit opaque ``iu-*``
+    identifiers.  Returning only such an identifier after validation therefore
+    creates an impossible correction loop.  Preserve the internal path for
+    diagnostics, but pair it with the exact content-addressed document handle,
+    ordinal, and already-disclosed preview accepted by the public schema.
+    """
+
+    match = re.search(r"(?:^|\.)coverage\.(iu-[0-9a-f]{24})(?:$|\.)", exc.path)
+    if match is None or not isinstance(planning_catalog, dict):
+        return {}
+    instruction_id = match.group(1)
+    catalog_documents = planning_catalog.get("documents")
+    if not isinstance(catalog_documents, list):
+        return {}
+    for document_index, document in enumerate(documents):
+        if document_index >= len(catalog_documents):
+            return {}
+        public_document = catalog_documents[document_index]
+        if not isinstance(public_document, dict):
+            return {}
+        public_units = public_document.get("units")
+        if not isinstance(public_units, list):
+            return {}
+        for unit_index, unit in enumerate(document.units):
+            if unit.id != instruction_id or unit_index >= len(public_units):
+                continue
+            public_unit = public_units[unit_index]
+            if not isinstance(public_unit, dict):
+                return {}
+            document_id = str(public_document.get("document_id") or "")
+            ordinal = unit_index + 1
+            preview = str(public_unit.get("preview") or "")[:240]
+            return {
+                "workflow_plan_internal_error_path": exc.path,
+                "workflow_plan_error_path": (
+                    "$.workflow_plan.nodes[*].instruction_ranges"
+                    f"[document_id={document_id},ordinal={ordinal}]"
+                ),
+                "workflow_plan_correction": {
+                    "action": "include_instruction_in_node_range",
+                    "document_id": document_id,
+                    "start_ordinal": ordinal,
+                    "end_ordinal": ordinal,
+                    "source_path": document.source_path,
+                    "kind": unit.kind,
+                    "start_line": unit.start_line,
+                    "end_line": unit.end_line,
+                    "preview": preview,
+                    "instruction": (
+                        "Include this ordinal in at least one semantic node's "
+                        "instruction_ranges, usually by extending an adjacent "
+                        "same-document range. Do not submit the internal iu-* ID."
+                    ),
+                },
+            }
+    return {}
+
+
 def _candidate_tool_names(candidate: dict[str, Any]) -> list[str]:
     names: list[str] = []
     tool_name = candidate.get("tool_name")
@@ -2138,11 +2203,26 @@ def validate_capability_plan(
                 if exc.code == "unknown_capability_id"
                 else "capability_plan_workflow_ir_invalid"
             )
+            actionable_correction = (
+                _actionable_workflow_plan_correction(
+                    exc,
+                    runtime_instruction_documents,
+                    current_instruction_plan_catalog,
+                )
+                if workflow_plan is not None
+                else {}
+            )
             return _error(
                 error_code,
                 (
                     "The submitted compact workflow plan failed deterministic "
                     "compilation."
+                    + (
+                        " Apply the exact document/ordinal correction returned "
+                        "in workflow_plan_correction; the internal instruction "
+                        "ID is not a provider-writable selector."
+                        if actionable_correction else ""
+                    )
                     if workflow_plan is not None
                     else "The submitted Workflow IR failed deterministic validation."
                 ),
@@ -2152,7 +2232,12 @@ def validate_capability_plan(
                 **(
                     {
                         "workflow_plan_error_code": exc.code,
-                        "workflow_plan_error_path": exc.path,
+                        "workflow_plan_error_path": (
+                            actionable_correction.get(
+                                "workflow_plan_error_path"
+                            ) or exc.path
+                        ),
+                        **actionable_correction,
                     }
                     if workflow_plan is not None
                     else {}

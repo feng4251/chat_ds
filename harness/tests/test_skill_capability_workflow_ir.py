@@ -548,6 +548,46 @@ description: A generic instruction-only workflow.
             result.payload["workflow_plan_error_path"],
         )
 
+    def test_compact_plan_coverage_error_returns_model_writable_coordinate(self):
+        _root, _main, document, catalog, delegate_id = self._fixture()
+        plan = self._workflow_plan(document)
+        executable = [unit for unit in document.units if unit.kind != "heading"]
+        first, second, _aggregate = executable
+        # Keep the graph structurally valid while leaving the first exact
+        # instruction unmapped. The runtime error path contains an opaque ID
+        # that the provider-facing schema deliberately cannot submit.
+        plan["nodes"][0]["instruction_ranges"] = [{
+            "start_instruction_id": second.id,
+            "end_instruction_id": second.id,
+        }]
+
+        result = self._validate(
+            catalog,
+            delegate_id,
+            workflow_plan=plan,
+        )
+
+        self.assertFalse(result.valid)
+        self.assertEqual(
+            "runtime_required_instruction_unmapped",
+            result.payload["workflow_plan_error_code"],
+        )
+        correction = result.payload["workflow_plan_correction"]
+        expected_ordinal = list(document.units).index(first) + 1
+        public_document = catalog["instruction_plan_catalog"]["documents"][0]
+        self.assertEqual(public_document["document_id"], correction["document_id"])
+        self.assertEqual(expected_ordinal, correction["start_ordinal"])
+        self.assertEqual(expected_ordinal, correction["end_ordinal"])
+        self.assertIn(first.text, correction["preview"])
+        self.assertNotIn(
+            first.id,
+            result.payload["workflow_plan_error_path"],
+        )
+        self.assertEqual(
+            f"coverage.{first.id}",
+            result.payload["workflow_plan_internal_error_path"],
+        )
+
     def test_agent_loop_catalog_requires_ir_for_declared_delegated_workflow(self):
         root, main, _document, _catalog, _delegate_id = self._fixture()
         main.write_text(

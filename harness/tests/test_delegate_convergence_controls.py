@@ -1806,6 +1806,7 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
         knowledge_gate_plan=None,
         knowledge_gate_plan_sha256=None,
         knowledge_gate_candidate_authority=None,
+        evidence_acquisition_contract=False,
     ):
         request_bodies = []
         tools = list(tools or ["web_search"])
@@ -1903,6 +1904,9 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
                             retrieval_completeness_policy
                         ),
                         required_capability_tools=required_capability_tools,
+                        evidence_acquisition_contract=(
+                            evidence_acquisition_contract
+                        ),
                         allowed_skill_resources=allowed_skill_resources,
                         allowed_skill_scripts=allowed_skill_scripts,
                         allowed_skill_package_digests=(
@@ -3369,6 +3373,78 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(
             event.get("event_type")
             == "debug.delegate.result_footer_repair.requested"
+            for event in events
+        ))
+        self.assertEqual(events[-1], {"type": "done", "finish_reason": "stop"})
+
+    async def test_unverified_typed_values_are_corrected_in_same_child_transaction(self):
+        responses = [
+            _stop_response(
+                "# Findings\nNo verified source was dispatched.\n"
+                'RESULT_FIELDS_JSON: {"record_id":"invented-value"}'
+            ),
+            _tool_call_response(
+                "call-submit-repeated-unverified-result",
+                tool_name="submit_result_fields",
+                arguments={"record_id": "still-invented"},
+            ),
+            _tool_call_response(
+                "call-submit-null-result",
+                tool_name="submit_result_fields",
+                arguments={"record_id": None},
+            ),
+        ]
+
+        request_bodies, dispatch_mock, events, _persisted = await self._run(
+            responses,
+            max_iterations=1,
+            dispatch_result=json.dumps({"status": "unused"}),
+            required_result_fields=["record_id"],
+            required_result_schema={"record_id": {}},
+            evidence_acquisition_contract=True,
+        )
+
+        self.assertFalse(responses)
+        self.assertEqual(3, len(request_bodies))
+        dispatch_mock.assert_not_awaited()
+        self.assertEqual(
+            "submit_result_fields",
+            request_bodies[1]["tools"][0]["function"]["name"],
+        )
+        correction_payload = json.loads(
+            request_bodies[1]["messages"][1]["content"]
+        )
+        self.assertIn(
+            "without verifiable evidence receipts",
+            correction_payload["previous_submission_validation_error"],
+        )
+        retry_payload = json.loads(
+            request_bodies[2]["messages"][1]["content"]
+        )
+        self.assertEqual(2, retry_payload["submission_attempt"])
+        self.assertIn(
+            "without verifiable evidence receipts",
+            retry_payload["previous_submission_validation_error"],
+        )
+        requested = next(
+            event for event in events
+            if event.get("event_type")
+            == "debug.delegate.result_footer_repair.requested"
+        )
+        self.assertEqual(
+            "unverified_populated_typed_values",
+            requested["payload"]["reason"],
+        )
+        self.assertEqual(
+            ["record_id"],
+            requested["payload"]["unverified_populated_fields"],
+        )
+        self.assertTrue(any(
+            event.get("event_type")
+            == "debug.delegate.result_footer_repair.rejected"
+            and event.get("payload", {}).get(
+                "unverified_populated_fields"
+            ) == ["record_id"]
             for event in events
         ))
         self.assertEqual(events[-1], {"type": "done", "finish_reason": "stop"})

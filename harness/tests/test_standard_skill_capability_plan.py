@@ -568,6 +568,20 @@ class StandardSkillCapabilityPlanTests(unittest.TestCase):
             "workflow_plan_error_path": (
                 "$.nodes[2].instruction_ranges[1]"
             ),
+            "workflow_plan_internal_error_path": (
+                "coverage.iu-0123456789abcdef01234567"
+            ),
+            "workflow_plan_correction": {
+                "action": "include_instruction_in_node_range",
+                "document_id": "doc-0123456789abcdef01234567",
+                "start_ordinal": 3,
+                "end_ordinal": 3,
+                "source_path": "SKILL.md",
+                "kind": "paragraph",
+                "start_line": 10,
+                "end_line": 10,
+                "preview": "private package prose is hashed, not persisted",
+            },
             "workflow_ir_error": "package-controlled prose must not persist",
         }))
 
@@ -578,6 +592,22 @@ class StandardSkillCapabilityPlanTests(unittest.TestCase):
         self.assertEqual(
             "$.nodes[2].instruction_ranges[1]",
             result["workflow_plan_error_path"],
+        )
+        self.assertEqual(
+            "coverage.iu-0123456789abcdef01234567",
+            result["workflow_plan_internal_error_path"],
+        )
+        self.assertEqual(
+            3,
+            result["workflow_plan_correction"]["start_ordinal"],
+        )
+        self.assertNotIn(
+            "preview",
+            result["workflow_plan_correction"],
+        )
+        self.assertEqual(
+            len("private package prose is hashed, not persisted"),
+            result["workflow_plan_correction"]["preview_chars"],
         )
         self.assertNotIn("workflow_ir_error", result)
 
