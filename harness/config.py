@@ -77,6 +77,14 @@ class Settings(BaseSettings):
     llm_stream_fixed_overhead_seconds: float = 30.0
     llm_stream_read_timeout_seconds: float = 120.0
     llm_stream_connect_timeout_seconds: float = 30.0
+    # A provider request that fails before returning any content, reasoning, or
+    # tool-call fragment is safe to replay: no model output has crossed the
+    # dispatch boundary.  Give that transport-only case a time budget separate
+    # from semantic/API retries so a short DNS or route outage cannot discard a
+    # long-running workflow.  The agent loop additionally enforces a fixed hard
+    # attempt clamp and remains cancellation-aware throughout the backoff.
+    llm_prebyte_transport_retry_budget_seconds: float = 600.0
+    llm_prebyte_transport_retry_max_attempts: int = 32
     # A corrupt streamed tool-call batch gets at most one non-stream repair.
     # Keep that bounded recovery independent from the adaptive stream budget:
     # increasing the latter for long, productive generations must not turn a

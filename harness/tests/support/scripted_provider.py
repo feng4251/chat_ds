@@ -28,6 +28,7 @@ class ScriptedTurn:
     assert_request: RequestAssertion | None = None
     stream_error_after_lines: int | None = None
     stream_error: BaseException | None = None
+    request_error: BaseException | None = None
 
 
 def _data(payload: dict[str, Any]) -> str:
@@ -222,6 +223,8 @@ class ScriptedProvider:
             "transport": transport,
             "body": body,
         })
+        if turn.request_error is not None:
+            raise turn.request_error
         return _ScriptedResponse(turn)
 
     @property

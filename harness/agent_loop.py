@@ -200,6 +200,9 @@ from workspace_context import get_workspace, load_workspace_context, Subdirector
 logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 3
+_MAX_PREBYTE_TRANSPORT_RETRY_ATTEMPTS = 64
+_MAX_PREBYTE_TRANSPORT_RETRY_BUDGET_SECONDS = 1800.0
+_PREBYTE_TRANSPORT_RETRY_MAX_DELAY_SECONDS = 30.0
 DEFAULT_MAX_TOKENS = 8192
 
 
@@ -1176,6 +1179,36 @@ def _provider_stream_transport_timeout() -> httpx.Timeout:
         read=None,
         write=30.0,
         pool=30.0,
+    )
+
+
+def _prebyte_transport_retry_policy() -> tuple[int, float]:
+    """Return the bounded reconnect policy for a byte-empty model request.
+
+    API/status failures keep ``MAX_RETRIES``.  This policy applies only after
+    ``_stream_retry_is_safe`` proves that the provider emitted no model state,
+    and is clamped here so deployment configuration cannot make it unbounded.
+    """
+
+    configured_attempts = int(getattr(
+        settings,
+        "llm_prebyte_transport_retry_max_attempts",
+        MAX_RETRIES,
+    ) or 0)
+    configured_budget = float(getattr(
+        settings,
+        "llm_prebyte_transport_retry_budget_seconds",
+        0.0,
+    ) or 0.0)
+    return (
+        min(
+            _MAX_PREBYTE_TRANSPORT_RETRY_ATTEMPTS,
+            max(MAX_RETRIES, configured_attempts),
+        ),
+        min(
+            _MAX_PREBYTE_TRANSPORT_RETRY_BUDGET_SECONDS,
+            max(0.0, configured_budget),
+        ),
     )
 
 
@@ -24958,7 +24991,16 @@ async def run_stream(
                 ),
             }
 
-        for attempt in range(1, MAX_RETRIES + 1):
+        (
+            prebyte_transport_max_attempts,
+            prebyte_transport_retry_budget_seconds,
+        ) = _prebyte_transport_retry_policy()
+        prebyte_transport_failure_started_at: float | None = None
+        provider_attempt_limit = max(
+            MAX_RETRIES,
+            prebyte_transport_max_attempts,
+        )
+        for attempt in range(1, provider_attempt_limit + 1):
             try:
                 attempt_raw_content_chars = 0
                 attempt_raw_reasoning_chars = 0
@@ -25845,7 +25887,11 @@ async def run_stream(
                         else "LLM transport error"
                     ),
                     attempt,
-                    MAX_RETRIES,
+                    (
+                        MAX_RETRIES
+                        if admission_timeout
+                        else prebyte_transport_max_attempts
+                    ),
                     e,
                 )
                 empty_transport_retry = queue_terminal_empty_transport_retry(
@@ -26126,11 +26172,96 @@ async def run_stream(
                     }
                     fallback_requested = True
                     break
+                prebyte_transport_retry_safe = bool(
+                    not admission_timeout
+                    and not isinstance(e, ProviderStreamDeadlineExceeded)
+                    and _stream_retry_is_safe(
+                        full_content,
+                        full_reasoning,
+                        raw_content_chars=attempt_raw_content_chars,
+                        raw_reasoning_chars=attempt_raw_reasoning_chars,
+                        tool_call_fragment_count=(
+                            tool_call_accumulator.fragment_count
+                        ),
+                    )
+                )
+                reconnect_elapsed_seconds = 0.0
+                reconnect_budget_remaining_seconds = 0.0
+                if prebyte_transport_retry_safe:
+                    now = asyncio.get_running_loop().time()
+                    if prebyte_transport_failure_started_at is None:
+                        prebyte_transport_failure_started_at = now
+                    reconnect_elapsed_seconds = max(
+                        0.0,
+                        now - prebyte_transport_failure_started_at,
+                    )
+                    reconnect_budget_remaining_seconds = max(
+                        0.0,
+                        prebyte_transport_retry_budget_seconds
+                        - reconnect_elapsed_seconds,
+                    )
+                if (
+                    prebyte_transport_retry_safe
+                    and attempt < prebyte_transport_max_attempts
+                    and reconnect_budget_remaining_seconds > 0
+                ):
+                    reconnect_attempt = max(1, attempt)
+                    delay = min(
+                        reconnect_budget_remaining_seconds,
+                        jittered_backoff(
+                            reconnect_attempt,
+                            base_delay=1.0,
+                            max_delay=(
+                                _PREBYTE_TRANSPORT_RETRY_MAX_DELAY_SECONDS
+                            ),
+                            jitter_ratio=0.25,
+                        ),
+                    )
+                    reconnect_debug = {
+                        "iteration": budget.used,
+                        "attempt": attempt,
+                        "max_attempts": prebyte_transport_max_attempts,
+                        "exception_kind": type(e).__name__,
+                        "provider_response_started": False,
+                        "http_request_replay_safe": True,
+                        "elapsed_seconds": reconnect_elapsed_seconds,
+                        "retry_budget_seconds": (
+                            prebyte_transport_retry_budget_seconds
+                        ),
+                        "budget_remaining_seconds": (
+                            reconnect_budget_remaining_seconds
+                        ),
+                        "delay_seconds": delay,
+                    }
+                    for debug_evt in await debug_stream_event(
+                        "provider.transport.reconnect_scheduled",
+                        reconnect_debug,
+                    ):
+                        yield debug_evt
+                    if attempt in {1, MAX_RETRIES}:
+                        # Persist every retry as debug evidence, but expose only
+                        # the initial reconnect and the transition beyond the
+                        # ordinary API retry budget in the user-facing stream.
+                        yield {
+                            "type": "tool_progress",
+                            "msg": (
+                                "↻ Provider connection failed before any "
+                                "model output; retrying within the bounded "
+                                "transport reconnect budget"
+                            ),
+                        }
+                    await asyncio.sleep(delay)
+                    continue
                 if attempt >= MAX_RETRIES:
                     msg = (
                         f"LLM provider admission timed out after {MAX_RETRIES} attempts: {e}"
                         if admission_timeout
-                        else f"LLM transport error after {MAX_RETRIES} attempts: {type(e).__name__}: {e}"
+                        else (
+                            "LLM transport error after bounded zero-byte "
+                            f"reconnect recovery ({attempt} attempts, "
+                            f"{reconnect_elapsed_seconds:.1f}s): "
+                            f"{type(e).__name__}: {e}"
+                        )
                     )
                     yield await emit_agent_event("run.failed", {
                         "error": msg,
@@ -26139,7 +26270,24 @@ async def run_stream(
                             "failure_class": "transient_external",
                             "retryable": True,
                             "provider_request_opened": False,
-                        } if admission_timeout else {}),
+                        } if admission_timeout else {
+                            "finish_reason": "provider_transport_unavailable",
+                            "failure_class": "transient_external",
+                            "retryable": True,
+                            "provider_response_started": bool(
+                                not prebyte_transport_retry_safe
+                            ),
+                            "http_request_replay_safe": bool(
+                                prebyte_transport_retry_safe
+                            ),
+                            "transport_attempts": attempt,
+                            "transport_retry_elapsed_seconds": (
+                                reconnect_elapsed_seconds
+                            ),
+                            "transport_retry_budget_seconds": (
+                                prebyte_transport_retry_budget_seconds
+                            ),
+                        }),
                     })
                     yield {
                         "type": "error",

@@ -5,9 +5,11 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
+import agent_loop
 from agent_loop import run_stream
 from tests.support.scripted_provider import (
     ScriptedProvider,
+    ScriptedTurn,
     interrupted_turn,
     stop_turn,
 )
@@ -138,3 +140,82 @@ class ScriptedProviderContractMatrixTests(
         self.assertFalse(
             failed[0]["payload"].get("http_request_replayed", False)
         )
+
+    async def test_zero_byte_transport_outage_recovers_beyond_api_retry_budget(
+        self,
+    ):
+        scripted = ScriptedProvider([
+            ScriptedTurn(
+                lines=(),
+                request_error=httpx.ConnectError("temporary DNS failure"),
+            ),
+            ScriptedTurn(
+                lines=(),
+                request_error=httpx.ConnectError("temporary DNS failure"),
+            ),
+            ScriptedTurn(
+                lines=(),
+                request_error=httpx.ConnectError("temporary DNS failure"),
+            ),
+            stop_turn("Recovered generic provider response."),
+        ])
+
+        with (
+            patch("agent_loop.jittered_backoff", return_value=0.0),
+            patch.object(agent_loop.settings, "agent_debug_trace", True),
+        ):
+            events = await self._run(scripted)
+
+        self.assertEqual(4, len(scripted.requests))
+        self.assertTrue(any(
+            event.get("event_type") == "run.completed"
+            for event in events
+        ))
+        reconnects = [
+            event for event in events
+            if event.get("event_type")
+            == "debug.provider.transport.reconnect_scheduled"
+        ]
+        self.assertEqual(3, len(reconnects))
+        self.assertTrue(all(
+            event["payload"]["http_request_replay_safe"]
+            and not event["payload"]["provider_response_started"]
+            for event in reconnects
+        ))
+
+    async def test_zero_byte_transport_budget_exhaustion_is_typed_transient(
+        self,
+    ):
+        scripted = ScriptedProvider([
+            ScriptedTurn(
+                lines=(),
+                request_error=httpx.ConnectError("persistent DNS failure"),
+            )
+            for _ in range(3)
+        ])
+
+        with (
+            patch.object(
+                agent_loop.settings,
+                "llm_prebyte_transport_retry_budget_seconds",
+                0.0,
+            ),
+            patch("agent_loop.jittered_backoff", return_value=0.0),
+        ):
+            events = await self._run(scripted)
+
+        failed = [
+            event for event in events
+            if event.get("event_type") == "run.failed"
+        ]
+        self.assertEqual(1, len(failed))
+        payload = failed[0]["payload"]
+        self.assertEqual(
+            "provider_transport_unavailable",
+            payload["finish_reason"],
+        )
+        self.assertEqual("transient_external", payload["failure_class"])
+        self.assertTrue(payload["retryable"])
+        self.assertFalse(payload["provider_response_started"])
+        self.assertTrue(payload["http_request_replay_safe"])
+        self.assertEqual(3, payload["transport_attempts"])
