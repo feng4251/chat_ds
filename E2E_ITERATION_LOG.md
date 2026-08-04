@@ -6,8 +6,10 @@ Harness 不变量，并由通用合成测试与非临床或 mutation/rename hold
 新的 root run 到达 durable terminal 后才计数，同一 run 的重试不算新一轮。
 
 自 2026-08-04 起，成熟 Harness 对照步骤的唯一实现参考改为本地独立仓库
-`claude-code/`，每轮必须记录其 exact commit 和与问题相关的实际代码路径；不再为该步骤执行
-Web 搜索或参考 OpenClaw、Hermes 等其他 Harness。stub 只记为未知边界，不能推断缺失实现。
+`claude-code/`，每轮必须记录其 exact commit 和与问题相关的实际代码路径。只有相关代码为 stub、
+调用链断裂或存在真实语义疑点时，才允许围绕该疑点进行最小化 Web 补证，并分别记录源码证据、
+Web 补证和最终取舍；不恢复 OpenClaw、Hermes 等其他 Harness 的常规轮询。stub 先记为未知边界，
+不能自行推断缺失实现。
 以下历史轮次保留当时真实使用的官方/多框架对照，不追溯改写。
 
 每轮自动模拟以下人工排障追问链：

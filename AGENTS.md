@@ -48,8 +48,12 @@ Key operating constraints:
   session-wise Harness/workflow implementation. The sole current implementation
   reference is the local, independent nested Git repository
   `/nfs/yangbb/codes/chat_ds/claude-code/`; freeze and record its exact commit
-  for each comparison. Do not use Web search, OpenClaw, Hermes, or another
-  Harness as a substitute during this step. Map the observed mechanism to
+  for each comparison. Treat that source as the primary design evidence. Web
+  search is allowed only when a relevant local code path is stubbed, broken,
+  or genuinely ambiguous; record the exact uncertainty and distinguish local
+  source evidence from the minimal Web corroboration. Do not resume routine
+  OpenClaw/Hermes/framework surveys or use another Harness as a substitute for
+  the local source. Map the observed mechanism to
   concrete code paths and patterns such as durable checkpoints/pending writes,
   typed state and structured output, idempotent activity retries, subgraph
   failure isolation, sandbox/workspace boundaries, and trace/terminal

@@ -11,9 +11,11 @@
   `6f6f12b37f529488b10e53928dd5508bb93535c7`）是从现在起唯一的成熟 Harness 实现参考。
   每轮原有三源诊断、逐 delegate 归因、通用不变量、确定性复现、跨领域 holdout、修复、回归、
   local commit、部署与观察步骤不变；只把“Web 搜索/多框架调研”替换成“读取该冻结仓库中与故障
-  对应的实际代码路径并给出 problem -> code path/pattern -> adopt/adapt/reject 映射”。不再使用
-  OpenClaw、Hermes 或 Web 搜索完成这一步。仓库中的 stub 只表示未知边界，不能据此猜测私有实现；
-  ChatDS 不依赖该仓库构建或运行，有用机制仍须在 ChatDS 内独立实现并通过跨 Skill 测试。
+  对应的实际代码路径并给出 problem -> code path/pattern -> adopt/adapt/reject 映射”。该源码是
+  默认和主要设计证据；只有相关路径是 stub、调用链断裂或确有语义疑点时，才允许围绕该疑点做
+  最小化 Web 补证，并必须分别记录源码证据、Web 补证和最终取舍。不恢复 OpenClaw/Hermes 或其他
+  框架的常规轮询。ChatDS 不依赖该仓库构建或运行，有用机制仍须在 ChatDS 内独立实现并通过跨
+  Skill 测试。
 - ChatDS 原创贡献现采用根目录 `LICENSE` 中未经修改的 PolyForm Noncommercial 1.0.0；
   `THIRD_PARTY_NOTICES.md` 明确排除了第三方目录、独立参考仓库、运行时数据、上传 Skill 和生成产物。
   该许可证没有、也不会重新授权 `claude-code/` 等第三方内容。
@@ -1837,9 +1839,11 @@ semantic SHA-256 为 `ecc16dc8f97994015c62b529e210cbc67296160b4fa54a99a954999161
 5. 冻结本地独立仓库 `claude-code/` 的 exact commit，并只读取与本轮故障相关的实际代码路径，
    把问题映射到 durable checkpoint/pending write、typed state/structured output、幂等 activity
    retry、subgraph failure isolation、sandbox/workspace boundary、trace 与 exactly-one terminal
-   等机制，形成 problem -> code path/pattern -> adopt/adapt/reject 记录。本步骤不做 Web 搜索，
-   不再参考 OpenClaw、Hermes 或其他 Harness。遇到 stub 必须标记为未知，不能推断缺失行为；
-   仅罗列文件名或概念、不核对代码路径不算完成对照。
+   等机制，形成 problem -> code path/pattern -> adopt/adapt/reject 记录。该源码是主要依据；只有
+   相关路径为 stub、调用链断裂或存在真实语义疑点时，才允许针对该疑点做最小化 Web 补证，并
+   分别记录源码证据、Web 补证与取舍。不恢复 OpenClaw/Hermes 或其他 Harness 的常规框架调研。
+   遇到 stub 必须先标记未知，不能自行推断缺失行为；仅罗列文件名或概念、不核对代码路径不算
+   完成对照。
 6. 修复只能进入通用 compiler/workflow/capability/evidence/artifact/recovery/lifecycle 层；
    不得加入疾病、V2.3、package/session/route/worker/KG ID、固定数量或报告文件名特判。
    只有确实提升任意规范 Skill 执行能力、并由通用复现及跨领域 holdout 证明的修改，才计为
