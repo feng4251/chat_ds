@@ -740,6 +740,12 @@ def _completion_quality_declaration(
 
     declared_status: str | None = None
     reason_receipt: dict[str, Any] | None = None
+    # Keep the validated reason available only inside the output transaction.
+    # Observability continues to receive the content-addressed receipt below,
+    # never the raw reason.  Semantic validation needs the literal value so a
+    # substantive result body plus an explicit zero-result/degraded reason is
+    # not misclassified as an unexplained empty typed ledger.
+    reason_text: str | None = None
     sources: list[str] = []
     if candidate_lines:
         raw = candidate_lines[0][
@@ -800,6 +806,7 @@ def _completion_quality_declaration(
                 ),
             }
         if isinstance(reason, str):
+            reason_text = reason.strip()
             reason_receipt = {
                 "representation": "sha256+shape",
                 "sha256": hashlib.sha256(
@@ -821,6 +828,7 @@ def _completion_quality_declaration(
             "source": "+".join(dict.fromkeys(sources)),
             "error": None,
             "reason_receipt": reason_receipt,
+            "_reason_text": reason_text,
         }
 
     legacy_status = (
@@ -12077,6 +12085,7 @@ async def _run_child(
         "non_substantive_fields": [],
         "substantive_body": False,
         "empty_ledger_justified": False,
+        "declaration_reason_justifies_empty_ledger": False,
         "body_audit_reason": "typed_footer_not_validated",
     }
     if (
@@ -12106,11 +12115,29 @@ async def _run_child(
             body_audit.get("valid")
             and not _is_process_narration_only(substantive_body)
         )
+        declared_reason = (
+            str(completion_quality_declaration.get("_reason_text") or "")
+            if completion_quality_declaration.get("status") == "degraded"
+            else ""
+        )
+        declaration_reason_justifies_empty_ledger = bool(
+            declared_reason
+            and (
+                _EMPTY_RESULT_SET_PATTERN.search(declared_reason)
+                or _DEGRADED_GAP_PATTERN.search(declared_reason)
+            )
+        )
+        # A quality ledger is audit metadata, not a result body.  Therefore a
+        # reason can explain an empty typed ledger only when the ordinary body
+        # is itself substantive.  This accepts an explicit machine-readable
+        # zero-result/degraded explanation without allowing a reason-only or
+        # unrelated declaration to masquerade as the delegated result.
         empty_ledger_justified = bool(
             body_is_substantive
             and (
                 _EMPTY_RESULT_SET_PATTERN.search(substantive_body)
                 or _DEGRADED_GAP_PATTERN.search(substantive_body)
+                or declaration_reason_justifies_empty_ledger
             )
         )
         typed_result_semantic_audit = {
@@ -12120,6 +12147,9 @@ async def _run_child(
             "non_substantive_fields": non_substantive_fields,
             "substantive_body": body_is_substantive,
             "empty_ledger_justified": empty_ledger_justified,
+            "declaration_reason_justifies_empty_ledger": (
+                declaration_reason_justifies_empty_ledger
+            ),
             "body_chars": len(substantive_body),
             "body_audit_reason": body_audit.get("reason"),
         }
