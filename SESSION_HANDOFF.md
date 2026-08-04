@@ -19,31 +19,34 @@
 - ChatDS 原创贡献现采用根目录 `LICENSE` 中未经修改的 PolyForm Noncommercial 1.0.0；
   `THIRD_PARTY_NOTICES.md` 明确排除了第三方目录、独立参考仓库、运行时数据、上传 Skill 和生成产物。
   该许可证没有、也不会重新授权 `claude-code/` 等第三方内容。
-- 2026-08-04 最新权威状态：Round 15 已完成两个全新顺序 E2E、exact Skill/对话/debug/tool/provider/
-  artifact 三源诊断、`claude-code/` 源码与真实 CLI 对照、通用修复、全量回归、本地代码 commit 和
-  生产切换。V2.3 conversation `9f83f64f7f4f4b87b6e057f6891cd780` / root
-  `159c979c17564922a0d735a02def3f74` 的 Competitive Landscape 两次 attempt 都在 tools-closed 终态
-  只返回未来搜索/比较叙述；旧 Harness 到 child 返回外层才做 semantic rejection，typed footer 投影无法
-  修复正文，导致整个 child 重跑后仍失败。肺癌 MDT conversation
-  `369e8a816594454598fd9c8c9a5c1f8a` / root `2fa0eb88bb454203877a424f6bafe9ce` 已通过
-  capability plan 并进入 Coordinator Round 0；同一个 `(skill_view, Skill, SKILL.md)` 被编译为 worker
-  contract 与 required capability main，实际预载成功但旧互斥 ledger 只记后者，错误拒绝已完成 worker。
-  逐 child、provider、tool、artifact 与 exact Skill 证据见 `E2E_ITERATION_LOG.md` Round 15。
-- Round 15 通用代码提交为
-  `86609068727337b88b0af564b935c85daba6a88e fix: make delegated contracts transactional`：
-  inner/outer delegation 共用“剥离机器账本后的 substantive body”与 process-narration validator；该错误在
-  同一 child 的 bounded tools-closed output transaction 中接收 exact feedback 后完整重生成，rejected draft
-  被丢弃，任务/预加载 authority/已提交 receipts 保留，工具与副作用不重开。deterministic preload 按 exact
-  resource coordinate 去重，一次成功 receipt 可独立满足 compiler 赋予该 source 的多个角色 ledger，
-  authority 不扩大。生产逻辑没有 V2.3、疾病、Skill/session/worker、固定角色数、route 或报告名特判。
-- Round 15 高风险联合 `454 passed`；bubblewrap clean tmpfs 为 `1973 passed, 2 errors, 1 skipped`，
-  两个 error 只因 namespace 改变 trusted executor identity，真实宿主精确复跑 `2 passed`。宿主 full 的
-  20 个红灯全由不可读生产 NFS tombstone 在被测逻辑前触发。因此本轮新增后的 1,975 项可执行逻辑全部
-  通过，唯一 skip 仍为环境条件。clean archive 与 Git tree 均为 22,456 files。生产 Harness image
-  `sha256:7af086170febee367a1c8ca42b6e0f0e763b699f53e15ff934777fff2e19130d`，revision 精确为
-  `86609068...`，healthy/restart 0，旧镜像为 `rollback-pre-86609068`；三入口、Harness 内部、
-  Backend→Harness、storage identity、SQLite quick/FK、idle AgentRun 与严重日志 smoke 全通过。
-- Round 16 是下一项，继续使用 `shaiengine_deepseek_v4_pro`，必须先全新 V2.3、再全新肺癌 MDT，
+- 2026-08-04 最新权威状态：Round 16 已完成两个全新顺序 E2E、exact Skill/对话/debug/tool/provider/
+  artifact 三源诊断、冻结 `claude-code/` 对照、通用修复、完整回归、本地代码 commit 和生产切换。
+  V2.3 conversation `8bdd202c6b854c07b21e61100723a977` / root
+  `3fef4aeefbd74600866712c02ecb3853` 的 Competitive Landscape 首次与精确 retry 都返回填充过的
+  typed DrugBank 字段，但没有任何真实 evidence receipt；旧 Harness 只在 child 返回外层拒绝，导致昂贵
+  的整个 child 重跑。肺癌 MDT conversation `7f8382b53003479b9c38d5f7d43d1c15` / root
+  `129194592ba943b4842d7cc610902fe5` 已进入 semantic capability-plan transaction，前四次收到 duplicate、
+  schema 与 unselected-capability feedback；第五次只余一个 internal `coverage.iu-*`，但 model-facing
+  feedback 没有 exact document/ordinal 坐标，模型无法据此修正。逐 child、provider、tool、artifact 与
+  exact Skill 证据见 `E2E_ITERATION_LOG.md` Round 16。
+- Round 16 通用代码提交为
+  `8097db3ca14d9341cffcf5d4253c5c8c51133728 fix: keep skill validation corrections transactional`：
+  parent-compiled evidence obligation 现在进入 child 的同一 bounded structured-output transaction；只有
+  runtime-owned 成功 receipt 才能支撑非空 evidence claims，零 receipt 时模型可在同一 child 内改为
+  `null/degraded` 或补正，工具、authority 与副作用均不重开。capability-plan validator 把内部
+  content-addressed `coverage.iu-*` 安全投影为 exact `document_id + ordinal + source lines`，内部 hash 仍
+  保留在 debug，coverage/authority 严格度没有降低。生产逻辑没有 V2.3、疾病、Skill/session/worker、
+  固定角色数、route、数据库名或报告名特判。
+- Round 16 直接受影响组合 `268 passed`，扩展高风险组合 `543 passed`。生产 Harness image 内 full
+  discovery 为 `1937 tests, 2 environment-assembly errors, 5 skipped`；两个 error 分别是只挂载 Harness
+  时缺 `/executor` 和缺 Backend workspace-lock parity 文件。按真实服务布局挂载后 workspace-lock 项通过，
+  isolated executor 44 项中 43 项直接通过，唯一 CommonJS 项只因 Harness image 不预装 Node；精确挂载
+  生产宿主 Node 后该项通过。因此没有逻辑回归。clean archive 与 Git tree 均为 22,456 files。生产
+  Harness image `sha256:75aa609858a9c8d24dd447b1d8565dbdccaf05378cb3123c8c377aa3ba655b9b`，
+  revision 精确为 `8097db3c...`，healthy/restart 0，旧镜像为 `rollback-pre-8097db3c`；三入口、
+  Harness 内部、Backend→Harness、storage identity、SQLite quick/FK、idle AgentRun 与严重日志 smoke
+  全通过。
+- Round 17 是下一项，继续使用 `shaiengine_deepseek_v4_pro`，必须先全新 V2.3、再全新肺癌 MDT，
   两个 root 顺序运行且各自达到唯一 durable terminal 后，按同一诊断/复现/`claude-code/` 对照/
   通用修复/回归/commit/clean-deploy 闭环推进。当前用户授权上限仍是 Round 18。
 - Round 14 历史状态：已完成两个全新顺序 E2E、exact Skill/对话/debug/tool/provider/
@@ -147,7 +150,7 @@
   delegated exact HTTP request 得到稳定 4xx 后会阻止同参真实 replay，但 408/409/425/429、5xx、transport
   与 changed args/candidate 仍可尝试。生产代码没有疾病、V2.3、Skill/session/worker/KG ID、数据库、
   固定数值或报告文件名特判。
-- 当前生产 Harness image 为
+- 该 Round 13 第一阶段的生产 Harness image 曾为
   `sha256:5536a15f50658dec43090db9c6a7e8ef419f29095709d90e28e2a26c74b8ec14`，revision 精确为
   `98882f0b...`，healthy/restart 0；Backend 仍为 `0108c664`。clean archive
   `/tmp/chat_ds_deploy_98882f0b.cU1tKE` 与 tracked tree 均为 22,452 files。受影响组合为
@@ -1432,6 +1435,18 @@ query/header schema/DLP，不再允许任意浏览器/API 请求。
 - 前端：`http://10.10.132.126:5173`、`http://172.30.100.126:5173`。
 - Harness 使用同机 SearXNG `http://10.10.132.126:8088`；既有 SearXNG/Valkey 在切换
   中未重建，健康状态和数据卷保持不变。
+- 2026-08-04 完成 `8097db3c` Round 16 evidence-terminal transaction 与 actionable compiler feedback：
+  - 部署前两次确认 active/nonterminal AgentRun 与 `:5173` established connection 均为 0；SQLite
+    `quick_check=ok`、foreign-key violation 0；
+  - 候选来自精确 clean archive `/tmp/chat_ds_deploy_8097db3c.ueKBN9`，archive 与 tracked tree
+    均为 22,456 files；candidate revision label、import 与受影响 `268 passed` 精确通过；
+  - 只 force-recreate Harness；Backend、Frontend、四槽、Proxy、Browser、SearXNG/Valkey 和数据卷
+    均未重建；旧 Harness image 保留 `rollback-pre-8097db3c`；
+  - 部署后 Harness image 为
+    `sha256:75aa609858a9c8d24dd447b1d8565dbdccaf05378cb3123c8c377aa3ba655b9b`，revision
+    为 `8097db3ca14d9341cffcf5d4253c5c8c51133728`，healthy/restart 0；三个 Frontend 入口、
+    Harness 与 Backend→Harness health/models 全 200，storage identity 相同，SQLite quick/FK 正常，
+    active run 与严重启动日志均为 0。
 - 2026-08-03 完成 `ca9f5eac` Round11 planned-resource binding 与 child quality canonicalization：
   - 部署前连续两次确认 nonterminal AgentRun/root、enabled/running schedule 与 5173 established
     connection 均为 0；SQLite `quick_check=ok`、foreign-key violation 0；
@@ -1980,13 +1995,17 @@ V2.3/肺癌 MDT 分别为 `9bb4a0173fc44c5b94cb4258b2a17ab7` /
 V2.3/肺癌 MDT 分别为 `2ca049506d0249418815b64bab500ead` /
 `5e635b2d7e4b4486bdeb37d88690d34b` 与 `7143d3304a6643c6aa3ff888d63a56d6` /
 `01236e10499d43898c0a1ab96cbe4598`，通用修复为 `d23c7e43`，生产已切换并通过 smoke。
-Round 14--18 仍获授权；下一项是从 `d23c7e43` 顺序建立 Round 14 的两个全新 case。不得复用
+Round 14--16 已闭环；Round 16 的 V2.3/肺癌 MDT 分别为
+`8bdd202c6b854c07b21e61100723a977` / `3fef4aeefbd74600866712c02ecb3853` 与
+`7f8382b53003479b9c38d5f7d43d1c15` / `129194592ba943b4842d7cc610902fe5`，通用修复为
+`8097db3c`，生产已经切换并通过 smoke。Round 17--18 仍获授权；下一项是从 `8097db3c` 顺序建立
+Round 17 的两个全新 case。不得复用
 任何已终态 run，或把同一 run 的重试、补跑和重复解读计为新轮。
 
 ## 10. 已知非 blocker 边界
 
 - V2.3 与 ground truth 的业务级一致性仍需真实模型重型 E2E；基础回归不能替代这项验收。
-  用户最新授权继续 Round 14--18；Round 13 已闭环。Round 18 后如仍需模型重型 E2E，必须
+  用户最新授权继续 Round 17--18；Round 16 已闭环。Round 18 后如仍需模型重型 E2E，必须
   重新获得授权。
 - Legacy `knowledge_gate.checks[].tools` 只能安全解释为单个 OR 组；需要多个独立
   必须条件的 Skill 应显式使用 `tool_groups` 或 `tools: {all_of: ...}`。Harness 不从

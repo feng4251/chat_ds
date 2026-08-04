@@ -1897,3 +1897,97 @@ Claude Code 2.1.152 做了两个黑盒实验：
 
 Round 15 至此闭环；代码没有 V2.3、疾病、Skill/session/worker、固定角色数、route 或报告名特判。
 Round 16 从生产 `86609068` 开始，仍须先 V2.3、后肺癌 MDT，使用两个全新 conversation/root。
+
+## Round 16：证据型终态事务与可操作的编译反馈
+
+### 两个顺序 E2E 与逐节点归因
+
+- V2.3 使用全新 conversation `8bdd202c6b854c07b21e61100723a977`、root
+  `3fef4aeefbd74600866712c02ecb3853`、`shaiengine_deepseek_v4_pro`，达到唯一 durable
+  `failed/delegate_retry_exhausted`。Intent、ClinicalTrials.gov、PubMed、ICH、FDA、EMA 和 Target
+  Biology child 均 succeeded；只有 Competitive Landscape 首次 attempt `1a185b3...` 与精确 retry
+  `290af569...` failed。
+- 两个 Competitive attempt 都不是网络、沙箱、provider stream 或工具调用损坏。它们在 tools-closed
+  terminal submission 中返回了 schema-valid、非空的 DrugBank 字段，却没有任何 runtime-owned 成功
+  evidence receipt。外层 delegated-result contract 正确拒绝“无 receipt 的填充值”，但这个 semantic
+  validator 只存在于 child commit boundary 之外；因此模型在同一 structured-output transaction 中收不到
+  精确错误，父级只能重跑整个 child。该 supporting Skill 的 DrugBank 路径又需要 credential/cache，当前
+  frozen authority 没有可执行 candidate，所以正确收敛应是同一 child 把字段改为 `null` 并明确 degraded，
+  而不是伪造事实，也不是无意义地重跑全部推理。
+- 肺癌 MDT 使用全新 conversation `7f8382b53003479b9c38d5f7d43d1c15`、root
+  `129194592ba943b4842d7cc610902fe5`、同一 provider 和 exact User Skill，达到 durable
+  `failed/capability_plan_validation_exhausted`，0 child、0 artifact。五次 plan submission 依次收到：
+  duplicate selection、`workflow_plan.nodes[0].round=0` schema error、unselected capability、Workflow IR
+  invalid，以及 Workflow IR 缺少 `coverage.iu-6f0d...`。五次 bounded transaction 和 fail-closed 均按
+  Round 14 设计工作，没有错误派发 worker。
+- 最后一个 internal instruction-unit 实际可从 frozen source 唯一反查到 `SKILL.md` ordinal 3、paragraph
+  line 10：`本 Skill 提供肺癌多学科诊疗（MDT）的完整决策支持框架，通过多轮讨论机制实现高质量的协作决策`。
+  但 provider-facing schema 只允许模型提交 `document_id + ordinal`，旧 compiler feedback 却只返回内部
+  `coverage.iu-*` hash；这是不可写、不可行动的错误坐标。validator 的 complete-coverage 要求本身正确，
+  缺陷是内部身份没有安全投影回模型已知的 source coordinate，而不是应放松 coverage 或由 Harness 猜补节点。
+
+### 通用不变量、`claude-code/` 对照与取舍
+
+1. **证据型 structured output 的语义校验必须留在原 transaction。** parent compiler 已声明某 child 的
+   non-null 字段需要 evidence acquisition 时，child 终态只有真实 handler/Knowledge Gate/standard-candidate
+   成功 receipt 才能支撑填充值。零 receipt 加填充值必须把 exact validator error 返回同一 child；模型可在
+   既有最多五次 transaction 内改为 `null/degraded`。不得重开工具、重放副作用、重跑整个 child，也不得把
+   preloaded Skill、模型自述或失败调用算作 evidence receipt。
+2. **内部 content-addressed identity 与模型可写坐标必须双轨保存。** validator/debug 保留稳定 `iu-*` hash；
+   model-facing feedback 必须投影成 frozen input schema 允许提交的 exact `document_id + ordinal`，并可附
+   bounded source line/已披露 preview 帮助定位。projection 不修改 coverage、selection、authority 或 DAG，
+   只让反馈可操作。
+
+唯一成熟参考仍冻结为本地 `claude-code/` commit
+`6f6f12b37f529488b10e53928dd5508bb93535c7`：
+
+| 问题 | 实际源码路径与模式 | ChatDS 决策 |
+|---|---|---|
+| schema-valid 但语义上无证据的 typed terminal | `src/tools/SyntheticOutputTool/SyntheticOutputTool.ts` 把 StructuredOutput 实现为 read-only、non-open-world synthetic tool，并用 AJV 返回 exact error；`src/QueryEngine.ts` 在同一 query 中保留最多 5 次 structured-output retry | **adapt** 为 child 内同一无副作用 terminal transaction，并叠加 ChatDS handler-owned evidence ledger；不把模型自述当 receipt |
+| compiler 返回模型无法提交的内部 hash | StructuredOutput 的错误必须围绕输入 schema 的 exact path/value 返回，才能由同一 query 修正 | **adapt** 为 internal hash + actionable frozen coordinate 双轨；保留 ChatDS content-addressed identity 和 strict complete coverage |
+| 自动补值或放松 evidence/coverage | 参考路径提供反馈重试，不替模型伪造业务字段 | **reject**；连续错误仍在既有上限确定性 fail closed |
+
+本轮还用已安装 Claude Code CLI 做过同类黑盒校验：首次 StructuredOutput 不合法时，exact validator error
+回到同一 query，随后可在同一 query 成功提交；这与上述源码路径一致。ChatDS 只独立实现该事务不变量，
+不依赖或复制参考仓库 runtime。
+
+### 通用实现、确定性复现与回归
+
+- `delegated_result_contract.py` 的字段审计现在同时返回 `present/degraded/missing/null_fields`；schema-valid
+  `null` 在结构上存在，但不会被误计为 evidence claim。inner 与 outer audit 共用同一投影。
+- `tools/delegation.py` 把 parent-compiled `evidence_acquisition_contract` 明确传入 delegated child。
+  `agent_loop.py` 在 child terminal structured-output transaction 中只统计真实成功的 handler-boundary、
+  Knowledge Gate 或 exact standard-candidate receipt。若 contract 要求 evidence、receipt 为 0 且字段非空，
+  exact error 进入已有最多五次的 `submit_result_fields` transaction；rejected submission 不进入 registry，
+  tools remain closed，重复无证据 submission 最终仍 fail closed。
+- `skill_capability_plan.py` 将 `coverage.iu-*` 转为 exact `document_id`、ordinal、source lines 和 bounded
+  disclosed preview；debug 同时保留 internal path，并只记录 preview hash。selection、coverage、capability
+  authority 和 atomic install 规则未改变。
+- 新增/调整的跨领域复现使用任意非医疗 `record_id`：第一次无 receipt 提交填充值，收到 exact error 后再次
+  错误提交，第三次改为 null/degraded；全部发生在同一 child、3 次 provider request、0 registry dispatch。
+  portable workflow omission 测试证明反馈包含 writable document/ordinal coordinate，同时 internal hash
+  仍稳定保留。无 V2.3、疾病、数据库、固定 worker、route 或报告文件名参与判断。
+- 聚焦与直接受影响 4 模块为 `268 passed`；扩展 stream/delegation/compiler/Knowledge Gate 高风险组合为
+  `543 passed`。生产 Harness image 内 `unittest discover` 为
+  `Ran 1937 tests; errors=2, skipped=5`，两项 error 是测试环境只挂载 Harness 导致缺 `/executor` 和缺
+  Backend workspace-lock parity 文件，而非断言失败。按真实服务布局挂载 whole repo 后 workspace-lock
+  项通过，isolated executor 44 项中 43 项通过；唯一 CommonJS 项只因 Harness image 不预装 Node，精确
+  挂载生产宿主 `/usr/bin/node` 后通过。`py_compile`、`git diff --check`、secret/genericity 与 protected
+  deletion staging 检查均通过。
+
+### 提交与生产切换
+
+- 通用代码提交为
+  `8097db3ca14d9341cffcf5d4253c5c8c51133728 fix: keep skill validation corrections transactional`。
+  clean archive `/tmp/chat_ds_deploy_8097db3c.ueKBN9` 与 Git tree 均为 22,456 files；candidate/deploy
+  image 为 `sha256:75aa609858a9c8d24dd447b1d8565dbdccaf05378cb3123c8c377aa3ba655b9b`，revision
+  label 精确匹配完整提交，旧镜像保留 `rollback-pre-8097db3c`。
+- 部署前两次确认 active/nonterminal AgentRun 与 `:5173` established connection 均为 0；只
+  force-recreate Harness。Backend、Frontend、四个 Executor、Browser、skill-egress proxy、SearXNG/Valkey
+  和数据卷均未重建。部署后 Harness healthy/restart 0；`127.0.0.1`、`10.10.132.126`、
+  `172.30.100.126` 三入口 root 与 `/api/health` 均 200；Harness 内部和 Backend→Harness health/models
+  均 200，四模型目录正常；host/container storage identity 一致，SQLite quick/FK 正常，active run 和
+  严重日志均为 0。
+
+Round 16 至此闭环。Round 17 从生产 `8097db3c` 开始，仍须先 V2.3、后肺癌 MDT，使用两个全新
+conversation/root；当前用户授权硬上限为 Round 18。
