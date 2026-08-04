@@ -6,15 +6,26 @@
 
 - 工作目录：`/nfs/yangbb/codes/chat_ds`。
 - 分支：`fix/generic-skill-harness-20260717`。
+- 2026-08-04 用户更新了双 Skill 迭代的成熟实现对照规则：以 ChatDS 为实现基础继续迭代，
+  本地独立仓库 `claude-code/`（当前冻结 commit
+  `6f6f12b37f529488b10e53928dd5508bb93535c7`）是从现在起唯一的成熟 Harness 实现参考。
+  每轮原有三源诊断、逐 delegate 归因、通用不变量、确定性复现、跨领域 holdout、修复、回归、
+  local commit、部署与观察步骤不变；只把“Web 搜索/多框架调研”替换成“读取该冻结仓库中与故障
+  对应的实际代码路径并给出 problem -> code path/pattern -> adopt/adapt/reject 映射”。不再使用
+  OpenClaw、Hermes 或 Web 搜索完成这一步。仓库中的 stub 只表示未知边界，不能据此猜测私有实现；
+  ChatDS 不依赖该仓库构建或运行，有用机制仍须在 ChatDS 内独立实现并通过跨 Skill 测试。
+- ChatDS 原创贡献现采用根目录 `LICENSE` 中未经修改的 PolyForm Noncommercial 1.0.0；
+  `THIRD_PARTY_NOTICES.md` 明确排除了第三方目录、独立参考仓库、运行时数据、上传 Skill 和生成产物。
+  该许可证没有、也不会重新授权 `claude-code/` 等第三方内容。
 - 2026-08-04 最新状态：当前数据库没有 `pending/planned/queued/running/committing` AgentRun，
   旧 Round 13 “正在运行”的描述已经失效；本轮按用户要求只完成通用 Harness 收敛、回归、提交和
   生产部署，没有自动启动高成本 V2.3/MDT E2E。用户下一次手工 E2E 应从当前生产版本建立全新
   conversation/root，诊断时继续同时核对 exact Skill、对话上下文与 session debug/tool/result。
-- 用户提供的第二个 `claude-code/` 仓库是第三方反编译/泄露整理，仓库没有 LICENSE，且存在 stub，
-  不能作为可验证的官方 Claude Code 源码。本轮仅对其可观察架构作 clean-room 思路对照，没有复制
-  代码、文本或私有实现。吸收的通用不变量是：一次 assistant tool-call batch 与其全部 tool result
-  构成不可拆分的 Provider API round；普通 guidance 必须在整批 result 之后；发送前必须审计；
-  历史修复不能伪造成功或副作用；压缩只能按完整 round 切割。
+- 用户提供的第二个 `claude-code/` 仓库是本地唯一成熟 Harness 参考；是否官方不作为本项目选择
+  参考路径的条件。对照只以冻结 commit 中实际存在的代码为证据，stub 不算实现证据，ChatDS 继续
+  采用 clean-room 的独立实现。此前从该仓库吸收的通用不变量是：一次 assistant tool-call batch
+  与其全部 tool result 构成不可拆分的 Provider API round；普通 guidance 必须在整批 result 之后；
+  发送前必须审计；历史修复不能伪造成功或副作用；压缩只能按完整 round 切割。
 - 最新通用修复已提交为
   `b38390c5ef83f2f7ddc52c5b2c70e324017a7583 fix: make provider tool rounds transactional`。
   新增独立 `provider_transcript` 协议层，统一执行 transcript audit、旧历史 canonicalization、
@@ -1823,13 +1834,12 @@ semantic SHA-256 为 `ecc16dc8f97994015c62b529e210cbc67296160b4fa54a99a954999161
    逐个解释 succeeded/degraded/failed/cancelled attempt，不能用前端最后一条文案代替证据。
 4. 在修改生产代码前，把缺陷重述为跨领域不变量，并先建立 ScriptedProvider、故障注入、
    mutation/rename 或非临床 holdout 的确定性复现。V2.3 E2E 只能验收，不能单独证明泛化。
-5. 同步查阅成熟 session-wise Harness/workflow 的官方资料，把本轮故障逐项映射到 durable
-   checkpoint/pending write、typed state/structured output、幂等 activity retry、subgraph
-   隔离、sandbox/workspace boundary、trace 与 exactly-one terminal 等机制，并明确
-   adopt/adapt/reject 决策。调研范围至少可覆盖 Deep Agents、OpenClaw、Hermes、Claude Code、
-   Codex、LangGraph、Temporal、PydanticAI、OpenAI Agents、AutoGen、Semantic Kernel 与
-   Inspect AI；开源项目优先冻结官方 repo revision 并检查实际源码，闭源项目（如 Claude Code）
-   只使用官方文档。仅罗列框架名称或采用二手文章不算完成调研。
+5. 冻结本地独立仓库 `claude-code/` 的 exact commit，并只读取与本轮故障相关的实际代码路径，
+   把问题映射到 durable checkpoint/pending write、typed state/structured output、幂等 activity
+   retry、subgraph failure isolation、sandbox/workspace boundary、trace 与 exactly-one terminal
+   等机制，形成 problem -> code path/pattern -> adopt/adapt/reject 记录。本步骤不做 Web 搜索，
+   不再参考 OpenClaw、Hermes 或其他 Harness。遇到 stub 必须标记为未知，不能推断缺失行为；
+   仅罗列文件名或概念、不核对代码路径不算完成对照。
 6. 修复只能进入通用 compiler/workflow/capability/evidence/artifact/recovery/lifecycle 层；
    不得加入疾病、V2.3、package/session/route/worker/KG ID、固定数量或报告文件名特判。
    只有确实提升任意规范 Skill 执行能力、并由通用复现及跨领域 holdout 证明的修改，才计为
@@ -1842,7 +1852,7 @@ semantic SHA-256 为 `ecc16dc8f97994015c62b529e210cbc67296160b4fa54a99a954999161
 维护代理应在每轮 terminal 后自动模拟用户此前有效的修复追问链，而不是等待用户再次发送：
 “这个 session 在干什么/哪里失败” -> “结合具体 Skill、对话、工具调用、思考/回复和 debug
 log 仔细查验” -> “逐个排查 delegate 的 failed/degraded/cancelled” -> “针对各问题先定义原因、
-观察信号和彻底修复思路，并设计更多测试复现” -> “调研成熟 session-wise Harness 如何解决，
+观察信号和彻底修复思路，并设计更多测试复现” -> “核对冻结 `claude-code/` 中相关实际代码路径，
 不要闭门造车” -> “实现跨 Skill 的系统性通用改进，完成回归、commit、部署并继续观察”。
 这条追问链属于维护侧诊断流程；ChatDS E2E 的用户业务输入仍保持历史手工基线，不把内部
 测试答案、工作流提示或修复暗示注入被测模型。

@@ -45,13 +45,19 @@ Key operating constraints:
   without manufacturing a code change; a fixture-specific workaround never
   counts as an iteration.
 - Every E2E repair iteration must include a current comparison with mature
-  session-wise Harness/workflow implementations. Map the observed mechanism to
-  concrete patterns such as durable checkpoints/pending writes, typed state and
-  structured output, idempotent activity retries, subgraph failure isolation,
-  sandbox/workspace boundaries, and trace/terminal semantics. State whether to
-  adopt, adapt behind the existing authority/receipt contracts, or reject each
-  relevant pattern. Listing framework names without this problem-to-pattern-to-
-  decision mapping is not sufficient.
+  session-wise Harness/workflow implementation. The sole current implementation
+  reference is the local, independent nested Git repository
+  `/nfs/yangbb/codes/chat_ds/claude-code/`; freeze and record its exact commit
+  for each comparison. Do not use Web search, OpenClaw, Hermes, or another
+  Harness as a substitute during this step. Map the observed mechanism to
+  concrete code paths and patterns such as durable checkpoints/pending writes,
+  typed state and structured output, idempotent activity retries, subgraph
+  failure isolation, sandbox/workspace boundaries, and trace/terminal
+  semantics. State whether to adopt, adapt behind the existing
+  authority/receipt contracts, or reject each relevant pattern. A stub is an
+  unknown boundary, not evidence of an implementation; do not infer or invent
+  the missing private behavior. Listing names without a problem-to-code-path-
+  to-decision mapping is not sufficient.
 - The preferred phase order is monotonic: compile/bind -> decide conditional
   authority -> satisfy mandatory receipts -> optional retrieval -> synthesize ->
   fan-in -> validate artifacts -> persist exactly one authoritative terminal.

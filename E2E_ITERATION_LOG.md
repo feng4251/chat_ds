@@ -5,6 +5,11 @@ V2.3 只作为业务压力测试和结构/质量 oracle；任何生产修复都�
 Harness 不变量，并由通用合成测试与非临床或 mutation/rename holdout 证明。每轮只有在
 新的 root run 到达 durable terminal 后才计数，同一 run 的重试不算新一轮。
 
+自 2026-08-04 起，成熟 Harness 对照步骤的唯一实现参考改为本地独立仓库
+`claude-code/`，每轮必须记录其 exact commit 和与问题相关的实际代码路径；不再为该步骤执行
+Web 搜索或参考 OpenClaw、Hermes 等其他 Harness。stub 只记为未知边界，不能推断缺失实现。
+以下历史轮次保留当时真实使用的官方/多框架对照，不追溯改写。
+
 每轮自动模拟以下人工排障追问链：
 
 1. 这个 session 在做什么、在哪里失败或异常？
@@ -12,7 +17,7 @@ Harness 不变量，并由通用合成测试与非临床或 mutation/rename hold
    provider 思考/回复与 workspace artifacts，执行意图是否符合 Skill？
 3. 逐个解释 delegate 的 succeeded/degraded/failed/cancelled，而不是只读前端终态。
 4. 对每个问题先定义通用根因、可观察信号、确定性复现和彻底修复思路。
-5. 对照成熟 session-wise Harness/workflow 的官方机制，明确 adopt/adapt/reject。
+5. 对照冻结 `claude-code/` 中与问题相关的实际代码路径，明确 adopt/adapt/reject。
 6. 只实现跨 Skill 的 compiler/workflow/capability/evidence/artifact/recovery/lifecycle
    改进，完成回归、local commit、clean-archive 部署后再开始下一轮。
 
