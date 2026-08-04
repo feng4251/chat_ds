@@ -1040,6 +1040,11 @@ def audit_result_fields(
     audit: dict[str, Any] = {
         "present": [],
         "degraded": [],
+        # A schema-valid JSON null is structurally present but cannot carry an
+        # evidence claim.  Keep that distinction in the shared parser so the
+        # in-run finalizer and the outer authoritative audit do not have to
+        # parse the terminal ledger independently.
+        "null_fields": [],
         "missing": fields,
         "footer_valid": not fields,
         "footer_error": None,
@@ -1111,6 +1116,7 @@ def audit_result_fields(
 
     present: list[str] = []
     degraded: list[str] = []
+    null_fields: list[str] = []
     missing: list[str] = []
 
     def substantive(value: Any) -> bool:
@@ -1163,6 +1169,8 @@ def audit_result_fields(
                 continue
             if not schema_is_status_envelope(declared_schema):
                 present.append(field)
+                if record is None:
+                    null_fields.append(field)
                 continue
         if not isinstance(record, dict):
             missing.append(field)
@@ -1182,6 +1190,7 @@ def audit_result_fields(
     audit.update({
         "present": present,
         "degraded": degraded,
+        "null_fields": null_fields,
         "missing": missing,
         "footer_valid": not missing,
         "footer_status": "valid" if not missing else "invalid",

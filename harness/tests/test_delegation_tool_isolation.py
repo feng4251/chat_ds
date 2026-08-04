@@ -3392,6 +3392,47 @@ class DelegationMachineAuditTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("did not attempt any declared required", result["error"])
         self.assertEqual(result["tool_audit"]["attempted_tools"], [])
 
+    async def test_evidence_step_passes_compiled_semantic_contract_to_child(self):
+        observed: dict[str, object] = {}
+
+        async def fake_run_stream(*args, **kwargs):
+            observed.update(kwargs)
+            yield {
+                "type": "delta",
+                "content": (
+                    "WARN — no verified source was dispatched, so the typed "
+                    "field is intentionally null.\n"
+                    'COMPLETION_QUALITY_JSON: {"status":"degraded",'
+                    '"reason":"no verified evidence receipt"}\n'
+                    'RESULT_FIELDS_JSON: {"record_id":null}'
+                ),
+            }
+            yield {"type": "done", "finish_reason": "stop"}
+
+        with (
+            patch("agent_loop.run_stream", fake_run_stream),
+            patch(
+                "tools.delegation.persist_result_for_history",
+                return_value="results/delegate-evidence-gap.txt",
+            ),
+        ):
+            result = await _run_child(
+                {
+                    "goal": "retrieve one externally evidenced record",
+                    "step_type": "evidence_acquisition",
+                    "tools": ["read_file"],
+                    "required_result_fields": ["record_id"],
+                    "required_result_schema": {"record_id": {}},
+                },
+                _context("read_file"),
+                0,
+            )
+
+        self.assertIn("evidence_acquisition_contract", observed, result)
+        self.assertTrue(observed["evidence_acquisition_contract"])
+        self.assertEqual(result["status"], "completed")
+        self.assertIsNone(result["error"])
+
     async def test_failed_required_call_can_complete_with_explicit_degraded_report(self):
         async def fake_run_stream(*args, **kwargs):
             yield _tool_started("web_search", "search-1", query="evidence")

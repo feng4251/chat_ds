@@ -11453,6 +11453,11 @@ async def _run_child(
         required_result_schema=required_result_schema,
         retrieval_completeness_policy=retrieval_completeness_policy,
         required_capability_tools=required_capability_tools,
+        # This is task-semantics metadata compiled by the parent, not a model
+        # inference.  It lets the same child transaction reject populated
+        # typed facts when no verifiable acquisition receipt exists, instead
+        # of restarting the whole delegated worker after the outer audit.
+        evidence_acquisition_contract=typed_evidence_dispatch_expected,
         knowledge_gate_plan=knowledge_gate_plan,
         knowledge_gate_plan_sha256=(
             knowledge_gate_plan_sha256 or None
@@ -12786,16 +12791,12 @@ async def _run_child(
             "receipts or the validated typed ledger require degraded quality: "
             + ", ".join(strict_complete_conflict_reasons)
         )
-    typed_result_ledger = _validated_typed_result_ledger(
-        content,
-        result_field_audit,
+    # ``audit_result_fields`` is shared with the in-run finalizer and already
+    # distinguishes schema-valid nulls from evidence-bearing values.  Reuse
+    # that bounded fact instead of independently reparsing the ledger here.
+    typed_null_gap_fields = list(
+        result_field_audit.get("null_fields") or []
     )
-    typed_null_gap_fields = [
-        field
-        for field in required_result_fields
-        if field in typed_result_ledger
-        and typed_result_ledger.get(field) is None
-    ]
     typed_degraded_gap_fields = list(
         result_field_audit.get("degraded") or []
     )
