@@ -215,6 +215,11 @@ class ChatStreamFailureClassificationTests(unittest.TestCase):
                     "tool.failed"
                 )
             )
+            self.assertTrue(
+                chat_router._should_persist_agent_event_immediately(
+                    "fan_in.reducer_attempt_started"
+                )
+            )
             self.assertFalse(
                 chat_router._should_persist_agent_event_immediately(
                     "debug.fixture"
