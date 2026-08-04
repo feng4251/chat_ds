@@ -1,3 +1,4 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -82,6 +83,15 @@ class Settings(BaseSettings):
     # control-plane repair into a 25-minute blocking request.
     llm_nonstream_repair_timeout_seconds: float = 600.0
     complex_report_max_iterations: int = 160
+    # Execution policy for ordinary Agent Skills which do not ship an
+    # authoritative ChatDS workflow contract.  ``progressive`` follows the
+    # portable Agent-Skills model used by Claude Code/Deep Agents: disclose the
+    # selected SKILL.md, compile exact package resources and runtime grants,
+    # then let the normal tool loop execute.  ``legacy_semantic_plan`` keeps
+    # the former model-authored capability-ID planning gate for a bounded
+    # rollback during migration.  Declarative workflow contracts never use
+    # this switch; they remain runtime-compiled DAGs.
+    standard_skill_execution_engine: str = "legacy_semantic_plan"
     # Keep ordinary production traffic on the SearXNG metasearch boundary.
     # `ddg` is an explicit optional fallback for deployments with direct egress.
     web_search_providers: str = "searxng"
@@ -99,6 +109,21 @@ class Settings(BaseSettings):
     # There is intentionally no local Chromium fallback in tools.browser.
     browser_cdp_socket: str = "/run/chat-ds-browser/cdp.sock"
     browser_cdp_connect_timeout_seconds: float = 10.0
+
+    @field_validator("standard_skill_execution_engine")
+    @classmethod
+    def validate_standard_skill_execution_engine(cls, value: str) -> str:
+        """Canonicalize the only two supported ordinary-Skill engines."""
+
+        normalized = str(value or "").strip().casefold().replace("-", "_")
+        if normalized in {"legacy", "legacy_semantic_plan", "semantic_plan"}:
+            return "legacy_semantic_plan"
+        if normalized in {"progressive", "progressive_disclosure"}:
+            return "progressive"
+        raise ValueError(
+            "STANDARD_SKILL_EXECUTION_ENGINE must be progressive or "
+            "legacy_semantic_plan"
+        )
 
 settings = Settings()
 

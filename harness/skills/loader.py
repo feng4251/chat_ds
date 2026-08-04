@@ -8080,8 +8080,21 @@ def _normalize_authority_resource_reference(
     return None
 
 
-def _skill_body_mentions_resource(skill_body: str, relative_path: str) -> bool:
-    """Return whether SKILL.md names one exact local resource path."""
+def _skill_body_mentions_resource(
+    skill_body: str,
+    relative_path: str,
+    *,
+    skill_name: str = "",
+) -> bool:
+    """Return whether SKILL.md names one exact package resource.
+
+    Agent Skills are portable between Harnesses, but many Hub packages retain
+    the canonical install spelling used by their source runtime (for example
+    ``~/.hermes/skills/<category>/<name>/scripts/tool.py``).  Treat that as an
+    exact reference to the same immutable selected package resource.  This is
+    path normalization only: the suffix must already exist in the package and
+    no ambient absolute path becomes readable or executable.
+    """
     if relative_path not in skill_body:
         return False
     pattern = re.compile(
@@ -8089,7 +8102,22 @@ def _skill_body_mentions_resource(skill_body: str, relative_path: str) -> bool:
         + re.escape(relative_path)
         + r"(?:#[^\s)`>\]]*)?(?![A-Za-z0-9_./-])"
     )
-    return pattern.search(skill_body) is not None
+    if pattern.search(skill_body) is not None:
+        return True
+    canonical_name = str(skill_name or "").strip()
+    if not canonical_name:
+        return False
+    install_prefix = re.compile(
+        r"(?:"
+        r"~|\$HOME|\$\{HOME\}"
+        r")/\.(?:hermes|claude|codex)/skills/"
+        r"(?:[A-Za-z0-9_.-]+/)*"
+        + re.escape(canonical_name)
+        + r"/"
+        + re.escape(relative_path)
+        + r"(?:#[^\s)`>\]]*)?(?![A-Za-z0-9_./-])"
+    )
+    return install_prefix.search(skill_body) is not None
 
 
 def _iter_bounded_scalar_strings(value: Any) -> list[str]:
@@ -8297,7 +8325,11 @@ def _discover_blocking_resource_authority(
             reasons[path].append(reason)
 
     for relative_path in sorted(known_resources):
-        if _skill_body_mentions_resource(skill_body, relative_path):
+        if _skill_body_mentions_resource(
+            skill_body,
+            relative_path,
+            skill_name=str(frontmatter.get("name") or skill_dir.name),
+        ):
             grant(relative_path, "explicit_skill_reference")
 
     for relative_path in _namespaced_frontmatter_authority_resources(

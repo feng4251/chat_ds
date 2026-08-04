@@ -18,6 +18,7 @@ from agent_loop import (
     _next_incomplete_aggregation_step,
     _parse_intent_selections,
     _plan_requires_intent,
+    _project_intent_scoped_local_resources,
     _prerequisite_result_paths,
 )
 from tools.context import ToolContext
@@ -100,6 +101,61 @@ def _generic_contract() -> dict:
 
 
 class SkillWorkflowRuntimeTests(unittest.TestCase):
+    def test_intent_projection_prunes_only_declared_alternative_resources(self):
+        plan = {
+            "intent_classification": {
+                "dimensions": [
+                    {
+                        "id": "region",
+                        "mappings": {
+                            "knowledge_source_map": {
+                                "north": ["rules/north.md"],
+                                "south": ["rules/south.md"],
+                            }
+                        },
+                    },
+                    {
+                        "id": "release",
+                        "mappings": {
+                            "reference_map": {
+                                "all": [
+                                    "rules/stable.md",
+                                    "rules/preview.md",
+                                ]
+                            }
+                        },
+                    },
+                ]
+            }
+        }
+        resolved = {
+            "region.knowledge_source_map": ["rules/north.md"],
+            "release.reference_map": [
+                "rules/stable.md",
+                "rules/preview.md",
+            ],
+        }
+
+        self.assertEqual(
+            [
+                "rules/common-schema.md",
+                "rules/north.md",
+                "rules/stable.md",
+                "rules/preview.md",
+            ],
+            _project_intent_scoped_local_resources(
+                plan,
+                resolved,
+                [
+                    "rules/common-schema.md",
+                    "rules/north.md",
+                    "rules/south.md",
+                    "rules/stable.md",
+                    "rules/preview.md",
+                ],
+            ),
+        )
+
     @staticmethod
     def _workflow_ir_state() -> HarnessRunState:
         state = HarnessRunState(
