@@ -369,7 +369,12 @@ _DELEGATE_RESULT_FOOTER_SUBMIT_TOOL_NAME = "submit_result_fields"
 # same spirit as mature structured-output runtimes (Claude Code defaults its
 # StructuredOutput validator to five submissions).
 _MAX_DELEGATE_RESULT_FOOTER_SUBMISSIONS = 5
-_CAPABILITY_PLAN_SEMANTIC_VALIDATION_MAX_ATTEMPTS = 3
+# A capability-plan submission is a typed control-plane transaction.  Count
+# both provider/schema corrections and semantic compiler corrections against
+# one finite budget, but leave enough feedback turns for a structurally valid
+# plan to repair a semantic mapping error.  Five matches the repository's
+# other structured-output boundary and remains fail-closed on exhaustion.
+_CAPABILITY_PLAN_SEMANTIC_VALIDATION_MAX_ATTEMPTS = 5
 _MEDIUM_WORKFLOW_PLAN_OUTPUT_TOKENS = 16_384
 _LARGE_WORKFLOW_PLAN_OUTPUT_TOKENS = 32_768
 _DELEGATE_BOUNDED_ARGUMENT_TOOLS = frozenset({
@@ -27902,6 +27907,61 @@ async def run_stream(
                     },
                 ):
                     yield debug_evt
+
+                # A delegated terminal synthesis turn intentionally exposes
+                # no tools.  Some OpenAI-compatible providers nevertheless
+                # append a foreign or malformed tool call to otherwise useful
+                # prose.  The rejected sample is not authoritative and no
+                # handler ran, but earlier committed tool receipts still are.
+                # Reuse the existing one-shot, tools-closed synthesis boundary
+                # before failing; never reopen a schema or replay the phantom
+                # call.  Pre-dispatch runs and exhausted budgets remain
+                # terminal because the helper rejects them.
+                post_dispatch_recovery = (
+                    queue_delegate_post_dispatch_stream_synthesis(
+                        "provider_tool_stream_corrupt_after_content"
+                    )
+                )
+                if post_dispatch_recovery is not None:
+                    post_dispatch_recovery.update({
+                        "repair_unavailable_reason": (
+                            repair_unavailable_reason
+                        ),
+                        "content_chars_discarded": len(full_content),
+                        "reasoning_chars_discarded": len(full_reasoning),
+                        "stream_fragment_count": (
+                            tool_call_accumulator.fragment_count
+                        ),
+                        "stream_logical_call_count": (
+                            tool_call_accumulator.logical_call_count
+                        ),
+                    })
+                    for debug_evt in await debug_stream_event(
+                        "gate.continuation",
+                        post_dispatch_recovery,
+                    ):
+                        yield debug_evt
+                    for debug_evt in await debug_stream_event(
+                        "tool.stream.post_dispatch_synthesis.requested",
+                        post_dispatch_recovery,
+                    ):
+                        yield debug_evt
+                    yield {
+                        "type": "tool_progress",
+                        "msg": (
+                            "↻ Synthesizing once from already-returned "
+                            "delegated tool results after discarding a "
+                            "tools-closed corrupt provider batch"
+                        ),
+                    }
+                    await notify_turn_boundary("finished", {
+                        **turn_finished_payload,
+                        "finish_reason": "discard",
+                        "abandon_reason": (
+                            "provider_tool_stream_corrupt_after_content"
+                        ),
+                    })
+                    continue
                 msg = (
                     "Provider returned a corrupt streamed tool-call batch after "
                     "emitting text or reasoning; no tool was dispatched, and no "

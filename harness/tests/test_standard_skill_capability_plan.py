@@ -3228,7 +3228,7 @@ class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
                         "submit_skill_capability_plan",
                         plan_args,
                     )
-                    for attempt in range(1, 4)
+                    for attempt in range(1, 6)
                 ],
             ]
             request_bodies: list[dict] = []
@@ -3295,7 +3295,7 @@ class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
                 )]
 
         self.assertFalse(responses)
-        self.assertEqual(4, len(request_bodies))
+        self.assertEqual(6, len(request_bodies))
         for body in request_bodies[1:]:
             exposed = {
                 item["function"]["name"] for item in body.get("tools") or []
@@ -3317,7 +3317,7 @@ class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
         terminal = next(
             event for event in events if event.get("event_type") == "run.failed"
         )
-        self.assertEqual(3, terminal["payload"]["attempt"])
+        self.assertEqual(5, terminal["payload"]["attempt"])
         self.assertEqual(
             "unknown_workflow_plan_instruction_id",
             terminal["payload"]["workflow_error_code"],
@@ -3535,7 +3535,7 @@ class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
                         "submit_skill_capability_plan",
                         invalid_args,
                     )
-                    for attempt in range(1, 4)
+                    for attempt in range(1, 6)
                 ],
             ]
             request_bodies: list[dict] = []
@@ -3606,7 +3606,7 @@ class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(responses)
         self.assertEqual(0, plan_dispatch_count)
-        self.assertEqual(4, len(request_bodies))
+        self.assertEqual(6, len(request_bodies))
         for body in request_bodies[1:]:
             exposed = {
                 item["function"]["name"] for item in body.get("tools") or []
@@ -3620,7 +3620,7 @@ class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
         terminal = next(
             event for event in events if event.get("event_type") == "run.failed"
         )
-        self.assertEqual(3, terminal["payload"]["attempt"])
+        self.assertEqual(5, terminal["payload"]["attempt"])
         self.assertEqual(
             "tool_schema_validation_failed",
             terminal["payload"]["error_code"],
@@ -4613,6 +4613,14 @@ class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
                 _tool_response(
                     "read-main", "skill_view", {"name": "portable-skill"}
                 ),
+                *[
+                    _tool_response(
+                        f"invalid-plan-schema-{attempt}",
+                        "submit_skill_capability_plan",
+                        {"skill_name": "portable-skill"},
+                    )
+                    for attempt in range(1, 4)
+                ],
                 _tool_response(
                     "submit-plan", "submit_skill_capability_plan", plan_args
                 ),
@@ -4688,7 +4696,7 @@ class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
                         allow_session_mcp=False,
                         user_id="u-capability-plan",
                         session_id="s-capability-plan",
-                        max_iterations=6,
+                        max_iterations=9,
                     )
                 ]
 
@@ -4704,16 +4712,22 @@ class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             {"submit_skill_capability_plan"}, model_tools[1]
         )
-        self.assertIn("read_file", model_tools[2])
-        self.assertIn("write_file", model_tools[2])
-        self.assertNotIn("execute_code", model_tools[2])
-        self.assertNotIn("submit_skill_capability_plan", model_tools[2])
+        for planner_tools in model_tools[2:5]:
+            self.assertIn("submit_skill_capability_plan", planner_tools)
+            self.assertLessEqual(
+                planner_tools,
+                {"skill_view", "submit_skill_capability_plan"},
+            )
+        self.assertIn("read_file", model_tools[5])
+        self.assertIn("write_file", model_tools[5])
+        self.assertNotIn("execute_code", model_tools[5])
+        self.assertNotIn("submit_skill_capability_plan", model_tools[5])
         self.assertEqual(
-            {"skill_view", "read_file", "write_file"}, model_tools[3],
+            {"skill_view", "read_file", "write_file"}, model_tools[6],
             "a receipt must not revoke the finite selected capability set",
         )
         self.assertNotIn(
-            "tool_choice", request_bodies[3],
+            "tool_choice", request_bodies[6],
             "a degraded receipt removes the minimum-call obligation without "
             "forcing a replay",
         )
