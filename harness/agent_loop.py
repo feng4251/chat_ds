@@ -48,8 +48,10 @@ from delegated_result_contract import (
     audit_raw_tool_protocol,
     audit_result_fields,
     canonical_result_fields_footer_from_internal_submitter_json,
+    delegated_result_substantive_body,
     extract_canonical_result_fields_footer,
     is_formal_object_result_schema,
+    is_process_narration_only,
     project_object_result_contract,
     strip_result_fields_candidate_tail,
     validate_projected_result_contract,
@@ -29843,6 +29845,12 @@ async def run_stream(
             protocol_invalid = bool(
                 int(result_protocol_audit.get("detected_count") or 0) > 0
             )
+            terminal_process_narration_invalid = bool(
+                delegated_subtask
+                and is_process_narration_only(
+                    delegated_result_substantive_body(full_content)
+                )
+            )
             if (
                 delegate_retrieval_tracker is not None
                 and delegate_retrieval_tracker.has_open_chains
@@ -30213,7 +30221,9 @@ async def run_stream(
                 yield {"type": "done", "finish_reason": "stop"}
                 return
             output_contract_repair_needed = bool(
-                protocol_invalid or post_dispatch_footer_invalid
+                protocol_invalid
+                or post_dispatch_footer_invalid
+                or terminal_process_narration_invalid
             )
             if (
                 delegated_subtask
@@ -30223,7 +30233,10 @@ async def run_stream(
                 and not iteration_result_footer_repair
                 and not iteration_visible_length_recovery
             ):
-                if delegated_required_result_fields:
+                if (
+                    delegated_required_result_fields
+                    and not terminal_process_narration_invalid
+                ):
                     evidence_capsule = (
                         _delegated_output_contract_evidence_capsule(
                             task_text=original_user_text,
@@ -30313,7 +30326,15 @@ async def run_stream(
                         "substantive result from the original task, preloaded "
                         "resources, and existing structured tool results already "
                         "in context. Do not copy or discuss the rejected draft. "
-                        "Be concise enough to finish in one provider response; "
+                        + (
+                            "The preceding terminal draft failed the shared "
+                            "validator because it only narrated future searches "
+                            "or actions instead of returning their substantive "
+                            "result. Correct that exact semantic failure now. "
+                            if terminal_process_narration_invalid
+                            else ""
+                        )
+                        + "Be concise enough to finish in one provider response; "
                         "target no more than 16,000 Unicode characters while "
                         "retaining every exact required field, evidence identifier, "
                         "provenance reference, conflict, and explicit gap. Prefer "
@@ -30332,7 +30353,17 @@ async def run_stream(
                     "reason": (
                         "raw_pseudo_tool_protocol"
                         if protocol_invalid
-                        else "post_dispatch_typed_footer_invalid"
+                        else (
+                            "process_narration_only"
+                            if terminal_process_narration_invalid
+                            else "post_dispatch_typed_footer_invalid"
+                        )
+                    ),
+                    "validator_error": (
+                        "Delegated step returned process narration about future "
+                        "searches/actions instead of a substantive final result."
+                        if terminal_process_narration_invalid
+                        else None
                     ),
                     "iteration": budget.used,
                     "remaining_iterations": budget.remaining,

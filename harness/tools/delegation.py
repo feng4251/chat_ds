@@ -33,6 +33,8 @@ from delegated_result_contract import (
     adaptive_result_contract_output_tokens,
     audit_raw_tool_protocol,
     audit_result_fields as _result_field_audit,
+    delegated_result_substantive_body,
+    is_process_narration_only,
     normalize_result_field_schema,
     strip_result_fields_candidate_tail,
     validate_projected_result_contract,
@@ -1214,27 +1216,6 @@ _DEGRADED_GAP_PATTERN = re.compile(
     r"\b(?:warn(?:ing)?|degraded|gap|unavailable|not available|missing|"
     r"not retrieved|not found|blocked)\b|警告|降级|缺口|不可用|缺失|未检索到|阻塞",
     re.IGNORECASE,
-)
-
-_PROCESS_NARRATION_PATTERN = re.compile(
-    r"(?:\b(?:let me|i will|i'll|i need to|i should|i am going to|i'm going to|"
-    r"next\s*,?\s*i(?:\s+will|'ll|\s+need to)?|now\s+i(?:\s+will|'ll|\s+need to)?|"
-    r"we need to|we will|continue (?:searching|researching|retrieving|checking)|"
-    r"going to (?:search|retrieve|inspect|check|query))\b|"
-    r"让我(?:先|再)?|我(?:将|会|要|需要|准备)(?:先|再)?|接下来(?:我)?|"
-    r"下一步(?:我)?|现在(?:我)?(?:要|需要|将)|继续(?:搜索|检索|查询|研究|检查))",
-    re.IGNORECASE,
-)
-
-_SUBSTANTIVE_RESULT_SIGNAL_PATTERN = re.compile(
-    r"(?:^|\n)\s*(?:#{1,6}\s+(?:findings?|results?|evidence|analysis|"
-    r"provenance|gaps?|verification|conclusions?|recommendations?|"
-    r"发现|结果|证据|分析|来源|缺口|验证|结论|建议)\b|"
-    r"(?:sources?|provenance|verification|来源|证据来源|验证)\s*:|"
-    r"\|[^\n]+\|\s*$)"
-    r"|\b(?:pass(?:ed)?|warn(?:ing)?|fail(?:ed|ure)?|degraded|verified)\b"
-    r"|通过|警告|失败|降级|验证",
-    re.IGNORECASE | re.MULTILINE,
 )
 
 _EMPTY_RESULT_SET_PATTERN = re.compile(
@@ -5291,22 +5272,6 @@ def _strict_result_field_schema(
     return validated, None
 
 
-def _is_process_narration_only(content: str) -> bool:
-    """Reject unfinished research narration masquerading as a child result.
-
-    This is intentionally conservative: it activates only after several
-    first-person/future-action markers and in the absence of ordinary report
-    structure, provenance, citations, or explicit completion/degraded status.
-    """
-    value = str(content or "").strip()
-    if not value:
-        return False
-    process_markers = _PROCESS_NARRATION_PATTERN.findall(value)
-    if len(process_markers) < 3:
-        return False
-    return _SUBSTANTIVE_RESULT_SIGNAL_PATTERN.search(value) is None
-
-
 def _structured_value_is_substantive(value: Any, depth: int = 0) -> bool:
     """Return whether a JSON value contains at least one semantic leaf.
 
@@ -5333,30 +5298,6 @@ def _structured_value_is_substantive(value: Any, depth: int = 0) -> bool:
             for item in value
         )
     return False
-
-
-def _typed_result_substantive_body(content: str) -> str:
-    """Return model-authored body text that can explain an all-empty ledger.
-
-    Harness-owned receipt/quality ledgers remain authoritative audit metadata,
-    but they are not a substitute for a result. Strip those single-line
-    machine records before deciding whether an otherwise schema-valid empty
-    typed ledger is accompanied by a substantive zero-result explanation.
-    """
-
-    retained, _removed = strip_result_fields_candidate_tail(content)
-    machine_prefixes = (
-        "[HARNESS_",
-        "CAPABILITY_GAPS_JSON:",
-        "COMPLETION_QUALITY_JSON:",
-        "KNOWLEDGE_GATE_CHECKS_JSON:",
-        "KNOWLEDGE_GATE_GAPS_JSON:",
-    )
-    return "\n".join(
-        line
-        for line in retained.splitlines()
-        if not line.strip().startswith(machine_prefixes)
-    ).strip()
 
 
 def _normalized_terminal_prose(content: str) -> str:
@@ -9206,6 +9147,33 @@ async def _run_child(
         )
         for capability_skill in required_capability_skills
     )
+    # A single exact resource may carry more than one compiled role.  The
+    # Skill main can be both the worker contract and the main of a capability
+    # package selected for that same node.  Mature agent runtimes load that
+    # authority once before the first model turn; duplicating the read creates
+    # two receipts for one immutable source and previously caused the latter
+    # role to overwrite the former in the inspection ledger.
+    deduplicated_preload_specs: list[
+        tuple[str, str, dict[str, Any]]
+    ] = []
+    seen_preload_coordinates: set[tuple[str, str, str]] = set()
+    for preload_tool_name, preload_path, preload_args in preload_specs:
+        preload_coordinate = (
+            preload_tool_name,
+            str(preload_args.get("name") or ""),
+            str(
+                preload_args.get("file_path")
+                or preload_args.get("filepath")
+                or preload_path
+            ),
+        )
+        if preload_coordinate in seen_preload_coordinates:
+            continue
+        seen_preload_coordinates.add(preload_coordinate)
+        deduplicated_preload_specs.append(
+            (preload_tool_name, preload_path, preload_args)
+        )
+    preload_specs = deduplicated_preload_specs
     # The same compiled declarations that drive deterministic preloading form
     # the complete model-time read authorization.  This is intentionally
     # task-local: ordinary/ad-hoc delegates retain their existing behavior.
@@ -10072,15 +10040,24 @@ async def _run_child(
             successful_tools.add(tool_name)
             if tool_name == "read_file":
                 read_result_paths.add(path)
-            elif (
-                tool_args.get("file_path") == "SKILL.md"
-                and tool_args.get("name") in required_capability_skills
-            ):
-                viewed_skill = tool_args.get("name")
-                if isinstance(viewed_skill, str) and viewed_skill.strip():
-                    inspected_capability_skills.add(viewed_skill.strip())
-            else:
-                inspected_skill_files.add(path)
+            elif tool_name == "skill_view":
+                viewed_skill = str(tool_args.get("name") or "").strip()
+                viewed_path = str(
+                    tool_args.get("file_path") or path
+                ).strip()
+                # One immutable preload receipt can satisfy every role that
+                # the compiler assigned to this exact coordinate.  These are
+                # independent ledgers, not mutually exclusive categories.
+                if (
+                    viewed_skill == skill_name
+                    and viewed_path in skill_preload_paths
+                ):
+                    inspected_skill_files.add(viewed_path)
+                if (
+                    viewed_path == "SKILL.md"
+                    and viewed_skill in required_capability_skills
+                ):
+                    inspected_capability_skills.add(viewed_skill)
             preloaded_resources.append((tool_name, path, result_body))
             if tool_name == "read_file":
                 preloaded_result_bytes += len(result_body.encode("utf-8"))
@@ -12064,7 +12041,8 @@ async def _run_child(
             )
     if validation_error is None and is_model_intent_classifier and not content.strip():
         validation_error = "Delegated intent classification returned no typed output."
-    if validation_error is None and _is_process_narration_only(content):
+    substantive_body = delegated_result_substantive_body(content)
+    if validation_error is None and is_process_narration_only(substantive_body):
         validation_error = (
             "Delegated step returned process narration about future searches/actions "
             "instead of a substantive final result."
@@ -12109,11 +12087,10 @@ async def _run_child(
             required_result_fields
             and len(non_substantive_fields) == len(required_result_fields)
         )
-        substantive_body = _typed_result_substantive_body(content)
         body_audit = _audit_free_prose_result(substantive_body, goal)
         body_is_substantive = bool(
             body_audit.get("valid")
-            and not _is_process_narration_only(substantive_body)
+            and not is_process_narration_only(substantive_body)
         )
         declared_reason = (
             str(completion_quality_declaration.get("_reason_text") or "")

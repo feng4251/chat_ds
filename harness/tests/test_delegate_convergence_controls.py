@@ -3315,6 +3315,64 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
                     {"type": "done", "finish_reason": "stop"},
                 )
 
+    async def test_process_narration_is_corrected_inside_same_child_transaction(self):
+        rejected_body = (
+            "Let me search the sources first. I will inspect the records next. "
+            "I need to compare them, and then I will prepare the result."
+        )
+        rejected = (
+            rejected_body
+            + '\nCOMPLETION_QUALITY_JSON: {"status":"degraded",'
+              '"reason":"declared source gap"}\n'
+            + _result_fields_footer("comparison")
+        )
+        corrected = (
+            "## Findings\n"
+            "Evidence: the bounded source set supports the completed comparison.\n"
+            + _result_fields_footer("comparison")
+        )
+        responses = [
+            _stop_response(rejected),
+            _stop_response(corrected),
+        ]
+
+        request_bodies, dispatch_mock, events, _persisted = await self._run(
+            responses,
+            max_iterations=3,
+            dispatch_result=json.dumps({"status": "unused"}),
+            required_result_fields=["comparison"],
+        )
+
+        self.assertFalse(responses)
+        self.assertEqual(2, len(request_bodies))
+        dispatch_mock.assert_not_awaited()
+        self.assertNotIn("tools", request_bodies[1])
+        correction_history = "\n".join(
+            str(message.get("content") or "")
+            for message in request_bodies[1]["messages"]
+        )
+        self.assertNotIn(rejected, correction_history)
+        self.assertIn("failed the shared validator", correction_history)
+        requested = next(
+            event for event in events
+            if event.get("event_type")
+            == "debug.delegate.output_contract_repair.requested"
+        )
+        self.assertEqual(
+            "process_narration_only",
+            requested["payload"]["reason"],
+        )
+        self.assertIn(
+            "process narration",
+            requested["payload"]["validator_error"],
+        )
+        self.assertFalse(any(
+            event.get("event_type")
+            == "debug.delegate.result_footer_repair.requested"
+            for event in events
+        ))
+        self.assertEqual(events[-1], {"type": "done", "finish_reason": "stop"})
+
     async def test_footer_repair_wrong_tool_fragment_never_dispatches(self):
         responses = [
             _tool_call_response("call-footer-terminal-fragment"),
