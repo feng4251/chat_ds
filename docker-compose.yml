@@ -424,6 +424,11 @@ services:
       # Absolute ceiling for a stream that continues making real progress.
       # Initial-response and read-stall leases remain independently shorter.
       LLM_STREAM_TOTAL_TIMEOUT_SECONDS: ${LLM_STREAM_TOTAL_TIMEOUT_SECONDS:-14400}
+      # Zero-byte provider transport failures have no emitted model state and
+      # may be replayed under a separate reconnect budget.  Semantic/API errors
+      # retain their short bounded retry policy.
+      LLM_PREBYTE_TRANSPORT_RETRY_BUDGET_SECONDS: ${LLM_PREBYTE_TRANSPORT_RETRY_BUDGET_SECONDS:-600}
+      LLM_PREBYTE_TRANSPORT_RETRY_MAX_ATTEMPTS: ${LLM_PREBYTE_TRANSPORT_RETRY_MAX_ATTEMPTS:-32}
       # Ordinary standard Skills use the same progressive-disclosure loop as
       # mature Agent-Skills Harnesses. Explicit declarative contracts continue
       # to compile into deterministic DAGs. The legacy model-authored
