@@ -158,6 +158,33 @@ class StandardSkillCapabilityPlanTests(unittest.TestCase):
                 _standard_skill_uses_semantic_capability_plan(package)
             )
 
+    def test_declared_multiagent_skill_always_uses_validated_workflow_plan(self):
+        package = {
+            "content": (
+                "# Workflow\n\n"
+                "| Agent | Responsibility | Output |\n"
+                "| --- | --- | --- |\n"
+                "| Evidence Agent | Independent review | Evidence table |\n"
+                "| Safety Agent | Independent review | Risk table |\n"
+                "| Coordinator Agent | Aggregate results | Final report |\n\n"
+                "- Round 1: all Agents independently assess the input.\n"
+                "- Round 2: the Coordinator aggregates their results.\n"
+            ),
+            "workflow_contract": {},
+        }
+        for configured in ("progressive", "legacy_semantic_plan"):
+            with self.subTest(configured=configured), patch(
+                "agent_loop.settings.standard_skill_execution_engine",
+                configured,
+            ):
+                self.assertEqual(
+                    "semantic_workflow_plan",
+                    _standard_skill_execution_engine(package),
+                )
+                self.assertTrue(
+                    _standard_skill_uses_semantic_capability_plan(package)
+                )
+
     def test_declarative_workflow_never_uses_model_authored_plan(self):
         package = {
             "content": "# Instructions\nRun the declared workflow.\n",
@@ -2995,6 +3022,9 @@ class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
                     "skill_view",
                     {"name": "portable-notes"},
                 ),
+                _stop_response(
+                    "I inspected the Skill but have not created the requested file."
+                ),
                 _tool_response(
                     "write-note",
                     "write_file",
@@ -3028,6 +3058,19 @@ class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
                         "skill_dir": str(root),
                     }, ensure_ascii=False)
                 if name == "write_file":
+                    target = (
+                        Path(temp_dir)
+                        / "ws"
+                        / context.user_id
+                        / context.session_id
+                        / "workspace"
+                        / str(args.get("filepath") or "")
+                    )
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(
+                        str(args.get("content") or ""),
+                        encoding="utf-8",
+                    )
                     return json.dumps({
                         "status": "written",
                         "path": args.get("filepath"),
@@ -3071,7 +3114,9 @@ class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
                     "mock-progressive-standard-skill",
                     [{
                         "role": "user",
-                        "content": "请运行 portable-notes Skill 完成任务",
+                        "content": (
+                            "请运行 portable-notes Skill 创建 note.md 文件"
+                        ),
                     }],
                     enabled,
                     provider_override=provider,
@@ -3092,8 +3137,14 @@ class StandardSkillCapabilityPlanRunTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual({"skill_view"}, exposed[0])
         self.assertIn("write_file", exposed[1])
-        self.assertNotIn("submit_skill_capability_plan", exposed[1])
+        self.assertIn("write_file", exposed[2])
+        self.assertEqual("required", request_bodies[2].get("tool_choice"))
         self.assertNotIn("submit_skill_capability_plan", exposed[2])
+        self.assertNotIn("submit_skill_capability_plan", exposed[3])
+        # The premature stop produced an additional tools-required request;
+        # without atomically installing the dynamic required group, the run
+        # would have terminated after request_bodies[1].
+        self.assertEqual(4, len(request_bodies))
         started = next(
             event for event in events
             if event.get("event_type") == "run.started"

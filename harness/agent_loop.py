@@ -363,6 +363,12 @@ _DELEGATE_RETRIEVAL_MAX_NO_CALL_TURNS = 2
 _DELEGATE_BOUNDED_CAPABILITY_CALL_MAX_TOKENS = 2_048
 _DELEGATE_RESULT_FOOTER_REPAIR_SOURCE_CHARS = 48 * 1024
 _DELEGATE_RESULT_FOOTER_SUBMIT_TOOL_NAME = "submit_result_fields"
+# Structured result submission is a read-only control-plane transaction.  A
+# schema-invalid submission can therefore be retried without replaying any
+# evidence/tool side effect.  Keep this boundary independently bounded, in the
+# same spirit as mature structured-output runtimes (Claude Code defaults its
+# StructuredOutput validator to five submissions).
+_MAX_DELEGATE_RESULT_FOOTER_SUBMISSIONS = 5
 _CAPABILITY_PLAN_SEMANTIC_VALIDATION_MAX_ATTEMPTS = 3
 _MEDIUM_WORKFLOW_PLAN_OUTPUT_TOKENS = 16_384
 _LARGE_WORKFLOW_PLAN_OUTPUT_TOKENS = 32_768
@@ -760,9 +766,9 @@ def _delegate_result_footer_submit_tool_schema(
 ) -> dict[str, Any]:
     """Build the run-scoped internal typed-footer submission schema.
 
-    This schema is never registered or dispatched. It is exposed only on the
-    single footer-repair turn and its arguments are consumed by the harness as
-    control-plane data after exact contract validation.
+    This schema is never registered or dispatched. It is exposed only inside
+    the bounded footer-validation transaction and its arguments are consumed
+    by the harness as control-plane data after exact contract validation.
     """
 
     return {
@@ -1012,6 +1018,9 @@ def _delegate_result_footer_repair_messages(
     required_fields: tuple[str, ...],
     field_schema: dict[str, Any],
     source_shape: dict[str, Any],
+    *,
+    submission_attempt: int = 1,
+    previous_validation_error: str | None = None,
 ) -> list[dict[str, str]]:
     """Return a small, instruction-isolated prompt for one typed submission."""
 
@@ -1029,7 +1038,15 @@ def _delegate_result_footer_repair_messages(
             )
             if key in source_shape
         },
+        "submission_attempt": max(1, int(submission_attempt)),
+        "max_submission_attempts": (
+            _MAX_DELEGATE_RESULT_FOOTER_SUBMISSIONS
+        ),
     }
+    if previous_validation_error:
+        payload["previous_submission_validation_error"] = str(
+            previous_validation_error
+        )[:2_000]
     return [
         {
             "role": "system",
@@ -1047,6 +1064,14 @@ def _delegate_result_footer_repair_messages(
                 "schema permits null. Use an empty collection only when the "
                 "retained evidence explicitly proves a valid zero-result set. "
                 "Never guess."
+                + (
+                    " The preceding control-plane submission was atomically "
+                    "discarded because it failed the validator. Correct the "
+                    "exact `previous_submission_validation_error`; do not "
+                    "repeat the rejected representation."
+                    if previous_validation_error
+                    else ""
+                )
             ),
         },
         {
@@ -14469,14 +14494,13 @@ async def run_stream(
     # A delegated model can return a complete substantive body with a normal
     # stop while omitting only its declared terminal typed ledger.  Treat the
     # exact-one structured footer projection as a finalization phase, not as
-    # another reasoning/tool iteration.  One run-scoped slot may therefore run
-    # after the ordinary iteration budget is exhausted; it exposes only the
-    # internal non-dispatchable submitter and cannot chain into another repair.
-    # This mirrors mature runtimes' separate output-validation/finalization
-    # budget and prevents a retained length continuation from consuming the
-    # only turn that can commit its typed result.
+    # another reasoning/tool iteration.  Schema-invalid submissions are
+    # discarded and may be retried inside a separately bounded validation
+    # transaction; no evidence/tool side effect is replayed.  The independent
+    # slots keep validation available after the ordinary iteration budget is
+    # exhausted while the hard submission cap prevents an infinite loop.
     delegate_result_footer_repair_attempted = False
-    delegate_result_footer_finalization_slot_used = False
+    delegate_result_footer_finalization_slots_used = 0
     pending_delegate_result_footer_repair = False
     pending_delegate_result_footer_repair_origin: str | None = None
     pending_delegate_result_footer_repair_context: dict[str, Any] | None = None
@@ -18073,7 +18097,10 @@ async def run_stream(
             standard_engine = _standard_skill_execution_engine(
                 standard_package
             )
-            if standard_engine == "legacy_semantic_plan":
+            if standard_engine in {
+                "legacy_semantic_plan",
+                "semantic_workflow_plan",
+            }:
                 standard_catalog, catalog_failure = (
                     _safe_build_standard_skill_capability_catalog(
                         standard_name,
@@ -19278,9 +19305,9 @@ async def run_stream(
         origin: str,
         replace_invalid_source_turn: bool = False,
     ) -> dict[str, Any]:
-        """Queue the run-scoped, exact-one-line delegated footer correction."""
+        """Queue a run-scoped delegated footer-validation transaction."""
         nonlocal delegate_result_footer_repair_attempted
-        nonlocal delegate_result_footer_finalization_slot_used
+        nonlocal delegate_result_footer_finalization_slots_used
         nonlocal pending_delegate_result_footer_repair
         nonlocal pending_delegate_result_footer_repair_origin
         nonlocal pending_delegate_result_footer_repair_context
@@ -19346,16 +19373,19 @@ async def run_stream(
         if main_iteration_budget_exhausted:
             # The outer loop consumes an IterationBudget unit before it knows
             # which phase will run. Give back the just-consumed terminal body
-            # turn exactly once so the next loop tick can execute the isolated
-            # finalizer without increasing the ordinary reasoning/tool budget.
-            # The run-scoped boolean, exact-one submitter, and terminal repair
-            # branch make this bounded even across provider failover.
-            if delegate_result_footer_finalization_slot_used:
+            # turn so the next loop tick can execute the isolated finalizer
+            # without increasing the ordinary reasoning/tool budget. The
+            # run-scoped submission cap and terminal repair branch keep the
+            # transaction bounded even across provider failover.
+            if (
+                delegate_result_footer_finalization_slots_used
+                >= _MAX_DELEGATE_RESULT_FOOTER_SUBMISSIONS
+            ):
                 raise RuntimeError(
                     "delegated result-footer finalization slot exhausted"
                 )
             budget.refund()
-            delegate_result_footer_finalization_slot_used = True
+            delegate_result_footer_finalization_slots_used += 1
             finalization_slot_borrowed = True
         delegate_result_footer_repair_attempted = True
         pending_delegate_result_footer_repair = True
@@ -19366,6 +19396,11 @@ async def run_stream(
             "replace_invalid_source_turn": bool(
                 replace_invalid_source_turn
             ),
+            "submission_attempt": 1,
+            # The first isolated submission has no rejected predecessor.  The
+            # source footer error remains in debug metadata; only an actual
+            # validator rejection is fed back as a previous submission error.
+            "previous_validation_error": "",
         }
         previous_length_content = ""
         forced_workflow_policy = None
@@ -19380,16 +19415,18 @@ async def run_stream(
             ),
             "footer_error": footer_error,
             "repair_count": 1,
-            "max_repairs": 1,
+            "max_repairs": _MAX_DELEGATE_RESULT_FOOTER_SUBMISSIONS,
             "finalization_budget_kind": "independent_output_validation",
             "main_iteration_budget_exhausted": (
                 main_iteration_budget_exhausted
             ),
             "finalization_slot_borrowed": finalization_slot_borrowed,
             "finalization_slot_count": int(
-                delegate_result_footer_finalization_slot_used
+                delegate_result_footer_finalization_slots_used
             ),
-            "max_finalization_slots": 1,
+            "max_finalization_slots": (
+                _MAX_DELEGATE_RESULT_FOOTER_SUBMISSIONS
+            ),
             "tools_exposed_next_turn": 1,
             "internal_submitter": True,
             "registry_dispatch_allowed": False,
@@ -19397,6 +19434,84 @@ async def run_stream(
                 replace_invalid_source_turn
             ),
             **source_shape,
+        }
+
+    def queue_delegate_result_footer_submission_retry(
+        repair_context: dict[str, Any] | None,
+        *,
+        validation_error: Any,
+        origin: str | None,
+    ) -> dict[str, Any] | None:
+        """Retry one rejected read-only typed submission transaction.
+
+        The rejected call never enters the registry and its arguments never
+        enter model history.  Only the original bounded source, exact schema,
+        and the validator-owned error are carried into the next isolated
+        submitter turn.  This is deliberately separate from ordinary child
+        reasoning/tool budgets and cannot replay a side effect.
+        """
+
+        nonlocal delegate_result_footer_finalization_slots_used
+        nonlocal pending_delegate_result_footer_repair
+        nonlocal pending_delegate_result_footer_repair_origin
+        nonlocal pending_delegate_result_footer_repair_context
+        nonlocal forced_workflow_policy
+        nonlocal previous_length_content
+
+        context = repair_context if isinstance(repair_context, dict) else {}
+        attempt = max(1, int(context.get("submission_attempt") or 1))
+        if attempt >= _MAX_DELEGATE_RESULT_FOOTER_SUBMISSIONS:
+            return None
+
+        finalization_slot_borrowed = False
+        if budget.remaining <= 0:
+            if (
+                delegate_result_footer_finalization_slots_used
+                >= _MAX_DELEGATE_RESULT_FOOTER_SUBMISSIONS
+            ):
+                return None
+            budget.refund()
+            delegate_result_footer_finalization_slots_used += 1
+            finalization_slot_borrowed = True
+
+        next_attempt = attempt + 1
+        pending_delegate_result_footer_repair = True
+        pending_delegate_result_footer_repair_origin = origin
+        pending_delegate_result_footer_repair_context = {
+            "retained_source": str(context.get("retained_source") or ""),
+            "source_shape": copy.deepcopy(
+                context.get("source_shape")
+                if isinstance(context.get("source_shape"), dict)
+                else {}
+            ),
+            "replace_invalid_source_turn": bool(
+                context.get("replace_invalid_source_turn")
+            ),
+            "submission_attempt": next_attempt,
+            "previous_validation_error": str(
+                validation_error or "structured result schema mismatch"
+            )[:2_000],
+        }
+        forced_workflow_policy = None
+        previous_length_content = ""
+        return {
+            "gate": "delegate_result_footer_repair",
+            "reason": "structured_submitter_contract_invalid",
+            "origin": origin,
+            "submission_attempt": next_attempt,
+            "max_submission_attempts": (
+                _MAX_DELEGATE_RESULT_FOOTER_SUBMISSIONS
+            ),
+            "finalization_slot_borrowed": finalization_slot_borrowed,
+            "finalization_slot_count": int(
+                delegate_result_footer_finalization_slots_used
+            ),
+            "max_finalization_slots": (
+                _MAX_DELEGATE_RESULT_FOOTER_SUBMISSIONS
+            ),
+            "tools_exposed_next_turn": 1,
+            "internal_submitter": True,
+            "registry_dispatch_allowed": False,
         }
 
     def queue_delegate_post_dispatch_stream_synthesis(
@@ -20448,6 +20563,16 @@ async def run_stream(
             ),
         )
         run_state.available_tools = set(tools)
+        # Installing a dynamic progressive boundary is one atomic control-plane
+        # state transition.  Keep the execution surface and its mandatory
+        # receipt groups in lockstep; otherwise a model can see delegate_task
+        # (or another required capability) while the stop gate still believes
+        # no dispatch is required.  The initial selected-Skill path already
+        # performs this projection from the same exposure object.
+        direct_required_tool_groups = list(exposure.required_groups)
+        direct_missing_requirements = list(
+            exposure.missing_requirements
+        )
         contract = run_state.skill_workflow_contracts.get(selected[0]) or {}
         refreshed_plan = _build_skill_execution_plan(
             contract,
@@ -22703,6 +22828,24 @@ async def run_stream(
             else None
         )
         pending_delegate_result_footer_repair_context = None
+        iteration_result_footer_submission_attempt = (
+            max(
+                1,
+                int(
+                    iteration_result_footer_repair_context.get(
+                        "submission_attempt"
+                    )
+                    or 1
+                ),
+            )
+            if (
+                iteration_result_footer_repair
+                and isinstance(
+                    iteration_result_footer_repair_context, dict
+                )
+            )
+            else 0
+        )
         iteration_result_footer_repair_replaces_source = bool(
             iteration_result_footer_repair
             and isinstance(iteration_result_footer_repair_context, dict)
@@ -23386,6 +23529,9 @@ async def run_stream(
             "delegate_result_footer_repair_origin": (
                 iteration_result_footer_repair_origin
             ),
+            "delegate_result_footer_submission_attempt": (
+                iteration_result_footer_submission_attempt
+            ),
             "delegate_result_footer_repair_discard_invalid_tail": bool(
                 iteration_result_footer_repair
             ),
@@ -23438,6 +23584,16 @@ async def run_stream(
                     repair_context.get("source_shape")
                     if isinstance(repair_context.get("source_shape"), dict)
                     else {}
+                ),
+                submission_attempt=(
+                    iteration_result_footer_submission_attempt
+                ),
+                previous_validation_error=(
+                    str(
+                        repair_context.get("previous_validation_error")
+                        or ""
+                    )
+                    or None
                 ),
             )
             sanitized = footer_repair_sanitized
@@ -26676,6 +26832,7 @@ async def run_stream(
         # protocol gates below remain authoritative. Never apply this bridge
         # to an executable/registry tool or to a response containing hidden
         # reasoning, fragments, prose, fences, or trailing bytes.
+        text_submit_debug: dict[str, Any] | None = None
         if (
             iteration_result_footer_repair
             and finish_reason == "stop"
@@ -29468,9 +29625,17 @@ async def run_stream(
             iteration_result_footer_repair
             and finish_reason != "tool_calls"
         ):
-            # The repair contract is one forced internal structured call. A
-            # stop/length/refusal response is not a partial footer and cannot
-            # enter any generic continuation. Discard it and fail closed.
+            # The repair contract is one forced internal structured call.  A
+            # stop/length/refusal response is atomically discarded, but it is
+            # safe to retry the read-only output-validation transaction: no
+            # registry call or evidence side effect has occurred.
+            validation_error = (
+                str(
+                    (text_submit_debug or {}).get("footer_error")
+                    or (text_submit_debug or {}).get("reason")
+                    or "required internal structured submission was not emitted"
+                )
+            )
             failed_debug = {
                 "reason": "structured_submitter_not_emitted",
                 "iteration": budget.used,
@@ -29481,10 +29646,46 @@ async def run_stream(
                 "tool_call_fragment_count": (
                     tool_call_accumulator.fragment_count
                 ),
-                "repair_count": 1,
-                "max_repairs": 1,
+                "repair_count": (
+                    iteration_result_footer_submission_attempt
+                ),
+                "max_repairs": (
+                    _MAX_DELEGATE_RESULT_FOOTER_SUBMISSIONS
+                ),
                 "registry_dispatch_attempted": False,
             }
+            retry_debug = queue_delegate_result_footer_submission_retry(
+                iteration_result_footer_repair_context,
+                validation_error=validation_error,
+                origin=iteration_result_footer_repair_origin,
+            )
+            if retry_debug is not None:
+                for debug_evt in await debug_stream_event(
+                    "delegate.result_footer_repair.rejected",
+                    {
+                        **failed_debug,
+                        "validation_error": validation_error[:2_000],
+                        "retry_queued": True,
+                        "next_submission_attempt": retry_debug[
+                            "submission_attempt"
+                        ],
+                    },
+                ):
+                    yield debug_evt
+                for debug_evt in await debug_stream_event(
+                    "gate.continuation", retry_debug
+                ):
+                    yield debug_evt
+                yield await emit_agent_event("usage.updated", {
+                    **run_usage,
+                    "model": provider.get("id") or api_model,
+                })
+                yield {
+                    "type": "usage",
+                    **run_usage,
+                    "model": provider.get("id") or api_model,
+                }
+                continue
             for debug_evt in await debug_stream_event(
                 "delegate.result_footer_repair.failed",
                 failed_debug,
@@ -29500,9 +29701,9 @@ async def run_stream(
                 "model": provider.get("id") or api_model,
             }
             msg = (
-                "The provider did not emit the required internal typed-footer "
-                "submission. Its buffered response was discarded and no "
-                "additional repair was queued."
+                "The provider did not emit a valid internal typed-footer "
+                "submission within the bounded output-validation budget. "
+                "Every buffered response was discarded."
             )
             yield await emit_agent_event("run.failed", {
                 "error": msg,
@@ -30319,8 +30520,8 @@ async def run_stream(
                         yield {
                             "type": "tool_progress",
                             "msg": (
-                                "↻ Repairing the delegated typed-result footer "
-                                "once after visible-length completion"
+                                "↻ Validating the delegated typed-result footer "
+                                "in an isolated bounded transaction"
                             ),
                         }
                         continue
@@ -30336,7 +30537,9 @@ async def run_stream(
                             "repair_count": int(
                                 delegate_result_footer_repair_attempted
                             ),
-                            "max_repairs": 1,
+                            "max_repairs": (
+                                _MAX_DELEGATE_RESULT_FOOTER_SUBMISSIONS
+                            ),
                         },
                     ):
                         yield debug_evt
@@ -30364,11 +30567,12 @@ async def run_stream(
                 yield {"type": "done", "finish_reason": "stop"}
                 return
             if iteration_result_footer_repair:
-                # This was the only footer repair sample.  Do not let any
-                # generic stop gate schedule another model turn.  The outer
-                # wrapper applies this same parser again to the complete
-                # accumulated child output, then performs every other semantic,
-                # capability, pseudo-tool, receipt, and persistence audit.
+                # A provider may ignore the required synthetic function and
+                # emit plain text.  Exact canonical footer text remains a
+                # backwards-compatible valid projection; every other response
+                # is an atomically rejected control-plane submission and gets
+                # the same bounded validator-feedback retry as a schema-invalid
+                # function call.  No evidence/tool side effect is replayed.
                 footer_repair_debug = {
                     "origin": iteration_result_footer_repair_origin,
                     "iteration": budget.used,
@@ -30384,9 +30588,56 @@ async def run_stream(
                     "required_field_count": len(
                         delegated_required_result_fields
                     ),
-                    "repair_count": 1,
-                    "max_repairs": 1,
+                    "repair_count": (
+                        iteration_result_footer_submission_attempt
+                    ),
+                    "max_repairs": (
+                        _MAX_DELEGATE_RESULT_FOOTER_SUBMISSIONS
+                    ),
                 }
+                if not footer_only_valid:
+                    invalid_reason = (
+                        "structured result contains raw pseudo-tool protocol"
+                        if protocol_invalid
+                        else result_footer_audit.get("footer_error")
+                        or "internal submitter did not emit a valid closed call"
+                    )
+                    retry_debug = (
+                        queue_delegate_result_footer_submission_retry(
+                            iteration_result_footer_repair_context,
+                            validation_error=invalid_reason,
+                            origin=iteration_result_footer_repair_origin,
+                        )
+                    )
+                    if retry_debug is not None:
+                        for debug_evt in await debug_stream_event(
+                            "delegate.result_footer_repair.rejected",
+                            {
+                                **footer_repair_debug,
+                                "reason": (
+                                    "structured_submitter_contract_invalid"
+                                ),
+                                "retry_queued": True,
+                                "next_submission_attempt": retry_debug[
+                                    "submission_attempt"
+                                ],
+                            },
+                        ):
+                            yield debug_evt
+                        for debug_evt in await debug_stream_event(
+                            "gate.continuation", retry_debug
+                        ):
+                            yield debug_evt
+                        yield await emit_agent_event("usage.updated", {
+                            **run_usage,
+                            "model": provider.get("id") or api_model,
+                        })
+                        yield {
+                            "type": "usage",
+                            **run_usage,
+                            "model": provider.get("id") or api_model,
+                        }
+                        continue
                 for debug_evt in await debug_stream_event(
                     (
                         "delegate.result_footer_repair.completed"
@@ -30417,19 +30668,18 @@ async def run_stream(
                     "model": provider.get("id") or api_model,
                 }
                 if (
-                    iteration_result_footer_repair_origin
-                    == "visible_length_recovery"
-                    and not footer_only_valid
+                    not footer_only_valid
                 ):
                     msg = (
-                        "The single footer-only repair did not emit one valid "
-                        "terminal RESULT_FIELDS_JSON line. Its buffered output "
-                        "was discarded and no further recovery was queued."
+                        "The bounded internal typed-footer submissions did not "
+                        "satisfy the exact result-field schema. Every rejected "
+                        "submission was discarded and no registry tool was "
+                        "dispatched."
                     )
                     yield await emit_agent_event("run.failed", {
                         "error": msg,
                         "finish_reason": (
-                            "delegated_visible_length_footer_repair_invalid"
+                            "delegated_result_footer_structured_repair_failed"
                         ),
                         "failure_class": "agent_contract_noncompliance",
                         "retryable": False,
@@ -30465,7 +30715,7 @@ async def run_stream(
                 # chaining into this footer-only model turn. A successful
                 # synthesis-length continuation is different: it completes a
                 # retained result body and may therefore enter the isolated
-                # output validator exactly once. The post-dispatch recovery
+                # bounded output validator. The post-dispatch recovery
                 # run-scoped guard is retained as a defence-in-depth boundary
                 # because that path owns the terminal result once requested.
                 footer_repair_incompatible_reasons: list[str] = []
@@ -30546,7 +30796,7 @@ async def run_stream(
                         "type": "tool_progress",
                         "msg": (
                             "↻ Finalizing the delegated typed-result footer "
-                            "once through the isolated output validator"
+                            "through the isolated bounded output validator"
                         ),
                     }
                     continue
@@ -30576,7 +30826,9 @@ async def run_stream(
                         "repair_count": int(
                             delegate_result_footer_repair_attempted
                         ),
-                        "max_repairs": 1,
+                        "max_repairs": (
+                            _MAX_DELEGATE_RESULT_FOOTER_SUBMISSIONS
+                        ),
                     },
                 ):
                     yield debug_evt
@@ -31259,8 +31511,12 @@ async def run_stream(
                     ),
                     "content_chars_discarded": len(full_content),
                     "reasoning_chars_discarded": len(full_reasoning),
-                    "repair_count": 1,
-                    "max_repairs": 1,
+                    "repair_count": (
+                        iteration_result_footer_submission_attempt
+                    ),
+                    "max_repairs": (
+                        _MAX_DELEGATE_RESULT_FOOTER_SUBMISSIONS
+                    ),
                     "internal_submitter": True,
                     "registry_preflight_attempted": False,
                     "registry_dispatch_attempted": False,
@@ -31288,6 +31544,54 @@ async def run_stream(
                     ),
                 }
                 if canonical_footer is None:
+                    retry_debug = queue_delegate_result_footer_submission_retry(
+                        iteration_result_footer_repair_context,
+                        validation_error=footer_submit_audit.get(
+                            "footer_error"
+                        ),
+                        origin=iteration_result_footer_repair_origin,
+                    )
+                    if retry_debug is not None:
+                        for debug_evt in await debug_stream_event(
+                            "delegate.result_footer_repair.rejected",
+                            {
+                                **footer_submit_debug,
+                                "reason": (
+                                    "structured_submitter_contract_invalid"
+                                ),
+                                "retry_queued": True,
+                                "next_submission_attempt": retry_debug[
+                                    "submission_attempt"
+                                ],
+                            },
+                        ):
+                            yield debug_evt
+                        for debug_evt in await debug_stream_event(
+                            "gate.continuation", retry_debug
+                        ):
+                            yield debug_evt
+                        await notify_turn_boundary("finished", {
+                            "iteration": budget.used,
+                            "finish_reason": "discard",
+                            "abandon_reason": (
+                                "structured_submitter_contract_invalid"
+                            ),
+                            "content_chars": len(full_content),
+                            "reasoning_chars": len(full_reasoning),
+                            "tool_call_fragment_count": (
+                                tool_call_accumulator.fragment_count
+                            ),
+                        })
+                        yield await emit_agent_event("usage.updated", {
+                            **run_usage,
+                            "model": provider.get("id") or api_model,
+                        })
+                        yield {
+                            "type": "usage",
+                            **run_usage,
+                            "model": provider.get("id") or api_model,
+                        }
+                        continue
                     for debug_evt in await debug_stream_event(
                         "delegate.result_footer_repair.failed",
                         {
@@ -31297,9 +31601,10 @@ async def run_stream(
                     ):
                         yield debug_evt
                     msg = (
-                        "The single internal typed-footer submission did not "
+                        "The bounded internal typed-footer submissions did not "
                         "satisfy the exact result-field schema. No registry "
-                        "tool was dispatched and the submission was discarded."
+                        "tool was dispatched and every rejected submission "
+                        "was discarded."
                     )
                     yield await emit_agent_event("usage.updated", {
                         **run_usage,
@@ -40243,9 +40548,11 @@ def _standard_skill_execution_engine(loaded_package: Any) -> str:
     """Return the structural execution engine for one selected Skill.
 
     Package-owned declarative contracts use the deterministic compiler.
-    Ordinary Agent Skills use progressive disclosure unless the deployment
-    explicitly enables the legacy model-authored capability-plan rollback.
-    No Skill name, domain, prompt, or filename participates in this choice.
+    Ordinary Agent Skills use progressive disclosure unless they explicitly
+    declare a delegated fan-out/fan-in workflow, which requires a validated
+    semantic graph, or the deployment enables the legacy model-authored
+    capability-plan rollback. No Skill name, domain, prompt, or filename
+    participates in this choice.
     """
 
     if not isinstance(loaded_package, dict) or loaded_package.get("error"):
@@ -40263,6 +40570,18 @@ def _standard_skill_execution_engine(loaded_package: Any) -> str:
         or execution.get("intent_classification")
     ):
         return "deterministic_workflow"
+    # Progressive disclosure is sufficient for an ordinary instruction Skill,
+    # but it cannot prove that an explicitly declared fan-out/fan-in procedure
+    # actually ran.  Route every such portable Skill through the existing
+    # content-addressed semantic planner, irrespective of language, domain,
+    # package name, or deployment default.  The model may map Markdown
+    # instruction units onto a graph, but the runtime validates complete
+    # instruction coverage, freezes the graph, and requires one receipt per
+    # lowered node before terminal synthesis.
+    if _standard_skill_declares_delegated_workflow(
+        loaded_package.get("content")
+    ):
+        return "semantic_workflow_plan"
     configured = str(
         getattr(
             settings,
@@ -40282,15 +40601,16 @@ def _standard_skill_uses_semantic_capability_plan(
     """Return whether a free-form Skill uses the legacy model planning gate.
 
     Portable Agent Skills run through progressive disclosure by default when
-    the deployment selects the ``progressive`` engine.  Only the rollback
-    engine asks the model to restate a compiler-owned capability catalog.
-    Authoritative structured workflows stay on the deterministic DAG path in
-    either mode.
+    the deployment selects the ``progressive`` engine. Explicitly delegated
+    portable workflows and the rollback engine ask the model to map the
+    compiler-owned instruction catalog onto a typed graph. Authoritative
+    structured workflows stay on the deterministic DAG path in either mode.
     """
 
-    return _standard_skill_execution_engine(loaded_package) == (
-        "legacy_semantic_plan"
-    )
+    return _standard_skill_execution_engine(loaded_package) in {
+        "legacy_semantic_plan",
+        "semantic_workflow_plan",
+    }
 
 
 def _standard_capability_catalog_requires_plan(

@@ -5583,7 +5583,7 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual("done", events[-1]["type"])
 
-    async def test_terminal_audit_contract_repair_second_bad_stop_is_terminal(self):
+    async def test_terminal_audit_contract_repair_bad_stop_gets_bounded_retry(self):
         reasoning_only = [
             "data: " + json.dumps({
                 "choices": [{
@@ -5597,13 +5597,23 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
             "still invalid\n"
             "<tool_call><arguments>{}</arguments></tool_call>"
         )
+        clean_fields = {
+            "study_title": {
+                "status": "degraded",
+                "reason": "not present in retained evidence",
+                "provenance": "attempted source/fallback",
+            },
+        }
         requests, dispatch_mock, events = await self._run_stream_sequence(
             [
                 self._valid_tool_lines("evidence.md"),
                 reasoning_only,
                 self._stop_lines(invalid_result),
                 self._stop_lines(invalid_result),
-                self._stop_lines("must not be requested"),
+                self._structured_tool_lines(
+                    "submit_result_fields",
+                    clean_fields,
+                ),
             ],
             max_iterations=6,
             delegated=True,
@@ -5611,7 +5621,7 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(
-            ["stream", "stream", "stream", "stream"],
+            ["stream", "stream", "stream", "stream", "stream"],
             [request["kind"] for request in requests],
         )
         dispatch_mock.assert_awaited_once()
@@ -5623,7 +5633,7 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
             {"enable_thinking": False},
             requests[-1]["body"].get("chat_template_kwargs"),
         )
-        self.assertEqual(1, sum(
+        self.assertEqual(2, sum(
             event.get("event_type") == "debug.gate.continuation"
             and event.get("payload", {}).get("gate")
             == "delegate_result_footer_repair"
@@ -5631,13 +5641,13 @@ class CorruptToolStreamRunTests(unittest.IsolatedAsyncioTestCase):
         ))
         terminal = [
             event for event in events
-            if event.get("event_type") == "run.failed"
+            if event.get("event_type") == "run.completed"
         ][-1]
         self.assertEqual(
-            "delegated_result_footer_structured_repair_failed",
-            terminal["payload"]["finish_reason"],
+            "delegated_result_footer_structured_repair",
+            terminal["payload"]["terminal_reason"],
         )
-        self.assertEqual("error", events[-1]["type"])
+        self.assertEqual("done", events[-1]["type"])
 
     async def test_terminal_audit_repairs_missing_footer_without_raw_protocol(self):
         reasoning_only = [

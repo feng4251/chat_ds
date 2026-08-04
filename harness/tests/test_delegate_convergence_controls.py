@@ -3255,7 +3255,7 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(malformed, emitted)
         self.assertEqual(events[-1], {"type": "done", "finish_reason": "stop"})
 
-    async def test_visible_recovery_footer_repair_failure_is_terminal(self):
+    async def test_visible_recovery_footer_validation_retries_are_isolated(self):
         cases = {
             "invalid": _stop_response(_result_fields_footer("wrong_key")),
             "length": _visible_length_response("RESULT_FIELDS_JSON: {"),
@@ -3264,9 +3264,6 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
                 "<tool_call><name>web_search</name>"
                 "<arguments>{}</arguments></tool_call>\n"
                 + _result_fields_footer("study_id")
-            ),
-            "tool_fragment": _tool_call_response(
-                "call-footer-must-not-dispatch"
             ),
         }
         for label, repair_response in cases.items():
@@ -3280,7 +3277,7 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
                     'RESULT_FIELDS_JSON: {"study_id":'
                 ),
                 repair_response,
-                _stop_response("must not be requested"),
+                _result_fields_submit_response("study_id"),
             ]
             with self.subTest(label=label):
                 request_bodies, dispatch_mock, events, _persisted = (
@@ -3295,8 +3292,8 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
                     )
                 )
 
-                self.assertEqual(len(request_bodies), 4)
-                self.assertEqual(len(responses), 1)
+                self.assertEqual(len(request_bodies), 5)
+                self.assertFalse(responses)
                 self.assertEqual(dispatch_mock.await_count, 1)
                 self.assertEqual(sum(
                     event.get("event_type")
@@ -3305,7 +3302,7 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
                 ), 1)
                 self.assertEqual(sum(
                     event.get("event_type")
-                    == "debug.delegate.result_footer_repair.failed"
+                    == "debug.delegate.result_footer_repair.rejected"
                     for event in events
                 ), 1)
                 self.assertFalse(any(
@@ -3313,7 +3310,43 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
                     == "debug.delegate.output_contract_repair.requested"
                     for event in events
                 ))
-                self.assertEqual(events[-1]["type"], "error")
+                self.assertEqual(
+                    events[-1],
+                    {"type": "done", "finish_reason": "stop"},
+                )
+
+    async def test_footer_repair_wrong_tool_fragment_never_dispatches(self):
+        responses = [
+            _tool_call_response("call-footer-terminal-fragment"),
+            _visible_length_response(
+                "status: PASS\nEvidence: retained bounded result"
+            ),
+            _stop_response(
+                "Conclusion retained.\n"
+                'RESULT_FIELDS_JSON: {"study_id":'
+            ),
+            _tool_call_response("call-footer-must-not-dispatch"),
+            _stop_response("must not be requested"),
+        ]
+
+        request_bodies, dispatch_mock, events, _persisted = await self._run(
+            responses,
+            max_iterations=6,
+            dispatch_result=json.dumps({"status": "ok", "results": [1]}),
+            required_result_fields=["study_id"],
+        )
+
+        self.assertEqual(4, len(request_bodies))
+        self.assertEqual(1, len(responses))
+        # Only the initial evidence call dispatched.  The wrong internal tool
+        # fragment never crossed the registry boundary.
+        self.assertEqual(1, dispatch_mock.await_count)
+        self.assertTrue(any(
+            event.get("event_type")
+            == "debug.delegate.result_footer_repair.failed"
+            for event in events
+        ))
+        self.assertEqual("error", events[-1]["type"])
 
     async def test_visible_recovery_raw_protocol_never_reaches_footer_repair(self):
         raw_protocol = (
@@ -3632,7 +3665,7 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(completed["payload"]["footer_valid"])
         self.assertEqual(events[-1], {"type": "done", "finish_reason": "stop"})
 
-    async def test_footer_repair_after_stream_repair_nonstop_is_terminal(self):
+    async def test_footer_repair_after_stream_repair_retries_validation_only(self):
         body = (
             "# Findings\nstatus: WARN\n"
             "Evidence: repaired tool result retained.\n"
@@ -3646,7 +3679,7 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
             ),
             _stop_response(body),
             _visible_length_response('RESULT_FIELDS_JSON: {"study_id":'),
-            _stop_response("must not be requested"),
+            _result_fields_submit_response("study_id"),
         ]
 
         request_bodies, dispatch_mock, events, _persisted = await self._run(
@@ -3656,8 +3689,8 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
             required_result_fields=["study_id"],
         )
 
-        self.assertEqual(len(request_bodies), 4)
-        self.assertEqual(len(responses), 1)
+        self.assertEqual(len(request_bodies), 5)
+        self.assertFalse(responses)
         self.assertEqual(dispatch_mock.await_count, 1)
         self.assertEqual(
             "submit_result_fields",
@@ -3668,13 +3701,13 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
             == "debug.delegate.result_footer_repair.requested"
             for event in events
         ), 1)
-        failed = next(
+        rejected = next(
             event for event in events
             if event.get("event_type")
-            == "debug.delegate.result_footer_repair.failed"
+            == "debug.delegate.result_footer_repair.rejected"
         )
         self.assertEqual(
-            failed["payload"]["reason"],
+            rejected["payload"]["reason"],
             "structured_submitter_not_emitted",
         )
         self.assertFalse(any(
@@ -3686,7 +3719,7 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
             }
             for event in events
         ))
-        self.assertEqual(events[-1]["type"], "error")
+        self.assertEqual(events[-1], {"type": "done", "finish_reason": "stop"})
 
     async def test_stream_repair_bad_footer_uses_finalization_slot(self):
         responses = [
@@ -3772,14 +3805,14 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(requested[0]["payload"]["finalization_slot_borrowed"])
         self.assertEqual(events[-1], {"type": "done", "finish_reason": "stop"})
 
-    async def test_invalid_footer_repair_is_not_repeated(self):
+    async def test_invalid_footer_repair_gets_feedback_then_succeeds(self):
         responses = [
             _stop_response(
                 "# Findings\nstatus: PASS\nEvidence: retained body without a "
                 "footer. " * 8
             ),
             _stop_response(_result_fields_footer("wrong_key")),
-            _stop_response("must not be requested"),
+            _result_fields_submit_response("study_id"),
         ]
 
         request_bodies, dispatch_mock, events, _persisted = await self._run(
@@ -3789,25 +3822,138 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
             required_result_fields=["study_id"],
         )
 
-        self.assertEqual(len(request_bodies), 2)
-        self.assertEqual(len(responses), 1)
+        self.assertEqual(len(request_bodies), 3)
+        self.assertFalse(responses)
         self.assertEqual(dispatch_mock.await_count, 0)
         self.assertEqual(
             "submit_result_fields",
             request_bodies[1]["tools"][0]["function"]["name"],
         )
-        failures = [
+        rejected = [
             event
             for event in events
             if event.get("event_type")
-            == "debug.delegate.result_footer_repair.failed"
+            == "debug.delegate.result_footer_repair.rejected"
         ]
-        self.assertEqual(len(failures), 1)
+        self.assertEqual(len(rejected), 1)
         self.assertEqual(
-            failures[0]["payload"]["reason"],
+            rejected[0]["payload"]["reason"],
             "structured_submitter_not_emitted",
         )
-        self.assertEqual(events[-1]["type"], "error")
+        retry_payload = json.loads(request_bodies[2]["messages"][1]["content"])
+        self.assertEqual(2, retry_payload["submission_attempt"])
+        self.assertIn(
+            "keys must exactly match",
+            retry_payload["previous_submission_validation_error"],
+        )
+        self.assertEqual(events[-1], {"type": "done", "finish_reason": "stop"})
+
+    async def test_object_result_field_string_is_rejected_then_corrected(self):
+        schema = {
+            "pico_metadata": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string"},
+                    "provenance": {"type": "string"},
+                },
+                "required": ["status", "provenance"],
+                "additionalProperties": False,
+            },
+        }
+        responses = [
+            _stop_response(
+                "# PICO result\nThe retained analysis contains a verified "
+                "status and bounded provenance."
+            ),
+            _tool_call_response(
+                "call-submit-wrong-object-shape",
+                tool_name="submit_result_fields",
+                arguments={
+                    "pico_metadata": (
+                        "status=present; provenance=bounded evidence"
+                    ),
+                },
+            ),
+            _tool_call_response(
+                "call-submit-correct-object-shape",
+                tool_name="submit_result_fields",
+                arguments={
+                    "pico_metadata": {
+                        "status": "present",
+                        "provenance": "bounded evidence",
+                    },
+                },
+            ),
+        ]
+
+        request_bodies, dispatch_mock, events, _persisted = await self._run(
+            responses,
+            max_iterations=1,
+            dispatch_result=json.dumps({"status": "unused"}),
+            required_result_fields=["pico_metadata"],
+            required_result_schema=schema,
+        )
+
+        self.assertFalse(responses)
+        self.assertEqual(3, len(request_bodies))
+        self.assertEqual(0, dispatch_mock.await_count)
+        retry_payload = json.loads(request_bodies[2]["messages"][1]["content"])
+        self.assertEqual(2, retry_payload["submission_attempt"])
+        self.assertIn(
+            "must be object",
+            retry_payload["previous_submission_validation_error"],
+        )
+        self.assertTrue(any(
+            event.get("event_type")
+            == "debug.delegate.result_footer_repair.completed"
+            for event in events
+        ))
+        self.assertEqual(events[-1], {"type": "done", "finish_reason": "stop"})
+
+    async def test_invalid_result_submissions_exhaust_exact_five_attempts(self):
+        responses = [
+            _stop_response(
+                "# Typed result\nEvidence is retained but the provider keeps "
+                "using the wrong JSON value type."
+            ),
+            *[
+                _tool_call_response(
+                    f"call-submit-invalid-{attempt}",
+                    tool_name="submit_result_fields",
+                    arguments={"metadata": f"wrong-shape-{attempt}"},
+                )
+                for attempt in range(1, 6)
+            ],
+        ]
+
+        request_bodies, dispatch_mock, events, _persisted = await self._run(
+            responses,
+            max_iterations=1,
+            dispatch_result=json.dumps({"status": "unused"}),
+            required_result_fields=["metadata"],
+            required_result_schema={"metadata": {"type": "object"}},
+        )
+
+        self.assertFalse(responses)
+        self.assertEqual(6, len(request_bodies))
+        self.assertEqual(0, dispatch_mock.await_count)
+        attempts = [
+            json.loads(body["messages"][1]["content"])["submission_attempt"]
+            for body in request_bodies[1:]
+        ]
+        self.assertEqual([1, 2, 3, 4, 5], attempts)
+        self.assertNotIn(
+            "previous_submission_validation_error",
+            json.loads(request_bodies[1]["messages"][1]["content"]),
+        )
+        failed = next(
+            event for event in events
+            if event.get("event_type")
+            == "debug.delegate.result_footer_repair.failed"
+        )
+        self.assertEqual(5, failed["payload"]["repair_count"])
+        self.assertEqual(5, failed["payload"]["max_repairs"])
+        self.assertEqual("error", events[-1]["type"])
 
     async def test_footer_repair_accepts_exact_canonical_footer_text(self):
         body = (
@@ -3878,14 +4024,14 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(accepted["payload"]["method"], "bare_json_text")
         self.assertEqual(events[-1], {"type": "done", "finish_reason": "stop"})
 
-    async def test_footer_repair_length_does_not_chain_other_recoveries(self):
+    async def test_footer_repair_length_retries_only_output_validation(self):
         responses = [
             _stop_response(
                 "# Findings\nstatus: PASS\nEvidence: retained body without a "
                 "footer. " * 8
             ),
             _visible_length_response("RESULT_FIELDS_JSON: {"),
-            _stop_response("must not be requested"),
+            _result_fields_submit_response("study_id"),
         ]
 
         request_bodies, dispatch_mock, events, _persisted = await self._run(
@@ -3895,8 +4041,8 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
             required_result_fields=["study_id"],
         )
 
-        self.assertEqual(len(request_bodies), 2)
-        self.assertEqual(len(responses), 1)
+        self.assertEqual(len(request_bodies), 3)
+        self.assertFalse(responses)
         self.assertEqual(dispatch_mock.await_count, 0)
         self.assertFalse(any(
             event.get("event_type") == "debug.gate.continuation"
@@ -3904,21 +4050,24 @@ class DelegateConvergenceControlTests(unittest.IsolatedAsyncioTestCase):
                 "delegate_synthesis_length_continuation",
                 "delegate_reasoning_only_length_recovery",
                 "tool_stream_continuation_repair",
+                "delegate_synthesis_length_continuation",
+                "delegate_reasoning_only_length_recovery",
+                "delegate_visible_length_recovery",
             }
             for event in events
         ))
-        failed = [
+        rejected = [
             event
             for event in events
             if event.get("event_type")
-            == "debug.delegate.result_footer_repair.failed"
+            == "debug.delegate.result_footer_repair.rejected"
         ]
-        self.assertEqual(len(failed), 1)
+        self.assertEqual(len(rejected), 1)
         self.assertEqual(
-            failed[0]["payload"]["reason"],
+            rejected[0]["payload"]["reason"],
             "structured_submitter_not_emitted",
         )
-        self.assertEqual(events[-1]["type"], "error")
+        self.assertEqual(events[-1], {"type": "done", "finish_reason": "stop"})
 
     async def test_footer_repair_does_not_chain_after_reasoning_recovery(self):
         responses = [
