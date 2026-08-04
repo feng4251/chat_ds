@@ -1,4 +1,4 @@
-# ChatDS 当前会话交接（2026-08-03）
+# ChatDS 当前会话交接（2026-08-04）
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
@@ -6,6 +6,39 @@
 
 - 工作目录：`/nfs/yangbb/codes/chat_ds`。
 - 分支：`fix/generic-skill-harness-20260717`。
+- 2026-08-04 最新状态：当前数据库没有 `pending/planned/queued/running/committing` AgentRun，
+  旧 Round 13 “正在运行”的描述已经失效；本轮按用户要求只完成通用 Harness 收敛、回归、提交和
+  生产部署，没有自动启动高成本 V2.3/MDT E2E。用户下一次手工 E2E 应从当前生产版本建立全新
+  conversation/root，诊断时继续同时核对 exact Skill、对话上下文与 session debug/tool/result。
+- 用户提供的第二个 `claude-code/` 仓库是第三方反编译/泄露整理，仓库没有 LICENSE，且存在 stub，
+  不能作为可验证的官方 Claude Code 源码。本轮仅对其可观察架构作 clean-room 思路对照，没有复制
+  代码、文本或私有实现。吸收的通用不变量是：一次 assistant tool-call batch 与其全部 tool result
+  构成不可拆分的 Provider API round；普通 guidance 必须在整批 result 之后；发送前必须审计；
+  历史修复不能伪造成功或副作用；压缩只能按完整 round 切割。
+- 最新通用修复已提交为
+  `b38390c5ef83f2f7ddc52c5b2c70e324017a7583 fix: make provider tool rounds transactional`。
+  新增独立 `provider_transcript` 协议层，统一执行 transcript audit、旧历史 canonicalization、
+  whole-round compaction boundary、active batch fail-closed close，以及 outbound-only tool-call ID
+  唯一化。Agent loop 先提交同一批全部 tool result，再追加 workflow/Knowledge Gate guidance；五类
+  pre-dispatch fail-closed 路径都会给尚未派发的 call 写明确的本地 aborted receipt（
+  `request_sent=false`、`actual_dispatch_attempted=false`），不会伪造工具成功。Chat Completions
+  transport 在任何 SDK 请求前做最后一层严格审计；durable history、artifact receipt 与副作用身份
+  不因兼容严格 Provider 的 outbound ID 投影而改变。生产逻辑没有 V2.3、疾病、报告名、Skill、
+  session 或 worker 特判。
+- 本轮从隔离的 workspace/data root 完成全部 Harness 回归：
+  `1965 passed, 1 skipped, 809 subtests passed`；唯一 skip 是既有环境条件，3 条 warning 是 Python
+  multiprocessing/fork deprecation。三组扩展回归分别为 `44 passed, 49 subtests`、
+  `269 passed, 86 subtests`、`278 passed, 127 subtests`；最后一组在默认生产 NFS 根出现的 9 个
+  subtest failure 仅由不可读 tombstone 引起，同一 exact test 在隔离根为 `1 passed, 9 subtests`。
+  `py_compile`、`git diff --check`、secret scan、genericity scan 与 protected-deletion staging 检查
+  均通过。
+- `b38390c5` 已从精确 clean Git archive（tracked/archive 均 22,454 files）构建并只滚动替换生产
+  Harness。当前 image 为
+  `sha256:099a4fbce03bcfb155dc2b56edff9b6942cfb220f9721d5e4053c7184ba55231`，revision label
+  精确匹配完整提交，healthy/restart 0；旧镜像保留为 `rollback-pre-b38390c5-local`。Backend、
+  Frontend、四个 Executor、Browser、skill-egress proxy、SearXNG 均未重建。Harness 内部 health、
+  Backend→Harness、模型目录（4 个模型）、两块本机地址的 `:5173`、storage identity、SQLite
+  quick/FK、idle AgentRun 与部署后严重日志检查全部通过。
 - 用户于 2026-08-03 再次明确授权五轮双 Skill 自动 E2E，当前授权范围为 Round 11--15，
   替代 Round 10 后的暂停要求与旧 Round 13 上限。每轮仍顺序运行 V2.3 和 `yangbb` User Skill
   `lung-cancer-mdt` 的全新 conversation/root，并完成三源诊断、通用复现、官方成熟实现对照、
