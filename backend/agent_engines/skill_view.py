@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -18,6 +19,8 @@ MAX_SKILL_VIEW_BYTES = 512 * 1024 * 1024
 MAX_SKILL_VIEW_FILE_BYTES = 64 * 1024 * 1024
 MAX_SKILL_MCP_SERVERS = 128
 MAX_SKILL_MCP_CONFIG_BYTES = 2 * 1024 * 1024
+CLAUDE_SKILL_PLUGIN_NAME = "chatds-session-skills"
+CLAUDE_SKILL_ENTRYPOINT_NAME = "chatds-harness-session-entry"
 
 
 class SkillViewError(RuntimeError):
@@ -42,6 +45,8 @@ class ClaudeSkillView:
     file_count: int
     size_bytes: int
     mcp_server_names: tuple[str, ...] = ()
+    entrypoint_skill_name: str | None = None
+    selected_primary_skill_names: tuple[str, ...] = ()
 
 
 def authorized_skill_sources(
@@ -91,6 +96,15 @@ def materialize_claude_skill_view(
     """Publish one immutable plugin tree or reuse its verified digest path."""
 
     source_rows = tuple(sources)
+    if any(source.name == CLAUDE_SKILL_ENTRYPOINT_NAME for source in source_rows):
+        raise SkillViewError(
+            f"Skill name '{CLAUDE_SKILL_ENTRYPOINT_NAME}' is reserved by the Harness"
+        )
+    selected_primary_skill_names = tuple(
+        source.name
+        for source in source_rows
+        if source.bundle_role != "supporting"
+    )
     runtime_root = Path(session_root) / "runtime" / "claude" / "skill-views"
     _ensure_real_directory_chain(runtime_root)
     staging = runtime_root / f".staging-{uuid.uuid4().hex}"
@@ -136,6 +150,40 @@ def materialize_claude_skill_view(
                 "files": skill_files,
             })
 
+        entrypoint_skill_name: str | None = None
+        if selected_primary_skill_names:
+            entrypoint_skill_name = CLAUDE_SKILL_ENTRYPOINT_NAME
+            entrypoint_root = skills_root / entrypoint_skill_name
+            entrypoint_root.mkdir(mode=0o700)
+            entrypoint_path = entrypoint_root / "SKILL.md"
+            entrypoint_bytes = _compiled_entrypoint_skill(
+                selected_primary_skill_names
+            ).encode("utf-8")
+            _write_bytes_exclusive(entrypoint_path, entrypoint_bytes)
+            entrypoint_digest = hashlib.sha256(entrypoint_bytes).hexdigest()
+            entrypoint_row = {
+                "path": (
+                    f"plugin/skills/{entrypoint_skill_name}/SKILL.md"
+                ),
+                "sha256": entrypoint_digest,
+                "size": len(entrypoint_bytes),
+            }
+            file_rows.append(entrypoint_row)
+            total_bytes += len(entrypoint_bytes)
+            if total_bytes > MAX_SKILL_VIEW_BYTES:
+                raise SkillViewError("Skill view byte limit exceeded")
+            manifest_skills.append({
+                "name": entrypoint_skill_name,
+                "scope": "harness",
+                "bundle_id": None,
+                "bundle_role": "entrypoint",
+                "files": [{
+                    "path": "SKILL.md",
+                    "sha256": entrypoint_digest,
+                    "size": len(entrypoint_bytes),
+                }],
+            })
+
         mcp_servers = _compile_explicit_mcp_servers(
             sources=source_rows,
             plugin_root=plugin,
@@ -153,7 +201,7 @@ def materialize_claude_skill_view(
         total_bytes += len(mcp_config_bytes)
 
         plugin_descriptor = {
-            "name": "chatds-session-skills",
+            "name": CLAUDE_SKILL_PLUGIN_NAME,
             "version": "1.0.0",
             "description": "Immutable ChatDS Session Skill view",
         }
@@ -168,6 +216,11 @@ def materialize_claude_skill_view(
         total_bytes += len(descriptor_bytes)
         identity = {
             "schema": "chatds.claude-skill-view.v1",
+            "plugin_name": CLAUDE_SKILL_PLUGIN_NAME,
+            "entrypoint_skill_name": entrypoint_skill_name,
+            "selected_primary_skill_names": list(
+                selected_primary_skill_names
+            ),
             "skills": manifest_skills,
             "files": sorted(file_rows, key=lambda row: row["path"]),
         }
@@ -179,7 +232,14 @@ def materialize_claude_skill_view(
         target = runtime_root / view_sha256
         try:
             staging.rename(target)
-        except FileExistsError:
+        except OSError as exc:
+            # POSIX local filesystems commonly report EEXIST when another
+            # publisher already installed the same content-addressed tree.
+            # NFSv3 reports ENOTEMPTY for the identical rename collision.
+            # Treat only those two destination-exists forms as a CAS race;
+            # the winner is still fully re-verified before reuse.
+            if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                raise
             _make_tree_owner_writable(staging)
             shutil.rmtree(staging)
             _verify_existing_view(target, view_sha256)
@@ -188,10 +248,12 @@ def materialize_claude_skill_view(
             root=target,
             plugin_root=target / "plugin",
             sha256=view_sha256,
-            skill_names=tuple(row["name"] for row in manifest_skills),
+            skill_names=tuple(source.name for source in source_rows),
             file_count=len(file_rows),
             size_bytes=total_bytes,
             mcp_server_names=tuple(mcp_servers),
+            entrypoint_skill_name=entrypoint_skill_name,
+            selected_primary_skill_names=selected_primary_skill_names,
         )
     except BaseException:
         if staging.exists():
@@ -213,17 +275,67 @@ def _safe_component(value: str, *, field: str) -> str:
     return value
 
 
+def _compiled_entrypoint_skill(primary_skill_names: tuple[str, ...]) -> str:
+    """Build the native entrypoint for the selected root Skills.
+
+    Native Skill auto-selection is model-dependent, especially behind
+    compatible third-party providers.  The immutable Harness entrypoint uses
+    Claude Code's documented slash-command mechanism to make the Session's
+    explicit selection deterministic. Bundle dependencies stay available in
+    the same plugin but are not promoted to independent roots.
+    """
+
+    rows = "\n".join(
+        f"- `/skill-view/plugin/skills/{name}/SKILL.md`"
+        for name in primary_skill_names
+    )
+    return (
+        "---\n"
+        f"name: {CLAUDE_SKILL_ENTRYPOINT_NAME}\n"
+        "description: Harness-owned entrypoint for explicitly selected "
+        "Session Skills.\n"
+        "---\n\n"
+        "# Execute the selected Session Skills\n\n"
+        "This command is invoked by the Harness because the Session owner "
+        "explicitly selected the following primary Skills:\n\n"
+        f"{rows}\n\n"
+        "Before any substantive analysis, delegation, tool call, or file "
+        "mutation, use `Read` to read every listed `SKILL.md` completely. "
+        "Then determine which selected Skills apply to the user's request "
+        "and follow every applicable instruction exactly. Supporting Skills "
+        "in `/skill-view/plugin/skills/` are dependencies and may be loaded "
+        "when the primary instructions require them; their presence does not "
+        "make them independent user selections.\n\n"
+        "Do not search `/workspace` for installed Skill instructions. The "
+        "Skill view is immutable and authoritative; write task artifacts only "
+        "to `/workspace`. Preserve required workflow steps, evidence, "
+        "delegation, validation, filenames, and final deliverables. When a "
+        "supporting Skill exists for a data source or tool, use its authored "
+        "instructions, scripts, or MCP capability before a generic web tool. "
+        "Do not finish while a task you created is pending or while an "
+        "applicable Skill's required validation or deliverable is incomplete. "
+        "If you spawn a background agent, wait for and collect its terminal "
+        "result before finishing. Treat every declared comparison and "
+        "validation threshold literally: a near miss is a failure, not a "
+        "pass. Repair every failed check and rerun it before marking it "
+        "complete. "
+        "Before the final response, inspect the workspace and task list, run "
+        "the declared checks, and close every task with evidence.\n\n"
+        "The original user request is supplied below without modification.\n\n"
+        "$ARGUMENTS\n"
+    )
+
+
 def _compile_explicit_mcp_servers(
     *,
     sources: tuple[SkillViewSource, ...],
     plugin_root: Path,
 ) -> dict[str, dict[str, Any]]:
-    """Compile only explicit Skill MCP declarations for ``--bare`` mode.
+    """Compile only explicit Skill MCP declarations for the isolated Runner.
 
-    Claude Code intentionally skips plugin MCP auto-discovery under
-    ``--bare``.  The Harness therefore produces one immutable explicit config
-    instead of silently losing a Skill capability or enabling ambient user/
-    project MCP state.  Unsupported helper/OAuth/WebSocket forms fail closed.
+    The Harness produces one immutable explicit config instead of silently
+    losing a Skill capability or enabling ambient user/project MCP state.
+    Unsupported helper/OAuth/WebSocket forms fail closed.
     """
 
     compiled: dict[str, dict[str, Any]] = {}
@@ -450,6 +562,13 @@ def _write_json_exclusive(path: Path, value: object) -> None:
     ).encode("utf-8") + b"\n"
     with path.open("xb") as stream:
         stream.write(encoded)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _write_bytes_exclusive(path: Path, value: bytes) -> None:
+    with path.open("xb") as stream:
+        stream.write(value)
         stream.flush()
         os.fsync(stream.fileno())
 

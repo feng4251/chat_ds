@@ -4,6 +4,49 @@
 
 ## 1. 当前结论
 
+- 2026-08-05 最新 ClaudeCodeEngine 验收与候选修复：生产会话
+  `25c72ca95b8544b58f3f57f6d8a9dc66` 在用户选择 `claude_code` 后有 0 Message、0
+  AgentRun、0 engine session、0 raw native event，失败发生在 durable run 建立之前。
+  根因是首轮启动路径缺少 `AsyncExitStack` 导入，并对不存在的上一代 native session 做了
+  `generation=None > 0` 比较；两项已提交为
+  `161b4e43285333d1a20a09a7a0279edf16ceb343 fix: start first Claude Code turn reliably`。
+  后续真实 E2E 又形成一组尚待本节所述最终提交/部署的通用候选：显式选中的根 Skill 由不可变
+  Harness-owned slash entrypoint 强制完整读取，supporting bundle Skill 只保留为依赖；移除会把
+  Claude 2.1.152 原生 Task/Agent 工具静默裁掉的 `--bare`，同时继续使用空 setting sources、
+  per-Session HOME、严格 MCP、单 Session mount、network-none 与签名 exact egress；第三方
+  Messages provider 默认禁用不属于兼容协议保证的 WebSearch/WebFetch；Provider exact route、
+  Turn/Proxy 出站预算、NFSv3 `ENOTEMPTY` 内容寻址发布竞态、native child/task-list terminal audit、
+  tool name 与 stream message 去重均已闭合。Claude 直接写入 workspace 的新/修改常规文件现在
+  还会在同一 Session mutation lock 内生成有界、内容寻址的 `artifact.created` 账本，不再只在
+  文件系统可见而 `artifacts` 为 0；该实现按 ctime/identity 选择变更并拒绝 symlink/special file、
+  文件/数量/总字节越界和审计期漂移，没有报告名或业务特判。
+- 最新真实 V2.3 ClaudeCodeEngine case 为 conversation
+  `c0d54695d6ac42aa9c9449d09a084f26`。首次 root
+  `204ba0dbd83f4b0bb35262d69f8445e3` 使用
+  `shaiengine_deepseek_v4_pro`，19 分 22 秒 durable succeeded，实际生成 11 个模块、README、
+  checklist 和 full report；3 个数据库检索 child failed、1 个修正 child succeeded，另一个后台
+  merge child 在 parent terminal 时被取消，但 parent 自身完成了 merge。首次 full report 为
+  112,883 bytes/`wc -l` 1989，暴露“接近 >2000 行阈值却被 checklist 误记为通过”和 parent 可在
+  native background child 未结算时完成两项通用缺陷。验证 continuation root
+  `adb85e43f9ae44e1a1ac8ebfe5109763` 通过两个均 succeeded 的 verifier child 修正为
+  112,943 bytes/`wc -l` 2019，满足 exact Skill 的 >100 KB、>2000 行、11 模块顺序 merge 和
+  checklist 合同。ground truth 为 200,094 bytes/3383 行，因此当前结果达到 Skill 硬性最低合同，
+  但只有 oracle 约 56% 字节量，不能宣称逐字或完整业务等价。上述 root 使用的是 artifact-ledger
+  修复前候选，所以其 DB 中 artifact row 为 0；workspace 文件本身完整存在。
+- 本轮肺癌 MDT 新 conversation `03b90a3ff581421682feafc6d4f58031` 尚未建立 AgentRun：Backend
+  在读取 User Skill `lung-cancer-mdt` 的 immutable view 时进入宿主 NFSv3 hard-mount
+  `folio_wait_bit_common`。独立只读 soft mount 能枚举全部 36 个文件，但读取第 8 个文件开始返回
+  `EIO`/随后同样进入 D-state；本地 volume 只恢复 7/36 文件，残缺 ZIP 校验为 `BadZipFile`，不得
+  用来冒充 E2E。NFS server ICMP、TCP 2049 与 NFSv3 RPC 当前都可达，故障位于导出文件数据页/
+  存储数据面而不是 Claude provider、Skill 路由或网络白名单。该 case 保持 0 Message、0 AgentRun、
+  0 artifact；NFS 恢复后必须用全新 conversation 重跑，避免与当前迟到请求竞态。
+- 最新候选从本地 clean archive（避免宿主 NFS 读取卡顿）完成 Backend `267 passed`；
+  Runner/Supervisor/Proxy 为 `109 passed, 1 deselected, 115 subtests passed`。唯一 deselected 是
+  未改动的 TLS 1.3 post-handshake-auth 环境用例：临时 Backend 测试镜像的 OpenSSL 组合在该
+  用例发生 BrokenPipe；同套完整运行除此以外全部通过。`py_compile`、diff、secret 与 genericity
+  scan 通过。宿主默认 Python 自身位于 NFS，直接 pytest 与 `git archive` 当前会进入 D-state，
+  因此候选测试使用 `/tmp/chat_ds_deploy_161b4e43.lFIsij` 的 clean tree 加当前精确 diff，并在
+  隔离 Docker runtime 中运行；不得把 NFS D-state 误报为测试逻辑失败。
 - 工作目录：`/nfs/yangbb/codes/chat_ds`。
 - 分支：`fix/generic-skill-harness-20260717`。
 - 2026-08-05 新增可选 `ClaudeCodeEngine`，Legacy Harness 保留且 Conversation 级固定

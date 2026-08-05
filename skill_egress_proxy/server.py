@@ -54,7 +54,7 @@ IDLE_TIMEOUT_SECONDS: Final[float] = float(
     os.environ.get("SKILL_EGRESS_IDLE_TIMEOUT_SECONDS", "30")
 )
 MAX_TUNNEL_SECONDS: Final[float] = float(
-    os.environ.get("SKILL_EGRESS_MAX_TUNNEL_SECONDS", "600")
+    os.environ.get("SKILL_EGRESS_MAX_TUNNEL_SECONDS", "14400")
 )
 MAX_HEADER_BYTES: Final[int] = 64 * 1024
 MAX_BUFFER_BYTES: Final[int] = 256 * 1024
@@ -173,17 +173,17 @@ def _bounded_positive_env_int(
 
 MAX_REQUESTS_PER_SCOPE: Final[int] = _bounded_positive_env_int(
     "SKILL_EGRESS_MAX_REQUESTS",
-    2_048,
+    8_192,
     _ABSOLUTE_MAX_REQUESTS_PER_SCOPE,
 )
 MAX_OUTBOUND_BYTES_PER_SCOPE: Final[int] = _bounded_positive_env_int(
     "SKILL_EGRESS_MAX_OUTBOUND_BYTES",
-    16 * 1024 * 1024,
+    64 * 1024 * 1024,
     _ABSOLUTE_MAX_OUTBOUND_BYTES_PER_SCOPE,
 )
 MAX_RESPONSE_WIRE_BYTES_PER_SCOPE: Final[int] = _bounded_positive_env_int(
     "SKILL_EGRESS_MAX_RESPONSE_WIRE_BYTES",
-    512 * 1024 * 1024,
+    2 * 1024 * 1024 * 1024,
     _ABSOLUTE_MAX_RESPONSE_WIRE_BYTES_PER_SCOPE,
 )
 MAX_POLICY_SCOPE_ENTRIES: Final[int] = _bounded_positive_env_int(

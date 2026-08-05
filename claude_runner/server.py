@@ -36,7 +36,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 
 from .config import ProviderProfile, RunnerSettings, load_settings
-from .policy import compile_turn_egress_policy
+from .policy import compile_turn_egress_policy, verify_skill_view
 from workspace_lock import workspace_mutation_guard
 
 
@@ -49,6 +49,8 @@ SECCOMP_PROFILE_PATH = Path("/app/claude_runner/seccomp_profile.json")
 SETID_STRIPPED_LABEL = "org.opencontainers.image.chatds.setid-stripped"
 EGRESS_POLICY_LABEL = "org.opencontainers.image.chatds.egress-policy"
 EXPECTED_EGRESS_POLICY_RUNTIME = "signed-exact-query-v1"
+EXPECTED_SKILL_PLUGIN_NAME = "chatds-session-skills"
+EXPECTED_SKILL_ENTRYPOINT_NAME = "chatds-harness-session-entry"
 _STATUS_UPDATE_LOCK = threading.RLock()
 
 
@@ -137,9 +139,15 @@ class RunManager:
             )
             else None
         )
+        skill_view_manifest = verify_skill_view(
+            skill_view,
+            request.skill_view_sha256,
+        )
+        skill_entrypoint = _manifest_skill_entrypoint(skill_view_manifest)
         prompt = _build_prompt(
             request.messages,
             resume=resume_from_native_session_id is not None,
+            skill_entrypoint=skill_entrypoint,
         )
         policy = compile_turn_egress_policy(
             skill_view_root=skill_view,
@@ -151,15 +159,7 @@ class RunManager:
                 "budget", request.user_id, request.conversation_id, request.root_run_id
             ),
             call_id_sha256=_scope_digest("call", request.root_run_id, request.run_id),
-            limits={
-                "max_outbound_bytes": int(os.environ.get(
-                    "CLAUDE_EGRESS_MAX_OUTBOUND_BYTES", "67108864"
-                )),
-                "max_requests": int(os.environ.get("CLAUDE_EGRESS_MAX_REQUESTS", "8192")),
-                "max_response_wire_bytes": int(os.environ.get(
-                    "CLAUDE_EGRESS_MAX_RESPONSE_WIRE_BYTES", "2147483648"
-                )),
-            },
+            limits=dict(self.settings.egress_limits),
         )
         sanitized = {
             "schema": "chatds.claude-run.v1",
@@ -173,6 +173,7 @@ class RunManager:
             "provider_backend_base_url": profile.backend_base_url,
             "provider_claude_base_url": profile.claude_base_url,
             "provider_protocol": request.provider_protocol,
+            "native_web_tools": profile.native_web_tools,
             "native_session_id": native_session_id,
             "resume_from_native_session_id": resume_from_native_session_id,
             "max_output_tokens": request.max_output_tokens,
@@ -1013,17 +1014,79 @@ class RunManager:
             await asyncio.gather(*tasks, return_exceptions=True)
 
 
-def _build_prompt(messages: list[dict[str, Any]], *, resume: bool) -> str:
+def _build_prompt(
+    messages: list[dict[str, Any]],
+    *,
+    resume: bool,
+    skill_entrypoint: str | None = None,
+) -> str:
     if resume:
         for message in reversed(messages):
             if message.get("role") == "user":
-                return _message_text(message.get("content"))
+                rendered = _message_text(message.get("content"))
+                return _activate_skill_entrypoint(
+                    rendered,
+                    skill_entrypoint=skill_entrypoint,
+                )
         raise HTTPException(400, "A resumed Claude Turn requires a user message")
     rendered = []
     for message in messages:
         role = str(message.get("role") or "user").upper()
         rendered.append(f"<{role}>\n{_message_text(message.get('content'))}\n</{role}>")
-    return "\n\n".join(rendered)
+    return _activate_skill_entrypoint(
+        "\n\n".join(rendered),
+        skill_entrypoint=skill_entrypoint,
+    )
+
+
+def _manifest_skill_entrypoint(manifest: dict[str, Any]) -> str | None:
+    plugin_name = manifest.get("plugin_name")
+    entrypoint_name = manifest.get("entrypoint_skill_name")
+    selected = manifest.get("selected_primary_skill_names")
+    if entrypoint_name is None:
+        if selected not in (None, []):
+            raise RuntimeError("skill_entrypoint_manifest_invalid")
+        return None
+    if (
+        plugin_name != EXPECTED_SKILL_PLUGIN_NAME
+        or entrypoint_name != EXPECTED_SKILL_ENTRYPOINT_NAME
+        or not isinstance(selected, list)
+        or not selected
+        or any(
+            not isinstance(name, str)
+            or not name
+            or name == EXPECTED_SKILL_ENTRYPOINT_NAME
+            for name in selected
+        )
+    ):
+        raise RuntimeError("skill_entrypoint_manifest_invalid")
+    skills = manifest.get("skills")
+    if not isinstance(skills, list):
+        raise RuntimeError("skill_entrypoint_manifest_invalid")
+    rows = {
+        str(row.get("name") or ""): row
+        for row in skills
+        if isinstance(row, dict)
+    }
+    entrypoint = rows.get(EXPECTED_SKILL_ENTRYPOINT_NAME)
+    if (
+        not isinstance(entrypoint, dict)
+        or entrypoint.get("scope") != "harness"
+        or entrypoint.get("bundle_role") != "entrypoint"
+        or any(name not in rows for name in selected)
+    ):
+        raise RuntimeError("skill_entrypoint_manifest_invalid")
+    return f"{EXPECTED_SKILL_PLUGIN_NAME}:{EXPECTED_SKILL_ENTRYPOINT_NAME}"
+
+
+def _activate_skill_entrypoint(
+    prompt: str,
+    *,
+    skill_entrypoint: str | None,
+) -> str:
+    if skill_entrypoint is None:
+        return prompt
+    return f"/{skill_entrypoint}\n\n{prompt}"
 
 
 def _recover_start_request(path: Path) -> StartRunRequest:

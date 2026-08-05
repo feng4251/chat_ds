@@ -64,8 +64,8 @@ def compile_turn_egress_policy(
         ):
             prefix_rows.append({"url_prefix": prefix, "methods": list(methods)})
 
-    # ``--bare`` loads this generated MCP file explicitly. Remote MCP
-    # transports are themselves an explicit Skill authority, but receive only
+    # The Runner loads this generated MCP file explicitly and rejects ambient
+    # MCP configuration. Remote transports are themselves an explicit Skill authority, but receive only
     # the protocol methods needed by streamable HTTP/SSE rather than an
     # origin-wide grant. The exact endpoint remains the path-prefix boundary.
     mcp_path = Path(skill_view_root) / "plugin" / ".mcp.json"
@@ -94,10 +94,25 @@ def compile_turn_egress_policy(
         for prefix in user_urls
     ]
 
-    messages_prefix = normalize_http_url_prefix(
-        provider_base_url.rstrip("/") + "/v1/messages"
+    # Claude Code 2.x uses the Anthropic SDK's beta transport coordinate and
+    # may ask the provider to count tokens before sending a long Messages
+    # request. Grant only those four exact protocol coordinates; in
+    # particular, ``beta=true`` is not widened into arbitrary query access.
+    provider_prefixes = tuple(
+        normalize_http_url_prefix(
+            provider_base_url.rstrip("/") + suffix
+        )
+        for suffix in (
+            "/v1/messages",
+            "/v1/messages?beta=true",
+            "/v1/messages/count_tokens",
+            "/v1/messages/count_tokens?beta=true",
+        )
     )
-    exact_query_rows.append({"url_prefix": messages_prefix, "methods": ["POST"]})
+    exact_query_rows.extend(
+        {"url_prefix": prefix, "methods": ["POST"]}
+        for prefix in provider_prefixes
+    )
     prefix_rules = normalize_session_sandbox_egress_rules(prefix_rows)
     exact_query_rules = normalize_session_sandbox_egress_rules(exact_query_rows)
     rule_payloads = [rule.as_payload() for rule in prefix_rules]
@@ -124,7 +139,7 @@ def compile_turn_egress_policy(
         for value in user_urls
         if _private_origin_eligible(value)
     }
-    provider_origin = normalize_http_origin(messages_prefix)
+    provider_origin = normalize_http_origin(provider_prefixes[0])
     private_origins = tuple(
         origin
         for origin in origins

@@ -24,6 +24,10 @@ class ProviderProfile:
     claude_base_url: str
     api_key: str
     models: frozenset[str]
+    # Anthropic-hosted server tools are not part of the generic Messages
+    # compatibility contract. Third-party facades must explicitly attest that
+    # they implement Claude Code's native WebSearch/WebFetch semantics.
+    native_web_tools: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,8 +44,21 @@ class RunnerSettings:
     worker_uid: int
     worker_gid: int
     security_mode: str
+    egress_limits: dict[str, int]
     provider_profiles: dict[str, ProviderProfile]
     private_origin_allowlist: tuple[str, ...]
+
+
+DEFAULT_CLAUDE_EGRESS_LIMITS = {
+    "max_requests": 8_192,
+    "max_outbound_bytes": 64 * 1024 * 1024,
+    "max_response_wire_bytes": 2 * 1024 * 1024 * 1024,
+}
+_ABSOLUTE_EGRESS_LIMITS = {
+    "max_requests": 65_536,
+    "max_outbound_bytes": 1024 * 1024 * 1024,
+    "max_response_wire_bytes": 16 * 1024 * 1024 * 1024,
+}
 
 
 def load_settings() -> RunnerSettings:
@@ -104,6 +121,21 @@ def load_settings() -> RunnerSettings:
         "seccomp_stripped_setid",
     }:
         raise RunnerConfigurationError("CLAUDE_RUNNER_SECURITY_MODE is invalid")
+    egress_limits = _egress_limits(
+        "CLAUDE_EGRESS",
+        DEFAULT_CLAUDE_EGRESS_LIMITS,
+    )
+    proxy_ceilings = _egress_limits(
+        "CLAUDE_EGRESS_POLICY",
+        DEFAULT_CLAUDE_EGRESS_LIMITS,
+    )
+    if any(
+        egress_limits[name] > proxy_ceilings[name]
+        for name in DEFAULT_CLAUDE_EGRESS_LIMITS
+    ):
+        raise RunnerConfigurationError(
+            "Claude egress limits exceed proxy policy ceilings"
+        )
     return RunnerSettings(
         internal_token=token,
         workspace_host_root=workspace_root,
@@ -117,6 +149,7 @@ def load_settings() -> RunnerSettings:
         worker_uid=_bounded_int("CLAUDE_RUNNER_WORKER_UID", 65529, 1, 2**31 - 1),
         worker_gid=_bounded_int("CLAUDE_RUNNER_WORKER_GID", 65529, 1, 2**31 - 1),
         security_mode=security_mode,
+        egress_limits=egress_limits,
         provider_profiles=profiles,
         private_origin_allowlist=private_values,
     )
@@ -166,6 +199,11 @@ def _provider_profiles() -> dict[str, ProviderProfile]:
             not isinstance(item, str) or not item or len(item) > 128 for item in models
         ):
             raise RunnerConfigurationError(f"Provider model allowlist is invalid for {profile_id}")
+        native_web_tools = value.get("native_web_tools", False)
+        if type(native_web_tools) is not bool:
+            raise RunnerConfigurationError(
+                f"Provider native web-tool capability is invalid for {profile_id}"
+            )
         profiles[profile_id] = ProviderProfile(
             id=profile_id,
             backend_base_url=backend_base,
@@ -173,6 +211,7 @@ def _provider_profiles() -> dict[str, ProviderProfile]:
             claude_base_url=claude_base,
             api_key=api_key,
             models=frozenset(models),
+            native_web_tools=native_web_tools,
         )
     return profiles
 
@@ -229,3 +268,20 @@ def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
     if not minimum <= value <= maximum:
         raise RunnerConfigurationError(f"{name} is out of range")
     return value
+
+
+def _egress_limits(prefix: str, defaults: dict[str, int]) -> dict[str, int]:
+    names = {
+        "max_requests": f"{prefix}_MAX_REQUESTS",
+        "max_outbound_bytes": f"{prefix}_MAX_OUTBOUND_BYTES",
+        "max_response_wire_bytes": f"{prefix}_MAX_RESPONSE_WIRE_BYTES",
+    }
+    result: dict[str, int] = {}
+    for field, environment_name in names.items():
+        result[field] = _bounded_int(
+            environment_name,
+            defaults[field],
+            1,
+            _ABSOLUTE_EGRESS_LIMITS[field],
+        )
+    return result

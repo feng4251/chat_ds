@@ -178,6 +178,11 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
             worker_uid=os.getuid(),
             worker_gid=os.getgid(),
             security_mode="seccomp_stripped_setid",
+            egress_limits={
+                "max_requests": 8192,
+                "max_outbound_bytes": 64 * 1024 * 1024,
+                "max_response_wire_bytes": 2 * 1024 * 1024 * 1024,
+            },
             provider_profiles={"shaiengine": self.profile},
             private_origin_allowlist=(),
         )
@@ -247,6 +252,50 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         })
         with self.assertRaises(HTTPException):
             self.manager._provider(request)
+
+    def test_selected_skill_entrypoint_precedes_fresh_and_resumed_prompts(self):
+        entrypoint = "chatds-session-skills:chatds-harness-session-entry"
+        fresh = supervisor_server._build_prompt(
+            [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "task"},
+            ],
+            resume=False,
+            skill_entrypoint=entrypoint,
+        )
+        resumed = supervisor_server._build_prompt(
+            [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "answer"},
+                {"role": "user", "content": "next"},
+            ],
+            resume=True,
+            skill_entrypoint=entrypoint,
+        )
+        self.assertTrue(fresh.startswith(f"/{entrypoint}\n\n<SYSTEM>"))
+        self.assertEqual(resumed, f"/{entrypoint}\n\nnext")
+
+    def test_skill_entrypoint_manifest_fails_closed_when_inconsistent(self):
+        valid = {
+            "plugin_name": "chatds-session-skills",
+            "entrypoint_skill_name": "chatds-harness-session-entry",
+            "selected_primary_skill_names": ["fixture"],
+            "skills": [
+                {"name": "fixture", "scope": "session"},
+                {
+                    "name": "chatds-harness-session-entry",
+                    "scope": "harness",
+                    "bundle_role": "entrypoint",
+                },
+            ],
+        }
+        self.assertEqual(
+            supervisor_server._manifest_skill_entrypoint(valid),
+            "chatds-session-skills:chatds-harness-session-entry",
+        )
+        invalid = {**valid, "selected_primary_skill_names": ["missing"]}
+        with self.assertRaisesRegex(RuntimeError, "skill_entrypoint"):
+            supervisor_server._manifest_skill_entrypoint(invalid)
 
     async def test_turn_container_has_one_session_mount_and_no_network(self):
         request = self._request()

@@ -26,6 +26,9 @@ class ClaudeEventProjector:
     root_run_id: str
     _streamed_text_messages: set[str] = field(default_factory=set)
     _streamed_reasoning_messages: set[str] = field(default_factory=set)
+    _active_stream_message_by_parent: dict[str, str] = field(
+        default_factory=dict
+    )
     _emitted_text: bool = False
     _terminal_seen: bool = False
     _result_seen: bool = False
@@ -36,6 +39,7 @@ class ClaudeEventProjector:
     _task_by_tool_use_id: dict[str, str] = field(default_factory=dict)
     _started_tools: set[str] = field(default_factory=set)
     _terminal_tools: set[str] = field(default_factory=set)
+    _tool_name_by_id: dict[str, str] = field(default_factory=dict)
 
     def project(self, envelope: Mapping[str, Any]) -> tuple[EngineStreamEvent, ...]:
         native = _mapping(envelope.get("event"))
@@ -70,6 +74,27 @@ class ClaudeEventProjector:
             ),)
         if event_type == "result":
             return tuple(self._project_result(native, envelope))
+        if event_type == "chatds.workspace.artifact":
+            source_event_key = str(native.get("source_event_key") or "")
+            return (EngineStreamEvent(
+                "agent_event",
+                {
+                    "event_type": "artifact.created",
+                    "run_id": self.root_run_id,
+                    "root_run_id": self.root_run_id,
+                    "tool_name": "ClaudeCodeWorkspace",
+                    "payload": {
+                        "kind": str(native.get("kind") or "file"),
+                        "title": str(native.get("title") or "artifact")[:256],
+                        "path": str(native.get("path") or "")[:1024],
+                        "size_bytes": max(0, int(native.get("size_bytes") or 0)),
+                        "sha256": str(native.get("sha256") or "")[:64],
+                        "source_event_key": source_event_key[:192],
+                    },
+                },
+                envelope,
+                native_event_id=source_event_key or None,
+            ),)
         if event_type == "chatds.supervisor.terminal":
             return tuple(self._project_supervisor_terminal(native, envelope))
         return (EngineStreamEvent(
@@ -87,7 +112,11 @@ class ClaudeEventProjector:
         nested_type = str(event.get("type") or "")
         delta = _mapping(event.get("delta"))
         delta_type = str(delta.get("type") or "")
-        message_identity = str(native.get("uuid") or "")
+        parent_identity = str(native.get("parent_tool_use_id") or "")
+        message_identity = self._active_stream_message_by_parent.get(
+            parent_identity,
+            str(native.get("uuid") or ""),
+        )
         run_id = self._native_run_id(native)
         if nested_type == "content_block_delta" and delta_type == "text_delta":
             text = str(delta.get("text") or "")
@@ -107,6 +136,8 @@ class ClaudeEventProjector:
             if block.get("type") in {"tool_use", "server_tool_use"}:
                 name = str(block.get("name") or "tool")
                 tool_id = str(block.get("id") or "") or None
+                if tool_id:
+                    self._tool_name_by_id[tool_id] = name
                 if tool_id and tool_id in self._started_tools:
                     return ()
                 if tool_id:
@@ -128,6 +159,11 @@ class ClaudeEventProjector:
                 )
         if nested_type == "message_start":
             message = _mapping(event.get("message"))
+            native_message_id = str(message.get("id") or "")
+            if native_message_id:
+                self._active_stream_message_by_parent[
+                    parent_identity
+                ] = native_message_id
             values: list[EngineStreamEvent] = []
             usage = _usage(_mapping(message.get("usage")))
             if usage:
@@ -151,7 +187,15 @@ class ClaudeEventProjector:
         envelope: Mapping[str, Any],
     ) -> Iterable[EngineStreamEvent]:
         message = _mapping(native.get("message"))
-        message_identity = str(native.get("uuid") or "")
+        message_identity = str(
+            message.get("id")
+            or self._active_stream_message_by_parent.get(
+                str(native.get("parent_tool_use_id") or ""),
+                "",
+            )
+            or native.get("uuid")
+            or ""
+        )
         run_id = self._native_run_id(native)
         values: list[EngineStreamEvent] = []
         text_parts: list[str] = []
@@ -177,6 +221,8 @@ class ClaudeEventProjector:
             elif block_type in {"tool_use", "server_tool_use"}:
                 name = str(block.get("name") or "tool")
                 tool_id = str(block.get("id") or "") or None
+                if tool_id:
+                    self._tool_name_by_id[tool_id] = name
                 if tool_id and tool_id in self._started_tools:
                     continue
                 if tool_id:
@@ -234,6 +280,7 @@ class ClaudeEventProjector:
                     "event_type": "tool.failed" if failed else "tool.completed",
                     "run_id": run_id,
                     "root_run_id": self.root_run_id,
+                    "tool_name": self._tool_name_by_id.get(tool_id or ""),
                     "tool_call_id": tool_id,
                     "error": "Claude tool returned an error" if failed else None,
                 },

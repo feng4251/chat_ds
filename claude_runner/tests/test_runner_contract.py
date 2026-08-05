@@ -17,7 +17,11 @@ from claude_runner.runner_entrypoint import (
     EventLedger,
     _claude_command,
     _native_checkpoint_exists,
+    _pending_plan_task_count,
     _safe_controller_exception_code,
+    _terminal_error,
+    _emit_workspace_artifacts,
+    _workspace_snapshot,
     _worker_environment,
 )
 
@@ -29,6 +33,7 @@ def _config(*, resume: bool = False) -> dict:
         "api_model": "glm-5.2",
         "max_output_tokens": 86400,
         "provider_claude_base_url": "https://api.shaiengine.com",
+        "native_web_tools": False,
         "prompt": "test",
     }
 
@@ -49,7 +54,7 @@ class RunnerCommandContractTests(unittest.TestCase):
         fresh = _config()
         command, prompt = _claude_command(fresh)
         self.assertEqual(prompt, b"test")
-        self.assertIn("--bare", command)
+        self.assertNotIn("--bare", command)
         self.assertIn("--no-chrome", command)
         self.assertIn("--thinking", command)
         self.assertIn("--strict-mcp-config", command)
@@ -58,6 +63,10 @@ class RunnerCommandContractTests(unittest.TestCase):
             "/skill-view/plugin/.mcp.json",
         )
         self.assertEqual(command[command.index("--tools") + 1], "default")
+        self.assertEqual(
+            command[command.index("--disallowedTools") + 1],
+            "WebFetch,WebSearch",
+        )
         self.assertEqual(command[command.index("--session-id") + 1], fresh["native_session_id"])
         self.assertNotIn("--resume", command)
 
@@ -69,6 +78,10 @@ class RunnerCommandContractTests(unittest.TestCase):
         )
         self.assertIn("--fork-session", command)
         self.assertEqual(command[command.index("--session-id") + 1], resumed["native_session_id"])
+
+        native_web = {**fresh, "native_web_tools": True}
+        command, _ = _claude_command(native_web)
+        self.assertNotIn("--disallowedTools", command)
 
     def test_worker_environment_is_explicit_and_binds_output_and_proxy(self):
         config = _config()
@@ -150,6 +163,133 @@ class RunnerCommandContractTests(unittest.TestCase):
             self.assertFalse(ledger.native_result_succeeded)
             self.assertEqual(ledger.native_result_count, 1)
             ledger.close()
+
+    def test_native_provider_status_is_retained_as_bounded_diagnostic(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = EventLedger(Path(temporary) / "events.jsonl")
+            ledger.append_line(
+                b'{"type":"result","subtype":"success","is_error":true,'
+                b'"api_error_status":403}',
+                channel="stdout",
+            )
+            self.assertEqual(ledger.native_api_error_status, 403)
+            ledger.close()
+
+    def test_exhausted_egress_receipt_beats_opaque_native_exit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = EventLedger(Path(temporary) / "events.jsonl")
+            ledger.append_line(
+                b'{"type":"result","subtype":"success","is_error":true}',
+                channel="stdout",
+            )
+            self.assertEqual(
+                _terminal_error(
+                    termination_reason=None,
+                    exit_code=1,
+                    ledger=ledger,
+                    checkpoint_ready=True,
+                    egress_receipt={"exhausted": True},
+                    pending_plan_task_count=0,
+                    pending_native_task_count=0,
+                ),
+                "egress_budget_exhausted",
+            )
+            ledger.close()
+
+    def test_native_subtask_lifecycle_and_plan_tasks_gate_success(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ledger = EventLedger(root / "events.jsonl")
+            ledger.append_line(
+                b'{"type":"system","subtype":"task_started",'
+                b'"task_id":"child-1"}',
+                channel="stdout",
+            )
+            self.assertEqual(ledger.active_native_task_count, 1)
+            ledger.append_line(
+                b'{"type":"system","subtype":"task_notification",'
+                b'"task_id":"child-1","status":"completed"}',
+                channel="stdout",
+            )
+            self.assertEqual(ledger.active_native_task_count, 0)
+            ledger.close()
+
+            native_session_id = str(uuid.uuid4())
+            task_root = root / "tasks" / native_session_id
+            task_root.mkdir(parents=True)
+            (task_root / "1.json").write_text(
+                json.dumps({"status": "in_progress"}),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                _pending_plan_task_count(root / "tasks", native_session_id),
+                1,
+            )
+            (task_root / "1.json").write_text(
+                json.dumps({"status": "completed"}),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                _pending_plan_task_count(root / "tasks", native_session_id),
+                0,
+            )
+
+    def test_workspace_snapshot_emits_only_new_or_mutated_regular_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            unchanged = workspace / "unchanged.txt"
+            unchanged.write_text("same", encoding="utf-8")
+            changed = workspace / "changed.md"
+            changed.write_text("old", encoding="utf-8")
+            before = _workspace_snapshot(workspace)
+
+            changed.write_text("new content", encoding="utf-8")
+            nested = workspace / "reports" / "final.md"
+            nested.parent.mkdir()
+            nested.write_text("result", encoding="utf-8")
+            after = _workspace_snapshot(workspace)
+
+            ledger_path = root / "events.jsonl"
+            ledger = EventLedger(ledger_path)
+            _emit_workspace_artifacts(
+                ledger=ledger,
+                run_id="a" * 32,
+                before=before,
+                after=after,
+                workspace_root=workspace,
+            )
+            ledger.close()
+            events = [
+                json.loads(line)["event"]
+                for line in ledger_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(
+                [event["path"] for event in events],
+                ["changed.md", "reports/final.md"],
+            )
+            self.assertTrue(all(
+                event["type"] == "chatds.workspace.artifact"
+                and len(event["sha256"]) == 64
+                and event["source_event_key"].startswith(
+                    "claude-workspace:" + "a" * 32
+                )
+                for event in events
+            ))
+
+    def test_workspace_snapshot_rejects_symlinks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / "target").write_text("target", encoding="utf-8")
+            (workspace / "link").symlink_to("target")
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "workspace_artifact_symlink_invalid",
+            ):
+                _workspace_snapshot(workspace)
 
     def test_candidate_checkpoint_must_be_one_regular_nonempty_transcript(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -264,14 +404,31 @@ class RunnerEgressPolicyTests(unittest.TestCase):
             rules,
         )
         self.assertIn(
+            (
+                "https://api.shaiengine.com:443/v1/messages?beta=true",
+                ("POST",),
+            ),
+            rules,
+        )
+        self.assertIn(
+            (
+                "https://api.shaiengine.com:443/v1/messages/count_tokens",
+                ("POST",),
+            ),
+            rules,
+        )
+        self.assertIn(
             ("https://news.example.net:443/item/42", ("GET", "HEAD")),
             rules,
         )
         for row in policy["egress_rules"]:
-            if row["url_prefix"] in {
-                "https://api.shaiengine.com:443/v1/messages",
-                "https://news.example.net:443/item/42",
-            }:
+            if (
+                row["url_prefix"].startswith(
+                    "https://api.shaiengine.com:443/v1/messages"
+                )
+                or row["url_prefix"]
+                == "https://news.example.net:443/item/42"
+            ):
                 self.assertIs(row.get("query_exact"), True)
         self.assertFalse(any("telemetry" in prefix for prefix, _methods in rules))
         self.assertEqual(policy["policy_version"], 3)
@@ -321,11 +478,35 @@ class RunnerEgressPolicyTests(unittest.TestCase):
             row for row in policy["egress_rules"]
             if "10.10.132.2" in row["url_prefix"]
         ]
-        self.assertEqual(provider_rules, [{
-            "url_prefix": "http://10.10.132.2:1025/v1/messages",
-            "methods": ["POST"],
-            "query_exact": True,
-        }])
+        self.assertEqual(provider_rules, [
+            {
+                "url_prefix": "http://10.10.132.2:1025/v1/messages",
+                "methods": ["POST"],
+                "query_exact": True,
+            },
+            {
+                "url_prefix": (
+                    "http://10.10.132.2:1025/v1/messages?beta=true"
+                ),
+                "methods": ["POST"],
+                "query_exact": True,
+            },
+            {
+                "url_prefix": (
+                    "http://10.10.132.2:1025/v1/messages/count_tokens"
+                ),
+                "methods": ["POST"],
+                "query_exact": True,
+            },
+            {
+                "url_prefix": (
+                    "http://10.10.132.2:1025/v1/messages/"
+                    "count_tokens?beta=true"
+                ),
+                "methods": ["POST"],
+                "query_exact": True,
+            },
+        ])
         self.assertEqual(
             policy["private_origins"], ["http://10.10.132.2:1025"]
         )
