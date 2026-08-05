@@ -372,6 +372,7 @@ async def _execute_job_once(
                     user_id=job.user_id,
                     title=f"定时任务 · {job.name}",
                     model_id=job.model_id or DEFAULT_AGENT_MODEL_ID,
+                    engine_id="legacy",
                 )
                 db.add(conv)
                 await db.flush()

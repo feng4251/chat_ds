@@ -12,6 +12,7 @@ from contextlib import AsyncExitStack
 from pathlib import Path
 
 import workspace as workspace_store
+from config import settings
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import case, desc, func, or_, select
@@ -20,6 +21,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from auth import get_current_user
 from database import get_db
 from models import (
+    AgentEngineRawEvent,
+    AgentEngineSession,
     AgentRun,
     AgentRunEvent,
     Artifact,
@@ -51,6 +54,7 @@ from workspace import (
 from hooks import emit_event
 from native_tools import DEFAULT_NATIVE_TOOL_SET, DEFAULT_NATIVE_TOOLS
 from model_routing import (
+    DEFAULT_AGENT_MODEL_ID,
     canonical_agent_model_id,
     filter_agentic_fallback_model_ids,
 )
@@ -85,6 +89,89 @@ async def _model_exists(model_id: str, user_id: str, db: AsyncSession) -> bool:
             CustomModelConfig.model_id == model_id,
         )
     )).scalar_one_or_none() is not None
+
+
+async def _engine_options_for_user(
+    *,
+    current_model_id: str,
+    user,
+    db: AsyncSession,
+) -> list[dict]:
+    """Return non-secret engine/model compatibility for safe UI switching.
+
+    Compatibility is derived from the same provider resolver used at Turn
+    dispatch.  The browser therefore never guesses that a Legacy model can be
+    sent through a deployment-owned Claude provider profile.
+    """
+
+    from routers.chat_router import (
+        BUILTIN,
+        claude_code_model_compatible,
+        resolve_model_config,
+    )
+
+    custom_ids = list((await db.execute(
+        select(CustomModelConfig.model_id).where(
+            CustomModelConfig.user_id == user.id,
+        ).order_by(CustomModelConfig.model_id)
+    )).scalars().all())
+    model_ids = list(dict.fromkeys([
+        *(
+            canonical_agent_model_id(model_id)
+            for model_id in BUILTIN
+            if model_id != "AgentModel"
+        ),
+        *custom_ids,
+    ]))
+    claude_model_ids: list[str] = []
+    for model_id in model_ids:
+        try:
+            provider = await resolve_model_config(model_id, user, db)
+        except HTTPException:
+            continue
+        if claude_code_model_compatible(provider):
+            claude_model_ids.append(model_id)
+
+    canonical_current = canonical_agent_model_id(current_model_id)
+    legacy_default = (
+        canonical_current
+        if canonical_current in model_ids
+        else DEFAULT_AGENT_MODEL_ID
+    )
+    options = [{
+        "id": "legacy",
+        "name": "ChatDS Legacy Harness",
+        "available": True,
+        "compatible_model_ids": model_ids,
+        "default_model_id": legacy_default,
+        "capabilities": ["skills", "multi_agent", "mcp", "sandbox"],
+    }]
+    if settings.claude_code_engine_enabled:
+        claude_default = (
+            canonical_current
+            if canonical_current in claude_model_ids
+            else DEFAULT_AGENT_MODEL_ID
+            if DEFAULT_AGENT_MODEL_ID in claude_model_ids
+            else claude_model_ids[0]
+            if claude_model_ids
+            else None
+        )
+        options.append({
+            "id": "claude_code",
+            "name": "Claude Code",
+            "available": bool(claude_model_ids),
+            "unavailable_reason": (
+                None
+                if claude_model_ids
+                else "No deployment-owned compatible model profile"
+            ),
+            "compatible_model_ids": claude_model_ids,
+            "default_model_id": claude_default,
+            "capabilities": [
+                "skills", "multi_agent", "sandbox", "native_resume",
+            ],
+        })
+    return options
 
 
 @router.get("/{cid}/workspace")
@@ -237,6 +324,17 @@ async def get_conversation_settings(
         requested_model_id=conv.model_id,
     )
     return {
+        "engine_id": conv.engine_id,
+        "engine_locked": bool((await db.execute(
+            select(func.count(Message.id)).where(Message.conversation_id == cid)
+        )).scalar_one() or (await db.execute(
+            select(func.count(AgentRun.id)).where(AgentRun.conversation_id == cid)
+        )).scalar_one()),
+        "engine_options": await _engine_options_for_user(
+            current_model_id=conv.model_id,
+            user=user,
+            db=db,
+        ),
         "model_id": canonical_agent_model_id(conv.model_id),
         "enabled_tools": serialize_json_list(conv.enabled_tools, DEFAULT_NATIVE_TOOLS),
         "fallback_model_ids": fallback_model_ids,
@@ -257,6 +355,25 @@ async def update_conversation_settings(
     db=Depends(get_db),
 ):
     conv = await _conversation(cid, user.id, db)
+    if payload.engine_id is not None and payload.engine_id != conv.engine_id:
+        from agent_engines.registry import build_agent_engine_registry
+
+        try:
+            build_agent_engine_registry().get(payload.engine_id)
+        except LookupError as exc:
+            raise HTTPException(400, "Requested Agent Engine is not configured") from exc
+        durable_turns = int((await db.execute(
+            select(func.count(Message.id)).where(Message.conversation_id == cid)
+        )).scalar_one())
+        durable_runs = int((await db.execute(
+            select(func.count(AgentRun.id)).where(AgentRun.conversation_id == cid)
+        )).scalar_one())
+        if durable_turns or durable_runs:
+            raise HTTPException(
+                409,
+                "Agent Engine is fixed after the first Turn; fork the Conversation to change it",
+            )
+        conv.engine_id = payload.engine_id
     if payload.model_id is not None:
         canonical_model_id = canonical_agent_model_id(payload.model_id)
         if not await _model_exists(canonical_model_id, user.id, db):
@@ -288,6 +405,18 @@ async def update_conversation_settings(
         if invalid:
             raise HTTPException(400, f"Unknown user-level skills: {sorted(invalid)}")
         conv.enabled_user_skills = json.dumps(list(dict.fromkeys(payload.enabled_user_skills)))
+    if conv.engine_id == "claude_code":
+        from routers.chat_router import (
+            claude_code_model_compatible,
+            resolve_model_config,
+        )
+
+        provider_config = await resolve_model_config(conv.model_id, user, db)
+        if not claude_code_model_compatible(provider_config):
+            raise HTTPException(
+                400,
+                "The selected model is not compatible with the Claude Code engine",
+            )
     await db.commit()
     return await get_conversation_settings(cid, user, db)
 
@@ -375,11 +504,14 @@ def _fork_snapshot_sha256(
     include_messages: bool,
     workspace_digest: str,
     skills_digest: str,
+    target_engine_id: str | None = None,
+    target_model_id: str | None = None,
 ) -> str:
     payload = {
         "source": {
             "title": source.title,
             "model_id": source.model_id,
+            "engine_id": source.engine_id,
             "enabled_tools": source.enabled_tools,
             "fallback_model_ids": source.fallback_model_ids,
             "enabled_user_skills": source.enabled_user_skills,
@@ -420,6 +552,13 @@ def _fork_snapshot_sha256(
         "workspace_digest": workspace_digest,
         "skills_digest": skills_digest,
     }
+    # Preserve the historic digest for ordinary same-engine forks, while
+    # binding an explicit engine/model transition into the immutable fork
+    # identity. This also lets pre-upgrade recovery journals remain valid.
+    if target_engine_id is not None:
+        payload["target_engine_id"] = target_engine_id
+    if target_model_id is not None:
+        payload["target_model_id"] = target_model_id
     return hashlib.sha256(
         json.dumps(
             payload,
@@ -462,6 +601,8 @@ def _prepare_fork_skill_snapshot(
     user_id: str,
     source_id: str,
     target_id: str,
+    target_engine_id: str | None,
+    target_model_id: str | None,
     skill_api,
 ) -> dict:
     """Copy/digest/persist a fork stage entirely off the asyncio loop."""
@@ -525,6 +666,8 @@ def _prepare_fork_skill_snapshot(
             include_messages=include_messages,
             workspace_digest=workspace_digest,
             skills_digest=skills_digest,
+            target_engine_id=target_engine_id,
+            target_model_id=target_model_id,
         )
         journal = {
             "version": 1,
@@ -539,6 +682,10 @@ def _prepare_fork_skill_snapshot(
             "skills_digest": skills_digest,
             "state": "prepared",
         }
+        if target_engine_id is not None:
+            journal["target_engine_id"] = target_engine_id
+        if target_model_id is not None:
+            journal["target_model_id"] = target_model_id
         skill_api._atomic_write_json(
             operation_dir / "journal.json",
             journal,
@@ -799,6 +946,8 @@ async def fork_conversation(
     title: str | None = None,
     include_messages: bool = True,
     fork_id: str | None = None,
+    target_engine_id: str | None = None,
+    target_model_id: str | None = None,
     user=Depends(get_current_user),
     db=Depends(get_db),
 ):
@@ -807,6 +956,8 @@ async def fork_conversation(
         title=title,
         include_messages=include_messages,
         fork_id=fork_id,
+        target_engine_id=target_engine_id,
+        target_model_id=target_model_id,
         user=user,
         db=db,
         source_maintenance_lease_already_held=False,
@@ -819,6 +970,8 @@ async def _fork_conversation_impl(
     title: str | None,
     include_messages: bool,
     fork_id: str | None,
+    target_engine_id: str | None = None,
+    target_model_id: str | None = None,
     user,
     db,
     source_maintenance_lease_already_held: bool,
@@ -898,6 +1051,45 @@ async def _fork_conversation_impl(
         )
         if True:
             source = await _conversation(cid, user.id, db)
+            requested_target_engine = (
+                str(target_engine_id).strip()
+                if target_engine_id is not None
+                else None
+            )
+            requested_target_model = (
+                canonical_agent_model_id(str(target_model_id).strip())
+                if target_model_id is not None
+                else None
+            )
+            effective_target_engine = requested_target_engine or source.engine_id
+            effective_target_model = requested_target_model or source.model_id
+            from agent_engines.base import ENGINE_ID_CLAUDE_CODE
+            from agent_engines.registry import build_agent_engine_registry
+            try:
+                build_agent_engine_registry().get(effective_target_engine)
+            except LookupError as exc:
+                raise HTTPException(
+                    400,
+                    "Requested target Agent Engine is not configured",
+                ) from exc
+            if not await _model_exists(effective_target_model, user.id, db):
+                raise HTTPException(400, "Requested target model is not configured")
+            if effective_target_engine == ENGINE_ID_CLAUDE_CODE:
+                from routers.chat_router import (
+                    claude_code_model_compatible,
+                    resolve_model_config,
+                )
+
+                target_provider = await resolve_model_config(
+                    effective_target_model,
+                    user,
+                    db,
+                )
+                if not claude_code_model_compatible(target_provider):
+                    raise HTTPException(
+                        400,
+                        "The target model has no deployment-owned Claude Code provider profile",
+                    )
             target = (await db.execute(
                 select(Conversation).where(
                     Conversation.id == target_id,
@@ -933,6 +1125,10 @@ async def _fork_conversation_impl(
                     or journal.get("title") != expected_title
                     or bool(journal.get("include_messages"))
                     != include_messages
+                    or journal.get("target_engine_id")
+                    != requested_target_engine
+                    or journal.get("target_model_id")
+                    != requested_target_model
                     or journal.get("snapshot_sha256")
                     != target.fork_snapshot_sha256
                     or journal.get("state")
@@ -950,6 +1146,8 @@ async def _fork_conversation_impl(
                 or journal.get("target_id") != target_id
                 or journal.get("title") != expected_title
                 or bool(journal.get("include_messages")) != include_messages
+                or journal.get("target_engine_id") != requested_target_engine
+                or journal.get("target_model_id") != requested_target_model
                 or journal.get("state") not in {"prepared", "published"}
             ):
                 raise HTTPException(
@@ -1044,6 +1242,8 @@ async def _fork_conversation_impl(
                             user_id=user.id,
                             source_id=cid,
                             target_id=target_id,
+                            target_engine_id=requested_target_engine,
+                            target_model_id=requested_target_model,
                             skill_api=skill_api,
                         )
                     )
@@ -1088,6 +1288,8 @@ async def _fork_conversation_impl(
                         skills_digest=str(
                             journal.get("skills_digest") or ""
                         ),
+                        target_engine_id=requested_target_engine,
+                        target_model_id=requested_target_model,
                     )
                 )
                 if current_snapshot != journal.get("snapshot_sha256"):
@@ -1140,7 +1342,8 @@ async def _fork_conversation_impl(
                         id=target_id,
                         user_id=user.id,
                         title=expected_title,
-                        model_id=source.model_id,
+                        model_id=effective_target_model,
+                        engine_id=effective_target_engine,
                         enabled_tools=source.enabled_tools,
                         fallback_model_ids=source.fallback_model_ids,
                         enabled_user_skills=source.enabled_user_skills,
@@ -1346,6 +1549,8 @@ async def _fork_conversation_impl(
             "conversation_id": target_id,
             "snapshot_sha256": journal["snapshot_sha256"],
             "idempotent": idempotent,
+            "engine_id": target.engine_id,
+            "model_id": target.model_id,
         },
         target_id,
     )
@@ -1356,6 +1561,8 @@ async def _fork_conversation_impl(
         "cloned_skill_count": len(cloned_skills),
         "skill_mcp_rebuild": mcp_rebuild,
         "fork_snapshot_sha256": journal["snapshot_sha256"],
+        "engine_id": target.engine_id,
+        "model_id": target.model_id,
         "idempotent": idempotent,
         "operation_status": "completed",
     }
@@ -1532,6 +1739,9 @@ def _run_to_dict(run: AgentRun) -> dict:
         "workspace_scope": run.workspace_scope or "shared_session",
         "workspace_ref": run.workspace_ref,
         "source": run.source,
+        "engine_id": run.engine_id,
+        "engine_version": run.engine_version,
+        "native_session_id": run.native_session_id,
         "requested_model_id": run.requested_model_id,
         "resolved_model_id": run.resolved_model_id,
         "status": run.status,
@@ -2761,6 +2971,55 @@ async def get_run_events(
         ],
         "limit": limit,
         "offset": offset,
+    }
+
+
+@router.get("/{cid}/runs/{run_id}/native-events")
+async def get_native_run_events(
+    cid: str,
+    run_id: str,
+    limit: int = Query(200, ge=1, le=1000),
+    after: int = Query(0, ge=0),
+    user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Return the lossless/native engine ledger index for debugging."""
+
+    await _conversation(cid, user.id, db)
+    run = (await db.execute(
+        select(AgentRun.id).where(
+            AgentRun.id == run_id,
+            AgentRun.conversation_id == cid,
+            AgentRun.user_id == user.id,
+        )
+    )).scalar_one_or_none()
+    if run is None:
+        raise HTTPException(404, "Run not found")
+    events = (await db.execute(
+        select(AgentEngineRawEvent)
+        .where(
+            AgentEngineRawEvent.run_id == run_id,
+            AgentEngineRawEvent.conversation_id == cid,
+            AgentEngineRawEvent.seq > after,
+        )
+        .order_by(AgentEngineRawEvent.seq)
+        .limit(limit)
+    )).scalars().all()
+    return {
+        "events": [
+            {
+                "seq": event.seq,
+                "engine_id": event.engine_id,
+                "native_event_id": event.native_event_id,
+                "native_event_type": event.native_event_type,
+                "payload": json.loads(event.payload),
+                "payload_sha256": event.payload_sha256,
+                "received_at": str(event.received_at),
+            }
+            for event in events
+        ],
+        "limit": limit,
+        "after": after,
     }
 
 

@@ -53,6 +53,12 @@ class Conversation(Base):
     model_id: Mapped[str] = mapped_column(
         String(64), nullable=False, default=DEFAULT_AGENT_MODEL_ID
     )
+    # The execution engine is a Conversation invariant.  It may be selected
+    # before the first durable turn; changing it later requires a fork so two
+    # incompatible native transcript/checkpoint formats are never spliced.
+    engine_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="legacy", server_default=text("'legacy'")
+    )
     enabled_tools: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     fallback_model_ids: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     enabled_user_skills: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -205,6 +211,13 @@ class AgentRun(Base):
     effective_tools: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     policy: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     source: Mapped[str] = mapped_column(String(24), nullable=False, default="chat")
+    engine_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="legacy", server_default=text("'legacy'"), index=True
+    )
+    engine_version: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    native_session_id: Mapped[Optional[str]] = mapped_column(
+        String(128), nullable=True, index=True
+    )
     requested_model_id: Mapped[str] = mapped_column(String(128), nullable=False)
     resolved_model_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="running")
@@ -216,6 +229,82 @@ class AgentRun(Base):
     total_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     started_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
+class AgentEngineSession(Base):
+    """Durable mapping from one ChatDS Conversation to native engine state."""
+
+    __tablename__ = "agent_engine_sessions"
+    __table_args__ = (
+        Index(
+            "ux_agent_engine_sessions_conversation_engine",
+            "conversation_id",
+            "engine_id",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=generate_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    conversation_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    engine_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    native_session_id: Mapped[Optional[str]] = mapped_column(
+        String(128), nullable=True, index=True
+    )
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="idle", index=True
+    )
+    active_run_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    skill_view_sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    engine_version: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    last_model_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    last_event_seq: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AgentEngineRawEvent(Base):
+    """Lossless native event ledger, separate from normalized UI events."""
+
+    __tablename__ = "agent_engine_raw_events"
+    __table_args__ = (
+        Index(
+            "ux_agent_engine_raw_events_run_seq",
+            "run_id",
+            "seq",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=generate_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    conversation_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    run_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    engine_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    native_event_id: Mapped[Optional[str]] = mapped_column(String(192), nullable=True)
+    native_event_type: Mapped[Optional[str]] = mapped_column(String(96), nullable=True, index=True)
+    payload: Mapped[str] = mapped_column(Text, nullable=False)
+    payload_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    received_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
 class AgentRunEvent(Base):

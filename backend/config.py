@@ -31,6 +31,13 @@ class Settings(BaseSettings):
     # duration.  Keep it above the Harness's four-hour absolute provider
     # ceiling so an outer transport cannot sever a healthy silent decoder.
     harness_stream_timeout_seconds: int = 18000
+    # Optional second execution engine. It is fail-closed unless the trusted
+    # Runner Supervisor and its networkless per-Turn container boundary are
+    # explicitly enabled by deployment configuration.
+    claude_code_engine_enabled: bool = False
+    claude_runner_url: str = "http://claude-runner-supervisor:8030"
+    claude_runner_stream_timeout_seconds: int = 18000
+    claude_code_provider_profiles: list[str] = ["shaiengine"]
     internal_api_token: str = "chat-ds-internal-token"
     scheduler_poll_seconds: int = 15
     hook_timeout_seconds: int = 8

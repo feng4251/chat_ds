@@ -11,6 +11,7 @@ SECCOMP_PATH = (
     PROJECT_ROOT / "executor/browser_runtime/seccomp_profile.json"
 )
 BASE_SECCOMP_PATH = PROJECT_ROOT / "executor/runtime/seccomp_profile.json"
+PROXY_DOCKERFILE_PATH = PROJECT_ROOT / "skill_egress_proxy/Dockerfile"
 
 
 class BrowserRuntimeTopologyTests(unittest.TestCase):
@@ -130,8 +131,19 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
             proxy["volumes"],
         )
         self.assertTrue(proxy["read_only"])
+        self.assertEqual(proxy["user"], "65531:65531")
         self.assertEqual(proxy["cap_drop"], ["ALL"])
-        self.assertIn("no-new-privileges:true", proxy["security_opt"])
+        # This host cannot stack NNP with any seccomp filter (runc errno 524).
+        # The proxy therefore keeps Docker's default seccomp while its image
+        # is attested as setid/capability stripped and runs non-root/capless.
+        self.assertNotIn("security_opt", proxy)
+        proxy_dockerfile = PROXY_DOCKERFILE_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            'org.opencontainers.image.chatds.setid-stripped="true"',
+            proxy_dockerfile,
+        )
+        self.assertIn("find / -xdev -type f -perm /6000", proxy_dockerfile)
+        self.assertIn("getcap -r /", proxy_dockerfile)
         self.assertNotIn("ports", proxy)
         self.assertEqual(self.services["executor"]["network_mode"], "none")
         self.assertEqual(
@@ -249,7 +261,13 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
     def test_workspace_lock_plane_is_local_and_backend_harness_only(self):
         self.assertEqual(
             self.compose["volumes"]["workspace_mutation_locks"],
-            {"driver": "local"},
+            {
+                "driver": "local",
+                "name": (
+                    "${WORKSPACE_MUTATION_LOCK_VOLUME_NAME:-"
+                    "chat_ds_workspace_mutation_locks}"
+                ),
+            },
         )
         expected_mount = {
             "type": "volume",
@@ -275,7 +293,10 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
                     self.fail(
                         "workspace lock plane must use nocopy long syntax"
                     )
-        self.assertEqual(consumers, {"backend", "harness"})
+        self.assertEqual(
+            consumers,
+            {"backend", "harness", "claude-runner-supervisor"},
+        )
         for name in consumers:
             environment = self.services[name]["environment"]
             self.assertEqual(

@@ -59,6 +59,7 @@ _LIGHTWEIGHT_MIGRATIONS = [
     "ALTER TABLE skill_packages ADD COLUMN bundle_source_path VARCHAR(512)",
     "CREATE INDEX IF NOT EXISTS ix_skill_packages_bundle_id ON skill_packages (bundle_id)",
     "ALTER TABLE conversations ADD COLUMN enabled_tools TEXT",
+    "ALTER TABLE conversations ADD COLUMN engine_id VARCHAR(32) NOT NULL DEFAULT 'legacy'",
     "ALTER TABLE conversations ADD COLUMN fallback_model_ids TEXT",
     "ALTER TABLE conversations ADD COLUMN enabled_user_skills TEXT",
     "ALTER TABLE conversations ADD COLUMN forked_from_conversation_id VARCHAR(32)",
@@ -86,6 +87,52 @@ _LIGHTWEIGHT_MIGRATIONS = [
     "ALTER TABLE agent_runs ADD COLUMN requested_tools TEXT",
     "ALTER TABLE agent_runs ADD COLUMN effective_tools TEXT",
     "ALTER TABLE agent_runs ADD COLUMN policy TEXT",
+    "ALTER TABLE agent_runs ADD COLUMN engine_id VARCHAR(32) NOT NULL DEFAULT 'legacy'",
+    "CREATE INDEX IF NOT EXISTS ix_agent_runs_engine_id ON agent_runs (engine_id)",
+    "ALTER TABLE agent_runs ADD COLUMN engine_version VARCHAR(64)",
+    "ALTER TABLE agent_runs ADD COLUMN native_session_id VARCHAR(128)",
+    "CREATE INDEX IF NOT EXISTS ix_agent_runs_native_session_id ON agent_runs (native_session_id)",
+    "CREATE TABLE IF NOT EXISTS agent_engine_sessions ("
+    "id VARCHAR(32) PRIMARY KEY, "
+    "user_id VARCHAR(32) NOT NULL, "
+    "conversation_id VARCHAR(32) NOT NULL, "
+    "engine_id VARCHAR(32) NOT NULL, "
+    "native_session_id VARCHAR(128), "
+    "status VARCHAR(24) NOT NULL DEFAULT 'idle', "
+    "active_run_id VARCHAR(32), "
+    "generation INTEGER NOT NULL DEFAULT 0, "
+    "skill_view_sha256 VARCHAR(64), "
+    "engine_version VARCHAR(64), "
+    "last_model_id VARCHAR(128), "
+    "last_event_seq INTEGER NOT NULL DEFAULT 0, "
+    "error TEXT, "
+    "created_at DATETIME DEFAULT CURRENT_TIMESTAMP, "
+    "updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+    "CREATE INDEX IF NOT EXISTS ix_agent_engine_sessions_user_id ON agent_engine_sessions (user_id)",
+    "CREATE INDEX IF NOT EXISTS ix_agent_engine_sessions_conversation_id ON agent_engine_sessions (conversation_id)",
+    "CREATE INDEX IF NOT EXISTS ix_agent_engine_sessions_engine_id ON agent_engine_sessions (engine_id)",
+    "CREATE INDEX IF NOT EXISTS ix_agent_engine_sessions_native_session_id ON agent_engine_sessions (native_session_id)",
+    "CREATE INDEX IF NOT EXISTS ix_agent_engine_sessions_status ON agent_engine_sessions (status)",
+    "CREATE INDEX IF NOT EXISTS ix_agent_engine_sessions_active_run_id ON agent_engine_sessions (active_run_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_agent_engine_sessions_conversation_engine ON agent_engine_sessions (conversation_id, engine_id)",
+    "CREATE TABLE IF NOT EXISTS agent_engine_raw_events ("
+    "id VARCHAR(32) PRIMARY KEY, "
+    "user_id VARCHAR(32) NOT NULL, "
+    "conversation_id VARCHAR(32) NOT NULL, "
+    "run_id VARCHAR(32) NOT NULL, "
+    "engine_id VARCHAR(32) NOT NULL, "
+    "seq INTEGER NOT NULL, "
+    "native_event_id VARCHAR(192), "
+    "native_event_type VARCHAR(96), "
+    "payload TEXT NOT NULL, "
+    "payload_sha256 VARCHAR(64) NOT NULL, "
+    "received_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+    "CREATE INDEX IF NOT EXISTS ix_agent_engine_raw_events_user_id ON agent_engine_raw_events (user_id)",
+    "CREATE INDEX IF NOT EXISTS ix_agent_engine_raw_events_conversation_id ON agent_engine_raw_events (conversation_id)",
+    "CREATE INDEX IF NOT EXISTS ix_agent_engine_raw_events_run_id ON agent_engine_raw_events (run_id)",
+    "CREATE INDEX IF NOT EXISTS ix_agent_engine_raw_events_engine_id ON agent_engine_raw_events (engine_id)",
+    "CREATE INDEX IF NOT EXISTS ix_agent_engine_raw_events_native_event_type ON agent_engine_raw_events (native_event_type)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_agent_engine_raw_events_run_seq ON agent_engine_raw_events (run_id, seq)",
     "CREATE TABLE IF NOT EXISTS agent_run_events ("
     "id VARCHAR(32) PRIMARY KEY, "
     "run_id VARCHAR(32) NOT NULL, "
@@ -181,6 +228,8 @@ _SKILL_PACKAGE_SCOPE_INDEXES = {
 }
 _ORPHAN_REPAIR_BATCH_SIZE = 500
 _SESSION_CONVERSATION_COLUMNS = (
+    ("agent_engine_raw_events", "conversation_id"),
+    ("agent_engine_sessions", "conversation_id"),
     ("agent_run_events", "conversation_id"),
     ("artifacts", "conversation_id"),
     ("task_items", "conversation_id"),
@@ -191,6 +240,8 @@ _SESSION_CONVERSATION_COLUMNS = (
     ("scheduled_jobs", "conversation_id"),
 )
 _USER_OWNED_TABLES = (
+    ("agent_engine_raw_events", "user_id"),
+    ("agent_engine_sessions", "user_id"),
     ("agent_run_events", "user_id"),
     ("artifacts", "user_id"),
     ("task_items", "user_id"),

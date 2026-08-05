@@ -1246,6 +1246,10 @@ export default function ChatArea({
           setSelectedModel(settings.model_id)
           onConvRefresh()
         }}
+        onConversationForked={(conversationId) => {
+          onConvRefresh()
+          onConvCreated(conversationId)
+        }}
       />
     </div>
   )

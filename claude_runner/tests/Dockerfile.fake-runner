@@ -1,0 +1,9 @@
+ARG BASE_IMAGE=chat_ds-claude-runner:candidate
+FROM ${BASE_IMAGE}
+
+COPY fake_claude.py /opt/chatds-fake/claude
+RUN rm -f /usr/local/bin/claude \
+    && chmod 0555 /opt/chatds-fake/claude \
+    && ln -s /opt/chatds-fake/claude /usr/local/bin/claude
+
+LABEL org.opencontainers.image.chatds.fixture="native-cli-no-provider"

@@ -8,6 +8,8 @@ from sqlalchemy import delete, desc, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from database import get_db
 from models import (
+    AgentEngineRawEvent,
+    AgentEngineSession,
     AgentRun,
     AgentRunEvent,
     Artifact,
@@ -149,7 +151,11 @@ async def create_conversation(
     db=Depends(get_db),
 ):
     """Create a new empty conversation."""
-    conv = Conversation(user_id=cur_user.id, model_id=DEFAULT_AGENT_MODEL_ID)
+    conv = Conversation(
+        user_id=cur_user.id,
+        model_id=DEFAULT_AGENT_MODEL_ID,
+        engine_id="legacy",
+    )
     db.add(conv)
     await db.commit()
     await db.refresh(conv)
@@ -159,6 +165,7 @@ async def create_conversation(
         {"conversation_id": conv.id}, conv.id,
     )
     return {"id": conv.id, "title": conv.title, "model_id": conv.model_id,
+            "engine_id": conv.engine_id,
             "created_at": str(conv.created_at), "updated_at": str(conv.updated_at)}
 
 
@@ -275,6 +282,7 @@ async def list_convs(cur_user=Depends(get_current_user), db=Depends(get_db)):
         )).scalar() or 0
         out.append(ConversationOut(
             id=c.id, title=c.title, model_id=c.model_id,
+            engine_id=c.engine_id,
             created_at=c.created_at, updated_at=c.updated_at,
             last_message=(lm.content[:100] if lm and lm.content else None),
             message_count=cnt,
@@ -329,7 +337,7 @@ async def _delete_conv_locked(cid: str, cur_user, db, skill_api):
         async def _cleanup_all_session_execution():
             return await asyncio.gather(
                 cancel_conversation_producers(cid),
-                _cleanup_harness_session(cur_user.id, cid),
+                _cleanup_agent_runtimes(cur_user.id, cid),
                 return_exceptions=True,
             )
 
@@ -391,6 +399,8 @@ async def _delete_conv_locked(cid: str, cur_user, db, skill_api):
             # databases may have been created before FK clauses existed, so
             # delete correctness never depends solely on ON DELETE CASCADE.
             for model in (
+                AgentEngineRawEvent,
+                AgentEngineSession,
                 AgentRunEvent,
                 Artifact,
                 TaskItem,
@@ -490,7 +500,7 @@ async def _delete_conv_locked(cid: str, cur_user, db, skill_api):
 
 
 async def _cleanup_harness_session(user_id: str, session_id: str) -> dict:
-    """Best-effort teardown of MCP subprocesses and session config."""
+    """Teardown Legacy MCP/process/session state."""
     try:
         # Revocation can spend up to 30s draining fence-owned resources and
         # persistent process cleanup has a bounded 60s close phase. Keep the
@@ -512,6 +522,52 @@ async def _cleanup_harness_session(user_id: str, session_id: str) -> dict:
             user_id, session_id, exc,
         )
         return {"success": False, "error": str(exc)}
+
+
+async def _cleanup_agent_runtimes(user_id: str, session_id: str) -> dict:
+    """Revoke every configured runtime before deleting Session authority."""
+
+    legacy = await _cleanup_harness_session(user_id, session_id)
+    claude = {"success": True, "execution_revocation": {"success": True}}
+    if settings.claude_code_engine_enabled:
+        from agent_engines.base import ENGINE_ID_CLAUDE_CODE
+        from agent_engines.registry import build_agent_engine_registry
+
+        try:
+            claude = dict(await build_agent_engine_registry().get(
+                ENGINE_ID_CLAUDE_CODE
+            ).cleanup_session(
+                user_id=user_id,
+                conversation_id=session_id,
+            ))
+        except Exception as exc:
+            logger.warning(
+                "Claude Runner session cleanup failed user=%s session=%s type=%s",
+                user_id,
+                session_id,
+                type(exc).__name__,
+            )
+            claude = {"success": False, "execution_revocation": {"success": False}}
+    legacy_revocation = legacy.get("execution_revocation")
+    legacy_revoked = bool(
+        isinstance(legacy_revocation, dict)
+        and legacy_revocation.get("success") is True
+    )
+    claude_revocation = claude.get("execution_revocation")
+    claude_revoked = bool(
+        isinstance(claude_revocation, dict)
+        and claude_revocation.get("success") is True
+    )
+    return {
+        "success": legacy.get("success") is True and claude.get("success") is True,
+        "execution_revocation": {
+            "success": legacy_revoked and claude_revoked,
+            "legacy": legacy_revocation,
+            "claude_code": claude_revocation,
+        },
+        "legacy": legacy,
+        "claude_code": claude,
+    }
 
 @router.get("/{cid}/messages")
 async def get_msgs(cid: str,

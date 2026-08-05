@@ -1,0 +1,33 @@
+# The repository root is used only by the optional Claude Runner images.
+# Fail closed: Docker must never receive workspace data, uploaded Skills,
+# local credentials, Git history, reference repositories, or generated output
+# as build context merely because those paths happen to exist in this checkout.
+*
+
+!.dockerignore
+
+!claude_runner/
+!claude_runner/Dockerfile.runner
+!claude_runner/Dockerfile.supervisor
+!claude_runner/__init__.py
+!claude_runner/config.py
+!claude_runner/policy.py
+!claude_runner/requirements.txt
+!claude_runner/runner_entrypoint.py
+!claude_runner/seccomp_profile.json
+!claude_runner/server.py
+
+!executor/
+!executor/browser_runtime/
+!executor/browser_runtime/seccomp_profile.json
+
+!harness/
+!harness/skills/
+!harness/skills/http_grants.py
+!harness/skills/path_safety.py
+!harness/tools/
+!harness/tools/context.py
+!harness/tools/session_sandbox_policy.py
+
+!backend/
+!backend/workspace_lock.py
