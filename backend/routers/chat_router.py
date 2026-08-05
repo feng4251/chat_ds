@@ -2863,6 +2863,7 @@ BUILTIN = {
         "thinking_send_enabled_explicitly": True,
         "capabilities": ["text", "tools", "reasoning"],
         "provider": "shaiengine",
+        "claude_provider_profile": "shaiengine",
         "protocol": "openai",
         "context_length": 200000,
         "discover_runtime_metadata": True,
@@ -2882,6 +2883,7 @@ BUILTIN = {
         "thinking_send_enabled_explicitly": True,
         "capabilities": ["text", "tools", "reasoning"],
         "provider": "shaiengine",
+        "claude_provider_profile": "shaiengine",
         "protocol": "openai",
         "context_length": 200000,
         "discover_runtime_metadata": True,
@@ -2901,6 +2903,7 @@ BUILTIN = {
         "thinking_request_format": "chat_template_kwargs",
         "capabilities": ["text", "tools", "reasoning"],
         "provider": "builtin",
+        "claude_provider_profile": "local_agentmodel",
         "protocol": "openai",
         "context_length": 303872,
         "discover_runtime_metadata": True,
@@ -2920,6 +2923,7 @@ BUILTIN = {
         "thinking_request_format": "chat_template_kwargs",
         "capabilities": ["text", "vision", "tools"],
         "provider": "builtin",
+        "claude_provider_profile": "local_qwen",
         "protocol": "openai",
         "context_length": 262144,
         "discover_runtime_metadata": True,
@@ -2948,9 +2952,11 @@ def claude_code_model_compatible(provider_config: dict) -> bool:
     # never forwarded from a user-defined model row.  Consequently protocol
     # shape alone is insufficient: the model must bind one explicitly
     # configured Runner profile.
+    profile = provider_config.get("claude_provider_profile")
     return (
-        str(provider_config.get("provider") or "")
-        in settings.claude_code_provider_profiles
+        isinstance(profile, str)
+        and bool(profile)
+        and profile in settings.claude_code_provider_profiles
     )
 
 
@@ -2982,6 +2988,7 @@ async def resolve_model_config(model_id: str, cur_user: User, db: AsyncSession) 
             "api_key": cfg["api_key"],
             "api_model": cfg["api_model"],
             "provider": cfg.get("provider", "builtin"),
+            "claude_provider_profile": cfg.get("claude_provider_profile"),
             "protocol": cfg.get("protocol", "openai"),
             "is_multimodal": cfg["is_multimodal"],
             "context_length": cfg.get("context_length", 262144),

@@ -278,7 +278,12 @@ services:
       # turn, this deployment allowlist, and the executor-signed run policy.
       # Hostname origins additionally require every DNS answer to remain
       # inside the configured CIDRs; literal IP origins are pinned exactly.
-      SKILL_EGRESS_PRIVATE_ORIGIN_ALLOWLIST: ${BROWSER_PRIVATE_ORIGIN_ALLOWLIST:-}
+      # A deployment profile is not, by itself, a network grant. Keep the
+      # private Claude Provider origins in a second explicit allowlist and
+      # merge them only at the trusted proxy boundary. Signed Turn policy must
+      # still name the exact selected origin and /v1/messages request.
+      SKILL_EGRESS_PRIVATE_ORIGIN_ALLOWLIST: >-
+        ${BROWSER_PRIVATE_ORIGIN_ALLOWLIST:-},${CLAUDE_PROVIDER_PRIVATE_ORIGIN_ALLOWLIST:-http://10.10.132.2:1025,http://10.10.132.128:1025}
       SKILL_EGRESS_PRIVATE_CIDR_ALLOWLIST: ${SKILL_EGRESS_PRIVATE_CIDR_ALLOWLIST:-}
       # Preferred certificate exceptions are scoped to canonical HTTPS
       # origins as JSON.  The legacy pin list is only consulted after the
@@ -382,6 +387,17 @@ services:
       SKILL_EGRESS_POLICY_TOKEN: ${EXECUTOR_V2_AUTH_TOKEN:-}
       SHAIENGINE_BASE_URL: ${SHAIENGINE_BASE_URL:-https://api.shaiengine.com/v1}
       SHAIENGINE_API_KEY: ${SHAIENGINE_API_KEY:-}
+      DEEPSEEK_PRO_BASE_URL: ${DEEPSEEK_PRO_BASE_URL:-http://10.10.132.2:1025/v1}
+      DEEPSEEK_PRO_API_KEY: ${DEEPSEEK_PRO_API_KEY:-EMPTY}
+      QWEN3_5_BASE_URL: ${QWEN3_5_BASE_URL:-http://10.10.132.128:1025/v1}
+      QWEN3_5_API_KEY: ${QWEN3_5_API_KEY:-EMPTY}
+      CLAUDE_PROVIDER_PRIVATE_ORIGIN_ALLOWLIST: >-
+        ${CLAUDE_PROVIDER_PRIVATE_ORIGIN_ALLOWLIST:-http://10.10.132.2:1025,http://10.10.132.128:1025}
+      # backend_protocol attests the existing ChatDS/Legacy model catalog.
+      # Every Claude Turn below still uses ANTHROPIC_BASE_URL and the native
+      # /v1/messages route; both local providers expose that facade.
+      CLAUDE_PROVIDER_PROFILES_JSON: >-
+        {"shaiengine":{"backend_base_url":"${SHAIENGINE_BASE_URL:-https://api.shaiengine.com/v1}","api_key_env":"SHAIENGINE_API_KEY","backend_protocol":"openai","models":["glm-5.2","deepseek-v4-pro"]},"local_agentmodel":{"backend_base_url":"${DEEPSEEK_PRO_BASE_URL:-http://10.10.132.2:1025/v1}","api_key_env":"DEEPSEEK_PRO_API_KEY","backend_protocol":"openai","models":["AgentModel"]},"local_qwen":{"backend_base_url":"${QWEN3_5_BASE_URL:-http://10.10.132.128:1025/v1}","api_key_env":"QWEN3_5_API_KEY","backend_protocol":"openai","models":["qwen3_5"]}}
       CLAUDE_WORKSPACE_HOST_ROOT: /nfs/temp/chat_ds
       CLAUDE_RUNNER_STATE_ROOT: /var/lib/chatds-claude-runner
       CLAUDE_RUNNER_IMAGE: chat_ds-claude-runner:2.1.152
@@ -654,10 +670,13 @@ services:
       CLAUDE_CODE_ENGINE_ENABLED: ${CLAUDE_CODE_ENGINE_ENABLED:-false}
       CLAUDE_RUNNER_URL: http://claude-runner-supervisor:8030
       CLAUDE_RUNNER_STREAM_TIMEOUT_SECONDS: ${CLAUDE_RUNNER_STREAM_TIMEOUT_SECONDS:-18000}
-      CLAUDE_CODE_PROVIDER_PROFILES: '["shaiengine"]'
+      CLAUDE_CODE_PROVIDER_PROFILES: >-
+        ["shaiengine","local_agentmodel","local_qwen"]
       # Primary AgentModel (GLM-5.2) and auxiliary multimodal endpoint.
       DEEPSEEK_PRO_BASE_URL: ${DEEPSEEK_PRO_BASE_URL:-http://10.10.132.2:1025/v1}
+      DEEPSEEK_PRO_API_KEY: ${DEEPSEEK_PRO_API_KEY:-EMPTY}
       QWEN3_5_BASE_URL: ${QWEN3_5_BASE_URL:-http://10.10.132.128:1025/v1}
+      QWEN3_5_API_KEY: ${QWEN3_5_API_KEY:-EMPTY}
       SHAIENGINE_BASE_URL: ${SHAIENGINE_BASE_URL:-https://api.shaiengine.com/v1}
       SHAIENGINE_API_KEY: ${SHAIENGINE_API_KEY:-}
       AGENT_DEBUG_TRACE: ${AGENT_DEBUG_TRACE:-true}

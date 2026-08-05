@@ -12,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from agent_engines.claude_events import ClaudeEventProjector
+from agent_engines.claude_code import ClaudeCodeEngine
 from agent_engines import lifecycle as engine_lifecycle
 from agent_engines.skill_view import (
     SkillViewError,
@@ -433,6 +434,75 @@ class EngineModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(claude["default_model_id"], "shaiengine_glm_5_2")
         self.assertNotIn("deepseek_v4_pro", claude["compatible_model_ids"])
+
+    async def test_explicit_local_profiles_expose_only_their_bound_models(self):
+        profiles = ["shaiengine", "local_agentmodel", "local_qwen"]
+        with (
+            patch.object(settings, "claude_code_engine_enabled", True),
+            patch.object(settings, "claude_code_provider_profiles", profiles),
+        ):
+            async with self.sessions() as db:
+                options = await workspace_router._engine_options_for_user(
+                    current_model_id="deepseek_v4_pro",
+                    user=self.user,
+                    db=db,
+                )
+        claude = next(item for item in options if item["id"] == "claude_code")
+        self.assertEqual(claude["compatible_model_ids"], [
+            "shaiengine_glm_5_2",
+            "shaiengine_deepseek_v4_pro",
+            "deepseek_v4_pro",
+            "qwen3_5",
+        ])
+        self.assertEqual(claude["default_model_id"], "deepseek_v4_pro")
+
+    def test_provider_family_without_explicit_profile_is_not_compatible(self):
+        with patch.object(
+            settings,
+            "claude_code_provider_profiles",
+            ["shaiengine", "local_agentmodel", "local_qwen"],
+        ):
+            self.assertFalse(chat_router.claude_code_model_compatible({
+                "provider": "builtin",
+            }))
+            self.assertTrue(chat_router.claude_code_model_compatible({
+                "provider": "builtin",
+                "claude_provider_profile": "local_agentmodel",
+            }))
+
+    def test_claude_payload_uses_explicit_profile_and_omits_caller_secret(self):
+        engine = ClaudeCodeEngine(
+            base_url="http://runner.test",
+            internal_token="fixture-internal-token",
+            timeout_seconds=60,
+        )
+        request = SimpleNamespace(
+            run_id="1" * 32,
+            root_run_id="1" * 32,
+            user_id="2" * 32,
+            conversation_id="3" * 32,
+            model_id="deepseek_v4_pro",
+            api_model="AgentModel",
+            provider_config={
+                "provider": "builtin",
+                "claude_provider_profile": "local_agentmodel",
+                "base_url": "http://10.10.132.2:1025/v1",
+                "protocol": "openai",
+                "api_key": "must-not-cross-the-engine-boundary",
+            },
+            messages=({"role": "user", "content": "fixture"},),
+            max_output_tokens=8,
+            metadata={"workspace_path": "/workspace", "user_turn_text": "fixture"},
+            skill_view_path="/skill-view",
+            skill_view_sha256="a" * 64,
+            native_session_id="4" * 32,
+            resume_from_native_session_id=None,
+            source="chat",
+        )
+        payload = engine._start_payload(request)
+        self.assertEqual(payload["provider_profile"], "local_agentmodel")
+        self.assertNotIn("api_key", payload)
+        self.assertNotIn("must-not-cross", json.dumps(payload))
 
     async def test_backend_models_do_not_disappear_when_harness_is_unavailable(self):
         with patch.object(

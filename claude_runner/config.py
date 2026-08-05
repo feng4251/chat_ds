@@ -16,6 +16,9 @@ class RunnerConfigurationError(RuntimeError):
 @dataclass(frozen=True, slots=True)
 class ProviderProfile:
     id: str
+    # These two fields attest the model row received from ChatDS. They may
+    # describe the Legacy engine's OpenAI-compatible route; Claude Code itself
+    # always uses ``claude_base_url`` through Anthropic Messages.
     backend_base_url: str
     backend_protocol: str
     claude_base_url: str
@@ -79,11 +82,19 @@ def load_settings() -> RunnerSettings:
     profiles = _provider_profiles()
     if not profiles:
         raise RunnerConfigurationError("No Claude-compatible provider profile is configured")
-    private_values = tuple(
+    # Browser/user retrieval and deployment-owned private model providers are
+    # separate authorities.  The egress compiler still grants only the exact
+    # selected Provider's /v1/messages endpoint; listing a Provider origin
+    # here does not grant Skills or arbitrary paths access to that host.
+    private_values = tuple(dict.fromkeys(
         value.strip()
-        for value in os.environ.get("BROWSER_PRIVATE_ORIGIN_ALLOWLIST", "").replace(";", ",").split(",")
+        for variable in (
+            "BROWSER_PRIVATE_ORIGIN_ALLOWLIST",
+            "CLAUDE_PROVIDER_PRIVATE_ORIGIN_ALLOWLIST",
+        )
+        for value in os.environ.get(variable, "").replace(";", ",").split(",")
         if value.strip()
-    )
+    ))
     security_mode = os.environ.get(
         "CLAUDE_RUNNER_SECURITY_MODE",
         "seccomp_no_new_privileges",
