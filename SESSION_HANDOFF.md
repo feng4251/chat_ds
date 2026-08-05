@@ -1,4 +1,4 @@
-# ChatDS 当前会话交接（2026-08-04）
+# ChatDS 当前会话交接（2026-08-05）
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
@@ -37,6 +37,27 @@
   Supervisor → 动态 Docker Turn → 回环代理/零出站 → native stream → checkpoint → 唯一 terminal
   链，结果为 `succeeded`、4 events、1 native result、checkpoint present、0 egress connections。
   本轮未自动运行模型重型 V2.3 E2E。
+- `ClaudeCodeEngine` 实现已本地提交为
+  `6ad54bd1 feat: add isolated Claude Code agent engine`，并于 2026-08-05 从 clean archive
+  `/tmp/chat_ds_deploy_6ad54bd1.bEDuDE` 部署到本机生产。上线前 SQLite 在线备份为 Docker volume
+  `chat_ds_db_backup_pre_6ad54bd1_20260805_155037`，大小 `263704576` bytes，SHA-256
+  `0051a84ddd7d7f854fdb1953351fb28a2f3dcc55fa76c8134ba636cce7e03d2b`，quick/FK 均通过。
+  当前生产镜像为 Egress Proxy
+  `sha256:8b79b29d59605ebe54b3d12200a071b54ce2eb294a027f24fe692898827ef2f4`、Claude Runner
+  `sha256:80ca75f505c8a05c455aa0149216a6e04fb305819b22d53d2061c6eeb9d262ed`、Supervisor
+  `sha256:9313a7b8744ccdab722baeb662a31212591883b3fb23d1358b69c20fb2433f1d`、Backend
+  `sha256:2e00fd967f83053c221c50c784b661b888ab009572f5c45a03e2e4efbb28ca71`、Frontend
+  `sha256:bcff7403fcbeaad8e5b1bf4f42258ddbeb662a9787b3078a75f9152d712c4ef2`。Proxy、Supervisor、Backend
+  均 healthy/restart 0，Frontend running/restart 0；后端实际发现 `legacy` 与 `claude_code` 都
+  available，Claude 版本为 `2.1.152`。`127.0.0.1`、`10.10.132.126`、`172.30.100.126` 的
+  `:5173/` 与 `/api/health` 均返回 200；新表/列、SQLite quick/FK、零 active run、零残留 Claude
+  Turn container 均通过。生产 `.env` 保持 root:root/0600，只持久加入非秘密开关
+  `CLAUDE_CODE_ENGINE_ENABLED=true`；发布时通过 `/dev/shm` 的 0600 短生命周期副本传给 Compose，
+  没有打印或持久复制凭据。旧 Legacy Harness 与四个既有 Executor 未在本轮重建。
+- BuildKit 首次构建 `executor/Dockerfile.browser-runtime` 时仅因远端
+  `docker/dockerfile:1.7` frontend 元数据连接重置而失败；该 Dockerfile 没有使用 1.7 专属语法，
+  因此已删除不必要的 `# syntax=` 远端依赖。正常 BuildKit `node-deps` target 随后从正确
+  `executor/` context 构建通过，日志不再请求 Dockerfile frontend；digest-pinned 基础镜像约束不变。
 - 2026-08-04 用户更新了双 Skill 迭代的成熟实现对照规则：以 ChatDS 为实现基础继续迭代，
   本地独立仓库 `claude-code/`（当前冻结 commit
   `6f6f12b37f529488b10e53928dd5508bb93535c7`）是从现在起唯一的成熟 Harness 实现参考。
@@ -2035,6 +2056,11 @@ Round 17 的两个全新 case。不得复用
 
 ## 10. 已知非 blocker 边界
 
+- 本轮没有重建四个既有 Legacy Executor 与 Browser；其 Docker `unhealthy` 是旧容器 healthcheck
+  `exec` 在本宿主触发已复现的 `no-new-privileges + seccomp -> errno 524`，不是主进程退出，现有
+  Harness 请求路径仍在工作。Claude Runner/Proxy 已采用上述已验证的 host-compatible 安全模式并
+  均 healthy。不要仅为消除状态标签而放松 Legacy 隔离；若后续迁移 Legacy 容器，应先在基础镜像
+  清除 setid/file-capability、校验 label，再逐槽 drained rollout 并运行完整 sandbox 回归。
 - V2.3 与 ground truth 的业务级一致性仍需真实模型重型 E2E；基础回归不能替代这项验收。
   用户最新授权继续 Round 17--18；Round 16 已闭环。Round 18 后如仍需模型重型 E2E，必须
   重新获得授权。
