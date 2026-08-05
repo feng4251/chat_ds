@@ -1,0 +1,1465 @@
+"""Trusted Docker supervisor for isolated Claude Code Turns."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import os
+import re
+import shutil
+import stat
+import threading
+import time
+import uuid
+from contextlib import asynccontextmanager, contextmanager
+from pathlib import Path
+from typing import Any, AsyncIterator
+
+try:
+    import docker
+    from docker.errors import DockerException, ImageNotFound, NotFound
+except ModuleNotFoundError:  # pragma: no cover - production image pins Docker SDK
+    docker = None
+
+    class DockerException(Exception):
+        pass
+
+    class ImageNotFound(DockerException):
+        pass
+
+    class NotFound(DockerException):
+        pass
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field, model_validator
+
+from .config import ProviderProfile, RunnerSettings, load_settings
+from .policy import compile_turn_egress_policy
+from workspace_lock import workspace_mutation_guard
+
+
+logger = logging.getLogger(__name__)
+SAFE_ID = re.compile(r"^[0-9a-f]{32}$")
+TERMINAL_STATUSES = frozenset({"succeeded", "failed", "cancelled", "interrupted"})
+MAX_REQUEST_BYTES = 64 * 1024 * 1024
+MAX_WORKSPACE_ENTRIES = 200_000
+SECCOMP_PROFILE_PATH = Path("/app/claude_runner/seccomp_profile.json")
+SETID_STRIPPED_LABEL = "org.opencontainers.image.chatds.setid-stripped"
+EGRESS_POLICY_LABEL = "org.opencontainers.image.chatds.egress-policy"
+EXPECTED_EGRESS_POLICY_RUNTIME = "signed-exact-query-v1"
+_STATUS_UPDATE_LOCK = threading.RLock()
+
+
+class StartRunRequest(BaseModel):
+    run_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    root_run_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    user_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    conversation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    model_id: str = Field(min_length=1, max_length=128)
+    api_model: str = Field(min_length=1, max_length=128)
+    provider_profile: str = Field(min_length=1, max_length=64)
+    provider_base_url: str = Field(min_length=8, max_length=2048)
+    provider_protocol: str = Field(max_length=32)
+    messages: list[dict[str, Any]] = Field(max_length=4096)
+    max_output_tokens: int = Field(ge=1, le=262144)
+    workspace_path: str = Field(min_length=1, max_length=4096)
+    skill_view_path: str = Field(min_length=1, max_length=4096)
+    skill_view_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    native_session_id: str = Field(
+        pattern=(
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+            r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        )
+    )
+    resume_from_native_session_id: str | None = Field(
+        default=None,
+        pattern=(
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+            r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        ),
+    )
+    source: str = Field(default="chat", max_length=24)
+    user_turn_text: str = Field(default="", max_length=2_000_000)
+
+    @model_validator(mode="after")
+    def bounded_payload(self):
+        encoded = json.dumps(
+            self.model_dump(), ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        ).encode("utf-8")
+        if len(encoded) > MAX_REQUEST_BYTES:
+            raise ValueError("Claude run request is too large")
+        return self
+
+
+class RunIdentityRequest(BaseModel):
+    user_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    conversation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+
+
+class SessionIdentityRequest(BaseModel):
+    user_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+
+
+class RunManager:
+    def __init__(self, settings: RunnerSettings, client) -> None:
+        self.settings = settings
+        self.client = client
+        self._semaphore = asyncio.Semaphore(settings.max_concurrent_runs)
+        self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._guard = asyncio.Lock()
+        self._draining = False
+        self._revoked_sessions: set[tuple[str, str]] = set()
+        self._index_root = settings.state_root / "run-index"
+        self._index_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self._index_root, 0o700)
+
+    async def start(self, request: StartRunRequest) -> dict[str, Any]:
+        async with self._guard:
+            if (request.user_id, request.conversation_id) in self._revoked_sessions:
+                raise HTTPException(410, "Session execution has been revoked")
+            return self._start_locked(request)
+
+    def _start_locked(self, request: StartRunRequest) -> dict[str, Any]:
+        workspace, skill_view, state = self._validate_paths(request)
+        profile = self._provider(request)
+        native_session_id = request.native_session_id
+        run_dir = state / "control" / "runs" / request.run_id
+        run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        request_path = run_dir / "request.json"
+        status_path = run_dir / "status.json"
+        resume_from_native_session_id = (
+            request.resume_from_native_session_id
+            if request.resume_from_native_session_id
+            and _native_transcript_exists(
+                state, request.resume_from_native_session_id
+            )
+            else None
+        )
+        prompt = _build_prompt(
+            request.messages,
+            resume=resume_from_native_session_id is not None,
+        )
+        policy = compile_turn_egress_policy(
+            skill_view_root=skill_view,
+            skill_view_sha256=request.skill_view_sha256,
+            user_turn_text=request.user_turn_text,
+            provider_base_url=profile.claude_base_url,
+            configured_private_origins=self.settings.private_origin_allowlist,
+            budget_scope_sha256=_scope_digest(
+                "budget", request.user_id, request.conversation_id, request.root_run_id
+            ),
+            call_id_sha256=_scope_digest("call", request.root_run_id, request.run_id),
+            limits={
+                "max_outbound_bytes": int(os.environ.get(
+                    "CLAUDE_EGRESS_MAX_OUTBOUND_BYTES", "67108864"
+                )),
+                "max_requests": int(os.environ.get("CLAUDE_EGRESS_MAX_REQUESTS", "8192")),
+                "max_response_wire_bytes": int(os.environ.get(
+                    "CLAUDE_EGRESS_MAX_RESPONSE_WIRE_BYTES", "2147483648"
+                )),
+            },
+        )
+        sanitized = {
+            "schema": "chatds.claude-run.v1",
+            "run_id": request.run_id,
+            "root_run_id": request.root_run_id,
+            "user_id": request.user_id,
+            "conversation_id": request.conversation_id,
+            "model_id": request.model_id,
+            "api_model": request.api_model,
+            "provider_profile": profile.id,
+            "provider_backend_base_url": profile.backend_base_url,
+            "provider_claude_base_url": profile.claude_base_url,
+            "provider_protocol": request.provider_protocol,
+            "native_session_id": native_session_id,
+            "resume_from_native_session_id": resume_from_native_session_id,
+            "max_output_tokens": request.max_output_tokens,
+            "prompt": prompt,
+            "workspace_path": str(workspace),
+            "skill_view_path": str(skill_view),
+            "skill_view_sha256": request.skill_view_sha256,
+            "source": request.source,
+            "egress_policy": policy,
+        }
+        digest = _canonical_sha256(sanitized)
+        sanitized["request_sha256"] = digest
+        if request_path.exists():
+            existing = _read_json(request_path)
+            if existing.get("request_sha256") != digest:
+                raise HTTPException(409, "Run id already belongs to a different request")
+            status = _read_json(status_path)
+            self._ensure_run_locator(request)
+            return {
+                "accepted": True,
+                "idempotent": True,
+                "run_id": request.run_id,
+                "native_session_id": native_session_id,
+                "status": status.get("status", "unknown"),
+            }
+        _atomic_json(request_path, sanitized, mode=0o600)
+        _atomic_json(status_path, {
+            "schema": "chatds.claude-run-status.v1",
+            "run_id": request.run_id,
+            "user_id": request.user_id,
+            "conversation_id": request.conversation_id,
+            "status": "queued",
+            "phase": "queued",
+            "container_id": None,
+            "created_at_unix_ms": int(time.time() * 1000),
+        }, mode=0o600)
+        self._ensure_run_locator(request)
+        existing_task = self._tasks.get(request.run_id)
+        if existing_task is None or existing_task.done():
+            task = asyncio.create_task(
+                self._execute(
+                    request=request,
+                    workspace=workspace,
+                    skill_view=skill_view,
+                    state=state,
+                    run_dir=run_dir,
+                    request_path=request_path,
+                    status_path=status_path,
+                    profile=profile,
+                ),
+                name=f"claude-run-{request.run_id}",
+            )
+            self._tasks[request.run_id] = task
+            task.add_done_callback(lambda _task, run_id=request.run_id: self._task_done(run_id))
+        return {
+            "accepted": True,
+            "idempotent": False,
+            "run_id": request.run_id,
+            "native_session_id": native_session_id,
+            "status": "queued",
+        }
+
+    def _task_done(self, run_id: str) -> None:
+        task = self._tasks.get(run_id)
+        if task is not None and task.done():
+            try:
+                if not task.cancelled():
+                    task.result()
+            except asyncio.CancelledError:
+                pass
+            except BaseException:
+                logger.exception("Claude run supervisor task failed run=%s", run_id)
+            finally:
+                self._tasks.pop(run_id, None)
+
+    def _locator_path(self, run_id: str) -> Path:
+        if not SAFE_ID.fullmatch(run_id):
+            raise HTTPException(404, "Run not found")
+        return self._index_root / f"{run_id}.json"
+
+    def _ensure_run_locator(self, request: StartRunRequest) -> None:
+        path = self._locator_path(request.run_id)
+        value = {
+            "schema": "chatds.claude-run-locator.v1",
+            "run_id": request.run_id,
+            "user_id": request.user_id,
+            "conversation_id": request.conversation_id,
+        }
+        try:
+            _atomic_create_json(path, value, mode=0o600)
+        except FileExistsError:
+            if _read_json(path) != value:
+                raise HTTPException(409, "Run locator identity conflict")
+
+    def _read_run_locator(self, run_id: str) -> dict[str, str]:
+        value = _read_json(self._locator_path(run_id))
+        if (
+            value.get("schema") != "chatds.claude-run-locator.v1"
+            or value.get("run_id") != run_id
+            or not SAFE_ID.fullmatch(str(value.get("user_id") or ""))
+            or not SAFE_ID.fullmatch(str(value.get("conversation_id") or ""))
+        ):
+            raise HTTPException(404, "Run state is unavailable")
+        return {
+            "run_id": run_id,
+            "user_id": str(value["user_id"]),
+            "conversation_id": str(value["conversation_id"]),
+        }
+
+    async def reconcile_existing_containers(self) -> dict[str, int]:
+        """Adopt trusted per-Turn containers after a Supervisor restart."""
+
+        containers = await asyncio.to_thread(
+            self.client.containers.list,
+            all=True,
+            filters={"label": "chatds.component=claude-runner"},
+        )
+        adopted = 0
+        removed_unknown = 0
+        active_container_runs: set[str] = set()
+        for container in containers:
+            run_id = str((container.labels or {}).get("chatds.run_id") or "")
+            try:
+                locator = self._read_run_locator(run_id)
+                run_dir = self._run_dir(
+                    locator["user_id"], locator["conversation_id"], run_id
+                )
+                request = _read_json(run_dir / "request.json")
+                status_path = run_dir / "status.json"
+                status = _read_json(status_path)
+                if (
+                    request.get("user_id") != locator["user_id"]
+                    or request.get("conversation_id") != locator["conversation_id"]
+                    or status.get("user_id") != locator["user_id"]
+                    or status.get("conversation_id") != locator["conversation_id"]
+                ):
+                    raise HTTPException(404, "Run identity mismatch")
+            except (HTTPException, OSError, ValueError, TypeError):
+                await asyncio.to_thread(container.remove, force=True)
+                removed_unknown += 1
+                continue
+            terminal = _terminal_status(run_dir / "events.jsonl")
+            if terminal is not None or str(status.get("status") or "") in TERMINAL_STATUSES:
+                await asyncio.to_thread(container.remove, force=True)
+                _update_status(
+                    status_path,
+                    status=terminal or str(status.get("status") or "failed"),
+                    phase="terminal",
+                    container_id=None,
+                )
+                continue
+            active_container_runs.add(run_id)
+            _update_status(
+                status_path,
+                status="running",
+                phase="running",
+                container_id=container.id,
+            )
+            created_ms = int(status.get("created_at_unix_ms") or int(time.time() * 1000))
+            elapsed = max(0.0, time.time() - created_ms / 1000.0)
+            remaining = max(0.0, self.settings.max_run_seconds - elapsed)
+            task = asyncio.create_task(
+                self._adopt_existing_container(
+                    container,
+                    run_id=run_id,
+                    run_dir=run_dir,
+                    status_path=status_path,
+                    remaining_seconds=remaining,
+                ),
+                name=f"claude-adopt-{run_id}",
+            )
+            self._tasks[run_id] = task
+            task.add_done_callback(
+                lambda _task, adopted_run_id=run_id: self._task_done(adopted_run_id)
+            )
+            adopted += 1
+
+        failed_orphans = 0
+        requeued = 0
+        for locator_path in self._index_root.glob("*.json"):
+            run_id = locator_path.stem
+            if not SAFE_ID.fullmatch(run_id) or run_id in active_container_runs:
+                continue
+            try:
+                locator = self._read_run_locator(run_id)
+                run_dir = self._run_dir(
+                    locator["user_id"], locator["conversation_id"], run_id
+                )
+                status_path = run_dir / "status.json"
+                status = _read_json(status_path)
+            except (HTTPException, OSError, ValueError, TypeError):
+                continue
+            terminal = _terminal_status(run_dir / "events.jsonl")
+            current_status = str(status.get("status") or "")
+            if terminal is not None or current_status in TERMINAL_STATUSES:
+                continue
+            if status.get("cancellation_requested"):
+                _ensure_terminal_event(
+                    run_dir / "events.jsonl",
+                    status="cancelled",
+                    error=None,
+                )
+                _update_status(
+                    status_path,
+                    status="cancelled",
+                    phase="terminal",
+                    container_id=None,
+                )
+                continue
+            if current_status in {"queued", "starting"}:
+                try:
+                    request = _recover_start_request(run_dir / "request.json")
+                    workspace, skill_view, state = self._validate_paths(request)
+                    profile = self._provider(request)
+                except (HTTPException, OSError, ValueError, TypeError):
+                    request = None
+                if request is not None:
+                    _update_status(
+                        status_path,
+                        status="queued",
+                        phase="queued",
+                        container_id=None,
+                        recovered_after_restart=True,
+                    )
+                    task = asyncio.create_task(
+                        self._execute(
+                            request=request,
+                            workspace=workspace,
+                            skill_view=skill_view,
+                            state=state,
+                            run_dir=run_dir,
+                            request_path=run_dir / "request.json",
+                            status_path=status_path,
+                            profile=profile,
+                        ),
+                        name=f"claude-requeue-{run_id}",
+                    )
+                    self._tasks[run_id] = task
+                    task.add_done_callback(
+                        lambda _task, recovered_run_id=run_id: self._task_done(
+                            recovered_run_id
+                        )
+                    )
+                    requeued += 1
+                    continue
+            if current_status not in TERMINAL_STATUSES:
+                _ensure_terminal_event(
+                    run_dir / "events.jsonl",
+                    status="failed",
+                    error="supervisor_restart_before_container_adoption",
+                )
+                _update_status(
+                    status_path,
+                    status="failed",
+                    phase="terminal",
+                    container_id=None,
+                )
+                failed_orphans += 1
+        return {
+            "adopted": adopted,
+            "removed_unknown": removed_unknown,
+            "requeued": requeued,
+            "failed_orphans": failed_orphans,
+        }
+
+    async def _adopt_existing_container(
+        self,
+        container,
+        *,
+        run_id: str,
+        run_dir: Path,
+        status_path: Path,
+        remaining_seconds: float,
+    ) -> None:
+        try:
+            await self._monitor_container(
+                container,
+                run_id=run_id,
+                run_dir=run_dir,
+                status_path=status_path,
+                remaining_seconds=remaining_seconds,
+            )
+        except asyncio.CancelledError:
+            if self._draining:
+                raise
+            _ensure_terminal_event(
+                run_dir / "events.jsonl",
+                status="cancelled",
+                error=None,
+            )
+            _update_status(
+                status_path,
+                status="cancelled",
+                phase="terminal",
+                container_id=None,
+            )
+            raise
+        except Exception as exc:
+            logger.exception(
+                "Adopted Claude run failed closed run=%s error_type=%s",
+                run_id,
+                type(exc).__name__,
+            )
+            _ensure_terminal_event(
+                run_dir / "events.jsonl",
+                status="failed",
+                error=type(exc).__name__,
+            )
+            _update_status(
+                status_path,
+                status="failed",
+                phase="terminal",
+                container_id=None,
+            )
+
+    async def _execute(
+        self,
+        *,
+        request: StartRunRequest,
+        workspace: Path,
+        skill_view: Path,
+        state: Path,
+        run_dir: Path,
+        request_path: Path,
+        status_path: Path,
+        profile: ProviderProfile,
+    ) -> None:
+        try:
+            async with self._semaphore:
+                # Serialize the queued -> starting boundary with cancellation
+                # and Session revocation. Once ``phase=starting`` is durable,
+                # cancellation must stop/adopt the deterministic container
+                # instead of cancelling this watcher and racing Docker create.
+                async with self._guard:
+                    status = _read_json(status_path)
+                    if status.get("cancellation_requested"):
+                        _ensure_terminal_event(
+                            run_dir / "events.jsonl",
+                            status="cancelled",
+                            error=None,
+                        )
+                        _update_status(
+                            status_path,
+                            status="cancelled",
+                            phase="terminal",
+                            container_id=None,
+                        )
+                        return
+                    _update_status(
+                        status_path,
+                        status="starting",
+                        phase="starting",
+                        container_id=None,
+                    )
+                container = await asyncio.to_thread(
+                    self._create_container_sync,
+                    request,
+                    workspace,
+                    skill_view,
+                    state,
+                    run_dir,
+                    request_path,
+                    status_path,
+                    profile,
+                )
+                if container is None:
+                    return
+                await self._monitor_container(
+                    container,
+                    run_id=request.run_id,
+                    run_dir=run_dir,
+                    status_path=status_path,
+                    remaining_seconds=float(self.settings.max_run_seconds),
+                )
+        except asyncio.CancelledError:
+            if self._draining:
+                # A Supervisor restart is not a user cancellation. Docker owns
+                # any already-created Turn and the next Supervisor adopts it;
+                # a durable queued request is re-enqueued before serving.
+                raise
+            _ensure_terminal_event(
+                run_dir / "events.jsonl",
+                status="cancelled",
+                error=None,
+            )
+            _update_status(
+                status_path,
+                status="cancelled",
+                phase="terminal",
+                container_id=None,
+            )
+            raise
+        except BaseException as exc:
+            logger.exception(
+                "Claude run failed closed run=%s error_type=%s",
+                request.run_id,
+                type(exc).__name__,
+            )
+            _ensure_terminal_event(
+                run_dir / "events.jsonl",
+                status="failed",
+                error=type(exc).__name__,
+            )
+            _update_status(
+                status_path,
+                status="failed",
+                phase="terminal",
+                error=type(exc).__name__,
+                container_id=None,
+            )
+
+    def _create_container_sync(
+        self,
+        request: StartRunRequest,
+        workspace: Path,
+        skill_view: Path,
+        state: Path,
+        run_dir: Path,
+        request_path: Path,
+        status_path: Path,
+        profile: ProviderProfile,
+    ):
+        with _prepared_worker_workspace(workspace, self.settings.worker_gid):
+            if _read_json(status_path).get("cancellation_requested"):
+                _ensure_terminal_event(
+                    run_dir / "events.jsonl",
+                    status="cancelled",
+                    error=None,
+                )
+                _update_status(
+                    status_path,
+                    status="cancelled",
+                    phase="terminal",
+                    container_id=None,
+                )
+                return None
+            home = state / "home"
+            home.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chown(home, self.settings.worker_uid, self.settings.worker_gid)
+            container_name = "chatds-claude-" + request.run_id
+            environment = {
+                "CHATDS_RUN_CONFIG": "/run/chatds/request.json",
+                "CHATDS_EVENT_LEDGER": f"/state/control/runs/{request.run_id}/events.jsonl",
+                "CLAUDE_PROVIDER_API_KEY": profile.api_key,
+                "SKILL_EGRESS_POLICY_TOKEN": os.environ["SKILL_EGRESS_POLICY_TOKEN"],
+                "CLAUDE_RUNNER_WORKER_UID": str(self.settings.worker_uid),
+                "CLAUDE_RUNNER_WORKER_GID": str(self.settings.worker_gid),
+            }
+            labels = {
+                "chatds.component": "claude-runner",
+                "chatds.run_id": request.run_id,
+                "chatds.user_sha256": hashlib.sha256(request.user_id.encode()).hexdigest(),
+                "chatds.conversation_sha256": hashlib.sha256(
+                    request.conversation_id.encode()
+                ).hexdigest(),
+            }
+            try:
+                container = self.client.containers.run(
+                    self.settings.runner_image,
+                    name=container_name,
+                    detach=True,
+                    network_mode="none",
+                    read_only=True,
+                    user="0:0",
+                    group_add=["65530"],
+                    cap_drop=["ALL"],
+                    cap_add=["CHOWN", "DAC_OVERRIDE", "FOWNER", "KILL", "SETGID", "SETUID"],
+                    security_opt=_runner_security_options(
+                        self.settings.security_mode
+                    ),
+                    pids_limit=512,
+                    mem_limit=os.environ.get("CLAUDE_RUNNER_MEMORY_LIMIT", "6g"),
+                    nano_cpus=int(float(os.environ.get("CLAUDE_RUNNER_CPUS", "4")) * 1_000_000_000),
+                    tmpfs={
+                        "/tmp": "rw,noexec,nosuid,nodev,size=2g,mode=1777",
+                        "/runtime": "rw,nosuid,nodev,size=64m,mode=0755",
+                        "/dev/shm": "rw,nosuid,nodev,size=1g,mode=1777",
+                    },
+                    volumes={
+                        str(workspace): {"bind": "/workspace", "mode": "rw"},
+                        str(state): {"bind": "/state", "mode": "rw"},
+                        str(skill_view): {"bind": "/skill-view", "mode": "ro"},
+                        str(request_path): {"bind": "/run/chatds/request.json", "mode": "ro"},
+                        self.settings.egress_proxy_volume: {
+                            "bind": "/run/chatds-skill-egress", "mode": "ro"
+                        },
+                        self.settings.workspace_lock_volume: {
+                            "bind": "/run/chatds-workspace-lock-plane", "mode": "rw"
+                        },
+                    },
+                    environment=environment,
+                    labels=labels,
+                )
+            except DockerException as exc:
+                raise RuntimeError("runner_container_start_failed") from exc
+            _update_status(
+                status_path,
+                status="running",
+                phase="running",
+                container_id=container.id,
+            )
+            return container
+
+    async def _monitor_container(
+        self,
+        container,
+        *,
+        run_id: str,
+        run_dir: Path,
+        status_path: Path,
+        remaining_seconds: float,
+    ) -> None:
+        deadline = time.monotonic() + max(0.0, remaining_seconds)
+        exit_code: int | None = None
+        disappeared = False
+        detach_for_restart = False
+        try:
+            while time.monotonic() < deadline:
+                try:
+                    await asyncio.to_thread(container.reload)
+                except NotFound:
+                    disappeared = True
+                    break
+                if container.status in {"exited", "dead"}:
+                    result = await asyncio.to_thread(container.wait, timeout=10)
+                    exit_code = int(result.get("StatusCode", 1))
+                    break
+                await asyncio.sleep(1.0)
+            if exit_code is None and not disappeared:
+                try:
+                    await asyncio.to_thread(container.kill, signal="SIGUSR1")
+                except (NotFound, DockerException):
+                    pass
+                try:
+                    result = await asyncio.to_thread(container.wait, timeout=40)
+                    exit_code = int(result.get("StatusCode", 124))
+                except DockerException:
+                    try:
+                        await asyncio.to_thread(container.stop, timeout=30)
+                    except (NotFound, DockerException):
+                        pass
+                    exit_code = 124
+                _ensure_terminal_event(
+                    run_dir / "events.jsonl",
+                    status="failed",
+                    error="run_hard_timeout",
+                )
+        except asyncio.CancelledError:
+            if self._draining:
+                detach_for_restart = True
+            raise
+        finally:
+            if not detach_for_restart:
+                try:
+                    await asyncio.to_thread(container.remove, force=True)
+                except NotFound:
+                    pass
+                except DockerException:
+                    logger.warning("Could not remove Claude runner container run=%s", run_id)
+        terminal = _terminal_status(run_dir / "events.jsonl")
+        if terminal is None:
+            status = _read_json(status_path)
+            terminal = (
+                "cancelled" if status.get("cancellation_requested") else "failed"
+            )
+            error = None if terminal == "cancelled" else (
+                "runner_container_disappeared"
+                if disappeared
+                else "runner_exited_without_terminal"
+            )
+            _ensure_terminal_event(
+                run_dir / "events.jsonl",
+                status=terminal,
+                error=error,
+            )
+        _update_status(
+            status_path,
+            status=terminal,
+            phase="terminal",
+            exit_code=exit_code,
+            container_id=None,
+        )
+
+    async def cancel(self, run_id: str, identity: RunIdentityRequest) -> bool:
+        run_dir = self._run_dir(identity.user_id, identity.conversation_id, run_id)
+        status_path = run_dir / "status.json"
+        task: asyncio.Task[None] | None = None
+        cancelled_queued_task = False
+        async with self._guard:
+            status = _read_json(status_path)
+            if (
+                status.get("user_id") != identity.user_id
+                or status.get("conversation_id") != identity.conversation_id
+            ):
+                raise HTTPException(404, "Run not found")
+            terminal = _terminal_status(run_dir / "events.jsonl")
+            if terminal is not None:
+                _update_status(
+                    status_path,
+                    status=terminal,
+                    phase="terminal",
+                    container_id=None,
+                )
+                return True
+            _update_status(status_path, cancellation_requested=True)
+            task = self._tasks.get(run_id)
+            phase = str(status.get("phase") or status.get("status") or "")
+            if phase == "queued" and task is not None and not task.done():
+                task.cancel()
+                cancelled_queued_task = True
+        if task is not None and cancelled_queued_task:
+            await asyncio.gather(task, return_exceptions=True)
+        container = None
+        deadline = time.monotonic() + 15.0
+        while True:
+            status = _read_json(status_path)
+            terminal = _terminal_status(run_dir / "events.jsonl")
+            if terminal is not None:
+                break
+            container_id = status.get("container_id")
+            try:
+                container = await asyncio.to_thread(
+                    self.client.containers.get,
+                    str(container_id or ("chatds-claude-" + run_id)),
+                )
+            except NotFound:
+                container = None
+            except DockerException as exc:
+                raise HTTPException(
+                    503, "Runner cancellation did not converge"
+                ) from exc
+            if container is not None:
+                break
+            task = self._tasks.get(run_id)
+            if task is None or task.done():
+                break
+            if time.monotonic() >= deadline:
+                raise HTTPException(503, "Runner cancellation did not converge")
+            await asyncio.sleep(0.05)
+        if container is not None:
+            try:
+                await asyncio.to_thread(container.stop, timeout=30)
+                try:
+                    await asyncio.to_thread(container.wait, timeout=40)
+                except (NotFound, DockerException):
+                    pass
+            except DockerException as exc:
+                raise HTTPException(503, "Runner cancellation did not converge") from exc
+        # The in-container controller is the sole ledger writer while it is
+        # alive.  Only synthesize cancellation after Docker confirms it has
+        # stopped, avoiding concurrent append/sequence corruption on NFS.
+        terminal = _terminal_status(run_dir / "events.jsonl")
+        if terminal is None:
+            _ensure_terminal_event(run_dir / "events.jsonl", status="cancelled", error=None)
+            terminal = "cancelled"
+        _update_status(
+            status_path,
+            status=terminal,
+            phase="terminal",
+            container_id=None,
+        )
+        return True
+
+    async def cleanup_session(self, user_id: str, conversation_id: str) -> dict[str, Any]:
+        state = self._session_state(user_id, conversation_id)
+        queued_tasks: list[asyncio.Task[None]] = []
+        async with self._guard:
+            self._revoked_sessions.add((user_id, conversation_id))
+            # Fence first, then discover. A concurrent start holds this same
+            # guard through durable request creation and task registration, so
+            # no just-created run can fall between discovery and revocation.
+            state_run_ids = {
+                child.name
+                for child in (state / "control" / "runs").iterdir()
+                if child.is_dir()
+                and not child.is_symlink()
+                and SAFE_ID.fullmatch(child.name)
+            } if (state / "control" / "runs").is_dir() else set()
+            for run_id in state_run_ids:
+                status_path = state / "control" / "runs" / run_id / "status.json"
+                try:
+                    status = _read_json(status_path)
+                    _update_status(status_path, cancellation_requested=True)
+                except HTTPException:
+                    continue
+                task = self._tasks.get(run_id)
+                if (
+                    str(status.get("phase") or status.get("status") or "")
+                    == "queued"
+                    and task is not None
+                    and not task.done()
+                ):
+                    task.cancel()
+                    queued_tasks.append(task)
+        if queued_tasks:
+            await asyncio.gather(*queued_tasks, return_exceptions=True)
+        conversation_hash = hashlib.sha256(conversation_id.encode()).hexdigest()
+        user_hash = hashlib.sha256(user_id.encode()).hexdigest()
+        failures = []
+        run_ids: set[str] = set(state_run_ids)
+        containers_by_id: dict[str, Any] = {}
+        filters = {"label": [
+            "chatds.component=claude-runner",
+            f"chatds.user_sha256={user_hash}",
+            f"chatds.conversation_sha256={conversation_hash}",
+        ]}
+        # A Docker create can overlap the first label query. The Session is
+        # already irrevocably fenced above, and each pending status carries a
+        # cancellation marker; poll until every start/monitor task converges.
+        deadline = time.monotonic() + 15.0
+        while True:
+            containers = await asyncio.to_thread(
+                self.client.containers.list,
+                all=True,
+                filters=filters,
+            )
+            for container in containers:
+                containers_by_id[str(container.id)] = container
+                run_id = str((container.labels or {}).get("chatds.run_id") or "")
+                if SAFE_ID.fullmatch(run_id):
+                    run_ids.add(run_id)
+                try:
+                    await asyncio.to_thread(container.stop, timeout=30)
+                except NotFound:
+                    pass
+                except DockerException:
+                    failures.append(container.id[:12])
+            active = [
+                task
+                for run_id in run_ids
+                if (task := self._tasks.get(run_id)) is not None and not task.done()
+            ]
+            if not active and not containers:
+                break
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(0.1)
+        pending = [
+            self._tasks[run_id]
+            for run_id in run_ids
+            if run_id in self._tasks and not self._tasks[run_id].done()
+        ]
+        if pending:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True), timeout=60.0
+                )
+            except asyncio.TimeoutError:
+                failures.extend(sorted(run_ids))
+        # Remove any stopped container that was not owned by a live watcher.
+        for container in containers_by_id.values():
+            try:
+                await asyncio.to_thread(container.remove, force=True)
+            except NotFound:
+                pass
+            except DockerException:
+                failures.append(container.id[:12])
+        if failures:
+            return {
+                "success": False,
+                "execution_revocation": {"success": False, "residual_count": len(failures)},
+            }
+        if state.exists():
+            await asyncio.to_thread(_remove_state_tree, state)
+        for run_id in run_ids:
+            try:
+                self._locator_path(run_id).unlink()
+            except FileNotFoundError:
+                pass
+        return {
+            "success": True,
+            "execution_revocation": {"success": True, "residual_count": 0},
+        }
+
+    def events_path(self, run_id: str) -> Path:
+        locator = self._read_run_locator(run_id)
+        run_dir = self._run_dir(
+            locator["user_id"], locator["conversation_id"], run_id
+        )
+        request_path = run_dir / "request.json"
+        request = _read_json(request_path)
+        if (
+            request.get("run_id") != run_id
+            or request.get("user_id") != locator["user_id"]
+            or request.get("conversation_id") != locator["conversation_id"]
+        ):
+            raise HTTPException(404, "Run not found")
+        return run_dir / "events.jsonl"
+
+    def _provider(self, request: StartRunRequest) -> ProviderProfile:
+        profile = self.settings.provider_profiles.get(request.provider_profile)
+        if profile is None:
+            raise HTTPException(400, "Provider profile is not Claude-compatible")
+        if request.api_model not in profile.models:
+            raise HTTPException(400, "Model is not allowed by the provider profile")
+        if request.provider_base_url.rstrip("/") != profile.backend_base_url:
+            raise HTTPException(400, "Provider endpoint does not match its deployment profile")
+        if request.provider_protocol != profile.backend_protocol:
+            raise HTTPException(400, "Provider protocol does not match its deployment profile")
+        return profile
+
+    def _validate_paths(self, request: StartRunRequest) -> tuple[Path, Path, Path]:
+        session = self.settings.workspace_host_root / request.user_id / request.conversation_id
+        expected_workspace = session / "workspace"
+        workspace = _exact_real_path(request.workspace_path, expected_workspace)
+        skill_view = _exact_real_path(
+            request.skill_view_path,
+            session / "runtime" / "claude" / "skill-views" / request.skill_view_sha256,
+        )
+        state = session / "runtime" / "claude" / "state"
+        state.mkdir(parents=True, exist_ok=True, mode=0o711)
+        os.chmod(state, 0o711)
+        control = state / "control"
+        control.mkdir(exist_ok=True, mode=0o700)
+        os.chmod(control, 0o700)
+        return workspace, skill_view, state
+
+    def _session_state(self, user_id: str, conversation_id: str) -> Path:
+        if not SAFE_ID.fullmatch(user_id) or not SAFE_ID.fullmatch(conversation_id):
+            raise HTTPException(404, "Session not found")
+        return self.settings.workspace_host_root / user_id / conversation_id / "runtime" / "claude" / "state"
+
+    def _run_dir(self, user_id: str, conversation_id: str, run_id: str) -> Path:
+        if not SAFE_ID.fullmatch(run_id):
+            raise HTTPException(404, "Run not found")
+        return self._session_state(user_id, conversation_id) / "control" / "runs" / run_id
+
+    async def detach_for_shutdown(self) -> None:
+        """Stop local watchers without changing Docker-owned run authority."""
+
+        async with self._guard:
+            self._draining = True
+            tasks = tuple(self._tasks.values())
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _build_prompt(messages: list[dict[str, Any]], *, resume: bool) -> str:
+    if resume:
+        for message in reversed(messages):
+            if message.get("role") == "user":
+                return _message_text(message.get("content"))
+        raise HTTPException(400, "A resumed Claude Turn requires a user message")
+    rendered = []
+    for message in messages:
+        role = str(message.get("role") or "user").upper()
+        rendered.append(f"<{role}>\n{_message_text(message.get('content'))}\n</{role}>")
+    return "\n\n".join(rendered)
+
+
+def _recover_start_request(path: Path) -> StartRunRequest:
+    """Rebuild only the non-secret execution identity from a durable request.
+
+    Prompt and egress policy were already compiled into ``request.json``. The
+    reconstructed Pydantic request is used solely for path/provider identity,
+    labels, and candidate checkpoint metadata; it never recompiles authority.
+    """
+
+    value = _read_json(path)
+    if value.get("schema") != "chatds.claude-run.v1":
+        raise ValueError("Durable Claude request schema is invalid")
+    return StartRunRequest.model_validate({
+        "run_id": value.get("run_id"),
+        "root_run_id": value.get("root_run_id"),
+        "user_id": value.get("user_id"),
+        "conversation_id": value.get("conversation_id"),
+        "model_id": value.get("model_id"),
+        "api_model": value.get("api_model"),
+        "provider_profile": value.get("provider_profile"),
+        "provider_base_url": value.get("provider_backend_base_url"),
+        "provider_protocol": value.get("provider_protocol") or "anthropic",
+        "messages": [],
+        "max_output_tokens": value.get("max_output_tokens"),
+        "workspace_path": value.get("workspace_path"),
+        "skill_view_path": value.get("skill_view_path"),
+        "skill_view_sha256": value.get("skill_view_sha256"),
+        "native_session_id": value.get("native_session_id"),
+        "resume_from_native_session_id": value.get(
+            "resume_from_native_session_id"
+        ),
+        "source": value.get("source") or "chat",
+        "user_turn_text": "",
+    })
+
+
+def _native_transcript_exists(state: Path, native_session_id: str) -> bool:
+    home = state / "home" / ".claude" / "projects"
+    if not home.is_dir() or home.is_symlink():
+        return False
+    matches = list(home.glob(f"*/{native_session_id}.jsonl"))
+    return len(matches) == 1 and matches[0].is_file() and not matches[0].is_symlink()
+
+
+def _message_text(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        pieces = []
+        for item in value:
+            if isinstance(item, dict) and item.get("type") == "text":
+                pieces.append(str(item.get("text") or ""))
+            elif isinstance(item, dict) and item.get("type") == "image_url":
+                pieces.append("[Image attachment available through the Session workspace]")
+        return "\n".join(pieces)
+    return str(value or "")
+
+
+def _prepare_worker_tree(root: Path, worker_gid: int) -> None:
+    count = 0
+    for walk_root, dirs, files in os.walk(root, followlinks=False):
+        current = Path(walk_root)
+        info = os.lstat(current)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise RuntimeError("workspace_contains_unsafe_directory")
+        os.chown(current, -1, worker_gid, follow_symlinks=False)
+        os.chmod(current, stat.S_IMODE(info.st_mode) | 0o070, follow_symlinks=False)
+        for name in [*dirs, *files]:
+            count += 1
+            if count > MAX_WORKSPACE_ENTRIES:
+                raise RuntimeError("workspace_entry_limit_exceeded")
+            path = current / name
+            item = os.lstat(path)
+            if stat.S_ISLNK(item.st_mode):
+                continue
+            if stat.S_ISDIR(item.st_mode):
+                continue
+            if not stat.S_ISREG(item.st_mode):
+                raise RuntimeError("workspace_contains_special_file")
+            os.chown(path, -1, worker_gid, follow_symlinks=False)
+            os.chmod(path, stat.S_IMODE(item.st_mode) | 0o060, follow_symlinks=False)
+
+
+@contextmanager
+def _prepared_worker_workspace(root: Path, worker_gid: int):
+    """Prepare permissions atomically, then let the Turn own the long lease.
+
+    The child controller acquires the same local lock volume before starting
+    Claude and holds it through terminal fsync.  Keeping the Supervisor's
+    flock for the whole Turn would make that durable lease deadlock; releasing
+    after preparation is safe because no model-controlled process exists yet.
+    """
+
+    with workspace_mutation_guard(root, timeout_seconds=60.0):
+        _prepare_worker_tree(root, worker_gid)
+    yield
+
+
+def _seccomp_security_option() -> str:
+    try:
+        value = json.loads(SECCOMP_PROFILE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise RuntimeError("runner_seccomp_profile_unavailable") from exc
+    if not isinstance(value, dict) or value.get("defaultAction") is None:
+        raise RuntimeError("runner_seccomp_profile_invalid")
+    return "seccomp=" + json.dumps(
+        value, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")
+    )
+
+
+def _runner_security_options(mode: str) -> list[str]:
+    options = [_seccomp_security_option()]
+    if mode == "seccomp_no_new_privileges":
+        options.insert(0, "no-new-privileges:true")
+    elif mode != "seccomp_stripped_setid":
+        raise RuntimeError("runner_security_mode_invalid")
+    return options
+
+
+def _validate_runner_image_security(image, mode: str) -> None:
+    labels = image.labels if isinstance(getattr(image, "labels", None), dict) else {}
+    if labels.get(EGRESS_POLICY_LABEL) != EXPECTED_EGRESS_POLICY_RUNTIME:
+        raise RuntimeError("runner_image_egress_policy_attestation_missing")
+    if mode == "seccomp_stripped_setid" and labels.get(SETID_STRIPPED_LABEL) != "true":
+        raise RuntimeError("runner_image_setid_attestation_missing")
+
+
+def _exact_real_path(value: str, expected: Path) -> Path:
+    supplied = Path(value)
+    try:
+        if supplied != expected or supplied.resolve(strict=True) != expected.resolve(strict=True):
+            raise HTTPException(400, "Runner path does not match the Session boundary")
+        info = os.lstat(supplied)
+    except OSError as exc:
+        raise HTTPException(400, "Runner path is unavailable") from exc
+    if supplied.is_symlink() or not stat.S_ISDIR(info.st_mode):
+        raise HTTPException(400, "Runner path is unsafe")
+    return supplied
+
+
+def _scope_digest(*parts: str) -> str:
+    digest = hashlib.sha256(b"chatds.claude-egress.v1\0")
+    for part in parts:
+        encoded = part.encode("utf-8")
+        digest.update(len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _canonical_sha256(value: object) -> str:
+    return hashlib.sha256(json.dumps(
+        value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
+
+
+def _atomic_json(path: Path, value: object, *, mode: int) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    encoded = json.dumps(
+        value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8") + b"\n"
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        _write_all(fd, encoded)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(temporary, path)
+    _fsync_directory(path.parent)
+
+
+def _atomic_create_json(path: Path, value: object, *, mode: int) -> None:
+    encoded = json.dumps(
+        value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8") + b"\n"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    complete = False
+    try:
+        _write_all(fd, encoded)
+        os.fsync(fd)
+        complete = True
+    finally:
+        os.close(fd)
+        if not complete:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+    _fsync_directory(path.parent)
+
+
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    written = 0
+    while written < len(view):
+        count = os.write(descriptor, view[written:])
+        if count <= 0:
+            raise OSError("short durable write")
+        written += count
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise HTTPException(404, "Run state is unavailable") from exc
+    return value if isinstance(value, dict) else {}
+
+
+def _update_status(path: Path, **changes: Any) -> None:
+    # Cancellation and Docker-create completion run on different threads. A
+    # process-local RMW lock prevents either update from erasing the other's
+    # durable fields; atomic rename alone only protects file integrity.
+    with _STATUS_UPDATE_LOCK:
+        current = _read_json(path)
+        current.update(changes)
+        current["updated_at_unix_ms"] = int(time.time() * 1000)
+        _atomic_json(path, current, mode=0o600)
+
+
+def _terminal_status(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            envelope = json.loads(line)
+            event = envelope.get("event") if isinstance(envelope, dict) else None
+            if isinstance(event, dict) and event.get("type") == "chatds.supervisor.terminal":
+                status = str(event.get("status") or "")
+                if status in TERMINAL_STATUSES:
+                    return status
+    except (OSError, ValueError, TypeError):
+        return None
+    return None
+
+
+def _ensure_terminal_event(path: Path, *, status: str, error: str | None) -> None:
+    with _STATUS_UPDATE_LOCK:
+        if _terminal_status(path) is not None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        seq = 1
+        if path.exists():
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+                if lines:
+                    seq = int(json.loads(lines[-1]).get("seq") or 0) + 1
+            except (OSError, ValueError, TypeError):
+                seq = 1
+        envelope = {
+            "seq": seq,
+            "received_at_unix_ms": int(time.time() * 1000),
+            "channel": "supervisor",
+            "event": {
+                "type": "chatds.supervisor.terminal",
+                "status": status,
+                "error": error,
+            },
+        }
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            _write_all(fd, json.dumps(
+                envelope, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+            ).encode("utf-8") + b"\n")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def _remove_state_tree(path: Path) -> None:
+    if path.is_symlink():
+        raise RuntimeError("state_tree_is_symlink")
+    for walk_root, dirs, files in os.walk(path, followlinks=False):
+        os.chmod(walk_root, 0o700, follow_symlinks=False)
+        for name in files:
+            item = Path(walk_root) / name
+            if not item.is_symlink():
+                os.chmod(item, 0o600, follow_symlinks=False)
+    shutil.rmtree(path)
+
+
+async def _event_stream(path: Path, after: int) -> AsyncIterator[str]:
+    cursor = after
+    heartbeat = time.monotonic()
+    byte_offset = 0
+    pending = bytearray()
+    while True:
+        if path.exists():
+            try:
+                chunk = await asyncio.to_thread(
+                    _read_ledger_chunk, path, byte_offset
+                )
+            except OSError:
+                chunk = b""
+            if chunk:
+                byte_offset += len(chunk)
+                pending.extend(chunk)
+            if len(pending) > 72 * 1024 * 1024:
+                raise RuntimeError("Claude Runner event line exceeded its durable bound")
+            while b"\n" in pending:
+                raw_line, _, remainder = pending.partition(b"\n")
+                pending = bytearray(remainder)
+                try:
+                    envelope = json.loads(raw_line.decode("utf-8"))
+                except (UnicodeError, json.JSONDecodeError):
+                    continue
+                seq = envelope.get("seq") if isinstance(envelope, dict) else None
+                if not isinstance(seq, int) or seq <= cursor:
+                    continue
+                cursor = seq
+                yield f"data: {json.dumps(envelope, ensure_ascii=False, separators=(',', ':'))}\n\n"
+                event = envelope.get("event")
+                if (
+                    isinstance(event, dict)
+                    and event.get("type") == "chatds.supervisor.terminal"
+                ):
+                    yield "data: [DONE]\n\n"
+                    return
+        if time.monotonic() - heartbeat >= 15:
+            heartbeat = time.monotonic()
+            yield ": heartbeat\n\n"
+        await asyncio.sleep(0.25)
+
+
+def _read_ledger_chunk(path: Path, offset: int) -> bytes:
+    with path.open("rb") as stream:
+        stream.seek(offset)
+        return stream.read(1024 * 1024)
+
+
+settings: RunnerSettings | None = None
+manager: RunManager | None = None
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    global settings, manager
+    settings = load_settings()
+    if docker is None:
+        raise RuntimeError("Docker SDK is unavailable")
+    client = docker.from_env()
+    client.ping()
+    image = client.images.get(settings.runner_image)
+    _validate_runner_image_security(image, settings.security_mode)
+    client.volumes.get(settings.egress_proxy_volume)
+    client.volumes.get(settings.workspace_lock_volume)
+    manager = RunManager(settings, client)
+    reconciliation = await manager.reconcile_existing_containers()
+    if any(reconciliation.values()):
+        logger.warning("Claude Runner startup reconciliation: %s", reconciliation)
+    yield
+    # Runs are Docker-owned and continue across an HTTP Supervisor restart.
+    # Detaching watchers must never project a user cancellation or remove a
+    # live Turn container. OS process teardown closes the Docker transport;
+    # the replacement Supervisor adopts labelled containers before serving.
+    await manager.detach_for_shutdown()
+
+
+app = FastAPI(title="ChatDS Claude Runner Supervisor", lifespan=lifespan)
+
+
+def _require_internal_token(x_internal_token: str = Header(default="")) -> None:
+    if settings is None or not _constant_time_equal(x_internal_token, settings.internal_token):
+        raise HTTPException(401, "Unauthorized")
+
+
+def _constant_time_equal(left: str, right: str) -> bool:
+    import hmac
+    return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
+
+
+@app.get("/health")
+async def health(_auth=Depends(_require_internal_token)):
+    if manager is None:
+        return JSONResponse(503, {"status": "error", "code": "not_ready"})
+    try:
+        await asyncio.to_thread(manager.client.ping)
+        image = await asyncio.to_thread(manager.client.images.get, manager.settings.runner_image)
+        _validate_runner_image_security(image, manager.settings.security_mode)
+        await asyncio.to_thread(
+            manager.client.volumes.get, manager.settings.workspace_lock_volume
+        )
+    except (DockerException, ImageNotFound):
+        return JSONResponse(503, {"status": "error", "code": "docker_or_image_unavailable"})
+    return {
+        "status": "ok",
+        "claude_version": image.labels.get("org.opencontainers.image.version", "unknown"),
+        "network_policy": "network-none+signed-exact-egress-v3",
+        "security_mode": manager.settings.security_mode,
+    }
+
+
+@app.post("/v1/runs")
+async def start_run(payload: StartRunRequest, _auth=Depends(_require_internal_token)):
+    assert manager is not None
+    return await manager.start(payload)
+
+
+@app.get("/v1/runs/{run_id}/events")
+async def run_events(
+    run_id: str,
+    after: int = Query(default=0, ge=0),
+    _auth=Depends(_require_internal_token),
+):
+    assert manager is not None
+    path = manager.events_path(run_id)
+    return StreamingResponse(
+        _event_stream(path, after),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/v1/runs/{run_id}/cancel")
+async def cancel_run(
+    run_id: str,
+    payload: RunIdentityRequest,
+    _auth=Depends(_require_internal_token),
+):
+    assert manager is not None
+    return {"success": await manager.cancel(run_id, payload)}
+
+
+@app.post("/v1/sessions/{conversation_id}/cleanup")
+async def cleanup_session(
+    conversation_id: str,
+    payload: SessionIdentityRequest,
+    _auth=Depends(_require_internal_token),
+):
+    assert manager is not None
+    return await manager.cleanup_session(payload.user_id, conversation_id)

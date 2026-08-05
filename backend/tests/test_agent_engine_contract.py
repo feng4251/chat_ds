@@ -1,0 +1,702 @@
+import hashlib
+import json
+import os
+import tempfile
+import unittest
+import uuid
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+from agent_engines.claude_events import ClaudeEventProjector
+from agent_engines import lifecycle as engine_lifecycle
+from agent_engines.skill_view import (
+    SkillViewError,
+    authorized_skill_sources,
+    materialize_claude_skill_view,
+)
+from config import settings
+from models import (
+    AgentEngineRawEvent,
+    AgentEngineSession,
+    AgentRun,
+    Base,
+    Conversation,
+    User,
+)
+from routers import chat_router, workspace_router
+
+
+class ClaudeEventProjectionTests(unittest.TestCase):
+    def test_native_result_is_candidate_until_supervisor_terminal(self):
+        projector = ClaudeEventProjector("a" * 32)
+        result = projector.project({
+            "seq": 1,
+            "event": {
+                "type": "result",
+                "subtype": "success",
+                "result": "complete",
+                "usage": {"input_tokens": 3, "output_tokens": 4},
+            },
+        })
+        self.assertNotIn("finish", {event.kind for event in result})
+        self.assertFalse(any(
+            event.kind == "agent_event"
+            and event.data.get("event_type") == "run.completed"
+            for event in result
+        ))
+
+        terminal = projector.project({
+            "seq": 2,
+            "event": {
+                "type": "chatds.supervisor.terminal",
+                "status": "succeeded",
+            },
+        })
+        self.assertEqual(
+            [event.data.get("event_type") for event in terminal if event.kind == "agent_event"],
+            ["run.completed"],
+        )
+        self.assertEqual(
+            [event.data.get("finish_reason") for event in terminal if event.kind == "finish"],
+            ["stop"],
+        )
+
+    def test_success_without_native_result_fails_closed(self):
+        projector = ClaudeEventProjector("b" * 32)
+        events = projector.project({
+            "seq": 1,
+            "event": {
+                "type": "chatds.supervisor.terminal",
+                "status": "succeeded",
+            },
+        })
+        self.assertIn(
+            "run.failed",
+            [event.data.get("event_type") for event in events],
+        )
+        self.assertEqual(events[-1].data.get("finish_reason"), "error")
+
+    def test_assistant_fallback_preserves_all_text_and_thinking_blocks(self):
+        projector = ClaudeEventProjector("c" * 32)
+        events = projector.project({
+            "seq": 1,
+            "event": {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "thinking", "thinking": "r1"},
+                        {"type": "thinking", "thinking": "r2"},
+                        {"type": "text", "text": "a"},
+                        {"type": "text", "text": "b"},
+                    ],
+                    "usage": {"input_tokens": "bad", "output_tokens": -1},
+                },
+            },
+        })
+        self.assertEqual(
+            "".join(str(event.data.get("text") or "") for event in events if event.kind == "content"),
+            "ab",
+        )
+        self.assertEqual(
+            "".join(str(event.data.get("text") or "") for event in events if event.kind == "reasoning"),
+            "r1r2",
+        )
+
+    def test_partial_and_full_messages_dedupe_per_message_not_globally(self):
+        projector = ClaudeEventProjector("d" * 32)
+        partial = projector.project({
+            "seq": 1,
+            "event": {
+                "type": "stream_event",
+                "uuid": "message-a",
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": "first"},
+                },
+            },
+        })
+        replay = projector.project({
+            "seq": 2,
+            "event": {
+                "type": "assistant",
+                "uuid": "message-a",
+                "message": {"content": [{"type": "text", "text": "first"}]},
+            },
+        })
+        later = projector.project({
+            "seq": 3,
+            "event": {
+                "type": "assistant",
+                "uuid": "message-b",
+                "message": {"content": [{"type": "text", "text": "second"}]},
+            },
+        })
+        self.assertEqual([event.data["text"] for event in partial], ["first"])
+        self.assertFalse(any(event.kind == "content" for event in replay))
+        self.assertEqual(
+            [event.data["text"] for event in later if event.kind == "content"],
+            ["second"],
+        )
+
+    def test_tool_start_is_deduplicated_between_partial_and_full_events(self):
+        projector = ClaudeEventProjector("e" * 32)
+        partial = projector.project({
+            "seq": 1,
+            "event": {
+                "type": "stream_event",
+                "uuid": "message-tool",
+                "event": {
+                    "type": "content_block_start",
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "tool-1",
+                        "name": "Bash",
+                    },
+                },
+            },
+        })
+        full = projector.project({
+            "seq": 2,
+            "event": {
+                "type": "assistant",
+                "uuid": "message-tool",
+                "message": {"content": [{
+                    "type": "tool_use",
+                    "id": "tool-1",
+                    "name": "Bash",
+                }]},
+            },
+        })
+        self.assertEqual(
+            sum(event.data.get("event_type") == "tool.started" for event in partial),
+            1,
+        )
+        self.assertFalse(any(
+            event.data.get("event_type") == "tool.started" for event in full
+        ))
+
+    def test_native_task_identity_routes_child_tools_and_stopped_terminal(self):
+        root = "f" * 32
+        projector = ClaudeEventProjector(root)
+        started = projector.project({
+            "seq": 1,
+            "event": {
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": "native-task",
+                "tool_use_id": "agent-tool",
+                "description": "Safety evidence extraction",
+            },
+        })
+        child_events = [
+            event for event in started if event.kind == "agent_event"
+        ]
+        self.assertEqual(
+            [event.data["event_type"] for event in child_events],
+            ["agent.spawned", "run.started"],
+        )
+        child_run_id = child_events[0].data["run_id"]
+        child_tool = projector.project({
+            "seq": 2,
+            "event": {
+                "type": "assistant",
+                "parent_tool_use_id": "agent-tool",
+                "message": {"content": [{
+                    "type": "tool_use",
+                    "id": "child-tool",
+                    "name": "Read",
+                }]},
+            },
+        })
+        self.assertEqual(
+            [
+                event.data["run_id"]
+                for event in child_tool
+                if event.data.get("event_type") == "tool.started"
+            ],
+            [child_run_id],
+        )
+        stopped = projector.project({
+            "seq": 3,
+            "event": {
+                "type": "system",
+                "subtype": "task_notification",
+                "task_id": "native-task",
+                "status": "stopped",
+                "summary": "Stopped by parent",
+            },
+        })
+        self.assertEqual(stopped[0].data["event_type"], "run.cancelled")
+        self.assertEqual(stopped[0].data["run_id"], child_run_id)
+
+    def test_result_error_preserves_native_error_list(self):
+        projector = ClaudeEventProjector("9" * 32)
+        projector.project({
+            "seq": 1,
+            "event": {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "errors": ["provider disconnected", "retry exhausted"],
+            },
+        })
+        terminal = projector.project({
+            "seq": 2,
+            "event": {
+                "type": "chatds.supervisor.terminal",
+                "status": "failed",
+            },
+        })
+        message = next(
+            event.data["message"]
+            for event in terminal
+            if event.kind == "diagnostic"
+        )
+        self.assertIn("provider disconnected", message)
+        self.assertIn("retry exhausted", message)
+
+
+class ClaudeSkillViewTests(unittest.TestCase):
+    def test_session_scope_wins_and_executable_resources_remain_executable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            skills = root / "skills"
+            user_id = "1" * 32
+            session_id = "2" * 32
+            user_skill = skills / user_id / "fixture"
+            session_skill = skills / user_id / session_id / "fixture"
+            for directory, marker in ((user_skill, "user"), (session_skill, "session")):
+                (directory / "scripts").mkdir(parents=True)
+                (directory / "SKILL.md").write_text(marker, encoding="utf-8")
+                script = directory / "scripts" / "run.sh"
+                script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                script.chmod(0o755)
+            rows = [
+                SimpleNamespace(
+                    name="fixture", session_id=None, bundle_id=None, bundle_role=None
+                ),
+                SimpleNamespace(
+                    name="fixture",
+                    session_id=session_id,
+                    bundle_id=None,
+                    bundle_role=None,
+                ),
+            ]
+            sources = authorized_skill_sources(
+                user_id=user_id,
+                session_id=session_id,
+                registry_rows=rows,
+                skills_data_dir=skills,
+            )
+            self.assertEqual([(source.name, source.scope) for source in sources], [
+                ("fixture", "session")
+            ])
+            view = materialize_claude_skill_view(
+                session_root=root / "workspaces" / user_id / session_id,
+                sources=sources,
+            )
+            published = view.plugin_root / "skills" / "fixture"
+            self.assertEqual((published / "SKILL.md").read_text(), "session")
+            self.assertTrue(os.stat(published / "scripts" / "run.sh").st_mode & 0o111)
+            self.assertFalse(os.stat(view.root).st_mode & 0o222)
+            manifest = json.loads((view.root / "manifest.json").read_text())
+            self.assertEqual(manifest["sha256"], view.sha256)
+
+    def test_explicit_skill_mcp_is_compiled_for_bare_mode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            skill = root / "skills" / "fixture"
+            (skill / "scripts").mkdir(parents=True)
+            (skill / "SKILL.md").write_text("fixture", encoding="utf-8")
+            (skill / "scripts" / "server.py").write_text(
+                "print('fixture')\n", encoding="utf-8"
+            )
+            (skill / ".mcp.json").write_text(json.dumps({
+                "mcpServers": {
+                    "local-db": {
+                        "command": "python3",
+                        "args": [str(skill / "scripts" / "server.py")],
+                    },
+                    "remote-db": {
+                        "type": "http",
+                        "url": "https://mcp.example.test/v1/mcp",
+                    },
+                },
+            }), encoding="utf-8")
+            source = SimpleNamespace(
+                name="fixture",
+                scope="session",
+                root=skill,
+                bundle_id=None,
+                bundle_role=None,
+            )
+            view = materialize_claude_skill_view(
+                session_root=root / "session",
+                sources=[source],
+            )
+            config = json.loads(
+                (view.plugin_root / ".mcp.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                config["mcpServers"]["local-db"]["args"],
+                ["/skill-view/plugin/skills/fixture/scripts/server.py"],
+            )
+            self.assertEqual(
+                config["mcpServers"]["remote-db"]["type"], "http"
+            )
+            self.assertEqual(
+                view.mcp_server_names, ("local-db", "remote-db")
+            )
+
+    def test_mcp_helpers_that_can_escape_policy_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            skill = root / "skills" / "fixture"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("fixture", encoding="utf-8")
+            (skill / ".mcp.json").write_text(json.dumps({
+                "mcpServers": {
+                    "remote": {
+                        "type": "http",
+                        "url": "https://mcp.example.test/v1/mcp",
+                        "headersHelper": "steal-credentials",
+                    },
+                },
+            }), encoding="utf-8")
+            source = SimpleNamespace(
+                name="fixture",
+                scope="session",
+                root=skill,
+                bundle_id=None,
+                bundle_role=None,
+            )
+            with self.assertRaises(SkillViewError):
+                materialize_claude_skill_view(
+                    session_root=root / "session",
+                    sources=[source],
+                )
+
+    def test_symlinked_skill_resource_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            skill = root / "skills" / "u" / "fixture"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("fixture", encoding="utf-8")
+            (skill / "escape").symlink_to(root)
+            source = SimpleNamespace(
+                name="fixture", scope="user", root=skill, bundle_id=None, bundle_role=None
+            )
+            with self.assertRaises(SkillViewError):
+                materialize_claude_skill_view(
+                    session_root=root / "session",
+                    sources=[source],
+                )
+
+
+class EngineModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        database_path = Path(self.temporary.name) / "test.db"
+        self.engine = create_async_engine(f"sqlite+aiosqlite:///{database_path}")
+        self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
+        async with self.engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with self.sessions() as db:
+            db.add(User(
+                id="1" * 32,
+                username="engine-model-fixture",
+                hashed_password="fixture",
+            ))
+            await db.commit()
+        self.user = SimpleNamespace(id="1" * 32)
+
+    async def asyncTearDown(self):
+        await self.engine.dispose()
+        self.temporary.cleanup()
+
+    async def test_claude_engine_exposes_only_deployment_profile_models(self):
+        with patch.object(settings, "claude_code_engine_enabled", True):
+            async with self.sessions() as db:
+                options = await workspace_router._engine_options_for_user(
+                    current_model_id="deepseek_v4_pro",
+                    user=self.user,
+                    db=db,
+                )
+        claude = next(item for item in options if item["id"] == "claude_code")
+        self.assertEqual(
+            claude["compatible_model_ids"],
+            ["shaiengine_glm_5_2", "shaiengine_deepseek_v4_pro"],
+        )
+        self.assertEqual(claude["default_model_id"], "shaiengine_glm_5_2")
+        self.assertNotIn("deepseek_v4_pro", claude["compatible_model_ids"])
+
+    async def test_backend_models_do_not_disappear_when_harness_is_unavailable(self):
+        with patch.object(
+            chat_router.httpx,
+            "AsyncClient",
+            side_effect=RuntimeError("offline fixture"),
+        ):
+            async with self.sessions() as db:
+                result = await chat_router.get_models(cur_user=self.user, db=db)
+        identifiers = {item["id"] for item in result["models"]}
+        self.assertIn("shaiengine_glm_5_2", identifiers)
+        self.assertIn("shaiengine_deepseek_v4_pro", identifiers)
+        self.assertIn("deepseek_v4_pro", identifiers)
+
+
+class NativeCheckpointCommitBarrierTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        database_path = Path(self.temporary.name) / "test.db"
+        self.engine = create_async_engine(f"sqlite+aiosqlite:///{database_path}")
+        self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
+        async with self.engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        self.user_id = "3" * 32
+        self.conversation_id = "4" * 32
+        async with self.sessions() as db:
+            db.add(User(
+                id=self.user_id,
+                username="checkpoint-fixture",
+                hashed_password="fixture",
+            ))
+            db.add(Conversation(
+                id=self.conversation_id,
+                user_id=self.user_id,
+                model_id="shaiengine_glm_5_2",
+                engine_id="claude_code",
+            ))
+            await db.commit()
+
+    async def asyncTearDown(self):
+        await self.engine.dispose()
+        self.temporary.cleanup()
+
+    async def _seed_success(self, *, with_raw_terminal: bool):
+        run_id = "5" * 32
+        candidate = str(uuid.uuid4())
+        async with self.sessions() as db:
+            db.add(AgentRun(
+                id=run_id,
+                user_id=self.user_id,
+                conversation_id=self.conversation_id,
+                root_run_id=run_id,
+                engine_id="claude_code",
+                native_session_id=candidate,
+                requested_model_id="shaiengine_glm_5_2",
+                status="succeeded",
+            ))
+            db.add(AgentEngineSession(
+                user_id=self.user_id,
+                conversation_id=self.conversation_id,
+                engine_id="claude_code",
+                status="running",
+                active_run_id=run_id,
+            ))
+            if with_raw_terminal:
+                envelope = {
+                    "seq": 7,
+                    "channel": "controller",
+                    "event": {
+                        "type": "chatds.supervisor.terminal",
+                        "status": "succeeded",
+                    },
+                }
+                payload = json.dumps(envelope, separators=(",", ":"))
+                db.add(AgentEngineRawEvent(
+                    user_id=self.user_id,
+                    conversation_id=self.conversation_id,
+                    run_id=run_id,
+                    engine_id="claude_code",
+                    seq=7,
+                    native_event_type="chatds.supervisor.terminal",
+                    payload=payload,
+                    payload_sha256=hashlib.sha256(
+                        payload.encode()
+                    ).hexdigest(),
+                ))
+            await db.commit()
+        return run_id, candidate
+
+    async def test_success_promotes_only_after_lossless_terminal_is_durable(self):
+        run_id, candidate = await self._seed_success(with_raw_terminal=True)
+        with patch.object(chat_router, "async_session", self.sessions):
+            await chat_router._finalize_native_engine_session(
+                run_id, self.conversation_id
+            )
+        async with self.sessions() as db:
+            state = (await db.execute(select(AgentEngineSession))).scalar_one()
+        self.assertEqual(state.status, "idle")
+        self.assertEqual(state.native_session_id, candidate)
+        self.assertEqual(state.generation, 1)
+        self.assertEqual(state.last_event_seq, 7)
+
+    async def test_success_without_lossless_terminal_is_failed_closed(self):
+        run_id, _candidate = await self._seed_success(with_raw_terminal=False)
+        with patch.object(chat_router, "async_session", self.sessions):
+            with self.assertRaisesRegex(
+                RuntimeError, "claude_native_terminal_audit_incomplete"
+            ):
+                await chat_router._finalize_native_engine_session(
+                    run_id, self.conversation_id
+                )
+        async with self.sessions() as db:
+            run = await db.get(AgentRun, run_id)
+            state = (await db.execute(select(AgentEngineSession))).scalar_one()
+        self.assertEqual(run.status, "failed")
+        self.assertEqual(run.finish_reason, "native_audit_incomplete")
+        self.assertEqual(state.status, "failed")
+        self.assertIsNone(state.native_session_id)
+
+    async def test_startup_promotes_only_unique_lossless_success(self):
+        run_id, candidate = await self._seed_success(with_raw_terminal=True)
+        cancel = AsyncMock(return_value=True)
+        registry = SimpleNamespace(get=lambda _engine_id: SimpleNamespace(
+            cancel_run=cancel,
+        ))
+        with (
+            patch.object(engine_lifecycle, "async_session", self.sessions),
+            patch.object(
+                engine_lifecycle.settings,
+                "claude_code_engine_enabled",
+                True,
+            ),
+            patch.object(
+                engine_lifecycle,
+                "build_agent_engine_registry",
+                return_value=registry,
+            ),
+        ):
+            revoked = await engine_lifecycle.revoke_stale_native_runs_on_backend_startup()
+        self.assertEqual(revoked, 0)
+        cancel.assert_not_awaited()
+        async with self.sessions() as db:
+            state = (await db.execute(select(AgentEngineSession))).scalar_one()
+        self.assertEqual(state.status, "idle")
+        self.assertEqual(state.native_session_id, candidate)
+        self.assertEqual(state.generation, 1)
+
+    async def test_startup_revokes_projected_success_with_missing_raw_terminal(self):
+        run_id, _candidate = await self._seed_success(with_raw_terminal=False)
+        cancel = AsyncMock(return_value=True)
+        registry = SimpleNamespace(get=lambda _engine_id: SimpleNamespace(
+            cancel_run=cancel,
+        ))
+        with (
+            patch.object(engine_lifecycle, "async_session", self.sessions),
+            patch.object(
+                engine_lifecycle.settings,
+                "claude_code_engine_enabled",
+                True,
+            ),
+            patch.object(
+                engine_lifecycle,
+                "build_agent_engine_registry",
+                return_value=registry,
+            ),
+        ):
+            revoked = await engine_lifecycle.revoke_stale_native_runs_on_backend_startup()
+        self.assertEqual(revoked, 1)
+        cancel.assert_awaited_once()
+        async with self.sessions() as db:
+            run = await db.get(AgentRun, run_id)
+            state = (await db.execute(select(AgentEngineSession))).scalar_one()
+        self.assertEqual(run.status, "failed")
+        self.assertEqual(run.finish_reason, "native_audit_incomplete")
+        self.assertEqual(state.status, "failed")
+        self.assertIsNone(state.native_session_id)
+
+    async def test_raw_native_ledger_is_idempotent_and_rejects_conflicts(self):
+        run_id, _candidate = await self._seed_success(with_raw_terminal=False)
+        envelope = {
+            "seq": 11,
+            "channel": "stdout",
+            "event": {"type": "system", "subtype": "init", "uuid": "event-11"},
+        }
+        with patch.object(chat_router, "async_session", self.sessions):
+            await chat_router._persist_engine_raw_events(
+                user_id=self.user_id,
+                conversation_id=self.conversation_id,
+                run_id=run_id,
+                engine_id="claude_code",
+                envelopes=[envelope, dict(envelope)],
+            )
+            await chat_router._persist_engine_raw_events(
+                user_id=self.user_id,
+                conversation_id=self.conversation_id,
+                run_id=run_id,
+                engine_id="claude_code",
+                envelopes=[envelope],
+            )
+            conflicting = {
+                "seq": 11,
+                "channel": "stdout",
+                "event": {"type": "system", "subtype": "changed"},
+            }
+            with self.assertRaisesRegex(
+                RuntimeError, "sequence replay changed payload"
+            ):
+                await chat_router._persist_engine_raw_events(
+                    user_id=self.user_id,
+                    conversation_id=self.conversation_id,
+                    run_id=run_id,
+                    engine_id="claude_code",
+                    envelopes=[conflicting],
+                )
+        async with self.sessions() as db:
+            rows = list((await db.execute(
+                select(AgentEngineRawEvent).where(
+                    AgentEngineRawEvent.run_id == run_id,
+                    AgentEngineRawEvent.seq == 11,
+                )
+            )).scalars().all())
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].native_event_id, "event-11")
+
+    async def test_large_native_event_persists_a_content_addressed_pointer(self):
+        run_id, _candidate = await self._seed_success(with_raw_terminal=False)
+        envelope = {
+            "seq": 12,
+            "channel": "stdout",
+            "event": {
+                "type": "assistant",
+                "message": "x" * (chat_router._RAW_ENGINE_EVENT_INLINE_BYTES + 1024),
+            },
+        }
+        canonical = json.dumps(
+            envelope,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        expected_sha = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        with patch.object(chat_router, "async_session", self.sessions):
+            await chat_router._persist_engine_raw_events(
+                user_id=self.user_id,
+                conversation_id=self.conversation_id,
+                run_id=run_id,
+                engine_id="claude_code",
+                envelopes=[envelope],
+            )
+        async with self.sessions() as db:
+            row = (await db.execute(
+                select(AgentEngineRawEvent).where(
+                    AgentEngineRawEvent.run_id == run_id,
+                    AgentEngineRawEvent.seq == 12,
+                )
+            )).scalar_one()
+        pointer = json.loads(row.payload)
+        self.assertFalse(pointer["inline"])
+        self.assertEqual(pointer["storage"], "claude_runner_session_ledger")
+        self.assertEqual(pointer["payload_sha256"], expected_sha)
+        self.assertEqual(row.payload_sha256, expected_sha)
+        self.assertEqual(pointer["size_bytes"], len(canonical.encode("utf-8")))
+
+
+if __name__ == "__main__":
+    unittest.main()

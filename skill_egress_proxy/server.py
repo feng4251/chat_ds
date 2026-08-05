@@ -46,6 +46,7 @@ from urllib.parse import urlsplit, urlunsplit
 LISTEN_HOST: Final[str] = os.environ.get("SKILL_EGRESS_LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT: Final[int] = int(os.environ.get("SKILL_EGRESS_LISTEN_PORT", "8080"))
 LISTEN_SOCKET: Final[str] = os.environ.get("SKILL_EGRESS_SOCKET_PATH", "").strip()
+EGRESS_POLICY_RUNTIME_VERSION: Final[str] = "signed-exact-query-v1"
 CONNECT_TIMEOUT_SECONDS: Final[float] = float(
     os.environ.get("SKILL_EGRESS_CONNECT_TIMEOUT_SECONDS", "10")
 )
@@ -235,6 +236,7 @@ class ExactEgressRule:
     origin: Origin
     path_prefix: str
     query_prefix: str
+    query_exact: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -612,12 +614,17 @@ def _validated_signed_egress_policy(
 
     compiled_rules: list[ExactEgressRule] = []
     derived_origins: list[Origin] = []
-    seen_rules: set[tuple[str, tuple[str, ...]]] = set()
+    seen_rules: set[tuple[str, tuple[str, ...], bool]] = set()
     for raw_rule in rules_raw:
+        keys = set(raw_rule) if isinstance(raw_rule, dict) else set()
         if (
             not isinstance(raw_rule, dict)
-            or set(raw_rule) != {"methods", "url_prefix"}
+            or keys not in (
+                {"methods", "url_prefix"},
+                {"methods", "url_prefix", "query_exact"},
+            )
             or not isinstance(raw_rule.get("methods"), list)
+            or type(raw_rule.get("query_exact", False)) is not bool
         ):
             raise ProxyPolicyError("invalid_policy_preface")
         methods_raw = raw_rule["methods"]
@@ -640,7 +647,8 @@ def _validated_signed_egress_policy(
         prefix = _canonical_egress_url_prefix(
             raw_rule.get("url_prefix")
         )
-        coordinate = (prefix, canonical_methods)
+        query_exact = bool(raw_rule.get("query_exact", False))
+        coordinate = (prefix, canonical_methods, query_exact)
         if (
             methods_raw != list(canonical_methods)
             or coordinate in seen_rules
@@ -658,6 +666,7 @@ def _validated_signed_egress_policy(
             origin=origin,
             path_prefix=parsed.path or "/",
             query_prefix=parsed.query,
+            query_exact=query_exact,
         ))
 
     if (
@@ -912,8 +921,11 @@ def _authorize_exact_request(
         )
         if not path_matches:
             continue
+        if rule.query_exact and query != rule.query_prefix:
+            continue
         if (
-            rule.query_prefix
+            not rule.query_exact
+            and rule.query_prefix
             and not query.startswith(rule.query_prefix)
         ):
             continue

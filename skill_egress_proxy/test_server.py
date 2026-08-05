@@ -1068,6 +1068,11 @@ class ExactEgressPolicyTests(unittest.TestCase):
                         "q=galectin"
                     ),
                 },
+                {
+                    "methods": ["GET"],
+                    "url_prefix": "https://example.com:443/exact?view=full",
+                    "query_exact": True,
+                },
             ],
             [],
         )
@@ -1087,6 +1092,7 @@ class ExactEgressPolicyTests(unittest.TestCase):
             ("GET", "/docs/chapter"),
             ("POST", "/search?q=galectin-3"),
             ("POST", "/search?q=galectin&phase=2"),
+            ("GET", "/exact?view=full"),
         )
         for method, target in allowed:
             with self.subTest(method=method, target=target):
@@ -1104,6 +1110,8 @@ class ExactEgressPolicyTests(unittest.TestCase):
             ("DELETE", "/docs/chapter"),
             ("POST", "/search?x=1&q=galectin"),
             ("GET", "/search?q=galectin"),
+            ("GET", "/exact"),
+            ("GET", "/exact?view=full&secret=1"),
         )
         for method, target in denied:
             with (

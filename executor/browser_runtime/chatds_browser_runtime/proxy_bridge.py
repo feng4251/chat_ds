@@ -33,6 +33,10 @@ from urllib.parse import urlsplit, urlunsplit
 
 LISTEN_HOST: Final[str] = "127.0.0.1"
 LISTEN_PORT: Final[int] = 18080
+# Bump this whenever the signed rule schema or its matching semantics change.
+# Container builds assert the value so a stale sandbox base cannot silently
+# disagree with the Supervisor policy compiler.
+EGRESS_POLICY_RUNTIME_VERSION: Final[str] = "signed-exact-query-v1"
 PROXY_SOCKET_PATH: Final[Path] = Path(
     "/run/chatds-skill-egress/proxy.sock"
 )
@@ -398,12 +402,17 @@ def _validated_exact_policy(
 
     canonical_rules: list[dict[str, object]] = []
     derived_origins: list[str] = []
-    seen_rules: set[tuple[str, tuple[str, ...]]] = set()
+    seen_rules: set[tuple[str, tuple[str, ...], bool]] = set()
     for raw_rule in rules:
+        keys = set(raw_rule) if isinstance(raw_rule, dict) else set()
         if (
             not isinstance(raw_rule, dict)
-            or set(raw_rule) != {"methods", "url_prefix"}
+            or keys not in (
+                {"methods", "url_prefix"},
+                {"methods", "url_prefix", "query_exact"},
+            )
             or not isinstance(raw_rule.get("methods"), list)
+            or type(raw_rule.get("query_exact", False)) is not bool
         ):
             raise BridgeConfigurationError(
                 "invalid exact egress rule"
@@ -428,7 +437,8 @@ def _validated_exact_policy(
             if method in set(methods_raw)
         )
         prefix = _canonical_url_prefix(raw_rule.get("url_prefix"))
-        coordinate = (prefix, canonical_methods)
+        query_exact = bool(raw_rule.get("query_exact", False))
+        coordinate = (prefix, canonical_methods, query_exact)
         if (
             list(canonical_methods) != methods_raw
             or coordinate in seen_rules
@@ -443,10 +453,13 @@ def _validated_exact_policy(
         )
         if origin not in derived_origins:
             derived_origins.append(origin)
-        canonical_rules.append({
+        canonical_rule: dict[str, object] = {
             "methods": list(canonical_methods),
             "url_prefix": prefix,
-        })
+        }
+        if query_exact:
+            canonical_rule["query_exact"] = True
+        canonical_rules.append(canonical_rule)
     if tuple(derived_origins) != canonical_origins:
         raise BridgeConfigurationError(
             "egress origins must exactly project the URL rules"

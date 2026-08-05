@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Awaitable, Callable, Optional, TypeVar
 import httpx
+import workspace as workspace_store
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select, func
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -17,6 +18,8 @@ from config import settings
 logger = logging.getLogger(__name__)
 from database import get_db, async_session
 from models import (
+    AgentEngineRawEvent,
+    AgentEngineSession,
     Artifact,
     User,
     Conversation,
@@ -60,6 +63,12 @@ from stream_observability import (
     _unsatisfied_contract_summary,
     set_service_shutdown_started,
 )
+from agent_engines.base import (
+    ENGINE_ID_CLAUDE_CODE,
+    ENGINE_ID_LEGACY,
+    AgentEngineError,
+    AgentEngineRequest,
+)
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -80,6 +89,87 @@ _DETACHED_STREAM_MAX_CHUNKS = 256
 _DETACHED_STREAM_MAX_BYTES = 4 * 1024 * 1024
 _DETACHED_STREAM_PUBLISH_WAIT_SECONDS = 5.0
 _AGENT_RUN_ERROR_STORAGE_LIMIT = 4000
+_RAW_ENGINE_EVENT_INLINE_BYTES = 1024 * 1024
+
+
+class _NormalizedEngineResponse:
+    """Expose normalized AgentEngine events through the legacy SSE parser."""
+
+    status_code = 200
+
+    def __init__(self, engine, request: AgentEngineRequest) -> None:
+        self._engine = engine
+        self._request = request
+
+    async def aread(self) -> bytes:
+        return b""
+
+    async def aiter_lines(self):
+        async for event in self._engine.stream(self._request):
+            delta: dict[str, object] = {}
+            finish_reason = None
+            model = None
+            if event.kind == "content":
+                delta["content"] = str(event.data.get("text") or "")
+            elif event.kind == "reasoning":
+                delta["reasoning"] = str(event.data.get("text") or "")
+            elif event.kind == "tool_progress":
+                delta["tool_progress"] = str(event.data.get("text") or "")
+            elif event.kind == "agent_event":
+                delta["agent_event"] = dict(event.data)
+            elif event.kind == "usage":
+                delta["usage"] = dict(event.data)
+            elif event.kind == "model":
+                model = str(event.data.get("resolved_model_id") or "") or None
+            elif event.kind == "finish":
+                finish_reason = str(event.data.get("finish_reason") or "stop")
+            elif event.kind == "diagnostic":
+                code = str(event.data.get("code") or "engine_diagnostic")
+                if code in {
+                    "claude_result_error",
+                    "claude_runner_failed",
+                    "malformed_claude_runner_event",
+                }:
+                    delta["error"] = str(event.data.get("message") or code)
+                else:
+                    delta["engine_diagnostic"] = dict(event.data)
+            payload: dict[str, object] = {
+                "choices": [{"delta": delta, "finish_reason": finish_reason}],
+            }
+            if model:
+                payload["model"] = model
+            if event.raw is not None:
+                payload["engine_raw_event"] = dict(event.raw)
+            yield "data: " + json.dumps(payload, ensure_ascii=False)
+        yield "data: [DONE]"
+
+
+@asynccontextmanager
+async def _open_agent_engine_stream(
+    *,
+    engine_id: str,
+    request: AgentEngineRequest,
+    legacy_payload: dict,
+):
+    if engine_id == ENGINE_ID_LEGACY:
+        async with httpx.AsyncClient(
+            timeout=settings.harness_stream_timeout_seconds
+        ) as client:
+            async with client.stream(
+                "POST",
+                f"{settings.harness_url}/v1/chat/completions",
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Internal-Token": settings.internal_api_token,
+                },
+                json=legacy_payload,
+            ) as response:
+                yield response
+        return
+    from agent_engines.registry import build_agent_engine_registry
+
+    engine = build_agent_engine_registry().get(engine_id)
+    yield _NormalizedEngineResponse(engine, request)
 
 
 def _bounded_agent_run_error(value: object) -> str | None:
@@ -89,6 +179,111 @@ def _bounded_agent_run_error(value: object) -> str | None:
     if len(text) <= _AGENT_RUN_ERROR_STORAGE_LIMIT:
         return text
     return text[:_AGENT_RUN_ERROR_STORAGE_LIMIT - 1] + "…"
+
+
+async def _persist_engine_raw_events(
+    *,
+    user_id: str,
+    conversation_id: str,
+    run_id: str,
+    engine_id: str,
+    envelopes: list[dict],
+) -> None:
+    if not envelopes:
+        return
+    prepared: dict[int, dict[str, object]] = {}
+    for envelope in envelopes:
+        seq = envelope.get("seq")
+        if not isinstance(seq, int) or seq < 1:
+            continue
+        full_payload = json.dumps(
+            envelope,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        encoded = full_payload.encode("utf-8")
+        payload_sha256 = hashlib.sha256(encoded).hexdigest()
+        native = envelope.get("event")
+        native_type = (
+            str(native.get("type") or "")[:96]
+            if isinstance(native, dict)
+            else None
+        )
+        native_event_id = None
+        if isinstance(native, dict):
+            candidate = native.get("uuid") or native.get("id") or native.get("task_id")
+            if candidate is not None:
+                native_event_id = str(candidate)[:192]
+        if len(encoded) > _RAW_ENGINE_EVENT_INLINE_BYTES:
+            full_payload = json.dumps(
+                {
+                    "storage": "claude_runner_session_ledger",
+                    "inline": False,
+                    "size_bytes": len(encoded),
+                    "payload_sha256": payload_sha256,
+                },
+                separators=(",", ":"),
+            )
+        row = {
+            "seq": seq,
+            "payload": full_payload,
+            "payload_sha256": payload_sha256,
+            "native_event_id": native_event_id,
+            "native_event_type": native_type,
+        }
+        previous = prepared.get(seq)
+        if previous is not None and previous["payload_sha256"] != payload_sha256:
+            raise RuntimeError("Conflicting native Agent Engine sequence in one batch")
+        prepared[seq] = row
+    if not prepared:
+        return
+
+    async def persist_once() -> None:
+        async with async_session() as event_db:
+            existing_rows = (await event_db.execute(
+                select(AgentEngineRawEvent).where(
+                    AgentEngineRawEvent.run_id == run_id,
+                    AgentEngineRawEvent.seq.in_(tuple(prepared)),
+                )
+            )).scalars().all()
+            existing = {row.seq: row for row in existing_rows}
+            for seq, row in sorted(prepared.items()):
+                prior = existing.get(seq)
+                if prior is not None:
+                    if prior.payload_sha256 != row["payload_sha256"]:
+                        raise RuntimeError(
+                            "Native Agent Engine sequence replay changed payload"
+                        )
+                    continue
+                event_db.add(AgentEngineRawEvent(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    run_id=run_id,
+                    engine_id=engine_id,
+                    seq=seq,
+                    native_event_id=row["native_event_id"],
+                    native_event_type=row["native_event_type"],
+                    payload=str(row["payload"]),
+                    payload_sha256=str(row["payload_sha256"]),
+                ))
+            await event_db.commit()
+
+    try:
+        await _run_sqlite_persist_with_retry(
+            persist_once,
+            description=f"native engine event persistence run={run_id}",
+        )
+    except Exception:
+        # Native events are part of the execution audit contract.  Do not
+        # silently claim a fully durable Turn when their index conflicts or
+        # cannot be committed; the caller's stream barrier will fail closed.
+        logger.exception(
+            "Native Agent Engine event index persistence failed run=%s",
+            run_id,
+        )
+        raise
 
 
 class _DetachedStreamRelay:
@@ -2456,6 +2651,94 @@ async def _persist_after_stream(
     return True
 
 
+async def _finalize_native_engine_session(run_id: str, conv_id: str) -> None:
+    async def finalize_once() -> None:
+        async with async_session() as s:
+            persisted_run = await s.get(AgentRun, run_id)
+            if (
+                persisted_run is None
+                or persisted_run.engine_id != ENGINE_ID_CLAUDE_CODE
+            ):
+                return
+            native_state = (await s.execute(
+                select(AgentEngineSession).where(
+                    AgentEngineSession.conversation_id == conv_id,
+                    AgentEngineSession.engine_id == ENGINE_ID_CLAUDE_CODE,
+                )
+            )).scalar_one_or_none()
+            if native_state is None or native_state.active_run_id != run_id:
+                return
+            terminal_status = str(persisted_run.status or "failed")
+            raw_terminal_rows = list((await s.execute(
+                select(AgentEngineRawEvent).where(
+                    AgentEngineRawEvent.run_id == run_id,
+                    AgentEngineRawEvent.native_event_type
+                    == "chatds.supervisor.terminal",
+                ).order_by(AgentEngineRawEvent.seq)
+            )).scalars().all())
+            raw_terminal_status = None
+            if len(raw_terminal_rows) == 1:
+                try:
+                    raw_envelope = json.loads(raw_terminal_rows[0].payload)
+                    raw_native = (
+                        raw_envelope.get("event")
+                        if isinstance(raw_envelope, dict)
+                        else None
+                    )
+                    if (
+                        isinstance(raw_native, dict)
+                        and raw_native.get("type")
+                        == "chatds.supervisor.terminal"
+                    ):
+                        raw_terminal_status = str(
+                            raw_native.get("status") or ""
+                        )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    raw_terminal_status = None
+            if (
+                terminal_status == "succeeded"
+                and raw_terminal_status != "succeeded"
+            ):
+                # A normalized projection is not sufficient authority to
+                # publish a native checkpoint.  The lossless Supervisor
+                # terminal must have crossed the raw-event durability barrier
+                # in the same Run first.
+                persisted_run.status = "failed"
+                persisted_run.finish_reason = "native_audit_incomplete"
+                persisted_run.error = (
+                    "Claude Code success was not backed by one durable "
+                    "Supervisor terminal event."
+                )
+                native_state.status = "failed"
+                native_state.active_run_id = None
+                native_state.error = persisted_run.error
+                await s.commit()
+                raise RuntimeError("claude_native_terminal_audit_incomplete")
+            native_state.status = (
+                "idle" if terminal_status == "succeeded" else terminal_status
+            )
+            native_state.active_run_id = None
+            native_state.last_event_seq = int((await s.execute(
+                select(func.max(AgentEngineRawEvent.seq)).where(
+                    AgentEngineRawEvent.run_id == run_id
+                )
+            )).scalar_one() or 0)
+            native_state.error = persisted_run.error
+            if terminal_status == "succeeded":
+                if not persisted_run.native_session_id:
+                    raise RuntimeError(
+                        "A successful Claude Code Turn has no candidate checkpoint identity"
+                    )
+                native_state.native_session_id = persisted_run.native_session_id
+                native_state.generation += 1
+            await s.commit()
+
+    await _run_sqlite_persist_with_retry(
+        finalize_once,
+        description=f"native engine session finalization conv={conv_id} run={run_id}",
+    )
+
+
 def _spawn_persist(
     conv_id: str,
     model_id: str,
@@ -2504,6 +2787,7 @@ def _spawn_persist_then_emit(
             raise RuntimeError(
                 f"Terminal stream projection was not durable conv={conv_id} run={run_id}"
             )
+        await _finalize_native_engine_session(run_id, conv_id)
         try:
             async with async_session() as s:
                 persisted_run = await s.get(AgentRun, run_id)
@@ -2659,6 +2943,17 @@ if _default_builtin_ids != [DEFAULT_AGENT_MODEL_ID]:
 DEFAULT_CUSTOM_MAX_TOKENS = 32768
 
 
+def claude_code_model_compatible(provider_config: dict) -> bool:
+    # Provider credentials are deployment-owned by the trusted Runner and are
+    # never forwarded from a user-defined model row.  Consequently protocol
+    # shape alone is insufficient: the model must bind one explicitly
+    # configured Runner profile.
+    return (
+        str(provider_config.get("provider") or "")
+        in settings.claude_code_provider_profiles
+    )
+
+
 async def resolve_model(model_id: str, cur_user: User, db: AsyncSession):
     """Return (base_url, api_key, is_multimodal, max_tokens, api_model)."""
     model_id = canonical_agent_model_id(model_id)
@@ -2744,34 +3039,37 @@ async def resolve_model_config(model_id: str, cur_user: User, db: AsyncSession) 
 
 @router.get("/models")
 async def get_models(cur_user=Depends(get_current_user), db=Depends(get_db)):
-    # Pull builtin models from harness
-    models: list[dict] = []
+    # Backend provider profiles are the execution authority. Harness discovery
+    # may enrich availability/name data, but it must never make configured
+    # models disappear merely because another engine reports a partial list.
+    discovered: dict[str, dict] = {}
     try:
         async with httpx.AsyncClient(timeout=5) as c:
             r = await c.get(f"{settings.harness_url}/v1/models")
             if r.status_code == 200:
                 data = r.json()
                 for m in data.get("data", []):
-                    mid = m["id"]
-                    cfg = BUILTIN.get(mid, {})
-                    models.append({
-                        "id": mid,
-                        "name": cfg.get("display_name", mid),
-                        "provider": "builtin",
-                        "is_multimodal": cfg.get("is_multimodal", False),
-                        "is_default": cfg.get("is_default", False),
-                        "capabilities": cfg.get("capabilities", ["text"]),
-                    })
+                    if isinstance(m, dict) and m.get("id"):
+                        discovered[canonical_agent_model_id(m["id"])] = m
     except Exception:
-        pass  # fall back to BUILTIN
-    if not models:
-        models = [
-            {"id": mid, "name": cfg["display_name"], "provider": "builtin",
-             "is_multimodal": cfg["is_multimodal"], "is_default": cfg.get("is_default", False),
-             "capabilities": cfg.get("capabilities", ["text"])}
-            for mid, cfg in BUILTIN.items()
-            if mid != "AgentModel"  # skip backward-compat alias
-        ]
+        pass
+    models = [
+        {
+            "id": mid,
+            "name": cfg["display_name"],
+            "provider": cfg.get("provider", "builtin"),
+            "is_multimodal": cfg["is_multimodal"],
+            "is_default": cfg.get("is_default", False),
+            "capabilities": cfg.get("capabilities", ["text"]),
+            "legacy_discovered": mid in discovered,
+            "compatible_engines": [
+                "legacy",
+                *(["claude_code"] if claude_code_model_compatible(cfg) else []),
+            ],
+        }
+        for mid, cfg in BUILTIN.items()
+        if mid != "AgentModel"  # skip backward-compat alias
+    ]
     # Merge custom models
     r = await db.execute(
         select(CustomModelConfig).where(CustomModelConfig.user_id == cur_user.id)
@@ -2782,8 +3080,32 @@ async def get_models(cur_user=Depends(get_current_user), db=Depends(get_db)):
             "provider": cm.provider, "is_multimodal": cm.is_multimodal,
             "is_default": False,
             "capabilities": ["vision"] if cm.is_multimodal else ["text"],
+            "compatible_engines": ["legacy"],
         })
     return {"models": models}
+
+
+@router.get("/engines")
+async def get_agent_engines(cur_user=Depends(get_current_user)):
+    """Expose configured execution engines without leaking runtime details."""
+
+    del cur_user
+    from agent_engines.registry import build_agent_engine_registry
+
+    descriptors = await build_agent_engine_registry().descriptors()
+    return {
+        "engines": [
+            {
+                "id": item.id,
+                "name": item.display_name,
+                "available": item.available,
+                "version": item.version,
+                "capabilities": list(item.capabilities),
+                "unavailable_reason": item.unavailable_reason,
+            }
+            for item in descriptors
+        ]
+    }
 
 
 async def _detect_model(req: ChatRequest, user_id: str) -> str:
@@ -2896,6 +3218,11 @@ async def _chat_stream(
             )).scalar_one_or_none()
             if not conv:
                 raise HTTPException(404, "Conversation not found")
+            if req.engine_id is not None and req.engine_id != conv.engine_id:
+                raise HTTPException(
+                    409,
+                    "Agent Engine is fixed for this Conversation; fork it to change engines",
+                )
             model_id = canonical_agent_model_id(
                 req.model_id
                 or conv.model_id
@@ -2912,7 +3239,17 @@ async def _chat_stream(
             model_id = canonical_agent_model_id(
                 await _detect_model(req, str(cur_user.id))
             )
-            conv = Conversation(user_id=cur_user.id, model_id=model_id)
+            requested_engine = req.engine_id or "legacy"
+            from agent_engines.registry import build_agent_engine_registry
+            try:
+                build_agent_engine_registry().get(requested_engine)
+            except LookupError as exc:
+                raise HTTPException(400, "Requested Agent Engine is not configured") from exc
+            conv = Conversation(
+                user_id=cur_user.id,
+                model_id=model_id,
+                engine_id=requested_engine,
+            )
             db.add(conv)
             await db.commit()
             await db.refresh(conv)
@@ -2966,6 +3303,14 @@ async def _chat_stream_with_turn(
     await _assert_no_unprojected_primary_turn(db, conv_id)
 
     provider_config = await resolve_model_config(model_id, cur_user, db)
+    if (
+        conv.engine_id == ENGINE_ID_CLAUDE_CODE
+        and not claude_code_model_compatible(provider_config)
+    ):
+        raise HTTPException(
+            400,
+            "The selected model is not allowed by a configured Claude Code provider profile",
+        )
     max_tokens = (
         BUILTIN.get(model_id, {}).get("max_tokens")
         if model_id in BUILTIN else DEFAULT_CUSTOM_MAX_TOKENS
@@ -3021,6 +3366,71 @@ async def _chat_stream_with_turn(
         except HTTPException:
             continue
 
+    claude_skill_view = None
+    engine_session: AgentEngineSession | None = None
+    resume_from_native_session_id: str | None = None
+    candidate_native_session_id: str | None = None
+    if conv.engine_id == ENGINE_ID_CLAUDE_CODE:
+        from agent_engines.skill_view import (
+            authorized_skill_sources,
+            materialize_claude_skill_view,
+        )
+        from routers import skill_router as skill_api
+
+        # Freeze both Skill scopes while copying the DB-authorized closure.
+        # The resulting plugin tree is content-addressed and read-only, so the
+        # long model Turn does not hold either install lock.
+        async with AsyncExitStack() as stack:
+            await stack.enter_async_context(
+                skill_api._skill_install_lock(cur_user.id, None)
+            )
+            await stack.enter_async_context(
+                skill_api._skill_install_lock(cur_user.id, conv_id)
+            )
+            fresh_rows = (await db.execute(skill_registry_query)).scalars().all()
+            sources = authorized_skill_sources(
+                user_id=str(cur_user.id),
+                session_id=conv_id,
+                registry_rows=fresh_rows,
+                skills_data_dir=skill_api.SKILLS_DATA_DIR,
+            )
+            claude_skill_view = await asyncio.to_thread(
+                materialize_claude_skill_view,
+                session_root=workspace_store.session_root(cur_user.id, conv_id),
+                sources=sources,
+            )
+
+        engine_session = (await db.execute(
+            select(AgentEngineSession).where(
+                AgentEngineSession.user_id == cur_user.id,
+                AgentEngineSession.conversation_id == conv_id,
+                AgentEngineSession.engine_id == ENGINE_ID_CLAUDE_CODE,
+            )
+        )).scalar_one_or_none()
+        if engine_session is None:
+            engine_session = AgentEngineSession(
+                user_id=cur_user.id,
+                conversation_id=conv_id,
+                engine_id=ENGINE_ID_CLAUDE_CODE,
+                native_session_id=None,
+                status="idle",
+            )
+            db.add(engine_session)
+        elif engine_session.status in {"queued", "running", "committing"}:
+            raise HTTPException(409, "A Claude Code Turn is already active for this Conversation")
+        if engine_session.generation > 0:
+            if not engine_session.native_session_id:
+                raise HTTPException(
+                    409,
+                    "Claude Code checkpoint metadata is incomplete for this Conversation",
+                )
+            resume_from_native_session_id = engine_session.native_session_id
+        # Every Turn writes a fresh native checkpoint.  It is promoted into
+        # AgentEngineSession only after the authoritative root terminal and
+        # assistant projection are durable.  A failed or cancelled Turn can
+        # therefore be discarded without polluting the last good transcript.
+        candidate_native_session_id = str(uuid.uuid4())
+
     # Load history before saving the new user message
     history_msgs = (await db.execute(
         select(Message).where(Message.conversation_id == conv_id).order_by(
@@ -3060,6 +3470,12 @@ async def _chat_stream_with_turn(
         conversation_id=conv_id,
         root_run_id=run_id,
         source="chat",
+        engine_id=conv.engine_id,
+        native_session_id=(
+            candidate_native_session_id
+            if engine_session is not None
+            else None
+        ),
         requested_model_id=model_id,
         resolved_model_id=model_id,
         status="running",
@@ -3072,6 +3488,12 @@ async def _chat_stream_with_turn(
         started_at=user_created_at,
     )
     db.add(run)
+    if engine_session is not None:
+        engine_session.status = "running"
+        engine_session.active_run_id = run_id
+        engine_session.skill_view_sha256 = claude_skill_view.sha256
+        engine_session.last_model_id = model_id
+        engine_session.error = None
     await db.commit()
     stream_observation = _StreamObservation(
         run_id=run.id,
@@ -3095,6 +3517,8 @@ async def _chat_stream_with_turn(
         upstream_failure_kind: str | None = None
         upstream_exception_class: str | None = None
         terminal_envelope_payload: dict | None = None
+        raw_engine_event_batch: list[dict] = []
+        seen_raw_engine_event_seqs: set[int] = set()
 
         def encode_sse(payload: dict) -> str:
             chunk = f"data: {json.dumps(payload)}\n\n"
@@ -3144,43 +3568,74 @@ async def _chat_stream_with_turn(
             # Stream from harness — agent loop with full tool set
             try:
                 stream_observation.upstream_state = "connecting"
-                async with httpx.AsyncClient(
-                    timeout=settings.harness_stream_timeout_seconds
-                ) as client:
-                    async with client.stream(
-                        "POST",
-                        f"{settings.harness_url}/v1/chat/completions",
-                        headers={
-                            "Content-Type": "application/json",
-                            "X-Internal-Token": settings.internal_api_token,
-                        },
-                        json={
-                            "model": model_id,
-                            "messages": final,
-                            "max_tokens": max_tokens,
-                            "temperature": 0.6,
-                            "stream": True,
-                            "tools": enabled_tools,
-                            "session_id": conv_id,
-                            "user": cur_user.id,
-                            "provider_config": provider_config,
-                            "fallback_configs": fallback_configs,
-                            "source": "chat",
-                            "enabled_user_skills": enabled_user_skills,
-                            "session_skill_registry": (
-                                session_skill_registry
-                            ),
-                            "event_schema": "chatds.agent.v2",
-                            "run_metadata": {
-                                "run_id": run.id,
-                                "root_run_id": run.id,
-                                "agent_kind": "primary",
-                                "agent_name": "primary",
-                                "depth": 0,
-                                "workspace_scope": "shared_session",
-                            },
-                        },
-                    ) as response:
+                legacy_payload = {
+                    "model": model_id,
+                    "messages": final,
+                    "max_tokens": max_tokens,
+                    "temperature": 0.6,
+                    "stream": True,
+                    "tools": enabled_tools,
+                    "session_id": conv_id,
+                    "user": cur_user.id,
+                    "provider_config": provider_config,
+                    "fallback_configs": fallback_configs,
+                    "source": "chat",
+                    "enabled_user_skills": enabled_user_skills,
+                    "session_skill_registry": session_skill_registry,
+                    "event_schema": "chatds.agent.v2",
+                    "run_metadata": {
+                        "run_id": run.id,
+                        "root_run_id": run.id,
+                        "agent_kind": "primary",
+                        "agent_name": "primary",
+                        "depth": 0,
+                        "workspace_scope": "shared_session",
+                    },
+                }
+                engine_request = AgentEngineRequest(
+                    run_id=run.id,
+                    root_run_id=run.id,
+                    user_id=str(cur_user.id),
+                    conversation_id=conv_id,
+                    model_id=model_id,
+                    api_model=str(provider_config.get("api_model") or model_id),
+                    messages=tuple(final),
+                    max_output_tokens=max_tokens,
+                    temperature=0.6,
+                    provider_config=provider_config,
+                    fallback_configs=tuple(fallback_configs),
+                    tools=tuple(enabled_tools),
+                    enabled_user_skills=tuple(enabled_user_skills),
+                    session_skill_registry=tuple(session_skill_registry),
+                    skill_view_path=(
+                        str(claude_skill_view.root)
+                        if claude_skill_view is not None
+                        else None
+                    ),
+                    skill_view_sha256=(
+                        claude_skill_view.sha256
+                        if claude_skill_view is not None
+                        else None
+                    ),
+                    native_session_id=(
+                        candidate_native_session_id
+                        if engine_session is not None
+                        else None
+                    ),
+                    resume_from_native_session_id=resume_from_native_session_id,
+                    source="chat",
+                    metadata={
+                        "workspace_path": str(
+                            workspace_store.workspace_dir(cur_user.id, conv_id)
+                        ),
+                        "user_turn_text": req.content,
+                    },
+                )
+                async with _open_agent_engine_stream(
+                    engine_id=conv.engine_id,
+                    request=engine_request,
+                    legacy_payload=legacy_payload,
+                ) as response:
                         stream_observation.upstream_state = "connected"
                         if response.status_code >= 400:
                             body = (await response.aread()).decode("utf-8", "ignore")[:300]
@@ -3199,6 +3654,32 @@ async def _chat_stream_with_turn(
                                 try:
                                     data = json.loads(chunk)
                                     stream_observation.observe_upstream_data()
+                                    raw_engine_event = data.get("engine_raw_event")
+                                    if isinstance(raw_engine_event, dict):
+                                        raw_seq = raw_engine_event.get("seq")
+                                        if (
+                                            isinstance(raw_seq, int)
+                                            and raw_seq > 0
+                                            and raw_seq not in seen_raw_engine_event_seqs
+                                        ):
+                                            seen_raw_engine_event_seqs.add(raw_seq)
+                                            raw_engine_event_batch.append(raw_engine_event)
+                                            native_payload = raw_engine_event.get("event")
+                                            raw_is_terminal = bool(
+                                                isinstance(native_payload, dict)
+                                                and native_payload.get("type")
+                                                == "chatds.supervisor.terminal"
+                                            )
+                                            if len(raw_engine_event_batch) >= 32 or raw_is_terminal:
+                                                pending_raw = list(raw_engine_event_batch)
+                                                raw_engine_event_batch.clear()
+                                                await _persist_engine_raw_events(
+                                                    user_id=str(cur_user.id),
+                                                    conversation_id=conv_id,
+                                                    run_id=run.id,
+                                                    engine_id=conv.engine_id,
+                                                    envelopes=pending_raw,
+                                                )
                                     delta = data["choices"][0].get("delta", {})
                                     agent_event = delta.get("agent_event")
                                     if isinstance(agent_event, dict):
@@ -3282,21 +3763,26 @@ async def _chat_stream_with_turn(
                                     stream_observation.observe_parse_error()
                             if stream_observation.upstream_state == "connected":
                                 stream_observation.upstream_state = "eof"
+            except AgentEngineError as exc:
+                upstream_failure_kind = f"agent_engine_{exc.code}"
+                upstream_exception_class = exc.exception_class or type(exc).__name__
+                stream_observation.upstream_state = "engine_error"
+                stream_error_message = str(exc)
             except httpx.ConnectError as exc:
                 upstream_failure_kind = "upstream_harness_connect_error"
                 upstream_exception_class = type(exc).__name__
                 stream_observation.upstream_state = "connect_error"
-                stream_error_message = f"无法连接到 Harness 服务 {settings.harness_url}。请检查 harness 容器是否在运行。"
+                stream_error_message = f"无法连接到 Legacy Harness 服务 {settings.harness_url}。请检查 harness 容器是否在运行。"
             except httpx.TimeoutException as exc:
                 upstream_failure_kind = "upstream_harness_timeout"
                 upstream_exception_class = type(exc).__name__
                 stream_observation.upstream_state = "timeout"
-                stream_error_message = "Harness 服务响应超时。"
+                stream_error_message = "Legacy Harness 服务响应超时。"
             except Exception as e:
                 upstream_failure_kind = "upstream_harness_exception"
                 upstream_exception_class = type(e).__name__
                 stream_observation.upstream_state = "exception"
-                stream_error_message = f"调用 Harness 时出错:{type(e).__name__}: {e}"
+                stream_error_message = f"调用 Agent Engine 时出错:{type(e).__name__}: {e}"
 
             error_message, execution_failed = _reconcile_root_stream_error(
                 agent_events,
@@ -3331,16 +3817,19 @@ async def _chat_stream_with_turn(
                 agent_events,
                 run_id=run.id,
             )
+            engine_source = (
+                "claude_code" if conv.engine_id == ENGINE_ID_CLAUDE_CODE else "harness"
+            )
             if root_terminal_status == "succeeded":
-                termination_source = "upstream_harness_completed"
+                termination_source = f"upstream_{engine_source}_completed"
             elif root_terminal_status == "failed":
                 termination_source = (
                     "provider_failure_reported_by_harness"
                     if provider_failure.get("reported") is True
-                    else "upstream_harness_failed"
+                    else f"upstream_{engine_source}_failed"
                 )
             elif root_terminal_status == "cancelled":
-                termination_source = "upstream_harness_cancelled"
+                termination_source = f"upstream_{engine_source}_cancelled"
             else:
                 termination_source = (
                     upstream_failure_kind
@@ -3506,6 +3995,21 @@ async def _chat_stream_with_turn(
                 "run_id": run.id,
             }
         finally:
+            if raw_engine_event_batch:
+                try:
+                    await _persist_engine_raw_events(
+                        user_id=str(cur_user.id),
+                        conversation_id=conv_id,
+                        run_id=run.id,
+                        engine_id=conv.engine_id,
+                        envelopes=list(raw_engine_event_batch),
+                    )
+                except Exception:
+                    error_message = (
+                        error_message
+                        or "Native Agent Engine audit events could not be persisted."
+                    )
+                raw_engine_event_batch.clear()
             termination_debug_event = next(
                 (
                     event for event in reversed(agent_events)
@@ -3524,6 +4028,35 @@ async def _chat_stream_with_turn(
             root_terminal_status, _root_terminal_error = (
                 _agent_event_terminal_status(agent_events, run_id=run.id)
             )
+            if (
+                conv.engine_id == ENGINE_ID_CLAUDE_CODE
+                and root_terminal_status is None
+            ):
+                try:
+                    from agent_engines.registry import build_agent_engine_registry
+
+                    revoked = await build_agent_engine_registry().get(
+                        ENGINE_ID_CLAUDE_CODE
+                    ).cancel_run(
+                        user_id=str(cur_user.id),
+                        conversation_id=conv_id,
+                        run_id=run.id,
+                    )
+                    if not revoked:
+                        error_message = (
+                            error_message
+                            or "Claude Code execution revocation did not converge."
+                        )
+                except Exception:
+                    logger.exception(
+                        "Claude Code execution revocation failed conv=%s run=%s",
+                        conv_id,
+                        run.id,
+                    )
+                    error_message = (
+                        error_message
+                        or "Claude Code execution revocation did not converge."
+                    )
             if (
                 not cancelled
                 and root_terminal_status is None

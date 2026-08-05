@@ -45,6 +45,7 @@ class ConversationOut(BaseModel):
     id: str
     title: Optional[str]
     model_id: str
+    engine_id: str = "legacy"
     created_at: datetime
     updated_at: datetime
     last_message: Optional[str] = None
@@ -61,9 +62,11 @@ class ChatRequest(BaseModel):
     content: str
     image_urls: Optional[list[str]] = None
     model_id: Optional[str] = None
+    engine_id: Optional[Literal["legacy", "claude_code"]] = None
 
 
 class ConversationSettingsUpdate(BaseModel):
+    engine_id: Optional[Literal["legacy", "claude_code"]] = None
     model_id: Optional[str] = None
     enabled_tools: Optional[list[str]] = None
     fallback_model_ids: Optional[list[str]] = None

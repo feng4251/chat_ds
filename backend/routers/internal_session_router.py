@@ -215,6 +215,8 @@ class InternalFork(BaseModel):
     title: str | None = Field(default=None, max_length=256)
     include_messages: bool = True
     fork_id: str | None = Field(default=None, min_length=32, max_length=32)
+    target_engine_id: str | None = Field(default=None, max_length=32)
+    target_model_id: str | None = Field(default=None, max_length=128)
 
 
 @router.post("/{cid}/fork")
@@ -246,6 +248,8 @@ async def fork_session(
         title=payload.title or ((source.title or "Session") + " · fork"),
         include_messages=payload.include_messages,
         fork_id=payload.fork_id,
+        target_engine_id=payload.target_engine_id,
+        target_model_id=payload.target_model_id,
         user=SimpleNamespace(id=user_id),
         db=db,
         source_maintenance_lease_already_held=True,

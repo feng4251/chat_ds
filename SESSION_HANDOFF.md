@@ -6,6 +6,37 @@
 
 - 工作目录：`/nfs/yangbb/codes/chat_ds`。
 - 分支：`fix/generic-skill-harness-20260717`。
+- 2026-08-05 新增可选 `ClaudeCodeEngine`，Legacy Harness 保留且 Conversation 级固定
+  engine；切换 engine 必须 fork，不能拼接不同原生 transcript。Backend 只保存稳定归一化事件，
+  同时把 Claude 原始 stream-json 持久化到独立 lossless ledger。每 Turn 使用新的候选 native
+  session；只有唯一成功 Supervisor terminal、原始事件和 assistant 投影均 durable 后才提升为
+  committed checkpoint，失败/取消不会污染上一个可恢复会话。Backend/Supervisor 重启、取消和
+  Conversation 删除都有 fail-closed reconcile/cleanup。
+- Claude Turn 由受信 Supervisor 动态创建独立容器：只挂载当前 user/session workspace、当前
+  session state、内容寻址只读 Skill plugin、单请求和本机 mutation-lock volume；无 Docker socket，
+  `network_mode=none`、只读根、cap-drop、资源上限和紧凑 seccomp。Skill view 仅包含 DB 已授权的
+  user/session Skills，显式编译受限 stdio/http/sse MCP，`--bare --strict-mcp-config` 禁止 ambient
+  project/user MCP。官方 npm 包和平台二进制固定为 Claude Code `2.1.152`，构建时校验版本和真实
+  native binary，不复制宿主不透明二进制。
+- Claude 网络制度见 `claude_runner/NETWORK_EGRESS_POLICY.md`：Turn 默认无网，只能经回环桥接到
+  Skill Egress Proxy；Provider 仅精确 `POST /v1/messages`，当前用户 URL 仅精确 query 的
+  `GET/HEAD`，Skill/MCP 只获得其静态声明的方法/路径前缀，私网还要求部署白名单、Skill grant、
+  当前 Turn URL 三方交集。不存在通配域名或临时全网兜底。策略集合、root-run budget 和 call ID
+  经 HMAC 绑定，重定向重新鉴权，终端保存出站计数/预算/摘要 receipt。Sandbox、Runner、Proxy
+  共同声明 `signed-exact-query-v1`；镜像构建实际导入解析器校验，Supervisor 再校验 Runner label，
+  防止编译器与旧执行镜像漂移。
+- 当前宿主 runc/kernel 把 `no-new-privileges + seccomp` 组合拒绝为 `errno 524`。Claude Turn
+  使用 `seccomp_stripped_setid`：构建移除全部 setuid/setgid/file capability 并由 Supervisor 校验，
+  运行仍保留 seccomp、network-none、cap/mount 边界。Egress Proxy 同样构建期剥离 setid/cap，
+  以非 root、cap-drop、只读根和 Docker 默认 seccomp 运行；固定、无网的 socket initializer 只保留
+  窄 capability。宿主修复后可切回 `seccomp_no_new_privileges`。
+- 本轮确定性验证：Backend `258 passed`；Claude Runner/Supervisor `20 passed`；Egress Proxy
+  `76 passed`；共享网络策略 `45 passed, 43 subtests`；Executor/Browser/Topology
+  `135 passed, 1 skipped, 140 subtests`；Frontend production build 通过；默认及
+  `claude-code` Compose config 均通过。真实、零模型 token 的固定 CLI 容器 E2E 已通过完整
+  Supervisor → 动态 Docker Turn → 回环代理/零出站 → native stream → checkpoint → 唯一 terminal
+  链，结果为 `succeeded`、4 events、1 native result、checkpoint present、0 egress connections。
+  本轮未自动运行模型重型 V2.3 E2E。
 - 2026-08-04 用户更新了双 Skill 迭代的成熟实现对照规则：以 ChatDS 为实现基础继续迭代，
   本地独立仓库 `claude-code/`（当前冻结 commit
   `6f6f12b37f529488b10e53928dd5508bb93535c7`）是从现在起唯一的成熟 Harness 实现参考。
@@ -2024,7 +2055,9 @@ Round 17 的两个全新 case。不得复用
   `fork_id`，并增加启动/周期 orphan journal reconciler。
 - Agent event 当前按事件即时持久化，长 run 的事件规模仍可能形成较高写放大；后续可做
   有界批处理。assistant projection 也还没有数据库级 run→message exactly-once 外键。
-- session-wise 隔离是固定容器池内的 lease/root-run 隔离，不是每 chat 动态创建容器。
+- Legacy Harness 的 session-wise 隔离仍是固定同质容器池内的 lease/root-run 隔离；可选
+  ClaudeCodeEngine 则由 Supervisor 为每个正在执行的 Turn 动态创建独立容器，结束即删除，
+  workspace/state 通过当前 Session 的精确挂载持续保存。
 - 依赖 profile 固定且不可运行时安装；复杂动态 Bash/Node/Python 需 exact marker/manifest。
 - Skill sandbox 的公网与显式白名单私网 HTTP(S) 都必须经过签名 egress policy；
   不支持 CAPTCHA、stealth、反爬绕过或未确认的重要操作。
@@ -2032,6 +2065,10 @@ Round 17 的两个全新 case。不得复用
   域名、路径、查询词和协议元数据；GET 也可把数据编码进 query/header。当前已拒绝
   GET/HEAD body 并精确限制 method/origin/path，严格 DLP 仍需查询/header schema、
   内容检查和出站字节/速率预算，不能把 GET/HEAD 等同于数学意义上的单向通道。
+- Claude CLI 当前仍需在其 worker 环境获得部署 Provider credential。精确 Provider endpoint 和
+  signed egress policy 可阻止把它发送到未授权目的地，但不能从数学上阻止模型把 workspace 内容
+  编码进本来就获准的 Provider 请求；不要宣称零泄露。若威胁模型要求模型/Skill 完全不可见
+  Provider secret，下一步必须实现由受信 Proxy 注入认证头的 credential gateway，而不是扩大网络。
 - policy-v3 root-run scope ledger 当前只存在于单个 Proxy 进程内并保留最多 24 小时；
   Proxy 重启会重置累计值。65,536 个未过期 scope 满载时会全局 fail closed，而不会
   LRU 驱逐并重置安全预算。若该累计值未来要成为跨重启安全证明，应迁移到持久 ledger。

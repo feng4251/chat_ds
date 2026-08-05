@@ -1,0 +1,50 @@
+ARG CLAUDE_CODE_VERSION=2.1.152
+ARG SESSION_SANDBOX_IMAGE=chat_ds-session-sandbox
+FROM node:22.23.1-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS claude-package
+ARG CLAUDE_CODE_VERSION
+WORKDIR /build
+RUN npm install --ignore-scripts --omit=dev --no-audit --no-fund \
+      "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+    # The wrapper package intentionally ships a tiny placeholder at its bin
+    # path and its postinstall replaces it with the platform package.  Keep
+    # third-party lifecycle scripts disabled, but perform that one operation
+    # explicitly after checking both pinned package versions.
+    && platform_arch="$(node -p 'process.arch')" \
+    && case "${platform_arch}" in x64|arm64) ;; *) exit 1 ;; esac \
+    && native_package="@anthropic-ai/claude-code-linux-${platform_arch}" \
+    && test "$(node -p "require('/build/node_modules/${native_package}/package.json').version")" = "${CLAUDE_CODE_VERSION}" \
+    && native_binary="$(node -p "require('path').join(require('path').dirname(require.resolve('${native_package}/package.json')), 'claude')")" \
+    && test -f "${native_binary}" \
+    && test "$(stat -c %s "${native_binary}")" -gt 100000000 \
+    && install -m 0555 "${native_binary}" /build/node_modules/@anthropic-ai/claude-code/bin/claude.exe \
+    && npm cache clean --force \
+    && test "$(node -p "require('/build/node_modules/@anthropic-ai/claude-code/package.json').version")" = "${CLAUDE_CODE_VERSION}" \
+    && /build/node_modules/.bin/claude --version | grep -F "${CLAUDE_CODE_VERSION}"
+
+FROM ${SESSION_SANDBOX_IMAGE}
+ARG CLAUDE_CODE_VERSION=2.1.152
+
+LABEL org.opencontainers.image.title="ChatDS isolated Claude Code Turn runner" \
+      org.opencontainers.image.version="${CLAUDE_CODE_VERSION}" \
+      org.opencontainers.image.chatds.network="none+signed-exact-egress-v3" \
+      org.opencontainers.image.chatds.egress-policy="signed-exact-query-v1" \
+      org.opencontainers.image.chatds.workspace-scope="one-session" \
+      org.opencontainers.image.chatds.setid-stripped="true"
+
+COPY --from=claude-package /build/node_modules /opt/chatds-claude-code/node_modules
+COPY claude_runner/runner_entrypoint.py /app/claude-runner/runner_entrypoint.py
+
+RUN ln -s /opt/chatds-claude-code/node_modules/.bin/claude /usr/local/bin/claude \
+    && mkdir -p /run/chatds /state /skill-view /runtime \
+    && chmod 0555 /app/claude-runner/runner_entrypoint.py \
+    && chmod -R a-w /opt/chatds-claude-code \
+    && find / -xdev -type f -perm /6000 -exec chmod a-s {} + \
+    && getcap -r / 2>/dev/null | cut -d ' ' -f 1 | xargs -r setcap -r \
+    && test -z "$(find / -xdev -type f -perm /6000 -print -quit)" \
+    && test -z "$(getcap -r / 2>/dev/null)" \
+    && test "$(python -I -c 'from chatds_browser_runtime.proxy_bridge import EGRESS_POLICY_RUNTIME_VERSION; print(EGRESS_POLICY_RUNTIME_VERSION)')" = "signed-exact-query-v1" \
+    && claude --version | grep -F "${CLAUDE_CODE_VERSION}"
+
+USER 0:0
+ENTRYPOINT ["/usr/bin/dumb-init", "--", "/usr/local/bin/python", "-I", "/app/claude-runner/runner_entrypoint.py"]
+CMD []

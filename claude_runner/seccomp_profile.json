@@ -1,0 +1,72 @@
+{
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "syscalls": [
+    {
+      "names": [
+        "_sysctl",
+        "acct",
+        "add_key",
+        "afs_syscall",
+        "bpf",
+        "clock_settime",
+        "clock_settime64",
+        "create_module",
+        "delete_module",
+        "fanotify_init",
+        "finit_module",
+        "fsconfig",
+        "fsmount",
+        "fsopen",
+        "fspick",
+        "init_module",
+        "ioperm",
+        "iopl",
+        "kexec_file_load",
+        "kexec_load",
+        "keyctl",
+        "lookup_dcookie",
+        "mount",
+        "mount_setattr",
+        "move_mount",
+        "name_to_handle_at",
+        "nfsservctl",
+        "open_by_handle_at",
+        "perf_event_open",
+        "pivot_root",
+        "ptrace",
+        "quotactl",
+        "reboot",
+        "request_key",
+        "setdomainname",
+        "sethostname",
+        "settimeofday",
+        "stime",
+        "swapoff",
+        "swapon",
+        "umount",
+        "umount2",
+        "userfaultfd",
+        "vm86",
+        "vm86old"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
+      "args": [],
+      "comment": "Deny host-control, kernel-extension, raw-inspection and mount syscalls; network and filesystem authority are separately fail-closed by network=none, capabilities and exact mounts."
+    },
+    {
+      "names": ["socket"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
+      "args": [
+        {
+          "index": 0,
+          "value": 17,
+          "valueTwo": 0,
+          "op": "SCMP_CMP_EQ"
+        }
+      ],
+      "comment": "Block AF_PACKET sockets even if a future capability change accidentally reintroduces CAP_NET_RAW."
+    }
+  ]
+}

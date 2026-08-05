@@ -99,10 +99,18 @@ export async function deleteConversation(convId) {
   return await res.json()
 }
 
-export async function forkConversation(convId, title, includeMessages = true) {
+export async function forkConversation(
+  convId,
+  title,
+  includeMessages = true,
+  targetEngineId = null,
+  targetModelId = null,
+) {
   const params = new URLSearchParams()
   if (title) params.set('title', title)
   params.set('include_messages', String(includeMessages))
+  if (targetEngineId) params.set('target_engine_id', targetEngineId)
+  if (targetModelId) params.set('target_model_id', targetModelId)
   const res = await request(`/conversations/${convId}/fork?${params}`, { method: 'POST' })
   return await res.json()
 }

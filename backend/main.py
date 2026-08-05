@@ -35,6 +35,7 @@ from storage_attestation import (
     storage_attestations_match,
     storage_root_attestation,
 )
+from agent_engines.lifecycle import revoke_stale_native_runs_on_backend_startup
 
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,12 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     set_service_shutdown_started(False)
     await init_db()
+    revoked_native_runs = await revoke_stale_native_runs_on_backend_startup()
+    if revoked_native_runs:
+        logger.warning(
+            "Revoked %s stale native Agent Engine run(s) during startup",
+            revoked_native_runs,
+        )
     try:
         workspace_reconcile = await reconcile_orphan_session_workspaces(
             clear_live_tombstones=True,

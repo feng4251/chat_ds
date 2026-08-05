@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import sqlite3
 import tempfile
 import unittest
@@ -15,6 +16,8 @@ import scheduler
 import workspace
 from workspace_lock import WorkspaceMutationLockError
 from models import (
+    AgentEngineRawEvent,
+    AgentEngineSession,
     AgentRun,
     AgentRunEvent,
     Artifact,
@@ -156,6 +159,28 @@ class ConversationDeletionLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 requested_model_id="model",
                 status="running",
             ))
+            db.add(AgentEngineSession(
+                id="engine-session",
+                user_id="user",
+                conversation_id="session",
+                engine_id="claude_code",
+                status="running",
+                active_run_id="run",
+            ))
+            native_payload = '{"event":{"type":"system"},"seq":1}'
+            db.add(AgentEngineRawEvent(
+                id="native-event",
+                user_id="user",
+                conversation_id="session",
+                run_id="run",
+                engine_id="claude_code",
+                seq=1,
+                native_event_type="system",
+                payload=native_payload,
+                payload_sha256=hashlib.sha256(
+                    native_payload.encode("utf-8")
+                ).hexdigest(),
+            ))
             db.add(AgentRunEvent(
                 id="event",
                 run_id="run",
@@ -268,6 +293,14 @@ class ConversationDeletionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             for model, predicate in (
                 (Message, Message.conversation_id == "session"),
                 (SkillPackage, SkillPackage.session_id == "session"),
+                (
+                    AgentEngineRawEvent,
+                    AgentEngineRawEvent.conversation_id == "session",
+                ),
+                (
+                    AgentEngineSession,
+                    AgentEngineSession.conversation_id == "session",
+                ),
                 (AgentRun, AgentRun.conversation_id == "session"),
                 (
                     AgentRunEvent,

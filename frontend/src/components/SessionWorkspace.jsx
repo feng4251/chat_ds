@@ -15,6 +15,7 @@ import {
   getSchedules, createSchedule, updateSchedule, deleteSchedule, runSchedule,
   getHooks, createHook, updateHook, deleteHook,
   getMcpServers, addMcpServer, deleteMcpServer,
+  forkConversation,
 } from '../api'
 
 const TOOL_GROUPS = {
@@ -98,7 +99,14 @@ const mdComponents = {
   ),
 }
 
-export default function SessionWorkspace({ open, onClose, convId, models, onSettingsChanged }) {
+export default function SessionWorkspace({
+  open,
+  onClose,
+  convId,
+  models,
+  onSettingsChanged,
+  onConversationForked,
+}) {
   const [tab, setTab] = useState('settings')
   const [settings, setSettings] = useState(null)
   const [workspace, setWorkspace] = useState({ files: [] })
@@ -167,12 +175,36 @@ export default function SessionWorkspace({ open, onClose, convId, models, onSett
     setSaving(true)
     try {
       const next = await updateConversationSettings(convId, {
+        engine_id: settings.engine_id,
         model_id: settings.model_id,
         enabled_tools: settings.enabled_tools,
         fallback_model_ids: settings.fallback_model_ids,
       })
       setSettings(next)
       onSettingsChanged?.(next)
+    } catch (e) { setError(e.message) } finally { setSaving(false) }
+  }
+
+  async function forkToEngine(targetEngineId) {
+    setSaving(true)
+    try {
+      const target = (settings.engine_options || []).find(
+        (engine) => engine.id === targetEngineId,
+      )
+      const compatible = target?.compatible_model_ids || []
+      const targetModelId = compatible.includes(settings.model_id)
+        ? settings.model_id
+        : target?.default_model_id
+      if (!targetModelId) throw new Error('目标执行引擎没有已配置的兼容模型')
+      const fork = await forkConversation(
+        convId,
+        null,
+        true,
+        targetEngineId,
+        targetModelId,
+      )
+      onClose?.()
+      onConversationForked?.(fork.id)
     } catch (e) { setError(e.message) } finally { setSaving(false) }
   }
 
@@ -336,12 +368,71 @@ export default function SessionWorkspace({ open, onClose, convId, models, onSett
         <div className="flex-1 overflow-y-auto p-5">
           {tab === 'settings' && settings && (
             <div className="space-y-5">
+              <Section title="执行引擎">
+                <select
+                  value={settings.engine_id || 'legacy'}
+                  disabled={settings.engine_locked}
+                  onChange={(e) => {
+                    const engineId = e.target.value
+                    const target = (settings.engine_options || []).find(
+                      (engine) => engine.id === engineId,
+                    )
+                    const compatible = target?.compatible_model_ids || []
+                    setSettings({
+                      ...settings,
+                      engine_id: engineId,
+                      model_id: compatible.includes(settings.model_id)
+                        ? settings.model_id
+                        : target?.default_model_id || settings.model_id,
+                    })
+                  }}
+                  className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm disabled:bg-stone-100 disabled:text-stone-500"
+                >
+                  {(settings.engine_options || []).map((engine) => (
+                    <option key={engine.id} value={engine.id} disabled={!engine.available}>
+                      {engine.name}{engine.available ? '' : '（不可用）'}
+                    </option>
+                  ))}
+                </select>
+                <div className="mt-1.5 text-[11px] text-slate-500">
+                  {settings.engine_locked
+                    ? '首个 Turn 后引擎即固定；如需切换，请 Fork 会话，避免混合原生检查点。'
+                    : '引擎可在首个 Turn 前选择。'}
+                </div>
+                {settings.engine_locked && (settings.engine_options || []).some(
+                  (engine) => engine.available && engine.id !== settings.engine_id,
+                ) && (
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {(settings.engine_options || [])
+                      .filter((engine) => engine.available && engine.id !== settings.engine_id)
+                      .map((engine) => (
+                        <button
+                          key={engine.id}
+                          type="button"
+                          disabled={saving}
+                          onClick={() => forkToEngine(engine.id)}
+                          className="px-2.5 py-1.5 rounded border border-indigo-200 text-xs text-indigo-700 hover:bg-indigo-50 disabled:opacity-50"
+                        >
+                          Fork 并切换到 {engine.name}
+                        </button>
+                      ))}
+                  </div>
+                )}
+              </Section>
               <Section title="主模型">
                 <select value={settings.model_id} onChange={(e) => setSettings({ ...settings, model_id: e.target.value })} className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm">
-                  {models.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+                  {models
+                    .filter((model) => {
+                      const active = (settings.engine_options || []).find(
+                        (engine) => engine.id === settings.engine_id,
+                      )
+                      return !active?.compatible_model_ids
+                        || active.compatible_model_ids.includes(model.id)
+                    })
+                    .map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
                 </select>
               </Section>
-              <Section title="模型回退链">
+              {settings.engine_id === 'legacy' && <Section title="模型回退链">
                 <div className="grid grid-cols-2 gap-2">
                   {models.filter((m) => m.id !== settings.model_id).map((m) => (
                     <Check key={m.id} label={m.name} checked={settings.fallback_model_ids.includes(m.id)} onChange={(checked) => setSettings({
@@ -350,7 +441,7 @@ export default function SessionWorkspace({ open, onClose, convId, models, onSett
                     })} />
                   ))}
                 </div>
-              </Section>
+              </Section>}
               {Object.entries(TOOL_GROUPS).map(([group, tools]) => (
                 <Section key={group} title={group}>
                   <div className="grid grid-cols-2 gap-2">
