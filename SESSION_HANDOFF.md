@@ -37,6 +37,36 @@
   Supervisor → 动态 Docker Turn → 回环代理/零出站 → native stream → checkpoint → 唯一 terminal
   链，结果为 `succeeded`、4 events、1 native result、checkpoint present、0 egress connections。
   本轮未自动运行模型重型 V2.3 E2E。
+- 2026-08-05 四模型 Claude provider 闭环已完成，本地代码提交为
+  `59fe8d0c54a95a4e2df28ca5a3c5de03f6ab3e6d feat: expose all deployment models to Claude engine`。
+  模型目录以显式 `claude_provider_profile` 绑定部署 profile，不再把宽泛 provider family 当作
+  Claude 兼容证明；当前 Claude selector 包含 `shaiengine_glm_5_2`、
+  `shaiengine_deepseek_v4_pro`、本地 `deepseek_v4_pro`（API model `AgentModel`）和
+  `qwen3_5`。`backend_protocol=openai` 只校验既有 ChatDS/Legacy catalog route；Claude Turn
+  始终设置 `ANTHROPIC_BASE_URL` 并只获准精确 `POST /v1/messages`。两个本地服务分别由真实
+  Claude Code `2.1.152` 做了无工具、无会话持久化、单 Turn Messages smoke，均返回唯一
+  `result/success`；所以本地 OpenAI-compatible Legacy 路由和 Anthropic Messages Claude 路由可并存。
+  provider credential 仍只存在于 Supervisor/Turn deployment profile，Backend 请求不会转发用户或
+  catalog secret；两个私网 origin 还必须同时通过部署白名单和签名 Turn exact-path policy。
+- `59fe8d0c` 回归结果为 Backend `261 passed`、Claude Runner/Supervisor `24 passed`、Egress
+  Proxy `76 passed, 117 subtests passed`、Frontend `19 passed` 且 production build 通过；Compose
+  三个 profile 和四组 model allowlist 解析通过，`py_compile`、`git diff --check`、secret scan、
+  genericity scan 均通过。本轮没有运行模型重型 V2.3 E2E。
+- `59fe8d0c` 已从精确 clean archive `/tmp/chat_ds_deploy_59fe8d0c.Vzvr4R` 部署生产，archive 与
+  Git tree 均为 22,482 files。上线前备份 volume 为
+  `chat_ds_db_backup_pre_59fe8d0c_20260805_165630`，大小 `263806976` bytes，SHA-256
+  `6922b18369ace298894882e7d3b939ced12635323ee67c6015ab1e2a59acfcbf`，quick/FK 正常。
+  当前 Backend image 为
+  `sha256:56a06ef70bae823c99b231b16875c6fc3407c57bcbf8f8c50dd140b83d2ce8ab`，Supervisor 为
+  `sha256:bcd0e11a640883a83554bf136c5c4e344e280ce74b6d783b0c3e53ce18f797d1`，revision 均精确
+  匹配 `59fe8d0c...`；旧镜像分别保留 `rollback-pre-59fe8d0c`。Proxy 代码镜像未变，容器已重建
+  以加载本地 provider exact-origin allowlist，image 仍为
+  `sha256:8b79b29d59605ebe54b3d12200a071b54ce2eb294a027f24fe692898827ef2f4`。
+  三服务均 healthy/restart 0；Backend 实测 `legacy`/`claude_code` 均 available，四模型 Claude
+  compatibility 全为 true，Proxy 容器到两个本地 `/v1/models` 均为 200。`127.0.0.1`、
+  `10.10.132.126`、`172.30.100.126` 的 Frontend `/` 与 `/api/health` 均为 200；SQLite quick/FK、
+  nonterminal run、active engine session、running schedule、残留 Claude Turn 和严重日志均正常/为零。
+  生产 `.env` 未读取到日志或复制进仓库，发布用 `/dev/shm` 0600 临时副本已删除。
 - `ClaudeCodeEngine` 实现已本地提交为
   `6ad54bd1 feat: add isolated Claude Code agent engine`，并于 2026-08-05 从 clean archive
   `/tmp/chat_ds_deploy_6ad54bd1.bEDuDE` 部署到本机生产。上线前 SQLite 在线备份为 Docker volume
