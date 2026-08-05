@@ -3,7 +3,7 @@ import hashlib
 import json
 import logging
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Awaitable, Callable, Optional, TypeVar
@@ -3421,6 +3421,11 @@ async def _chat_stream_with_turn(
                 engine_id=ENGINE_ID_CLAUDE_CODE,
                 native_session_id=None,
                 status="idle",
+                # SQLAlchemy column defaults are applied during INSERT.  The
+                # first Turn inspects this value before the session is
+                # flushed, so initialize the in-memory checkpoint state
+                # explicitly instead of comparing None with an integer.
+                generation=0,
             )
             db.add(engine_session)
         elif engine_session.status in {"queued", "running", "committing"}:
