@@ -2155,3 +2155,33 @@ Round 17 的两个全新 case。不得复用
   `0777/0755/0775` 权限且不都由当前 euid 拥有。沙箱不挂载 marker plane，现阶段信任
   同主机/NFS writer；若威胁模型包含恶意同 UID/父目录 writer，应离线规范权限或把
   tombstone authority 迁到专用 control plane。
+
+## 11. 2026-08-05 Docker 历史项清理
+
+- 本次只清理本机 Docker 中可证明未被当前运行面依赖的 ChatDS 历史容器和镜像；没有使用
+  `docker system prune -a`、`docker image rm --force` 或其他强制删除，也没有清理 volume、
+  workspace、network、BuildKit cache、模型权重或非 ChatDS 项目。
+- 共删除 10 个无运行依赖的 ChatDS 残留容器：3 个 exited socket/smoke 容器，以及 7 个从未
+  启动的 Claude runner candidate/smoke 容器。删除前后，全部运行中 ChatDS 容器和 26 个运行中
+  非 ChatDS 容器的 ID/name/image 冻结快照保持不变；vLLM、HIS、OpenELIS、PACS、SearXNG、
+  Browser MCP 和本地 Git 服务均未触碰。
+- 共删除 212 个旧 `chat_ds-*` candidate/deploy/rollback/test 镜像引用，以及 7 个无容器引用的
+  旧 `chatds-*` acceptance/execmode/weston/test 引用。当前只保留 20 个 ChatDS 镜像引用：每个
+  生产组件的当前 `latest`/部署标签、每个组件最近一个有意义的 rollback，以及精确
+  `chat_ds-claude-runner:2.1.152`。生产 image ID 与本节前记录一致。
+- Docker image inventory 从 283 降至 84，Docker 汇总的 image virtual size 从 254.1 GB 降至
+  232.8 GB；该 21.3 GB 是含共享层的汇总差值，不能当作物理磁盘净释放量。第一次安全
+  `docker image prune -f` 明确报告回收 1.01 GB。dangling image ID 从 102 降至 5；剩余 5 个均
+  被现存容器引用，其中 3 个属于运行中的 HIS/OpenEMR/ChatDS SearXNG，2 个属于已停止但不在
+  本次授权范围内的 insurance 项目，因此保留。
+- 清理后 Backend、Legacy Harness、Claude runner Supervisor 和 Egress Proxy 均为
+  healthy/restart 0；三个 Frontend `/` 始终为 200。Backend 到 Harness 的 `/health`、
+  `/v1/models` 以及 `127.0.0.1`、`10.10.132.126`、`172.30.100.126` 的 `/api/health`
+  曾同时恢复为 200，但下述活跃 Legacy root 未结束时后续探针又同步返回 503，因此不能把这一轮
+  业务健康探针记为稳定通过。
+- 最终 smoke 期间恰有会话 `6be9862f7fc143c4b590d6a1f187c41b` 的 Legacy root
+  `4143fe85324b4a198d0e39f16fe3f99a` 及 3 个 delegate 在运行。Harness 单 Uvicorn 进程一度仍可
+  建立 TCP，但本地和容器间 `/health` 都无法在 2--5 秒内返回，导致 Backend `/api/health`
+  暂时为 `harness_health_unavailable`；未重启、取消或干预该任务后探针自行恢复并连续返回 200。
+  这不是镜像删除造成的容器/网络缺失，而是一条后续应以独立测试复现的 Legacy 长任务事件循环
+  饥饿观测，不能通过放宽健康超时掩盖。
