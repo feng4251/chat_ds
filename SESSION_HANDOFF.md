@@ -47,6 +47,34 @@
   scan 通过。宿主默认 Python 自身位于 NFS，直接 pytest 与 `git archive` 当前会进入 D-state，
   因此候选测试使用 `/tmp/chat_ds_deploy_161b4e43.lFIsij` 的 clean tree 加当前精确 diff，并在
   隔离 Docker runtime 中运行；不得把 NFS D-state 误报为测试逻辑失败。
+- 上述候选已经本地提交并部署为
+  `c148a0b440cfce19621340524fb942861248878f fix: execute selected Claude skills transactionally`。
+  精确 clean tree 为 22,482 个 tracked 文件；上线前 SQLite online backup volume 为
+  `chat_ds_db_backup_pre_c148a0b4_20260805_221507`，大小 270,528,512 bytes，SHA-256
+  `8d5772717b59e295ccae4b53248a195fa113d5cbb931d7f49424deed0f4d4f75`，quick/FK 正常。
+  当前生产 Backend image 为
+  `sha256:d89d7dd72edf9a66d2082a93569b47424ccc6f897ea783c013f0ce22d3ba9e11`，Supervisor 为
+  `sha256:60928a56aed7b5de542cc1a36ef8529fd748265f4e752cff38cb92eb548a8161`，Egress Proxy 为
+  `sha256:9c56e5509e327322c5bbf708ac91c5ecaf0913054fb7d2305b5009f135234f1f`，Claude Turn
+  Runner 为 `sha256:63a91c566a4ca8bdbb11ff6ab971d1970948e7aa331834abb4b0f91e2f7d9894`；四者 revision
+  均精确为 `c148a0b4...`，Claude Code 仍为 2.1.152。旧镜像分别保留
+  `rollback-pre-c148a0b4`。Proxy、Supervisor、Backend 均 healthy/restart 0；三个 Frontend
+  入口 `/` 与 `/api/health` 均为 200，SQLite quick/FK、nonterminal run、active engine session、
+  残留 Turn container 与严重日志均为 0。Proxy 实际 ceiling 为 8,192 requests、64 MiB outbound、
+  2 GiB response 和 14,400 秒 tunnel；发布 tmpfs 环境副本已删除。
+- 部署后的真实首轮 smoke conversation 为 `c378cb839ce0402e93a51dc8f3861e05`，root
+  `ccaf68376f7849aa9f867f3b1c3e7ecc`。它使用 ClaudeCodeEngine +
+  `shaiengine_deepseek_v4_pro`，durable `succeeded/end_turn`，generation=1、native checkpoint
+  已 committed，assistant 持久化正文精确命中 `SMOKE_OK`；Bash 写入并回读的
+  `claude_engine_smoke.txt` 内容与 29-byte 合同一致，Artifact row 的 source 为
+  `ClaudeCodeWorkspace`、SHA-256 为
+  `d1fc42fe96dad010730b35d229f430d6af088d7dfe25518ca391de3db2d7d808`。这直接证明原生产
+  session `25c72...` 的首轮闪退路径和新的 workspace artifact 投影在正式容器中均已闭合。
+- 本次 Supervisor 首次重启还揭示两个旧 local run locator 指向 NFS 状态并在启动对账时进入
+  D-state；生产 DB 中精确确认两个 run ID 都不存在。它们没有被删除，而是从 local state volume
+  的 `run-index/` 原子移动到 `quarantine-nfs-20260805/` 后保留；随后 Supervisor 正常启动。当前
+  quarantine=2，run-index=1（上面的有效 committed smoke session）。这不修复 NFS 数据面；有效
+  native checkpoint 仍需 NFS 恢复才能保证未来重启/续接读取稳定。
 - 工作目录：`/nfs/yangbb/codes/chat_ds`。
 - 分支：`fix/generic-skill-harness-20260717`。
 - 2026-08-05 新增可选 `ClaudeCodeEngine`，Legacy Harness 保留且 Conversation 级固定
