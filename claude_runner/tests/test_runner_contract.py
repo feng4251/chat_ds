@@ -90,6 +90,28 @@ class RunnerCommandContractTests(unittest.TestCase):
         self.assertEqual(environment["DISABLE_TELEMETRY"], "1")
         self.assertNotIn("SKILL_EGRESS_POLICY_TOKEN", environment)
 
+    def test_local_openai_catalog_binding_still_uses_anthropic_messages_base(self):
+        config = {
+            **_config(),
+            "api_model": "AgentModel",
+            "provider_claude_base_url": "http://10.10.132.2:1025",
+        }
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            os.environ,
+            {"CLAUDE_PROVIDER_API_KEY": "EMPTY"},
+            clear=False,
+        ):
+            environment = _worker_environment(
+                config,
+                trust={},
+                proxy_url="http://127.0.0.1:12345",
+                worker_tmp=Path(temporary),
+            )
+        self.assertEqual(
+            environment["ANTHROPIC_BASE_URL"],
+            "http://10.10.132.2:1025",
+        )
+
     def test_only_one_successful_stdout_result_can_commit(self):
         with tempfile.TemporaryDirectory() as temporary:
             ledger = EventLedger(Path(temporary) / "events.jsonl")
@@ -277,6 +299,36 @@ class RunnerEgressPolicyTests(unittest.TestCase):
             )
         self.assertEqual(absent["private_origins"], [])
         self.assertEqual(present["private_origins"], ["https://10.10.132.126:18443"])
+
+    def test_private_provider_gets_only_exact_messages_authority(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            view, digest = self._view(Path(temporary))
+            policy = compile_turn_egress_policy(
+                skill_view_root=view,
+                skill_view_sha256=digest,
+                user_turn_text="fixture",
+                provider_base_url="http://10.10.132.2:1025",
+                configured_private_origins=("http://10.10.132.2:1025",),
+                budget_scope_sha256=hashlib.sha256(b"budget").hexdigest(),
+                call_id_sha256=hashlib.sha256(b"call").hexdigest(),
+                limits={
+                    "max_outbound_bytes": 1024,
+                    "max_requests": 10,
+                    "max_response_wire_bytes": 4096,
+                },
+            )
+        provider_rules = [
+            row for row in policy["egress_rules"]
+            if "10.10.132.2" in row["url_prefix"]
+        ]
+        self.assertEqual(provider_rules, [{
+            "url_prefix": "http://10.10.132.2:1025/v1/messages",
+            "methods": ["POST"],
+            "query_exact": True,
+        }])
+        self.assertEqual(
+            policy["private_origins"], ["http://10.10.132.2:1025"]
+        )
 
     def test_user_url_never_grants_write_or_neighbor_paths(self):
         with tempfile.TemporaryDirectory() as temporary:

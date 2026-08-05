@@ -82,7 +82,13 @@ class ClaudeCodeEngine:
             "conversation_id": request.conversation_id,
             "model_id": request.model_id,
             "api_model": request.api_model,
-            "provider_profile": str(provider.get("provider") or ""),
+            # This is an explicit deployment binding, not the broad provider
+            # family used by Legacy Harness routing.  A model becomes Claude
+            # compatible only when its catalog row names one configured
+            # Supervisor profile.
+            "provider_profile": str(
+                provider.get("claude_provider_profile") or ""
+            ),
             "provider_base_url": str(provider.get("base_url") or ""),
             "provider_protocol": str(provider.get("protocol") or ""),
             "messages": [dict(item) for item in request.messages],
