@@ -26,6 +26,8 @@ from models import (
     AgentRun,
     Base,
     Conversation,
+    Message,
+    SkillPackage,
     User,
 )
 from routers import chat_router, workspace_router
@@ -516,6 +518,139 @@ class EngineModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("shaiengine_glm_5_2", identifiers)
         self.assertIn("shaiengine_deepseek_v4_pro", identifiers)
         self.assertIn("deepseek_v4_pro", identifiers)
+
+    async def test_claude_chat_entry_materializes_session_skill_before_run(self):
+        conversation_id = "6" * 32
+        skills_root = Path(self.temporary.name) / "skills"
+        session_root = Path(self.temporary.name) / "sessions" / conversation_id
+        skill_root = (
+            skills_root
+            / str(self.user.id)
+            / conversation_id
+            / "fixture-skill"
+        )
+        skill_root.mkdir(parents=True)
+        (skill_root / "SKILL.md").write_text(
+            "---\nname: fixture-skill\ndescription: route fixture\n---\n",
+            encoding="utf-8",
+        )
+        async with self.sessions() as db:
+            db.add(Conversation(
+                id=conversation_id,
+                user_id=str(self.user.id),
+                model_id="shaiengine_glm_5_2",
+                engine_id="claude_code",
+            ))
+            db.add(SkillPackage(
+                user_id=str(self.user.id),
+                session_id=conversation_id,
+                name="fixture-skill",
+            ))
+            await db.commit()
+
+        def discard_detached(*, operation, **_kwargs):
+            operation.close()
+            return None
+
+        def discard_best_effort(operation, **_kwargs):
+            operation.close()
+            return None
+
+        lease = await chat_router._acquire_conversation_turn(conversation_id)
+        try:
+            with (
+                patch.object(
+                    chat_router,
+                    "resolve_model_config",
+                    AsyncMock(return_value={
+                        "id": "shaiengine_glm_5_2",
+                        "api_model": "glm-5.2",
+                        "provider": "builtin",
+                        "claude_provider_profile": "shaiengine",
+                        "base_url": "https://provider.invalid/v1",
+                        "api_key": "fixture",
+                    }),
+                ),
+                patch.object(
+                    chat_router,
+                    "claude_code_model_compatible",
+                    return_value=True,
+                ),
+                patch(
+                    "routers.skill_router.SKILLS_DATA_DIR",
+                    skills_root,
+                ),
+                patch.object(
+                    chat_router.workspace_store,
+                    "session_root",
+                    return_value=session_root,
+                ),
+                patch.object(
+                    chat_router,
+                    "_track_detached_chat_producer",
+                    side_effect=discard_detached,
+                ),
+                patch.object(
+                    chat_router,
+                    "_track_best_effort_task",
+                    side_effect=discard_best_effort,
+                ),
+            ):
+                async with self.sessions() as db:
+                    conversation = await db.get(Conversation, conversation_id)
+                    response = await chat_router._chat_stream_with_turn(
+                        chat_router.ChatRequest(
+                            conversation_id=conversation_id,
+                            content="exercise the Claude route",
+                            model_id="shaiengine_glm_5_2",
+                            engine_id="claude_code",
+                        ),
+                        self.user,
+                        db,
+                        conv=conversation,
+                        conv_id=conversation_id,
+                        model_id="shaiengine_glm_5_2",
+                        turn_lease=lease,
+                    )
+            self.assertEqual(response.media_type, "text/event-stream")
+        finally:
+            chat_router._release_conversation_turn(conversation_id, lease)
+
+        async with self.sessions() as db:
+            engine_session = (await db.execute(
+                select(AgentEngineSession).where(
+                    AgentEngineSession.conversation_id == conversation_id
+                )
+            )).scalar_one()
+            run = (await db.execute(
+                select(AgentRun).where(
+                    AgentRun.conversation_id == conversation_id
+                )
+            )).scalar_one()
+            message = (await db.execute(
+                select(Message).where(
+                    Message.conversation_id == conversation_id
+                )
+            )).scalar_one()
+        self.assertEqual(engine_session.status, "running")
+        self.assertEqual(engine_session.active_run_id, run.id)
+        self.assertEqual(engine_session.engine_id, "claude_code")
+        self.assertEqual(run.engine_id, "claude_code")
+        self.assertEqual(message.content, "exercise the Claude route")
+        self.assertTrue(engine_session.skill_view_sha256)
+        self.assertTrue(
+            (
+                session_root
+                / "runtime"
+                / "claude"
+                / "skill-views"
+                / engine_session.skill_view_sha256
+                / "plugin"
+                / "skills"
+                / "fixture-skill"
+                / "SKILL.md"
+            ).is_file()
+        )
 
 
 class NativeCheckpointCommitBarrierTests(unittest.IsolatedAsyncioTestCase):
