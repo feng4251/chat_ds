@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from skill_egress_proxy import server
+from claude_runner.config import DEFAULT_CLAUDE_EGRESS_LIMITS
 
 
 TEST_POLICY_TOKEN = "test-egress-policy-token-" + "x" * 40
@@ -942,6 +943,20 @@ class PolicyScopeLedgerTests(unittest.TestCase):
             ledger.admit(policy)
         first.release()
         second.release()
+
+    def test_proxy_ceiling_accepts_default_claude_turn_budget(self):
+        policy = self._policy(
+            "a" * 64,
+            requests=DEFAULT_CLAUDE_EGRESS_LIMITS["max_requests"],
+            outbound=DEFAULT_CLAUDE_EGRESS_LIMITS["max_outbound_bytes"],
+            response=DEFAULT_CLAUDE_EGRESS_LIMITS[
+                "max_response_wire_bytes"
+            ],
+        )
+        self.assertEqual(
+            policy.limits.max_requests,
+            DEFAULT_CLAUDE_EGRESS_LIMITS["max_requests"],
+        )
 
     def test_scope_limit_drift_and_capacity_fail_closed(self):
         ledger = server.PolicyScopeLedger(capacity=1, ttl_seconds=60)

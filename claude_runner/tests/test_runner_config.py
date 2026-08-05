@@ -16,6 +16,7 @@ class RunnerProviderConfigurationTests(unittest.TestCase):
                 "api_key_env": "PUBLIC_PROVIDER_KEY",
                 "backend_protocol": "openai",
                 "models": ["model-a", "model-b"],
+                "native_web_tools": True,
             },
             "local_agentmodel": {
                 "backend_base_url": "http://10.10.132.2:1025/v1",
@@ -56,6 +57,12 @@ class RunnerProviderConfigurationTests(unittest.TestCase):
             settings.provider_profiles["shaiengine"].claude_base_url,
             "https://api.example.test",
         )
+        self.assertTrue(
+            settings.provider_profiles["shaiengine"].native_web_tools
+        )
+        self.assertFalse(
+            settings.provider_profiles["local_agentmodel"].native_web_tools
+        )
         self.assertEqual(
             settings.provider_profiles["local_agentmodel"].claude_base_url,
             "http://10.10.132.2:1025",
@@ -64,6 +71,26 @@ class RunnerProviderConfigurationTests(unittest.TestCase):
             "https://10.10.132.126:18443",
             "http://10.10.132.2:1025",
         ))
+        self.assertEqual(settings.egress_limits, {
+            "max_requests": 8192,
+            "max_outbound_bytes": 64 * 1024 * 1024,
+            "max_response_wire_bytes": 2 * 1024 * 1024 * 1024,
+        })
+
+    def test_turn_budget_cannot_exceed_proxy_policy_ceiling(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = self._environment(root)
+            environment.update({
+                "CLAUDE_EGRESS_MAX_OUTBOUND_BYTES": str(64 * 1024 * 1024),
+                "CLAUDE_EGRESS_POLICY_MAX_OUTBOUND_BYTES": str(16 * 1024 * 1024),
+            })
+            with patch.dict(os.environ, environment, clear=True):
+                with self.assertRaisesRegex(
+                    RunnerConfigurationError,
+                    "exceed proxy policy ceilings",
+                ):
+                    load_settings()
 
     def test_missing_profile_credential_fails_closed(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -74,6 +101,20 @@ class RunnerProviderConfigurationTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     RunnerConfigurationError,
                     "credential env is unavailable",
+                ):
+                    load_settings()
+
+    def test_native_web_tool_capability_must_be_boolean(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = self._environment(root)
+            profiles = json.loads(environment["CLAUDE_PROVIDER_PROFILES_JSON"])
+            profiles["shaiengine"]["native_web_tools"] = "true"
+            environment["CLAUDE_PROVIDER_PROFILES_JSON"] = json.dumps(profiles)
+            with patch.dict(os.environ, environment, clear=True):
+                with self.assertRaisesRegex(
+                    RunnerConfigurationError,
+                    "native web-tool capability",
                 ):
                     load_settings()
 

@@ -35,6 +35,11 @@ from chatds_browser_runtime.proxy_bridge import (
 
 MAX_NATIVE_LINE_BYTES = 64 * 1024 * 1024
 SYNC_EVERY_EVENTS = 20
+MAX_WORKSPACE_SNAPSHOT_FILES = 65_536
+MAX_WORKSPACE_ARTIFACTS = 8_192
+MAX_WORKSPACE_ARTIFACT_FILE_BYTES = 1024 * 1024 * 1024
+MAX_WORKSPACE_ARTIFACT_TOTAL_BYTES = 8 * 1024 * 1024 * 1024
+MAX_WORKSPACE_RELATIVE_PATH_BYTES = 1024
 WORKSPACE_LOCK_IDENTITY_DOMAIN = b"chatds-workspace-mutation-lock-v1\0"
 SAFE_SESSION_ID = re.compile(r"^[0-9a-f]{32}$")
 _child: subprocess.Popen[bytes] | None = None
@@ -56,6 +61,7 @@ def main() -> int:
         worker_tmp.mkdir(mode=0o700)
         os.chown(worker_tmp, worker_uid, worker_gid)
         with _session_workspace_lock(config):
+            workspace_before = _workspace_snapshot(Path("/workspace"))
             authority = ProxySocketAuthority(
                 PROXY_SOCKET_PATH,
                 expected_uid=EXPECTED_PROXY_UID,
@@ -122,10 +128,22 @@ def main() -> int:
             bridge_thread.join(timeout=5.0)
             if bridge_thread.is_alive():
                 raise RuntimeError("egress_bridge_did_not_stop")
+            _emit_workspace_artifacts(
+                ledger=ledger,
+                run_id=str(config["run_id"]),
+                before=workspace_before,
+                after=_workspace_snapshot(Path("/workspace")),
+                workspace_root=Path("/workspace"),
+            )
         checkpoint_ready = _native_checkpoint_exists(
             Path("/state/home/.claude/projects"),
             str(config["native_session_id"]),
         )
+        pending_plan_task_count = _pending_plan_task_count(
+            Path("/state/home/.claude/tasks"),
+            str(config["native_session_id"]),
+        )
+        pending_native_task_count = ledger.active_native_task_count
         status = (
             "cancelled"
             if _termination_reason == "cancelled"
@@ -136,23 +154,19 @@ def main() -> int:
                 exit_code == 0
                 and ledger.native_result_succeeded
                 and checkpoint_ready
+                and pending_plan_task_count == 0
+                and pending_native_task_count == 0
             )
             else "failed"
         )
-        terminal_error = (
-            "run_hard_timeout"
-            if _termination_reason == "hard_timeout"
-            else "native_result_duplicated"
-            if ledger.native_result_count > 1
-            else "runner_exited_without_result"
-            if exit_code == 0 and not ledger.saw_native_result
-            else "native_result_failed"
-            if exit_code == 0 and not ledger.native_result_succeeded
-            else "native_checkpoint_missing"
-            if exit_code == 0 and not checkpoint_ready
-            else "runner_exit_nonzero"
-            if exit_code != 0 and _termination_reason != "cancelled"
-            else None
+        terminal_error = _terminal_error(
+            termination_reason=_termination_reason,
+            exit_code=exit_code,
+            ledger=ledger,
+            checkpoint_ready=checkpoint_ready,
+            egress_receipt=receipt,
+            pending_plan_task_count=pending_plan_task_count,
+            pending_native_task_count=pending_native_task_count,
         )
         ledger.append_event({
             "type": "chatds.supervisor.terminal",
@@ -162,6 +176,8 @@ def main() -> int:
             "result_succeeded": ledger.native_result_succeeded,
             "result_count": ledger.native_result_count,
             "checkpoint_observed": checkpoint_ready,
+            "pending_plan_task_count": pending_plan_task_count,
+            "pending_native_task_count": pending_native_task_count,
             "error": terminal_error,
             "egress_receipt": receipt,
         }, channel="controller", terminal=True)
@@ -210,6 +226,41 @@ def _safe_controller_exception_code(exc: BaseException) -> str | None:
     return "egress_" + re.sub(r"[ -]+", "_", message)
 
 
+def _terminal_error(
+    *,
+    termination_reason: str | None,
+    exit_code: int,
+    ledger: "EventLedger",
+    checkpoint_ready: bool,
+    egress_receipt: dict[str, Any],
+    pending_plan_task_count: int,
+    pending_native_task_count: int,
+) -> str | None:
+    """Choose the most specific trusted failure signal for one Turn."""
+
+    if termination_reason == "hard_timeout":
+        return "run_hard_timeout"
+    if ledger.native_result_count > 1:
+        return "native_result_duplicated"
+    if bool(egress_receipt.get("exhausted")):
+        return "egress_budget_exhausted"
+    if pending_native_task_count:
+        return "native_subtasks_pending"
+    if pending_plan_task_count:
+        return "native_plan_tasks_pending"
+    if ledger.native_api_error_status is not None:
+        return f"provider_http_{ledger.native_api_error_status}"
+    if exit_code == 0 and not ledger.saw_native_result:
+        return "runner_exited_without_result"
+    if exit_code == 0 and not ledger.native_result_succeeded:
+        return "native_result_failed"
+    if exit_code == 0 and not checkpoint_ready:
+        return "native_checkpoint_missing"
+    if exit_code != 0 and termination_reason != "cancelled":
+        return "runner_exit_nonzero"
+    return None
+
+
 class EventLedger:
     def __init__(self, path: Path) -> None:
         if not path.is_absolute():
@@ -220,6 +271,8 @@ class EventLedger:
         self._saw_native_result = False
         self._native_result_succeeded = False
         self._native_result_count = 0
+        self._native_api_error_status: int | None = None
+        self._active_native_tasks: set[str] = set()
         if path.exists():
             raise RuntimeError("event_ledger_already_exists")
         self._stream = path.open("xb", buffering=0)
@@ -254,6 +307,28 @@ class EventLedger:
                 and native.get("subtype") == "success"
                 and not bool(native.get("is_error"))
             )
+            api_error_status = native.get("api_error_status")
+            if (
+                bool(native.get("is_error"))
+                and type(api_error_status) is int
+                and 400 <= api_error_status <= 599
+            ):
+                self._native_api_error_status = api_error_status
+        if (
+            channel == "stdout"
+            and isinstance(native, dict)
+            and native.get("type") == "system"
+        ):
+            subtype = str(native.get("subtype") or "")
+            task_id = str(native.get("task_id") or native.get("id") or "")
+            if subtype == "task_started" and task_id:
+                self._active_native_tasks.add(task_id)
+            elif subtype in {
+                "task_notification",
+                "task_completed",
+                "task_failed",
+            } and task_id:
+                self._active_native_tasks.discard(task_id)
         self._append({"channel": channel, "event": native})
 
     @property
@@ -267,6 +342,14 @@ class EventLedger:
     @property
     def native_result_count(self) -> int:
         return self._native_result_count
+
+    @property
+    def native_api_error_status(self) -> int | None:
+        return self._native_api_error_status
+
+    @property
+    def active_native_task_count(self) -> int:
+        return len(self._active_native_tasks)
 
     def append_event(
         self,
@@ -340,12 +423,167 @@ def _native_checkpoint_exists(projects_root: Path, native_session_id: str) -> bo
     return stat.S_ISREG(info.st_mode) and not path.is_symlink() and info.st_size > 0
 
 
+def _workspace_snapshot(workspace_root: Path) -> dict[str, tuple[int, ...]]:
+    """Capture a bounded, no-follow workspace identity snapshot.
+
+    Content hashing every historical attachment before every Turn is
+    needlessly expensive.  The kernel-owned ctime component cannot be restored
+    by the worker, so the full regular-file identity tuple reliably selects
+    new or mutated files for the post-Turn content-addressed artifact ledger.
+    """
+
+    root_info = os.lstat(workspace_root)
+    if not stat.S_ISDIR(root_info.st_mode) or workspace_root.is_symlink():
+        raise RuntimeError("workspace_artifact_root_invalid")
+    result: dict[str, tuple[int, ...]] = {}
+    pending = [workspace_root]
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                info = entry.stat(follow_symlinks=False)
+                path = Path(entry.path)
+                relative = path.relative_to(workspace_root).as_posix()
+                if (
+                    not relative
+                    or len(relative.encode("utf-8"))
+                    > MAX_WORKSPACE_RELATIVE_PATH_BYTES
+                ):
+                    raise RuntimeError("workspace_artifact_path_invalid")
+                if stat.S_ISLNK(info.st_mode):
+                    raise RuntimeError("workspace_artifact_symlink_invalid")
+                if stat.S_ISDIR(info.st_mode):
+                    pending.append(path)
+                    continue
+                if not stat.S_ISREG(info.st_mode):
+                    raise RuntimeError("workspace_artifact_type_invalid")
+                result[relative] = (
+                    info.st_dev,
+                    info.st_ino,
+                    info.st_mode,
+                    info.st_size,
+                    info.st_mtime_ns,
+                    info.st_ctime_ns,
+                )
+                if len(result) > MAX_WORKSPACE_SNAPSHOT_FILES:
+                    raise RuntimeError("workspace_artifact_file_limit")
+    return result
+
+
+def _emit_workspace_artifacts(
+    *,
+    ledger: "EventLedger",
+    run_id: str,
+    before: dict[str, tuple[int, ...]],
+    after: dict[str, tuple[int, ...]],
+    workspace_root: Path,
+) -> None:
+    changed = sorted(
+        relative
+        for relative, identity in after.items()
+        if before.get(relative) != identity
+    )
+    if len(changed) > MAX_WORKSPACE_ARTIFACTS:
+        raise RuntimeError("workspace_artifact_change_limit")
+    total_bytes = 0
+    for relative in changed:
+        size = after[relative][3]
+        if size > MAX_WORKSPACE_ARTIFACT_FILE_BYTES:
+            raise RuntimeError("workspace_artifact_size_limit")
+        total_bytes += size
+        if total_bytes > MAX_WORKSPACE_ARTIFACT_TOTAL_BYTES:
+            raise RuntimeError("workspace_artifact_total_size_limit")
+        path = workspace_root / relative
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        current = os.lstat(path)
+        current_identity = (
+            current.st_dev,
+            current.st_ino,
+            current.st_mode,
+            current.st_size,
+            current.st_mtime_ns,
+            current.st_ctime_ns,
+        )
+        if not stat.S_ISREG(current.st_mode) or current_identity != after[relative]:
+            raise RuntimeError("workspace_artifact_changed_during_audit")
+        sha256 = digest.hexdigest()
+        artifact_identity = hashlib.sha256(
+            (
+                "chatds.claude.workspace-artifact.v1\0"
+                + run_id
+                + "\0"
+                + relative
+                + "\0"
+                + sha256
+            ).encode("utf-8")
+        ).hexdigest()
+        ledger.append_event({
+            "type": "chatds.workspace.artifact",
+            "path": relative,
+            "title": Path(relative).name,
+            "kind": "file",
+            "size_bytes": size,
+            "sha256": sha256,
+            "source_event_key": (
+                f"claude-workspace:{run_id}:{artifact_identity}"
+            ),
+        }, channel="controller")
+
+
+def _pending_plan_task_count(tasks_root: Path, native_session_id: str) -> int:
+    """Return unfinished Claude task-list items or fail on unsafe state."""
+
+    try:
+        uuid_value = uuid.UUID(native_session_id)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise RuntimeError("native_task_session_invalid") from exc
+    if str(uuid_value) != native_session_id:
+        raise RuntimeError("native_task_session_invalid")
+    session_root = tasks_root / native_session_id
+    try:
+        session_info = os.lstat(session_root)
+    except FileNotFoundError:
+        return 0
+    if not stat.S_ISDIR(session_info.st_mode) or session_root.is_symlink():
+        raise RuntimeError("native_task_state_invalid")
+    entries = list(session_root.iterdir())
+    if len(entries) > 4_096:
+        raise RuntimeError("native_task_state_invalid")
+    pending = 0
+    for path in entries:
+        if path.name == ".lock":
+            lock_info = os.lstat(path)
+            if not stat.S_ISREG(lock_info.st_mode) or path.is_symlink():
+                raise RuntimeError("native_task_state_invalid")
+            continue
+        if re.fullmatch(r"[1-9][0-9]{0,9}\.json", path.name) is None:
+            raise RuntimeError("native_task_state_invalid")
+        info = os.lstat(path)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or path.is_symlink()
+            or info.st_size > 1024 * 1024
+        ):
+            raise RuntimeError("native_task_state_invalid")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise RuntimeError("native_task_state_invalid")
+        status_value = str(payload.get("status") or "")
+        if status_value in {"pending", "in_progress"}:
+            pending += 1
+        elif status_value not in {"completed", "deleted"}:
+            raise RuntimeError("native_task_state_invalid")
+    return pending
+
+
 def _claude_command(config: dict[str, Any]) -> tuple[list[str], bytes]:
     native_session_id = str(config["native_session_id"])
     command = [
         "/usr/local/bin/claude",
         "--print",
-        "--bare",
         "--verbose",
         "--output-format", "stream-json",
         "--include-partial-messages",
@@ -359,11 +597,22 @@ def _claude_command(config: dict[str, Any]) -> tuple[list[str], bytes]:
         "--strict-mcp-config",
         "--model", str(config["api_model"]),
         # Keep Claude Code's own coherent built-in tool surface, including its
-        # current Agent/Task aliases and task-management tools. The container,
-        # mount, and exact egress boundaries—not a version-fragile name list—
-        # are the security authority.
+        # current Agent/Task aliases and task-management tools. ``--bare`` is
+        # intentionally not used: Claude 2.1.152's simple mode reduces
+        # ``default`` to Bash/Edit/Read and silently removes native delegation.
+        # Empty setting sources, the per-Session HOME, immutable plugin view,
+        # strict MCP config, container mounts, and exact egress policy remain
+        # the authority boundary without a version-fragile tool-name list.
         "--tools", "default",
     ]
+    if not bool(config.get("native_web_tools")):
+        # WebSearch/WebFetch are provider-hosted server tools, not ordinary
+        # local tools. A generic Messages facade can accept their schemas yet
+        # return empty pseudo-results or depend on unavailable claude.ai
+        # safety services. Local Bash/Skill/MCP/browser capabilities remain.
+        command.extend([
+            "--disallowedTools", "WebFetch,WebSearch",
+        ])
     resume_from = str(config.get("resume_from_native_session_id") or "")
     if resume_from:
         command.extend([

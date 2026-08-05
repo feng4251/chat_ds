@@ -1,3 +1,4 @@
+import errno
 import hashlib
 import json
 import os
@@ -145,6 +146,57 @@ class ClaudeEventProjectionTests(unittest.TestCase):
             ["second"],
         )
 
+    def test_partial_and_full_message_dedupe_uses_native_message_id(self):
+        projector = ClaudeEventProjector("d" * 32)
+        projector.project({
+            "seq": 1,
+            "event": {
+                "type": "stream_event",
+                "uuid": "stream-start-uuid",
+                "parent_tool_use_id": None,
+                "event": {
+                    "type": "message_start",
+                    "message": {
+                        "id": "native-message-id",
+                        "model": "fixture",
+                    },
+                },
+            },
+        })
+        partial = projector.project({
+            "seq": 2,
+            "event": {
+                "type": "stream_event",
+                "uuid": "delta-has-a-different-uuid",
+                "parent_tool_use_id": None,
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": "once"},
+                },
+            },
+        })
+        full = projector.project({
+            "seq": 3,
+            "event": {
+                "type": "assistant",
+                "uuid": "assistant-has-another-uuid",
+                "parent_tool_use_id": None,
+                "message": {
+                    "id": "native-message-id",
+                    "content": [{"type": "text", "text": "once"}],
+                },
+            },
+        })
+        self.assertEqual(
+            [
+                event.data["text"]
+                for event in partial
+                if event.kind == "content"
+            ],
+            ["once"],
+        )
+        self.assertFalse(any(event.kind == "content" for event in full))
+
     def test_tool_start_is_deduplicated_between_partial_and_full_events(self):
         projector = ClaudeEventProjector("e" * 32)
         partial = projector.project({
@@ -181,6 +233,23 @@ class ClaudeEventProjectionTests(unittest.TestCase):
         self.assertFalse(any(
             event.data.get("event_type") == "tool.started" for event in full
         ))
+        terminal = projector.project({
+            "seq": 3,
+            "event": {
+                "type": "user",
+                "message": {"content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tool-1",
+                    "is_error": True,
+                }]},
+            },
+        })
+        completed = next(
+            event
+            for event in terminal
+            if event.data.get("event_type") == "tool.failed"
+        )
+        self.assertEqual(completed.data["tool_name"], "Bash")
 
     def test_native_task_identity_routes_child_tools_and_stopped_terminal(self):
         root = "f" * 32
@@ -236,6 +305,36 @@ class ClaudeEventProjectionTests(unittest.TestCase):
         self.assertEqual(stopped[0].data["event_type"], "run.cancelled")
         self.assertEqual(stopped[0].data["run_id"], child_run_id)
 
+    def test_workspace_artifact_is_projected_to_durable_artifact_event(self):
+        root = "8" * 32
+        projector = ClaudeEventProjector(root)
+        events = projector.project({
+            "seq": 1,
+            "event": {
+                "type": "chatds.workspace.artifact",
+                "kind": "file",
+                "title": "report.md",
+                "path": "results/report.md",
+                "size_bytes": 123,
+                "sha256": "a" * 64,
+                "source_event_key": "claude-workspace:key",
+            },
+        })
+        artifact = self.assert_single_agent_event(
+            events,
+            "artifact.created",
+        )
+        self.assertEqual(artifact["run_id"], root)
+        self.assertEqual(artifact["tool_name"], "ClaudeCodeWorkspace")
+        self.assertEqual(artifact["payload"], {
+            "kind": "file",
+            "title": "report.md",
+            "path": "results/report.md",
+            "size_bytes": 123,
+            "sha256": "a" * 64,
+            "source_event_key": "claude-workspace:key",
+        })
+
     def test_result_error_preserves_native_error_list(self):
         projector = ClaudeEventProjector("9" * 32)
         projector.project({
@@ -261,6 +360,16 @@ class ClaudeEventProjectionTests(unittest.TestCase):
         )
         self.assertIn("provider disconnected", message)
         self.assertIn("retry exhausted", message)
+
+    def assert_single_agent_event(self, events, event_type):
+        matches = [
+            event.data
+            for event in events
+            if event.kind == "agent_event"
+            and event.data.get("event_type") == event_type
+        ]
+        self.assertEqual(len(matches), 1)
+        return matches[0]
 
 
 class ClaudeSkillViewTests(unittest.TestCase):
@@ -308,8 +417,121 @@ class ClaudeSkillViewTests(unittest.TestCase):
             self.assertFalse(os.stat(view.root).st_mode & 0o222)
             manifest = json.loads((view.root / "manifest.json").read_text())
             self.assertEqual(manifest["sha256"], view.sha256)
+            self.assertEqual(
+                view.entrypoint_skill_name,
+                "chatds-harness-session-entry",
+            )
+            self.assertEqual(view.selected_primary_skill_names, ("fixture",))
+            self.assertEqual(
+                manifest["selected_primary_skill_names"],
+                ["fixture"],
+            )
+            entrypoint = (
+                view.plugin_root
+                / "skills"
+                / "chatds-harness-session-entry"
+                / "SKILL.md"
+            ).read_text(encoding="utf-8")
+            self.assertIn(
+                "/skill-view/plugin/skills/fixture/SKILL.md",
+                entrypoint,
+            )
+            self.assertIn("$ARGUMENTS", entrypoint)
 
-    def test_explicit_skill_mcp_is_compiled_for_bare_mode(self):
+    def test_bundle_supporting_skills_are_not_promoted_to_entrypoints(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            primary = root / "skills" / "primary"
+            supporting = root / "skills" / "supporting"
+            for skill in (primary, supporting):
+                skill.mkdir(parents=True)
+                (skill / "SKILL.md").write_text(
+                    skill.name,
+                    encoding="utf-8",
+                )
+            view = materialize_claude_skill_view(
+                session_root=root / "session",
+                sources=[
+                    SimpleNamespace(
+                        name="primary",
+                        scope="session",
+                        root=primary,
+                        bundle_id="bundle",
+                        bundle_role="primary",
+                    ),
+                    SimpleNamespace(
+                        name="supporting",
+                        scope="session",
+                        root=supporting,
+                        bundle_id="bundle",
+                        bundle_role="supporting",
+                    ),
+                ],
+            )
+            self.assertEqual(
+                view.selected_primary_skill_names,
+                ("primary",),
+            )
+            entrypoint = (
+                view.plugin_root
+                / "skills"
+                / "chatds-harness-session-entry"
+                / "SKILL.md"
+            ).read_text(encoding="utf-8")
+            self.assertIn("skills/primary/SKILL.md", entrypoint)
+            self.assertNotIn("skills/supporting/SKILL.md", entrypoint)
+
+    def test_harness_entrypoint_name_is_reserved(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            skill = root / "skills" / "reserved"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("fixture", encoding="utf-8")
+            with self.assertRaisesRegex(SkillViewError, "reserved"):
+                materialize_claude_skill_view(
+                    session_root=root / "session",
+                    sources=[SimpleNamespace(
+                        name="chatds-harness-session-entry",
+                        scope="session",
+                        root=skill,
+                        bundle_id=None,
+                        bundle_role=None,
+                    )],
+                )
+
+    def test_content_addressed_view_reuses_nfs_enotempty_winner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            skill = root / "skills" / "fixture"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("fixture", encoding="utf-8")
+            source = SimpleNamespace(
+                name="fixture",
+                scope="session",
+                root=skill,
+                bundle_id=None,
+                bundle_role=None,
+            )
+            winner = materialize_claude_skill_view(
+                session_root=root / "session",
+                sources=[source],
+            )
+            with patch.object(
+                Path,
+                "rename",
+                side_effect=OSError(
+                    errno.ENOTEMPTY,
+                    "Directory not empty",
+                ),
+            ):
+                reused = materialize_claude_skill_view(
+                    session_root=root / "session",
+                    sources=[source],
+                )
+            self.assertEqual(reused.sha256, winner.sha256)
+            self.assertEqual(reused.root, winner.root)
+
+    def test_explicit_skill_mcp_is_compiled_for_isolated_runner(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             skill = root / "skills" / "fixture"
