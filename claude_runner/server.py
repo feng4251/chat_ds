@@ -1440,7 +1440,23 @@ def _manifest_skill_entrypoint(manifest: dict[str, Any]) -> str | None:
     entrypoint_name = manifest.get("entrypoint_skill_name")
     selected = manifest.get("selected_primary_skill_names")
     if entrypoint_name is None:
-        if selected not in (None, []):
+        # Backward-compatible immutable views created before selected root
+        # identity was added had neither field and never forced a command.
+        if selected is None:
+            return None
+        if not isinstance(selected, list) or any(
+            not isinstance(name, str) or not name for name in selected
+        ):
+            raise RuntimeError("skill_entrypoint_manifest_invalid")
+        skills = manifest.get("skills")
+        if not isinstance(skills, list):
+            raise RuntimeError("skill_entrypoint_manifest_invalid")
+        available = {
+            str(row.get("name") or "")
+            for row in skills
+            if isinstance(row, dict)
+        }
+        if any(name not in available for name in selected):
             raise RuntimeError("skill_entrypoint_manifest_invalid")
         return None
     if (

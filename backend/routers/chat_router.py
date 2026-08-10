@@ -2888,7 +2888,7 @@ BUILTIN = {
         "context_length": 200000,
         "discover_runtime_metadata": True,
     },
-    # 10.10.132.2 local GLM-5.2 (303872 ctx) — retained for existing sessions
+    # 10.10.132.2 local GLM-5.2 (918528 ctx) — retained for existing sessions
     "deepseek_v4_pro": {
         "api_model": "AgentModel",
         "base_url": settings.deepseek_pro_base_url,
@@ -2905,7 +2905,29 @@ BUILTIN = {
         "provider": "builtin",
         "claude_provider_profile": "local_agentmodel",
         "protocol": "openai",
-        "context_length": 303872,
+        "context_length": 918528,
+        "discover_runtime_metadata": True,
+    },
+    # 10.10.132.126 local DeepSeek-V4-Flash.  It shares the wire-level
+    # ``AgentModel`` name with the GLM deployment, so the user-facing route id
+    # and Claude provider profile must stay distinct.
+    "local_deepseek_v4_flash": {
+        "api_model": "AgentModel",
+        "base_url": settings.local_deepseek_v4_flash_base_url,
+        "api_key": settings.local_deepseek_v4_flash_api_key,
+        "is_multimodal": False,
+        "max_tokens": 262144,
+        "display_name": "DeepSeek V4 Flash (本地 AgentModel)",
+        "is_default": False,
+        "agentic_auxiliary_only": False,
+        "supports_thinking_toggle": True,
+        "thinking_enabled_by_default": True,
+        "thinking_request_format": "chat_template_kwargs",
+        "capabilities": ["text", "tools", "reasoning"],
+        "provider": "builtin",
+        "claude_provider_profile": "local_deepseek_v4_flash",
+        "protocol": "openai",
+        "context_length": 1048576,
         "discover_runtime_metadata": True,
     },
     # 10.10.132.128 Qwen3-5 (397B, multimodal) — 多模态识别
@@ -3246,7 +3268,7 @@ async def _chat_stream(
             model_id = canonical_agent_model_id(
                 await _detect_model(req, str(cur_user.id))
             )
-            requested_engine = req.engine_id or "legacy"
+            requested_engine = req.engine_id or settings.default_agent_engine_id
             from agent_engines.registry import build_agent_engine_registry
             try:
                 build_agent_engine_registry().get(requested_engine)
@@ -3405,6 +3427,8 @@ async def _chat_stream_with_turn(
                 materialize_claude_skill_view,
                 session_root=workspace_store.session_root(cur_user.id, conv_id),
                 sources=sources,
+                enabled_tools=enabled_tools,
+                web_search_url=settings.claude_web_search_url,
             )
 
         engine_session = (await db.execute(

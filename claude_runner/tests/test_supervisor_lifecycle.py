@@ -354,6 +354,30 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(fresh.startswith(f"/{entrypoint}\n\n<SYSTEM>"))
         self.assertEqual(resumed, f"/{entrypoint}\n\nnext")
 
+    def test_native_skill_discovery_does_not_force_installed_skill_on_turn(self):
+        manifest = {
+            "plugin_name": "chatds-session-skills",
+            "entrypoint_skill_name": None,
+            "selected_primary_skill_names": ["museum-provenance"],
+            "skills": [{
+                "name": "museum-provenance",
+                "scope": "session",
+            }],
+        }
+        entrypoint = supervisor_server._manifest_skill_entrypoint(manifest)
+        self.assertIsNone(entrypoint)
+        prompt = supervisor_server._build_prompt(
+            [{"role": "user", "content": "unrelated current weather"}],
+            resume=True,
+            skill_entrypoint=entrypoint,
+        )
+        self.assertEqual(prompt, "unrelated current weather")
+        with self.assertRaisesRegex(RuntimeError, "skill_entrypoint"):
+            supervisor_server._manifest_skill_entrypoint({
+                **manifest,
+                "selected_primary_skill_names": ["missing"],
+            })
+
     def test_skill_entrypoint_manifest_fails_closed_when_inconsistent(self):
         valid = {
             "plugin_name": "chatds-session-skills",

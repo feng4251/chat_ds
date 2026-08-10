@@ -10,7 +10,7 @@ import rehypeHighlight from 'rehype-highlight'
 import 'highlight.js/styles/github-dark.css'
 import {
   getConversationSettings, updateConversationSettings,
-  getWorkspace, readWorkspaceFile, getWorkspaceFileBlobUrl, writeWorkspaceFile, deleteWorkspaceFile,
+  getWorkspace, readWorkspaceFile, getWorkspaceFileBlobUrl, downloadWorkspaceFile, writeWorkspaceFile, deleteWorkspaceFile,
   getGoal, updateGoal, clearGoal, getRuns, getRunEvents, getArtifacts, getTasks, downloadTrajectory,
   getSchedules, createSchedule, updateSchedule, deleteSchedule, runSchedule,
   getHooks, createHook, updateHook, deleteHook,
@@ -133,6 +133,16 @@ export default function SessionWorkspace({
   })
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
+
+  async function downloadFile(path) {
+    if (!path) return
+    setError('')
+    try {
+      await downloadWorkspaceFile(convId, path)
+    } catch (downloadError) {
+      setError(downloadError.message || '下载文件失败')
+    }
+  }
 
   useEffect(() => {
     if (!open || !convId) return
@@ -467,16 +477,25 @@ export default function SessionWorkspace({
                 </div>
                 <div className="flex-1 overflow-y-auto max-h-[620px]">
                   {workspace.files.map((f) => (
-                    <button
-                      key={f.path}
-                      onClick={() => openFile(f.path)}
-                      className={`flex w-full items-center gap-2 text-left px-3 py-1.5 text-xs border-l-2 ${selectedFile === f.path ? 'bg-indigo-50 text-indigo-700 border-indigo-500 font-medium' : 'hover:bg-stone-50 border-transparent text-slate-700'}`}
-                    >
-                      <span className="min-w-0 flex-1 truncate">{f.path}</span>
-                      {f.preview_kind && (
-                        <span className="shrink-0 text-[10px] text-slate-400">{f.preview_kind}</span>
-                      )}
-                    </button>
+                    <div key={f.path} className="flex w-full items-stretch group">
+                      <button
+                        onClick={() => openFile(f.path)}
+                        className={`flex min-w-0 flex-1 items-center gap-2 text-left px-3 py-1.5 text-xs border-l-2 ${selectedFile === f.path ? 'bg-indigo-50 text-indigo-700 border-indigo-500 font-medium' : 'hover:bg-stone-50 border-transparent text-slate-700'}`}
+                      >
+                        <span className="min-w-0 flex-1 truncate">{f.path}</span>
+                        {f.preview_kind && (
+                          <span className="shrink-0 text-[10px] text-slate-400">{f.preview_kind}</span>
+                        )}
+                      </button>
+                      <button
+                        onClick={() => downloadFile(f.path)}
+                        title={`下载 ${f.path}`}
+                        aria-label={`下载 ${f.path}`}
+                        className="shrink-0 px-2 text-slate-400 hover:text-indigo-700 hover:bg-indigo-50"
+                      >
+                        <FiDownload size={13} />
+                      </button>
+                    </div>
                   ))}
                   {workspace.files.length === 0 && (
                     <div className="p-3 text-xs text-slate-400 italic">工作区为空</div>
@@ -515,6 +534,7 @@ export default function SessionWorkspace({
                           </button>
                         </div>
                       )}
+                      <button onClick={() => downloadFile(selectedFile)} disabled={!selectedFile} title="下载到本地" className="p-1 rounded hover:bg-stone-100 disabled:opacity-40"><FiDownload size={14} /></button>
                       <button onClick={saveFile} disabled={!selectedFile} title="保存" className="p-1 rounded hover:bg-stone-100 disabled:opacity-40"><FiSave size={14} /></button>
                       <button onClick={removeFile} disabled={!selectedFile} title="删除" className="p-1 rounded hover:bg-stone-100 disabled:opacity-40"><FiTrash2 size={14} /></button>
                     </div>

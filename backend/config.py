@@ -1,3 +1,6 @@
+from typing import Literal
+
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,10 +15,15 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:///./chat_ds.db"
 
     # Default model endpoints (intranet)
-    # 10.10.132.2 serves AgentModel (GLM-5.2, 303872 ctx) — 主模型
+    # These independent deployments may expose the same wire model id.  Their
+    # endpoint and capacity identities must remain separate in the catalog.
+    # 10.10.132.2 serves AgentModel (GLM-5.2, 918528 ctx) — 主模型
+    # 10.10.132.126 serves AgentModel (DeepSeek-V4-Flash, 1048576 ctx)
     # 10.10.132.128 serves qwen3_5 (397B, multimodal) — 多模态识别
     deepseek_pro_base_url: str = "http://10.10.132.2:1025/v1"
     deepseek_pro_api_key: str = "EMPTY"
+    local_deepseek_v4_flash_base_url: str = "http://10.10.132.126:1025/v1"
+    local_deepseek_v4_flash_api_key: str = "EMPTY"
     qwen3_5_base_url: str = "http://10.10.132.128:1025/v1"
     qwen3_5_api_key: str = "EMPTY"
     shaiengine_base_url: str = "https://api.shaiengine.com/v1"
@@ -35,14 +43,28 @@ class Settings(BaseSettings):
     # Runner Supervisor and its networkless per-Turn container boundary are
     # explicitly enabled by deployment configuration.
     claude_code_engine_enabled: bool = False
+    default_agent_engine_id: Literal["legacy", "claude_code"] = "legacy"
     claude_runner_url: str = "http://claude-runner-supervisor:8030"
     claude_runner_stream_timeout_seconds: int = 18000
     claude_code_provider_profiles: list[str] = ["shaiengine"]
+    claude_web_search_url: str = "http://searxng:8080/search"
     internal_api_token: str = "chat-ds-internal-token"
     scheduler_poll_seconds: int = 15
     hook_timeout_seconds: int = 8
     allow_private_hook_urls: bool = False
     agent_debug_trace: bool = False
     agent_event_immediate_persist: bool = True
+
+    @model_validator(mode="after")
+    def validate_default_agent_engine(self):
+        if (
+            self.default_agent_engine_id == "claude_code"
+            and not self.claude_code_engine_enabled
+        ):
+            raise ValueError(
+                "DEFAULT_AGENT_ENGINE_ID=claude_code requires "
+                "CLAUDE_CODE_ENGINE_ENABLED=true"
+            )
+        return self
 
 settings = Settings()

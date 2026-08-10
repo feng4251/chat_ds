@@ -92,6 +92,8 @@ def materialize_claude_skill_view(
     *,
     session_root: Path,
     sources: Iterable[SkillViewSource],
+    enabled_tools: Iterable[str] = (),
+    web_search_url: str = "",
 ) -> ClaudeSkillView:
     """Publish one immutable plugin tree or reuse its verified digest path."""
 
@@ -150,44 +152,40 @@ def materialize_claude_skill_view(
                 "files": skill_files,
             })
 
+        # Installed Skills remain available to Claude's native description-
+        # based Skill router. Do not prepend a synthetic slash command: doing
+        # so turns "installed" into "mandatory on every Turn" and anchors
+        # unrelated follow-up requests to stale domain instructions.
         entrypoint_skill_name: str | None = None
-        if selected_primary_skill_names:
-            entrypoint_skill_name = CLAUDE_SKILL_ENTRYPOINT_NAME
-            entrypoint_root = skills_root / entrypoint_skill_name
-            entrypoint_root.mkdir(mode=0o700)
-            entrypoint_path = entrypoint_root / "SKILL.md"
-            entrypoint_bytes = _compiled_entrypoint_skill(
-                selected_primary_skill_names
-            ).encode("utf-8")
-            _write_bytes_exclusive(entrypoint_path, entrypoint_bytes)
-            entrypoint_digest = hashlib.sha256(entrypoint_bytes).hexdigest()
-            entrypoint_row = {
-                "path": (
-                    f"plugin/skills/{entrypoint_skill_name}/SKILL.md"
-                ),
-                "sha256": entrypoint_digest,
-                "size": len(entrypoint_bytes),
-            }
-            file_rows.append(entrypoint_row)
-            total_bytes += len(entrypoint_bytes)
-            if total_bytes > MAX_SKILL_VIEW_BYTES:
-                raise SkillViewError("Skill view byte limit exceeded")
-            manifest_skills.append({
-                "name": entrypoint_skill_name,
-                "scope": "harness",
-                "bundle_id": None,
-                "bundle_role": "entrypoint",
-                "files": [{
-                    "path": "SKILL.md",
-                    "sha256": entrypoint_digest,
-                    "size": len(entrypoint_bytes),
-                }],
-            })
 
         mcp_servers = _compile_explicit_mcp_servers(
             sources=source_rows,
             plugin_root=plugin,
         )
+        harness_egress_rules: list[dict[str, Any]] = []
+        enabled_tool_names = {
+            str(name) for name in enabled_tools if isinstance(name, str)
+        }
+        if "web_search" in enabled_tool_names:
+            normalized_search_url = _normalize_harness_web_search_url(
+                web_search_url
+            )
+            server_name = "chatds-web-search"
+            if server_name in mcp_servers:
+                raise SkillViewError(
+                    "Explicit Skill MCP identity conflicts with Harness capability"
+                )
+            mcp_servers[server_name] = {
+                "type": "stdio",
+                "command": "/usr/local/bin/python",
+                "args": ["-I", "/app/claude-runner/mcp_web_search.py"],
+                "env": {"CHATDS_SEARXNG_SEARCH_URL": normalized_search_url},
+            }
+            harness_egress_rules.append({
+                "capability": "web_search",
+                "url_prefix": normalized_search_url,
+                "methods": ["GET"],
+            })
         mcp_config_path = plugin / ".mcp.json"
         _write_json_exclusive(mcp_config_path, {"mcpServers": mcp_servers})
         mcp_config_bytes = mcp_config_path.read_bytes()
@@ -221,6 +219,7 @@ def materialize_claude_skill_view(
             "selected_primary_skill_names": list(
                 selected_primary_skill_names
             ),
+            "harness_egress_rules": harness_egress_rules,
             "skills": manifest_skills,
             "files": sorted(file_rows, key=lambda row: row["path"]),
         }
@@ -275,55 +274,36 @@ def _safe_component(value: str, *, field: str) -> str:
     return value
 
 
-def _compiled_entrypoint_skill(primary_skill_names: tuple[str, ...]) -> str:
-    """Build the native entrypoint for the selected root Skills.
+def _normalize_harness_web_search_url(value: object) -> str:
+    """Validate the deployment-owned metasearch coordinate."""
 
-    Native Skill auto-selection is model-dependent, especially behind
-    compatible third-party providers.  The immutable Harness entrypoint uses
-    Claude Code's documented slash-command mechanism to make the Session's
-    explicit selection deterministic. Bundle dependencies stay available in
-    the same plugin but are not promoted to independent roots.
-    """
+    from urllib.parse import urlsplit, urlunsplit
 
-    rows = "\n".join(
-        f"- `/skill-view/plugin/skills/{name}/SKILL.md`"
-        for name in primary_skill_names
-    )
-    return (
-        "---\n"
-        f"name: {CLAUDE_SKILL_ENTRYPOINT_NAME}\n"
-        "description: Harness-owned entrypoint for explicitly selected "
-        "Session Skills.\n"
-        "---\n\n"
-        "# Execute the selected Session Skills\n\n"
-        "This command is invoked by the Harness because the Session owner "
-        "explicitly selected the following primary Skills:\n\n"
-        f"{rows}\n\n"
-        "Before any substantive analysis, delegation, tool call, or file "
-        "mutation, use `Read` to read every listed `SKILL.md` completely. "
-        "Then determine which selected Skills apply to the user's request "
-        "and follow every applicable instruction exactly. Supporting Skills "
-        "in `/skill-view/plugin/skills/` are dependencies and may be loaded "
-        "when the primary instructions require them; their presence does not "
-        "make them independent user selections.\n\n"
-        "Do not search `/workspace` for installed Skill instructions. The "
-        "Skill view is immutable and authoritative; write task artifacts only "
-        "to `/workspace`. Preserve required workflow steps, evidence, "
-        "delegation, validation, filenames, and final deliverables. When a "
-        "supporting Skill exists for a data source or tool, use its authored "
-        "instructions, scripts, or MCP capability before a generic web tool. "
-        "Do not finish while a task you created is pending or while an "
-        "applicable Skill's required validation or deliverable is incomplete. "
-        "If you spawn a background agent, wait for and collect its terminal "
-        "result before finishing. Treat every declared comparison and "
-        "validation threshold literally: a near miss is a failure, not a "
-        "pass. Repair every failed check and rerun it before marking it "
-        "complete. "
-        "Before the final response, inspect the workspace and task list, run "
-        "the declared checks, and close every task with evidence.\n\n"
-        "The original user request is supplied below without modification.\n\n"
-        "$ARGUMENTS\n"
-    )
+    if not isinstance(value, str) or not value or len(value) > 8192:
+        raise SkillViewError("Harness web-search URL is invalid")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise SkillViewError("Harness web-search URL is invalid") from exc
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or parsed.query
+        or port is not None and not 1 <= port <= 65535
+        or not parsed.path.rstrip("/").endswith("/search")
+    ):
+        raise SkillViewError("Harness web-search URL is invalid")
+    return urlunsplit((
+        parsed.scheme,
+        parsed.netloc,
+        parsed.path.rstrip("/"),
+        "",
+        "",
+    ))
 
 
 def _compile_explicit_mcp_servers(

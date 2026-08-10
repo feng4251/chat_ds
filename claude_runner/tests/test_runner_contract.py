@@ -84,7 +84,7 @@ class RunnerCommandContractTests(unittest.TestCase):
         command, _ = _claude_command(native_web)
         self.assertNotIn("--disallowedTools", command)
 
-    def test_one_million_context_is_a_client_marker_not_an_upstream_model_id(self):
+    def test_extended_context_is_a_client_marker_not_an_upstream_model_id(self):
         config = {
             **_config(),
             "api_model": "renamed-model-holdout",
@@ -96,11 +96,21 @@ class RunnerCommandContractTests(unittest.TestCase):
             "renamed-model-holdout[1m]",
         )
 
-        conservative = {
+        sub_million = {
             **config,
             "context_window_tokens": 303_872,
         }
-        command, _ = _claude_command(conservative)
+        command, _ = _claude_command(sub_million)
+        self.assertEqual(
+            command[command.index("--model") + 1],
+            "renamed-model-holdout[1m]",
+        )
+
+        baseline = {
+            **config,
+            "context_window_tokens": 200_000,
+        }
+        command, _ = _claude_command(baseline)
         self.assertEqual(
             command[command.index("--model") + 1],
             "renamed-model-holdout",
@@ -130,6 +140,7 @@ class RunnerCommandContractTests(unittest.TestCase):
                 worker_tmp=Path(temporary),
             )
         self.assertEqual(environment["CLAUDE_CODE_MAX_OUTPUT_TOKENS"], "86400")
+        self.assertEqual(environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "200000")
         self.assertEqual(environment["ANTHROPIC_BASE_URL"], "https://api.shaiengine.com")
         self.assertEqual(environment["HTTPS_PROXY"], "http://127.0.0.1:12345")
         self.assertEqual(environment["SKILL_EGRESS_PROXY_URL"], environment["HTTPS_PROXY"])
@@ -343,7 +354,13 @@ class RunnerCommandContractTests(unittest.TestCase):
 
 
 class RunnerEgressPolicyTests(unittest.TestCase):
-    def _view(self, root: Path, *, mcp_servers: dict | None = None):
+    def _view(
+        self,
+        root: Path,
+        *,
+        mcp_servers: dict | None = None,
+        harness_egress_rules: list[dict] | None = None,
+    ):
         view = root / "view"
         skill = view / "plugin" / "skills" / "fixture"
         descriptor = view / "plugin" / ".claude-plugin" / "plugin.json"
@@ -381,6 +398,11 @@ class RunnerEgressPolicyTests(unittest.TestCase):
             })
         identity = {
             "schema": "chatds.claude-skill-view.v1",
+            **(
+                {"harness_egress_rules": harness_egress_rules}
+                if harness_egress_rules is not None
+                else {}
+            ),
             "skills": [{
                 "name": "fixture",
                 "scope": "session",
@@ -412,6 +434,52 @@ class RunnerEgressPolicyTests(unittest.TestCase):
                 os.chmod(Path(walk_root) / name, 0o555)
         os.chmod(view, 0o555)
         return view, digest
+
+    def test_harness_web_capability_has_exact_rule_and_private_origin_gate(self):
+        rule = {
+            "capability": "web_search",
+            "url_prefix": "http://search.internal:8080/search",
+            "methods": ["GET"],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            view, digest = self._view(
+                Path(temporary),
+                harness_egress_rules=[rule],
+            )
+            common = dict(
+                skill_view_root=view,
+                skill_view_sha256=digest,
+                user_turn_text="generic current-information request",
+                provider_base_url="https://api.example.test",
+                budget_scope_sha256=hashlib.sha256(b"budget").hexdigest(),
+                call_id_sha256=hashlib.sha256(b"call").hexdigest(),
+                limits={
+                    "max_outbound_bytes": 1024,
+                    "max_requests": 10,
+                    "max_response_wire_bytes": 4096,
+                },
+            )
+            denied = compile_turn_egress_policy(
+                configured_private_origins=(),
+                **common,
+            )
+            allowed = compile_turn_egress_policy(
+                configured_private_origins=("http://search.internal:8080",),
+                **common,
+            )
+        search_rule = next(
+            row for row in allowed["egress_rules"]
+            if row["url_prefix"] == "http://search.internal:8080/search"
+        )
+        self.assertEqual(search_rule["methods"], ["GET"])
+        self.assertNotIn(
+            "http://search.internal:8080",
+            denied["private_origins"],
+        )
+        self.assertIn(
+            "http://search.internal:8080",
+            allowed["private_origins"],
+        )
 
     def test_policy_has_only_declared_user_and_provider_coordinates(self):
         with tempfile.TemporaryDirectory() as temporary:

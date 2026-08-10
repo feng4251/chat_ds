@@ -283,8 +283,11 @@ services:
       # merge them only at the trusted proxy boundary. Signed Turn policy must
       # still name the exact selected origin and /v1/messages request.
       SKILL_EGRESS_PRIVATE_ORIGIN_ALLOWLIST: >-
-        ${BROWSER_PRIVATE_ORIGIN_ALLOWLIST:-},${CLAUDE_PROVIDER_PRIVATE_ORIGIN_ALLOWLIST:-http://10.10.132.2:1025,http://10.10.132.128:1025}
-      SKILL_EGRESS_PRIVATE_CIDR_ALLOWLIST: ${SKILL_EGRESS_PRIVATE_CIDR_ALLOWLIST:-}
+        ${BROWSER_PRIVATE_ORIGIN_ALLOWLIST:-},${CLAUDE_PROVIDER_PRIVATE_ORIGIN_ALLOWLIST:-http://10.10.132.2:1025,http://10.10.132.126:1025,http://10.10.132.128:1025,http://searxng:8080}
+      # ``search_net`` is application-owned and has a fixed subnet below.
+      # Hostname-based access to SearXNG still needs this independent DNS-pin
+      # boundary; arbitrary private networks remain unavailable by default.
+      SKILL_EGRESS_PRIVATE_CIDR_ALLOWLIST: ${SKILL_EGRESS_PRIVATE_CIDR_ALLOWLIST:-172.29.250.0/24}
       # Preferred certificate exceptions are scoped to canonical HTTPS
       # origins as JSON.  The legacy pin list is only consulted after the
       # signed run origin, deployment private-origin and address/CIDR gates
@@ -315,6 +318,10 @@ services:
       - skill_egress_proxy_private:/var/lib/chatds-skill-egress-private
     networks:
       - browser_egress
+      # The proxy is the only execution component joining this network. Turn
+      # containers remain network=none and Harness-owned signed policy grants
+      # only GET /search on the exact SearXNG origin.
+      - search_net
     healthcheck:
       test: ["CMD", "python", "-I", "/app/server.py", "--healthcheck"]
       interval: 5s
@@ -397,15 +404,17 @@ services:
       SHAIENGINE_API_KEY: ${SHAIENGINE_API_KEY:-}
       DEEPSEEK_PRO_BASE_URL: ${DEEPSEEK_PRO_BASE_URL:-http://10.10.132.2:1025/v1}
       DEEPSEEK_PRO_API_KEY: ${DEEPSEEK_PRO_API_KEY:-EMPTY}
+      LOCAL_DEEPSEEK_V4_FLASH_BASE_URL: ${LOCAL_DEEPSEEK_V4_FLASH_BASE_URL:-http://10.10.132.126:1025/v1}
+      LOCAL_DEEPSEEK_V4_FLASH_API_KEY: ${LOCAL_DEEPSEEK_V4_FLASH_API_KEY:-EMPTY}
       QWEN3_5_BASE_URL: ${QWEN3_5_BASE_URL:-http://10.10.132.128:1025/v1}
       QWEN3_5_API_KEY: ${QWEN3_5_API_KEY:-EMPTY}
       CLAUDE_PROVIDER_PRIVATE_ORIGIN_ALLOWLIST: >-
-        ${CLAUDE_PROVIDER_PRIVATE_ORIGIN_ALLOWLIST:-http://10.10.132.2:1025,http://10.10.132.128:1025}
+        ${CLAUDE_PROVIDER_PRIVATE_ORIGIN_ALLOWLIST:-http://10.10.132.2:1025,http://10.10.132.126:1025,http://10.10.132.128:1025,http://searxng:8080}
       # backend_protocol attests the existing ChatDS/Legacy model catalog.
       # Every Claude Turn below still uses ANTHROPIC_BASE_URL and the native
       # /v1/messages route; both local providers expose that facade.
       CLAUDE_PROVIDER_PROFILES_JSON: >-
-        {"shaiengine":{"backend_base_url":"${SHAIENGINE_BASE_URL:-https://api.shaiengine.com/v1}","api_key_env":"SHAIENGINE_API_KEY","backend_protocol":"openai","models":["glm-5.2","deepseek-v4-pro"],"context_windows":{"glm-5.2":1000000,"deepseek-v4-pro":200000}},"local_agentmodel":{"backend_base_url":"${DEEPSEEK_PRO_BASE_URL:-http://10.10.132.2:1025/v1}","api_key_env":"DEEPSEEK_PRO_API_KEY","backend_protocol":"openai","models":["AgentModel"],"context_windows":{"AgentModel":303872}},"local_qwen":{"backend_base_url":"${QWEN3_5_BASE_URL:-http://10.10.132.128:1025/v1}","api_key_env":"QWEN3_5_API_KEY","backend_protocol":"openai","models":["qwen3_5"],"context_windows":{"qwen3_5":262144}}}
+        {"shaiengine":{"backend_base_url":"${SHAIENGINE_BASE_URL:-https://api.shaiengine.com/v1}","api_key_env":"SHAIENGINE_API_KEY","backend_protocol":"openai","models":["glm-5.2","deepseek-v4-pro"],"context_windows":{"glm-5.2":1000000,"deepseek-v4-pro":200000}},"local_agentmodel":{"backend_base_url":"${DEEPSEEK_PRO_BASE_URL:-http://10.10.132.2:1025/v1}","api_key_env":"DEEPSEEK_PRO_API_KEY","backend_protocol":"openai","models":["AgentModel"],"context_windows":{"AgentModel":918528}},"local_deepseek_v4_flash":{"backend_base_url":"${LOCAL_DEEPSEEK_V4_FLASH_BASE_URL:-http://10.10.132.126:1025/v1}","api_key_env":"LOCAL_DEEPSEEK_V4_FLASH_API_KEY","backend_protocol":"openai","models":["AgentModel"],"context_windows":{"AgentModel":1048576}},"local_qwen":{"backend_base_url":"${QWEN3_5_BASE_URL:-http://10.10.132.128:1025/v1}","api_key_env":"QWEN3_5_API_KEY","backend_protocol":"openai","models":["qwen3_5"],"context_windows":{"qwen3_5":262144}}}
       CLAUDE_WORKSPACE_HOST_ROOT: /nfs/temp/chat_ds
       CLAUDE_RUNNER_STATE_ROOT: /var/lib/chatds-claude-runner
       CLAUDE_RUNNER_IMAGE: chat_ds-claude-runner:2.1.152
@@ -547,6 +556,7 @@ services:
     environment:
       # Backward-compatible env key; this endpoint serves AgentModel (GLM-5.2).
       DEEPSEEK_PRO_URL: ${DEEPSEEK_PRO_URL:-http://10.10.132.2:1025/v1}
+      LOCAL_DEEPSEEK_V4_FLASH_URL: ${LOCAL_DEEPSEEK_V4_FLASH_URL:-http://10.10.132.126:1025/v1}
       QWEN3_5_URL: ${QWEN3_5_URL:-http://10.10.132.128:1025/v1}
       SHAIENGINE_BASE_URL: ${SHAIENGINE_BASE_URL:-https://api.shaiengine.com/v1}
       SHAIENGINE_API_KEY: ${SHAIENGINE_API_KEY:-}
@@ -682,14 +692,18 @@ services:
       # Idle/read boundary: must exceed Harness's four-hour absolute
       # provider-stream ceiling so this outer transport cannot fire first.
       HARNESS_STREAM_TIMEOUT_SECONDS: ${HARNESS_STREAM_TIMEOUT_SECONDS:-18000}
-      CLAUDE_CODE_ENGINE_ENABLED: ${CLAUDE_CODE_ENGINE_ENABLED:-false}
+      CLAUDE_CODE_ENGINE_ENABLED: ${CLAUDE_CODE_ENGINE_ENABLED:-true}
+      DEFAULT_AGENT_ENGINE_ID: ${DEFAULT_AGENT_ENGINE_ID:-claude_code}
+      CLAUDE_WEB_SEARCH_URL: ${CLAUDE_WEB_SEARCH_URL:-http://searxng:8080/search}
       CLAUDE_RUNNER_URL: http://claude-runner-supervisor:8030
       CLAUDE_RUNNER_STREAM_TIMEOUT_SECONDS: ${CLAUDE_RUNNER_STREAM_TIMEOUT_SECONDS:-18000}
       CLAUDE_CODE_PROVIDER_PROFILES: >-
-        ["shaiengine","local_agentmodel","local_qwen"]
+        ["shaiengine","local_agentmodel","local_deepseek_v4_flash","local_qwen"]
       # Primary AgentModel (GLM-5.2) and auxiliary multimodal endpoint.
       DEEPSEEK_PRO_BASE_URL: ${DEEPSEEK_PRO_BASE_URL:-http://10.10.132.2:1025/v1}
       DEEPSEEK_PRO_API_KEY: ${DEEPSEEK_PRO_API_KEY:-EMPTY}
+      LOCAL_DEEPSEEK_V4_FLASH_BASE_URL: ${LOCAL_DEEPSEEK_V4_FLASH_BASE_URL:-http://10.10.132.126:1025/v1}
+      LOCAL_DEEPSEEK_V4_FLASH_API_KEY: ${LOCAL_DEEPSEEK_V4_FLASH_API_KEY:-EMPTY}
       QWEN3_5_BASE_URL: ${QWEN3_5_BASE_URL:-http://10.10.132.128:1025/v1}
       QWEN3_5_API_KEY: ${QWEN3_5_API_KEY:-EMPTY}
       SHAIENGINE_BASE_URL: ${SHAIENGINE_BASE_URL:-https://api.shaiengine.com/v1}
