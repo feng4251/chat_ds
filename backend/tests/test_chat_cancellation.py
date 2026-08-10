@@ -56,7 +56,7 @@ class ChatStreamFailureClassificationTests(unittest.TestCase):
             None,
         ))
 
-        self.assertEqual(200_000, config["context_length"])
+        self.assertEqual(1_000_000, config["context_length"])
         self.assertEqual(86_400, config["max_output_tokens"])
 
     def test_child_and_provisional_failures_do_not_override_root_success(self):

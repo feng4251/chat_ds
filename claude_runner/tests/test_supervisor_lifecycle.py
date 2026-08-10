@@ -187,6 +187,7 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
             claude_base_url="https://api.shaiengine.com",
             api_key="fixture-key",
             models=frozenset({"glm-5.2"}),
+            context_windows={"glm-5.2": 1_000_000},
         )
         self.settings = RunnerSettings(
             internal_token="fixture-internal-token",
@@ -280,6 +281,7 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
             provider_protocol="openai",
             messages=[{"role": "user", "content": "fixture"}],
             max_output_tokens=1024,
+            context_window_tokens=1_000_000,
             workspace_path=str(self.workspace),
             skill_view_path=str(self.view),
             skill_view_sha256=self.view_digest,
@@ -293,6 +295,16 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
             "provider_protocol": "anthropic",
         })
         with self.assertRaises(HTTPException):
+            self.manager._provider(request)
+
+    async def test_context_window_is_part_of_the_deployment_profile(self):
+        request = self._request().model_copy(update={
+            "context_window_tokens": 200_000,
+        })
+        with self.assertRaisesRegex(
+            HTTPException,
+            "context window",
+        ):
             self.manager._provider(request)
 
     async def test_start_admission_is_idempotent_and_identity_bound(self):

@@ -31,6 +31,7 @@ def _config(*, resume: bool = False) -> dict:
         "native_session_id": str(uuid.uuid4()),
         "resume_from_native_session_id": str(uuid.uuid4()) if resume else None,
         "api_model": "glm-5.2",
+        "context_window_tokens": 200000,
         "max_output_tokens": 86400,
         "provider_claude_base_url": "https://api.shaiengine.com",
         "native_web_tools": False,
@@ -83,6 +84,38 @@ class RunnerCommandContractTests(unittest.TestCase):
         command, _ = _claude_command(native_web)
         self.assertNotIn("--disallowedTools", command)
 
+    def test_one_million_context_is_a_client_marker_not_an_upstream_model_id(self):
+        config = {
+            **_config(),
+            "api_model": "renamed-model-holdout",
+            "context_window_tokens": 1_000_000,
+        }
+        command, _ = _claude_command(config)
+        self.assertEqual(
+            command[command.index("--model") + 1],
+            "renamed-model-holdout[1m]",
+        )
+
+        conservative = {
+            **config,
+            "context_window_tokens": 303_872,
+        }
+        command, _ = _claude_command(conservative)
+        self.assertEqual(
+            command[command.index("--model") + 1],
+            "renamed-model-holdout",
+        )
+
+    def test_missing_or_unbounded_context_fails_before_native_start(self):
+        for value in (None, True, 199_999, 4_000_001):
+            with self.subTest(value=value):
+                config = {**_config(), "context_window_tokens": value}
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "model_context_window_invalid",
+                ):
+                    _claude_command(config)
+
     def test_worker_environment_is_explicit_and_binds_output_and_proxy(self):
         config = _config()
         with tempfile.TemporaryDirectory() as temporary, patch.dict(
@@ -101,6 +134,8 @@ class RunnerCommandContractTests(unittest.TestCase):
         self.assertEqual(environment["HTTPS_PROXY"], "http://127.0.0.1:12345")
         self.assertEqual(environment["SKILL_EGRESS_PROXY_URL"], environment["HTTPS_PROXY"])
         self.assertEqual(environment["DISABLE_TELEMETRY"], "1")
+        self.assertNotIn("USER_TYPE", environment)
+        self.assertNotIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS", environment)
         self.assertNotIn("SKILL_EGRESS_POLICY_TOKEN", environment)
 
     def test_local_openai_catalog_binding_still_uses_anthropic_messages_base(self):

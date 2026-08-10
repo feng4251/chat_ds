@@ -24,6 +24,10 @@ class ProviderProfile:
     claude_base_url: str
     api_key: str
     models: frozenset[str]
+    # Deployment-owned model capacity.  The Backend repeats this value in a
+    # start request so the Supervisor can reject catalog/profile drift before
+    # granting a Turn any Docker or Provider authority.
+    context_windows: dict[str, int]
     # Anthropic-hosted server tools are not part of the generic Messages
     # compatibility contract. Third-party facades must explicitly attest that
     # they implement Claude Code's native WebSearch/WebFetch semantics.
@@ -177,6 +181,10 @@ def _provider_profiles() -> dict[str, ProviderProfile]:
                 "api_key_env": "SHAIENGINE_API_KEY",
                 "backend_protocol": "openai",
                 "models": ["glm-5.2", "deepseek-v4-pro"],
+                "context_windows": {
+                    "glm-5.2": 1_000_000,
+                    "deepseek-v4-pro": 200_000,
+                },
             }
         }
     profiles: dict[str, ProviderProfile] = {}
@@ -203,6 +211,20 @@ def _provider_profiles() -> dict[str, ProviderProfile]:
             not isinstance(item, str) or not item or len(item) > 128 for item in models
         ):
             raise RunnerConfigurationError(f"Provider model allowlist is invalid for {profile_id}")
+        context_windows = value.get("context_windows")
+        if (
+            not isinstance(context_windows, dict)
+            or set(context_windows) != set(models)
+            or any(
+                type(window) is not int
+                or window < 200_000
+                or window > 4_000_000
+                for window in context_windows.values()
+            )
+        ):
+            raise RunnerConfigurationError(
+                f"Provider context-window map is invalid for {profile_id}"
+            )
         native_web_tools = value.get("native_web_tools", False)
         if type(native_web_tools) is not bool:
             raise RunnerConfigurationError(
@@ -215,6 +237,7 @@ def _provider_profiles() -> dict[str, ProviderProfile]:
             claude_base_url=claude_base,
             api_key=api_key,
             models=frozenset(models),
+            context_windows=dict(context_windows),
             native_web_tools=native_web_tools,
         )
     return profiles

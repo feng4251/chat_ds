@@ -581,6 +581,22 @@ def _pending_plan_task_count(tasks_root: Path, native_session_id: str) -> int:
 
 def _claude_command(config: dict[str, Any]) -> tuple[list[str], bytes]:
     native_session_id = str(config["native_session_id"])
+    api_model = str(config["api_model"])
+    context_window_tokens = config.get("context_window_tokens")
+    if (
+        type(context_window_tokens) is not int
+        or context_window_tokens < 200_000
+        or context_window_tokens > 4_000_000
+    ):
+        raise RuntimeError("model_context_window_invalid")
+    # Claude Code's public model syntax uses ``[1m]`` as a client-side
+    # context capability marker and strips it before every API request.  This
+    # preserves the exact upstream model ID while aligning native compaction.
+    # Sub-million custom windows stay on Claude's conservative 200K tier; an
+    # overestimate would be less safe than an early compaction.
+    claude_model = (
+        f"{api_model}[1m]" if context_window_tokens >= 1_000_000 else api_model
+    )
     command = [
         "/usr/local/bin/claude",
         "--print",
@@ -595,7 +611,7 @@ def _claude_command(config: dict[str, Any]) -> tuple[list[str], bytes]:
         "--plugin-dir", "/skill-view/plugin",
         "--mcp-config", "/skill-view/plugin/.mcp.json",
         "--strict-mcp-config",
-        "--model", str(config["api_model"]),
+        "--model", claude_model,
         # Keep Claude Code's own coherent built-in tool surface, including its
         # current Agent/Task aliases and task-management tools. ``--bare`` is
         # intentionally not used: Claude 2.1.152's simple mode reduces
