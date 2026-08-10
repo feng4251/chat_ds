@@ -2,6 +2,76 @@
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
+## 2026-08-10 Claude Skill 相关性、受控搜索与部署默认值闭环
+
+- 生产 conversation `28f32a430935405e92cc0ea53700cba8` 的最后两轮已按三源证据闭环。
+  持久化对话中两次天气提问都被错误引向 TrialSim 后拒答；对应 primary runs
+  `a4ccadc543f74de788b3909fe59f3426`、`8092a780b8754b0bb2f04d7c9a25af9d`
+  均是唯一 `succeeded/end_turn`，但 init 中 `mcp_servers=[]`、`webSearchRequests=0`，没有
+  provider stream 或 Claude core 错误；exact immutable Skill view digest 为
+  `241bcf331e12478a0a6b997496a4d4c7d5660173ed95f6d4ca0e675b77c42127`，其中
+  `healthsim-trialsim/SKILL.md` 明确只描述临床试验任务。旧 ChatDS 编译器却生成
+  `chatds-harness-session-entry` 并在每个 Turn 强制 slash invocation，同时没有给 Claude 装配搜索
+  MCP。SearXNG 同期手工查询有结果。因此两项缺陷都在 ChatDS Skill/capability adapter，不是 Claude
+  Code 后台不会判断，也不是该时刻 SearXNG 无数据。
+- 通用提交 `8b0f61eda471e96445366a33f495e25349685e48 fix: route Claude skills and search by
+  capability` 移除了每轮强制合成 entry Skill。已安装/选中的 Skills 仍以 immutable manifest 和原生
+  plugin 暴露，但由 Claude 按 `SKILL.md` description 与当前问题相关性决定是否调用；旧内容寻址 view
+  仍兼容恢复。新增 Harness-owned `chatds-web-search` stdio MCP，仅在 capability 开启时编译，并把
+  authority 限定为 `GET http://searxng:8080/search`、当前 Turn HMAC policy、固定私网 CIDR 和总出站
+  budget 的交集。Turn 容器继续 `network=none`，只有受信 Egress Proxy 同时连接出公网与固定
+  `search_net`，没有给模型开放任意网络。
+- 首次生产搜索 smoke 证明 Skill 路由和 MCP 装配已正确：一个仅描述博物馆来源核验的合成 Skill
+  没有被天气问题调用，Claude init 中 `chatds-web-search=connected`，并实际调用搜索工具。但工具三次
+  收到 `RemoteDisconnected`。签名规则、DNS pin、私网 allowlist、SearXNG 直连和 budget receipt 都
+  正常；对真实 SearXNG 的 UDS probe 与进程内逐阶段 probe 都定位到 cleartext HTTP 代理在请求发送后、
+  响应返回前执行 `upstream.shutdown(SHUT_WR)`，上游把提前 FIN 当作客户端中止并返回空流。
+- 该跨域不变量以 `858f0d25f19bd61be3c491107a1677aad2f7f961 fix: preserve HTTP request lifetime
+  through proxy` 修复：单请求限制、Content-Length 校验、`Connection: close`、deadline 与 response-only
+  relay 继续负责边界，但代理不再用提前 TCP 半关闭替代 HTTP framing。新增的通用、非业务
+  `FinSensitiveOrigin` 失败注入在旧实现稳定得到空响应，在新实现通过；两个 cleartext HTTP lane 都
+  采用同一修正，没有台风、SearXNG、Skill/session ID 或 V2.3 特判。
+- 成熟实现对照仍冻结本地独立 `claude-code/` commit
+  `6f6f12b37f529488b10e53928dd5508bb93535c7`。`src/commands.ts` 的 description-driven Skill
+  暴露、`src/main.tsx`/`src/tools.ts` 的首轮 MCP 工具装配被采用；原生 MCP/HTTP 客户端的标准请求—
+  响应生命周期被适配到 ChatDS 既有签名 authority/receipt 边界。拒绝“安装即每轮强制执行”和绕过
+  policy 的原生任意 Web 能力。确定性代理复现已无语义疑点，因此本轮没有额外 Web 搜索框架调研，
+  也没有臆测本地参考仓库中不存在的 private/stub 行为。
+- 同一 `8b0f61ed` 提交完成部署模型/上下文闭环：selector 现在有
+  `shaiengine_glm_5_2`（1,000,000）、`shaiengine_deepseek_v4_pro`（200,000）、本地
+  `deepseek_v4_pro`→`10.10.132.2:1025/AgentModel`（918,528）、
+  `local_deepseek_v4_flash`→`10.10.132.126:1025/AgentModel`（1,048,576）和
+  `qwen3_5`→`10.10.132.128:1025/qwen3_5`（262,144）。共享 wire model 名的两个本地端点由
+  route/profile 保持独立；Claude 启动使用 exact capacity 设置
+  `CLAUDE_CODE_AUTO_COMPACT_WINDOW`，大上下文模型附加 native `[1m]` client marker，实际 wire
+  model 仍是 provider 声明名。新 Conversation 的生产默认 engine 为 `claude_code`；已存在
+  Conversation 继续使用自身持久化 engine。Workspace 每个常规文件及编辑器工具栏均有带认证的下载
+  按钮，后端 raw endpoint 继续先鉴权、拒绝 traversal/symlink/special file。
+- 回归结果：Backend `275 passed`；Claude Runner/Supervisor 主套件 `51 passed, 1 skipped,
+  7 subtests`，本次代理相邻套件另为 `45 passed, 4 subtests`；Egress Proxy `78 passed,
+  117 subtests`；Frontend `19 passed` 且 production build 通过；Harness 可执行逻辑为 1,975 项通过。
+  三个未计入的旧 fixture 测试绑定历史 TrialSim snapshot 阈值，不是本轮通用逻辑失败；没有自动发起
+  模型重型 V2.3 E2E。模型 `/v1/models` 容量、Compose、py_compile、diff/secret/genericity scan、
+  direct MCP JSONL 和真实 native Claude MCP init 均验证通过。
+- `8b0f61ed` 上线前 DB backup volume 为
+  `chat_ds_db_backup_pre_8b0f61ed_20260810_174223`，345,542,656 bytes，SHA-256
+  `a08782c1b99ba7ae9a82024029338f28b5e13c2855a461e8a12bec3f06fe2305`，quick/FK 正常。
+  当前 Backend `sha256:c3e05f5720ee44aa038f40d79dc98f6c043b1fd432e99c42fab3d4f9712a9510`、
+  Harness `sha256:81a5d21f913d8921758f215627bf9b3c1068874f30b5ac7ba5870781ec655146`、
+  Supervisor `sha256:5bec97658a4d6c61aa90ae0b0b9843d70b507fafd6f429645ed1126e9329dda9`、
+  Runner `sha256:5174f037b00605bf671f4ec2c5aa9075b122d30e22feccb63a751c4b9451e1df`、
+  Frontend `sha256:bf27848afa91b4cc1ac7d602c0bed5bc8356549bc684acf24884e6e7fcf66795`
+  的 revision 都是 `8b0f61ed...`；Proxy 已进一步更新为
+  `sha256:c1395f6c1fad2ba52b844c62e00a7901824b3b1c95a6c0f06cfc037eb12282cc`、revision
+  `858f0d25...`。所有目标容器 running/healthy、restart=0，localhost 与
+  `10.10.132.126:5173/api/health` 均 200。
+- 最终真实生产 smoke 使用 `shaiengine_deepseek_v4_pro` 和无关的合成
+  `museum-provenance` Skill：Claude 没有调用该 Skill，自动调用
+  `mcp__chatds-web-search__web_search("白海豚 台风 现在 位置")`，工具成功返回中央气象台、新闻和
+  上海台风路径共 3 条结果，assistant 为 `SEARCH_SMOKE_OK: 台风路径`；native result 与唯一
+  Supervisor terminal 都是 succeeded，egress receipt 为 3 accepted/3 clean close、0 budget
+  rejection、not exhausted。该合成 Session 的 control state、run index 和 workspace 已清理。
+
 ## 2026-08-10 ClaudeCodeEngine 启动事务闭环
 
 - 用户报告的生产 conversation `9cd170e6ac064be4a03b978022153f6d` 已按三源闭环查验。持久化对话确认
