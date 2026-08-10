@@ -590,12 +590,13 @@ def _claude_command(config: dict[str, Any]) -> tuple[list[str], bytes]:
     ):
         raise RuntimeError("model_context_window_invalid")
     # Claude Code's public model syntax uses ``[1m]`` as a client-side
-    # context capability marker and strips it before every API request.  This
-    # preserves the exact upstream model ID while aligning native compaction.
-    # Sub-million custom windows stay on Claude's conservative 200K tier; an
-    # overestimate would be less safe than an early compaction.
+    # context capability marker and strips it before every API request.  Its
+    # public ``CLAUDE_CODE_AUTO_COMPACT_WINDOW`` setting can then cap that
+    # tier to the deployment-owned exact capacity.  Thus custom windows above
+    # 200K avoid premature compaction without ever overestimating a sub-1M
+    # provider, and the upstream model id remains unchanged.
     claude_model = (
-        f"{api_model}[1m]" if context_window_tokens >= 1_000_000 else api_model
+        f"{api_model}[1m]" if context_window_tokens > 200_000 else api_model
     )
     command = [
         "/usr/local/bin/claude",
@@ -673,6 +674,9 @@ def _worker_environment(
         "DISABLE_AUTOUPDATER": "1",
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
         "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(config["max_output_tokens"]),
+        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(
+            config["context_window_tokens"]
+        ),
         "HTTP_PROXY": proxy_url,
         "HTTPS_PROXY": proxy_url,
         "ALL_PROXY": proxy_url,

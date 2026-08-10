@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
     # vLLM provider endpoints (from env)
     deepseek_pro_url: str = "http://10.10.132.2:1025/v1"
+    local_deepseek_v4_flash_url: str = "http://10.10.132.126:1025/v1"
     qwen3_5_url: str = "http://10.10.132.128:1025/v1"
     shaiengine_base_url: str = "https://api.shaiengine.com/v1"
     shaiengine_api_key: str = ""
@@ -195,7 +196,28 @@ PROVIDERS: dict[str, dict] = {
         "thinking_enabled_by_default": True,
         "thinking_request_format": "chat_template_kwargs",
         "protocol": "openai",
-        "context_length": 303872,
+        "context_length": 918528,
+        "max_output_tokens": 262144,
+        "discover_runtime_metadata": True,
+    },
+    "local_deepseek_v4_flash": {
+        "base_url": settings.local_deepseek_v4_flash_url,
+        # This independent vLLM deployment intentionally exposes the same
+        # wire model name as the local GLM endpoint.  ChatDS route identity,
+        # provider authority, and capacity therefore remain explicit data.
+        "api_model": "AgentModel",
+        "api_key": "EMPTY",
+        "provider": "DeepSeek",
+        "display_name": "DeepSeek V4 Flash (本地 AgentModel)",
+        "is_multimodal": False,
+        "is_default": False,
+        "agentic_auxiliary_only": False,
+        "capabilities": ["text", "tools", "reasoning"],
+        "supports_thinking_toggle": True,
+        "thinking_enabled_by_default": True,
+        "thinking_request_format": "chat_template_kwargs",
+        "protocol": "openai",
+        "context_length": 1048576,
         "max_output_tokens": 262144,
         "discover_runtime_metadata": True,
     },

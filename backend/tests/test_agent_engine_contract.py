@@ -22,7 +22,7 @@ from agent_engines.skill_view import (
     authorized_skill_sources,
     materialize_claude_skill_view,
 )
-from config import settings
+from config import Settings, settings
 from models import (
     AgentEngineRawEvent,
     AgentEngineSession,
@@ -33,7 +33,7 @@ from models import (
     SkillPackage,
     User,
 )
-from routers import chat_router, workspace_router
+from routers import chat_router, conv_router, workspace_router
 
 
 class ClaudeEventProjectionTests(unittest.TestCase):
@@ -419,26 +419,19 @@ class ClaudeSkillViewTests(unittest.TestCase):
             self.assertFalse(os.stat(view.root).st_mode & 0o222)
             manifest = json.loads((view.root / "manifest.json").read_text())
             self.assertEqual(manifest["sha256"], view.sha256)
-            self.assertEqual(
-                view.entrypoint_skill_name,
-                "chatds-harness-session-entry",
-            )
+            self.assertIsNone(view.entrypoint_skill_name)
             self.assertEqual(view.selected_primary_skill_names, ("fixture",))
             self.assertEqual(
                 manifest["selected_primary_skill_names"],
                 ["fixture"],
             )
-            entrypoint = (
-                view.plugin_root
-                / "skills"
-                / "chatds-harness-session-entry"
-                / "SKILL.md"
-            ).read_text(encoding="utf-8")
-            self.assertIn(
-                "/skill-view/plugin/skills/fixture/SKILL.md",
-                entrypoint,
+            self.assertFalse(
+                (
+                    view.plugin_root
+                    / "skills"
+                    / "chatds-harness-session-entry"
+                ).exists()
             )
-            self.assertIn("$ARGUMENTS", entrypoint)
 
     def test_bundle_supporting_skills_are_not_promoted_to_entrypoints(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -474,14 +467,61 @@ class ClaudeSkillViewTests(unittest.TestCase):
                 view.selected_primary_skill_names,
                 ("primary",),
             )
-            entrypoint = (
-                view.plugin_root
-                / "skills"
-                / "chatds-harness-session-entry"
-                / "SKILL.md"
-            ).read_text(encoding="utf-8")
-            self.assertIn("skills/primary/SKILL.md", entrypoint)
-            self.assertNotIn("skills/supporting/SKILL.md", entrypoint)
+            self.assertIsNone(view.entrypoint_skill_name)
+            self.assertFalse(
+                (
+                    view.plugin_root
+                    / "skills"
+                    / "chatds-harness-session-entry"
+                ).exists()
+            )
+
+    def test_enabled_web_search_compiles_one_harness_owned_mcp_capability(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            skill = root / "skills" / "renamed-holdout"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(
+                "Use only when a museum provenance request applies.",
+                encoding="utf-8",
+            )
+            source = SimpleNamespace(
+                name="renamed-holdout",
+                scope="session",
+                root=skill,
+                bundle_id=None,
+                bundle_role=None,
+            )
+            enabled = materialize_claude_skill_view(
+                session_root=root / "enabled",
+                sources=[source],
+                enabled_tools=["read_file", "web_search"],
+                web_search_url="http://search.internal:8080/search",
+            )
+            disabled = materialize_claude_skill_view(
+                session_root=root / "disabled",
+                sources=[source],
+                enabled_tools=["read_file"],
+            )
+            enabled_mcp = json.loads(
+                (enabled.plugin_root / ".mcp.json").read_text()
+            )
+            disabled_mcp = json.loads(
+                (disabled.plugin_root / ".mcp.json").read_text()
+            )
+            manifest = json.loads(
+                (enabled.root / "manifest.json").read_text()
+            )
+        self.assertEqual(
+            set(enabled_mcp["mcpServers"]),
+            {"chatds-web-search"},
+        )
+        self.assertEqual(disabled_mcp, {"mcpServers": {}})
+        self.assertEqual(manifest["harness_egress_rules"], [{
+            "capability": "web_search",
+            "url_prefix": "http://search.internal:8080/search",
+            "methods": ["GET"],
+        }])
 
     def test_harness_entrypoint_name_is_reserved(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -662,7 +702,12 @@ class EngineModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("deepseek_v4_pro", claude["compatible_model_ids"])
 
     async def test_explicit_local_profiles_expose_only_their_bound_models(self):
-        profiles = ["shaiengine", "local_agentmodel", "local_qwen"]
+        profiles = [
+            "shaiengine",
+            "local_agentmodel",
+            "local_deepseek_v4_flash",
+            "local_qwen",
+        ]
         with (
             patch.object(settings, "claude_code_engine_enabled", True),
             patch.object(settings, "claude_code_provider_profiles", profiles),
@@ -678,6 +723,7 @@ class EngineModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             "shaiengine_glm_5_2",
             "shaiengine_deepseek_v4_pro",
             "deepseek_v4_pro",
+            "local_deepseek_v4_flash",
             "qwen3_5",
         ])
         self.assertEqual(claude["default_model_id"], "deepseek_v4_pro")
@@ -686,7 +732,12 @@ class EngineModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             settings,
             "claude_code_provider_profiles",
-            ["shaiengine", "local_agentmodel", "local_qwen"],
+            [
+                "shaiengine",
+                "local_agentmodel",
+                "local_deepseek_v4_flash",
+                "local_qwen",
+            ],
         ):
             self.assertFalse(chat_router.claude_code_model_compatible({
                 "provider": "builtin",
@@ -695,6 +746,55 @@ class EngineModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                 "provider": "builtin",
                 "claude_provider_profile": "local_agentmodel",
             }))
+
+    def test_colliding_wire_model_names_keep_distinct_route_capabilities(self):
+        local_glm = chat_router.BUILTIN["deepseek_v4_pro"]
+        local_deepseek = chat_router.BUILTIN["local_deepseek_v4_flash"]
+        self.assertEqual(local_glm["api_model"], local_deepseek["api_model"])
+        self.assertNotEqual(local_glm["base_url"], local_deepseek["base_url"])
+        self.assertNotEqual(
+            local_glm["claude_provider_profile"],
+            local_deepseek["claude_provider_profile"],
+        )
+        self.assertEqual(local_glm["context_length"], 918_528)
+        self.assertEqual(local_deepseek["context_length"], 1_048_576)
+
+    async def test_new_session_uses_configured_engine_without_rebinding_existing(self):
+        async with self.sessions() as db:
+            existing = Conversation(
+                user_id=self.user.id,
+                model_id="shaiengine_glm_5_2",
+                engine_id="legacy",
+            )
+            db.add(existing)
+            await db.commit()
+            with (
+                patch.object(settings, "default_agent_engine_id", "claude_code"),
+                patch.object(
+                    conv_router,
+                    "ensure_workspace_async",
+                    AsyncMock(),
+                ),
+                patch.object(conv_router, "emit_event", AsyncMock()),
+            ):
+                created = await conv_router.create_conversation(
+                    cur_user=self.user,
+                    db=db,
+                )
+            await db.refresh(existing)
+        self.assertEqual(created["engine_id"], "claude_code")
+        self.assertEqual(existing.engine_id, "legacy")
+
+    def test_claude_default_fails_closed_when_engine_is_disabled(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "CLAUDE_CODE_ENGINE_ENABLED=true",
+        ):
+            Settings(
+                _env_file=None,
+                claude_code_engine_enabled=False,
+                default_agent_engine_id="claude_code",
+            )
 
     def test_claude_payload_uses_explicit_profile_and_omits_caller_secret(self):
         engine = ClaudeCodeEngine(

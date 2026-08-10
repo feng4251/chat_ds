@@ -154,7 +154,7 @@ async def create_conversation(
     conv = Conversation(
         user_id=cur_user.id,
         model_id=DEFAULT_AGENT_MODEL_ID,
-        engine_id="legacy",
+        engine_id=settings.default_agent_engine_id,
     )
     db.add(conv)
     await db.commit()

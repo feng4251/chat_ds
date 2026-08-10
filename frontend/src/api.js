@@ -147,6 +147,21 @@ export async function getWorkspaceFileBlobUrl(convId, path) {
   return URL.createObjectURL(await res.blob())
 }
 
+export async function downloadWorkspaceFile(convId, path) {
+  const blobUrl = await getWorkspaceFileBlobUrl(convId, path)
+  const anchor = document.createElement('a')
+  anchor.href = blobUrl
+  anchor.download = path.split('/').pop() || 'workspace-file'
+  anchor.style.display = 'none'
+  document.body.appendChild(anchor)
+  try {
+    anchor.click()
+  } finally {
+    anchor.remove()
+    window.setTimeout(() => URL.revokeObjectURL(blobUrl), 0)
+  }
+}
+
 export async function writeWorkspaceFile(convId, path, content) {
   const res = await request(`/conversations/${convId}/workspace/file?path=${encodeURIComponent(path)}`, {
     method: 'PUT',

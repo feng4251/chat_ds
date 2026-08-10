@@ -31,6 +31,15 @@ class AgenticModelRoutingDecisionTests(unittest.TestCase):
         self.assertEqual(86_400, PRIMARY["max_output_tokens"])
         self.assertEqual("deepseek_v4_pro", PROVIDER_ALIASES["AgentModel"])
 
+    def test_colliding_local_wire_names_remain_distinct_catalog_routes(self):
+        local_glm = PROVIDERS["deepseek_v4_pro"]
+        local_deepseek = PROVIDERS["local_deepseek_v4_flash"]
+        self.assertEqual(local_glm["api_model"], "AgentModel")
+        self.assertEqual(local_deepseek["api_model"], "AgentModel")
+        self.assertNotEqual(local_glm["base_url"], local_deepseek["base_url"])
+        self.assertEqual(local_glm["context_length"], 918_528)
+        self.assertEqual(local_deepseek["context_length"], 1_048_576)
+
     def _resolve(self, **overrides):
         kwargs = {
             "requested_model_id": "qwen3_5",

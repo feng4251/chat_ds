@@ -69,6 +69,7 @@ def compile_turn_egress_policy(
     manifest = receipt.manifest
     verified_resources = receipt.policy_resources
     prefix_rows: list[dict[str, Any]] = []
+    harness_capability_origins: set[str] = set()
     plugin_skills = Path(skill_view_root) / "plugin" / "skills"
     for skill in manifest.get("skills", []):
         if not isinstance(skill, dict):
@@ -103,6 +104,23 @@ def compile_turn_egress_policy(
             name, loaded, allowed_paths
         ):
             prefix_rows.append({"url_prefix": prefix, "methods": list(methods)})
+
+    harness_rules = manifest.get("harness_egress_rules", [])
+    if not isinstance(harness_rules, list):
+        raise ClaudeEgressPolicyError("Harness capability rules are malformed")
+    for row in harness_rules:
+        if (
+            not isinstance(row, dict)
+            or set(row) != {"capability", "url_prefix", "methods"}
+            or row.get("capability") != "web_search"
+            or row.get("methods") != ["GET"]
+        ):
+            raise ClaudeEgressPolicyError(
+                "Harness capability rule is malformed"
+            )
+        prefix = normalize_http_url_prefix(str(row.get("url_prefix") or ""))
+        prefix_rows.append({"url_prefix": prefix, "methods": ["GET"]})
+        harness_capability_origins.add(normalize_http_origin(prefix))
 
     # The Runner loads this generated MCP file explicitly and rejects ambient
     # MCP configuration. Remote transports are themselves an explicit Skill authority, but receive only
@@ -192,7 +210,11 @@ def compile_turn_egress_policy(
         for origin in origins
         if _origin_is_private(origin)
         and origin in configured
-        and (origin in user_origins or origin == provider_origin)
+        and (
+            origin in user_origins
+            or origin == provider_origin
+            or origin in harness_capability_origins
+        )
     )
     return {
         "policy_version": 3,
