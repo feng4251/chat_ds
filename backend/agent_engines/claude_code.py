@@ -108,12 +108,26 @@ class ClaudeCodeEngine:
     ) -> AsyncIterator[EngineStreamEvent]:
         projector = ClaudeEventProjector(request.root_run_id)
         try:
-            async with self._client_factory(timeout=300.0) as client:
-                response = await client.post(
-                    f"{self._base_url}/v1/runs",
-                    headers=self._headers,
-                    json=self._start_payload(request),
+            try:
+                start_timeout = httpx.Timeout(
+                    connect=10.0,
+                    read=120.0,
+                    write=120.0,
+                    pool=10.0,
                 )
+                async with self._client_factory(timeout=start_timeout) as client:
+                    response = await client.post(
+                        f"{self._base_url}/v1/runs",
+                        headers=self._headers,
+                        json=self._start_payload(request),
+                    )
+            except httpx.TimeoutException as exc:
+                raise AgentEngineError(
+                    "The Claude Runner did not durably accept the run in time.",
+                    code="claude_runner_start_timeout",
+                    retryable=True,
+                    exception_class=type(exc).__name__,
+                ) from exc
             if response.status_code >= 400:
                 raise AgentEngineError(
                     "Claude Runner rejected the run "
@@ -276,8 +290,8 @@ class ClaudeCodeEngine:
             raise
         except httpx.TimeoutException as exc:
             raise AgentEngineError(
-                "The Claude Runner event stream timed out.",
-                code="claude_runner_timeout",
+                "The Claude Runner event stream became inactive.",
+                code="claude_runner_event_stream_timeout",
                 retryable=False,
                 exception_class=type(exc).__name__,
             ) from exc

@@ -9,11 +9,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from agent_engines.claude_events import ClaudeEventProjector
 from agent_engines.claude_code import ClaudeCodeEngine
+from agent_engines.base import AgentEngineError
 from agent_engines import lifecycle as engine_lifecycle
 from agent_engines.skill_view import (
     SkillViewError,
@@ -727,6 +729,53 @@ class EngineModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["provider_profile"], "local_agentmodel")
         self.assertNotIn("api_key", payload)
         self.assertNotIn("must-not-cross", json.dumps(payload))
+
+    async def test_claude_start_timeout_is_not_misreported_as_stream_timeout(self):
+        class StartTimeoutClient:
+            def __init__(self, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def post(self, *_args, **_kwargs):
+                raise httpx.ReadTimeout("start fixture")
+
+        engine = ClaudeCodeEngine(
+            base_url="http://runner.test",
+            internal_token="fixture-internal-token",
+            timeout_seconds=60,
+            client_factory=StartTimeoutClient,
+        )
+        request = SimpleNamespace(
+            run_id="1" * 32,
+            root_run_id="1" * 32,
+            user_id="2" * 32,
+            conversation_id="3" * 32,
+            model_id="shaiengine_glm_5_2",
+            api_model="glm-5.2",
+            provider_config={
+                "claude_provider_profile": "shaiengine",
+                "base_url": "https://api.shaiengine.com/v1",
+                "protocol": "openai",
+            },
+            messages=({"role": "user", "content": "fixture"},),
+            max_output_tokens=8,
+            metadata={"workspace_path": "/workspace", "user_turn_text": "fixture"},
+            skill_view_path="/skill-view",
+            skill_view_sha256="a" * 64,
+            native_session_id=str(uuid.uuid4()),
+            resume_from_native_session_id=None,
+            source="chat",
+        )
+        with self.assertRaises(AgentEngineError) as raised:
+            async for _event in engine.stream(request):
+                pass
+        self.assertEqual(raised.exception.code, "claude_runner_start_timeout")
+        self.assertTrue(raised.exception.retryable)
 
     async def test_backend_models_do_not_disappear_when_harness_is_unavailable(self):
         with patch.object(

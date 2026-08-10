@@ -40,6 +40,7 @@ class RunnerSettings:
     workspace_lock_volume: str
     workspace_lock_root: Path
     max_concurrent_runs: int
+    preflight_timeout_seconds: float
     max_run_seconds: int
     worker_uid: int
     worker_gid: int
@@ -145,6 +146,9 @@ def load_settings() -> RunnerSettings:
         workspace_lock_volume=lock_volume,
         workspace_lock_root=lock_root,
         max_concurrent_runs=max_concurrent,
+        preflight_timeout_seconds=float(
+            _bounded_int("CLAUDE_RUNNER_PREFLIGHT_TIMEOUT_SECONDS", 1800, 30, 3600)
+        ),
         max_run_seconds=max_run_seconds,
         worker_uid=_bounded_int("CLAUDE_RUNNER_WORKER_UID", 65529, 1, 2**31 - 1),
         worker_gid=_bounded_int("CLAUDE_RUNNER_WORKER_GID", 65529, 1, 2**31 - 1),

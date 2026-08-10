@@ -7,6 +7,7 @@ import ipaddress
 import json
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 from urllib.parse import urlsplit
@@ -26,10 +27,21 @@ class ClaudeEgressPolicyError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class VerifiedSkillView:
+    """Process-local attestation receipt for one immutable Skill view."""
+
+    root: Path
+    sha256: str
+    manifest: dict[str, Any]
+    policy_resources: dict[str, bytes]
+
+
 def compile_turn_egress_policy(
     *,
     skill_view_root: Path,
     skill_view_sha256: str,
+    verified_skill_view: VerifiedSkillView | None = None,
     user_turn_text: str,
     provider_base_url: str,
     configured_private_origins: Iterable[str],
@@ -37,7 +49,25 @@ def compile_turn_egress_policy(
     call_id_sha256: str,
     limits: dict[str, int],
 ) -> dict[str, Any]:
-    manifest = verify_skill_view(skill_view_root, skill_view_sha256)
+    # The Supervisor attests the immutable view before compiling execution
+    # authority.  Accept that exact receipt so one start transaction never
+    # re-reads and re-hashes an arbitrarily large/NFS-backed Skill tree.  The
+    # standalone compiler still verifies for callers that do not already own
+    # an attestation receipt.
+    receipt = (
+        verify_skill_view(skill_view_root, skill_view_sha256)
+        if verified_skill_view is None
+        else verified_skill_view
+    )
+    if (
+        not isinstance(receipt, VerifiedSkillView)
+        or receipt.root != Path(skill_view_root)
+        or receipt.sha256 != skill_view_sha256
+        or receipt.manifest.get("sha256") != skill_view_sha256
+    ):
+        raise ClaudeEgressPolicyError("Verified Skill view receipt is invalid")
+    manifest = receipt.manifest
+    verified_resources = receipt.policy_resources
     prefix_rows: list[dict[str, Any]] = []
     plugin_skills = Path(skill_view_root) / "plugin" / "skills"
     for skill in manifest.get("skills", []):
@@ -46,7 +76,17 @@ def compile_turn_egress_policy(
         name = str(skill.get("name") or "")
         root = plugin_skills / name
         try:
-            content = (root / "SKILL.md").read_text(encoding="utf-8")
+            relative_instruction = f"plugin/skills/{name}/SKILL.md"
+            cached = (
+                verified_resources.get(relative_instruction)
+                if isinstance(verified_resources, dict)
+                else None
+            )
+            content = (
+                bytes(cached).decode("utf-8")
+                if isinstance(cached, (bytes, bytearray))
+                else (root / "SKILL.md").read_text(encoding="utf-8")
+            )
         except (OSError, UnicodeError) as exc:
             raise ClaudeEgressPolicyError("Skill instructions are unavailable") from exc
         allowed_paths = tuple(
@@ -69,9 +109,16 @@ def compile_turn_egress_policy(
     # the protocol methods needed by streamable HTTP/SSE rather than an
     # origin-wide grant. The exact endpoint remains the path-prefix boundary.
     mcp_path = Path(skill_view_root) / "plugin" / ".mcp.json"
-    if mcp_path.is_file():
+    cached_mcp = (
+        verified_resources.get("plugin/.mcp.json")
+    )
+    if cached_mcp is not None:
         try:
-            mcp_payload = json.loads(mcp_path.read_text(encoding="utf-8"))
+            mcp_payload = json.loads(
+                bytes(cached_mcp).decode("utf-8")
+                if isinstance(cached_mcp, (bytes, bytearray))
+                else mcp_path.read_text(encoding="utf-8")
+            )
         except (OSError, UnicodeError, ValueError, TypeError) as exc:
             raise ClaudeEgressPolicyError("Compiled MCP configuration is invalid") from exc
         mcp_servers = mcp_payload.get("mcpServers") if isinstance(mcp_payload, dict) else None
@@ -158,7 +205,7 @@ def compile_turn_egress_policy(
     }
 
 
-def verify_skill_view(root: Path, expected_sha256: str) -> dict[str, Any]:
+def verify_skill_view(root: Path, expected_sha256: str) -> VerifiedSkillView:
     if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256 or ""):
         raise ClaudeEgressPolicyError("Skill view digest is invalid")
     try:
@@ -174,6 +221,7 @@ def verify_skill_view(root: Path, expected_sha256: str) -> dict[str, Any]:
     identity.pop("sha256", None)
     if _canonical_sha256(identity) != expected_sha256:
         raise ClaudeEgressPolicyError("Skill view manifest digest mismatch")
+    verified_resources: dict[str, bytes] = {}
     for row in manifest.get("files", []):
         if not isinstance(row, dict):
             raise ClaudeEgressPolicyError("Skill view file manifest is malformed")
@@ -190,7 +238,19 @@ def verify_skill_view(root: Path, expected_sha256: str) -> dict[str, Any]:
             raise ClaudeEgressPolicyError("Skill view resource is mutable or non-regular")
         if len(payload) != row.get("size") or hashlib.sha256(payload).hexdigest() != row.get("sha256"):
             raise ClaudeEgressPolicyError("Skill view resource digest mismatch")
-    return manifest
+        relative_name = relative.as_posix()
+        if (
+            relative_name == "plugin/.mcp.json"
+            or relative_name.startswith("plugin/skills/")
+            and relative_name.endswith("/SKILL.md")
+        ):
+            verified_resources[relative_name] = payload
+    return VerifiedSkillView(
+        root=Path(root),
+        sha256=expected_sha256,
+        manifest=manifest,
+        policy_resources=verified_resources,
+    )
 
 
 def _private_origin_eligible(value: str) -> bool:
