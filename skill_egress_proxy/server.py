@@ -3338,10 +3338,11 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                         "destination_connection_failed",
                     )
                     return
-                try:
-                    upstream.shutdown(socket.SHUT_WR)
-                except OSError:
-                    pass
+                # The request already has one unambiguous HTTP framing
+                # boundary and carries ``Connection: close``.  Do not send a
+                # TCP FIN before the response: several compliant production
+                # servers treat an early write-half close as a client abort
+                # and close without returning the response.
                 _relay_response_only(self.request, upstream, budget)
                 return
             if requested_origin.scheme == "http":
@@ -3420,10 +3421,9 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                         "destination_connection_failed",
                     )
                     return
-                try:
-                    upstream.shutdown(socket.SHUT_WR)
-                except OSError:
-                    pass
+                # Preserve the request side until the one-response relay is
+                # complete.  HTTP framing, not an early TCP half-close, owns
+                # the transaction boundary here.
                 _relay_response_only(self.request, upstream, budget)
                 return
             authority = self.certificate_authority
