@@ -2865,7 +2865,7 @@ BUILTIN = {
         "provider": "shaiengine",
         "claude_provider_profile": "shaiengine",
         "protocol": "openai",
-        "context_length": 200000,
+        "context_length": 1000000,
         "discover_runtime_metadata": True,
     },
     "shaiengine_deepseek_v4_pro": {

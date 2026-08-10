@@ -73,6 +73,17 @@ class ClaudeCodeEngine:
 
     def _start_payload(self, request: AgentEngineRequest) -> dict[str, Any]:
         provider = request.provider_config
+        context_window_tokens = provider.get("context_length")
+        if (
+            type(context_window_tokens) is not int
+            or context_window_tokens < 200_000
+            or context_window_tokens > 4_000_000
+        ):
+            raise AgentEngineError(
+                "The selected model lacks a valid Claude context-window binding.",
+                code="claude_model_capability_invalid",
+                retryable=False,
+            )
         # Credentials and arbitrary caller headers never cross this API. The
         # Supervisor resolves its deployment-owned provider profile.
         return {
@@ -93,6 +104,7 @@ class ClaudeCodeEngine:
             "provider_protocol": str(provider.get("protocol") or ""),
             "messages": [dict(item) for item in request.messages],
             "max_output_tokens": request.max_output_tokens,
+            "context_window_tokens": context_window_tokens,
             "workspace_path": str(request.metadata.get("workspace_path") or ""),
             "skill_view_path": request.skill_view_path,
             "skill_view_sha256": request.skill_view_sha256,

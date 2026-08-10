@@ -16,6 +16,10 @@ class RunnerProviderConfigurationTests(unittest.TestCase):
                 "api_key_env": "PUBLIC_PROVIDER_KEY",
                 "backend_protocol": "openai",
                 "models": ["model-a", "model-b"],
+                "context_windows": {
+                    "model-a": 1_000_000,
+                    "model-b": 200_000,
+                },
                 "native_web_tools": True,
             },
             "local_agentmodel": {
@@ -23,6 +27,7 @@ class RunnerProviderConfigurationTests(unittest.TestCase):
                 "api_key_env": "LOCAL_PROVIDER_KEY",
                 "backend_protocol": "openai",
                 "models": ["AgentModel"],
+                "context_windows": {"AgentModel": 303_872},
             },
         }
         return {
@@ -62,6 +67,10 @@ class RunnerProviderConfigurationTests(unittest.TestCase):
         )
         self.assertFalse(
             settings.provider_profiles["local_agentmodel"].native_web_tools
+        )
+        self.assertEqual(
+            settings.provider_profiles["shaiengine"].context_windows,
+            {"model-a": 1_000_000, "model-b": 200_000},
         )
         self.assertEqual(
             settings.provider_profiles["local_agentmodel"].claude_base_url,
@@ -117,6 +126,38 @@ class RunnerProviderConfigurationTests(unittest.TestCase):
                     "native web-tool capability",
                 ):
                     load_settings()
+
+    def test_every_profile_model_requires_an_exact_context_window(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = self._environment(root)
+            profiles = json.loads(environment["CLAUDE_PROVIDER_PROFILES_JSON"])
+            profiles["shaiengine"]["context_windows"] = {
+                "model-a": 1_000_000,
+                "renamed-model": 200_000,
+            }
+            environment["CLAUDE_PROVIDER_PROFILES_JSON"] = json.dumps(profiles)
+            with patch.dict(os.environ, environment, clear=True):
+                with self.assertRaisesRegex(
+                    RunnerConfigurationError,
+                    "context-window map",
+                ):
+                    load_settings()
+
+    def test_context_windows_reject_boolean_and_unsafe_bounds(self):
+        for value in (True, 199_999, 4_000_001):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = self._environment(root)
+                profiles = json.loads(environment["CLAUDE_PROVIDER_PROFILES_JSON"])
+                profiles["local_agentmodel"]["context_windows"]["AgentModel"] = value
+                environment["CLAUDE_PROVIDER_PROFILES_JSON"] = json.dumps(profiles)
+                with patch.dict(os.environ, environment, clear=True):
+                    with self.assertRaisesRegex(
+                        RunnerConfigurationError,
+                        "context-window map",
+                    ):
+                        load_settings()
 
 
 if __name__ == "__main__":

@@ -714,6 +714,7 @@ class EngineModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                 "claude_provider_profile": "local_agentmodel",
                 "base_url": "http://10.10.132.2:1025/v1",
                 "protocol": "openai",
+                "context_length": 303872,
                 "api_key": "must-not-cross-the-engine-boundary",
             },
             messages=({"role": "user", "content": "fixture"},),
@@ -727,8 +728,26 @@ class EngineModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         )
         payload = engine._start_payload(request)
         self.assertEqual(payload["provider_profile"], "local_agentmodel")
+        self.assertEqual(payload["context_window_tokens"], 303872)
         self.assertNotIn("api_key", payload)
         self.assertNotIn("must-not-cross", json.dumps(payload))
+
+    def test_claude_payload_rejects_unbound_model_capacity(self):
+        engine = ClaudeCodeEngine(
+            base_url="http://runner.test",
+            internal_token="fixture-internal-token",
+            timeout_seconds=60,
+        )
+        request = SimpleNamespace(
+            provider_config={"context_length": True},
+        )
+        with self.assertRaises(AgentEngineError) as raised:
+            engine._start_payload(request)
+        self.assertEqual(
+            raised.exception.code,
+            "claude_model_capability_invalid",
+        )
+        self.assertFalse(raised.exception.retryable)
 
     async def test_claude_start_timeout_is_not_misreported_as_stream_timeout(self):
         class StartTimeoutClient:
@@ -761,6 +780,7 @@ class EngineModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                 "claude_provider_profile": "shaiengine",
                 "base_url": "https://api.shaiengine.com/v1",
                 "protocol": "openai",
+                "context_length": 1_000_000,
             },
             messages=({"role": "user", "content": "fixture"},),
             max_output_tokens=8,
@@ -840,6 +860,7 @@ class EngineModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                         "claude_provider_profile": "shaiengine",
                         "base_url": "https://provider.invalid/v1",
                         "api_key": "fixture",
+                        "context_length": 1_000_000,
                     }),
                 ),
                 patch.object(

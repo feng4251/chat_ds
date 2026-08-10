@@ -75,6 +75,7 @@ class StartRunRequest(BaseModel):
     provider_protocol: str = Field(max_length=32)
     messages: list[dict[str, Any]] = Field(max_length=4096)
     max_output_tokens: int = Field(ge=1, le=262144)
+    context_window_tokens: int = Field(ge=200_000, le=4_000_000)
     workspace_path: str = Field(min_length=1, max_length=4096)
     skill_view_path: str = Field(min_length=1, max_length=4096)
     skill_view_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -233,6 +234,7 @@ class RunManager:
             "native_session_id": native_session_id,
             "resume_from_native_session_id": resume_from_native_session_id,
             "max_output_tokens": request.max_output_tokens,
+            "context_window_tokens": request.context_window_tokens,
             "prompt": prompt,
             "workspace_path": str(workspace),
             "skill_view_path": str(skill_view),
@@ -1354,6 +1356,14 @@ class RunManager:
             raise HTTPException(400, "Provider profile is not Claude-compatible")
         if request.api_model not in profile.models:
             raise HTTPException(400, "Model is not allowed by the provider profile")
+        if (
+            profile.context_windows.get(request.api_model)
+            != request.context_window_tokens
+        ):
+            raise HTTPException(
+                400,
+                "Model context window does not match its deployment profile",
+            )
         if request.provider_base_url.rstrip("/") != profile.backend_base_url:
             raise HTTPException(400, "Provider endpoint does not match its deployment profile")
         if request.provider_protocol != profile.backend_protocol:
@@ -1498,6 +1508,7 @@ def _recover_start_request(path: Path) -> StartRunRequest:
         "provider_protocol": value.get("provider_protocol") or "anthropic",
         "messages": [],
         "max_output_tokens": value.get("max_output_tokens"),
+        "context_window_tokens": value.get("context_window_tokens"),
         "workspace_path": value.get("workspace_path"),
         "skill_view_path": value.get("skill_view_path"),
         "skill_view_sha256": value.get("skill_view_sha256"),

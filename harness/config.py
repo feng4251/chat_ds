@@ -152,9 +152,9 @@ PROVIDERS: dict[str, dict] = {
         "thinking_request_format": "thinking_object",
         "thinking_send_enabled_explicitly": True,
         "protocol": "openai",
-        # The compatible /models catalog currently omits capacity fields.
-        # Keep a conservative static bound and still discover future metadata.
-        "context_length": 200000,
+        # The compatible /models catalog currently omits capacity fields, so
+        # the deployment-owned model profile is the authority for this bound.
+        "context_length": 1000000,
         "max_output_tokens": 86400,
         "discover_runtime_metadata": True,
     },

@@ -27,7 +27,7 @@ class AgenticModelRoutingDecisionTests(unittest.TestCase):
     def test_default_remote_model_does_not_rebind_historic_alias(self):
         self.assertEqual("shaiengine_glm_5_2", DEFAULT_AGENT_MODEL_ID)
         self.assertEqual("glm-5.2", PRIMARY["api_model"])
-        self.assertEqual(200_000, PRIMARY["context_length"])
+        self.assertEqual(1_000_000, PRIMARY["context_length"])
         self.assertEqual(86_400, PRIMARY["max_output_tokens"])
         self.assertEqual("deepseek_v4_pro", PROVIDER_ALIASES["AgentModel"])
 
