@@ -2913,6 +2913,107 @@ class ProxyRelayIntegrationTests(unittest.TestCase):
             proxy_thread.join(timeout=3)
             origin_thread.join(timeout=3)
 
+    def test_absolute_http_waits_for_response_before_closing_request_side(
+        self,
+    ):
+        """A complete HTTP request is not an invitation to send an early FIN.
+
+        Some production HTTP servers treat a client write-half close before
+        their response as an aborted request.  The proxy already injects
+        ``Connection: close`` and permits exactly one framed request, so the
+        response boundary must be owned by HTTP rather than TCP half-close.
+        """
+
+        class FinSensitiveOrigin(socketserver.BaseRequestHandler):
+            def handle(self):
+                request = bytearray()
+                self.request.settimeout(1)
+                while b"\r\n\r\n" not in request:
+                    chunk = self.request.recv(4096)
+                    if not chunk:
+                        return
+                    request.extend(chunk)
+
+                # Give the proxy a deterministic opportunity to expose an
+                # early write-half close.  A readable EOF means the caller
+                # aborted before this origin produced its response.
+                self.request.settimeout(0.15)
+                try:
+                    premature = self.request.recv(1)
+                except socket.timeout:
+                    premature = None
+                if premature == b"":
+                    return
+
+                body = b"fin-safe-origin"
+                self.request.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Length: 15\r\n"
+                    b"Connection: close\r\n\r\n"
+                    + body
+                )
+
+        origin = socketserver.ThreadingTCPServer(
+            ("127.0.0.1", 0),
+            FinSensitiveOrigin,
+        )
+        origin_port = int(origin.server_address[1])
+
+        class GrantedProxyHandler(server.ProxyHandler):
+            policy = server.AddressPolicy(
+                public_ports=(80, 443),
+                private_origins=(f"http://127.0.0.1:{origin_port}",),
+                private_cidrs=("127.0.0.1/32",),
+            )
+
+        proxy = server.ThreadingProxyServer(
+            ("127.0.0.1", 0),
+            GrantedProxyHandler,
+        )
+        proxy_port = int(proxy.server_address[1])
+        origin_thread = threading.Thread(
+            target=origin.serve_forever,
+            daemon=True,
+        )
+        proxy_thread = threading.Thread(
+            target=proxy.serve_forever,
+            daemon=True,
+        )
+        origin_thread.start()
+        proxy_thread.start()
+        try:
+            with socket.create_connection(
+                ("127.0.0.1", proxy_port),
+                timeout=3,
+            ) as client:
+                client.settimeout(3)
+                client.sendall(
+                    _policy_preface([
+                        f"http://127.0.0.1:{origin_port}",
+                    ])
+                    +
+                    (
+                        f"GET http://127.0.0.1:{origin_port}/proof HTTP/1.1\r\n"
+                        f"Host: 127.0.0.1:{origin_port}\r\n"
+                        "Connection: close\r\n\r\n"
+                    ).encode("ascii")
+                )
+                response = bytearray()
+                while True:
+                    chunk = client.recv(4096)
+                    if not chunk:
+                        break
+                    response.extend(chunk)
+            self.assertIn(b"HTTP/1.1 200 OK", response)
+            self.assertTrue(response.endswith(b"fin-safe-origin"))
+        finally:
+            proxy.shutdown()
+            origin.shutdown()
+            proxy.server_close()
+            origin.server_close()
+            proxy_thread.join(timeout=3)
+            origin_thread.join(timeout=3)
+
     def test_signed_http_connect_supports_node_fetch_without_opaque_tunnel(
         self,
     ):
