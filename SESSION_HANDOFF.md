@@ -1,6 +1,63 @@
-# ChatDS 当前会话交接（2026-08-05）
+# ChatDS 当前会话交接（2026-08-10）
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
+
+## 2026-08-10 ClaudeCodeEngine 启动事务闭环
+
+- 用户报告的生产 conversation `9cd170e6ac064be4a03b978022153f6d` 已按三源闭环查验。持久化对话确认
+  engine=`claude_code`、model=`shaiengine_glm_5_2`，只有一轮用户请求和误导性的
+  `The Claude Runner event stream timed out`；exact immutable Skill view 是一项 primary
+  `healthsim-trialsim` 加 18 项 supporting Skill（177 files、2,549,525 bytes），声明 7 个并行
+  worker、后续聚合与大报告合同；AgentRun/debug 则显示 root 从未启动，generation=0、0 token、
+  0 tool、0 native event、0 artifact、container_id=null。Backend 在约 330 秒后先超时，Supervisor
+  的 `/v1/runs` POST 到约 15 分钟才返回。故障发生在真实 Claude Code 2.1.152、模型和工具启动
+  之前，不是本地 `claude-code/` 参考仓库或 Claude 内部 Harness 错误。
+- 通用根因是 Supervisor 在 HTTP event loop 上同步执行 NFS Session 路径解析、完整 Skill view
+  hash/manifest 验证，并在 egress compiler 再次读取认证资源；同一阻塞还让 cancel/health/events
+  失去活性。另有两项部署漂移：动态 Runner tag 被清理，以及旧 `session-sandbox:latest` 缺少
+  `signed-exact-query-v1` 运行时；缺镜像健康检查又因 `JSONResponse` 参数顺序错误返回 500。
+- 跨 Skill 不变量已提交为 `a3d6ef88caaf78af41676b5f37c7de3342b8cb00 fix: make Claude runner
+  startup transactional`：`POST /v1/runs` 只做部署拥有的 provider binding，然后在 Supervisor
+  本地 volume 原子持久化 identity-bound admission/request/status/locator 并立即返回；慢 NFS/Skill
+  preflight 在独立有界 executor 中运行。cancel/session cleanup 先写本地 authority fence，late 或
+  timeout preflight 在每个后续边界都失去 Docker authority；Supervisor restart 会重排 durable
+  preflight/queued work。event stream 在 preflight 阶段只读本地 ledger，每个后端 ledger 至多一个
+  异步读取，不再因 NFS read 卡死 heartbeat/cancel。Skill view 产生 typed
+  `VerifiedSkillView` receipt，policy compiler 复用已认证的 `SKILL.md`/`.mcp.json` bytes，不再二次
+  hash/read。Backend 现在把 start acceptance timeout 与 event inactivity 分成
+  `claude_runner_start_timeout`（retryable）和 `claude_runner_event_stream_timeout`。preflight
+  默认 1800 秒、部署可调且上限 3600 秒；模型 Turn 的四小时 hard timeout 未缩短。
+- 动态 Runner 镜像现在由一个 `network=none`、read-only、cap-drop、64 MiB/0.05 CPU 的 inert
+  Compose anchor 持有，防止常规 stopped/dangling cleanup 再删除其唯一 tag；Supervisor 依赖
+  anchor started。Runner 仍是官方 npm/package native binary Claude Code 2.1.152，不使用本地
+  `claude-code/` 仓库作运行内核。为避免旧基础镜像漂移，本轮从同一 clean source 重建
+  `chat_ds-session-sandbox:runner-base-a3d6ef88`，但没有替换四个 Legacy executor 容器。
+- 成熟实现对照仍只使用本地独立参考仓库 commit
+  `6f6f12b37f529488b10e53928dd5508bb93535c7`：`src/Task.ts` 与
+  `src/tasks/LocalMainSessionTask.ts` 的 typed pending/running/terminal 和 work 前注册状态被采用；
+  `src/cli/structuredIO.ts` 的本地立即 cancel/忽略迟到结果被适配为 durable authority fence；
+  `src/cli/transports/SSETransport.ts` 的 transport liveness 与 workflow terminal 分离，以及
+  `SerialBatchEventUploader.ts` 的单写者有界 pending/backpressure 仅用于校验现有 ledger 方向。
+  没有复制 private/stub 行为，也没有把参考仓库打包进生产。
+- clean source 为 `/tmp/chat_ds_claude_start_final.VZmBpO`（HEAD archive 加且仅加本轮 7 个精确
+  修改文件）。最终回归：Claude Runner/Supervisor `40 passed`，Backend `268 passed`，
+  `py_compile`、`git diff --check`、Compose config、production genericity/credential scan 均通过；
+  新增 synthetic generic missing/slow Skill view、late preflight、timeout、cancel、restart、single
+  attestation、missing image 503 和非业务 rename/identity holdout。未自动运行模型重型 V2.3 E2E。
+- 生产已切到 commit `a3d6ef88` 对应代码：Backend image
+  `sha256:a72a1758504534d921a8a99b55e0ff85f14e17e512e6245a4217382d96e2721a`，Supervisor
+  `sha256:a44e8f7ca51508ae8971bc3d86184a20908b0ec8a69dab83059e681819bb941d`，Runner/anchor
+  `sha256:3c9536c30a3cfdc49ebeaf20fa6c2c592257bcd7731564daf7eb68093dc81ceb`。三者 running，
+  Backend/Supervisor healthy、restart=0，Supervisor health 精确报告 Claude 2.1.152；
+  `127.0.0.1` 与 `10.10.132.126` 的 `/api/health` 均 200。上线前 nonterminal AgentRun 和 active
+  engine session 均为 0；SQLite quick/FK 正常。online backup volume 为
+  `chat_ds_db_backup_pre_claude_starttxn_20260810_153122`，270,667,776 bytes，SHA-256
+  `db1b5f413ba6d0f655f920de5e49219801ad7894102e28935393dd438f1dad58`。
+- 生产零模型 failure-injection smoke 验证完整新路径：start admission 120 ms 返回 preflight，
+  不存在的 generic Session view 后台形成唯一 `preflight_HTTPException` failed terminal，动态 Turn
+  容器从未创建，Session cleanup 成功。该 smoke 的预期 traceback 是注入故障证据，不是生产残留。
+  历史 `chat_acits_claude_runner_supervisor_e2e` 与 `chat_acits_backend_e2e_161b4e43` 容器未参与
+  当前生产路由且本轮未擅自删除；模型/vLLM/其他生产容器均未触碰。
 
 ## 1. 当前结论
 
