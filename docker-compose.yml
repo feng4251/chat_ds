@@ -322,10 +322,11 @@ services:
       retries: 12
       start_period: 5s
 
-  # Build-only member of the opt-in Claude Code profile. The actual Turn
-  # containers are created by the trusted Supervisor and always use
-  # network_mode:none; this one-shot service merely makes `compose up --build`
-  # produce the pinned runtime image before the Supervisor becomes healthy.
+  # Image anchor for the opt-in Claude Code profile. Actual Turn containers are
+  # created by the trusted Supervisor and always use network_mode:none. Keeping
+  # one inert, networkless container alive makes the dynamically referenced
+  # runtime image an explicit deployment dependency: routine stopped-container
+  # and dangling-image cleanup can no longer remove it behind the Supervisor.
   claude-runner-image:
     profiles:
       - claude-code
@@ -336,7 +337,8 @@ services:
       args:
         SESSION_SANDBOX_IMAGE: chat_ds-session-sandbox
         CLAUDE_CODE_VERSION: 2.1.152
-    restart: "no"
+    container_name: chat_acits_claude_runner_image_anchor
+    restart: unless-stopped
     depends_on:
       executor:
         # This is an image-build dependency, not a request-path dependency.
@@ -350,12 +352,15 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-      # This build-only /usr/bin/true container executes no model input. The
+      # This inert container executes no model input. The
       # current host kernel rejects stacking no-new-privileges with a loaded
       # seccomp BPF program (errno 524), so keep NNP and disable only seccomp.
       - seccomp=unconfined
-    entrypoint: ["/usr/bin/true"]
-    command: []
+    pids_limit: 16
+    mem_limit: 64m
+    cpus: 0.05
+    entrypoint: ["python", "-I", "-c"]
+    command: ["import time; time.sleep(315360000)"]
 
   # Trusted control plane only. Backend never receives the Docker socket and
   # per-Turn containers never join chat_net or browser_egress.
@@ -370,7 +375,7 @@ services:
     restart: unless-stopped
     depends_on:
       claude-runner-image:
-        condition: service_completed_successfully
+        condition: service_started
       skill-egress-proxy:
         condition: service_healthy
     user: "0:0"
@@ -407,6 +412,7 @@ services:
       CLAUDE_EGRESS_PROXY_VOLUME_NAME: ${SKILL_EGRESS_PROXY_VOLUME_NAME:-chat_ds_skill_egress_proxy_socket}
       CLAUDE_WORKSPACE_LOCK_VOLUME_NAME: ${WORKSPACE_MUTATION_LOCK_VOLUME_NAME:-chat_ds_workspace_mutation_locks}
       CLAUDE_RUNNER_MAX_CONCURRENT: ${CLAUDE_RUNNER_MAX_CONCURRENT:-4}
+      CLAUDE_RUNNER_PREFLIGHT_TIMEOUT_SECONDS: ${CLAUDE_RUNNER_PREFLIGHT_TIMEOUT_SECONDS:-1800}
       CLAUDE_RUNNER_MAX_RUN_SECONDS: ${CLAUDE_RUNNER_MAX_RUN_SECONDS:-14400}
       CLAUDE_RUNNER_MEMORY_LIMIT: ${CLAUDE_RUNNER_MEMORY_LIMIT:-6g}
       CLAUDE_RUNNER_CPUS: ${CLAUDE_RUNNER_CPUS:-4}

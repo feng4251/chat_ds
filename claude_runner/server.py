@@ -13,6 +13,7 @@ import stat
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -52,6 +53,14 @@ EXPECTED_EGRESS_POLICY_RUNTIME = "signed-exact-query-v1"
 EXPECTED_SKILL_PLUGIN_NAME = "chatds-session-skills"
 EXPECTED_SKILL_ENTRYPOINT_NAME = "chatds-harness-session-entry"
 _STATUS_UPDATE_LOCK = threading.RLock()
+
+
+class _PreflightCancelled(RuntimeError):
+    """Internal fence: accepted work was revoked before Docker authority."""
+
+
+class _PreflightTimedOut(RuntimeError):
+    """Internal fence: bounded Skill/storage preparation did not converge."""
 
 
 class StartRunRequest(BaseModel):
@@ -109,6 +118,13 @@ class RunManager:
         self.settings = settings
         self.client = client
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_runs)
+        self._preflight_semaphore = asyncio.Semaphore(
+            settings.max_concurrent_runs
+        )
+        self._preflight_executor = ThreadPoolExecutor(
+            max_workers=settings.max_concurrent_runs,
+            thread_name_prefix="claude-preflight",
+        )
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._guard = asyncio.Lock()
         self._draining = False
@@ -116,16 +132,49 @@ class RunManager:
         self._index_root = settings.state_root / "run-index"
         self._index_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self._index_root, 0o700)
+        self._admission_root = settings.state_root / "admissions"
+        self._admission_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self._admission_root, 0o700)
 
     async def start(self, request: StartRunRequest) -> dict[str, Any]:
+        # Provider identity is deployment-owned and does not touch Session/NFS
+        # state, so reject an invalid binding before accepting durable work.
+        profile = self._provider(request)
         async with self._guard:
             if (request.user_id, request.conversation_id) in self._revoked_sessions:
                 raise HTTPException(410, "Session execution has been revoked")
-            return self._start_locked(request)
+            admission, idempotent = self._ensure_admission(request)
+            status = _read_json(admission / "status.json")
+            existing_task = self._tasks.get(request.run_id)
+            if (
+                str(status.get("status") or "") not in TERMINAL_STATUSES
+                and (existing_task is None or existing_task.done())
+            ):
+                task = asyncio.create_task(
+                    self._prepare_and_execute(request, profile),
+                    name=f"claude-prepare-{request.run_id}",
+                )
+                self._tasks[request.run_id] = task
+                task.add_done_callback(
+                    lambda _task, run_id=request.run_id: self._task_done(run_id)
+                )
+            return {
+                "accepted": True,
+                "idempotent": idempotent,
+                "run_id": request.run_id,
+                "native_session_id": request.native_session_id,
+                "status": str(status.get("status") or "queued"),
+                "phase": str(status.get("phase") or "preflight"),
+            }
 
-    def _start_locked(self, request: StartRunRequest) -> dict[str, Any]:
+    def _prepare_run_sync(
+        self,
+        request: StartRunRequest,
+        profile: ProviderProfile,
+    ) -> tuple[Path, Path, Path, Path, Path, ProviderProfile]:
         workspace, skill_view, state = self._validate_paths(request)
-        profile = self._provider(request)
+        if self._admission_cancelled(request.run_id):
+            raise _PreflightCancelled
         native_session_id = request.native_session_id
         run_dir = state / "control" / "runs" / request.run_id
         run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -139,11 +188,15 @@ class RunManager:
             )
             else None
         )
-        skill_view_manifest = verify_skill_view(
+        skill_view_receipt = verify_skill_view(
             skill_view,
             request.skill_view_sha256,
         )
-        skill_entrypoint = _manifest_skill_entrypoint(skill_view_manifest)
+        if self._admission_cancelled(request.run_id):
+            raise _PreflightCancelled
+        skill_entrypoint = _manifest_skill_entrypoint(
+            skill_view_receipt.manifest
+        )
         prompt = _build_prompt(
             request.messages,
             resume=resume_from_native_session_id is not None,
@@ -152,6 +205,7 @@ class RunManager:
         policy = compile_turn_egress_policy(
             skill_view_root=skill_view,
             skill_view_sha256=request.skill_view_sha256,
+            verified_skill_view=skill_view_receipt,
             user_turn_text=request.user_turn_text,
             provider_base_url=profile.claude_base_url,
             configured_private_origins=self.settings.private_origin_allowlist,
@@ -161,6 +215,8 @@ class RunManager:
             call_id_sha256=_scope_digest("call", request.root_run_id, request.run_id),
             limits=dict(self.settings.egress_limits),
         )
+        if self._admission_cancelled(request.run_id):
+            raise _PreflightCancelled
         sanitized = {
             "schema": "chatds.claude-run.v1",
             "run_id": request.run_id,
@@ -190,15 +246,8 @@ class RunManager:
             existing = _read_json(request_path)
             if existing.get("request_sha256") != digest:
                 raise HTTPException(409, "Run id already belongs to a different request")
-            status = _read_json(status_path)
-            self._ensure_run_locator(request)
-            return {
-                "accepted": True,
-                "idempotent": True,
-                "run_id": request.run_id,
-                "native_session_id": native_session_id,
-                "status": status.get("status", "unknown"),
-            }
+            _read_json(status_path)
+            return workspace, skill_view, state, run_dir, status_path, profile
         _atomic_json(request_path, sanitized, mode=0o600)
         _atomic_json(status_path, {
             "schema": "chatds.claude-run-status.v1",
@@ -210,31 +259,139 @@ class RunManager:
             "container_id": None,
             "created_at_unix_ms": int(time.time() * 1000),
         }, mode=0o600)
-        self._ensure_run_locator(request)
-        existing_task = self._tasks.get(request.run_id)
-        if existing_task is None or existing_task.done():
-            task = asyncio.create_task(
-                self._execute(
-                    request=request,
-                    workspace=workspace,
-                    skill_view=skill_view,
-                    state=state,
-                    run_dir=run_dir,
-                    request_path=request_path,
-                    status_path=status_path,
-                    profile=profile,
-                ),
-                name=f"claude-run-{request.run_id}",
+        return workspace, skill_view, state, run_dir, status_path, profile
+
+    async def _prepare_and_execute(
+        self,
+        request: StartRunRequest,
+        profile: ProviderProfile,
+    ) -> None:
+        admission = self._admission_dir(request.run_id)
+        started = time.monotonic()
+        try:
+            async def prepare():
+                async with self._preflight_semaphore:
+                    if self._admission_cancelled(request.run_id):
+                        raise _PreflightCancelled
+                    return await asyncio.get_running_loop().run_in_executor(
+                        self._preflight_executor,
+                        self._prepare_run_sync,
+                        request,
+                        profile,
+                    )
+
+            try:
+                prepared = await asyncio.wait_for(
+                    prepare(),
+                    timeout=self.settings.preflight_timeout_seconds,
+                )
+            except asyncio.TimeoutError as exc:
+                # The kernel thread may remain inside an uninterruptible NFS
+                # syscall. Revoke locally before publishing the terminal; a
+                # late return will fail every remaining authority fence.
+                _update_status(
+                    admission / "status.json", cancellation_requested=True
+                )
+                raise _PreflightTimedOut from exc
+            workspace, skill_view, state, run_dir, status_path, profile = prepared
+            if self._admission_cancelled(request.run_id):
+                await asyncio.to_thread(
+                    _ensure_terminal_event,
+                    run_dir / "events.jsonl",
+                    status="cancelled",
+                    error=None,
+                )
+                await asyncio.to_thread(
+                    _update_status,
+                    status_path,
+                    status="cancelled",
+                    phase="terminal",
+                    container_id=None,
+                    cancellation_requested=True,
+                )
+                return
+            _update_status(
+                admission / "status.json",
+                status="queued",
+                phase="queued",
+                preflight_elapsed_ms=int((time.monotonic() - started) * 1000),
             )
-            self._tasks[request.run_id] = task
-            task.add_done_callback(lambda _task, run_id=request.run_id: self._task_done(run_id))
-        return {
-            "accepted": True,
-            "idempotent": False,
-            "run_id": request.run_id,
-            "native_session_id": native_session_id,
-            "status": "queued",
-        }
+            await self._execute(
+                request=request,
+                workspace=workspace,
+                skill_view=skill_view,
+                state=state,
+                run_dir=run_dir,
+                request_path=run_dir / "request.json",
+                status_path=status_path,
+                profile=profile,
+            )
+            terminal = await asyncio.to_thread(
+                _terminal_status, run_dir / "events.jsonl"
+            )
+            if terminal is not None:
+                _update_status(
+                    admission / "status.json",
+                    status=terminal,
+                    phase="terminal",
+                )
+        except _PreflightCancelled:
+            _ensure_terminal_event(
+                admission / "events.jsonl", status="cancelled", error=None
+            )
+            _update_status(
+                admission / "status.json",
+                status="cancelled",
+                phase="terminal",
+                cancellation_requested=True,
+                preflight_elapsed_ms=int((time.monotonic() - started) * 1000),
+            )
+        except _PreflightTimedOut:
+            _ensure_terminal_event(
+                admission / "events.jsonl",
+                status="failed",
+                error="preflight_timeout",
+            )
+            _update_status(
+                admission / "status.json",
+                status="failed",
+                phase="terminal",
+                error="preflight_timeout",
+                cancellation_requested=True,
+                preflight_elapsed_ms=int((time.monotonic() - started) * 1000),
+            )
+        except asyncio.CancelledError:
+            if self._draining:
+                raise
+            if not (admission / "events.jsonl").exists():
+                _ensure_terminal_event(
+                    admission / "events.jsonl", status="cancelled", error=None
+                )
+            _update_status(
+                admission / "status.json",
+                status="cancelled",
+                phase="terminal",
+                cancellation_requested=True,
+            )
+            raise
+        except BaseException as exc:
+            logger.exception(
+                "Claude run preflight failed closed run=%s error_type=%s",
+                request.run_id,
+                type(exc).__name__,
+            )
+            _ensure_terminal_event(
+                admission / "events.jsonl",
+                status="failed",
+                error="preflight_" + type(exc).__name__,
+            )
+            _update_status(
+                admission / "status.json",
+                status="failed",
+                phase="terminal",
+                error="preflight_" + type(exc).__name__,
+                preflight_elapsed_ms=int((time.monotonic() - started) * 1000),
+            )
 
     def _task_done(self, run_id: str) -> None:
         task = self._tasks.get(run_id)
@@ -254,37 +411,148 @@ class RunManager:
             raise HTTPException(404, "Run not found")
         return self._index_root / f"{run_id}.json"
 
-    def _ensure_run_locator(self, request: StartRunRequest) -> None:
+    def _admission_dir(self, run_id: str) -> Path:
+        if not SAFE_ID.fullmatch(run_id):
+            raise HTTPException(404, "Run not found")
+        return self._admission_root / run_id
+
+    def _ensure_admission(
+        self, request: StartRunRequest
+    ) -> tuple[Path, bool]:
+        """Durably accept a start without touching Session/NFS storage.
+
+        The local Supervisor volume is the control-plane pending-write journal.
+        It contains no provider credential and makes the POST idempotent before
+        slow immutable-view attestation begins in an isolated worker thread.
+        """
+
         path = self._locator_path(request.run_id)
+        request_payload = request.model_dump(mode="json")
+        request_sha256 = _canonical_sha256(request_payload)
+        admission = self._admission_dir(request.run_id)
         value = {
-            "schema": "chatds.claude-run-locator.v1",
+            "schema": "chatds.claude-run-locator.v2",
             "run_id": request.run_id,
             "user_id": request.user_id,
             "conversation_id": request.conversation_id,
+            "request_sha256": request_sha256,
         }
-        try:
-            _atomic_create_json(path, value, mode=0o600)
-        except FileExistsError:
-            if _read_json(path) != value:
+        if path.exists():
+            existing = _read_json(path)
+            if existing != value:
                 raise HTTPException(409, "Run locator identity conflict")
+            durable_request = _read_json(admission / "request.json")
+            if _canonical_sha256(durable_request) != request_sha256:
+                raise HTTPException(409, "Run id already belongs to a different request")
+            _read_json(admission / "status.json")
+            return admission, True
+
+        # A process can stop after both admission files fsync but before the
+        # locator rename. Recover that pending write by exact request identity;
+        # never overwrite a partial or conflicting admission directory.
+        if admission.exists():
+            durable_request = _read_json(admission / "request.json")
+            durable_status = _read_json(admission / "status.json")
+            if (
+                _canonical_sha256(durable_request) != request_sha256
+                or durable_status.get("run_id") != request.run_id
+                or durable_status.get("user_id") != request.user_id
+                or durable_status.get("conversation_id")
+                != request.conversation_id
+            ):
+                raise HTTPException(409, "Run admission identity conflict")
+            _atomic_create_json(path, value, mode=0o600)
+            return admission, True
+
+        try:
+            admission.mkdir(mode=0o700)
+            _atomic_json(admission / "request.json", request_payload, mode=0o600)
+            _atomic_json(admission / "status.json", {
+                "schema": "chatds.claude-admission-status.v1",
+                "run_id": request.run_id,
+                "user_id": request.user_id,
+                "conversation_id": request.conversation_id,
+                "status": "queued",
+                "phase": "preflight",
+                "cancellation_requested": False,
+                "created_at_unix_ms": int(time.time() * 1000),
+            }, mode=0o600)
+            _atomic_create_json(path, value, mode=0o600)
+        except BaseException:
+            if not path.exists():
+                shutil.rmtree(admission, ignore_errors=True)
+            raise
+        return admission, False
+
+    def _admission_cancelled(self, run_id: str) -> bool:
+        try:
+            status = _read_json(self._admission_dir(run_id) / "status.json")
+        except HTTPException:
+            return False
+        return bool(status.get("cancellation_requested"))
 
     def _read_run_locator(self, run_id: str) -> dict[str, str]:
         value = _read_json(self._locator_path(run_id))
         if (
-            value.get("schema") != "chatds.claude-run-locator.v1"
+            value.get("schema") not in {
+                "chatds.claude-run-locator.v1",
+                "chatds.claude-run-locator.v2",
+            }
             or value.get("run_id") != run_id
             or not SAFE_ID.fullmatch(str(value.get("user_id") or ""))
             or not SAFE_ID.fullmatch(str(value.get("conversation_id") or ""))
         ):
             raise HTTPException(404, "Run state is unavailable")
-        return {
+        result = {
             "run_id": run_id,
             "user_id": str(value["user_id"]),
             "conversation_id": str(value["conversation_id"]),
         }
+        if value.get("schema") == "chatds.claude-run-locator.v2":
+            digest = str(value.get("request_sha256") or "")
+            if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                raise HTTPException(404, "Run state is unavailable")
+            result["request_sha256"] = digest
+            result["schema"] = "chatds.claude-run-locator.v2"
+        else:
+            result["schema"] = "chatds.claude-run-locator.v1"
+        return result
 
     async def reconcile_existing_containers(self) -> dict[str, int]:
         """Adopt trusted per-Turn containers after a Supervisor restart."""
+
+        requeued_preflight = 0
+        for locator_path in self._index_root.glob("*.json"):
+            run_id = locator_path.stem
+            try:
+                locator = self._read_run_locator(run_id)
+                if locator.get("schema") != "chatds.claude-run-locator.v2":
+                    continue
+                admission = self._admission_dir(run_id)
+                status = _read_json(admission / "status.json")
+                if (
+                    str(status.get("phase") or "") != "preflight"
+                    or str(status.get("status") or "") in TERMINAL_STATUSES
+                    or status.get("cancellation_requested")
+                ):
+                    continue
+                request = StartRunRequest.model_validate(
+                    _read_json(admission / "request.json")
+                )
+                profile = self._provider(request)
+            except (HTTPException, OSError, ValueError, TypeError):
+                continue
+            task = asyncio.create_task(
+                self._prepare_and_execute(request, profile),
+                name=f"claude-recover-preflight-{run_id}",
+            )
+            self._tasks[run_id] = task
+            task.add_done_callback(
+                lambda _task, recovered_run_id=run_id: self._task_done(
+                    recovered_run_id
+                )
+            )
+            requeued_preflight += 1
 
         containers = await asyncio.to_thread(
             self.client.containers.list,
@@ -435,6 +703,7 @@ class RunManager:
         return {
             "adopted": adopted,
             "removed_unknown": removed_unknown,
+            "requeued_preflight": requeued_preflight,
             "requeued": requeued,
             "failed_orphans": failed_orphans,
         }
@@ -503,31 +772,29 @@ class RunManager:
     ) -> None:
         try:
             async with self._semaphore:
-                # Serialize the queued -> starting boundary with cancellation
-                # and Session revocation. Once ``phase=starting`` is durable,
-                # cancellation must stop/adopt the deterministic container
-                # instead of cancelling this watcher and racing Docker create.
+                # The authoritative cancellation fence is local and cheap.
+                # NFS status mutation is performed off the HTTP event loop so
+                # a storage stall cannot take health/cancel endpoints down.
                 async with self._guard:
-                    status = _read_json(status_path)
-                    if status.get("cancellation_requested"):
-                        _ensure_terminal_event(
-                            run_dir / "events.jsonl",
-                            status="cancelled",
-                            error=None,
-                        )
-                        _update_status(
-                            status_path,
-                            status="cancelled",
-                            phase="terminal",
-                            container_id=None,
-                        )
-                        return
-                    _update_status(
-                        status_path,
-                        status="starting",
-                        phase="starting",
-                        container_id=None,
+                    cancelled = (
+                        self._admission_cancelled(request.run_id)
+                        or (request.user_id, request.conversation_id)
+                        in self._revoked_sessions
                     )
+                    if not cancelled:
+                        _update_status(
+                            self._admission_dir(request.run_id) / "status.json",
+                            status="starting",
+                            phase="starting",
+                        )
+                can_start = await asyncio.to_thread(
+                    self._mark_starting_sync,
+                    run_dir,
+                    status_path,
+                    cancelled,
+                )
+                if not can_start:
+                    return
                 container = await asyncio.to_thread(
                     self._create_container_sync,
                     request,
@@ -554,16 +821,12 @@ class RunManager:
                 # any already-created Turn and the next Supervisor adopts it;
                 # a durable queued request is re-enqueued before serving.
                 raise
-            _ensure_terminal_event(
-                run_dir / "events.jsonl",
-                status="cancelled",
-                error=None,
-            )
-            _update_status(
+            await asyncio.to_thread(
+                self._finish_run_sync,
+                run_dir,
                 status_path,
-                status="cancelled",
-                phase="terminal",
-                container_id=None,
+                "cancelled",
+                None,
             )
             raise
         except BaseException as exc:
@@ -572,18 +835,54 @@ class RunManager:
                 request.run_id,
                 type(exc).__name__,
             )
-            _ensure_terminal_event(
-                run_dir / "events.jsonl",
-                status="failed",
-                error=type(exc).__name__,
-            )
-            _update_status(
+            await asyncio.to_thread(
+                self._finish_run_sync,
+                run_dir,
                 status_path,
-                status="failed",
-                phase="terminal",
-                error=type(exc).__name__,
-                container_id=None,
+                "failed",
+                type(exc).__name__,
             )
+
+    def _mark_starting_sync(
+        self,
+        run_dir: Path,
+        status_path: Path,
+        cancelled: bool,
+    ) -> bool:
+        status = _read_json(status_path)
+        if str(status.get("status") or "") in TERMINAL_STATUSES:
+            return False
+        if cancelled or status.get("cancellation_requested"):
+            self._finish_run_sync(run_dir, status_path, "cancelled", None)
+            return False
+        _update_status(
+            status_path,
+            status="starting",
+            phase="starting",
+            container_id=None,
+        )
+        return True
+
+    @staticmethod
+    def _finish_run_sync(
+        run_dir: Path,
+        status_path: Path,
+        status: str,
+        error: str | None,
+    ) -> None:
+        _ensure_terminal_event(
+            run_dir / "events.jsonl", status=status, error=error
+        )
+        changes: dict[str, Any] = {
+            "status": status,
+            "phase": "terminal",
+            "container_id": None,
+        }
+        if error is not None:
+            changes["error"] = error
+        if status == "cancelled":
+            changes["cancellation_requested"] = True
+        _update_status(status_path, **changes)
 
     def _create_container_sync(
         self,
@@ -597,7 +896,10 @@ class RunManager:
         profile: ProviderProfile,
     ):
         with _prepared_worker_workspace(workspace, self.settings.worker_gid):
-            if _read_json(status_path).get("cancellation_requested"):
+            if (
+                self._admission_cancelled(request.run_id)
+                or _read_json(status_path).get("cancellation_requested")
+            ):
                 _ensure_terminal_event(
                     run_dir / "events.jsonl",
                     status="cancelled",
@@ -758,39 +1060,79 @@ class RunManager:
         )
 
     async def cancel(self, run_id: str, identity: RunIdentityRequest) -> bool:
+        locator = self._read_run_locator(run_id)
+        if (
+            locator.get("user_id") != identity.user_id
+            or locator.get("conversation_id") != identity.conversation_id
+        ):
+            raise HTTPException(404, "Run not found")
+        admission = self._admission_dir(run_id)
+        async with self._guard:
+            admission_status = _read_json(admission / "status.json")
+            phase = str(
+                admission_status.get("phase")
+                or admission_status.get("status")
+                or ""
+            )
+            if str(admission_status.get("status") or "") in TERMINAL_STATUSES:
+                return True
+            _update_status(
+                admission / "status.json", cancellation_requested=True
+            )
+            if phase == "preflight":
+                # Revoke authority immediately. The isolated preflight worker
+                # may still be stuck in an uninterruptible filesystem syscall,
+                # but every post-attestation/Docker boundary rechecks this
+                # durable local fence and can no longer launch a Turn.
+                _ensure_terminal_event(
+                    admission / "events.jsonl", status="cancelled", error=None
+                )
+                _update_status(
+                    admission / "status.json",
+                    status="cancelled",
+                    phase="terminal",
+                )
+                return True
+
         run_dir = self._run_dir(identity.user_id, identity.conversation_id, run_id)
         status_path = run_dir / "status.json"
         task: asyncio.Task[None] | None = None
         cancelled_queued_task = False
-        async with self._guard:
-            status = _read_json(status_path)
-            if (
-                status.get("user_id") != identity.user_id
-                or status.get("conversation_id") != identity.conversation_id
-            ):
-                raise HTTPException(404, "Run not found")
-            terminal = _terminal_status(run_dir / "events.jsonl")
-            if terminal is not None:
-                _update_status(
-                    status_path,
-                    status=terminal,
-                    phase="terminal",
-                    container_id=None,
-                )
-                return True
-            _update_status(status_path, cancellation_requested=True)
-            task = self._tasks.get(run_id)
-            phase = str(status.get("phase") or status.get("status") or "")
-            if phase == "queued" and task is not None and not task.done():
-                task.cancel()
-                cancelled_queued_task = True
+        status = await asyncio.to_thread(_read_json, status_path)
+        if (
+            status.get("user_id") != identity.user_id
+            or status.get("conversation_id") != identity.conversation_id
+        ):
+            raise HTTPException(404, "Run not found")
+        terminal = await asyncio.to_thread(
+            _terminal_status, run_dir / "events.jsonl"
+        )
+        if terminal is not None:
+            await asyncio.to_thread(
+                _update_status,
+                status_path,
+                status=terminal,
+                phase="terminal",
+                container_id=None,
+            )
+            return True
+        await asyncio.to_thread(
+            _update_status, status_path, cancellation_requested=True
+        )
+        task = self._tasks.get(run_id)
+        phase = str(status.get("phase") or status.get("status") or "")
+        if phase == "queued" and task is not None and not task.done():
+            task.cancel()
+            cancelled_queued_task = True
         if task is not None and cancelled_queued_task:
             await asyncio.gather(task, return_exceptions=True)
         container = None
         deadline = time.monotonic() + 15.0
         while True:
-            status = _read_json(status_path)
-            terminal = _terminal_status(run_dir / "events.jsonl")
+            status = await asyncio.to_thread(_read_json, status_path)
+            terminal = await asyncio.to_thread(
+                _terminal_status, run_dir / "events.jsonl"
+            )
             if terminal is not None:
                 break
             container_id = status.get("container_id")
@@ -825,15 +1167,26 @@ class RunManager:
         # The in-container controller is the sole ledger writer while it is
         # alive.  Only synthesize cancellation after Docker confirms it has
         # stopped, avoiding concurrent append/sequence corruption on NFS.
-        terminal = _terminal_status(run_dir / "events.jsonl")
+        terminal = await asyncio.to_thread(
+            _terminal_status, run_dir / "events.jsonl"
+        )
         if terminal is None:
-            _ensure_terminal_event(run_dir / "events.jsonl", status="cancelled", error=None)
+            await asyncio.to_thread(
+                _ensure_terminal_event,
+                run_dir / "events.jsonl",
+                status="cancelled",
+                error=None,
+            )
             terminal = "cancelled"
-        _update_status(
+        await asyncio.to_thread(
+            _update_status,
             status_path,
             status=terminal,
             phase="terminal",
             container_id=None,
+        )
+        _update_status(
+            admission / "status.json", status=terminal, phase="terminal"
         )
         return True
 
@@ -842,38 +1195,70 @@ class RunManager:
         queued_tasks: list[asyncio.Task[None]] = []
         async with self._guard:
             self._revoked_sessions.add((user_id, conversation_id))
-            # Fence first, then discover. A concurrent start holds this same
-            # guard through durable request creation and task registration, so
-            # no just-created run can fall between discovery and revocation.
-            state_run_ids = {
-                child.name
-                for child in (state / "control" / "runs").iterdir()
-                if child.is_dir()
-                and not child.is_symlink()
-                and SAFE_ID.fullmatch(child.name)
-            } if (state / "control" / "runs").is_dir() else set()
-            for run_id in state_run_ids:
-                status_path = state / "control" / "runs" / run_id / "status.json"
+            # Fence local pending writes before touching Session/NFS state. A
+            # blocked preflight cannot acquire Docker authority after this.
+            admission_run_ids: set[str] = set()
+            for locator_path in self._index_root.glob("*.json"):
                 try:
-                    status = _read_json(status_path)
-                    _update_status(status_path, cancellation_requested=True)
+                    locator = self._read_run_locator(locator_path.stem)
                 except HTTPException:
                     continue
-                task = self._tasks.get(run_id)
                 if (
-                    str(status.get("phase") or status.get("status") or "")
-                    == "queued"
-                    and task is not None
-                    and not task.done()
+                    locator.get("user_id") != user_id
+                    or locator.get("conversation_id") != conversation_id
+                    or locator.get("schema") != "chatds.claude-run-locator.v2"
                 ):
-                    task.cancel()
-                    queued_tasks.append(task)
+                    continue
+                run_id = locator["run_id"]
+                admission_run_ids.add(run_id)
+                admission = self._admission_dir(run_id)
+                try:
+                    admission_status = _read_json(admission / "status.json")
+                    _update_status(
+                        admission / "status.json", cancellation_requested=True
+                    )
+                    if str(admission_status.get("phase") or "") == "preflight":
+                        _ensure_terminal_event(
+                            admission / "events.jsonl",
+                            status="cancelled",
+                            error=None,
+                        )
+                        _update_status(
+                            admission / "status.json",
+                            status="cancelled",
+                            phase="terminal",
+                        )
+                except HTTPException:
+                    continue
+        # Discover already-prepared Session runs after the local fence. NFS
+        # enumeration and status RMW never execute on the HTTP event loop.
+        state_run_ids = await asyncio.to_thread(_state_run_ids, state)
+        for run_id in state_run_ids:
+            status_path = state / "control" / "runs" / run_id / "status.json"
+            try:
+                status = await asyncio.to_thread(_read_json, status_path)
+                await asyncio.to_thread(
+                    _update_status,
+                    status_path,
+                    cancellation_requested=True,
+                )
+            except HTTPException:
+                continue
+            task = self._tasks.get(run_id)
+            if (
+                str(status.get("phase") or status.get("status") or "")
+                == "queued"
+                and task is not None
+                and not task.done()
+            ):
+                task.cancel()
+                queued_tasks.append(task)
         if queued_tasks:
             await asyncio.gather(*queued_tasks, return_exceptions=True)
         conversation_hash = hashlib.sha256(conversation_id.encode()).hexdigest()
         user_hash = hashlib.sha256(user_id.encode()).hexdigest()
         failures = []
-        run_ids: set[str] = set(state_run_ids)
+        run_ids: set[str] = set(state_run_ids) | admission_run_ids
         containers_by_id: dict[str, Any] = {}
         filters = {"label": [
             "chatds.component=claude-runner",
@@ -936,32 +1321,32 @@ class RunManager:
                 "success": False,
                 "execution_revocation": {"success": False, "residual_count": len(failures)},
             }
-        if state.exists():
+        if await asyncio.to_thread(state.exists):
             await asyncio.to_thread(_remove_state_tree, state)
         for run_id in run_ids:
             try:
                 self._locator_path(run_id).unlink()
             except FileNotFoundError:
                 pass
+            shutil.rmtree(self._admission_dir(run_id), ignore_errors=True)
         return {
             "success": True,
             "execution_revocation": {"success": True, "residual_count": 0},
         }
 
-    def events_path(self, run_id: str) -> Path:
+    def event_paths(self, run_id: str) -> tuple[Path, Path, Path]:
         locator = self._read_run_locator(run_id)
         run_dir = self._run_dir(
             locator["user_id"], locator["conversation_id"], run_id
         )
-        request_path = run_dir / "request.json"
-        request = _read_json(request_path)
-        if (
-            request.get("run_id") != run_id
-            or request.get("user_id") != locator["user_id"]
-            or request.get("conversation_id") != locator["conversation_id"]
-        ):
-            raise HTTPException(404, "Run not found")
-        return run_dir / "events.jsonl"
+        # Admission events cover only failures/cancellation before Session/NFS
+        # preflight completes. Native/supervisor execution events remain in the
+        # Session ledger. Constructing these paths performs no NFS I/O.
+        return (
+            self._admission_dir(run_id) / "events.jsonl",
+            self._admission_dir(run_id) / "status.json",
+            run_dir / "events.jsonl",
+        )
 
     def _provider(self, request: StartRunRequest) -> ProviderProfile:
         profile = self.settings.provider_profiles.get(request.provider_profile)
@@ -1012,6 +1397,7 @@ class RunManager:
                     task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        self._preflight_executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _build_prompt(
@@ -1376,47 +1762,97 @@ def _remove_state_tree(path: Path) -> None:
     shutil.rmtree(path)
 
 
-async def _event_stream(path: Path, after: int) -> AsyncIterator[str]:
+def _state_run_ids(state: Path) -> set[str]:
+    root = state / "control" / "runs"
+    if not root.is_dir():
+        return set()
+    return {
+        child.name
+        for child in root.iterdir()
+        if child.is_dir()
+        and not child.is_symlink()
+        and SAFE_ID.fullmatch(child.name)
+    }
+
+
+async def _event_stream(
+    sources: tuple[Path, Path, Path], after: int
+) -> AsyncIterator[str]:
+    admission_events, admission_status, native_events = sources
     cursor = after
     heartbeat = time.monotonic()
-    byte_offset = 0
-    pending = bytearray()
-    while True:
-        if path.exists():
+    byte_offsets = {admission_events: 0, native_events: 0}
+    pending = {admission_events: bytearray(), native_events: bytearray()}
+    reads: dict[Path, asyncio.Task[bytes]] = {}
+    try:
+        while True:
+            # Never probe the Session/NFS ledger until preflight has completed.
+            # A local cancellation/failure therefore remains immediately
+            # observable even if the immutable Skill tree is hard-stalled.
             try:
-                chunk = await asyncio.to_thread(
-                    _read_ledger_chunk, path, byte_offset
-                )
-            except OSError:
-                chunk = b""
-            if chunk:
-                byte_offset += len(chunk)
-                pending.extend(chunk)
-            if len(pending) > 72 * 1024 * 1024:
-                raise RuntimeError("Claude Runner event line exceeded its durable bound")
-            while b"\n" in pending:
-                raw_line, _, remainder = pending.partition(b"\n")
-                pending = bytearray(remainder)
+                phase = str(_read_json(admission_status).get("phase") or "")
+            except HTTPException:
+                phase = "preflight"
+            active_paths = [admission_events]
+            if phase != "preflight":
+                active_paths.append(native_events)
+            for path in active_paths:
+                task = reads.get(path)
+                if task is None:
+                    reads[path] = asyncio.create_task(
+                        asyncio.to_thread(
+                            _read_ledger_chunk, path, byte_offsets[path]
+                        )
+                    )
+                    continue
+                if not task.done():
+                    continue
+                reads.pop(path, None)
                 try:
-                    envelope = json.loads(raw_line.decode("utf-8"))
-                except (UnicodeError, json.JSONDecodeError):
-                    continue
-                seq = envelope.get("seq") if isinstance(envelope, dict) else None
-                if not isinstance(seq, int) or seq <= cursor:
-                    continue
-                cursor = seq
-                yield f"data: {json.dumps(envelope, ensure_ascii=False, separators=(',', ':'))}\n\n"
-                event = envelope.get("event")
-                if (
-                    isinstance(event, dict)
-                    and event.get("type") == "chatds.supervisor.terminal"
-                ):
-                    yield "data: [DONE]\n\n"
-                    return
-        if time.monotonic() - heartbeat >= 15:
-            heartbeat = time.monotonic()
-            yield ": heartbeat\n\n"
-        await asyncio.sleep(0.25)
+                    chunk = task.result()
+                except OSError:
+                    chunk = b""
+                if chunk:
+                    byte_offsets[path] += len(chunk)
+                    pending[path].extend(chunk)
+                if len(pending[path]) > 72 * 1024 * 1024:
+                    raise RuntimeError(
+                        "Claude Runner event line exceeded its durable bound"
+                    )
+                while b"\n" in pending[path]:
+                    raw_line, _, remainder = pending[path].partition(b"\n")
+                    pending[path] = bytearray(remainder)
+                    try:
+                        envelope = json.loads(raw_line.decode("utf-8"))
+                    except (UnicodeError, json.JSONDecodeError):
+                        continue
+                    seq = envelope.get("seq") if isinstance(envelope, dict) else None
+                    if not isinstance(seq, int) or seq <= cursor:
+                        continue
+                    cursor = seq
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            envelope,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                        + "\n\n"
+                    )
+                    event = envelope.get("event")
+                    if (
+                        isinstance(event, dict)
+                        and event.get("type") == "chatds.supervisor.terminal"
+                    ):
+                        yield "data: [DONE]\n\n"
+                        return
+            if time.monotonic() - heartbeat >= 15:
+                heartbeat = time.monotonic()
+                yield ": heartbeat\n\n"
+            await asyncio.sleep(0.25)
+    finally:
+        for task in reads.values():
+            task.cancel()
 
 
 def _read_ledger_chunk(path: Path, offset: int) -> bytes:
@@ -1469,7 +1905,10 @@ def _constant_time_equal(left: str, right: str) -> bool:
 @app.get("/health")
 async def health(_auth=Depends(_require_internal_token)):
     if manager is None:
-        return JSONResponse(503, {"status": "error", "code": "not_ready"})
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "code": "not_ready"},
+        )
     try:
         await asyncio.to_thread(manager.client.ping)
         image = await asyncio.to_thread(manager.client.images.get, manager.settings.runner_image)
@@ -1478,7 +1917,10 @@ async def health(_auth=Depends(_require_internal_token)):
             manager.client.volumes.get, manager.settings.workspace_lock_volume
         )
     except (DockerException, ImageNotFound):
-        return JSONResponse(503, {"status": "error", "code": "docker_or_image_unavailable"})
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "code": "docker_or_image_unavailable"},
+        )
     return {
         "status": "ok",
         "claude_version": image.labels.get("org.opencontainers.image.version", "unknown"),
@@ -1500,9 +1942,9 @@ async def run_events(
     _auth=Depends(_require_internal_token),
 ):
     assert manager is not None
-    path = manager.events_path(run_id)
+    paths = manager.event_paths(run_id)
     return StreamingResponse(
-        _event_stream(path, after),
+        _event_stream(paths, after),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

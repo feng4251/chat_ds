@@ -7,6 +7,7 @@ import tempfile
 import threading
 import unittest
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -112,15 +113,37 @@ def _make_readonly_view(view: Path) -> str:
         json.dumps({"name": "fixture", "version": "1.0.0"}),
         encoding="utf-8",
     )
+    instruction = view / "plugin" / "skills" / "fixture" / "SKILL.md"
+    instruction.parent.mkdir(parents=True)
+    instruction.write_text(
+        "---\nname: fixture\ndescription: generic lifecycle fixture\n---\n",
+        encoding="utf-8",
+    )
     payload = descriptor.read_bytes()
+    instruction_payload = instruction.read_bytes()
     identity = {
         "schema": "chatds.claude-skill-view.v1",
-        "skills": [],
-        "files": [{
-            "path": "plugin/.claude-plugin/plugin.json",
-            "sha256": hashlib.sha256(payload).hexdigest(),
-            "size": len(payload),
+        "skills": [{
+            "name": "fixture",
+            "scope": "session",
+            "files": [{
+                "path": "SKILL.md",
+                "sha256": hashlib.sha256(instruction_payload).hexdigest(),
+                "size": len(instruction_payload),
+            }],
         }],
+        "files": [
+            {
+                "path": "plugin/.claude-plugin/plugin.json",
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size": len(payload),
+            },
+            {
+                "path": "plugin/skills/fixture/SKILL.md",
+                "sha256": hashlib.sha256(instruction_payload).hexdigest(),
+                "size": len(instruction_payload),
+            },
+        ],
     }
     digest = hashlib.sha256(json.dumps(
         identity,
@@ -174,6 +197,7 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
             workspace_lock_volume="lock-volume",
             workspace_lock_root=self.root / "locks",
             max_concurrent_runs=1,
+            preflight_timeout_seconds=120,
             max_run_seconds=120,
             worker_uid=os.getuid(),
             worker_gid=os.getgid(),
@@ -200,6 +224,24 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         image.labels.pop("org.opencontainers.image.chatds.egress-policy")
         with self.assertRaisesRegex(RuntimeError, "egress_policy_attestation"):
             _validate_runner_image_security(image, "seccomp_stripped_setid")
+
+    async def test_missing_dynamic_runner_image_is_structured_503(self):
+        class MissingImages:
+            @staticmethod
+            def get(_name):
+                raise supervisor_server.ImageNotFound("missing")
+
+        fake_manager = SimpleNamespace(
+            client=SimpleNamespace(ping=lambda: True, images=MissingImages()),
+            settings=self.settings,
+        )
+        with patch.object(supervisor_server, "manager", fake_manager):
+            response = await supervisor_server.health()
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            json.loads(response.body),
+            {"status": "error", "code": "docker_or_image_unavailable"},
+        )
 
     async def asyncTearDown(self):
         self.manager._draining = True
@@ -253,6 +295,31 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException):
             self.manager._provider(request)
 
+    async def test_start_admission_is_idempotent_and_identity_bound(self):
+        await self.manager._semaphore.acquire()
+        request = self._request()
+        try:
+            first = await self.manager.start(request)
+            task = self.manager._tasks[request.run_id]
+            second = await self.manager.start(request)
+            self.assertFalse(first["idempotent"])
+            self.assertTrue(second["idempotent"])
+            self.assertIs(self.manager._tasks[request.run_id], task)
+            conflicting = request.model_copy(update={
+                "messages": [{"role": "user", "content": "renamed holdout"}],
+            })
+            with self.assertRaises(HTTPException):
+                await self.manager.start(conflicting)
+            await self.manager.cancel(
+                request.run_id,
+                RunIdentityRequest(
+                    user_id=self.user_id,
+                    conversation_id=self.conversation_id,
+                ),
+            )
+        finally:
+            self.manager._semaphore.release()
+
     def test_selected_skill_entrypoint_precedes_fresh_and_resumed_prompts(self):
         entrypoint = "chatds-session-skills:chatds-harness-session-entry"
         fresh = supervisor_server._build_prompt(
@@ -296,6 +363,28 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         invalid = {**valid, "selected_primary_skill_names": ["missing"]}
         with self.assertRaisesRegex(RuntimeError, "skill_entrypoint"):
             supervisor_server._manifest_skill_entrypoint(invalid)
+
+    def test_verified_manifest_carries_policy_inputs_without_second_read(self):
+        receipt = supervisor_server.verify_skill_view(
+            self.view, self.view_digest
+        )
+        with patch.object(
+            Path,
+            "read_text",
+            side_effect=AssertionError("policy reread immutable Skill input"),
+        ):
+            policy = supervisor_server.compile_turn_egress_policy(
+                skill_view_root=self.view,
+                skill_view_sha256=self.view_digest,
+                verified_skill_view=receipt,
+                user_turn_text="generic fixture",
+                provider_base_url=self.profile.claude_base_url,
+                configured_private_origins=(),
+                budget_scope_sha256="a" * 64,
+                call_id_sha256="b" * 64,
+                limits=dict(self.settings.egress_limits),
+            )
+        self.assertEqual(policy["policy_version"], 3)
 
     async def test_turn_container_has_one_session_mount_and_no_network(self):
         request = self._request()
@@ -367,6 +456,14 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         request = self._request()
         await self.manager.start(request)
         try:
+            admission_status = self.manager._admission_dir(
+                request.run_id
+            ) / "status.json"
+            for _ in range(100):
+                if _read_json(admission_status).get("phase") == "queued":
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(_read_json(admission_status)["phase"], "queued")
             self.assertTrue(await self.manager.cancel(
                 request.run_id,
                 RunIdentityRequest(
@@ -382,6 +479,130 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_terminal_status(run_dir / "events.jsonl"), "cancelled")
         self.assertEqual(_read_json(run_dir / "status.json")["phase"], "terminal")
         self.assertEqual(self.client.containers.values, {})
+
+    async def test_blocked_preflight_does_not_block_start_or_cancel(self):
+        request = self._request()
+        entered = threading.Event()
+        release = threading.Event()
+        real_verify = supervisor_server.verify_skill_view
+
+        def blocked_verify(*args, **kwargs):
+            entered.set()
+            release.wait(timeout=5)
+            return real_verify(*args, **kwargs)
+
+        with patch.object(
+            supervisor_server, "verify_skill_view", side_effect=blocked_verify
+        ):
+            accepted = await asyncio.wait_for(
+                self.manager.start(request), timeout=0.5
+            )
+            self.assertEqual(accepted["phase"], "preflight")
+            self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+            self.assertTrue(await asyncio.wait_for(
+                self.manager.cancel(
+                    request.run_id,
+                    RunIdentityRequest(
+                        user_id=self.user_id,
+                        conversation_id=self.conversation_id,
+                    ),
+                ),
+                timeout=0.5,
+            ))
+            local_events, _admission_status, _native_events = (
+                self.manager.event_paths(request.run_id)
+            )
+            self.assertEqual(_terminal_status(local_events), "cancelled")
+            stream = supervisor_server._event_stream(
+                self.manager.event_paths(request.run_id), 0
+            )
+            terminal_frame = await asyncio.wait_for(anext(stream), timeout=1)
+            done_frame = await asyncio.wait_for(anext(stream), timeout=1)
+            self.assertIn("chatds.supervisor.terminal", terminal_frame)
+            self.assertEqual(done_frame, "data: [DONE]\n\n")
+            task = self.manager._tasks[request.run_id]
+            release.set()
+            await asyncio.wait_for(asyncio.shield(task), timeout=2)
+        self.assertEqual(self.client.containers.values, {})
+
+    async def test_preflight_timeout_revokes_late_container_authority(self):
+        settings = replace(self.settings, preflight_timeout_seconds=0.05)
+        manager = RunManager(settings, self.client)
+        request = self._request()
+        entered = threading.Event()
+        release = threading.Event()
+        real_verify = supervisor_server.verify_skill_view
+
+        def blocked_verify(*args, **kwargs):
+            entered.set()
+            release.wait(timeout=5)
+            return real_verify(*args, **kwargs)
+
+        try:
+            with patch.object(
+                supervisor_server,
+                "verify_skill_view",
+                side_effect=blocked_verify,
+            ):
+                await manager.start(request)
+                self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+                admission = manager._admission_dir(request.run_id)
+                for _ in range(100):
+                    if _terminal_status(admission / "events.jsonl") == "failed":
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertEqual(
+                    _terminal_status(admission / "events.jsonl"), "failed"
+                )
+                self.assertEqual(
+                    _read_json(admission / "status.json")["error"],
+                    "preflight_timeout",
+                )
+                release.set()
+                await asyncio.sleep(0.1)
+            self.assertEqual(self.client.containers.values, {})
+        finally:
+            release.set()
+            manager._draining = True
+            for task in tuple(manager._tasks.values()):
+                task.cancel()
+            if manager._tasks:
+                await asyncio.gather(
+                    *tuple(manager._tasks.values()), return_exceptions=True
+                )
+            manager._preflight_executor.shutdown(
+                wait=False, cancel_futures=True
+            )
+
+    async def test_one_preflight_attestation_receipt_is_reused_by_policy(self):
+        await self.manager._semaphore.acquire()
+        request = self._request()
+        real_verify = supervisor_server.verify_skill_view
+        try:
+            with patch.object(
+                supervisor_server,
+                "verify_skill_view",
+                wraps=real_verify,
+            ) as verify:
+                await self.manager.start(request)
+                admission_status = self.manager._admission_dir(
+                    request.run_id
+                ) / "status.json"
+                for _ in range(100):
+                    if _read_json(admission_status).get("phase") == "queued":
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertEqual(_read_json(admission_status)["phase"], "queued")
+                self.assertEqual(verify.call_count, 1)
+                await self.manager.cancel(
+                    request.run_id,
+                    RunIdentityRequest(
+                        user_id=self.user_id,
+                        conversation_id=self.conversation_id,
+                    ),
+                )
+        finally:
+            self.manager._semaphore.release()
 
     async def test_session_cleanup_fences_and_revokes_queued_run(self):
         await self.manager._semaphore.acquire()
@@ -507,6 +728,14 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await self.manager._semaphore.acquire()
         request = self._request()
         await self.manager.start(request)
+        admission_status = self.manager._admission_dir(
+            request.run_id
+        ) / "status.json"
+        for _ in range(100):
+            if _read_json(admission_status).get("phase") == "queued":
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(_read_json(admission_status)["phase"], "queued")
         await self.manager.detach_for_shutdown()
         self.manager._semaphore.release()
         run_dir = self.manager._run_dir(
@@ -521,6 +750,32 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["requeued"], 1)
             self.assertEqual(_read_json(run_dir / "status.json")["phase"], "queued")
             self.assertIsNone(_terminal_status(run_dir / "events.jsonl"))
+        finally:
+            replacement._draining = True
+            for task in tuple(replacement._tasks.values()):
+                task.cancel()
+            if replacement._tasks:
+                await asyncio.gather(
+                    *tuple(replacement._tasks.values()), return_exceptions=True
+                )
+            replacement._semaphore.release()
+
+    async def test_durable_preflight_is_requeued_after_restart(self):
+        request = self._request()
+        self.manager._ensure_admission(request)
+        replacement = RunManager(self.settings, self.client)
+        await replacement._semaphore.acquire()
+        try:
+            result = await replacement.reconcile_existing_containers()
+            self.assertEqual(result["requeued_preflight"], 1)
+            admission_status = replacement._admission_dir(
+                request.run_id
+            ) / "status.json"
+            for _ in range(100):
+                if _read_json(admission_status).get("phase") == "queued":
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(_read_json(admission_status)["phase"], "queued")
         finally:
             replacement._draining = True
             for task in tuple(replacement._tasks.values()):
