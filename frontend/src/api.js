@@ -1,10 +1,12 @@
+import { fetchWithIdempotentReadRetry } from './utils/requestPolicy.js'
+
 const API = '/api'
 
 async function request(path, options = {}) {
   const token = localStorage.getItem('token')
   const headers = { 'Content-Type': 'application/json', ...options.headers }
   if (token) headers['Authorization'] = 'Bearer ' + token
-  const res = await fetch(API + path, { ...options, headers })
+  const res = await fetchWithIdempotentReadRetry(API + path, { ...options, headers })
   console.log('[request]', path, 'status:', res.status)
   if (res.status === 401) {
     localStorage.removeItem('token')
@@ -14,7 +16,7 @@ async function request(path, options = {}) {
   }
   if (!res.ok) {
     const detail = await res.json().then(d => d.detail).catch(() => null)
-    throw new Error(detail || `Request failed (${res.status})`)
+    throw new Error(detail || `Request ${path} failed (${res.status})`)
   }
   return res
 }

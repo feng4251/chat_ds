@@ -108,6 +108,7 @@ export default function SessionWorkspace({
   onConversationForked,
 }) {
   const [tab, setTab] = useState('settings')
+  const [loadedConvId, setLoadedConvId] = useState('')
   const [settings, setSettings] = useState(null)
   const [workspace, setWorkspace] = useState({ files: [] })
   const [selectedFile, setSelectedFile] = useState('')
@@ -147,30 +148,46 @@ export default function SessionWorkspace({
   useEffect(() => {
     if (!open || !convId) return
     let cancelled = false
-    Promise.all([
-      getConversationSettings(convId),
-      getWorkspace(convId),
-      getGoal(convId),
-      getRuns(convId),
-      getArtifacts(convId),
-      getTasks(convId),
-      getSchedules(convId),
-      getHooks(),
-      getMcpServers(convId),
-    ]).then(([s, w, g, r, a, t, j, h, m]) => {
+    const resources = [
+      ['运行配置', () => getConversationSettings(convId)],
+      ['Workspace', () => getWorkspace(convId)],
+      ['Goal', () => getGoal(convId)],
+      ['Runs', () => getRuns(convId)],
+      ['Artifacts', () => getArtifacts(convId)],
+      ['Tasks', () => getTasks(convId)],
+      ['Schedules', () => getSchedules(convId)],
+      ['Hooks', () => getHooks()],
+      ['MCP', () => getMcpServers(convId)],
+    ]
+    Promise.allSettled(resources.map(([, load]) => load())).then((results) => {
       if (cancelled) return
+      const values = results.map((result) => (
+        result.status === 'fulfilled' ? result.value : null
+      ))
+      const [s, w, g, r, a, t, j, h, m] = values
       setSettings(s)
-      setWorkspace(w)
-      setGoal(g)
-      setRuns(Array.isArray(r) ? r : (r.runs || []))
-      setRunTree(Array.isArray(r) ? [] : (r.tree || []))
-      setArtifacts(a.artifacts || [])
-      setTasks(t.tasks || [])
-      setJobs(j)
-      setHooks(h)
-      setMcpServers(m.servers || [])
-    }).catch((err) => {
-      if (!cancelled) setError(err.message)
+      setWorkspace(w || { files: [] })
+      setGoal(g || {})
+      if (r) {
+        setRuns(Array.isArray(r) ? r : (r.runs || []))
+        setRunTree(Array.isArray(r) ? [] : (r.tree || []))
+      } else {
+        setRuns([])
+        setRunTree([])
+      }
+      setArtifacts(a?.artifacts || [])
+      setTasks(t?.tasks || [])
+      setJobs(j || [])
+      setHooks(h || [])
+      setMcpServers(m?.servers || [])
+
+      const failures = results.flatMap((result, index) => (
+        result.status === 'rejected'
+          ? [`${resources[index][0]}：${result.reason?.message || '加载失败'}`]
+          : []
+      ))
+      setError(failures.length ? `部分面板加载失败：${failures.join('；')}` : '')
+      setLoadedConvId(convId)
     })
     return () => { cancelled = true }
   }, [open, convId])
@@ -182,6 +199,7 @@ export default function SessionWorkspace({
   }, [fileBlobUrl])
 
   async function saveSettings() {
+    setError('')
     setSaving(true)
     try {
       const next = await updateConversationSettings(convId, {
@@ -191,6 +209,7 @@ export default function SessionWorkspace({
         fallback_model_ids: settings.fallback_model_ids,
       })
       setSettings(next)
+      setError('')
       onSettingsChanged?.(next)
     } catch (e) { setError(e.message) } finally { setSaving(false) }
   }
@@ -374,9 +393,12 @@ export default function SessionWorkspace({
             </button>
           ))}
         </div>
-        {error && <div className="mx-5 mt-3 p-2 rounded bg-red-50 text-red-700 text-xs">{error}</div>}
+        {loadedConvId === convId && error && <div className="mx-5 mt-3 p-2 rounded bg-red-50 text-red-700 text-xs">{error}</div>}
         <div className="flex-1 overflow-y-auto p-5">
-          {tab === 'settings' && settings && (
+          {loadedConvId !== convId && (
+            <div className="py-10 text-center text-sm text-slate-500">正在加载 Session Workspace…</div>
+          )}
+          {loadedConvId === convId && tab === 'settings' && settings && (
             <div className="space-y-5">
               <Section title="执行引擎">
                 <select
@@ -467,7 +489,7 @@ export default function SessionWorkspace({
             </div>
           )}
 
-          {tab === 'workspace' && (
+          {loadedConvId === convId && tab === 'workspace' && (
             <div className={`grid ${gridTemplate} gap-3`}>
               {/* File list */}
               <div className="border border-stone-200 rounded-xl overflow-hidden flex flex-col">
@@ -591,7 +613,7 @@ export default function SessionWorkspace({
             </div>
           )}
 
-          {tab === 'artifacts' && (
+          {loadedConvId === convId && tab === 'artifacts' && (
             <div className="space-y-3">
               <div className="flex items-center justify-between">
                 <div className="text-sm font-medium text-slate-800">Session artifacts</div>
@@ -625,7 +647,7 @@ export default function SessionWorkspace({
             </div>
           )}
 
-          {tab === 'tasks' && (
+          {loadedConvId === convId && tab === 'tasks' && (
             <div className="space-y-3">
               <div className="flex items-center justify-between">
                 <div className="text-sm font-medium text-slate-800">Durable tasks</div>
@@ -648,7 +670,7 @@ export default function SessionWorkspace({
             </div>
           )}
 
-          {tab === 'goal' && (
+          {loadedConvId === convId && tab === 'goal' && (
             <div className="space-y-4">
               <Field label="持久目标"><textarea value={goal.objective || ''} onChange={(e) => setGoal({ ...goal, objective: e.target.value })} rows={5} className="input" /></Field>
               <div className="grid grid-cols-2 gap-3">
@@ -661,7 +683,7 @@ export default function SessionWorkspace({
             </div>
           )}
 
-          {tab === 'automation' && (
+          {loadedConvId === convId && tab === 'automation' && (
             <div className="space-y-5">
               <form onSubmit={addJob} className="p-4 border border-stone-200 rounded-xl space-y-3">
                 <div className="font-medium text-sm">新建定时任务</div>
@@ -680,7 +702,7 @@ export default function SessionWorkspace({
             </div>
           )}
 
-          {tab === 'mcp' && (
+          {loadedConvId === convId && tab === 'mcp' && (
             <div className="space-y-5">
               <form onSubmit={addMcp} className="p-4 border border-stone-200 rounded-xl space-y-3">
                 <div className="font-medium text-sm">会话级 MCP Server</div>
@@ -704,7 +726,7 @@ export default function SessionWorkspace({
             </div>
           )}
 
-          {tab === 'hooks' && (
+          {loadedConvId === convId && tab === 'hooks' && (
             <div className="space-y-5">
               <form onSubmit={addHook} className="p-4 border border-stone-200 rounded-xl space-y-3">
                 <div className="font-medium text-sm">生命周期 Webhook</div>
@@ -724,7 +746,7 @@ export default function SessionWorkspace({
             </div>
           )}
 
-          {tab === 'runs' && (
+          {loadedConvId === convId && tab === 'runs' && (
             <div className="grid grid-cols-[1fr_1.1fr] gap-4">
               <div className="space-y-3">
                 <button onClick={() => downloadTrajectory(convId)} className="primary"><FiDownload />导出脱敏轨迹 JSON</button>
