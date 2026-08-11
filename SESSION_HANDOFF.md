@@ -2,6 +2,75 @@
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
+## 2026-08-11 Claude Skill 合约、持久进程与唯一执行引擎闭环
+
+- 本轮把近期 ClaudeCodeEngine 会话暴露的问题统一重述为五个跨领域不变量：Skill 声明的最终
+  artifact/模块/体量/行数/章节必须成为内容寻址的机器合约，不能由模型正文自证；持久 stdin
+  进程必须有 controller-owned typed lifecycle，不能依赖后台 Bash 通知时序；本地 Bash task 与
+  delegated agent 必须分型投影；每个失败终态必须持久化稳定 `error_stage/error_code`；部署声明
+  Claude-only 时，Legacy 只能读历史，任何新 Conversation/Turn/settings/fork/底层 dispatch 都不能
+  旁路。生产修复没有疾病、Skill/package/session、worker、固定报告名或 V2.3 分支。
+- 新增 `backend/agent_engines/skill_contracts.py`。它只在有界、惯例化 orchestration/workflow YAML
+  中编译显式 `output_contract` 或 `final_report_template.auto_merge`，拒绝不安全路径、冲突声明、
+  越界 YAML/指令与倒置范围；可从声明的 inert `cat` merge 中提取 Markdown 模块 glob。合约随
+  immutable Skill-view digest 写入 manifest，经 Supervisor verified receipt 一次性传给 Turn。
+  Runner 只有观察到当轮原生 `Skill` tool receipt 才激活对应合约，因此已安装但与当前问题无关的
+  Skill 不会强制运行或强制产物。最终文件必须是当轮唯一新建/修改匹配项；历史产物可保留；模块可由
+  同 Session 的失败续跑复用。字节、行数、H1/H2 章节和模块存在性均由 controller 审计，失败以
+  `artifact_contract_failed` 形成唯一 authoritative terminal。
+- 对生产真实但重命名为 holdout 的复杂 Skill 零模型编译得到：最终 artifact placeholder、11 个
+  module glob、20 个章节、153,600--256,000 bytes、至少 2,000 行；这证明此前 50/114KB 单文件或
+  1,623 行结果不会再被模型 checklist 文案误报完成。该检查只是通用编译/基础验收，不替代用户手工
+  V2.3 业务 E2E 或 ground-truth 语义对比。
+- 新增按需 `chatds-process` stdio MCP：只有 Skill 指令同时声明 persistent/long-running 与 stdin
+  才装配 `process_open/write/read/close`。它不接受 shell 字符串，限定 argv/进程数/读写量、可执行
+  根与当前 `/workspace`/只读 Skill-view cwd；每个子进程有独立 session、合并输出 offset receipt，
+  MCP EOF 时精确 TERM/KILL 全部 owned process，并从子进程环境剥离 provider/API credential。
+  Turn 仍为 `network=none`，只挂当前 Session；子进程继承的 HTTP proxy 仍受既有 signed egress
+  policy，不获得第二套 Bash、mount 或网络 authority。编译出的通用 runtime prompt 明确要求使用
+  typed process MCP，解决 visual-browser 类 JSONL stdin driver 无法交互的问题。
+- native task ledger 现在分型保存 `local_bash/local_agent/...`。`TaskOutput` 的 exact XML
+  `retrieval_status/task_id/status` 可在通知缺失时结算；Claude 退出并由 PID 1 确认整个 disposable
+  process group 已回收后，只把仍 running 的 `local_bash` 结算为 killed，delegated agent 继续
+  fail closed。Backend 不再把 `local_bash` 伪装成 delegate AgentRun；真正 agent 仍用 Claude 描述
+  命名并持久化。逻辑失败与异常失败均带阶段、稳定代码、native task summary、artifact receipt 和
+  egress receipt。Web-search MCP 以及 TLS Proxy 另补齐 HTTP/DNS/timeout/certificate/handshake/reset/
+  transport 的安全分类，不再把所有网络故障压成类名或同一个 TLS 错误。
+- 部署配置新增 `LEGACY_ENGINE_NEW_RUNS_ENABLED`，生产为 `false`，默认 engine 仍为
+  `claude_code`。Legacy 源码和历史 Conversation 保留，但 registry、模型兼容列表、新会话、已有
+  Legacy 会话新 Turn、settings、fork 与最终 stream dispatch 均 fail closed；当前生产 registry
+  实测只有 `claude_code`。未停止 Legacy 容器，因为 Backend 的共享存储健康证明和显式回滚路径仍
+  使用它；“Claude-only”在这里指执行 authority，而不是删除 rollback 组件。
+- 成熟实现对照冻结独立仓库 `claude-code/` commit
+  `6f6f12b37f529488b10e53928dd5508bb93535c7`。采用并适配 `src/Task.ts` 的 typed TaskType/TaskStatus、
+  `LocalShellTask` 先提交 completed 再通知、`TaskOutputTool` 的 exact structured terminal receipt；
+  这些模式被放在 ChatDS 既有 Session mount、authority、ledger、artifact 与 exactly-one terminal
+  合同之后。拒绝把参考仓库 private/stub 当实现证据，也拒绝用模型 prose、无限 retry 或后台 shell
+  存活代替 durable state；相关本地路径无语义疑点，本轮未用 Web 搜索替代源码证据。
+- 确定性回归覆盖跨域 inventory/warehouse/satellite rename、历史 artifact mutation、字段误编译、
+  冲突声明、未调用 Skill 不激活、真实复杂 Skill 零样本编译、persistent stdin echo/cleanup、
+  credential scrub、TaskOutput 无通知、local-bash/agent 分型、terminal stage/code、Legacy history-only、
+  Web/TLS failure injection。Backend 全套为 `283 passed`，最终改动后的相关 Backend 为
+  `45 passed`；Claude Runner/Supervisor 全套 `68 passed, 1 skipped, 7 subtests passed`；Egress
+  Proxy `82 passed, 122 subtests passed`。Compose config、compileall、diff/genericity scan 与候选
+  image JSONL smoke 均通过；未自动启动模型重型 V2.3 E2E。
+- 代码提交为 `50b44861dae7a65845385bf94b41fc2ab8ec78b3 fix: enforce compiled Claude skill
+  contracts`。clean archive `/tmp/chat_ds_deploy_50b44861.vMY5YZ1d` 与 Git tree 均 22,499 files。
+  切换前连续两次确认 nonterminal AgentRun、active engine session、running schedule 与动态 Turn
+  container 均为 0；SQLite online backup volume
+  `chat_ds_db_backup_pre_50b44861_20260811_184725` 为 446,984,192 bytes，SHA-256
+  `c094a6d276793ea1d1d6fe1b3a503fa2b3eedffd8cfe26fb73c74768f9d2af6d`，quick/FK 正常。
+- 当前生产 Backend/Runner/Supervisor/Proxy image 分别为
+  `sha256:ceb6af9bd003a06d1f2289199effa77b1821c042c17da7234cfb226d7fa5b0e9`、
+  `sha256:83981279d0a4a30b67eb4b65c9bb28744cddd6d5d13e15f0777b138a92f298f8`、
+  `sha256:4c5a210ae7f9046388cab57bb0a04c5f09709f428cbe6bd042e693a5101e3514`、
+  `sha256:d8aa0f06d536acd2eb7ad062b51233ce1a6698f11501845cf2cb90230131c543`，revision label 均精确为
+  `50b44861...`；旧镜像保留 `rollback-pre-50b44861`。相关容器 running/healthy、restart 0，Claude
+  2.1.152 与 signed public-read policy attestation 正常；SQLite quick/FK、active run/session 与
+  严重启动日志均正常/为 0。`127.0.0.1`、`10.10.132.126`、`172.30.100.128` 的
+  `/api/health` 均为 200。下一项应由用户手工发起新 V2.3/其他 Skill E2E；收到 session ID 后仍须按
+  debug/对话/exact Skill 三源流程验收，不能把本轮 deterministic closure 宣称为业务 E2E 已通过。
+
 ## 2026-08-11 统一沙箱公网只读出站闭环
 
 - 用户指出对每个新网址增加 typed broker/hostname allowlist 是补丁式治理，并要求统一
