@@ -34,11 +34,13 @@ LABEL org.opencontainers.image.title="ChatDS isolated Claude Code Turn runner" \
 COPY --from=claude-package /build/node_modules /opt/chatds-claude-code/node_modules
 COPY claude_runner/runner_entrypoint.py /app/claude-runner/runner_entrypoint.py
 COPY claude_runner/mcp_web_search.py /app/claude-runner/mcp_web_search.py
+COPY claude_runner/mcp_market_data.py /app/claude-runner/mcp_market_data.py
 
 RUN ln -s /opt/chatds-claude-code/node_modules/.bin/claude /usr/local/bin/claude \
     && mkdir -p /run/chatds /state /skill-view /runtime \
     && chmod 0555 /app/claude-runner/runner_entrypoint.py \
     && chmod 0555 /app/claude-runner/mcp_web_search.py \
+    && chmod 0555 /app/claude-runner/mcp_market_data.py \
     && chmod -R a-w /opt/chatds-claude-code \
     && find / -xdev -type f -perm /6000 -exec chmod a-s {} + \
     && getcap -r / 2>/dev/null | cut -d ' ' -f 1 | xargs -r setcap -r \

@@ -15,6 +15,7 @@ class NativeToolCatalogTests(unittest.TestCase):
         self.assertIn("run_declared_command", DEFAULT_NATIVE_TOOL_SET)
         self.assertIn("skill_http_post_json", DEFAULT_NATIVE_TOOL_SET)
         self.assertIn("skill_copy_resource", DEFAULT_NATIVE_TOOL_SET)
+        self.assertIn("market_quote", DEFAULT_NATIVE_TOOL_SET)
         self.assertIn(
             "submit_knowledge_gate_decisions",
             DEFAULT_NATIVE_TOOL_SET,

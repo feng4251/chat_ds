@@ -11,6 +11,7 @@ from __future__ import annotations
 DEFAULT_NATIVE_TOOLS: tuple[str, ...] = (
     "web_search",
     "web_extract",
+    "market_quote",
     "execute_code",
     "run_skill_python",
     "run_skill_script",

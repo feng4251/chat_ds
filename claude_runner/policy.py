@@ -27,6 +27,12 @@ class ClaudeEgressPolicyError(RuntimeError):
     pass
 
 
+_HARNESS_EGRESS_CAPABILITIES = {
+    "web_search": ("GET",),
+    "market_quote": ("GET",),
+}
+
+
 @dataclass(frozen=True, slots=True)
 class VerifiedSkillView:
     """Process-local attestation receipt for one immutable Skill view."""
@@ -109,17 +115,22 @@ def compile_turn_egress_policy(
     if not isinstance(harness_rules, list):
         raise ClaudeEgressPolicyError("Harness capability rules are malformed")
     for row in harness_rules:
+        capability = row.get("capability") if isinstance(row, dict) else None
+        expected_methods = _HARNESS_EGRESS_CAPABILITIES.get(capability)
         if (
             not isinstance(row, dict)
             or set(row) != {"capability", "url_prefix", "methods"}
-            or row.get("capability") != "web_search"
-            or row.get("methods") != ["GET"]
+            or expected_methods is None
+            or row.get("methods") != list(expected_methods)
         ):
             raise ClaudeEgressPolicyError(
                 "Harness capability rule is malformed"
             )
         prefix = normalize_http_url_prefix(str(row.get("url_prefix") or ""))
-        prefix_rows.append({"url_prefix": prefix, "methods": ["GET"]})
+        prefix_rows.append({
+            "url_prefix": prefix,
+            "methods": list(expected_methods),
+        })
         harness_capability_origins.add(normalize_http_origin(prefix))
 
     # The Runner loads this generated MCP file explicitly and rejects ambient

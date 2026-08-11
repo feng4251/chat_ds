@@ -1,6 +1,7 @@
 from tools.registry import register
 from tools.web_search import web_search
 from tools.web_extract import web_extract
+from tools.market_quote import market_quote, MARKET_QUOTE_SCHEMA
 from tools.skill_http import (
     skill_http_get,
     skill_http_post_json,
@@ -122,6 +123,15 @@ register(
         },
     },
     web_extract,
+    is_read_only=True,
+    parallel_safe=True,
+    external_interaction=True,
+)
+
+register(
+    "market_quote",
+    MARKET_QUOTE_SCHEMA,
+    market_quote,
     is_read_only=True,
     parallel_safe=True,
     external_interaction=True,

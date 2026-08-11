@@ -3429,6 +3429,7 @@ async def _chat_stream_with_turn(
                 sources=sources,
                 enabled_tools=enabled_tools,
                 web_search_url=settings.claude_web_search_url,
+                market_data_url=settings.claude_market_data_url,
             )
 
         engine_session = (await db.execute(

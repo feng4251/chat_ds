@@ -106,6 +106,9 @@ class Settings(BaseSettings):
     web_search_providers: str = "searxng"
     searxng_base_url: str = "http://searxng:8080"
     searxng_timeout_seconds: float = 10.0
+    # Fixed internal capability broker. Agent/model input never selects an
+    # upstream URL; the gateway accepts only typed market/symbol arguments.
+    market_data_url: str = "http://market-data-gateway:8090/v1/quote"
     # Private browser navigation remains disabled unless an origin is present
     # both here and as an explicit URL in the current primary user turn.
     browser_private_origin_allowlist: str = ""
