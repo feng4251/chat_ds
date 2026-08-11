@@ -2,6 +2,26 @@
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
+## 2026-08-11 `172.30.100.128:5173` 前端转发入口
+
+- 因用户本地无法直接访问 `172.30.100.126:5173`、但可访问
+  `172.30.100.128`，已在 `172.30.100.128` 部署持久、透明的 TCP 转发：
+  `0.0.0.0:5173 -> 172.30.100.126:5173`。没有修改 ChatDS 容器、数据库或
+  126 上的生产配置，也没有触碰 128 上已有 vLLM/TEI/pathology/cloudreve 容器。
+- 128 的 5173 部署前为空闲，UFW inactive；128 到 126 的 `/api/health` 实测为
+  HTTP 200。实现使用 Ubuntu 自带的 `systemd-socket-proxyd`，不安装 socat/nginx，
+  也不新增 Docker 容器。unit 为
+  `/etc/systemd/system/chatds-forward-5173.socket` 与
+  `/etc/systemd/system/chatds-forward-5173.service`；socket 已 enabled/active，
+  service 按连接激活并在空闲 5 分钟后退出，下一连接会自动重启，开机由
+  `sockets.target` 自动恢复。
+- service 使用 `DynamicUser`、`PrivateTmp`、`PrivateDevices`、read-only
+  `ProtectSystem`/`ProtectHome`、`NoNewPrivileges`、地址族限制、
+  `MemoryDenyWriteExecute`；当前 `NRestarts=0`。部署后从维护机访问
+  `http://172.30.100.128:5173/` 和 `/api/health` 均为 HTTP 200，返回的是 126
+  上同一 ChatDS 前端/Backend。维护或回滚只操作上述两个精确 unit；凭据未写入仓库、
+  unit、日志或本文件。
+
 ## 2026-08-10 Claude Skill 相关性、受控搜索与部署默认值闭环
 
 - 生产 conversation `28f32a430935405e92cc0ea53700cba8` 的最后两轮已按三源证据闭环。
