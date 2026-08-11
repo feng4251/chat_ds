@@ -203,6 +203,10 @@ class RunManager:
             resume=resume_from_native_session_id is not None,
             skill_entrypoint=skill_entrypoint,
         )
+        prompt = _attach_runtime_contract(
+            prompt,
+            skill_view_receipt.manifest.get("runtime_requirements", []),
+        )
         policy = compile_turn_egress_policy(
             skill_view_root=skill_view,
             skill_view_sha256=request.skill_view_sha256,
@@ -242,6 +246,18 @@ class RunManager:
             "workspace_path": str(workspace),
             "skill_view_path": str(skill_view),
             "skill_view_sha256": request.skill_view_sha256,
+            # These compiler-owned values are part of the immutable Skill-view
+            # digest.  The worker consumes them as control-plane data rather
+            # than asking model prose to attest its own workflow/artifacts.
+            "artifact_contracts": skill_view_receipt.manifest.get(
+                "artifact_contracts", []
+            ),
+            "runtime_requirements": skill_view_receipt.manifest.get(
+                "runtime_requirements", []
+            ),
+            "skill_diagnostics": skill_view_receipt.manifest.get(
+                "skill_diagnostics", []
+            ),
             "source": request.source,
             "egress_policy": policy,
         }
@@ -1502,6 +1518,30 @@ def _activate_skill_entrypoint(
     if skill_entrypoint is None:
         return prompt
     return f"/{skill_entrypoint}\n\n{prompt}"
+
+
+def _attach_runtime_contract(prompt: str, requirements: object) -> str:
+    """Describe compiled capabilities without making installed Skills mandatory."""
+
+    if not isinstance(requirements, list) or len(requirements) > 128:
+        raise RuntimeError("skill_runtime_requirements_invalid")
+    persistent = False
+    for row in requirements:
+        if not isinstance(row, dict):
+            raise RuntimeError("skill_runtime_requirements_invalid")
+        if row.get("persistent_stdin_process") is True:
+            persistent = True
+    if not persistent:
+        return prompt
+    return (
+        prompt
+        + "\n\n<CHATDS_RUNTIME_CONTRACT>\n"
+        + "If an invoked Skill requires a persistent stdin-driven process, "
+        + "use the chatds-process MCP process_open/process_write/process_read/"
+        + "process_close tools. Do not emulate interactive stdin with a "
+        + "detached background Bash command. Close the exact managed process "
+        + "when finished.\n</CHATDS_RUNTIME_CONTRACT>"
+    )
 
 
 def _recover_start_request(path: Path) -> StartRunRequest:

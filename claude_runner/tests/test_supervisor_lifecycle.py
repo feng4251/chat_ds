@@ -378,6 +378,22 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 "selected_primary_skill_names": ["missing"],
             })
 
+    def test_compiled_persistent_process_requirement_adds_generic_guidance(self):
+        prompt = supervisor_server._attach_runtime_contract(
+            "unrelated task",
+            [{
+                "skill_name": "renamed-holdout",
+                "persistent_stdin_process": True,
+            }],
+        )
+        self.assertTrue(prompt.startswith("unrelated task\n\n"))
+        self.assertIn("chatds-process", prompt)
+        self.assertIn("process_write", prompt)
+        self.assertEqual(
+            supervisor_server._attach_runtime_contract("plain", []),
+            "plain",
+        )
+
     def test_skill_entrypoint_manifest_fails_closed_when_inconsistent(self):
         valid = {
             "plugin_name": "chatds-session-skills",

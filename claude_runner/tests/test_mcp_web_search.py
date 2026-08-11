@@ -1,7 +1,9 @@
 import io
 import json
 import os
+import socket
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 from claude_runner import mcp_web_search
@@ -95,6 +97,20 @@ class WebSearchMcpTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "search_endpoint_invalid"):
                 mcp_web_search._search("current status")
         opened.assert_not_called()
+
+    def test_upstream_failures_have_stable_safe_diagnostics(self):
+        http_error = urllib.error.HTTPError(
+            "https://secret.example/path", 429, "limited", {}, None
+        )
+        self.assertEqual(
+            mcp_web_search._search_error(http_error),
+            ("upstream_http_error", 429),
+        )
+        timeout = urllib.error.URLError(socket.timeout("secret endpoint"))
+        self.assertEqual(
+            mcp_web_search._search_error(timeout),
+            ("upstream_timeout", None),
+        )
 
 
 if __name__ == "__main__":

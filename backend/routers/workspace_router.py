@@ -141,7 +141,12 @@ async def _engine_options_for_user(
     options = [{
         "id": "legacy",
         "name": "ChatDS Legacy Harness",
-        "available": True,
+        "available": settings.legacy_engine_new_runs_enabled,
+        "unavailable_reason": (
+            None
+            if settings.legacy_engine_new_runs_enabled
+            else "Legacy Harness is retained for history only"
+        ),
         "compatible_model_ids": model_ids,
         "default_model_id": legacy_default,
         "capabilities": ["skills", "multi_agent", "mcp", "sandbox"],
@@ -358,6 +363,11 @@ async def update_conversation_settings(
     if payload.engine_id is not None and payload.engine_id != conv.engine_id:
         from agent_engines.registry import build_agent_engine_registry
 
+        if (
+            payload.engine_id == "legacy"
+            and not settings.legacy_engine_new_runs_enabled
+        ):
+            raise HTTPException(400, "Legacy Harness execution is disabled")
         try:
             build_agent_engine_registry().get(payload.engine_id)
         except LookupError as exc:
@@ -1065,6 +1075,14 @@ async def _fork_conversation_impl(
             effective_target_model = requested_target_model or source.model_id
             from agent_engines.base import ENGINE_ID_CLAUDE_CODE
             from agent_engines.registry import build_agent_engine_registry
+            if (
+                effective_target_engine == "legacy"
+                and not settings.legacy_engine_new_runs_enabled
+            ):
+                raise HTTPException(
+                    400,
+                    "Legacy Harness execution is disabled for target Conversations",
+                )
             try:
                 build_agent_engine_registry().get(effective_target_engine)
             except LookupError as exc:

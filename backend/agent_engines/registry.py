@@ -31,13 +31,13 @@ class AgentEngineRegistry:
 
 
 def build_agent_engine_registry() -> AgentEngineRegistry:
-    engines: list[AgentEngine] = [
-        LegacyHarnessEngine(
+    engines: list[AgentEngine] = []
+    if settings.legacy_engine_new_runs_enabled:
+        engines.append(LegacyHarnessEngine(
             base_url=settings.harness_url,
             internal_token=settings.internal_api_token,
             timeout_seconds=settings.harness_stream_timeout_seconds,
-        )
-    ]
+        ))
     # ClaudeCodeEngine is registered only when its supervisor is explicitly
     # enabled. This keeps the existing production path rollback-compatible
     # while making missing isolation infrastructure fail closed rather than

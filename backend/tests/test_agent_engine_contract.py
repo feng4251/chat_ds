@@ -307,6 +307,54 @@ class ClaudeEventProjectionTests(unittest.TestCase):
         self.assertEqual(stopped[0].data["event_type"], "run.cancelled")
         self.assertEqual(stopped[0].data["run_id"], child_run_id)
 
+    def test_background_shell_is_not_projected_as_a_delegate_agent(self):
+        projector = ClaudeEventProjector("7" * 32)
+        started = projector.project({
+            "event": {
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": "bash-task",
+                "task_type": "local_bash",
+                "description": "watch output",
+            },
+        })
+        self.assertEqual([event.kind for event in started], ["tool_progress"])
+        self.assertFalse(any(
+            event.data.get("event_type") in {"agent.spawned", "run.started"}
+            for event in started
+        ))
+        completed = projector.project({
+            "event": {
+                "type": "system",
+                "subtype": "task_notification",
+                "task_id": "bash-task",
+                "status": "completed",
+            },
+        })
+        self.assertEqual([event.kind for event in completed], ["tool_progress"])
+
+    def test_controller_terminal_exposes_safe_stage_and_code(self):
+        projector = ClaudeEventProjector("6" * 32)
+        events = projector.project({
+            "event": {
+                "type": "chatds.supervisor.terminal",
+                "status": "failed",
+                "error": "RuntimeError",
+                "error_code": "artifact_contract_audit_failed",
+                "error_stage": "artifact_contract_audit",
+                "native_task_summary": {"task_count": 1},
+            },
+        })
+        diagnostic = next(event for event in events if event.kind == "diagnostic")
+        self.assertEqual(
+            diagnostic.data["error_code"],
+            "artifact_contract_audit_failed",
+        )
+        self.assertEqual(
+            diagnostic.data["error_stage"],
+            "artifact_contract_audit",
+        )
+
     def test_workspace_artifact_is_projected_to_durable_artifact_event(self):
         root = "8" * 32
         projector = ClaudeEventProjector(root)
@@ -375,6 +423,118 @@ class ClaudeEventProjectionTests(unittest.TestCase):
 
 
 class ClaudeSkillViewTests(unittest.TestCase):
+    def test_generic_artifact_and_runtime_contracts_are_compiled(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            skill = root / "skills" / "archive-synthesis-renamed"
+            (skill / "orchestration").mkdir(parents=True)
+            (skill / "SKILL.md").write_text(
+                "Keep a persistent JSONL process alive and write requests to stdin.\n"
+                "Allow anti-bot bypass, but never conceal webdriver automation signals.\n",
+                encoding="utf-8",
+            )
+            (skill / "orchestration" / "pipeline.yaml").write_text(
+                """final_report_template:
+  auto_merge:
+    command_template: "cat 01_*.md 02_*.md > {PROJECT}_FULL_REPORT.md"
+    output_artifact: "{PROJECT}_FULL_REPORT.md"
+    expected_size_range: "10KB-20KB"
+    post_merge_verification:
+      - "Line count > 42"
+""",
+                encoding="utf-8",
+            )
+            view = materialize_claude_skill_view(
+                session_root=root / "session",
+                sources=[SimpleNamespace(
+                    name="archive-synthesis-renamed",
+                    scope="session",
+                    root=skill,
+                    bundle_id=None,
+                    bundle_role=None,
+                )],
+            )
+            manifest = json.loads((view.root / "manifest.json").read_text())
+            mcp = json.loads((view.plugin_root / ".mcp.json").read_text())
+        self.assertEqual(manifest["artifact_contracts"], [{
+            "skill_name": "archive-synthesis-renamed",
+            "declared_final_artifact": "{PROJECT}_FULL_REPORT.md",
+            "declared_modular_files": ["01_*.md", "02_*.md"],
+            "expected_min_bytes": 10 * 1024,
+            "expected_max_bytes": 20 * 1024,
+            "expected_min_lines": 42,
+        }])
+        self.assertEqual(manifest["runtime_requirements"], [{
+            "skill_name": "archive-synthesis-renamed",
+            "persistent_stdin_process": True,
+        }])
+        self.assertEqual(
+            manifest["skill_diagnostics"][0]["code"],
+            "contradictory_automation_evasion_policy",
+        )
+        self.assertEqual(set(mcp["mcpServers"]), {"chatds-process"})
+
+    def test_size_checks_cannot_be_miscompiled_as_line_checks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            skill = root / "skills" / "warehouse-audit"
+            (skill / "orchestration").mkdir(parents=True)
+            (skill / "SKILL.md").write_text("Audit inventory.", encoding="utf-8")
+            (skill / "orchestration" / "contract.yaml").write_text(
+                """final_report_template:
+  auto_merge:
+    output_artifact: "{WAREHOUSE}_AUDIT.md"
+    expected_size_range: "2KB-8KB"
+    post_merge_verification:
+      - "File size > 1KB"
+      - "Line count > 73"
+""",
+                encoding="utf-8",
+            )
+            view = materialize_claude_skill_view(
+                session_root=root / "session",
+                sources=[SimpleNamespace(
+                    name="warehouse-audit",
+                    scope="session",
+                    root=skill,
+                    bundle_id=None,
+                    bundle_role=None,
+                )],
+            )
+            manifest = json.loads((view.root / "manifest.json").read_text())
+        contract = manifest["artifact_contracts"][0]
+        self.assertEqual(contract["expected_min_bytes"], 2 * 1024)
+        self.assertEqual(contract["expected_min_lines"], 73)
+
+    def test_conflicting_structured_artifact_authority_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            skill = root / "skills" / "satellite-review"
+            (skill / "orchestration").mkdir(parents=True)
+            (skill / "SKILL.md").write_text("Review readiness.", encoding="utf-8")
+            for name, artifact in (
+                ("alpha.yaml", "ALPHA.md"),
+                ("beta.yaml", "BETA.md"),
+            ):
+                (skill / "orchestration" / name).write_text(
+                    "output_contract:\n"
+                    f"  final_artifact: {artifact}\n",
+                    encoding="utf-8",
+                )
+            with self.assertRaisesRegex(
+                SkillViewError, "skill_output_contract_conflict"
+            ):
+                materialize_claude_skill_view(
+                    session_root=root / "session",
+                    sources=[SimpleNamespace(
+                        name="satellite-review",
+                        scope="session",
+                        root=skill,
+                        bundle_id=None,
+                        bundle_role=None,
+                    )],
+                )
+
     def test_session_scope_wins_and_executable_resources_remain_executable(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -767,6 +927,18 @@ class EngineModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual(claude["default_model_id"], "deepseek_v4_pro")
 
+    async def test_legacy_engine_can_be_retained_for_history_only(self):
+        with patch.object(settings, "legacy_engine_new_runs_enabled", False):
+            async with self.sessions() as db:
+                options = await workspace_router._engine_options_for_user(
+                    current_model_id="deepseek_v4_pro",
+                    user=self.user,
+                    db=db,
+                )
+        legacy = next(item for item in options if item["id"] == "legacy")
+        self.assertFalse(legacy["available"])
+        self.assertIn("history", legacy["unavailable_reason"])
+
     def test_provider_family_without_explicit_profile_is_not_compatible(self):
         with patch.object(
             settings,
@@ -833,6 +1005,18 @@ class EngineModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                 _env_file=None,
                 claude_code_engine_enabled=False,
                 default_agent_engine_id="claude_code",
+            )
+
+    def test_disabled_legacy_cannot_remain_the_default_engine(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "LEGACY_ENGINE_NEW_RUNS_ENABLED=true",
+        ):
+            Settings(
+                _env_file=None,
+                claude_code_engine_enabled=True,
+                legacy_engine_new_runs_enabled=False,
+                default_agent_engine_id="legacy",
             )
 
     def test_claude_payload_uses_explicit_profile_and_omits_caller_secret(self):

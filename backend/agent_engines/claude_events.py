@@ -36,6 +36,7 @@ class ClaudeEventProjector:
     _result_finish_reason: str = "stop"
     _result_error: str | None = None
     _started_tasks: dict[str, str] = field(default_factory=dict)
+    _task_type_by_id: dict[str, str] = field(default_factory=dict)
     _task_by_tool_use_id: dict[str, str] = field(default_factory=dict)
     _started_tools: set[str] = field(default_factory=set)
     _terminal_tools: set[str] = field(default_factory=set)
@@ -94,6 +95,24 @@ class ClaudeEventProjector:
                 },
                 envelope,
                 native_event_id=source_event_key or None,
+            ),)
+        if event_type in {
+            "chatds.runtime.config",
+            "chatds.skill.diagnostic",
+            "chatds.artifact.contract",
+            "chatds.native-task.reconciled",
+        }:
+            return (EngineStreamEvent(
+                "diagnostic",
+                {
+                    "code": event_type,
+                    "details": {
+                        key: value
+                        for key, value in native.items()
+                        if key != "type"
+                    },
+                },
+                envelope,
             ),)
         if event_type == "chatds.supervisor.terminal":
             return tuple(self._project_supervisor_terminal(native, envelope))
@@ -333,14 +352,23 @@ class ClaudeEventProjector:
             return tuple(values)
         if subtype == "task_started":
             task_id = str(native.get("task_id") or native.get("id") or "")
+            task_type = str(native.get("task_type") or "local_agent")
+            self._task_type_by_id[task_id] = task_type
+            description = str(
+                native.get("description") or native.get("prompt")
+                or "Claude background task"
+            )[:256]
+            if task_type == "local_bash":
+                return (EngineStreamEvent(
+                    "tool_progress",
+                    {"text": f"Background command started: {description}"},
+                    envelope,
+                ),)
             child = _child_run_id(self.root_run_id, task_id)
             self._started_tasks[task_id] = child
             tool_use_id = str(native.get("tool_use_id") or "")
             if tool_use_id:
                 self._task_by_tool_use_id[tool_use_id] = child
-            description = str(
-                native.get("description") or native.get("prompt") or "Claude sub-agent"
-            )[:256]
             identity = {
                 "run_id": child,
                 "root_run_id": self.root_run_id,
@@ -350,6 +378,7 @@ class ClaudeEventProjector:
                 "depth": 1,
                 "workspace_scope": "shared_session",
                 "native_task_id": task_id,
+                "native_task_type": task_type,
             }
             return (
                 EngineStreamEvent(
@@ -360,6 +389,7 @@ class ClaudeEventProjector:
                         "payload": {
                             "goal": description,
                             "native_task_id": task_id,
+                            "native_task_type": task_type,
                             "tool_call_id": tool_use_id or None,
                         },
                     },
@@ -375,8 +405,24 @@ class ClaudeEventProjector:
             )
         if subtype in {"task_notification", "task_completed", "task_failed"}:
             task_id = str(native.get("task_id") or native.get("id") or "")
-            child = self._started_tasks.get(task_id) or _child_run_id(self.root_run_id, task_id)
+            task_type = str(
+                native.get("task_type")
+                or self._task_type_by_id.get(task_id)
+                or "local_agent"
+            )
             task_status = str(native.get("status") or "")
+            if task_type == "local_bash":
+                return (EngineStreamEvent(
+                    "tool_progress",
+                    {
+                        "text": (
+                            "Background command "
+                            + (task_status or "completed")
+                        )
+                    },
+                    envelope,
+                ),)
+            child = self._started_tasks.get(task_id) or _child_run_id(self.root_run_id, task_id)
             failed = subtype == "task_failed" or task_status == "failed"
             stopped = task_status == "stopped"
             event_type = (
@@ -399,6 +445,7 @@ class ClaudeEventProjector:
                     ),
                     "error": (summary or None) if failed else None,
                     "native_task_id": task_id,
+                    "native_task_type": task_type,
                     "payload": {
                         "summary": summary,
                         "output_file": str(native.get("output_file") or ""),
@@ -489,15 +536,31 @@ class ClaudeEventProjector:
             status = "failed"
             self._result_error = "Claude runner succeeded without a native result"
         if status not in {"succeeded", "cancelled"}:
+            error_code = str(native.get("error_code") or "")
+            error_stage = str(native.get("error_stage") or "")
             message = str(
-                native.get("error")
+                error_code
+                or native.get("error")
                 or self._result_error
                 or f"Claude runner exited with status {status}"
             )
             self._terminal_seen = True
             return (
                 EngineStreamEvent(
-                    "diagnostic", {"code": "claude_runner_failed", "message": message}, envelope
+                    "diagnostic",
+                    {
+                        "code": "claude_runner_failed",
+                        "message": message,
+                        "error_code": error_code or None,
+                        "error_stage": error_stage or None,
+                        "native_task_summary": native.get(
+                            "native_task_summary"
+                        ),
+                        "artifact_contract": native.get(
+                            "artifact_contract"
+                        ),
+                    },
+                    envelope,
                 ),
                 EngineStreamEvent(
                     "agent_event",

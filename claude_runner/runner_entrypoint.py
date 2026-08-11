@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import fnmatch
 import fcntl
 import json
 import os
@@ -40,18 +41,74 @@ MAX_WORKSPACE_ARTIFACTS = 8_192
 MAX_WORKSPACE_ARTIFACT_FILE_BYTES = 1024 * 1024 * 1024
 MAX_WORKSPACE_ARTIFACT_TOTAL_BYTES = 8 * 1024 * 1024 * 1024
 MAX_WORKSPACE_RELATIVE_PATH_BYTES = 1024
+MAX_ARTIFACT_CONTRACTS = 64
+MAX_ARTIFACT_CONTRACT_FINDINGS = 128
 WORKSPACE_LOCK_IDENTITY_DOMAIN = b"chatds-workspace-mutation-lock-v1\0"
 SAFE_SESSION_ID = re.compile(r"^[0-9a-f]{32}$")
+SAFE_NATIVE_TASK_ID = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
+SAFE_NATIVE_TASK_TYPES = frozenset({
+    "local_bash",
+    "local_agent",
+    "remote_agent",
+    "in_process_teammate",
+    "local_workflow",
+    "monitor_mcp",
+    "dream",
+})
+SAFE_CONTROLLER_RUNTIME_CODES = frozenset({
+    "native_task_session_invalid",
+    "native_task_state_invalid",
+    "workspace_artifact_root_invalid",
+    "workspace_artifact_path_invalid",
+    "workspace_artifact_symlink_invalid",
+    "workspace_artifact_type_invalid",
+    "workspace_artifact_file_limit",
+    "workspace_artifact_change_limit",
+    "workspace_artifact_size_limit",
+    "workspace_artifact_total_size_limit",
+    "workspace_artifact_changed_during_audit",
+    "artifact_contract_invalid",
+    "artifact_contract_audit_failed",
+    "egress_bridge_did_not_stop",
+})
 _child: subprocess.Popen[bytes] | None = None
 _termination_reason: str | None = None
 
 
 def main() -> int:
+    controller_stage = "bootstrap"
+    exit_code: int | None = None
+    receipt: dict[str, Any] | None = None
+    checkpoint_ready: bool | None = None
+    pending_plan_task_count: int | None = None
+    artifact_contract_receipt: dict[str, Any] | None = None
     if os.geteuid() != 0:
         return _fatal("runner_controller_not_root")
     try:
+        controller_stage = "load_config"
         config = _load_config(Path(os.environ["CHATDS_RUN_CONFIG"]))
         ledger = EventLedger(Path(os.environ["CHATDS_EVENT_LEDGER"]))
+        ledger.append_event({
+            "type": "chatds.runtime.config",
+            "context_window_tokens": int(config["context_window_tokens"]),
+            "max_output_tokens": int(config["max_output_tokens"]),
+            "extended_context_marker": int(config["context_window_tokens"]) > 200_000,
+        }, channel="controller")
+        for diagnostic in config.get("skill_diagnostics") or ():
+            if not isinstance(diagnostic, dict):
+                continue
+            code = str(diagnostic.get("code") or "")
+            skill_name = str(diagnostic.get("skill_name") or "")
+            if (
+                re.fullmatch(r"[a-z][a-z0-9_]{0,127}", code)
+                and re.fullmatch(r"[A-Za-z0-9._-]{1,128}", skill_name)
+            ):
+                ledger.append_event({
+                    "type": "chatds.skill.diagnostic",
+                    "code": code,
+                    "skill_name": skill_name,
+                    "severity": "warning",
+                }, channel="controller")
         worker_uid = int(os.environ.get("CLAUDE_RUNNER_WORKER_UID", "65529"))
         worker_gid = int(os.environ.get("CLAUDE_RUNNER_WORKER_GID", "65529"))
         runtime_root = Path("/runtime/worker")
@@ -60,8 +117,11 @@ def main() -> int:
         worker_tmp = runtime_root / "tmp"
         worker_tmp.mkdir(mode=0o700)
         os.chown(worker_tmp, worker_uid, worker_gid)
+        controller_stage = "workspace_lock"
         with _session_workspace_lock(config):
+            controller_stage = "workspace_snapshot_before"
             workspace_before = _workspace_snapshot(Path("/workspace"))
+            controller_stage = "egress_bridge_start"
             authority = ProxySocketAuthority(
                 PROXY_SOCKET_PATH,
                 expected_uid=EXPECTED_PROXY_UID,
@@ -108,6 +168,7 @@ def main() -> int:
                 worker_gid=worker_gid,
             )
             try:
+                controller_stage = "native_execution"
                 command, prompt = _claude_command(config)
                 _install_signal_handlers()
                 exit_code = _run_child(
@@ -125,26 +186,49 @@ def main() -> int:
                         path.unlink()
                     except FileNotFoundError:
                         pass
+            controller_stage = "egress_bridge_seal"
             receipt = bridge.shutdown_and_seal()
             bridge_thread.join(timeout=5.0)
             if bridge_thread.is_alive():
                 raise RuntimeError("egress_bridge_did_not_stop")
+            controller_stage = "workspace_snapshot_after"
+            workspace_after = _workspace_snapshot(Path("/workspace"))
+            controller_stage = "workspace_artifact_audit"
             _emit_workspace_artifacts(
                 ledger=ledger,
                 run_id=str(config["run_id"]),
                 before=workspace_before,
-                after=_workspace_snapshot(Path("/workspace")),
+                after=workspace_after,
                 workspace_root=Path("/workspace"),
             )
+            controller_stage = "artifact_contract_audit"
+            artifact_contract_receipt = _validate_artifact_contracts(
+                contracts=config.get("artifact_contracts"),
+                invoked_skill_names=ledger.invoked_skill_names,
+                before=workspace_before,
+                after=workspace_after,
+                workspace_root=Path("/workspace"),
+            )
+            ledger.append_event({
+                "type": "chatds.artifact.contract",
+                **artifact_contract_receipt,
+            }, channel="controller")
+        controller_stage = "native_checkpoint_audit"
         checkpoint_ready = _native_checkpoint_exists(
             Path("/state/home/.claude/projects"),
             str(config["native_session_id"]),
         )
+        controller_stage = "native_plan_task_audit"
         pending_plan_task_count = _pending_plan_task_count(
             Path("/state/home/.claude/tasks"),
             str(config["native_session_id"]),
         )
         pending_native_task_count = ledger.active_native_task_count
+        artifact_contract_passed = (
+            artifact_contract_receipt is not None
+            and artifact_contract_receipt.get("status") != "failed"
+        )
+        controller_stage = "terminal_commit"
         status = (
             "cancelled"
             if _termination_reason == "cancelled"
@@ -157,6 +241,7 @@ def main() -> int:
                 and checkpoint_ready
                 and pending_plan_task_count == 0
                 and pending_native_task_count == 0
+                and artifact_contract_passed
             )
             else "failed"
         )
@@ -168,6 +253,7 @@ def main() -> int:
             egress_receipt=receipt,
             pending_plan_task_count=pending_plan_task_count,
             pending_native_task_count=pending_native_task_count,
+            artifact_contract_passed=artifact_contract_passed,
         )
         ledger.append_event({
             "type": "chatds.supervisor.terminal",
@@ -179,7 +265,11 @@ def main() -> int:
             "checkpoint_observed": checkpoint_ready,
             "pending_plan_task_count": pending_plan_task_count,
             "pending_native_task_count": pending_native_task_count,
+            "native_task_summary": ledger.native_task_summary,
+            "artifact_contract": artifact_contract_receipt,
             "error": terminal_error,
+            "error_code": terminal_error,
+            "error_stage": _terminal_error_stage(terminal_error),
             "egress_receipt": receipt,
         }, channel="controller", terminal=True)
         ledger.close()
@@ -196,6 +286,17 @@ def main() -> int:
             "type": "chatds.supervisor.terminal",
             "status": "failed",
             "error": type(exc).__name__,
+            "error_stage": controller_stage,
+            "exit_code": exit_code,
+            "result_observed": ledger.saw_native_result,
+            "result_succeeded": ledger.native_result_succeeded,
+            "result_count": ledger.native_result_count,
+            "checkpoint_observed": checkpoint_ready,
+            "pending_plan_task_count": pending_plan_task_count,
+            "pending_native_task_count": ledger.active_native_task_count,
+            "native_task_summary": ledger.native_task_summary,
+            "artifact_contract": artifact_contract_receipt,
+            "egress_receipt": receipt,
         }
         safe_code = _safe_controller_exception_code(exc)
         if safe_code is not None:
@@ -219,12 +320,18 @@ def _safe_controller_exception_code(exc: BaseException) -> str | None:
     removed.
     """
 
-    if not isinstance(exc, BridgeConfigurationError):
-        return None
-    message = str(exc)
-    if re.fullmatch(r"[a-z][a-z0-9 -]{0,127}", message) is None:
-        return None
-    return "egress_" + re.sub(r"[ -]+", "_", message)
+    if isinstance(exc, BridgeConfigurationError):
+        message = str(exc)
+        if re.fullmatch(r"[a-z][a-z0-9 -]{0,127}", message) is None:
+            return None
+        return "egress_" + re.sub(r"[ -]+", "_", message)
+    if (
+        isinstance(exc, RuntimeError)
+        and len(exc.args) == 1
+        and exc.args[0] in SAFE_CONTROLLER_RUNTIME_CODES
+    ):
+        return str(exc.args[0])
+    return None
 
 
 def _terminal_error(
@@ -236,6 +343,7 @@ def _terminal_error(
     egress_receipt: dict[str, Any],
     pending_plan_task_count: int,
     pending_native_task_count: int,
+    artifact_contract_passed: bool = True,
 ) -> str | None:
     """Choose the most specific trusted failure signal for one Turn."""
 
@@ -249,6 +357,8 @@ def _terminal_error(
         return "native_subtasks_pending"
     if pending_plan_task_count:
         return "native_plan_tasks_pending"
+    if not artifact_contract_passed:
+        return "artifact_contract_failed"
     if ledger.native_api_error_status is not None:
         return f"provider_http_{ledger.native_api_error_status}"
     if exit_code == 0 and not ledger.saw_native_result:
@@ -262,6 +372,31 @@ def _terminal_error(
     return None
 
 
+def _terminal_error_stage(error_code: str | None) -> str | None:
+    if error_code is None:
+        return None
+    if error_code.startswith("provider_http_") or error_code in {
+        "runner_exited_without_result",
+        "native_result_failed",
+        "native_result_duplicated",
+        "runner_exit_nonzero",
+    }:
+        return "native_execution"
+    if error_code == "native_checkpoint_missing":
+        return "native_checkpoint_audit"
+    if error_code == "native_plan_tasks_pending":
+        return "native_plan_task_audit"
+    if error_code == "native_subtasks_pending":
+        return "native_task_audit"
+    if error_code == "artifact_contract_failed":
+        return "artifact_contract_audit"
+    if error_code == "egress_budget_exhausted":
+        return "egress_bridge_seal"
+    if error_code == "run_hard_timeout":
+        return "native_execution"
+    return "terminal_commit"
+
+
 class EventLedger:
     def __init__(self, path: Path) -> None:
         if not path.is_absolute():
@@ -273,7 +408,14 @@ class EventLedger:
         self._native_result_succeeded = False
         self._native_result_count = 0
         self._native_api_error_status: int | None = None
-        self._active_native_tasks: set[str] = set()
+        self._native_tasks: dict[str, dict[str, Any]] = {}
+        self._task_output_calls: dict[str, str] = {}
+        self._invoked_skill_names: set[str] = set()
+        self._native_task_reconciliations = {
+            "native_notification": 0,
+            "task_output": 0,
+            "controller_process_reap": 0,
+        }
         if path.exists():
             raise RuntimeError("event_ledger_already_exists")
         self._stream = path.open("xb", buffering=0)
@@ -323,13 +465,43 @@ class EventLedger:
             subtype = str(native.get("subtype") or "")
             task_id = str(native.get("task_id") or native.get("id") or "")
             if subtype == "task_started" and task_id:
-                self._active_native_tasks.add(task_id)
+                task_type = str(native.get("task_type") or "unknown")
+                if task_type not in SAFE_NATIVE_TASK_TYPES:
+                    task_type = "unknown"
+                if SAFE_NATIVE_TASK_ID.fullmatch(task_id):
+                    existing = self._native_tasks.get(task_id)
+                    if existing is None:
+                        self._native_tasks[task_id] = {
+                            "task_id": task_id,
+                            "task_type": task_type,
+                            "status": "running",
+                            "terminal_source": None,
+                        }
+                    elif existing.get("status") != "running":
+                        existing["status"] = "running"
+                        existing["terminal_source"] = None
             elif subtype in {
                 "task_notification",
                 "task_completed",
                 "task_failed",
             } and task_id:
-                self._active_native_tasks.discard(task_id)
+                status = str(native.get("status") or "")
+                if subtype == "task_failed" or status == "failed":
+                    status = "failed"
+                elif status in {"stopped", "killed"}:
+                    status = "killed"
+                else:
+                    status = "completed"
+                self._settle_native_task(
+                    task_id,
+                    status=status,
+                    source="native_notification",
+                )
+        if channel == "stdout" and isinstance(native, dict):
+            if native.get("type") == "assistant":
+                self._observe_assistant_tool_calls(native)
+            elif native.get("type") == "user":
+                self._observe_task_output_results(native)
         self._append({"channel": channel, "event": native})
 
     @property
@@ -350,7 +522,175 @@ class EventLedger:
 
     @property
     def active_native_task_count(self) -> int:
-        return len(self._active_native_tasks)
+        return sum(
+            row.get("status") == "running"
+            for row in self._native_tasks.values()
+        )
+
+    @property
+    def invoked_skill_names(self) -> frozenset[str]:
+        return frozenset(self._invoked_skill_names)
+
+    @property
+    def native_task_summary(self) -> dict[str, Any]:
+        active_by_type: dict[str, int] = {}
+        terminal_by_status: dict[str, int] = {}
+        active_ids: list[str] = []
+        for task_id in sorted(self._native_tasks):
+            row = self._native_tasks[task_id]
+            task_type = str(row.get("task_type") or "unknown")
+            status = str(row.get("status") or "unknown")
+            if status == "running":
+                active_by_type[task_type] = active_by_type.get(task_type, 0) + 1
+                if len(active_ids) < 64:
+                    active_ids.append(task_id)
+            else:
+                terminal_by_status[status] = terminal_by_status.get(status, 0) + 1
+        return {
+            "task_count": len(self._native_tasks),
+            "active_count": sum(active_by_type.values()),
+            "active_by_type": dict(sorted(active_by_type.items())),
+            "active_task_ids": active_ids,
+            "terminal_by_status": dict(sorted(terminal_by_status.items())),
+            "reconciled_by": dict(self._native_task_reconciliations),
+        }
+
+    def reconcile_worker_process_exit(self) -> int:
+        """Close local shell tasks after the controller reaps the Turn group.
+
+        Claude's SDK notification is advisory and may be skipped when the
+        model consumes TaskOutput directly or exits while a background shell
+        is still alive.  Once PID 1 has synchronously reaped the disposable
+        per-Turn process group, local Bash tasks are authoritatively killed;
+        sub-agent tasks remain pending so incomplete delegated work still
+        fails closed.
+        """
+
+        settled = 0
+        for task_id, row in self._native_tasks.items():
+            if (
+                row.get("status") == "running"
+                and row.get("task_type") == "local_bash"
+            ):
+                self._settle_native_task(
+                    task_id,
+                    status="killed",
+                    source="controller_process_reap",
+                )
+                settled += 1
+        if settled:
+            self.append_event({
+                "type": "chatds.native-task.reconciled",
+                "source": "controller_process_reap",
+                "task_type": "local_bash",
+                "count": settled,
+            }, channel="controller")
+        return settled
+
+    def _settle_native_task(
+        self,
+        task_id: str,
+        *,
+        status: str,
+        source: str,
+    ) -> None:
+        if SAFE_NATIVE_TASK_ID.fullmatch(task_id) is None:
+            return
+        row = self._native_tasks.get(task_id)
+        if row is None:
+            row = {
+                "task_id": task_id,
+                "task_type": "unknown",
+                "status": status,
+                "terminal_source": source,
+            }
+            self._native_tasks[task_id] = row
+        elif row.get("status") == "running":
+            row["status"] = status
+            row["terminal_source"] = source
+        else:
+            return
+        if source in self._native_task_reconciliations:
+            self._native_task_reconciliations[source] += 1
+
+    def _observe_assistant_tool_calls(self, native: dict[str, Any]) -> None:
+        message = native.get("message")
+        if not isinstance(message, dict):
+            return
+        content = message.get("content")
+        if not isinstance(content, list):
+            return
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") not in {
+                "tool_use", "server_tool_use",
+            }:
+                continue
+            name = str(block.get("name") or "")
+            tool_use_id = str(block.get("id") or "")
+            arguments = block.get("input")
+            if not isinstance(arguments, dict):
+                continue
+            if name in {"TaskOutput", "AgentOutputTool", "BashOutputTool"}:
+                task_id = str(arguments.get("task_id") or "")
+                if (
+                    tool_use_id
+                    and SAFE_NATIVE_TASK_ID.fullmatch(task_id)
+                    and len(tool_use_id) <= 256
+                ):
+                    self._task_output_calls[tool_use_id] = task_id
+            elif name == "Skill":
+                raw_skill = str(
+                    arguments.get("skill")
+                    or arguments.get("name")
+                    or arguments.get("command")
+                    or ""
+                ).strip().lstrip("/")
+                skill_name = raw_skill.rsplit(":", 1)[-1]
+                if re.fullmatch(r"[A-Za-z0-9._-]{1,128}", skill_name):
+                    self._invoked_skill_names.add(skill_name)
+
+    def _observe_task_output_results(self, native: dict[str, Any]) -> None:
+        message = native.get("message")
+        if not isinstance(message, dict):
+            return
+        content = message.get("content")
+        if not isinstance(content, list):
+            return
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            tool_use_id = str(block.get("tool_use_id") or "")
+            task_id = self._task_output_calls.get(tool_use_id)
+            if not task_id or bool(block.get("is_error")):
+                continue
+            result_text = _tool_result_text(block.get("content"))
+            if len(result_text) > 1_000_000:
+                continue
+            retrieval = re.search(
+                r"<retrieval_status>\s*([^<]+?)\s*</retrieval_status>",
+                result_text,
+            )
+            status_match = re.search(
+                r"<status>\s*(completed|failed|killed)\s*</status>",
+                result_text,
+            )
+            result_task = re.search(
+                r"<task_id>\s*([^<]+?)\s*</task_id>",
+                result_text,
+            )
+            if (
+                retrieval is None
+                or retrieval.group(1).strip() != "success"
+                or status_match is None
+                or result_task is None
+                or result_task.group(1).strip() != task_id
+            ):
+                continue
+            self._settle_native_task(
+                task_id,
+                status=status_match.group(1),
+                source="task_output",
+            )
 
     def append_event(
         self,
@@ -532,6 +872,268 @@ def _emit_workspace_artifacts(
                 f"claude-workspace:{run_id}:{artifact_identity}"
             ),
         }, channel="controller")
+
+
+def _tool_result_text(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list):
+        return ""
+    parts: list[str] = []
+    for item in value:
+        if isinstance(item, dict) and item.get("type") == "text":
+            parts.append(str(item.get("text") or ""))
+    return "\n".join(parts)
+
+
+def _workspace_contract_pattern(value: object) -> str:
+    if not isinstance(value, str):
+        raise RuntimeError("artifact_contract_invalid")
+    pattern = value.strip().replace("\\", "/")
+    if (
+        not pattern
+        or pattern.startswith("/")
+        or "\x00" in pattern
+        or len(pattern.encode("utf-8")) > MAX_WORKSPACE_RELATIVE_PATH_BYTES
+        or any(part in {"", ".", ".."} for part in pattern.split("/"))
+    ):
+        raise RuntimeError("artifact_contract_invalid")
+    # Skill placeholders are data, not Harness policy.  At validation time
+    # each bounded placeholder denotes exactly one path-segment wildcard.
+    pattern = re.sub(r"\{[A-Za-z_][A-Za-z0-9_]{0,63}\}", "*", pattern)
+    if "{" in pattern or "}" in pattern:
+        raise RuntimeError("artifact_contract_invalid")
+    return pattern
+
+
+def _artifact_text_stats(path: Path) -> tuple[int, int]:
+    """Count lines and H1/H2 headings without buffering unbounded lines."""
+
+    line_count = 0
+    heading_count = 0
+    prefix = bytearray()
+    current_has_bytes = False
+
+    def finish_line() -> None:
+        nonlocal line_count, heading_count, prefix, current_has_bytes
+        line_count += 1
+        if re.match(rb" {0,3}#{1,2}[ \t]+\S", bytes(prefix)):
+            heading_count += 1
+        prefix = bytearray()
+        current_has_bytes = False
+
+    with path.open("rb") as stream:
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            parts = chunk.split(b"\n")
+            for index, part in enumerate(parts):
+                if part:
+                    current_has_bytes = True
+                    if len(prefix) < 1024:
+                        prefix.extend(part[:1024 - len(prefix)])
+                if index < len(parts) - 1:
+                    finish_line()
+    if current_has_bytes:
+        finish_line()
+    return line_count, heading_count
+
+
+def _validate_artifact_contracts(
+    *,
+    contracts: object,
+    invoked_skill_names: frozenset[str],
+    before: dict[str, tuple[int, ...]],
+    after: dict[str, tuple[int, ...]],
+    workspace_root: Path,
+) -> dict[str, Any]:
+    """Validate only contracts for Skills actually invoked this Turn.
+
+    Installed Skills remain ambient capabilities and must not force unrelated
+    turns to create artifacts.  A native ``Skill`` tool receipt activates the
+    corresponding immutable contract.  Final deliverables must be created or
+    mutated in this Turn; declared supporting modules may come from an earlier
+    failed Turn in the same Session so continuation recovery remains possible.
+    """
+
+    if contracts is None:
+        rows: list[object] = []
+    elif isinstance(contracts, list) and len(contracts) <= MAX_ARTIFACT_CONTRACTS:
+        rows = contracts
+    else:
+        raise RuntimeError("artifact_contract_invalid")
+    active: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise RuntimeError("artifact_contract_invalid")
+        skill_name = str(row.get("skill_name") or "")
+        if re.fullmatch(r"[A-Za-z0-9._-]{1,128}", skill_name) is None:
+            raise RuntimeError("artifact_contract_invalid")
+        if skill_name in invoked_skill_names:
+            active.append(row)
+    if not active:
+        return {
+            "status": "not_applicable",
+            "activated_contract_count": 0,
+            "finding_count": 0,
+            "findings": [],
+        }
+
+    changed = {
+        path for path, identity in after.items() if before.get(path) != identity
+    }
+    findings: list[dict[str, Any]] = []
+    validated: list[dict[str, Any]] = []
+
+    def finding(code: str, **values: Any) -> None:
+        if len(findings) < MAX_ARTIFACT_CONTRACT_FINDINGS:
+            findings.append({"code": code, **values})
+
+    for row in active:
+        skill_name = str(row["skill_name"])
+        final_pattern = _workspace_contract_pattern(
+            row.get("declared_final_artifact")
+        )
+        matches = sorted(
+            path for path in after
+            if fnmatch.fnmatchcase(path, final_pattern)
+        )
+        changed_matches = [path for path in matches if path in changed]
+        if not matches:
+            finding(
+                "artifact_final_missing",
+                skill_name=skill_name,
+                pattern=final_pattern,
+            )
+            continue
+        if not changed_matches:
+            finding(
+                "artifact_final_not_committed_this_turn",
+                skill_name=skill_name,
+                pattern=final_pattern,
+            )
+            continue
+        if len(changed_matches) != 1:
+            finding(
+                "artifact_final_ambiguous",
+                skill_name=skill_name,
+                pattern=final_pattern,
+                actual=len(changed_matches),
+            )
+            continue
+        relative = changed_matches[0]
+        identity = after[relative]
+        size_bytes = int(identity[3])
+        minimum = row.get("expected_min_bytes")
+        maximum = row.get("expected_max_bytes")
+        if isinstance(minimum, int) and not isinstance(minimum, bool):
+            if minimum < 0:
+                raise RuntimeError("artifact_contract_invalid")
+            if size_bytes < minimum:
+                finding(
+                    "artifact_min_bytes_not_met",
+                    skill_name=skill_name,
+                    path=relative,
+                    actual=size_bytes,
+                    expected=minimum,
+                )
+        elif minimum is not None:
+            raise RuntimeError("artifact_contract_invalid")
+        if isinstance(maximum, int) and not isinstance(maximum, bool):
+            if maximum < 0:
+                raise RuntimeError("artifact_contract_invalid")
+            if maximum and size_bytes > maximum:
+                finding(
+                    "artifact_max_bytes_exceeded",
+                    skill_name=skill_name,
+                    path=relative,
+                    actual=size_bytes,
+                    expected=maximum,
+                )
+        elif maximum is not None:
+            raise RuntimeError("artifact_contract_invalid")
+
+        min_lines = row.get("expected_min_lines")
+        max_lines = row.get("expected_max_lines")
+        min_headings = row.get("declared_section_count")
+        line_count: int | None = None
+        heading_count: int | None = None
+        if min_lines is not None or max_lines is not None or min_headings is not None:
+            for value in (min_lines, max_lines, min_headings):
+                if (
+                    value is not None
+                    and (
+                        isinstance(value, bool)
+                        or not isinstance(value, int)
+                        or value < 0
+                    )
+                ):
+                    raise RuntimeError("artifact_contract_invalid")
+            path = workspace_root / relative
+            try:
+                line_count, heading_count = _artifact_text_stats(path)
+            except OSError as exc:
+                raise RuntimeError("artifact_contract_audit_failed") from exc
+            if isinstance(min_lines, int) and line_count < min_lines:
+                finding(
+                    "artifact_min_lines_not_met",
+                    skill_name=skill_name,
+                    path=relative,
+                    actual=line_count,
+                    expected=min_lines,
+                )
+            if isinstance(max_lines, int) and max_lines and line_count > max_lines:
+                finding(
+                    "artifact_max_lines_exceeded",
+                    skill_name=skill_name,
+                    path=relative,
+                    actual=line_count,
+                    expected=max_lines,
+                )
+            if (
+                isinstance(min_headings, int)
+                and min_headings
+                and heading_count < min_headings
+            ):
+                finding(
+                    "artifact_declared_sections_not_met",
+                    skill_name=skill_name,
+                    path=relative,
+                    actual=heading_count,
+                    expected=min_headings,
+                )
+
+        declared_modules = row.get("declared_modular_files") or []
+        if (
+            not isinstance(declared_modules, list)
+            or len(declared_modules) > MAX_ARTIFACT_CONTRACT_FINDINGS
+        ):
+            raise RuntimeError("artifact_contract_invalid")
+        for declared in declared_modules:
+            module_pattern = _workspace_contract_pattern(declared)
+            if not any(
+                fnmatch.fnmatchcase(path, module_pattern) for path in after
+            ):
+                finding(
+                    "artifact_declared_module_missing",
+                    skill_name=skill_name,
+                    pattern=module_pattern,
+                )
+        validated.append({
+            "skill_name": skill_name,
+            "path": relative,
+            "size_bytes": size_bytes,
+            "line_count": line_count,
+            "heading_count": heading_count,
+        })
+    return {
+        "status": "failed" if findings else "passed",
+        "activated_contract_count": len(active),
+        "finding_count": len(findings),
+        "findings": findings,
+        "validated": validated,
+    }
 
 
 def _pending_plan_task_count(tasks_root: Path, native_session_id: str) -> int:
@@ -921,6 +1523,12 @@ def _run_child(
             leader_exited_at = None
     exit_code = int(_child.wait())
     _stop_process_group(_child)
+    # PID 1 has now synchronously reaped every process in the disposable Turn
+    # group.  Native local-bash notifications can legitimately be absent when
+    # TaskOutput was consumed directly or the parent returned first; convert
+    # only those OS-owned tasks to killed receipts.  Delegated agent tasks are
+    # deliberately left pending and continue to gate a successful terminal.
+    ledger.reconcile_worker_process_exit()
     feeder.join(timeout=5.0)
     return exit_code
 

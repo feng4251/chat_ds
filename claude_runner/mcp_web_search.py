@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import json
 import os
+import socket
+import ssl
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
@@ -14,6 +17,40 @@ from typing import Any
 MAX_QUERY_CHARS = 2_000
 MAX_RESULTS = 10
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+
+
+def _search_error(exc: BaseException) -> tuple[str, int | None]:
+    """Return a stable, non-secret upstream failure classification."""
+
+    if isinstance(exc, urllib.error.HTTPError):
+        status = int(exc.code) if 400 <= int(exc.code) <= 599 else None
+        return "upstream_http_error", status
+    if isinstance(exc, urllib.error.URLError):
+        reason = exc.reason
+        if isinstance(reason, (TimeoutError, socket.timeout)):
+            return "upstream_timeout", None
+        if isinstance(reason, socket.gaierror):
+            return "upstream_dns_error", None
+        if isinstance(reason, ssl.SSLCertVerificationError):
+            return "upstream_tls_certificate_invalid", None
+        if isinstance(reason, ssl.SSLError):
+            return "upstream_tls_error", None
+        return "upstream_transport_error", None
+    if isinstance(exc, json.JSONDecodeError):
+        return "search_response_invalid", None
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return "upstream_timeout", None
+    if isinstance(exc, ValueError) and str(exc) in {
+        "invalid_query", "invalid_max_results",
+    }:
+        return str(exc), None
+    if isinstance(exc, RuntimeError) and str(exc) in {
+        "search_endpoint_invalid",
+        "search_response_too_large",
+        "search_response_invalid",
+    }:
+        return str(exc), None
+    return "search_internal_error", None
 
 
 def _search(query: object, max_results: object = 5) -> str:
@@ -168,10 +205,14 @@ def _handle(message: dict[str, Any]) -> None:
                 "isError": False,
             })
         except Exception as exc:
+            code, status = _search_error(exc)
+            detail = f" code={code}"
+            if status is not None:
+                detail += f" status={status}"
             _reply(identifier, {
                 "content": [{
                     "type": "text",
-                    "text": f"web_search failed: {type(exc).__name__}",
+                    "text": "web_search failed:" + detail,
                 }],
                 "isError": True,
             })
