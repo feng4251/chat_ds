@@ -94,6 +94,7 @@ def materialize_claude_skill_view(
     sources: Iterable[SkillViewSource],
     enabled_tools: Iterable[str] = (),
     web_search_url: str = "",
+    market_data_url: str = "",
 ) -> ClaudeSkillView:
     """Publish one immutable plugin tree or reuse its verified digest path."""
 
@@ -184,6 +185,26 @@ def materialize_claude_skill_view(
             harness_egress_rules.append({
                 "capability": "web_search",
                 "url_prefix": normalized_search_url,
+                "methods": ["GET"],
+            })
+        if "market_quote" in enabled_tool_names:
+            normalized_market_url = _normalize_harness_market_data_url(
+                market_data_url
+            )
+            server_name = "chatds-market-data"
+            if server_name in mcp_servers:
+                raise SkillViewError(
+                    "Explicit Skill MCP identity conflicts with Harness capability"
+                )
+            mcp_servers[server_name] = {
+                "type": "stdio",
+                "command": "/usr/local/bin/python",
+                "args": ["-I", "/app/claude-runner/mcp_market_data.py"],
+                "env": {"CHATDS_MARKET_DATA_URL": normalized_market_url},
+            }
+            harness_egress_rules.append({
+                "capability": "market_quote",
+                "url_prefix": normalized_market_url,
                 "methods": ["GET"],
             })
         mcp_config_path = plugin / ".mcp.json"
@@ -301,6 +322,38 @@ def _normalize_harness_web_search_url(value: object) -> str:
         parsed.scheme,
         parsed.netloc,
         parsed.path.rstrip("/"),
+        "",
+        "",
+    ))
+
+
+def _normalize_harness_market_data_url(value: object) -> str:
+    """Validate the fixed typed quote-gateway coordinate."""
+
+    from urllib.parse import urlsplit, urlunsplit
+
+    if not isinstance(value, str) or not value or len(value) > 8192:
+        raise SkillViewError("Harness market-data URL is invalid")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise SkillViewError("Harness market-data URL is invalid") from exc
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or parsed.query
+        or port is not None and not 1 <= port <= 65535
+        or parsed.path.rstrip("/") != "/v1/quote"
+    ):
+        raise SkillViewError("Harness market-data URL is invalid")
+    return urlunsplit((
+        parsed.scheme,
+        parsed.netloc,
+        "/v1/quote",
         "",
         "",
     ))

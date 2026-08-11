@@ -523,6 +523,45 @@ class ClaudeSkillViewTests(unittest.TestCase):
             "methods": ["GET"],
         }])
 
+    def test_market_quote_compiles_typed_gateway_not_public_provider_origins(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            skill = root / "skills" / "renamed-holdout"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(
+                "Use only for museum provenance requests.",
+                encoding="utf-8",
+            )
+            view = materialize_claude_skill_view(
+                session_root=root / "session",
+                sources=[SimpleNamespace(
+                    name="renamed-holdout",
+                    scope="session",
+                    root=skill,
+                    bundle_id=None,
+                    bundle_role=None,
+                )],
+                enabled_tools=["market_quote"],
+                market_data_url="http://market-data.internal:8090/v1/quote",
+            )
+            mcp = json.loads((view.plugin_root / ".mcp.json").read_text())
+            manifest = json.loads((view.root / "manifest.json").read_text())
+        self.assertEqual(set(mcp["mcpServers"]), {"chatds-market-data"})
+        config = mcp["mcpServers"]["chatds-market-data"]
+        self.assertEqual(
+            config["env"]["CHATDS_MARKET_DATA_URL"],
+            "http://market-data.internal:8090/v1/quote",
+        )
+        self.assertEqual(manifest["harness_egress_rules"], [{
+            "capability": "market_quote",
+            "url_prefix": "http://market-data.internal:8090/v1/quote",
+            "methods": ["GET"],
+        }])
+        serialized = json.dumps(manifest)
+        self.assertNotIn("sinajs", serialized)
+        self.assertNotIn("gtimg", serialized)
+        self.assertNotIn("eastmoney", serialized)
+
     def test_harness_entrypoint_name_is_reserved(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

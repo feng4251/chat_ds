@@ -150,6 +150,37 @@ services:
       retries: 12
       start_period: 15s
 
+  market-data-gateway:
+    image: chat_ds-market-data-gateway
+    build:
+      context: ./market_data_gateway
+    container_name: chat_acits_market_data_gateway
+    restart: unless-stopped
+    init: true
+    user: "65532:65532"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 0.5
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    networks:
+      # The gateway is the only component that translates typed quote
+      # arguments into fixed public-provider requests. Agent Turns can reach
+      # only its private /v1/quote coordinate through the signed proxy.
+      - search_net
+      - browser_egress
+    healthcheck:
+      test: ["CMD", "python", "-I", "/app/server.py", "--healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
   executor:
     <<: *session-sandbox-slot
     container_name: chat_acits_executor
@@ -255,6 +286,8 @@ services:
     depends_on:
       skill-egress-proxy-socket-init:
         condition: service_completed_successfully
+      market-data-gateway:
+        condition: service_healthy
     init: true
     user: "65531:65531"
     group_add:
@@ -283,7 +316,7 @@ services:
       # merge them only at the trusted proxy boundary. Signed Turn policy must
       # still name the exact selected origin and /v1/messages request.
       SKILL_EGRESS_PRIVATE_ORIGIN_ALLOWLIST: >-
-        ${BROWSER_PRIVATE_ORIGIN_ALLOWLIST:-},${CLAUDE_PROVIDER_PRIVATE_ORIGIN_ALLOWLIST:-http://10.10.132.2:1025,http://10.10.132.126:1025,http://10.10.132.128:1025,http://searxng:8080}
+        ${BROWSER_PRIVATE_ORIGIN_ALLOWLIST:-},${CLAUDE_PROVIDER_PRIVATE_ORIGIN_ALLOWLIST:-http://10.10.132.2:1025,http://10.10.132.126:1025,http://10.10.132.128:1025,http://searxng:8080},${MARKET_DATA_PRIVATE_ORIGIN:-http://market-data-gateway:8090}
       # ``search_net`` is application-owned and has a fixed subnet below.
       # Hostname-based access to SearXNG still needs this independent DNS-pin
       # boundary; arbitrary private networks remain unavailable by default.
@@ -409,7 +442,7 @@ services:
       QWEN3_5_BASE_URL: ${QWEN3_5_BASE_URL:-http://10.10.132.128:1025/v1}
       QWEN3_5_API_KEY: ${QWEN3_5_API_KEY:-EMPTY}
       CLAUDE_PROVIDER_PRIVATE_ORIGIN_ALLOWLIST: >-
-        ${CLAUDE_PROVIDER_PRIVATE_ORIGIN_ALLOWLIST:-http://10.10.132.2:1025,http://10.10.132.126:1025,http://10.10.132.128:1025,http://searxng:8080}
+        ${CLAUDE_PROVIDER_PRIVATE_ORIGIN_ALLOWLIST:-http://10.10.132.2:1025,http://10.10.132.126:1025,http://10.10.132.128:1025,http://searxng:8080},${MARKET_DATA_PRIVATE_ORIGIN:-http://market-data-gateway:8090}
       # backend_protocol attests the existing ChatDS/Legacy model catalog.
       # Every Claude Turn below still uses ANTHROPIC_BASE_URL and the native
       # /v1/messages route; both local providers expose that facade.
@@ -595,6 +628,7 @@ services:
       WEB_SEARCH_PROVIDERS: ${WEB_SEARCH_PROVIDERS:-searxng}
       SEARXNG_BASE_URL: ${SEARXNG_BASE_URL:-http://searxng:8080}
       SEARXNG_TIMEOUT_SECONDS: ${SEARXNG_TIMEOUT_SECONDS:-10}
+      MARKET_DATA_URL: ${MARKET_DATA_URL:-http://market-data-gateway:8090/v1/quote}
       BROWSER_PRIVATE_ORIGIN_ALLOWLIST: ${BROWSER_PRIVATE_ORIGIN_ALLOWLIST:-}
       BROWSER_DNS_SYNTHETIC_PUBLIC_RANGES: ${BROWSER_DNS_SYNTHETIC_PUBLIC_RANGES:-}
       # Chromium is reachable only through a dedicated named-volume socket.
@@ -695,6 +729,7 @@ services:
       CLAUDE_CODE_ENGINE_ENABLED: ${CLAUDE_CODE_ENGINE_ENABLED:-true}
       DEFAULT_AGENT_ENGINE_ID: ${DEFAULT_AGENT_ENGINE_ID:-claude_code}
       CLAUDE_WEB_SEARCH_URL: ${CLAUDE_WEB_SEARCH_URL:-http://searxng:8080/search}
+      CLAUDE_MARKET_DATA_URL: ${CLAUDE_MARKET_DATA_URL:-http://market-data-gateway:8090/v1/quote}
       CLAUDE_RUNNER_URL: http://claude-runner-supervisor:8030
       CLAUDE_RUNNER_STREAM_TIMEOUT_SECONDS: ${CLAUDE_RUNNER_STREAM_TIMEOUT_SECONDS:-18000}
       CLAUDE_CODE_PROVIDER_PROFILES: >-

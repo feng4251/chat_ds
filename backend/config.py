@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     claude_runner_stream_timeout_seconds: int = 18000
     claude_code_provider_profiles: list[str] = ["shaiengine"]
     claude_web_search_url: str = "http://searxng:8080/search"
+    claude_market_data_url: str = (
+        "http://market-data-gateway:8090/v1/quote"
+    )
     internal_api_token: str = "chat-ds-internal-token"
     scheduler_poll_seconds: int = 15
     hook_timeout_seconds: int = 8

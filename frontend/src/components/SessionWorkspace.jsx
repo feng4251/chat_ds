@@ -20,7 +20,7 @@ import {
 
 const TOOL_GROUPS = {
   '文件与执行': ['read_file', 'write_file', 'patch_file', 'search_files', 'execute_code'],
-  '网络与浏览器': ['web_search', 'web_extract', 'browser_navigate', 'browser_snapshot', 'browser_click', 'browser_type', 'browser_scroll', 'browser_back'],
+  '网络与浏览器': ['web_search', 'web_extract', 'market_quote', 'browser_navigate', 'browser_snapshot', 'browser_click', 'browser_type', 'browser_scroll', 'browser_back'],
   '知识与会话': ['memory', 'session_search', 'sessions_list', 'sessions_history', 'sessions_send', 'sessions_fork', 'session_status', 'skills_list', 'skill_view', 'skill_manage'],
   '协作与自动化': ['todo', 'clarify', 'delegate_task', 'cronjob', 'get_goal', 'create_goal', 'update_goal'],
   '多模态与扩展': ['image_generate', 'vision_analyze', 'mcp_server_list', 'mcp_server_status'],
@@ -31,6 +31,7 @@ const TOOL_POLICY_BADGES = {
   search_files: ['read-only'],
   web_search: ['read-only'],
   web_extract: ['read-only'],
+  market_quote: ['read-only', 'typed-egress'],
   browser_snapshot: ['read-only'],
   write_file: ['workspace', 'parallel-child-off'],
   patch_file: ['workspace', 'parallel-child-off'],

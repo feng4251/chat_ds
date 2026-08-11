@@ -481,6 +481,80 @@ class RunnerEgressPolicyTests(unittest.TestCase):
             allowed["private_origins"],
         )
 
+    def test_typed_market_capability_has_only_internal_gateway_authority(self):
+        rule = {
+            "capability": "market_quote",
+            "url_prefix": "http://market-data.internal:8090/v1/quote",
+            "methods": ["GET"],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            view, digest = self._view(
+                Path(temporary),
+                harness_egress_rules=[rule],
+            )
+            policy = compile_turn_egress_policy(
+                skill_view_root=view,
+                skill_view_sha256=digest,
+                user_turn_text="latest quote without any URL",
+                provider_base_url="https://api.example.test",
+                configured_private_origins=(
+                    "http://market-data.internal:8090",
+                ),
+                budget_scope_sha256=hashlib.sha256(b"budget").hexdigest(),
+                call_id_sha256=hashlib.sha256(b"call").hexdigest(),
+                limits={
+                    "max_outbound_bytes": 1024,
+                    "max_requests": 10,
+                    "max_response_wire_bytes": 4096,
+                },
+            )
+        self.assertIn(
+            "http://market-data.internal:8090",
+            policy["private_origins"],
+        )
+        market_rules = [
+            row for row in policy["egress_rules"]
+            if "market-data.internal" in row["url_prefix"]
+        ]
+        self.assertEqual(market_rules, [{
+            "url_prefix": "http://market-data.internal:8090/v1/quote",
+            "methods": ["GET"],
+        }])
+        self.assertFalse(any(
+            provider in row["url_prefix"]
+            for row in policy["egress_rules"]
+            for provider in ("sinajs", "gtimg", "eastmoney")
+        ))
+
+    def test_unknown_harness_capability_cannot_mint_egress(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            view, digest = self._view(
+                Path(temporary),
+                harness_egress_rules=[{
+                    "capability": "arbitrary_http",
+                    "url_prefix": "https://attacker.invalid/",
+                    "methods": ["GET"],
+                }],
+            )
+            with self.assertRaisesRegex(
+                ClaudeEgressPolicyError,
+                "Harness capability rule is malformed",
+            ):
+                compile_turn_egress_policy(
+                    skill_view_root=view,
+                    skill_view_sha256=digest,
+                    user_turn_text="fixture",
+                    provider_base_url="https://api.example.test",
+                    configured_private_origins=(),
+                    budget_scope_sha256=hashlib.sha256(b"budget").hexdigest(),
+                    call_id_sha256=hashlib.sha256(b"call").hexdigest(),
+                    limits={
+                        "max_outbound_bytes": 1024,
+                        "max_requests": 10,
+                        "max_response_wire_bytes": 4096,
+                    },
+                )
+
     def test_policy_has_only_declared_user_and_provider_coordinates(self):
         with tempfile.TemporaryDirectory() as temporary:
             view, digest = self._view(Path(temporary))
