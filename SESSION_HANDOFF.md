@@ -1,6 +1,44 @@
-# ChatDS 当前会话交接（2026-08-10）
+# ChatDS 当前会话交接（2026-08-11）
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
+
+## 2026-08-11 `request_url_not_allowed` 与类型化实时行情闭环
+
+- conversation `63a312df7a1d462fac00ac0926381de3` 已按三源证据闭环。持久化对话中的最后一轮要求查询
+  德明利实时股价；四个 Claude primary run 均为 `succeeded/end_turn`，最后一轮实际通过 Bash 请求
+  新浪、腾讯与东方财富公网接口时被 Turn bridge 返回 `request_url_not_allowed`，随后 Web 搜索虽成功但
+  只能给出陈旧摘要。对应 immutable Skill view digest 为
+  `4eee910b17659a55da8509d3ebb500ed502d609586ae41758e88220f0819cb12`，包含 TrialSim 主 Skill 与
+  18 个生物医学 supporting Skills，没有行情 provider 声明；Skill router 也没有错误强制调用 TrialSim。
+  出站 receipt 同期为 8 次 accepted、无预算拒绝或耗尽。因此根因不是容器断网、模型中断、Skill 编译
+  或 SearXNG 故障，而是 Harness 缺少受控的实时行情 capability；任意模型生成 URL 没有签名 authority
+  时被 fail-closed 拒绝是正确安全边界。
+- 通用不变量为：模型生成的任意 Bash URL 永远不能自行成为出站权限；需要时效性和结构化语义的外部数据，
+  必须经 deployment-owned、typed、固定上游、只读、限时限量的 broker 获取。提交
+  `3143bda7 feat: broker typed market quotes for isolated turns` 新增独立、非 root、read-only 的
+  `market-data-gateway`，只接受严格的 market/symbol/exchange 字段，不接受 URL、任意 query、额外字段或
+  非 GET 请求；固定使用腾讯主源与新浪交叉核验并返回来源时间和 freshness。ClaudeCodeEngine 通过
+  `chatds-market-data` stdio MCP 暴露唯一 `market_quote` 工具，Legacy Harness 通过同名 typed tool
+  使用同一网关。Turn 容器继续 `network=none`，只把内部 `/v1/quote` 精确 GET 权限编入当轮签名 policy；
+  新浪、腾讯、东方财富公网 origin 不会进入模型可见 authority。
+- 成熟实现对照冻结本地独立 `claude-code/` commit
+  `6f6f12b37f529488b10e53928dd5508bb93535c7`。采用其 strict MCP configuration、typed tool schema、
+  显式工具/权限装配模式，并适配到 ChatDS 既有 authority/receipt 合约；拒绝其仅适用于无网 sandbox 的
+  bypass 思路。这里没有行情代码、证券代码、conversation/Skill ID 或 V2.3 特判；同类新数据域应新增
+  typed capability 或由 Skill/MCP 明确声明 authority，不能扩大通用 Bash 权限。
+- 回归结果：Gateway/MCP 目标套件分别 7 项及 4 个 subtests 通过，Legacy 行情工具 2 项通过；Backend
+  `276 passed`；Claude Runner/Supervisor `56 passed, 1 skipped, 7 subtests`；Egress Proxy 与 Gateway
+  `81 passed`；Frontend `24 passed`、production build 与 targeted ESLint 通过；Compose、py_compile、
+  `git diff --check` 通过。Harness 全套约 1,939 项中 10 项因当前本地 `cc` 测试进程无权读取
+  `/nfs/temp/chat_ds/*/.chatds-session-tombstones/*.deleted` 而失败，其中一个 delegation timeout 是同一
+  前置权限问题的下游现象；没有为使测试通过而削弱跨 Session 文件边界。
+- 生产由 commit `3143bda7` 的 exact clean archive 构建并部署。部署前确认无 active run/session，完成
+  SQLite online backup，并保留 `rollback-12c30348` 镜像标签。当前 Gateway、Egress Proxy、Runner
+  Supervisor、Harness、Backend 均 healthy，Frontend 与 Runner image anchor 正常运行，restart=0；
+  `/api/health` 和目标 Session 页面均为 200。生产 MCP JSONL smoke 只列出 `market_quote`，并对 CN
+  `001309` 返回腾讯主源与新浪核验一致的实时报价。该既有 Session 的 `enabled_tools` 为空，下一 Turn
+  会自动继承包含 `market_quote` 的新默认能力，无需重新上传 Skill 或新建 Session。公网行情端点仍可能
+  变更；网关会显式报告 source failure 并 fail closed，而不会退化为任意网络访问。
 
 ## 2026-08-11 `172.30.100.128:5173` 前端转发入口
 
