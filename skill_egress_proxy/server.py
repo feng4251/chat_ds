@@ -4,9 +4,11 @@ The worker container has ``network_mode:none``. This separately networked
 service is its only egress path, so changing browser flags or ignoring proxy
 environment variables cannot create a direct route. Every request must match
 an authenticated method-and-URL-prefix rule before its destination is resolved,
-classified, and pinned.
+classified, and pinned. A deployment may additionally sign the fixed public
+GET/HEAD-on-80/443 profile; it strips caller headers and never authorizes a
+request body or a non-public address.
 
-This is deliberately not a general forward proxy.  It supports the two forms
+This is deliberately not an unrestricted forward proxy. It supports the two forms
 used by browsers (CONNECT for HTTPS and absolute-form HTTP), limits ports,
 blocks non-public addresses by default, and never logs URL paths. Every
 connection carries a fresh authenticated method-and-URL-prefix policy; its
@@ -46,7 +48,7 @@ from urllib.parse import urlsplit, urlunsplit
 LISTEN_HOST: Final[str] = os.environ.get("SKILL_EGRESS_LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT: Final[int] = int(os.environ.get("SKILL_EGRESS_LISTEN_PORT", "8080"))
 LISTEN_SOCKET: Final[str] = os.environ.get("SKILL_EGRESS_SOCKET_PATH", "").strip()
-EGRESS_POLICY_RUNTIME_VERSION: Final[str] = "signed-exact-query-v1"
+EGRESS_POLICY_RUNTIME_VERSION: Final[str] = "signed-public-read-v1"
 CONNECT_TIMEOUT_SECONDS: Final[float] = float(
     os.environ.get("SKILL_EGRESS_CONNECT_TIMEOUT_SECONDS", "10")
 )
@@ -255,6 +257,7 @@ class SignedEgressPolicy:
     origins: frozenset[Origin]
     rules: tuple[ExactEgressRule, ...]
     private_origins: frozenset[Origin]
+    public_read: bool = False
     version: int = 2
     budget_scope_sha256: str | None = None
     call_id_sha256: str | None = None
@@ -535,6 +538,7 @@ def _validated_signed_egress_policy(
     budget_scope_sha256: object = None,
     call_id_sha256: object = None,
     limits_raw: object = None,
+    public_read_raw: object = None,
 ) -> SignedEgressPolicy:
     """Compile and cross-check one authenticated version-2/3 policy."""
 
@@ -546,6 +550,7 @@ def _validated_signed_egress_policy(
                 budget_scope_sha256,
                 call_id_sha256,
                 limits_raw,
+                public_read_raw,
             )
         ):
             raise ProxyPolicyError("invalid_policy_preface")
@@ -582,6 +587,17 @@ def _validated_signed_egress_policy(
         )
     else:
         raise ProxyPolicyError("invalid_policy_preface")
+
+    public_read = False
+    if version == 3 and public_read_raw is not None:
+        if (
+            not isinstance(public_read_raw, dict)
+            or set(public_read_raw) != {"methods", "ports"}
+            or public_read_raw.get("methods") != ["GET", "HEAD"]
+            or public_read_raw.get("ports") != [80, 443]
+        ):
+            raise ProxyPolicyError("invalid_policy_preface")
+        public_read = True
 
     if (
         not isinstance(origins_raw, list)
@@ -678,6 +694,7 @@ def _validated_signed_egress_policy(
         origins=frozenset(ordered_origins),
         rules=tuple(compiled_rules),
         private_origins=frozenset(ordered_private),
+        public_read=public_read,
         version=version,
         budget_scope_sha256=(
             budget_scope_sha256 if version == 3 else None
@@ -931,6 +948,60 @@ def _authorize_exact_request(
             continue
         return
     raise ProxyPolicyError("request_url_not_allowed")
+
+
+def _authorize_request(
+    policy: SignedEgressPolicy,
+    origin: Origin,
+    forwarded: bytes,
+) -> str:
+    """Return the narrowest signed authority that admits one request."""
+
+    try:
+        _authorize_exact_request(policy, origin, forwarded)
+        return "exact"
+    except ProxyPolicyError as exc:
+        if str(exc) != "request_url_not_allowed":
+            raise
+    method, _path, _query = _request_policy_coordinate(forwarded, origin)
+    expected_port = 443 if origin.scheme == "https" else 80
+    if (
+        not policy.public_read
+        or method not in {"GET", "HEAD"}
+        or origin.port != expected_port
+    ):
+        raise ProxyPolicyError("request_url_not_allowed")
+    return "public_read"
+
+
+def _sanitize_public_read_request(
+    forwarded: bytes,
+    origin: Origin,
+) -> bytes:
+    """Remove caller-controlled headers/body from generic public reads.
+
+    Exact Skill/MCP/provider grants keep their protocol headers. The ambient
+    public-read fallback exposes only the unavoidable destination/path/query
+    plus a fixed, credential-free HTTP envelope.
+    """
+
+    framing = _validated_request_body_framing(forwarded)
+    if framing.content_length or framing.initial_body:
+        raise ProxyPolicyError("read_only_http_method_body_not_allowed")
+    request_line = framing.header.split(b"\r\n", 1)[0]
+    method = request_line.split(b" ", 1)[0]
+    if method not in {b"GET", b"HEAD"}:
+        raise ProxyPolicyError("request_method_not_allowed")
+    return b"\r\n".join((
+        request_line,
+        b"Host: " + _canonical_http_host_header(origin),
+        b"User-Agent: ChatDS-PublicRead/1.0",
+        b"Accept: */*",
+        b"Accept-Encoding: identity",
+        b"Connection: close",
+        b"",
+        b"",
+    ))
 
 
 def _run_openssl(
@@ -2259,6 +2330,7 @@ def _read_policy_preface(
         "budget_scope_sha256",
         "call_id_sha256",
         "limits",
+        "public_read",
     }
     expected_fields = (
         base_fields | v3_fields if version == 3 else base_fields
@@ -2304,6 +2376,7 @@ def _read_policy_preface(
     }
     if version == 3:
         unsigned.update({
+            "public_read": payload["public_read"],
             "budget_scope_sha256": payload["budget_scope_sha256"],
             "call_id_sha256": payload["call_id_sha256"],
             "limits": payload["limits"],
@@ -2344,6 +2417,7 @@ def _read_policy_preface(
             ),
             call_id_sha256=payload.get("call_id_sha256"),
             limits_raw=payload.get("limits"),
+            public_read_raw=payload.get("public_read"),
         ),
         remainder,
     )
@@ -2409,6 +2483,7 @@ class AddressPolicy:
         signed_private_origins: (
             Iterable[Origin | tuple[str, str, int]] | None
         ) = None,
+        public_read: bool = False,
     ) -> Destination:
         """Authorize, resolve, classify, and pin one exact request origin.
 
@@ -2420,7 +2495,8 @@ class AddressPolicy:
 
         origin = _normalized_origin(scheme, host, port)
         allowed_origins = normalize_origin_allowlist(origin_allowlist)
-        if origin not in allowed_origins:
+        exact_origin = origin in allowed_origins
+        if not exact_origin and not public_read:
             raise ProxyPolicyError("destination_origin_not_allowed")
 
         signed_private = normalize_origin_allowlist(
@@ -2431,9 +2507,15 @@ class AddressPolicy:
                 "signed_private_origin_not_allowed"
             )
         private_grant = (
+            exact_origin
+            and
             origin in self.private_origins
             and origin in signed_private
         )
+        if public_read and not exact_origin:
+            expected_port = 443 if origin.scheme == "https" else 80
+            if port != expected_port:
+                raise ProxyPolicyError("destination_port_not_allowed")
         if not private_grant and port not in self.public_ports:
             raise ProxyPolicyError("destination_port_not_allowed")
 
@@ -3259,14 +3341,24 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                     scheme = next(
                         iter(matching_connect_origins)
                     ).scheme
+                elif signed_policy.public_read:
+                    if port == 80:
+                        scheme = "http"
+                    elif port == 443:
+                        scheme = "https"
+                    else:
+                        raise ProxyPolicyError(
+                            "destination_port_not_allowed"
+                        )
             requested_origin = _normalized_origin(
                 scheme,
                 host,
                 port,
             )
             framing: _RequestBodyFraming | None = None
+            authority_mode: str | None = None
             if forwarded:
-                _authorize_exact_request(
+                authority_mode = _authorize_request(
                     signed_policy,
                     requested_origin,
                     forwarded,
@@ -3275,6 +3367,14 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                 framing = _validated_request_body_framing(
                     forwarded
                 )
+                if authority_mode == "public_read":
+                    forwarded = _sanitize_public_read_request(
+                        forwarded,
+                        requested_origin,
+                    )
+                    framing = _validated_request_body_framing(
+                        forwarded
+                    )
                 if budget is not None:
                     budget.consume_outbound(
                         _normalized_outbound_wire_bytes(framing)
@@ -3292,6 +3392,7 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                     signed_private_origins=(
                         signed_policy.private_origins
                     ),
+                    public_read=(authority_mode == "public_read"),
                 )
             if forwarded:
                 assert destination is not None
@@ -3360,11 +3461,19 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                     framing = _validated_request_body_framing(
                         forwarded_http
                     )
-                    _authorize_exact_request(
+                    authority_mode = _authorize_request(
                         signed_policy,
                         requested_origin,
                         forwarded_http,
                     )
+                    if authority_mode == "public_read":
+                        forwarded_http = _sanitize_public_read_request(
+                            forwarded_http,
+                            requested_origin,
+                        )
+                        framing = _validated_request_body_framing(
+                            forwarded_http
+                        )
                     if budget is not None:
                         budget.consume_outbound(
                             _normalized_outbound_wire_bytes(framing)
@@ -3377,6 +3486,9 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                             origin_allowlist=trusted_origins,
                             signed_private_origins=(
                                 signed_policy.private_origins
+                            ),
+                            public_read=(
+                                authority_mode == "public_read"
                             ),
                         )
                 except ProxyPolicyError as exc:
@@ -3465,11 +3577,19 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                 framing = _validated_request_body_framing(
                     forwarded_https,
                 )
-                _authorize_exact_request(
+                authority_mode = _authorize_request(
                     signed_policy,
                     exact_origin,
                     forwarded_https,
                 )
+                if authority_mode == "public_read":
+                    forwarded_https = _sanitize_public_read_request(
+                        forwarded_https,
+                        exact_origin,
+                    )
+                    framing = _validated_request_body_framing(
+                        forwarded_https
+                    )
                 if budget is not None:
                     budget.consume_outbound(
                         _normalized_outbound_wire_bytes(framing)
@@ -3482,6 +3602,9 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                         origin_allowlist=trusted_origins,
                         signed_private_origins=(
                             signed_policy.private_origins
+                        ),
+                        public_read=(
+                            authority_mode == "public_read"
                         ),
                     )
                     self.upstream_tls_policy.authorize(

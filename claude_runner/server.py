@@ -49,7 +49,7 @@ MAX_WORKSPACE_ENTRIES = 200_000
 SECCOMP_PROFILE_PATH = Path("/app/claude_runner/seccomp_profile.json")
 SETID_STRIPPED_LABEL = "org.opencontainers.image.chatds.setid-stripped"
 EGRESS_POLICY_LABEL = "org.opencontainers.image.chatds.egress-policy"
-EXPECTED_EGRESS_POLICY_RUNTIME = "signed-exact-query-v1"
+EXPECTED_EGRESS_POLICY_RUNTIME = "signed-public-read-v1"
 EXPECTED_SKILL_PLUGIN_NAME = "chatds-session-skills"
 EXPECTED_SKILL_ENTRYPOINT_NAME = "chatds-harness-session-entry"
 _STATUS_UPDATE_LOCK = threading.RLock()
@@ -215,6 +215,9 @@ class RunManager:
             ),
             call_id_sha256=_scope_digest("call", request.root_run_id, request.run_id),
             limits=dict(self.settings.egress_limits),
+            public_read_enabled=(
+                self.settings.public_read_egress_enabled
+            ),
         )
         if self._admission_cancelled(request.run_id):
             raise _PreflightCancelled
@@ -1951,7 +1954,9 @@ async def health(_auth=Depends(_require_internal_token)):
     return {
         "status": "ok",
         "claude_version": image.labels.get("org.opencontainers.image.version", "unknown"),
-        "network_policy": "network-none+signed-exact-egress-v3",
+        "network_policy": (
+            "network-none+signed-exact-and-public-read-egress-v3"
+        ),
         "security_mode": manager.settings.security_mode,
     }
 

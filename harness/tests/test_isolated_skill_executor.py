@@ -49,6 +49,43 @@ def _artifact(path: str, content: bytes, *, change: str = "created") -> dict[str
 
 
 class IsolatedSkillExecutorClientTests(unittest.TestCase):
+    def test_public_read_request_is_budgeted_without_wildcard_origin(self) -> None:
+        request, encoded = client.build_declared_command_request(
+            skill_root=self.skill,
+            workspace=self.workspace,
+            executable="python",
+            public_read={
+                "methods": ["GET", "HEAD"],
+                "ports": [80, 443],
+            },
+            budget_scope_sha256="a" * 64,
+            call_id_sha256="b" * 64,
+        )
+        self.assertEqual(3, request["egress_policy_version"])
+        self.assertEqual([], request["egress_origins"])
+        self.assertEqual([], request["egress_rules"])
+        self.assertEqual(request, json.loads(encoded))
+
+        for malformed in (
+            {"methods": ["GET", "POST"], "ports": [80, 443]},
+            {"methods": ["GET", "HEAD"], "ports": [80, 443, 8443]},
+            {
+                "methods": ["GET", "HEAD"],
+                "ports": [80, 443],
+                "hosts": ["*"],
+            },
+        ):
+            with self.subTest(profile=malformed), self.assertRaises(
+                client.IsolatedSkillExecutorError
+            ):
+                client.build_declared_command_request(
+                    skill_root=self.skill,
+                    workspace=self.workspace,
+                    executable="python",
+                    public_read=malformed,
+                    budget_scope_sha256="a" * 64,
+                    call_id_sha256="b" * 64,
+                )
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.root = Path(self.tempdir.name)
@@ -433,6 +470,7 @@ class IsolatedSkillExecutorClientTests(unittest.TestCase):
             "origins": request["egress_origins"],
             "egress_rules": request["egress_rules"],
             "private_origins": request["private_origins"],
+            "public_read": None,
         }
         audit = {
             "profile": "bounded_controlled_exchange",

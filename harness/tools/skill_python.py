@@ -533,7 +533,7 @@ async def run_skill_python(
                 context,
                 operation="skill_python",
             )
-            if egress_policy.rules
+            if egress_policy.has_authority
             else None
         )
     except (
@@ -579,12 +579,13 @@ async def run_skill_python(
                 {
                     "egress_rules": egress_policy.rule_payload(),
                     "private_origins": egress_policy.private_origins,
+                    "public_read": egress_policy.public_read_payload(),
                     "budget_scope_sha256": (
                         egress_budget_binding.budget_scope_sha256
                     ),
                     "call_id_sha256": egress_budget_binding.call_id_sha256,
                 }
-                if egress_policy.rules else {}
+                if egress_policy.has_authority else {}
             ),
             **(
                 {
@@ -614,7 +615,7 @@ async def run_skill_python(
             "script_path": display_path,
             "cwd": cwd,
             "network": (
-                "controlled_egress" if egress_policy.rules else "disabled"
+                "controlled_egress" if egress_policy.has_authority else "disabled"
             ),
             "isolated_execution": True,
             "managed_fallback": False,

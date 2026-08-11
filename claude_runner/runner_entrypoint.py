@@ -81,6 +81,7 @@ def main() -> int:
                 origin_allowlist=tuple(policy["origin_allowlist"]),
                 egress_rules=tuple(policy["egress_rules"]),
                 private_origins=tuple(policy["private_origins"]),
+                public_read=policy.get("public_read"),
                 policy_token=os.environ.get("SKILL_EGRESS_POLICY_TOKEN"),
                 trust_generation=trust["SKILL_EGRESS_TRUST_GENERATION"],
                 budget_scope_sha256=policy["budget_scope_sha256"],

@@ -481,6 +481,33 @@ class RunnerEgressPolicyTests(unittest.TestCase):
             allowed["private_origins"],
         )
 
+    def test_public_read_profile_is_signed_data_not_wildcard_rules(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            view, digest = self._view(Path(temporary))
+            policy = compile_turn_egress_policy(
+                skill_view_root=view,
+                skill_view_sha256=digest,
+                user_turn_text="inspect a renamed public documentation site",
+                provider_base_url="https://api.example.test",
+                configured_private_origins=(),
+                budget_scope_sha256=hashlib.sha256(b"budget").hexdigest(),
+                call_id_sha256=hashlib.sha256(b"call").hexdigest(),
+                limits={
+                    "max_outbound_bytes": 1024,
+                    "max_requests": 10,
+                    "max_response_wire_bytes": 4096,
+                },
+                public_read_enabled=True,
+            )
+        self.assertEqual(policy["public_read"], {
+            "methods": ["GET", "HEAD"],
+            "ports": [80, 443],
+        })
+        self.assertFalse(any(
+            "*" in row["url_prefix"]
+            for row in policy["egress_rules"]
+        ))
+
     def test_typed_market_capability_has_only_internal_gateway_authority(self):
         rule = {
             "capability": "market_quote",

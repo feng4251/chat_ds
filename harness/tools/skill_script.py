@@ -200,7 +200,7 @@ async def run_skill_script(
                 context,
                 operation="skill_script",
             )
-            if egress_policy.rules
+            if egress_policy.has_authority
             else None
         )
     except (
@@ -248,12 +248,13 @@ async def run_skill_script(
                 {
                     "egress_rules": egress_policy.rule_payload(),
                     "private_origins": egress_policy.private_origins,
+                    "public_read": egress_policy.public_read_payload(),
                     "budget_scope_sha256": (
                         egress_budget_binding.budget_scope_sha256
                     ),
                     "call_id_sha256": egress_budget_binding.call_id_sha256,
                 }
-                if egress_policy.rules else {}
+                if egress_policy.has_authority else {}
             ),
             **(
                 {
@@ -279,7 +280,7 @@ async def run_skill_script(
             execution_runtime="isolated_skill_executor",
             network=(
                 "controlled_egress"
-                if egress_policy.rules
+                if egress_policy.has_authority
                 else "disabled"
             ),
             fallback_attempted=False,
@@ -290,7 +291,9 @@ async def run_skill_script(
     payload["execution_runtime"] = "isolated_skill_executor"
     payload["environment_policy"] = "ephemeral_snapshot_no_secrets"
     payload["egress_policy"] = (
-        "compiled_exact_url_policy" if egress_policy.rules else "none"
+        "controlled_public_read_or_exact_policy"
+        if egress_policy.has_authority
+        else "none"
     )
     payload["runtime_preflight"] = runtime_preflight
     payload["fallback_attempted"] = False

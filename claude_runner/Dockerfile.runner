@@ -26,8 +26,8 @@ ARG CLAUDE_CODE_VERSION=2.1.152
 
 LABEL org.opencontainers.image.title="ChatDS isolated Claude Code Turn runner" \
       org.opencontainers.image.version="${CLAUDE_CODE_VERSION}" \
-      org.opencontainers.image.chatds.network="none+signed-exact-egress-v3" \
-      org.opencontainers.image.chatds.egress-policy="signed-exact-query-v1" \
+      org.opencontainers.image.chatds.network="none+signed-exact-and-public-read-egress-v3" \
+      org.opencontainers.image.chatds.egress-policy="signed-public-read-v1" \
       org.opencontainers.image.chatds.workspace-scope="one-session" \
       org.opencontainers.image.chatds.setid-stripped="true"
 
@@ -46,7 +46,7 @@ RUN ln -s /opt/chatds-claude-code/node_modules/.bin/claude /usr/local/bin/claude
     && getcap -r / 2>/dev/null | cut -d ' ' -f 1 | xargs -r setcap -r \
     && test -z "$(find / -xdev -type f -perm /6000 -print -quit)" \
     && test -z "$(getcap -r / 2>/dev/null)" \
-    && test "$(python -I -c 'from chatds_browser_runtime.proxy_bridge import EGRESS_POLICY_RUNTIME_VERSION; print(EGRESS_POLICY_RUNTIME_VERSION)')" = "signed-exact-query-v1" \
+    && test "$(python -I -c 'from chatds_browser_runtime.proxy_bridge import EGRESS_POLICY_RUNTIME_VERSION; print(EGRESS_POLICY_RUNTIME_VERSION)')" = "signed-public-read-v1" \
     && claude --version | grep -F "${CLAUDE_CODE_VERSION}"
 
 USER 0:0

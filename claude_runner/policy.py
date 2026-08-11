@@ -1,4 +1,4 @@
-"""Compile one exact, auditable outbound policy for a Claude Turn."""
+"""Compile one auditable exact/private/public-read policy for a Claude Turn."""
 
 from __future__ import annotations
 
@@ -54,6 +54,7 @@ def compile_turn_egress_policy(
     budget_scope_sha256: str,
     call_id_sha256: str,
     limits: dict[str, int],
+    public_read_enabled: bool = False,
 ) -> dict[str, Any]:
     # The Supervisor attests the immutable view before compiling execution
     # authority.  Accept that exact receipt so one start transaction never
@@ -232,6 +233,11 @@ def compile_turn_egress_policy(
         "origin_allowlist": list(origins),
         "egress_rules": rule_payloads,
         "private_origins": list(private_origins),
+        "public_read": (
+            {"methods": ["GET", "HEAD"], "ports": [80, 443]}
+            if public_read_enabled
+            else None
+        ),
         "budget_scope_sha256": _sha256_identity(budget_scope_sha256),
         "call_id_sha256": _sha256_identity(call_id_sha256),
         "limits": _validated_limits(limits),

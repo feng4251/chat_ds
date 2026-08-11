@@ -2078,7 +2078,9 @@ def _requested_v1_egress_policy(payload: dict[str, Any]) -> str:
 
     rules = payload.get("egress_rules", [])
     return (
-        "origin_allowlist_proxy"
+        "controlled_egress_proxy"
+        if payload.get("public_read") is not None
+        else "origin_allowlist_proxy"
         if isinstance(rules, list) and bool(rules)
         else "none"
     )
@@ -2673,6 +2675,7 @@ def _validated_exact_egress_policy(
 ) -> tuple[
     tuple[dict[str, Any], ...],
     tuple[str, ...],
+    dict[str, Any] | None,
     tuple[str, ...],
 ]:
     raw_rules = payload.get("egress_rules", [])
@@ -2722,12 +2725,27 @@ def _validated_exact_egress_policy(
             "methods": list(canonical_methods),
             "url_prefix": prefix,
         })
-    if raw_rules and payload.get("egress_policy_version") not in {2, 3}:
+    public_read_raw = payload.get("public_read")
+    public_read: dict[str, Any] | None = None
+    if public_read_raw is not None:
+        if (
+            not isinstance(public_read_raw, dict)
+            or set(public_read_raw) != {"methods", "ports"}
+            or public_read_raw.get("methods") != ["GET", "HEAD"]
+            or public_read_raw.get("ports") != [80, 443]
+        ):
+            raise ProtocolError(
+                "invalid_egress_policy",
+                "Public-read egress must use the fixed GET/HEAD ports 80/443 profile.",
+            )
+        public_read = {"methods": ["GET", "HEAD"], "ports": [80, 443]}
+    has_authority = bool(raw_rules or public_read)
+    if has_authority and payload.get("egress_policy_version") not in {2, 3}:
         raise ProtocolError(
             "invalid_egress_policy",
             "Exact sandbox egress requires policy version 2 or 3.",
         )
-    if not raw_rules and payload.get("egress_policy_version") not in {
+    if not has_authority and payload.get("egress_policy_version") not in {
         None, 2,
     }:
         raise ProtocolError(
@@ -2758,7 +2776,12 @@ def _validated_exact_egress_policy(
             "invalid_egress_policy",
             "Private sandbox origins must be derived from exact URL rules.",
         )
-    return tuple(rules), origins, private_origins
+    if public_read is not None and payload.get("egress_policy_version") != 3:
+        raise ProtocolError(
+            "invalid_egress_policy",
+            "Public-read egress requires aggregate-budgeted policy v3.",
+        )
+    return tuple(rules), origins, private_origins, public_read
 
 
 def _validated_egress_budget_binding(
@@ -2775,7 +2798,7 @@ def _validated_egress_budget_binding(
         if not has_rules or not has_scope_field or not has_call_field:
             raise ProtocolError(
                 "invalid_egress_policy",
-                "Egress policy v3 requires exact rules and both runtime-owned "
+                "Egress policy v3 requires authority and both runtime-owned "
                 "budget bindings.",
             )
         scope = payload.get("budget_scope_sha256")
@@ -3013,6 +3036,7 @@ def _start_egress_bridge(
     *,
     egress_rules: tuple[dict[str, Any], ...] = (),
     private_origins: tuple[str, ...] = (),
+    public_read: dict[str, Any] | None = None,
     policy_version: int = 2,
     budget_scope_sha256: str | None = None,
     call_id_sha256: str | None = None,
@@ -3093,6 +3117,7 @@ def _start_egress_bridge(
             origin_allowlist=origins,
             egress_rules=egress_rules,
             private_origins=private_origins,
+            public_read=public_read,
             trust_generation=trust_environment[
                 "SKILL_EGRESS_TRUST_GENERATION"
             ],
@@ -4665,7 +4690,9 @@ def _skill_error(
     **extra: Any,
 ) -> dict[str, Any]:
     runtime_profile = _configured_runtime_profile()
-    if egress_policy not in {"none", "origin_allowlist_proxy"}:
+    if egress_policy not in {
+        "none", "origin_allowlist_proxy", "controlled_egress_proxy"
+    }:
         raise ProtocolError(
             "invalid_egress_policy",
             "Executor error receipt contains an invalid egress policy.",
@@ -4701,7 +4728,9 @@ def _declared_command_error(
     **extra: Any,
 ) -> dict[str, Any]:
     runtime_profile = _configured_runtime_profile()
-    if egress_policy not in {"none", "origin_allowlist_proxy"}:
+    if egress_policy not in {
+        "none", "origin_allowlist_proxy", "controlled_egress_proxy"
+    }:
         raise ProtocolError(
             "invalid_egress_policy",
             "Executor error receipt contains an invalid egress policy.",
@@ -4741,6 +4770,7 @@ def _run_declared_command(payload: dict[str, Any]) -> dict[str, Any]:
     egress_origins: tuple[str, ...] = ()
     egress_rules: tuple[dict[str, Any], ...] = ()
     private_origins: tuple[str, ...] = ()
+    public_read: dict[str, Any] | None = None
     egress_policy = "none"
     egress_policy_version = 2
     budget_scope_sha256: str | None = None
@@ -4768,6 +4798,7 @@ def _run_declared_command(payload: dict[str, Any]) -> dict[str, Any]:
             egress_rules,
             egress_origins,
             private_origins,
+            public_read,
         ) = _validated_exact_egress_policy(
             payload
         )
@@ -4777,10 +4808,12 @@ def _run_declared_command(payload: dict[str, Any]) -> dict[str, Any]:
             call_id_sha256,
         ) = _validated_egress_budget_binding(
             payload,
-            has_rules=bool(egress_rules),
+            has_rules=bool(egress_rules or public_read),
         )
         egress_policy = (
-            "origin_allowlist_proxy" if egress_origins else "none"
+            "controlled_egress_proxy" if public_read
+            else "origin_allowlist_proxy" if egress_origins
+            else "none"
         )
         raw_cwd = payload.get("cwd", "workspace")
         if raw_cwd not in {"workspace", "skill"}:
@@ -4863,15 +4896,20 @@ def _run_declared_command(payload: dict[str, Any]) -> dict[str, Any]:
                 egress_origins,
                 egress_rules=egress_rules,
                 private_origins=private_origins,
+                **(
+                    {"public_read": public_read}
+                    if public_read is not None
+                    else {}
+                ),
                 policy_version=egress_policy_version,
                 budget_scope_sha256=budget_scope_sha256,
                 call_id_sha256=call_id_sha256,
                 runtime_root=runtime_root,
             )
-            if egress_origins
+            if egress_origins or public_read
             else None
         )
-        if egress_origins and egress_bridge is None:
+        if (egress_origins or public_read) and egress_bridge is None:
             raise ProtocolError(
                 "egress_bridge_unavailable",
                 "The declared-command egress bridge failed closed.",
@@ -4953,8 +4991,8 @@ def _run_declared_command(payload: dict[str, Any]) -> dict[str, Any]:
             "network_policy": {
                 "direct": "disabled",
                 "egress": (
-                    "origin_allowlist_proxy"
-                    if egress_origins
+                    "controlled_egress_proxy" if public_read
+                    else "origin_allowlist_proxy" if egress_origins
                     else "none"
                 ),
             },
@@ -5070,6 +5108,7 @@ def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
     egress_origins: tuple[str, ...] = ()
     egress_rules: tuple[dict[str, Any], ...] = ()
     private_origins: tuple[str, ...] = ()
+    public_read: dict[str, Any] | None = None
     egress_policy = "none"
     egress_policy_version = 2
     budget_scope_sha256: str | None = None
@@ -5106,6 +5145,7 @@ def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
             egress_rules,
             egress_origins,
             private_origins,
+            public_read,
         ) = _validated_exact_egress_policy(
             payload
         )
@@ -5115,10 +5155,12 @@ def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
             call_id_sha256,
         ) = _validated_egress_budget_binding(
             payload,
-            has_rules=bool(egress_rules),
+            has_rules=bool(egress_rules or public_read),
         )
         egress_policy = (
-            "origin_allowlist_proxy" if egress_origins else "none"
+            "controlled_egress_proxy" if public_read
+            else "origin_allowlist_proxy" if egress_origins
+            else "none"
         )
         cwd_policy = payload.get("cwd", "workspace")
         if cwd_policy not in {"workspace", "script", "skill"}:
@@ -5265,7 +5307,7 @@ def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
             immutable_roots=(skill_root,),
             writable_roots=(workspace, runtime_root),
         )
-        if egress_origins or runtime_profile in {
+        if egress_origins or public_read or runtime_profile in {
             "browser-automation-v1",
             SESSION_SANDBOX_RUNTIME_PROFILE,
         }:
@@ -5273,6 +5315,11 @@ def _run_skill_script(payload: dict[str, Any]) -> dict[str, Any]:
                 egress_origins,
                 egress_rules=egress_rules,
                 private_origins=private_origins,
+                **(
+                    {"public_read": public_read}
+                    if public_read is not None
+                    else {}
+                ),
                 policy_version=egress_policy_version,
                 budget_scope_sha256=budget_scope_sha256,
                 call_id_sha256=call_id_sha256,
@@ -5530,6 +5577,8 @@ def _session_code_error(
     request_id: str | None,
     code: str,
     message: str,
+    egress_policy: str = "none",
+    egress_policy_version: int = 2,
     **extra: Any,
 ) -> dict[str, Any]:
     response: dict[str, Any] = {
@@ -5540,6 +5589,11 @@ def _session_code_error(
         "error_code": code,
         "error": message,
         "network": "disabled",
+        "network_policy": {
+            "direct": "disabled",
+            "egress": egress_policy,
+        },
+        "egress_policy_version": egress_policy_version,
         "artifacts": [],
     }
     response.update(extra)
@@ -5552,6 +5606,12 @@ def _run_session_code(payload: dict[str, Any]) -> dict[str, Any]:
     started = time.monotonic()
     request_id: str | None = None
     temp_dir: Path | None = None
+    egress_bridge: _EgressBridgeHandle | None = None
+    egress_audit_receipt: dict[str, Any] | None = None
+    egress_policy_version = 2
+    public_read: dict[str, Any] | None = None
+    egress_policy = _requested_v1_egress_policy(payload)
+    bridge_cleanup_error: ProtocolError | None = None
     try:
         if payload.get("protocol_version") != PROTOCOL_VERSION:
             raise ProtocolError("unsupported_protocol", f"protocol_version must be {PROTOCOL_VERSION}.")
@@ -5572,6 +5632,20 @@ def _run_session_code(payload: dict[str, Any]) -> dict[str, Any]:
             raise ProtocolError(
                 "invalid_timeout", f"session code timeout cannot exceed {MAX_CODE_TIMEOUT} seconds."
             )
+        (
+            egress_rules,
+            egress_origins,
+            private_origins,
+            public_read,
+        ) = _validated_exact_egress_policy(payload)
+        (
+            egress_policy_version,
+            budget_scope_sha256,
+            call_id_sha256,
+        ) = _validated_egress_budget_binding(
+            payload,
+            has_rules=bool(egress_rules or public_read),
+        )
         skill_files = _decode_snapshot(
             payload.get("skill_files", []),
             field="skill_files",
@@ -5640,6 +5714,18 @@ def _run_session_code(payload: dict[str, Any]) -> dict[str, Any]:
             immutable_roots=(skills_root, results_root),
             writable_roots=(workspace, runtime_root, code_root),
         )
+        if egress_origins or public_read:
+            egress_bridge = _start_egress_bridge(
+                egress_origins,
+                egress_rules=egress_rules,
+                private_origins=private_origins,
+                public_read=public_read,
+                policy_version=egress_policy_version,
+                budget_scope_sha256=budget_scope_sha256,
+                call_id_sha256=call_id_sha256,
+                runtime_root=runtime_root,
+            )
+            env.update(egress_bridge.environment)
         try:
             proc = subprocess.Popen(
                 _resource_limited_command(
@@ -5664,10 +5750,28 @@ def _run_session_code(payload: dict[str, Any]) -> dict[str, Any]:
         stdout, stderr, stdout_truncated, stderr_truncated, timed_out = (
             _communicate_capped(proc, timeout=timeout)
         )
-        artifacts, deleted_count = _collect_workspace_artifacts(workspace, initial)
+        if egress_bridge is not None:
+            (
+                egress_audit_receipt,
+                bridge_cleanup_error,
+            ) = _seal_or_quarantine_one_shot_egress_bridge(
+                egress_bridge
+            )
+            egress_bridge = None
+        if bridge_cleanup_error is None:
+            artifacts, deleted_count = _collect_workspace_artifacts(
+                workspace, initial
+            )
+        else:
+            artifacts, deleted_count = [], 0
         stdout_text = stdout.decode("utf-8", errors="replace")
         stderr_text = stderr.decode("utf-8", errors="replace")
-        status = "timeout" if timed_out else ("success" if proc.returncode == 0 else "error")
+        status = (
+            "error" if bridge_cleanup_error is not None
+            else "timeout" if timed_out
+            else "success" if proc.returncode == 0
+            else "error"
+        )
         response: dict[str, Any] = {
             "protocol_version": PROTOCOL_VERSION,
             "kind": "session_code_result",
@@ -5677,6 +5781,13 @@ def _run_session_code(payload: dict[str, Any]) -> dict[str, Any]:
             "interpreter": "python",
             "interpreter_policy": "fixed_python",
             "network": "disabled",
+            "network_policy": {
+                "direct": "disabled",
+                "egress": (
+                    egress_policy
+                ),
+            },
+            "egress_policy_version": egress_policy_version,
             "stdout": stdout_text,
             "stderr": stderr_text,
             "stdout_truncated": stdout_truncated,
@@ -5695,12 +5806,24 @@ def _run_session_code(payload: dict[str, Any]) -> dict[str, Any]:
                 error_code="script_exit_nonzero",
                 error=stderr_text or f"Session code exited with return code {proc.returncode}.",
             )
+        if bridge_cleanup_error is not None:
+            response.update(
+                error_code=bridge_cleanup_error.code,
+                error=str(bridge_cleanup_error),
+                cleanup_phase="egress_bridge_seal",
+                execution_completed=True,
+                artifacts_discarded=True,
+            )
+        if egress_audit_receipt is not None:
+            response["egress_audit_receipt"] = egress_audit_receipt
         return response
     except ProtocolError as exc:
         return _session_code_error(
             request_id,
             exc.code,
             str(exc),
+            egress_policy=egress_policy,
+            egress_policy_version=egress_policy_version,
             duration_seconds=round(time.monotonic() - started, 3),
         )
     except Exception as exc:
@@ -5708,11 +5831,19 @@ def _run_session_code(payload: dict[str, Any]) -> dict[str, Any]:
             request_id,
             "executor_internal_error",
             f"The isolated session-code executor failed safely ({type(exc).__name__}).",
+            egress_policy=egress_policy,
+            egress_policy_version=egress_policy_version,
             duration_seconds=round(time.monotonic() - started, 3),
         )
     finally:
-        if temp_dir is not None:
-            _teardown_one_shot_temp_dir(temp_dir)
+        try:
+            if egress_bridge is not None:
+                _seal_or_quarantine_one_shot_egress_bridge(
+                    egress_bridge
+                )
+        finally:
+            if temp_dir is not None:
+                _teardown_one_shot_temp_dir(temp_dir)
 
 
 def _drain_process_stream(
@@ -6599,6 +6730,7 @@ def _open_process_lease(
     egress_policy_version = 2
     budget_scope_sha256: str | None = None
     call_id_sha256: str | None = None
+    public_read: dict[str, Any] | None = None
     with _PROCESS_LEASES_LOCK:
         previous = _PROCESS_OPEN_OPERATIONS.get((scope_digest, op_id))
         if previous is not None:
@@ -6673,6 +6805,7 @@ def _open_process_lease(
             egress_rules,
             egress_origins,
             private_origins,
+            public_read,
         ) = _validated_exact_egress_policy(
             payload
         )
@@ -6682,7 +6815,7 @@ def _open_process_lease(
             call_id_sha256,
         ) = _validated_egress_budget_binding(
             payload,
-            has_rules=bool(egress_rules),
+            has_rules=bool(egress_rules or public_read),
         )
         cwd_policy = payload.get("cwd", "workspace")
         if cwd_policy not in {"workspace", "script", "skill"}:
@@ -6847,7 +6980,7 @@ def _open_process_lease(
                 immutable_roots=(skill_root,),
                 writable_roots=(workspace, runtime_root),
             )
-            if egress_origins or runtime_profile in {
+            if egress_origins or public_read or runtime_profile in {
                 "browser-automation-v1",
                 SESSION_SANDBOX_RUNTIME_PROFILE,
             }:
@@ -6855,6 +6988,11 @@ def _open_process_lease(
                     egress_origins,
                     egress_rules=egress_rules,
                     private_origins=private_origins,
+                    **(
+                        {"public_read": public_read}
+                        if public_read is not None
+                        else {}
+                    ),
                     policy_version=egress_policy_version,
                     budget_scope_sha256=budget_scope_sha256,
                     call_id_sha256=call_id_sha256,
@@ -6862,7 +7000,9 @@ def _open_process_lease(
                 )
             if egress_bridge is not None:
                 environment.update(egress_bridge.environment)
-                if egress_origins:
+                if public_read:
+                    egress_policy = "controlled_egress_proxy"
+                elif egress_origins:
                     egress_policy = "origin_allowlist_proxy"
             initial = {
                 relative: (len(content), hashlib.sha256(content).hexdigest())
@@ -7998,6 +8138,7 @@ def healthcheck() -> int:
             "none",
             "policy_proxy",
             "origin_allowlist_proxy",
+            "controlled_egress_proxy",
         }
         and (
             (

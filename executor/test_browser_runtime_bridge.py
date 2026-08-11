@@ -1030,6 +1030,7 @@ class BrowserRuntimeBridgeTests(unittest.TestCase):
                         "url_prefix": "https://example.com:443/",
                     }],
                     "private_origins": [],
+                    "public_read": None,
                 })).hexdigest(),
                 receipt["rules_sha256"],
             )
