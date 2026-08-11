@@ -4,23 +4,45 @@
 
 ## 2026-08-11 `172.30.100.128:5173` 前端转发入口
 
-- 因用户本地无法直接访问 `172.30.100.126:5173`、但可访问
-  `172.30.100.128`，已在 `172.30.100.128` 部署持久、透明的 TCP 转发：
-  `0.0.0.0:5173 -> 172.30.100.126:5173`。没有修改 ChatDS 容器、数据库或
-  126 上的生产配置，也没有触碰 128 上已有 vLLM/TEI/pathology/cloudreve 容器。
-- 128 的 5173 部署前为空闲，UFW inactive；128 到 126 的 `/api/health` 实测为
-  HTTP 200。实现使用 Ubuntu 自带的 `systemd-socket-proxyd`，不安装 socat/nginx，
-  也不新增 Docker 容器。unit 为
-  `/etc/systemd/system/chatds-forward-5173.socket` 与
-  `/etc/systemd/system/chatds-forward-5173.service`；socket 已 enabled/active，
-  service 按连接激活并在空闲 5 分钟后退出，下一连接会自动重启，开机由
-  `sockets.target` 自动恢复。
-- service 使用 `DynamicUser`、`PrivateTmp`、`PrivateDevices`、read-only
-  `ProtectSystem`/`ProtectHome`、`NoNewPrivileges`、地址族限制、
-  `MemoryDenyWriteExecute`；当前 `NRestarts=0`。部署后从维护机访问
-  `http://172.30.100.128:5173/` 和 `/api/health` 均为 HTTP 200，返回的是 126
-  上同一 ChatDS 前端/Backend。维护或回滚只操作上述两个精确 unit；凭据未写入仓库、
-  unit、日志或本文件。
+- 用户报告 conversation `7ba267744b3a4b1d9bb322831793a776` 的运行配置显示
+  `Request failed (502)`。按三源证据冻结的原始配置阶段（01:35–01:37 UTC）中：持久化
+  Conversation 尚无消息，DB/AgentRun/engine session/raw event 均为 0；Session Skill 列表为空，
+  因而没有可参与该错误的 Skill 指令；Frontend 与 Backend 记录的 settings GET 以及 01:37:20
+  settings PATCH 全部为 200。PATCH 已正确持久化 `engine_id=claude_code`、
+  `model_id=local_deepseek_v4_flash`。因此该 502 不是模型、Claude Runner、Harness、Skill 编译或
+  配置落库失败。用户稍后在 01:47 上传 TrialSim bundle 并启动了一个独立 Turn；其后续运行、Skill
+  view 与一次 debug mirror workspace lock timeout 不得倒灌成早先 502 的根因。
+- 基础设施复现发现两个方向的 128↔126 新 TCP 流约有 1–3% 建连黑洞：128 上
+  `systemd-socket-proxyd` 明确记录 `Failed to connect to remote host: Connection timed out`，从维护机
+  对 128 的 5×100 raw 并发读取也有 11 个请求在到达代理前 `time_connect=0`。128 的两个 i40e
+  接口都有累计 `rx_dropped`，而 conntrack、listen backlog、CRC/error 不是瓶颈。这是主机/NIC/交换
+  路径问题，应用代理不能修复未到达主机的 SYN。另发现 128 系统时钟停在 2026-07-06、NTP inactive，
+  与当前权威时间相差约 36 天；为避免扰动现有 vLLM/TEI/病理/Cloudreve 工作负载，本轮没有擅自跳变
+  主机时钟，后续应由基础设施维护窗口修复 NIC/交换路径与 NTP。
+- 原先单次上游尝试的 `systemd-socket-proxyd` 已由发行版 HAProxy 2.4.30 接管 128 的
+  `0.0.0.0:5173`。HAProxy unit enabled/active；主上游为 `10.10.132.126:5173`，备用为
+  `172.30.100.126:5173`，仅在上游尚未连接时做 4 次 connect retry，带双路径健康检查、HTTP keepalive
+  和 6 小时 client/server/tunnel timeout，不重放已经发送的 HTTP mutation。权威配置已跟踪为
+  `ops/chatds-forward-5173/haproxy.cfg`。旧 `chatds-forward-5173.socket/service` 保留但 disabled/inactive，
+  仅用于显式回滚；128 上既有容器均未重启或改动。HAProxy 解决出站一次尝试和长流代理问题，但不能
+  宣称修复上述入站链路丢流。
+- 跨 Session 的 UI 不变量由本地提交
+  `06e9b40acee603ac348ecbf9a57f77eab877d71b fix: isolate workspace reads from transient gateway loss`
+  修复：API client 只对 GET/HEAD 的 transport error 或 502/503/504 做两次短退避重试；PATCH/POST/DELETE
+  与 abort 永不自动重放。Session Workspace 九类资源改为 `Promise.allSettled` 独立加载，单个可选面板
+  失败不会清空运行配置；每个失败显示精确资源和 API path；切换 Conversation 时用 exact
+  `loadedConvId` 阻断上一 Session 状态；保存成功清除旧错误。脚本化测试覆盖 502→200、网络错误→成功、
+  budget exhaustion 边界、400 不重试、abort 及 PATCH 不重放。Frontend 共 24 项通过，涉及文件的
+  targeted ESLint 通过，production build 通过；全量 lint 仍只有两个修改前既有的
+  `ModelSelector.jsx`/`SkillLibrary.jsx` React effect 规则错误。
+- 生产 Frontend 已从 commit 的 22,489-file exact clean archive
+  `/tmp/chat_ds_deploy_06e9b40a` 构建并单独替换。当前 image
+  `sha256:a8b48f30fb027a6e29cb615c3238849027734a4687a2733407b46068cdc1eae3`、revision
+  `06e9b40a...`、running/restart=0，旧镜像保留 tag `chat_ds-frontend:rollback-pre-06e9b40a`；
+  Backend/Harness/Supervisor 未重启。localhost、`10.10.132.126:5173` 和
+  `172.30.100.128:5173` 的 `/`、`/api/health` 均为 200，生产 bundle marker 正确。4×50 个带相同
+  两次有界重试的逻辑读取全部成功，期间 raw TCP 仍捕获 4 次首次建连超时，证明 UI 缓解闭环成立且
+  底层链路问题仍需独立处理。凭据未写入仓库、代理配置、日志或本文件。
 
 ## 2026-08-10 Claude Skill 相关性、受控搜索与部署默认值闭环
 
