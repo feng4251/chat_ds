@@ -48,33 +48,39 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
 
     def test_proxy_is_the_only_networked_session_sandbox_component(self):
         proxy = self.services["skill-egress-proxy"]
-        self.assertEqual(proxy["networks"], ["browser_egress"])
+        self.assertEqual(
+            proxy["networks"],
+            ["browser_egress", "search_net"],
+        )
         self.assertEqual(proxy["group_add"], ["65530"])
         self.assertEqual(
             proxy["environment"]["SKILL_EGRESS_SOCKET_PATH"],
             "/run/chatds-skill-egress/proxy.sock",
         )
-        self.assertEqual(
-            proxy["environment"][
-                "SKILL_EGRESS_PRIVATE_ORIGIN_ALLOWLIST"
-            ],
-            "${BROWSER_PRIVATE_ORIGIN_ALLOWLIST:-}",
+        private_origins = proxy["environment"][
+            "SKILL_EGRESS_PRIVATE_ORIGIN_ALLOWLIST"
+        ]
+        self.assertIn("${BROWSER_PRIVATE_ORIGIN_ALLOWLIST:-}", private_origins)
+        self.assertIn(
+            "${CLAUDE_PROVIDER_PRIVATE_ORIGIN_ALLOWLIST:-",
+            private_origins,
         )
+        self.assertIn("${MARKET_DATA_PRIVATE_ORIGIN:-", private_origins)
         self.assertEqual(
             proxy["environment"][
                 "SKILL_EGRESS_PRIVATE_CIDR_ALLOWLIST"
             ],
-            "${SKILL_EGRESS_PRIVATE_CIDR_ALLOWLIST:-}",
+            "${SKILL_EGRESS_PRIVATE_CIDR_ALLOWLIST:-172.29.250.0/24}",
         )
         expected_budget_environment = {
             "SKILL_EGRESS_MAX_REQUESTS": (
-                "${SKILL_EGRESS_MAX_REQUESTS:-2048}"
+                "${SKILL_EGRESS_MAX_REQUESTS:-8192}"
             ),
             "SKILL_EGRESS_MAX_OUTBOUND_BYTES": (
-                "${SKILL_EGRESS_MAX_OUTBOUND_BYTES:-16777216}"
+                "${SKILL_EGRESS_MAX_OUTBOUND_BYTES:-67108864}"
             ),
             "SKILL_EGRESS_MAX_RESPONSE_WIRE_BYTES": (
-                "${SKILL_EGRESS_MAX_RESPONSE_WIRE_BYTES:-536870912}"
+                "${SKILL_EGRESS_MAX_RESPONSE_WIRE_BYTES:-2147483648}"
             ),
             "SKILL_EGRESS_MAX_POLICY_SCOPE_ENTRIES": (
                 "${SKILL_EGRESS_MAX_POLICY_SCOPE_ENTRIES:-65536}"
@@ -91,25 +97,19 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
                 environment[
                     "EXECUTOR_EGRESS_MAX_REQUESTS_PER_SCOPE"
                 ],
-                expected_budget_environment[
-                    "SKILL_EGRESS_MAX_REQUESTS"
-                ],
+                "${SKILL_EGRESS_MAX_REQUESTS:-2048}",
             )
             self.assertEqual(
                 environment[
                     "EXECUTOR_EGRESS_MAX_OUTBOUND_BYTES_PER_SCOPE"
                 ],
-                expected_budget_environment[
-                    "SKILL_EGRESS_MAX_OUTBOUND_BYTES"
-                ],
+                "${SKILL_EGRESS_MAX_OUTBOUND_BYTES:-16777216}",
             )
             self.assertEqual(
                 environment[
                     "EXECUTOR_EGRESS_MAX_RESPONSE_WIRE_BYTES_PER_SCOPE"
                 ],
-                expected_budget_environment[
-                    "SKILL_EGRESS_MAX_RESPONSE_WIRE_BYTES"
-                ],
+                "${SKILL_EGRESS_MAX_RESPONSE_WIRE_BYTES:-536870912}",
             )
             self.assertEqual(
                 "1",

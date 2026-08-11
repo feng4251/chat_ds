@@ -52,6 +52,7 @@ class RunnerSettings:
     egress_limits: dict[str, int]
     provider_profiles: dict[str, ProviderProfile]
     private_origin_allowlist: tuple[str, ...]
+    public_read_egress_enabled: bool = False
 
 
 DEFAULT_CLAUDE_EGRESS_LIMITS = {
@@ -160,7 +161,18 @@ def load_settings() -> RunnerSettings:
         egress_limits=egress_limits,
         provider_profiles=profiles,
         private_origin_allowlist=private_values,
+        public_read_egress_enabled=_strict_bool(
+            "CLAUDE_PUBLIC_READ_EGRESS_ENABLED",
+            False,
+        ),
     )
+
+
+def _strict_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, str(default).lower()).strip().casefold()
+    if raw not in {"true", "false"}:
+        raise RunnerConfigurationError(f"{name} must be true or false")
+    return raw == "true"
 
 
 def _provider_profiles() -> dict[str, ProviderProfile]:

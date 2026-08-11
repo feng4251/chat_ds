@@ -726,6 +726,7 @@ class SkillProcessManager:
         constructor_kwargs: dict[str, Any] | None,
         egress_rules: tuple[dict[str, Any], ...],
         private_origins: tuple[str, ...],
+        public_read: dict[str, Any] | None,
         runtime_profile: str,
         socket_path: str,
     ) -> tuple[_ManagedProcess, dict[str, Any]]:
@@ -735,7 +736,7 @@ class SkillProcessManager:
                 context,
                 operation="skill_process",
             )
-            if egress_rules
+            if egress_rules or public_read
             else None
         )
         workspace = sandbox_dir(
@@ -832,6 +833,7 @@ class SkillProcessManager:
                         {
                             "egress_rules": egress_rules,
                             "private_origins": private_origins,
+                            "public_read": public_read,
                             "budget_scope_sha256": (
                                 egress_budget_binding.budget_scope_sha256
                             ),
@@ -839,7 +841,7 @@ class SkillProcessManager:
                                 egress_budget_binding.call_id_sha256
                             ),
                         }
-                        if egress_rules else {}
+                        if egress_rules or public_read else {}
                     ),
                     socket_path=socket_path,
                     op_id=open_op_id,
@@ -2404,6 +2406,7 @@ async def run_skill_process(
                 constructor_kwargs=constructor_kwargs,
                 egress_rules=egress_policy.rule_payload(),
                 private_origins=egress_policy.private_origins,
+                public_read=egress_policy.public_read_payload(),
                 runtime_profile=profile,
                 socket_path=socket_path,
             )

@@ -4,7 +4,7 @@ ARG DEBIAN_SNAPSHOT=20260720T000000Z
 
 LABEL org.opencontainers.image.title="ChatDS Skill egress policy proxy" \
       org.opencontainers.image.description="Fail-closed exact-method and URL-prefix HTTP/TLS boundary for isolated Skill workers" \
-      org.opencontainers.image.chatds.egress-policy="signed-exact-query-v1" \
+      org.opencontainers.image.chatds.egress-policy="signed-public-read-v1" \
       org.opencontainers.image.chatds.debian-snapshot="${DEBIAN_SNAPSHOT}"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -29,7 +29,7 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources \
 
 COPY --chown=65531:65531 server.py /app/server.py
 
-RUN test "$(python -c 'import runpy; print(runpy.run_path("/app/server.py")["EGRESS_POLICY_RUNTIME_VERSION"])')" = "signed-exact-query-v1" \
+RUN test "$(python -c 'import runpy; print(runpy.run_path("/app/server.py")["EGRESS_POLICY_RUNTIME_VERSION"])')" = "signed-public-read-v1" \
     && find / -xdev -type f -perm /6000 -exec chmod a-s {} + \
     && getcap -r / 2>/dev/null | cut -d ' ' -f 1 | xargs -r setcap -r \
     && test -z "$(find / -xdev -type f -perm /6000 -print -quit)" \

@@ -460,7 +460,7 @@ services:
       CLAUDE_RUNNER_CPUS: ${CLAUDE_RUNNER_CPUS:-4}
       # The Turn image has every setuid/setgid bit and file capability removed
       # and is attested by label. This host-compatible mode retains the compact
-      # seccomp denylist; network=none and exact proxy policy are unchanged.
+      # seccomp denylist; network=none and signed proxy policy are unchanged.
       CLAUDE_RUNNER_SECURITY_MODE: ${CLAUDE_RUNNER_SECURITY_MODE:-seccomp_stripped_setid}
       CLAUDE_EGRESS_MAX_REQUESTS: ${CLAUDE_EGRESS_MAX_REQUESTS:-8192}
       CLAUDE_EGRESS_MAX_OUTBOUND_BYTES: ${CLAUDE_EGRESS_MAX_OUTBOUND_BYTES:-67108864}
@@ -471,6 +471,7 @@ services:
       CLAUDE_EGRESS_POLICY_MAX_REQUESTS: ${SKILL_EGRESS_MAX_REQUESTS:-8192}
       CLAUDE_EGRESS_POLICY_MAX_OUTBOUND_BYTES: ${SKILL_EGRESS_MAX_OUTBOUND_BYTES:-67108864}
       CLAUDE_EGRESS_POLICY_MAX_RESPONSE_WIRE_BYTES: ${SKILL_EGRESS_MAX_RESPONSE_WIRE_BYTES:-2147483648}
+      CLAUDE_PUBLIC_READ_EGRESS_ENABLED: ${CLAUDE_PUBLIC_READ_EGRESS_ENABLED:-true}
       BROWSER_PRIVATE_ORIGIN_ALLOWLIST: ${BROWSER_PRIVATE_ORIGIN_ALLOWLIST:-}
       WORKSPACE_MUTATION_LOCK_ROOT: /run/chatds-workspace-lock-plane/locks
       WORKSPACE_MUTATION_LOCK_REQUIRE_MOUNTPOINT: "1"
@@ -629,6 +630,7 @@ services:
       SEARXNG_BASE_URL: ${SEARXNG_BASE_URL:-http://searxng:8080}
       SEARXNG_TIMEOUT_SECONDS: ${SEARXNG_TIMEOUT_SECONDS:-10}
       MARKET_DATA_URL: ${MARKET_DATA_URL:-http://market-data-gateway:8090/v1/quote}
+      SESSION_SANDBOX_PUBLIC_READ_EGRESS_ENABLED: ${SESSION_SANDBOX_PUBLIC_READ_EGRESS_ENABLED:-true}
       BROWSER_PRIVATE_ORIGIN_ALLOWLIST: ${BROWSER_PRIVATE_ORIGIN_ALLOWLIST:-}
       BROWSER_DNS_SYNTHETIC_PUBLIC_RANGES: ${BROWSER_DNS_SYNTHETIC_PUBLIC_RANGES:-}
       # Chromium is reachable only through a dedicated named-volume socket.

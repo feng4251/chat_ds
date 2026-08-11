@@ -2,9 +2,10 @@
 
 The untrusted session-sandbox worker has no network interface beyond loopback. It can
 only reach this fixed TCP listener, which relays bytes to the policy proxy's
-fixed Unix-domain socket. The controller signs exact HTTP-method and canonical
-URL-prefix rules into every proxy connection; the bridge deliberately has no
-authority input controlled by the Skill process.
+fixed Unix-domain socket. The controller signs exact HTTP-method/URL-prefix
+rules and, when deployment enables it, one fixed public GET/HEAD profile into
+every proxy connection; the bridge has no authority input controlled by the
+Skill process.
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ LISTEN_PORT: Final[int] = 18080
 # Bump this whenever the signed rule schema or its matching semantics change.
 # Container builds assert the value so a stale sandbox base cannot silently
 # disagree with the Supervisor policy compiler.
-EGRESS_POLICY_RUNTIME_VERSION: Final[str] = "signed-exact-query-v1"
+EGRESS_POLICY_RUNTIME_VERSION: Final[str] = "signed-public-read-v1"
 PROXY_SOCKET_PATH: Final[Path] = Path(
     "/run/chatds-skill-egress/proxy.sock"
 )
@@ -475,10 +476,28 @@ def _validated_exact_policy(
     )
 
 
+def _validated_public_read_profile(
+    value: object,
+) -> dict[str, object] | None:
+    """Validate the one deployment-owned public retrieval profile."""
+
+    if value is None:
+        return None
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"methods", "ports"}
+        or value.get("methods") != ["GET", "HEAD"]
+        or value.get("ports") != [80, 443]
+    ):
+        raise BridgeConfigurationError("invalid public-read egress profile")
+    return {"methods": ["GET", "HEAD"], "ports": [80, 443]}
+
+
 def _authority_projection_sha256(
     origins: tuple[str, ...],
     rules: tuple[dict[str, object], ...],
     private_origins: tuple[str, ...],
+    public_read: dict[str, object] | None = None,
 ) -> str:
     """Bind every authority-bearing policy coordinate without exposing it."""
 
@@ -486,6 +505,7 @@ def _authority_projection_sha256(
         "origins": list(origins),
         "egress_rules": list(rules),
         "private_origins": list(private_origins),
+        "public_read": public_read,
     })
 
 
@@ -494,6 +514,7 @@ def _policy_preface(
     *,
     egress_rules: tuple[dict[str, object], ...],
     private_origins: tuple[str, ...],
+    public_read: dict[str, object] | None = None,
     auth_key: bytes,
     trust_generation: str,
     budget_scope_sha256: str | None = None,
@@ -538,6 +559,7 @@ def _policy_preface(
     if v3_requested:
         assert normalized_limits is not None
         unsigned.update({
+            "public_read": _validated_public_read_profile(public_read),
             "budget_scope_sha256": budget_scope_sha256,
             "call_id_sha256": call_id_sha256,
             "limits": normalized_limits,
@@ -1432,6 +1454,7 @@ class _BridgeHandler(socketserver.BaseRequestHandler):
                 server.origin_allowlist,
                 egress_rules=server.egress_rules,
                 private_origins=server.private_origins,
+                public_read=server.public_read,
                 auth_key=server.policy_auth_key,
                 trust_generation=server.trust_generation,
                 budget_scope_sha256=(
@@ -1475,6 +1498,7 @@ class LoopbackProxyBridge(
         origin_allowlist: tuple[str, ...] = (),
         egress_rules: tuple[dict[str, object], ...] = (),
         private_origins: tuple[str, ...] = (),
+        public_read: dict[str, object] | None = None,
         policy_token: str | None = None,
         trust_generation: str,
         budget_scope_sha256: str | None = None,
@@ -1498,10 +1522,12 @@ class LoopbackProxyBridge(
         self.origin_allowlist = normalized
         self.egress_rules = normalized_rules
         self.private_origins = normalized_private_origins
+        self.public_read = _validated_public_read_profile(public_read)
         self._rules_sha256 = _authority_projection_sha256(
             self.origin_allowlist,
             self.egress_rules,
             self.private_origins,
+            self.public_read,
         )
         self.policy_auth_key = _policy_auth_key(policy_token)
         v3_requested = any(
@@ -1558,6 +1584,7 @@ class LoopbackProxyBridge(
             self.origin_allowlist,
             egress_rules=self.egress_rules,
             private_origins=self.private_origins,
+            public_read=self.public_read,
             auth_key=self.policy_auth_key,
             trust_generation=self.trust_generation,
             budget_scope_sha256=self.budget_scope_sha256,
@@ -1700,6 +1727,7 @@ class LoopbackProxyBridge(
                 self.origin_allowlist,
                 self.egress_rules,
                 self.private_origins,
+                self.public_read,
             ),
         ):
             raise BridgeConfigurationError(

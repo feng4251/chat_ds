@@ -9,8 +9,9 @@ Skill Python may run as a CLI or as one strictly data-described public
 top-level function call; neither form accepts model-authored wrapper code.
 The additive protocol-v2 API retains authenticated persistent CLI processes
 and strictly declared public class/factory objects in trusted runtime state.
-Direct networking is absent; exact Skill executions can receive only the
-runtime-compiled origin set through the policy proxy.
+Direct networking is absent; executions receive only runtime-compiled exact
+rules and the optional deployment-owned public-read profile through the policy
+proxy.
 """
 
 from __future__ import annotations
@@ -215,6 +216,24 @@ def _validated_exact_egress_policy(
             "rules.",
         )
     return rule_payload, origins, raw_private
+
+
+def _validated_public_read_profile(
+    value: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"methods", "ports"}
+        or value.get("methods") != ["GET", "HEAD"]
+        or value.get("ports") != [80, 443]
+    ):
+        raise IsolatedSkillExecutorError(
+            "invalid_egress_policy",
+            "Public-read egress must use the fixed GET/HEAD ports 80/443 profile.",
+        )
+    return {"methods": ["GET", "HEAD"], "ports": [80, 443]}
 
 
 def _validated_egress_budget_binding(
@@ -1265,6 +1284,7 @@ def build_skill_script_request(
     egress_origins: tuple[str, ...] | list[str] | None = None,
     egress_rules: tuple[dict[str, Any], ...] | list[dict[str, Any]] | None = None,
     private_origins: tuple[str, ...] | list[str] | None = None,
+    public_read: dict[str, Any] | None = None,
     budget_scope_sha256: str | None = None,
     call_id_sha256: str | None = None,
     request_id: str | None = None,
@@ -1363,7 +1383,10 @@ def build_skill_script_request(
     )
     egress_policy_version, egress_budget_binding = (
         _validated_egress_budget_binding(
-            has_rules=bool(safe_egress_rules),
+            has_rules=bool(
+                safe_egress_rules
+                or _validated_public_read_profile(public_read)
+            ),
             budget_scope_sha256=budget_scope_sha256,
             call_id_sha256=call_id_sha256,
         )
@@ -1383,6 +1406,7 @@ def build_skill_script_request(
         "egress_policy_version": egress_policy_version,
         "egress_rules": safe_egress_rules,
         "private_origins": safe_private_origins,
+        "public_read": _validated_public_read_profile(public_read),
         **egress_budget_binding,
     }
     encoded = json.dumps(
@@ -1415,6 +1439,7 @@ def build_process_lease_open_request(
     egress_origins: tuple[str, ...] | list[str] | None = None,
     egress_rules: tuple[dict[str, Any], ...] | list[dict[str, Any]] | None = None,
     private_origins: tuple[str, ...] | list[str] | None = None,
+    public_read: dict[str, Any] | None = None,
     budget_scope_sha256: str | None = None,
     call_id_sha256: str | None = None,
     request_id: str | None = None,
@@ -1502,7 +1527,10 @@ def build_process_lease_open_request(
     )
     egress_policy_version, egress_budget_binding = (
         _validated_egress_budget_binding(
-            has_rules=bool(safe_egress_rules),
+            has_rules=bool(
+                safe_egress_rules
+                or _validated_public_read_profile(public_read)
+            ),
             budget_scope_sha256=budget_scope_sha256,
             call_id_sha256=call_id_sha256,
         )
@@ -1531,6 +1559,7 @@ def build_process_lease_open_request(
         "egress_policy_version": egress_policy_version,
         "egress_rules": safe_egress_rules,
         "private_origins": safe_private_origins,
+        "public_read": _validated_public_read_profile(public_read),
         **egress_budget_binding,
     }
     return payload, _encode_process_request(payload)
@@ -1625,6 +1654,7 @@ def build_declared_command_request(
     egress_origins: tuple[str, ...] | list[str] | None = None,
     egress_rules: tuple[dict[str, Any], ...] | list[dict[str, Any]] | None = None,
     private_origins: tuple[str, ...] | list[str] | None = None,
+    public_read: dict[str, Any] | None = None,
     budget_scope_sha256: str | None = None,
     call_id_sha256: str | None = None,
     request_id: str | None = None,
@@ -1683,7 +1713,10 @@ def build_declared_command_request(
     )
     egress_policy_version, egress_budget_binding = (
         _validated_egress_budget_binding(
-            has_rules=bool(safe_egress_rules),
+            has_rules=bool(
+                safe_egress_rules
+                or _validated_public_read_profile(public_read)
+            ),
             budget_scope_sha256=budget_scope_sha256,
             call_id_sha256=call_id_sha256,
         )
@@ -1702,6 +1735,7 @@ def build_declared_command_request(
         "egress_policy_version": egress_policy_version,
         "egress_rules": safe_egress_rules,
         "private_origins": safe_private_origins,
+        "public_read": _validated_public_read_profile(public_read),
         **egress_budget_binding,
     }
     encoded = json.dumps(
@@ -1726,6 +1760,9 @@ def build_session_code_request(
     skills_root: Path | None = None,
     results_root: Path | None = None,
     result_paths: tuple[str, ...] | list[str] | None = None,
+    public_read: dict[str, Any] | None = None,
+    budget_scope_sha256: str | None = None,
+    call_id_sha256: str | None = None,
     request_id: str | None = None,
 ) -> tuple[dict[str, Any], bytes]:
     """Build a bounded request for model-authored Python with session files.
@@ -1793,6 +1830,15 @@ def build_session_code_request(
             max_total_bytes=MAX_WORKSPACE_TOTAL_BYTES,
         )
 
+    safe_public_read = _validated_public_read_profile(public_read)
+    egress_policy_version, egress_budget_binding = (
+        _validated_egress_budget_binding(
+            has_rules=bool(safe_public_read),
+            budget_scope_sha256=budget_scope_sha256,
+            call_id_sha256=call_id_sha256,
+        )
+    )
+
     payload: dict[str, Any] = {
         "protocol_version": PROTOCOL_VERSION,
         "kind": "session_code",
@@ -1803,6 +1849,15 @@ def build_session_code_request(
         "workspace_files": workspace_files,
         "result_files": result_files,
     }
+    if safe_public_read is not None:
+        payload.update({
+            "egress_origins": [],
+            "egress_rules": [],
+            "private_origins": [],
+            "public_read": safe_public_read,
+            "egress_policy_version": egress_policy_version,
+            **egress_budget_binding,
+        })
     encoded = json.dumps(
         payload,
         ensure_ascii=False,
@@ -2034,6 +2089,7 @@ def _egress_authority_sha256(request: dict[str, Any]) -> str:
         "origins": list(request.get("egress_origins") or []),
         "egress_rules": list(request.get("egress_rules") or []),
         "private_origins": list(request.get("private_origins") or []),
+        "public_read": request.get("public_read"),
     })
 
 
@@ -2290,6 +2346,7 @@ def validate_process_lease_response(
                     "none",
                     "policy_proxy",
                     "origin_allowlist_proxy",
+                    "controlled_egress_proxy",
                 }
                 or response.get("sync_token") is not None
                 or response.get("sync_pending") is not None
@@ -2337,6 +2394,7 @@ def validate_process_lease_response(
                     "none",
                     "policy_proxy",
                     "origin_allowlist_proxy",
+                    "controlled_egress_proxy",
                 }
             ):
                 raise IsolatedSkillExecutorError(
@@ -2361,6 +2419,7 @@ def validate_process_lease_response(
                 "none",
                 "policy_proxy",
                 "origin_allowlist_proxy",
+                "controlled_egress_proxy",
             }
             or isinstance(response.get("reaped_leases"), bool)
             or not isinstance(response.get("reaped_leases"), int)
@@ -2430,6 +2489,7 @@ def validate_process_lease_response(
             "none",
             "policy_proxy",
             "origin_allowlist_proxy",
+            "controlled_egress_proxy",
         }
     ):
         raise IsolatedSkillExecutorError(
@@ -2438,8 +2498,8 @@ def validate_process_lease_response(
         )
     if operation == "open":
         expected_egress = (
-            "origin_allowlist_proxy"
-            if request.get("egress_origins")
+            "controlled_egress_proxy" if request.get("public_read")
+            else "origin_allowlist_proxy" if request.get("egress_origins")
             else "none"
         )
         if network_policy.get("egress") != expected_egress:
@@ -2556,7 +2616,10 @@ def validate_skill_script_response(
         raise IsolatedSkillExecutorError("invalid_response", "Executor response status is invalid.")
     if expected_egress is not None:
         expected_policy = (
-            "origin_allowlist_proxy" if expected_egress else "none"
+            "controlled_egress_proxy"
+            if expected_egress and request is not None and request.get("public_read")
+            else "origin_allowlist_proxy" if expected_egress
+            else "none"
         )
         network_policy = response.get("network_policy")
         if (
@@ -2648,20 +2711,53 @@ def validate_skill_script_response(
 def validate_session_code_response(
     response: Any,
     *,
-    request_id: str,
+    request: dict[str, Any] | None = None,
+    request_id: str | None = None,
 ) -> list[tuple[str, bytes, dict[str, Any]]]:
+    expected_request_id = (
+        request.get("request_id") if request is not None else request_id
+    )
     if not isinstance(response, dict):
         raise IsolatedSkillExecutorError("invalid_response", "Executor response must be an object.")
     if (
         response.get("protocol_version") != PROTOCOL_VERSION
         or response.get("kind") != "session_code_result"
-        or response.get("request_id") != request_id
+        or response.get("request_id") != expected_request_id
     ):
         raise IsolatedSkillExecutorError(
             "invalid_response", "Executor response protocol or request identity does not match."
         )
     if response.get("status") not in {"success", "error", "timeout"}:
         raise IsolatedSkillExecutorError("invalid_response", "Executor response status is invalid.")
+    if request is None:
+        return _decode_artifacts(response)
+    expected_egress = "controlled_egress_proxy"
+    network_policy = response.get("network_policy")
+    if request.get("public_read") and network_policy != {
+        "direct": "disabled", "egress": expected_egress
+    }:
+        raise IsolatedSkillExecutorError(
+            "invalid_response",
+            "Executor session-code network receipt does not match.",
+        )
+    policy_version = int(request.get("egress_policy_version") or 2)
+    post_spawn = (
+        _one_shot_execution_requires_egress_audit(response)
+        if policy_version == 3
+        else False
+    )
+    _validate_terminal_egress_response(
+        response,
+        policy_version=policy_version,
+        budget_scope_sha256=request.get("budget_scope_sha256"),
+        call_id_sha256=request.get("call_id_sha256"),
+        authority_sha256=(
+            _egress_authority_sha256(request)
+            if policy_version == 3
+            else None
+        ),
+        require_audit=bool(policy_version == 3 and post_spawn),
+    )
     return _decode_artifacts(response)
 
 
@@ -2693,8 +2789,8 @@ def validate_declared_command_response(
             "invalid_response", "Executor command status is invalid."
         )
     expected_egress = (
-        "origin_allowlist_proxy"
-        if request.get("egress_origins")
+        "controlled_egress_proxy" if request.get("public_read")
+        else "origin_allowlist_proxy" if request.get("egress_origins")
         else "none"
     )
     network_policy = response.get("network_policy")
@@ -3496,6 +3592,7 @@ async def open_isolated_process_lease(
     egress_origins: tuple[str, ...] | list[str] | None = None,
     egress_rules: tuple[dict[str, Any], ...] | list[dict[str, Any]] | None = None,
     private_origins: tuple[str, ...] | list[str] | None = None,
+    public_read: dict[str, Any] | None = None,
     budget_scope_sha256: str | None = None,
     call_id_sha256: str | None = None,
     socket_path: str = EXECUTOR_SOCKET,
@@ -3519,6 +3616,7 @@ async def open_isolated_process_lease(
         egress_origins=egress_origins,
         egress_rules=egress_rules,
         private_origins=private_origins,
+        public_read=public_read,
         budget_scope_sha256=budget_scope_sha256,
         call_id_sha256=call_id_sha256,
         op_id=op_id,
@@ -4604,6 +4702,7 @@ async def execute_isolated_skill_script(
     egress_origins: tuple[str, ...] | list[str] | None = None,
     egress_rules: tuple[dict[str, Any], ...] | list[dict[str, Any]] | None = None,
     private_origins: tuple[str, ...] | list[str] | None = None,
+    public_read: dict[str, Any] | None = None,
     budget_scope_sha256: str | None = None,
     call_id_sha256: str | None = None,
     socket_path: str = EXECUTOR_SOCKET,
@@ -4632,6 +4731,7 @@ async def execute_isolated_skill_script(
         egress_origins=egress_origins,
         egress_rules=egress_rules,
         private_origins=private_origins,
+        public_read=public_read,
         budget_scope_sha256=budget_scope_sha256,
         call_id_sha256=call_id_sha256,
     )
@@ -4650,7 +4750,10 @@ async def execute_isolated_skill_script(
                     function_name=payload["invocation"].get("name"),
                     class_name=payload["invocation"].get("class_name"),
                     method_name=payload["invocation"].get("method_name"),
-                    expected_egress=bool(payload["egress_origins"]),
+                    expected_egress=bool(
+                        payload["egress_origins"]
+                        or payload.get("public_read")
+                    ),
                 )
             ),
             execution_authority_check=execution_authority_check,
@@ -4707,6 +4810,7 @@ async def execute_isolated_declared_command(
     egress_origins: tuple[str, ...] | list[str] | None = None,
     egress_rules: tuple[dict[str, Any], ...] | list[dict[str, Any]] | None = None,
     private_origins: tuple[str, ...] | list[str] | None = None,
+    public_read: dict[str, Any] | None = None,
     budget_scope_sha256: str | None = None,
     call_id_sha256: str | None = None,
     socket_path: str = EXECUTOR_SOCKET,
@@ -4724,6 +4828,7 @@ async def execute_isolated_declared_command(
         egress_origins=egress_origins,
         egress_rules=egress_rules,
         private_origins=private_origins,
+        public_read=public_read,
         budget_scope_sha256=budget_scope_sha256,
         call_id_sha256=call_id_sha256,
     )
@@ -4795,6 +4900,9 @@ async def execute_isolated_session_code(
     skills_root: Path | None = None,
     results_root: Path | None = None,
     result_paths: tuple[str, ...] | list[str] | None = None,
+    public_read: dict[str, Any] | None = None,
+    budget_scope_sha256: str | None = None,
+    call_id_sha256: str | None = None,
     socket_path: str = EXECUTOR_SOCKET,
     apply_artifacts: bool = True,
     execution_authority_check: Callable[[], None] | None = None,
@@ -4808,6 +4916,9 @@ async def execute_isolated_session_code(
         skills_root=skills_root,
         results_root=results_root,
         result_paths=result_paths,
+        public_read=public_read,
+        budget_scope_sha256=budget_scope_sha256,
+        call_id_sha256=call_id_sha256,
     )
     reservation: ExecutorSlotReservation | None = None
     try:
@@ -4818,7 +4929,7 @@ async def execute_isolated_session_code(
             validate_response=lambda candidate: (
                 validate_session_code_response(
                     candidate,
-                    request_id=payload["request_id"],
+                    request=payload,
                 )
             ),
             execution_authority_check=execution_authority_check,

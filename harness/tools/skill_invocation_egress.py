@@ -356,4 +356,5 @@ def invocation_bound_skill_egress_policy_for_invocations(
         private_origins=tuple(
             origin for origin in origins if origin in allowed_private
         ),
+        public_read=static_policy.public_read,
     )

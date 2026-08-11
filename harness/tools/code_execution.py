@@ -14,6 +14,11 @@ from tools.context import ToolContext
 from tools.execution_fence import require_execution_authority
 from tools.omission_guard import compacted_history_omission_error, contains_compacted_history_omission
 from tools.path_security import SANDBOX_ROOT, sandbox_dir
+from tools.session_sandbox_policy import (
+    SessionSandboxPolicyError,
+    session_sandbox_egress_budget_binding,
+    session_sandbox_public_read_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -582,6 +587,25 @@ async def execute_code(
             else None
         )
         try:
+            public_read = (
+                context is not None
+                and session_sandbox_public_read_enabled()
+            )
+            egress_binding = (
+                session_sandbox_egress_budget_binding(
+                    context,
+                    operation="execute_code",
+                )
+                if public_read
+                else None
+            )
+        except SessionSandboxPolicyError as exc:
+            return json.dumps({
+                "status": "error",
+                "error_code": "invalid_session_sandbox_policy",
+                "error": str(exc),
+            }, ensure_ascii=False)
+        try:
             result = await execute_isolated_session_code(
                 workspace=workspace,
                 code=isolated_code,
@@ -589,6 +613,20 @@ async def execute_code(
                 skills_root=skills_root,
                 results_root=results_root,
                 result_paths=result_paths,
+                **(
+                    {
+                        "public_read": {
+                            "methods": ["GET", "HEAD"],
+                            "ports": [80, 443],
+                        },
+                        "budget_scope_sha256": (
+                            egress_binding.budget_scope_sha256
+                        ),
+                        "call_id_sha256": egress_binding.call_id_sha256,
+                    }
+                    if public_read and egress_binding is not None
+                    else {}
+                ),
                 **(
                     {
                         "execution_authority_check": lambda: (
@@ -611,7 +649,9 @@ async def execute_code(
                 "status": "error",
                 "error_code": exc.code,
                 "error": str(exc),
-                "network": "disabled",
+                "network": (
+                    "controlled_egress" if public_read else "disabled"
+                ),
                 "artifacts": [],
                 "workspace_applied": False,
             }
@@ -625,15 +665,19 @@ async def execute_code(
         result["execution_runtime"] = "isolated_session_python"
         result["execution_note"] = (
             f"execute_code detected {managed_reason} and ran it only in the disposable, "
-            "network-disabled session executor. Workspace changes were content-verified before "
+            "session executor. Workspace changes were content-verified before "
             "atomic application; execution never falls back to the harness container."
         )
         if managed_reason == "network/API code":
-            result["network_access"] = "unavailable"
-            result["degraded_reason"] = (
-                "Network access is disabled for model-authored code. Use an explicitly authorized "
-                "web/API tool or declared Skill capability; execute_code will not retry in harness."
+            result["network_access"] = (
+                "controlled_public_read" if public_read else "unavailable"
             )
+            if not public_read:
+                result["degraded_reason"] = (
+                    "Network access is disabled for model-authored code. Use "
+                    "an explicitly authorized web/API tool or declared Skill "
+                    "capability; execute_code will not retry in harness."
+                )
         warnings = check_code_warnings(code)
         if warnings:
             result["warnings"] = warnings

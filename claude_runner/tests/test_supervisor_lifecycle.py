@@ -217,7 +217,7 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         image = SimpleNamespace(labels={
             "org.opencontainers.image.chatds.setid-stripped": "true",
             "org.opencontainers.image.chatds.egress-policy": (
-                "signed-exact-query-v1"
+                "signed-public-read-v1"
             ),
         })
         _validate_runner_image_security(image, "seccomp_stripped_setid")

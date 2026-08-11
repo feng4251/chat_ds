@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import hashlib
 import ipaddress
 import json
+import os
 import re
 from typing import Any, Iterable
 from urllib.parse import urlsplit, urlunsplit
@@ -66,6 +67,7 @@ class SessionSandboxEgressPolicy:
 
     rules: tuple[SessionSandboxEgressRule, ...] = ()
     private_origins: tuple[str, ...] = ()
+    public_read: bool = False
 
     @property
     def origins(self) -> tuple[str, ...]:
@@ -76,6 +78,36 @@ class SessionSandboxEgressPolicy:
 
     def rule_payload(self) -> tuple[dict[str, Any], ...]:
         return tuple(rule.as_payload() for rule in self.rules)
+
+    @property
+    def has_authority(self) -> bool:
+        return bool(self.rules or self.public_read)
+
+    def public_read_payload(self) -> dict[str, Any] | None:
+        return (
+            {"methods": ["GET", "HEAD"], "ports": [80, 443]}
+            if self.public_read
+            else None
+        )
+
+
+def session_sandbox_public_read_enabled() -> bool:
+    """Return the deployment-owned generic public retrieval grant.
+
+    This switch is deliberately not carried by ToolContext or Skill data: a
+    model/package may use the profile when deployment enables it, but cannot
+    mint or widen the profile itself.
+    """
+
+    raw = os.environ.get(
+        "SESSION_SANDBOX_PUBLIC_READ_EGRESS_ENABLED",
+        "false",
+    ).strip().casefold()
+    if raw not in {"true", "false"}:
+        raise SessionSandboxPolicyError(
+            "invalid_session_sandbox_public_read_configuration"
+        )
+    return raw == "true"
 
 
 @dataclass(frozen=True, slots=True)
@@ -694,6 +726,7 @@ def skill_session_sandbox_egress_policy(
     return SessionSandboxEgressPolicy(
         rules=rules,
         private_origins=private_origins,
+        public_read=session_sandbox_public_read_enabled(),
     )
 
 

@@ -134,7 +134,7 @@ async def run_declared_command(
                 context,
                 operation="declared_command",
             )
-            if egress_policy.rules
+            if egress_policy.has_authority
             else None
         )
     except SessionSandboxPolicyError as exc:
@@ -174,12 +174,13 @@ async def run_declared_command(
                 {
                     "egress_rules": egress_policy.rule_payload(),
                     "private_origins": egress_policy.private_origins,
+                    "public_read": egress_policy.public_read_payload(),
                     "budget_scope_sha256": (
                         egress_budget_binding.budget_scope_sha256
                     ),
                     "call_id_sha256": egress_budget_binding.call_id_sha256,
                 }
-                if egress_policy.rules else {}
+                if egress_policy.has_authority else {}
             ),
             **(
                 {
@@ -202,7 +203,7 @@ async def run_declared_command(
             command_id=command_id,
             network=(
                 "controlled_egress"
-                if egress_policy.rules
+                if egress_policy.has_authority
                 else "disabled"
             ),
         )
@@ -213,7 +214,7 @@ async def run_declared_command(
         "environment_policy": "ephemeral_snapshot_no_secrets",
         "egress_policy": (
             "compiled_exact_url_policy"
-            if egress_policy.rules
+            if egress_policy.has_authority
             else "none"
         ),
         "fallback_attempted": False,

@@ -38,6 +38,7 @@ def _policy_preface(
     budget_scope_sha256: str = "b" * 64,
     call_id_sha256: str = "c" * 64,
     limits: dict[str, object] | None = None,
+    public_read: dict[str, object] | None = None,
 ) -> bytes:
     if trust_generation is None:
         trust_generation = (
@@ -69,6 +70,7 @@ def _policy_preface(
     }
     if version == 3:
         unsigned.update({
+            "public_read": public_read,
             "budget_scope_sha256": budget_scope_sha256,
             "call_id_sha256": call_id_sha256,
             "limits": (
@@ -1200,6 +1202,85 @@ class ExactEgressPolicyTests(unittest.TestCase):
                     private,
                 )
 
+    def test_public_read_is_generic_read_only_and_sanitized(self):
+        policy = server._validated_signed_egress_policy(
+            [],
+            [],
+            [],
+            version=3,
+            budget_scope_sha256="a" * 64,
+            call_id_sha256="b" * 64,
+            limits_raw={
+                "max_requests": 8,
+                "max_outbound_bytes": 4096,
+                "max_response_wire_bytes": 65536,
+            },
+            public_read_raw={
+                "methods": ["GET", "HEAD"],
+                "ports": [80, 443],
+            },
+        )
+        for hostname in ("manuals.example", "packages.example"):
+            origin = server.Origin("https", hostname, 443)
+            request = (
+                f"GET /resource?q=public HTTP/1.1\r\n"
+                f"Host: {hostname}\r\n"
+                "Authorization: Bearer must-not-leak\r\n"
+                "Cookie: secret=value\r\n"
+                "X-Workspace-Token: must-not-leak\r\n\r\n"
+            ).encode("ascii")
+            self.assertEqual(
+                "public_read",
+                server._authorize_request(policy, origin, request),
+            )
+            sanitized = server._sanitize_public_read_request(
+                request,
+                origin,
+            )
+            self.assertIn(b"ChatDS-PublicRead/1.0", sanitized)
+            self.assertNotIn(b"Authorization", sanitized)
+            self.assertNotIn(b"Cookie", sanitized)
+            self.assertNotIn(b"Workspace-Token", sanitized)
+
+        with self.assertRaisesRegex(
+            server.ProxyPolicyError,
+            "request_url_not_allowed",
+        ):
+            server._authorize_request(
+                policy,
+                server.Origin("https", "manuals.example", 443),
+                self._request("POST", "/resource"),
+            )
+
+    def test_public_read_profile_is_exact_and_hmac_bound(self):
+        profile = {"methods": ["GET", "HEAD"], "ports": [80, 443]}
+        rendered = _policy_preface(
+            [],
+            egress_rules=[],
+            private_origins=[],
+            version=3,
+            public_read=profile,
+        )
+        payload = json.loads(
+            rendered[len(server.POLICY_PREFACE_PREFIX):].decode("utf-8")
+        )
+        payload["public_read"] = None
+        with (
+            patch.dict(
+                os.environ,
+                {"SKILL_EGRESS_POLICY_TOKEN": TEST_POLICY_TOKEN},
+            ),
+            self.assertRaisesRegex(
+                server.ProxyPolicyError,
+                "policy_authentication_failed",
+            ),
+        ):
+            PolicyPrefaceAuthenticationTests._read_preface(
+                server.POLICY_PREFACE_PREFIX
+                + json.dumps(payload, separators=(",", ":")).encode()
+                + b"\n"
+            )
+
 
 class AddressPolicyTests(unittest.TestCase):
     @staticmethod
@@ -1235,6 +1316,57 @@ class AddressPolicyTests(unittest.TestCase):
         self.assertEqual("example.com", result.host)
         self.assertEqual("93.184.216.34", result.address)
         self.assertFalse(result.private_grant)
+
+    def test_public_read_allows_only_global_standard_port_answers(self):
+        policy = server.AddressPolicy(public_ports=(80, 443))
+        with patch.object(
+            server.socket,
+            "getaddrinfo",
+            return_value=self._records("93.184.216.34"),
+        ):
+            result = policy.resolve(
+                "https",
+                "renamed-holdout.example",
+                443,
+                public_read=True,
+            )
+        self.assertEqual("93.184.216.34", result.address)
+
+        for records in (
+            self._records("127.0.0.1"),
+            self._records("93.184.216.34", "10.0.0.7"),
+        ):
+            with (
+                patch.object(
+                    server.socket,
+                    "getaddrinfo",
+                    return_value=records,
+                ),
+                self.assertRaisesRegex(
+                    server.ProxyPolicyError,
+                    "destination_address_not_public",
+                ),
+            ):
+                policy.resolve(
+                    "https",
+                    "renamed-holdout.example",
+                    443,
+                    public_read=True,
+                )
+        with (
+            patch.object(server.socket, "getaddrinfo") as resolver,
+            self.assertRaisesRegex(
+                server.ProxyPolicyError,
+                "destination_port_not_allowed",
+            ),
+        ):
+            policy.resolve(
+                "https",
+                "renamed-holdout.example",
+                8443,
+                public_read=True,
+            )
+        resolver.assert_not_called()
 
     def test_default_deny_and_origin_mismatch_happen_before_dns(self):
         policy = server.AddressPolicy(public_ports=(80, 443))

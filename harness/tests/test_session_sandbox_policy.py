@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from tools.context import ToolContext
 from tools.session_sandbox_policy import (
@@ -21,6 +22,34 @@ from tools.skill_script import RUN_SKILL_SCRIPT_SCHEMA
 
 
 class SessionSandboxPolicyTests(unittest.TestCase):
+    def test_public_read_is_deployment_owned_and_cross_skill_generic(self) -> None:
+        context = ToolContext(
+            user_id="tenant",
+            session_id="session",
+            run_id="run",
+        )
+        with patch.dict(
+            "os.environ",
+            {"SESSION_SANDBOX_PUBLIC_READ_EGRESS_ENABLED": "true"},
+        ):
+            first = skill_session_sandbox_egress_policy(
+                context, "renamed-doc-tool"
+            )
+            second = skill_session_sandbox_egress_policy(
+                context, "registry-inspector"
+            )
+        self.assertTrue(first.has_authority)
+        self.assertEqual(first.public_read_payload(), {
+            "methods": ["GET", "HEAD"],
+            "ports": [80, 443],
+        })
+        self.assertEqual(first, second)
+
+        with patch.dict(
+            "os.environ",
+            {"SESSION_SANDBOX_PUBLIC_READ_EGRESS_ENABLED": "invalid"},
+        ), self.assertRaises(SessionSandboxPolicyError):
+            skill_session_sandbox_egress_policy(context, "any-skill")
     def test_egress_budget_binding_is_root_scoped_and_call_attributable(
         self,
     ) -> None:
