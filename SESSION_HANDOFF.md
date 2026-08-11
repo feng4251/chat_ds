@@ -2,6 +2,72 @@
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
+## 2026-08-11 统一沙箱公网只读出站闭环
+
+- 用户指出对每个新网址增加 typed broker/hostname allowlist 是补丁式治理，并要求统一
+  session-wise Bash/代码沙箱在不破坏文件系统隔离的前提下具备通用公网读取能力。本轮将问题重述为
+  跨 Skill 不变量：网络 authority 必须由 deployment 拥有、与模型/Skill 参数分离、经过签名和总预算
+  约束；任意规范 Skill 可以使用同一只读 profile，但不能自行扩大 method、port、私网或 header/body
+  权限。提交 `133616f6740dea1643e4d5e2a4e1e42eceb4502b feat: add signed public-read
+  sandbox egress` 完成该闭环，没有加入疾病、Skill/package/session、route、worker、文件名、固定来源
+  或 V2.3 特判。
+- 四个 Legacy session sandbox 和每 Turn 独立 Claude 容器仍保持 `network_mode=none`，没有 Docker DNS、
+  默认路由或第二套 Bash 环境。新增的是签名 policy-v3 中固定的
+  `public_read={methods:[GET,HEAD],ports:[80,443]}` profile；生产仅能由
+  `SESSION_SANDBOX_PUBLIC_READ_EGRESS_ENABLED=true` 与
+  `CLAUDE_PUBLIC_READ_EGRESS_ENABLED=true` 启用，ToolContext、Skill、MCP 和模型参数都不能铸造或
+  修改它。既有 provider/MCP/Skill exact rules 优先匹配并保留所需协议 header；只有 exact rule 未命中
+  时才进入公网只读 fallback。
+- `skill-egress-proxy` 在 fallback 中删除调用方全部 header、credential 和 request body，只重建固定
+  Host、User-Agent、Accept、identity encoding 与 close envelope；非 GET/HEAD、GET/HEAD body、
+  非 80/443 端口、loopback、private、link-local、reserved、multicast、metadata、transition/NAT64
+  地址以及 mixed public/private DNS 全部在上游连接前 fail closed。Proxy 自行解析、分类并 pin 公网 IP；
+  policy/profile/root-run budget/call identity 全部受 HMAC 绑定，redirect 必须重新经过同一授权。
+  Legacy declared command、Skill script/Python/persistent process、模型生成 `execute_code` 与 Claude Turn
+  都复用同一协议；runtime cohort 标签统一为 `signed-public-read-v1`，Supervisor health 明确报告
+  `network-none+signed-exact-and-public-read-egress-v3`。
+- 该设计没有也不能宣称数学意义的“禁止上传”：域名、path、query、DNS/TLS 元数据本身就是出站信息，
+  恶意代码仍可把少量数据编码进允许的 URL。当前固定 header、无 body、仅标准端口、全局次数/字节预算
+  和无私网访问显著收窄泄露面；真正零任意外传仍必须使用固定参数 schema 的 typed broker。需要 POST、
+  WebSocket、raw TCP、QUIC、非标准端口或认证 header 的合法应用，仍应由 Skill/MCP exact declaration 或
+  新 typed capability 显式获得权限，不能借 public-read profile 放宽。
+- 成熟实现对照冻结本地独立 `claude-code/` commit
+  `6f6f12b37f529488b10e53928dd5508bb93535c7`。采用并适配
+  `src/upstreamproxy/upstreamproxy.ts` 对所有 subprocess 集中注入代理/证书环境、
+  `src/cli/structuredIO.ts` 的结构化 sandbox permission callback，以及 `src/tools.ts` 的中央工具装配；
+  这些模式被放在 ChatDS 既有 signed authority、receipt、budget 与 session mount 合同之后。拒绝
+  `src/main.tsx` 中只适用于真正无网外层 sandbox 的 permission bypass，也拒绝给 Turn 容器直接加入
+  Docker network。相关本地路径完整且无 stub/语义疑点，因此本轮没有用 Web 搜索替代源码证据。
+- 回归证据：Proxy/Bridge/Topology 最终组合为 `119 passed, 206 subtests passed`；Claude 全套此前为
+  `57 passed, 1 skipped, 7 subtests passed`，Executor/Proxy 完整相关组合为
+  `216 passed, 1 skipped, 257 subtests passed`。Harness 宿主全量的可执行逻辑为
+  `1972 passed, 1 skipped, 804 subtests`，其 19 个既有 failure 来自当前 `cc` 无权读取生产 NFS
+  tombstone；隔离 root/tmpfs 全量为 1,983 项通过，唯一 CommonJS holdout 因测试镜像不带 Node 且用例
+  mock 掉 worker-tree 准备而失败，同一 isolated-executor 路径在完整宿主 runtime 已通过。最终发布前
+  rerun 的 Claude/policy/isolated 组合为 `113 passed, 1 skipped` 加同一个 Node 环境 holdout。
+  `compileall`、Compose config、`git diff --check`、secret 与 genericity scan 均通过；未自动运行模型
+  重型 V2.3 E2E。
+- 生产从提交的精确 clean archive `/tmp/chat_ds_deploy_133616f6` 构建，archive/tracked tree 均为
+  22,496 个文件。切换前两次确认 nonterminal AgentRun 和动态 Claude Turn container 均为 0；SQLite
+  online backup volume 为 `chat_ds_db_backup_pre_133616f6_20260811_124338`，365,400,064 bytes，
+  SHA-256 `96ec6fb3554058c39b687fa1537c9d01e929d46aa69ef211171cabbe56f9b5b8`，quick/FK 正常。
+  切换前镜像保留 `rollback-pre-133616f6` 标签；Backend、Frontend、数据库、Browser、SearXNG/Valkey
+  和其他生产容器没有重建。
+- 当前生产 Proxy image 为
+  `sha256:7f396ab6c8aae1692e2f3800179bbf876be7a2d9cb546bc7ec1875e805ae1da3`，四个 sandbox 为
+  `sha256:33c723834ffd5843af0c154a3df5b453b1913f65bb852d6def185a0cff32427d`，Claude Runner 为
+  `sha256:92e6ddcf0d4bd66f5c95034e4c46492cea99717b5fd1e0d402958d7fdacdbbfd`，Supervisor 为
+  `sha256:9b1b15265a2a1170541ac42e57c4fdb9a11a61b8b810de1b4ab4771d8659672f`，Harness 为
+  `sha256:2be8da8e348f1b48b7dbcced24ac99a7a082e934d0f30056973dc74d20e12281`；revision 均精确匹配
+  `133616f6...`。所有长期目标容器 running/healthy、restart 0（inert Runner anchor 无 healthcheck）；
+  Backend→Harness `/health`/`/v1/models`、localhost 和 `10.10.132.126:5173/api/health` 均为 200，
+  SQLite quick/FK、nonterminal run 和严重启动日志均正常/为 0。
+- 生产零模型真实网络 smoke 经 Harness→统一 executor→loopback bridge→签名 Proxy 完成：
+  `https://example.com/` 与 `https://www.iana.org/domains/example` 均返回 200；
+  `http://127.0.0.1/` 在上游连接前被拒，公网 POST 返回 403；receipt 为 policy v3、
+  `controlled_egress_proxy`。该 smoke 证明是通用公网 profile 而非域名补丁，并且没有创建持久 Session、
+  workspace artifact 或模型调用。
+
 ## 2026-08-11 `request_url_not_allowed` 与类型化实时行情闭环
 
 - conversation `63a312df7a1d462fac00ac0926381de3` 已按三源证据闭环。持久化对话中的最后一轮要求查询
