@@ -1829,6 +1829,54 @@ class TlsInterceptionPolicyTests(unittest.TestCase):
             legacy.pins,
         )
 
+    def test_public_tls_failures_keep_distinct_safe_codes(self):
+        destination = server.Destination(
+            "https", "example.com", 443, "93.184.216.34",
+            socket.AF_INET, False,
+        )
+        policy = server.UpstreamTlsPolicy({})
+
+        class RawSocket:
+            def settimeout(self, _value):
+                return None
+
+        class Context:
+            post_handshake_auth = False
+            check_hostname = True
+            verify_mode = ssl.CERT_REQUIRED
+            minimum_version = ssl.TLSVersion.TLSv1_2
+
+            def __init__(self, failure):
+                self.failure = failure
+
+            def set_alpn_protocols(self, _protocols):
+                return None
+
+            def wrap_socket(self, *_args, **_kwargs):
+                raise self.failure
+
+        cases = (
+            (
+                ssl.SSLCertVerificationError(1, "fixture"),
+                "upstream_tls_certificate_invalid",
+            ),
+            (socket.timeout("fixture"), "upstream_tls_handshake_timeout"),
+            (ConnectionResetError("fixture"), "upstream_connection_reset"),
+            (ssl.SSLError("fixture"), "upstream_tls_handshake_failed"),
+            (OSError("fixture"), "upstream_tls_transport_failed"),
+        )
+        for failure, code in cases:
+            with (
+                self.subTest(code=code),
+                patch.object(
+                    server.ssl,
+                    "create_default_context",
+                    return_value=Context(failure),
+                ),
+                self.assertRaisesRegex(server.ProxyPolicyError, code),
+            ):
+                policy.wrap(RawSocket(), destination)
+
     def test_legacy_pin_parser_is_bounded_and_canonicalizes_padding(self):
         pin_without_padding = "A" * 43
         self.assertEqual(

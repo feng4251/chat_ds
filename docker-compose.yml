@@ -729,6 +729,7 @@ services:
       # provider-stream ceiling so this outer transport cannot fire first.
       HARNESS_STREAM_TIMEOUT_SECONDS: ${HARNESS_STREAM_TIMEOUT_SECONDS:-18000}
       CLAUDE_CODE_ENGINE_ENABLED: ${CLAUDE_CODE_ENGINE_ENABLED:-true}
+      LEGACY_ENGINE_NEW_RUNS_ENABLED: ${LEGACY_ENGINE_NEW_RUNS_ENABLED:-false}
       DEFAULT_AGENT_ENGINE_ID: ${DEFAULT_AGENT_ENGINE_ID:-claude_code}
       CLAUDE_WEB_SEARCH_URL: ${CLAUDE_WEB_SEARCH_URL:-http://searxng:8080/search}
       CLAUDE_MARKET_DATA_URL: ${CLAUDE_MARKET_DATA_URL:-http://market-data-gateway:8090/v1/quote}

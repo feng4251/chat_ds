@@ -152,6 +152,11 @@ async def _open_agent_engine_stream(
     legacy_payload: dict,
 ):
     if engine_id == ENGINE_ID_LEGACY:
+        if not settings.legacy_engine_new_runs_enabled:
+            raise HTTPException(
+                409,
+                "Legacy Harness execution is disabled for new Turns",
+            )
         async with httpx.AsyncClient(
             timeout=settings.harness_stream_timeout_seconds
         ) as client:
@@ -3072,16 +3077,17 @@ async def get_models(cur_user=Depends(get_current_user), db=Depends(get_db)):
     # may enrich availability/name data, but it must never make configured
     # models disappear merely because another engine reports a partial list.
     discovered: dict[str, dict] = {}
-    try:
-        async with httpx.AsyncClient(timeout=5) as c:
-            r = await c.get(f"{settings.harness_url}/v1/models")
-            if r.status_code == 200:
-                data = r.json()
-                for m in data.get("data", []):
-                    if isinstance(m, dict) and m.get("id"):
-                        discovered[canonical_agent_model_id(m["id"])] = m
-    except Exception:
-        pass
+    if settings.legacy_engine_new_runs_enabled:
+        try:
+            async with httpx.AsyncClient(timeout=5) as c:
+                r = await c.get(f"{settings.harness_url}/v1/models")
+                if r.status_code == 200:
+                    data = r.json()
+                    for m in data.get("data", []):
+                        if isinstance(m, dict) and m.get("id"):
+                            discovered[canonical_agent_model_id(m["id"])] = m
+        except Exception:
+            pass
     models = [
         {
             "id": mid,
@@ -3092,7 +3098,11 @@ async def get_models(cur_user=Depends(get_current_user), db=Depends(get_db)):
             "capabilities": cfg.get("capabilities", ["text"]),
             "legacy_discovered": mid in discovered,
             "compatible_engines": [
-                "legacy",
+                *(
+                    ["legacy"]
+                    if settings.legacy_engine_new_runs_enabled
+                    else []
+                ),
                 *(["claude_code"] if claude_code_model_compatible(cfg) else []),
             ],
         }
@@ -3109,7 +3119,11 @@ async def get_models(cur_user=Depends(get_current_user), db=Depends(get_db)):
             "provider": cm.provider, "is_multimodal": cm.is_multimodal,
             "is_default": False,
             "capabilities": ["vision"] if cm.is_multimodal else ["text"],
-            "compatible_engines": ["legacy"],
+            "compatible_engines": (
+                ["legacy"]
+                if settings.legacy_engine_new_runs_enabled
+                else []
+            ),
         })
     return {"models": models}
 
@@ -3127,10 +3141,23 @@ async def get_agent_engines(cur_user=Depends(get_current_user)):
             {
                 "id": item.id,
                 "name": item.display_name,
-                "available": item.available,
+                "available": (
+                    item.available
+                    and not (
+                        item.id == ENGINE_ID_LEGACY
+                        and not settings.legacy_engine_new_runs_enabled
+                    )
+                ),
                 "version": item.version,
                 "capabilities": list(item.capabilities),
-                "unavailable_reason": item.unavailable_reason,
+                "unavailable_reason": (
+                    "Legacy Harness is retained for history only"
+                    if (
+                        item.id == ENGINE_ID_LEGACY
+                        and not settings.legacy_engine_new_runs_enabled
+                    )
+                    else item.unavailable_reason
+                ),
             }
             for item in descriptors
         ]
@@ -3252,6 +3279,14 @@ async def _chat_stream(
                     409,
                     "Agent Engine is fixed for this Conversation; fork it to change engines",
                 )
+            if (
+                conv.engine_id == ENGINE_ID_LEGACY
+                and not settings.legacy_engine_new_runs_enabled
+            ):
+                raise HTTPException(
+                    409,
+                    "Legacy Harness execution is disabled; fork this Conversation to Claude Code",
+                )
             model_id = canonical_agent_model_id(
                 req.model_id
                 or conv.model_id
@@ -3269,6 +3304,14 @@ async def _chat_stream(
                 await _detect_model(req, str(cur_user.id))
             )
             requested_engine = req.engine_id or settings.default_agent_engine_id
+            if (
+                requested_engine == ENGINE_ID_LEGACY
+                and not settings.legacy_engine_new_runs_enabled
+            ):
+                raise HTTPException(
+                    400,
+                    "Legacy Harness execution is disabled for new Conversations",
+                )
             from agent_engines.registry import build_agent_engine_registry
             try:
                 build_agent_engine_registry().get(requested_engine)

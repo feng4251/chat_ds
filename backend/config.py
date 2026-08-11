@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     # Runner Supervisor and its networkless per-Turn container boundary are
     # explicitly enabled by deployment configuration.
     claude_code_engine_enabled: bool = False
+    # Keep the adapter and historical Sessions readable while allowing a
+    # deployment to route every newly executed Turn through Claude Code.
+    legacy_engine_new_runs_enabled: bool = True
     default_agent_engine_id: Literal["legacy", "claude_code"] = "legacy"
     claude_runner_url: str = "http://claude-runner-supervisor:8030"
     claude_runner_stream_timeout_seconds: int = 18000
@@ -67,6 +70,14 @@ class Settings(BaseSettings):
             raise ValueError(
                 "DEFAULT_AGENT_ENGINE_ID=claude_code requires "
                 "CLAUDE_CODE_ENGINE_ENABLED=true"
+            )
+        if (
+            self.default_agent_engine_id == "legacy"
+            and not self.legacy_engine_new_runs_enabled
+        ):
+            raise ValueError(
+                "DEFAULT_AGENT_ENGINE_ID=legacy requires "
+                "LEGACY_ENGINE_NEW_RUNS_ENABLED=true"
             )
         return self
 

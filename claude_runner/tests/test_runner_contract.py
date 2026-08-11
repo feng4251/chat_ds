@@ -20,6 +20,7 @@ from claude_runner.runner_entrypoint import (
     _pending_plan_task_count,
     _safe_controller_exception_code,
     _terminal_error,
+    _validate_artifact_contracts,
     _emit_workspace_artifacts,
     _workspace_snapshot,
     _worker_environment,
@@ -49,6 +50,12 @@ class RunnerCommandContractTests(unittest.TestCase):
         )
         self.assertIsNone(
             _safe_controller_exception_code(RuntimeError("secret=/tmp/value"))
+        )
+        self.assertEqual(
+            _safe_controller_exception_code(
+                RuntimeError("native_task_state_invalid")
+            ),
+            "native_task_state_invalid",
         )
 
     def test_fresh_and_resumed_turns_use_transactional_native_sessions(self):
@@ -279,6 +286,148 @@ class RunnerCommandContractTests(unittest.TestCase):
                 _pending_plan_task_count(root / "tasks", native_session_id),
                 0,
             )
+
+    def test_task_output_terminal_receipt_closes_missing_notification(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = EventLedger(Path(temporary) / "events.jsonl")
+            ledger.append_line(
+                b'{"type":"system","subtype":"task_started",'
+                b'"task_id":"bfixture01","task_type":"local_bash"}',
+                channel="stdout",
+            )
+            ledger.append_line(
+                b'{"type":"assistant","message":{"content":[{'
+                b'"type":"tool_use","id":"tool-output-1",'
+                b'"name":"TaskOutput","input":{"task_id":"bfixture01"}}]}}',
+                channel="stdout",
+            )
+            ledger.append_line(json.dumps({
+                "type": "user",
+                "message": {"content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tool-output-1",
+                    "is_error": False,
+                    "content": (
+                        "<retrieval_status>success</retrieval_status>\n"
+                        "<task_id>bfixture01</task_id>\n"
+                        "<task_type>local_bash</task_type>\n"
+                        "<status>completed</status>\n"
+                        "<exit_code>0</exit_code>"
+                    ),
+                }]},
+            }).encode(), channel="stdout")
+            self.assertEqual(ledger.active_native_task_count, 0)
+            self.assertEqual(
+                ledger.native_task_summary["reconciled_by"]["task_output"],
+                1,
+            )
+            ledger.close()
+
+    def test_controller_reaps_only_local_bash_not_delegated_agent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = EventLedger(Path(temporary) / "events.jsonl")
+            for task_id, task_type in (
+                ("bfixture02", "local_bash"),
+                ("afixture02", "local_agent"),
+            ):
+                ledger.append_line(json.dumps({
+                    "type": "system",
+                    "subtype": "task_started",
+                    "task_id": task_id,
+                    "task_type": task_type,
+                }).encode(), channel="stdout")
+            self.assertEqual(ledger.active_native_task_count, 2)
+            self.assertEqual(ledger.reconcile_worker_process_exit(), 1)
+            self.assertEqual(ledger.active_native_task_count, 1)
+            self.assertEqual(
+                ledger.native_task_summary["active_by_type"],
+                {"local_agent": 1},
+            )
+            ledger.close()
+
+    def test_artifact_contract_is_machine_checked_only_after_skill_receipt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report = root / "RENAMED_DELIVERABLE.md"
+            report.write_text("one\ntwo\n", encoding="utf-8")
+            after = _workspace_snapshot(root)
+            contract = [{
+                "skill_name": "inventory-audit",
+                "declared_final_artifact": "{PROJECT}_DELIVERABLE.md",
+                "expected_min_bytes": 1,
+                "expected_min_lines": 4,
+                "declared_section_count": 2,
+            }]
+            inactive = _validate_artifact_contracts(
+                contracts=contract,
+                invoked_skill_names=frozenset(),
+                before={},
+                after=after,
+                workspace_root=root,
+            )
+            self.assertEqual(inactive["status"], "not_applicable")
+            active = _validate_artifact_contracts(
+                contracts=contract,
+                invoked_skill_names=frozenset({"inventory-audit"}),
+                before={},
+                after=after,
+                workspace_root=root,
+            )
+            self.assertEqual(active["status"], "failed")
+            self.assertIn(
+                "artifact_min_lines_not_met",
+                {finding["code"] for finding in active["findings"]},
+            )
+            self.assertIn(
+                "artifact_declared_sections_not_met",
+                {finding["code"] for finding in active["findings"]},
+            )
+
+    def test_artifact_contract_accepts_renamed_cross_domain_package(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "01_inventory.md").write_text("module\n", encoding="utf-8")
+            report = root / "WAREHOUSE_FULL.md"
+            report.write_text("# One\nbody\n## Two\nbody\n", encoding="utf-8")
+            after = _workspace_snapshot(root)
+            receipt = _validate_artifact_contracts(
+                contracts=[{
+                    "skill_name": "warehouse-planner",
+                    "declared_final_artifact": "{NAME}_FULL.md",
+                    "declared_modular_files": ["01_*.md"],
+                    "expected_min_bytes": 4,
+                    "expected_min_lines": 4,
+                    "declared_section_count": 2,
+                }],
+                invoked_skill_names=frozenset({"warehouse-planner"}),
+                before={},
+                after=after,
+                workspace_root=root,
+            )
+            self.assertEqual(receipt["status"], "passed")
+
+    def test_current_final_is_selected_without_deleting_prior_deliverables(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prior = root / "PRIOR_FULL.md"
+            prior.write_text("# Prior\n", encoding="utf-8")
+            before = _workspace_snapshot(root)
+            current = root / "CURRENT_FULL.md"
+            current.write_text("# Current\n", encoding="utf-8")
+            after = _workspace_snapshot(root)
+            receipt = _validate_artifact_contracts(
+                contracts=[{
+                    "skill_name": "portable-planner",
+                    "declared_final_artifact": "{NAME}_FULL.md",
+                    "declared_section_count": 1,
+                }],
+                invoked_skill_names=frozenset({"portable-planner"}),
+                before=before,
+                after=after,
+                workspace_root=root,
+            )
+        self.assertEqual(receipt["status"], "passed")
+        self.assertEqual(receipt["validated"][0]["path"], "CURRENT_FULL.md")
 
     def test_workspace_snapshot_emits_only_new_or_mutated_regular_files(self):
         with tempfile.TemporaryDirectory() as temporary:

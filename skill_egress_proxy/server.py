@@ -2178,8 +2178,18 @@ class UpstreamTlsPolicy:
                 raw_socket,
                 server_hostname=destination.host,
             )
-        except (OSError, ssl.SSLError) as exc:
-            raise ProxyPolicyError("upstream_tls_verification_failed") from exc
+        except ssl.SSLCertVerificationError as exc:
+            raise ProxyPolicyError(
+                "upstream_tls_certificate_invalid"
+            ) from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise ProxyPolicyError("upstream_tls_handshake_timeout") from exc
+        except ConnectionResetError as exc:
+            raise ProxyPolicyError("upstream_connection_reset") from exc
+        except ssl.SSLError as exc:
+            raise ProxyPolicyError("upstream_tls_handshake_failed") from exc
+        except OSError as exc:
+            raise ProxyPolicyError("upstream_tls_transport_failed") from exc
         try:
             negotiated = wrapped.selected_alpn_protocol()
             if negotiated not in {None, "http/1.1"}:

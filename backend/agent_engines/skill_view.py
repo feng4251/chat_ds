@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
+from .skill_contracts import SkillContractError, compile_skill_contract
+
 
 MAX_SKILL_VIEW_FILES = 8_192
 MAX_SKILL_VIEW_BYTES = 512 * 1024 * 1024
@@ -118,6 +120,9 @@ def materialize_claude_skill_view(
     skills_root.mkdir(parents=True, mode=0o700)
 
     manifest_skills: list[dict[str, Any]] = []
+    artifact_contracts: list[dict[str, Any]] = []
+    runtime_requirements: list[dict[str, Any]] = []
+    skill_diagnostics: list[dict[str, str]] = []
     file_rows: list[dict[str, Any]] = []
     total_bytes = 0
     try:
@@ -128,6 +133,25 @@ def materialize_claude_skill_view(
             relative_files = _safe_regular_files(root)
             if not any(path.as_posix() == "SKILL.md" for path in relative_files):
                 raise SkillViewError(f"Skill '{source.name}' has no regular SKILL.md")
+            try:
+                artifact_contract, requirements, diagnostics = (
+                    compile_skill_contract(
+                        skill_name=source.name,
+                        root=root,
+                        relative_files=relative_files,
+                        primary=source.bundle_role != "supporting",
+                    )
+                )
+            except SkillContractError as exc:
+                raise SkillViewError(str(exc)) from exc
+            if artifact_contract is not None:
+                artifact_contracts.append(artifact_contract)
+            if any(requirements.values()):
+                runtime_requirements.append({
+                    "skill_name": source.name,
+                    **requirements,
+                })
+            skill_diagnostics.extend(diagnostics)
             skill_files: list[dict[str, Any]] = []
             for relative in relative_files:
                 if len(file_rows) >= MAX_SKILL_VIEW_FILES:
@@ -163,6 +187,20 @@ def materialize_claude_skill_view(
             sources=source_rows,
             plugin_root=plugin,
         )
+        if any(
+            row.get("persistent_stdin_process") is True
+            for row in runtime_requirements
+        ):
+            server_name = "chatds-process"
+            if server_name in mcp_servers:
+                raise SkillViewError(
+                    "Explicit Skill MCP identity conflicts with Harness capability"
+                )
+            mcp_servers[server_name] = {
+                "type": "stdio",
+                "command": "/usr/local/bin/python",
+                "args": ["-I", "/app/claude-runner/mcp_process.py"],
+            }
         harness_egress_rules: list[dict[str, Any]] = []
         enabled_tool_names = {
             str(name) for name in enabled_tools if isinstance(name, str)
@@ -207,6 +245,8 @@ def materialize_claude_skill_view(
                 "url_prefix": normalized_market_url,
                 "methods": ["GET"],
             })
+        if len(mcp_servers) > MAX_SKILL_MCP_SERVERS:
+            raise SkillViewError("Compiled MCP server-count limit exceeded")
         mcp_config_path = plugin / ".mcp.json"
         _write_json_exclusive(mcp_config_path, {"mcpServers": mcp_servers})
         mcp_config_bytes = mcp_config_path.read_bytes()
@@ -241,6 +281,9 @@ def materialize_claude_skill_view(
                 selected_primary_skill_names
             ),
             "harness_egress_rules": harness_egress_rules,
+            "artifact_contracts": artifact_contracts,
+            "runtime_requirements": runtime_requirements,
+            "skill_diagnostics": skill_diagnostics,
             "skills": manifest_skills,
             "files": sorted(file_rows, key=lambda row: row["path"]),
         }
