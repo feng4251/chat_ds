@@ -44,9 +44,11 @@ class AgentEngineRequest:
     session_skill_registry: tuple[Mapping[str, Any], ...] = ()
     skill_view_path: str | None = None
     skill_view_sha256: str | None = None
-    # ``native_session_id`` is the fresh, transaction-local checkpoint that
-    # this Turn may publish.  A previously committed checkpoint is supplied
-    # separately so a failed/cancelled Turn can never contaminate it.
+    # ``native_session_id`` is the fresh, transaction-local transcript
+    # checkpoint that this Turn may publish.  Outcome authority remains in
+    # durable receipts: an outer contract failure may still publish a fully
+    # observed native transcript boundary so the next Turn does not roll back
+    # to stale conversational context.
     native_session_id: str | None = None
     resume_from_native_session_id: str | None = None
     source: str = "chat"

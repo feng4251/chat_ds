@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -26,14 +27,17 @@ from model_routing import (
     filter_agentic_fallback_model_ids,
 )
 from models import (
+    AgentRun,
     Conversation,
     CustomModelConfig,
     Message,
     ScheduledJob,
     ScheduledJobRun,
+    User,
 )
 from workspace import ensure_workspace_async, serialize_json_list
 from workspace_lock import WorkspaceMutationLockError
+from schemas import ScheduledJobCreate
 
 logger = logging.getLogger(__name__)
 
@@ -297,6 +301,10 @@ async def execute_job(job_id: str, *, force: bool = False) -> None:
 def _job_may_run(job: ScheduledJob | None, flight: _JobExecutionFlight) -> bool:
     if job is None:
         return False
+    if job.max_runs is not None and job.run_count >= job.max_runs:
+        return False
+    if job.expires_at is not None and _utcnow() > job.expires_at:
+        return False
     if flight.force_requested:
         return True
     return bool(
@@ -304,6 +312,130 @@ def _job_may_run(job: ScheduledJob | None, flight: _JobExecutionFlight) -> bool:
         and job.next_run_at is not None
         and job.next_run_at <= _utcnow()
     )
+
+
+async def stage_schedule_control_writes(
+    db,
+    *,
+    user_id: str,
+    conversation_id: str,
+    root_run_id: str,
+    model_id: str,
+    writes: object,
+) -> tuple[str, ...]:
+    """Stage validated, idempotent schedule rows in the root projection txn.
+
+    Identity is controller-bound; model arguments cannot select a user,
+    Session, engine, or ownership scope. Re-projecting the same durable root
+    terminal derives the same primary key and therefore cannot duplicate an
+    unattended side effect.
+    """
+
+    if not isinstance(writes, list) or len(writes) > 64:
+        raise ValueError("schedule_control_writes_invalid")
+    created: list[str] = []
+    observed_tool_calls: set[str] = set()
+    from native_tools import DEFAULT_NATIVE_TOOL_SET
+
+    for row in writes:
+        if (
+            not isinstance(row, dict)
+            or row.get("schema") != "chatds.schedule-write.v1"
+            or row.get("operation") != "create"
+        ):
+            raise ValueError("schedule_control_write_invalid")
+        tool_call_id = row.get("tool_call_id")
+        if (
+            not isinstance(tool_call_id, str)
+            or not tool_call_id
+            or len(tool_call_id) > 256
+            or tool_call_id in observed_tool_calls
+        ):
+            raise ValueError("schedule_control_tool_call_invalid")
+        observed_tool_calls.add(tool_call_id)
+        request = _normalize_schedule_control_request(row.get("request"))
+        tools = request.get("enabled_tools")
+        if tools is not None and set(tools) - DEFAULT_NATIVE_TOOL_SET:
+            raise ValueError("schedule_control_tools_unknown")
+        threat = scan_cron_prompt(request["prompt"])
+        if threat:
+            raise ValueError(f"schedule_control_prompt_{threat}")
+        kind, value, next_run = parse_schedule(
+            request["schedule"], request["timezone"]
+        )
+        expires_at = None
+        parsed_expiry = request.get("expires_at")
+        if parsed_expiry is not None:
+            if parsed_expiry.tzinfo is None:
+                raise ValueError("schedule_control_expiry_timezone_missing")
+            expires_at = parsed_expiry.astimezone(timezone.utc).replace(tzinfo=None)
+            if next_run > expires_at:
+                raise ValueError("schedule_control_no_occurrence_before_expiry")
+        job_id = hashlib.sha256(
+            (
+                "chatds.schedule-control.v1\0"
+                + root_run_id
+                + "\0"
+                + tool_call_id
+            ).encode("utf-8")
+        ).hexdigest()[:32]
+        existing = await db.get(ScheduledJob, job_id)
+        if existing is not None:
+            if (
+                existing.user_id != user_id
+                or existing.conversation_id != conversation_id
+            ):
+                raise ValueError("schedule_control_identity_collision")
+            created.append(job_id)
+            continue
+        db.add(ScheduledJob(
+            id=job_id,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            name=request["name"],
+            prompt=request["prompt"],
+            schedule_kind=kind,
+            schedule_value=value,
+            timezone=request["timezone"],
+            model_id=model_id,
+            enabled_tools=(
+                json.dumps(tools, ensure_ascii=False)
+                if tools is not None else None
+            ),
+            enabled=True,
+            delete_after_run=request["delete_after_run"],
+            max_runs=request.get("max_runs"),
+            run_count=0,
+            expires_at=expires_at,
+            next_run_at=next_run,
+        ))
+        created.append(job_id)
+    return tuple(created)
+
+
+def _normalize_schedule_control_request(value: object) -> dict:
+    allowed = {
+        "name", "prompt", "schedule", "timezone", "max_runs",
+        "expires_at", "enabled_tools", "delete_after_run",
+    }
+    if not isinstance(value, dict) or set(value) - allowed:
+        raise ValueError("schedule_control_request_invalid")
+    try:
+        payload = ScheduledJobCreate.model_validate(value)
+    except Exception as exc:
+        raise ValueError("schedule_control_request_invalid") from exc
+    if payload.conversation_id is not None or payload.model_id is not None:
+        raise ValueError("schedule_control_identity_override")
+    return {
+        "name": payload.name.strip(),
+        "prompt": payload.prompt.strip(),
+        "schedule": payload.schedule.strip(),
+        "timezone": payload.timezone.strip(),
+        "max_runs": payload.max_runs,
+        "expires_at": payload.expires_at,
+        "enabled_tools": payload.enabled_tools,
+        "delete_after_run": payload.delete_after_run,
+    }
 
 
 async def _persist_job_run_terminal(
@@ -472,7 +604,21 @@ async def _execute_job_bound(
             model_id=job.model_id,
         )
         job.last_run_at = _utcnow()
-        job.next_run_at = next_run_for(job, job.last_run_at)
+        job.run_count += 1
+        candidate_next_run = next_run_for(job, job.last_run_at)
+        if (
+            job.schedule_kind == "once"
+            or job.max_runs is not None and job.run_count >= job.max_runs
+            or job.expires_at is not None
+            and (
+                candidate_next_run is None
+                or candidate_next_run > job.expires_at
+            )
+        ):
+            job.next_run_at = None
+            job.enabled = False
+        else:
+            job.next_run_at = candidate_next_run
         db.add(run)
         await db.flush()
         flight.run_id = str(run.id)
@@ -510,6 +656,21 @@ async def _execute_job_bound(
         model_id = canonical_agent_model_id(
             job.model_id or conv.model_id or DEFAULT_AGENT_MODEL_ID
         )
+        tools = serialize_json_list(job.enabled_tools, [])
+        if not tools:
+            from native_tools import UNATTENDED_DEFAULT_NATIVE_TOOLS
+            tools = list(UNATTENDED_DEFAULT_NATIVE_TOOLS)
+
+        if conv.engine_id == "claude_code":
+            await _execute_claude_scheduled_turn(
+                db,
+                job=job,
+                conv=conv,
+                scheduled_run=run,
+                tools=tools,
+            )
+            return
+
         provider_config = await _resolve_job_model(db, job.user_id, model_id)
         fallback_configs: list[dict] = []
         fallback_ids, removed_fallback_ids = filter_agentic_fallback_model_ids(
@@ -535,11 +696,6 @@ async def _execute_job_bound(
                     job.id,
                     fallback_id,
                 )
-        tools = serialize_json_list(job.enabled_tools, [])
-        if not tools:
-            from native_tools import UNATTENDED_DEFAULT_NATIVE_TOOLS
-            tools = list(UNATTENDED_DEFAULT_NATIVE_TOOLS)
-
         user_message = Message(
             conversation_id=conv.id,
             role="user",
@@ -671,6 +827,111 @@ async def _execute_job_bound(
                 },
                 conv.id,
             )
+
+
+async def _execute_claude_scheduled_turn(
+    db,
+    *,
+    job: ScheduledJob,
+    conv: Conversation,
+    scheduled_run: ScheduledJobRun,
+    tools: list[str],
+) -> None:
+    """Execute unattended work through the Conversation's ClaudeEngine.
+
+    This deliberately reuses the ordinary chat ingestion/projection path, so
+    checkpoints, exact Skills, workspace locking, terminal receipts and model
+    bindings cannot drift between interactive and scheduled Turns.
+    """
+
+    from routers.chat_router import _chat_stream
+    from schemas import ChatRequest
+
+    user = await db.get(User, str(job.user_id))
+    if user is None:
+        raise RuntimeError("Scheduled job owner no longer exists")
+    response = await _chat_stream(
+        ChatRequest(
+            conversation_id=str(conv.id),
+            content=str(job.prompt),
+            model_id=(str(job.model_id) if job.model_id else None),
+            engine_id="claude_code",
+        ),
+        user,
+        db,
+        source="cron",
+        enabled_tools_override=tuple(tools),
+    )
+    agent_run_id: str | None = None
+    output_parts: list[str] = []
+    async for raw_chunk in response.body_iterator:
+        text_chunk = (
+            raw_chunk.decode("utf-8", "replace")
+            if isinstance(raw_chunk, bytes)
+            else str(raw_chunk)
+        )
+        for line in text_chunk.splitlines():
+            if not line.startswith("data: "):
+                continue
+            try:
+                payload = json.loads(line[6:])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            candidate_run = payload.get("run_id")
+            if isinstance(candidate_run, str) and candidate_run:
+                agent_run_id = agent_run_id or candidate_run
+            delta = payload.get("delta")
+            if isinstance(delta, str):
+                output_parts.append(delta)
+    if not agent_run_id:
+        raise RuntimeError("Scheduled Claude Turn returned no durable run identity")
+
+    # The terminal SSE is emitted only after the root projection commits.
+    # End the request Session's read transaction before observing that commit.
+    await db.rollback()
+    agent_run = await db.get(AgentRun, agent_run_id)
+    if agent_run is None or agent_run.source != "cron":
+        raise RuntimeError("Scheduled Claude Turn projection is missing")
+    await db.refresh(scheduled_run)
+    await db.refresh(job)
+    scheduled_run.ended_at = _utcnow()
+    scheduled_run.output = "".join(output_parts)
+    scheduled_run.model_id = agent_run.resolved_model_id or agent_run.requested_model_id
+    scheduled_run.input_tokens = int(agent_run.input_tokens or 0)
+    scheduled_run.output_tokens = int(agent_run.output_tokens or 0)
+    scheduled_run.total_tokens = int(agent_run.total_tokens or 0)
+    if agent_run.status == "succeeded":
+        scheduled_run.status = "succeeded"
+        scheduled_run.error = None
+        job.last_status = "succeeded"
+        job.consecutive_errors = 0
+    else:
+        scheduled_run.status = (
+            "cancelled" if agent_run.status == "cancelled" else "failed"
+        )
+        scheduled_run.error = agent_run.error or agent_run.finish_reason
+        job.last_status = scheduled_run.status
+        if scheduled_run.status == "failed":
+            job.consecutive_errors += 1
+    await _commit_scheduled_session_state(
+        db,
+        user_id=str(job.user_id),
+        conversation_id=str(conv.id),
+    )
+    await emit_event(
+        str(job.user_id),
+        "cron.completed" if scheduled_run.status == "succeeded" else "cron.failed",
+        {
+            "job_id": str(job.id),
+            "run_id": str(scheduled_run.id),
+            "agent_run_id": agent_run_id,
+            "conversation_id": str(conv.id),
+            "error": scheduled_run.error,
+        },
+        str(conv.id),
+    )
 
 
 async def enqueue_due_jobs_once() -> dict[str, int]:

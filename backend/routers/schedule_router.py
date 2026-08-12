@@ -38,6 +38,9 @@ def _job_dict(job: ScheduledJob) -> dict:
         "enabled_tools": json.loads(job.enabled_tools) if job.enabled_tools else [],
         "enabled": job.enabled,
         "delete_after_run": job.delete_after_run,
+        "max_runs": job.max_runs,
+        "run_count": job.run_count,
+        "expires_at": str(job.expires_at) if job.expires_at else None,
         "next_run_at": str(job.next_run_at) if job.next_run_at else None,
         "last_run_at": str(job.last_run_at) if job.last_run_at else None,
         "last_status": job.last_status,
@@ -88,6 +91,9 @@ async def _create_for_user_in_session(
             400,
             f"Unsafe unattended prompt blocked by security rule: {threat}",
         )
+    expires_at = _normalize_expiry(payload.expires_at)
+    if expires_at is not None and next_run > expires_at:
+        raise HTTPException(400, "The schedule has no occurrence before expires_at")
     job = ScheduledJob(
         user_id=user_id,
         conversation_id=payload.conversation_id,
@@ -99,6 +105,8 @@ async def _create_for_user_in_session(
         model_id=payload.model_id,
         enabled_tools=json.dumps(payload.enabled_tools) if payload.enabled_tools else None,
         delete_after_run=payload.delete_after_run,
+        max_runs=payload.max_runs,
+        expires_at=expires_at,
         next_run_at=next_run,
     )
     db.add(job)
@@ -163,10 +171,13 @@ async def _apply_job_update(
         "model_id",
         "enabled",
         "delete_after_run",
+        "max_runs",
     ):
         value = getattr(payload, field)
         if value is not None:
             setattr(job, field, value)
+    if payload.expires_at is not None:
+        job.expires_at = _normalize_expiry(payload.expires_at)
     if payload.enabled_tools is not None:
         job.enabled_tools = json.dumps(payload.enabled_tools)
     if payload.prompt is not None:
@@ -198,6 +209,11 @@ async def _apply_job_update(
         and job.schedule_kind != "once"
     ):
         job.next_run_at = next_run_for(job)
+    if job.expires_at is not None and (
+        job.next_run_at is None or job.next_run_at > job.expires_at
+    ):
+        job.next_run_at = None
+        job.enabled = False
     if job.conversation_id:
         from workspace import require_session_workspace_active
 
@@ -207,6 +223,16 @@ async def _apply_job_update(
         )
     await db.commit()
     return _job_dict(job)
+
+
+def _normalize_expiry(value):
+    if value is None:
+        return None
+    from datetime import timezone
+
+    if value.tzinfo is None:
+        raise HTTPException(400, "expires_at must include a timezone offset")
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 async def _update_for_user(

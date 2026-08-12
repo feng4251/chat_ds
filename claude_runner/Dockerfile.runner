@@ -40,6 +40,7 @@ COPY claude_runner/__init__.py \
      claude_runner/image_selftest.py \
      claude_runner/mcp_web_search.py \
      claude_runner/mcp_market_data.py \
+     claude_runner/mcp_schedule_control.py \
      claude_runner/mcp_process.py \
      /opt/chatds-claude-runner/python/claude_runner/
 
@@ -53,6 +54,7 @@ RUN ln -s /opt/chatds-claude-code/node_modules/.bin/claude /usr/local/bin/claude
     # the installed ``python -I -m claude_runner.*`` entrypoints.
     && ln -s /opt/chatds-claude-runner/python/claude_runner/mcp_web_search.py /app/claude-runner/mcp_web_search.py \
     && ln -s /opt/chatds-claude-runner/python/claude_runner/mcp_market_data.py /app/claude-runner/mcp_market_data.py \
+    && ln -s /opt/chatds-claude-runner/python/claude_runner/mcp_schedule_control.py /app/claude-runner/mcp_schedule_control.py \
     && ln -s /opt/chatds-claude-runner/python/claude_runner/mcp_process.py /app/claude-runner/mcp_process.py \
     && chmod 0555 /opt/chatds-claude-runner/bootstrap.py \
     && chmod -R a-w /opt/chatds-claude-code /opt/chatds-claude-runner \

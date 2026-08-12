@@ -182,6 +182,8 @@ async def cronjob(
     enabled_tools: list[str] | None = None,
     enabled: bool | None = None,
     delete_after_run: bool = False,
+    max_runs: int | None = None,
+    expires_at: str = "",
     user_id: str = "default",
     session_id: str = "default",
 ) -> str:
@@ -210,6 +212,8 @@ async def cronjob(
                 "model_id": model_id or None,
                 "enabled_tools": enabled_tools,
                 "delete_after_run": delete_after_run,
+                "max_runs": max_runs,
+                "expires_at": expires_at or None,
             },
         )
     if not job_id:
@@ -250,6 +254,8 @@ async def cronjob(
                 "enabled_tools": enabled_tools,
                 "enabled": enabled,
                 "delete_after_run": delete_after_run,
+                "max_runs": max_runs,
+                "expires_at": expires_at or None,
             }.items() if value is not None
         }
         return await _request(
@@ -392,6 +398,16 @@ CRONJOB_SCHEMA = {
             "enabled_tools": {"type": "array", "items": {"type": "string"}},
             "enabled": {"type": "boolean"},
             "delete_after_run": {"type": "boolean", "default": False},
+            "max_runs": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10000,
+                "description": "Maximum number of execution attempts for bounded recurring work.",
+            },
+            "expires_at": {
+                "type": "string",
+                "description": "Timezone-aware ISO-8601 upper execution boundary.",
+            },
         },
         "required": ["action"],
     },

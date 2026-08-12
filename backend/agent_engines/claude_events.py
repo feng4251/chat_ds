@@ -101,6 +101,7 @@ class ClaudeEventProjector:
             "chatds.skill.diagnostic",
             "chatds.artifact.contract",
             "chatds.native-task.reconciled",
+            "chatds.native-cron.quarantined",
         }:
             return (EngineStreamEvent(
                 "diagnostic",
@@ -559,6 +560,9 @@ class ClaudeEventProjector:
                         "artifact_contract": native.get(
                             "artifact_contract"
                         ),
+                        "pending_control_writes": native.get(
+                            "pending_control_writes"
+                        ),
                     },
                     envelope,
                 ),
@@ -587,6 +591,11 @@ class ClaudeEventProjector:
                     "run_id": self.root_run_id,
                     "root_run_id": self.root_run_id,
                     "finish_reason": finish_reason,
+                    "payload": {
+                        "pending_control_writes": native.get(
+                            "pending_control_writes"
+                        ),
+                    },
                 },
                 envelope,
             ),

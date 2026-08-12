@@ -245,16 +245,16 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         _validate_runner_image_self_test_output(json.dumps({
             "schema": "chatds.claude-runner-image-self-test.v1",
             "status": "ok",
-            "mcp_entrypoints": 3,
-            "compatibility_entrypoints": 3,
+            "mcp_entrypoints": 4,
+            "compatibility_entrypoints": 4,
         }).encode())
         for payload in (
             b"",
-            b'{"schema":"wrong","status":"ok","mcp_entrypoints":3,'
-            b'"compatibility_entrypoints":3}\n',
+            b'{"schema":"wrong","status":"ok","mcp_entrypoints":4,'
+            b'"compatibility_entrypoints":4}\n',
             b'{"schema":"chatds.claude-runner-image-self-test.v1",'
-            b'"status":"ok","mcp_entrypoints":2,'
-            b'"compatibility_entrypoints":3}\n',
+            b'"status":"ok","mcp_entrypoints":3,'
+            b'"compatibility_entrypoints":4}\n',
             b"not-json\n",
         ):
             with self.subTest(payload=payload):

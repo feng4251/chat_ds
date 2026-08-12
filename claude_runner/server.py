@@ -1728,8 +1728,8 @@ def _validate_runner_image_self_test_output(payload: object) -> None:
     if rows != [{
         "schema": RUNNER_IMAGE_SELF_TEST_SCHEMA,
         "status": "ok",
-        "mcp_entrypoints": 3,
-        "compatibility_entrypoints": 3,
+        "mcp_entrypoints": 4,
+        "compatibility_entrypoints": 4,
     }]:
         raise RuntimeError("runner_image_self_test_failed")
 

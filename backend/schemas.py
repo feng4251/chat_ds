@@ -95,6 +95,8 @@ class ScheduledJobCreate(BaseModel):
     model_id: Optional[str] = None
     enabled_tools: Optional[list[str]] = None
     delete_after_run: bool = False
+    max_runs: Optional[int] = Field(default=None, ge=1, le=10_000)
+    expires_at: Optional[datetime] = None
 
 
 class ScheduledJobUpdate(BaseModel):
@@ -106,6 +108,8 @@ class ScheduledJobUpdate(BaseModel):
     enabled_tools: Optional[list[str]] = None
     enabled: Optional[bool] = None
     delete_after_run: Optional[bool] = None
+    max_runs: Optional[int] = Field(default=None, ge=1, le=10_000)
+    expires_at: Optional[datetime] = None
 
 
 class EventHookCreate(BaseModel):
