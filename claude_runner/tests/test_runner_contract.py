@@ -18,6 +18,7 @@ from claude_runner.runner_entrypoint import (
     _claude_command,
     _native_checkpoint_exists,
     _pending_plan_task_count,
+    _quarantine_native_cron_state,
     _safe_controller_exception_code,
     _terminal_error,
     _validate_artifact_contracts,
@@ -88,7 +89,7 @@ class RunnerCommandContractTests(unittest.TestCase):
         self.assertNotEqual(capability_prompt, fresh["prompt"])
         self.assertEqual(
             command[command.index("--disallowedTools") + 1],
-            "WebFetch,WebSearch",
+            "CronCreate,CronDelete,CronList,WebFetch,WebSearch",
         )
         self.assertEqual(command[command.index("--session-id") + 1], fresh["native_session_id"])
         self.assertNotIn("--resume", command)
@@ -105,7 +106,10 @@ class RunnerCommandContractTests(unittest.TestCase):
 
         native_web = {**fresh, "native_web_tools": True}
         command, _ = _claude_command(native_web)
-        self.assertNotIn("--disallowedTools", command)
+        self.assertEqual(
+            command[command.index("--disallowedTools") + 1],
+            "CronCreate,CronDelete,CronList",
+        )
 
     def test_extended_context_is_a_client_marker_not_an_upstream_model_id(self):
         config = {
@@ -289,7 +293,7 @@ class RunnerCommandContractTests(unittest.TestCase):
             )
             ledger.close()
 
-    def test_native_subtask_lifecycle_and_plan_tasks_gate_success(self):
+    def test_native_subtask_lifecycle_and_plan_tasks_are_diagnostic_only(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             ledger = EventLedger(root / "events.jsonl")
@@ -318,6 +322,22 @@ class RunnerCommandContractTests(unittest.TestCase):
                 _pending_plan_task_count(root / "tasks", native_session_id),
                 1,
             )
+            success_ledger = EventLedger(root / "success-events.jsonl")
+            success_ledger.append_line(
+                b'{"type":"result","subtype":"success",'
+                b'"is_error":false}',
+                channel="stdout",
+            )
+            self.assertIsNone(_terminal_error(
+                termination_reason=None,
+                exit_code=0,
+                ledger=success_ledger,
+                checkpoint_ready=True,
+                egress_receipt={"exhausted": False},
+                pending_plan_task_count=1,
+                pending_native_task_count=0,
+            ))
+            success_ledger.close()
             (task_root / "1.json").write_text(
                 json.dumps({"status": "completed"}),
                 encoding="utf-8",
@@ -326,6 +346,23 @@ class RunnerCommandContractTests(unittest.TestCase):
                 _pending_plan_task_count(root / "tasks", native_session_id),
                 0,
             )
+
+    def test_native_cron_file_is_archived_out_of_active_load_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / ".claude"
+            root.mkdir()
+            source = root / "scheduled_tasks.json"
+            source.write_text(
+                json.dumps({"tasks": [{"prompt": "stale unrelated task"}]}),
+                encoding="utf-8",
+            )
+            run_id = "d" * 32
+
+            self.assertTrue(_quarantine_native_cron_state(root, run_id))
+            self.assertFalse(source.exists())
+            archived = root / "chatds-native-cron-archive" / f"{run_id}.json"
+            self.assertTrue(archived.is_file())
+            self.assertFalse(_quarantine_native_cron_state(root, "e" * 32))
 
     def test_task_output_terminal_receipt_closes_missing_notification(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -361,6 +398,43 @@ class RunnerCommandContractTests(unittest.TestCase):
                 ledger.native_task_summary["reconciled_by"]["task_output"],
                 1,
             )
+            ledger.close()
+
+    def test_schedule_control_receipt_becomes_controller_pending_write(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = EventLedger(Path(temporary) / "events.jsonl")
+            arguments = {
+                "name": "Cross-domain equipment monitor",
+                "prompt": "Report both selected equipment readings.",
+                "schedule": "*/10 13-14 12 8 *",
+                "timezone": "Asia/Shanghai",
+                "max_runs": 12,
+                "expires_at": "2026-08-12T15:00:00+08:00",
+            }
+            from claude_runner.mcp_schedule_control import _accepted_receipt
+            ledger.append_line(json.dumps({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "tool_use",
+                    "id": "schedule-tool-1",
+                    "name": "mcp__chatds-schedule__schedule_create",
+                    "input": arguments,
+                }]},
+            }).encode(), channel="stdout")
+            ledger.append_line(json.dumps({
+                "type": "user",
+                "message": {"content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "schedule-tool-1",
+                    "is_error": False,
+                    "content": _accepted_receipt(arguments),
+                }]},
+            }).encode(), channel="stdout")
+
+            self.assertEqual(len(ledger.pending_control_writes), 1)
+            write = ledger.pending_control_writes[0]
+            self.assertEqual(write["operation"], "create")
+            self.assertEqual(write["request"]["max_runs"], 12)
             ledger.close()
 
     def test_controller_reaps_only_local_bash_not_delegated_agent(self):

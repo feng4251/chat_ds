@@ -33,6 +33,7 @@ from chatds_browser_runtime.proxy_bridge import (
     ProxyTrustAuthority,
 )
 from claude_runner.runtime_capabilities import render_runtime_capability_prompt
+from claude_runner.mcp_schedule_control import normalize_schedule_create
 
 
 MAX_NATIVE_LINE_BYTES = 64 * 1024 * 1024
@@ -70,6 +71,7 @@ SAFE_CONTROLLER_RUNTIME_CODES = frozenset({
     "workspace_artifact_changed_during_audit",
     "artifact_contract_invalid",
     "artifact_contract_audit_failed",
+    "native_cron_state_invalid",
     "egress_bridge_did_not_stop",
 })
 SAFE_RUNNER_FATAL_CODES = frozenset({
@@ -132,6 +134,15 @@ def main() -> int:
         os.chown(worker_tmp, worker_uid, worker_gid)
         controller_stage = "workspace_lock"
         with _session_workspace_lock(config):
+            controller_stage = "native_cron_quarantine"
+            if _quarantine_native_cron_state(
+                Path("/state/home/.claude"),
+                str(config["run_id"]),
+            ):
+                ledger.append_event({
+                    "type": "chatds.native-cron.quarantined",
+                    "reason": "per_turn_runtime_has_no_scheduler_authority",
+                }, channel="controller")
             controller_stage = "workspace_snapshot_before"
             workspace_before = _workspace_snapshot(Path("/workspace"))
             controller_stage = "egress_bridge_start"
@@ -252,7 +263,6 @@ def main() -> int:
                 exit_code == 0
                 and ledger.native_result_succeeded
                 and checkpoint_ready
-                and pending_plan_task_count == 0
                 and pending_native_task_count == 0
                 and artifact_contract_passed
             )
@@ -279,6 +289,7 @@ def main() -> int:
             "pending_plan_task_count": pending_plan_task_count,
             "pending_native_task_count": pending_native_task_count,
             "native_task_summary": ledger.native_task_summary,
+            "pending_control_writes": list(ledger.pending_control_writes),
             "artifact_contract": artifact_contract_receipt,
             "error": terminal_error,
             "error_code": terminal_error,
@@ -312,6 +323,7 @@ def main() -> int:
             "pending_plan_task_count": pending_plan_task_count,
             "pending_native_task_count": ledger.active_native_task_count,
             "native_task_summary": ledger.native_task_summary,
+            "pending_control_writes": list(ledger.pending_control_writes),
             "artifact_contract": artifact_contract_receipt,
             "egress_receipt": receipt,
         }
@@ -372,8 +384,10 @@ def _terminal_error(
         return "egress_budget_exhausted"
     if pending_native_task_count:
         return "native_subtasks_pending"
-    if pending_plan_task_count:
-        return "native_plan_tasks_pending"
+    # Claude's TaskCreate/TaskUpdate files are model-owned planning/UI state.
+    # They are useful diagnostics, but they are not machine-owned receipts for
+    # work completion.  Native process/sub-agent receipts and compiled
+    # artifact contracts remain authoritative terminal gates.
     if not artifact_contract_passed:
         return "artifact_contract_failed"
     if ledger.native_api_error_status is not None:
@@ -401,8 +415,6 @@ def _terminal_error_stage(error_code: str | None) -> str | None:
         return "native_execution"
     if error_code == "native_checkpoint_missing":
         return "native_checkpoint_audit"
-    if error_code == "native_plan_tasks_pending":
-        return "native_plan_task_audit"
     if error_code == "native_subtasks_pending":
         return "native_task_audit"
     if error_code == "artifact_contract_failed":
@@ -427,6 +439,9 @@ class EventLedger:
         self._native_api_error_status: int | None = None
         self._native_tasks: dict[str, dict[str, Any]] = {}
         self._task_output_calls: dict[str, str] = {}
+        self._schedule_control_calls: dict[str, dict[str, Any]] = {}
+        self._pending_control_writes: list[dict[str, Any]] = []
+        self._settled_control_tool_calls: set[str] = set()
         self._invoked_skill_names: set[str] = set()
         self._native_task_reconciliations = {
             "native_notification": 0,
@@ -572,6 +587,10 @@ class EventLedger:
             "reconciled_by": dict(self._native_task_reconciliations),
         }
 
+    @property
+    def pending_control_writes(self) -> tuple[dict[str, Any], ...]:
+        return tuple(dict(row) for row in self._pending_control_writes)
+
     def reconcile_worker_process_exit(self) -> int:
         """Close local shell tasks after the controller reaps the Turn group.
 
@@ -665,6 +684,16 @@ class EventLedger:
                 skill_name = raw_skill.rsplit(":", 1)[-1]
                 if re.fullmatch(r"[A-Za-z0-9._-]{1,128}", skill_name):
                     self._invoked_skill_names.add(skill_name)
+            elif (
+                name == "mcp__chatds-schedule__schedule_create"
+                and tool_use_id
+                and len(tool_use_id) <= 256
+            ):
+                try:
+                    normalized = normalize_schedule_create(arguments)
+                except (TypeError, ValueError):
+                    continue
+                self._schedule_control_calls[tool_use_id] = normalized
 
     def _observe_task_output_results(self, native: dict[str, Any]) -> None:
         message = native.get("message")
@@ -679,6 +708,7 @@ class EventLedger:
             tool_use_id = str(block.get("tool_use_id") or "")
             task_id = self._task_output_calls.get(tool_use_id)
             if not task_id or bool(block.get("is_error")):
+                self._observe_schedule_control_result(block)
                 continue
             result_text = _tool_result_text(block.get("content"))
             if len(result_text) > 1_000_000:
@@ -708,6 +738,43 @@ class EventLedger:
                 status=status_match.group(1),
                 source="task_output",
             )
+            self._observe_schedule_control_result(block)
+
+    def _observe_schedule_control_result(self, block: dict[str, Any]) -> None:
+        tool_use_id = str(block.get("tool_use_id") or "")
+        request = self._schedule_control_calls.get(tool_use_id)
+        if (
+            request is None
+            or tool_use_id in self._settled_control_tool_calls
+            or bool(block.get("is_error"))
+        ):
+            return
+        result_text = _tool_result_text(block.get("content"))
+        if len(result_text) > 16_384:
+            return
+        try:
+            receipt = json.loads(result_text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("schema") != "chatds.schedule.accepted.v1"
+            or receipt.get("status") != "accepted_pending_terminal_commit"
+        ):
+            return
+        canonical = json.dumps(
+            request, ensure_ascii=False, allow_nan=False,
+            sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        if receipt.get("request_sha256") != hashlib.sha256(canonical).hexdigest():
+            return
+        self._settled_control_tool_calls.add(tool_use_id)
+        self._pending_control_writes.append({
+            "schema": "chatds.schedule-write.v1",
+            "operation": "create",
+            "tool_call_id": tool_use_id,
+            "request": request,
+        })
 
     def append_event(
         self,
@@ -1199,6 +1266,50 @@ def _pending_plan_task_count(tasks_root: Path, native_session_id: str) -> int:
     return pending
 
 
+def _quarantine_native_cron_state(claude_root: Path, run_id: str) -> bool:
+    """Move unsupported native cron state out of Claude's active load path.
+
+    ChatDS uses disposable ``claude --print`` processes, while the native cron
+    scheduler deliberately does not keep print mode alive.  Retaining its
+    file in the active location can replay stale prompts on a later unrelated
+    Turn, so the controller archives it inside the same Session state before
+    Claude starts. No content crosses the Session boundary.
+    """
+
+    if SAFE_SESSION_ID.fullmatch(run_id) is None:
+        raise RuntimeError("native_cron_state_invalid")
+    source = claude_root / "scheduled_tasks.json"
+    try:
+        info = os.lstat(source)
+    except FileNotFoundError:
+        return False
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or source.is_symlink()
+        or info.st_size > 2 * 1024 * 1024
+    ):
+        raise RuntimeError("native_cron_state_invalid")
+    archive = claude_root / "chatds-native-cron-archive"
+    archive.mkdir(mode=0o700, exist_ok=True)
+    archive_info = os.lstat(archive)
+    if not stat.S_ISDIR(archive_info.st_mode) or archive.is_symlink():
+        raise RuntimeError("native_cron_state_invalid")
+    destination = archive / f"{run_id}.json"
+    try:
+        os.lstat(destination)
+    except FileNotFoundError:
+        pass
+    else:
+        raise RuntimeError("native_cron_state_invalid")
+    source.rename(destination)
+    directory_fd = os.open(archive, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    return True
+
+
 def _claude_command(config: dict[str, Any]) -> tuple[list[str], bytes]:
     native_session_id = str(config["native_session_id"])
     api_model = str(config["api_model"])
@@ -1248,14 +1359,14 @@ def _claude_command(config: dict[str, Any]) -> tuple[list[str], bytes]:
             config.get("runtime_capability_contract")
         ),
     ])
+    disallowed_tools = ["CronCreate", "CronDelete", "CronList"]
     if not bool(config.get("native_web_tools")):
         # WebSearch/WebFetch are provider-hosted server tools, not ordinary
         # local tools. A generic Messages facade can accept their schemas yet
         # return empty pseudo-results or depend on unavailable claude.ai
         # safety services. Local Bash/Skill/MCP/browser capabilities remain.
-        command.extend([
-            "--disallowedTools", "WebFetch,WebSearch",
-        ])
+        disallowed_tools.extend(["WebFetch", "WebSearch"])
+    command.extend(["--disallowedTools", ",".join(disallowed_tools)])
     resume_from = str(config.get("resume_from_native_session_id") or "")
     if resume_from:
         command.extend([

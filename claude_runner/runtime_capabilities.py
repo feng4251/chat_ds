@@ -96,6 +96,19 @@ def compile_runtime_capability_contract(
     if not isinstance(rules, list) or len(rules) > MAX_STRUCTURED_CAPABILITIES:
         raise _invalid()
     capabilities: set[str] = set()
+    declared_capabilities = manifest.get("harness_capabilities", [])
+    if (
+        not isinstance(declared_capabilities, list)
+        or len(declared_capabilities) > MAX_STRUCTURED_CAPABILITIES
+        or any(
+            not isinstance(name, str)
+            or _SAFE_CAPABILITY.fullmatch(name) is None
+            for name in declared_capabilities
+        )
+        or declared_capabilities != sorted(set(declared_capabilities))
+    ):
+        raise _invalid()
+    capabilities.update(declared_capabilities)
     for row in rules:
         if not isinstance(row, dict):
             raise _invalid()

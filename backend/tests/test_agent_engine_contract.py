@@ -71,6 +71,34 @@ class ClaudeEventProjectionTests(unittest.TestCase):
             ["stop"],
         )
 
+    def test_success_terminal_preserves_pending_control_writes(self):
+        projector = ClaudeEventProjector("f" * 32)
+        projector.project({
+            "seq": 1,
+            "event": {"type": "result", "subtype": "success"},
+        })
+        writes = [{
+            "schema": "chatds.schedule-write.v1",
+            "operation": "create",
+            "tool_call_id": "renamed-receipt",
+            "request": {"name": "cross-domain"},
+        }]
+        events = projector.project({
+            "seq": 2,
+            "event": {
+                "type": "chatds.supervisor.terminal",
+                "status": "succeeded",
+                "pending_control_writes": writes,
+            },
+        })
+        completed = next(
+            event.data for event in events
+            if event.kind == "agent_event"
+        )
+        self.assertEqual(
+            completed["payload"]["pending_control_writes"], writes
+        )
+
     def test_success_without_native_result_fails_closed(self):
         projector = ClaudeEventProjector("b" * 32)
         events = projector.project({
@@ -690,6 +718,36 @@ class ClaudeSkillViewTests(unittest.TestCase):
             "url_prefix": "http://search.internal:8080/search",
             "methods": ["GET"],
         }])
+
+    def test_cronjob_compiles_backend_owned_schedule_capability(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            skill = root / "skills" / "renamed-holdout"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(
+                "Use only for factory equipment requests.", encoding="utf-8"
+            )
+            view = materialize_claude_skill_view(
+                session_root=root / "session",
+                sources=[SimpleNamespace(
+                    name="renamed-holdout",
+                    scope="session",
+                    root=skill,
+                    bundle_id=None,
+                    bundle_role=None,
+                )],
+                enabled_tools=["cronjob"],
+            )
+            mcp = json.loads((view.plugin_root / ".mcp.json").read_text())
+            manifest = json.loads((view.root / "manifest.json").read_text())
+
+        self.assertEqual(set(mcp["mcpServers"]), {"chatds-schedule"})
+        self.assertEqual(
+            mcp["mcpServers"]["chatds-schedule"]["args"],
+            ["-I", "-m", "claude_runner.mcp_schedule_control"],
+        )
+        self.assertEqual(manifest["harness_capabilities"], ["schedule_control"])
+        self.assertEqual(manifest["harness_egress_rules"], [])
 
     def test_market_quote_compiles_typed_gateway_not_public_provider_origins(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1336,6 +1394,8 @@ class NativeCheckpointCommitBarrierTests(unittest.IsolatedAsyncioTestCase):
                     "event": {
                         "type": "chatds.supervisor.terminal",
                         "status": "succeeded",
+                        "result_succeeded": True,
+                        "checkpoint_observed": True,
                     },
                 }
                 payload = json.dumps(envelope, separators=(",", ":"))
@@ -1383,6 +1443,61 @@ class NativeCheckpointCommitBarrierTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(run.finish_reason, "native_audit_incomplete")
         self.assertEqual(state.status, "failed")
         self.assertIsNone(state.native_session_id)
+
+    async def test_failed_outer_contract_keeps_complete_transcript_checkpoint(self):
+        run_id = "7" * 32
+        candidate = "28c25fd9-a780-47f4-a8a2-8d233e5fd263"
+        envelope = {
+            "seq": 9,
+            "channel": "controller",
+            "event": {
+                "type": "chatds.supervisor.terminal",
+                "status": "failed",
+                "error_code": "artifact_contract_failed",
+                "result_succeeded": True,
+                "checkpoint_observed": True,
+            },
+        }
+        payload = json.dumps(envelope, separators=(",", ":"))
+        async with self.sessions() as db:
+            db.add(AgentRun(
+                id=run_id,
+                user_id=self.user_id,
+                conversation_id=self.conversation_id,
+                engine_id="claude_code",
+                native_session_id=candidate,
+                requested_model_id="renamed-cross-domain-model",
+                status="failed",
+                error="artifact_contract_failed",
+            ))
+            db.add(AgentEngineSession(
+                user_id=self.user_id,
+                conversation_id=self.conversation_id,
+                engine_id="claude_code",
+                status="running",
+                active_run_id=run_id,
+            ))
+            db.add(AgentEngineRawEvent(
+                user_id=self.user_id,
+                conversation_id=self.conversation_id,
+                run_id=run_id,
+                engine_id="claude_code",
+                seq=9,
+                native_event_type="chatds.supervisor.terminal",
+                payload=payload,
+                payload_sha256=hashlib.sha256(payload.encode()).hexdigest(),
+            ))
+            await db.commit()
+        with patch.object(chat_router, "async_session", self.sessions):
+            await chat_router._finalize_native_engine_session(
+                run_id, self.conversation_id
+            )
+        async with self.sessions() as db:
+            state = (await db.execute(select(AgentEngineSession))).scalar_one()
+        self.assertEqual(state.status, "failed")
+        self.assertEqual(state.native_session_id, candidate)
+        self.assertEqual(state.generation, 1)
+        self.assertEqual(state.last_event_seq, 9)
 
     async def test_startup_promotes_only_unique_lossless_success(self):
         run_id, candidate = await self._seed_success(with_raw_terminal=True)

@@ -2369,7 +2369,7 @@ async def _persist_stream_projection_once(
     finish_reason: str,
     error_message: str | None,
     agent_events: list[dict],
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, str | None, str]:
     async with async_session() as s:
         assistant_message = None
         event_user_id = None
@@ -2393,6 +2393,31 @@ async def _persist_stream_projection_once(
                     run_id=run_id,
                 )
             )
+            pending_control_writes = root_terminal_payload.get(
+                "pending_control_writes", []
+            )
+            if pending_control_writes is None:
+                pending_control_writes = []
+            if terminal_status == "succeeded":
+                from scheduler import stage_schedule_control_writes
+
+                await stage_schedule_control_writes(
+                    s,
+                    user_id=str(conv.user_id),
+                    conversation_id=conv_id,
+                    root_run_id=run_id,
+                    model_id=resolved_model_id or model_id,
+                    writes=pending_control_writes,
+                )
+            elif pending_control_writes:
+                # Failed/cancelled Turns never commit unattended effects.
+                logger.info(
+                    "Discarded %s pending control write(s) for terminal %s run=%s",
+                    len(pending_control_writes)
+                    if isinstance(pending_control_writes, list) else 0,
+                    terminal_status,
+                    run_id,
+                )
             reconciled_usage = _reconciled_root_run_usage(
                 usage,
                 agent_events,
@@ -2401,6 +2426,13 @@ async def _persist_stream_projection_once(
             input_tokens = reconciled_usage["input_tokens"]
             output_tokens = reconciled_usage["output_tokens"]
             total_tokens = reconciled_usage["total_tokens"]
+            projection_run = await s.get(AgentRun, run_id)
+            message_source = (
+                str(projection_run.source)
+                if projection_run is not None
+                and str(projection_run.source or "") in {"chat", "cron"}
+                else "chat"
+            )
             # Every accepted chat root owns exactly one assistant turn at the
             # durable projection boundary. A valid tool/artifact-only success
             # may have no visible model text; omitting the row would leave the
@@ -2416,6 +2448,7 @@ async def _persist_stream_projection_once(
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 total_tokens=total_tokens,
+                source=message_source,
                 created_at=await _next_message_created_at(s, conv_id),
             )
             s.add(assistant_message)
@@ -2458,9 +2491,7 @@ async def _persist_stream_projection_once(
                     run_id,
                     terminal_status,
                 )
-            run = (await s.execute(
-                select(AgentRun).where(AgentRun.id == run_id)
-            )).scalar_one_or_none()
+            run = projection_run
             if run:
                 run.root_run_id = run.root_run_id or run.id
                 run.agent_kind = run.agent_kind or "primary"
@@ -2501,6 +2532,7 @@ async def _persist_stream_projection_once(
             return (
                 assistant_message.id if assistant_message is not None else None,
                 str(event_user_id) if event_user_id else None,
+                message_source,
             )
         except BaseException:
             await s.rollback()
@@ -2575,7 +2607,7 @@ async def _persist_after_stream(
                     execution_failed=_execution_failed,
                     has_partial_content=bool(content),
                 )
-            assistant_message_id, event_user_id = (
+            assistant_message_id, event_user_id, projected_message_source = (
                 await _run_sqlite_persist_with_retry(
                     lambda: _persist_stream_projection_once(
                         conv_id,
@@ -2617,7 +2649,7 @@ async def _persist_after_stream(
                     "message_id": assistant_message_id,
                     "role": "assistant",
                     "model_id": resolved_model_id or model_id,
-                    "source": "chat",
+                    "source": projected_message_source,
                 },
                 conv_id,
             )
@@ -2682,6 +2714,8 @@ async def _finalize_native_engine_session(run_id: str, conv_id: str) -> None:
                 ).order_by(AgentEngineRawEvent.seq)
             )).scalars().all())
             raw_terminal_status = None
+            raw_result_succeeded = False
+            raw_checkpoint_observed = False
             if len(raw_terminal_rows) == 1:
                 try:
                     raw_envelope = json.loads(raw_terminal_rows[0].payload)
@@ -2697,6 +2731,12 @@ async def _finalize_native_engine_session(run_id: str, conv_id: str) -> None:
                     ):
                         raw_terminal_status = str(
                             raw_native.get("status") or ""
+                        )
+                        raw_result_succeeded = (
+                            raw_native.get("result_succeeded") is True
+                        )
+                        raw_checkpoint_observed = (
+                            raw_native.get("checkpoint_observed") is True
                         )
                 except (TypeError, ValueError, json.JSONDecodeError):
                     raw_terminal_status = None
@@ -2729,10 +2769,17 @@ async def _finalize_native_engine_session(run_id: str, conv_id: str) -> None:
                 )
             )).scalar_one() or 0)
             native_state.error = persisted_run.error
-            if terminal_status == "succeeded":
+            publish_transcript_checkpoint = bool(
+                persisted_run.native_session_id
+                and raw_checkpoint_observed
+                and raw_result_succeeded
+                and raw_terminal_status in {"succeeded", "failed"}
+                and terminal_status in {"succeeded", "failed"}
+            )
+            if publish_transcript_checkpoint:
                 if not persisted_run.native_session_id:
                     raise RuntimeError(
-                        "A successful Claude Code Turn has no candidate checkpoint identity"
+                        "A complete Claude Code Turn has no candidate checkpoint identity"
                     )
                 native_state.native_session_id = persisted_run.native_session_id
                 native_state.generation += 1
@@ -3258,7 +3305,11 @@ async def _chat_stream(
     db: AsyncSession,
     *,
     ingress_request_id: str | None = None,
+    source: str = "chat",
+    enabled_tools_override: tuple[str, ...] | None = None,
 ):
+    if source not in {"chat", "cron"}:
+        raise ValueError("Unsupported internal chat source")
     # Serialize a conversation before verifying it or loading history.  A
     # different conversation receives a distinct lock and is unaffected.
     conv_id = req.conversation_id
@@ -3344,6 +3395,8 @@ async def _chat_stream(
             model_id=model_id,
             turn_lease=turn_lease,
             ingress_request_id=ingress_request_id,
+            source=source,
+            enabled_tools_override=enabled_tools_override,
         )
     except _ConversationProjectionBarrierError as exc:
         if turn_lease is not None:
@@ -3371,6 +3424,8 @@ async def _chat_stream_with_turn(
     model_id: str,
     turn_lease: _ConversationTurnLease,
     ingress_request_id: str | None = None,
+    source: str = "chat",
+    enabled_tools_override: tuple[str, ...] | None = None,
 ):
     await _assert_no_unprojected_primary_turn(db, conv_id)
 
@@ -3387,7 +3442,11 @@ async def _chat_stream_with_turn(
         BUILTIN.get(model_id, {}).get("max_tokens")
         if model_id in BUILTIN else DEFAULT_CUSTOM_MAX_TOKENS
     ) or DEFAULT_CUSTOM_MAX_TOKENS
-    enabled_tools = serialize_json_list(conv.enabled_tools, DEFAULT_NATIVE_TOOLS)
+    enabled_tools = (
+        list(enabled_tools_override)
+        if enabled_tools_override is not None
+        else serialize_json_list(conv.enabled_tools, DEFAULT_NATIVE_TOOLS)
+    )
     enabled_user_skills = serialize_json_list(conv.enabled_user_skills, [])
     skill_registry_query = select(SkillPackage).where(
         SkillPackage.user_id == cur_user.id,
@@ -3507,8 +3566,10 @@ async def _chat_stream_with_turn(
             resume_from_native_session_id = engine_session.native_session_id
         # Every Turn writes a fresh native checkpoint.  It is promoted into
         # AgentEngineSession only after the authoritative root terminal and
-        # assistant projection are durable.  A failed or cancelled Turn can
-        # therefore be discarded without polluting the last good transcript.
+        # assistant projection are durable. A controller-rejected Turn may
+        # still publish this candidate as a transcript-only boundary when the
+        # raw native result and checkpoint are both complete; its failed
+        # receipts remain authoritative for the business outcome.
         candidate_native_session_id = str(uuid.uuid4())
 
     # Load history before saving the new user message
@@ -3539,7 +3600,7 @@ async def _chat_stream_with_turn(
         content=req.content,
         image_urls=json.dumps(req.image_urls) if req.image_urls else None,
         model_id=model_id,
-        source="chat",
+        source=source,
         created_at=user_created_at,
     )
     db.add(user_msg)
@@ -3549,7 +3610,7 @@ async def _chat_stream_with_turn(
         user_id=cur_user.id,
         conversation_id=conv_id,
         root_run_id=run_id,
-        source="chat",
+        source=source,
         engine_id=conv.engine_id,
         native_session_id=(
             candidate_native_session_id
@@ -3659,7 +3720,7 @@ async def _chat_stream_with_turn(
                     "user": cur_user.id,
                     "provider_config": provider_config,
                     "fallback_configs": fallback_configs,
-                    "source": "chat",
+                    "source": source,
                     "enabled_user_skills": enabled_user_skills,
                     "session_skill_registry": session_skill_registry,
                     "event_schema": "chatds.agent.v2",
@@ -3703,7 +3764,7 @@ async def _chat_stream_with_turn(
                         else None
                     ),
                     resume_from_native_session_id=resume_from_native_session_id,
-                    source="chat",
+                    source=source,
                     metadata={
                         "workspace_path": str(
                             workspace_store.workspace_dir(cur_user.id, conv_id)
@@ -4260,7 +4321,7 @@ async def _chat_stream_with_turn(
                 "message_id": user_msg.id,
                 "role": "user",
                 "model_id": model_id,
-                "source": "chat",
+                "source": source,
             },
             conv_id,
         )

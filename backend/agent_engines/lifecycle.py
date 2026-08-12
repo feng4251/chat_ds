@@ -50,10 +50,10 @@ async def revoke_stale_native_runs_on_backend_startup() -> int:
                 )
                 .order_by(AgentEngineRawEvent.seq)
             )).scalars().all())
-            terminal_status = (
-                _raw_terminal_status(terminal_rows[0])
+            terminal_status, result_succeeded, checkpoint_observed = (
+                _raw_terminal_receipt(terminal_rows[0])
                 if len(terminal_rows) == 1
-                else None
+                else (None, False, False)
             )
             if (
                 run is not None
@@ -71,6 +71,29 @@ async def revoke_stale_native_runs_on_backend_startup() -> int:
                     )
                 )).scalar_one() or 0)
                 row.error = None
+                continue
+            if (
+                run is not None
+                and run.status == "failed"
+                and run.native_session_id
+                and terminal_status == "failed"
+                and result_succeeded
+                and checkpoint_observed
+            ):
+                # The native transcript is complete even though a later,
+                # controller-owned contract rejected the business outcome.
+                # Publish only the conversational boundary; the failed Run
+                # and its receipts remain the outcome authority.
+                row.native_session_id = run.native_session_id
+                row.generation += 1
+                row.status = "failed"
+                row.active_run_id = None
+                row.last_event_seq = int((await db.execute(
+                    select(func.max(AgentEngineRawEvent.seq)).where(
+                        AgentEngineRawEvent.run_id == active_run_id
+                    )
+                )).scalar_one() or 0)
+                row.error = run.error
                 continue
             if run is not None and run.status == "succeeded":
                 run.status = "failed"
@@ -104,15 +127,21 @@ async def revoke_stale_native_runs_on_backend_startup() -> int:
         return revoked
 
 
-def _raw_terminal_status(row: AgentEngineRawEvent | None) -> str | None:
+def _raw_terminal_receipt(
+    row: AgentEngineRawEvent | None,
+) -> tuple[str | None, bool, bool]:
     if row is None:
-        return None
+        return None, False, False
     try:
         envelope = json.loads(row.payload)
     except (TypeError, ValueError):
-        return None
+        return None, False, False
     event = envelope.get("event") if isinstance(envelope, dict) else None
     if not isinstance(event, dict):
         return None
     status = str(event.get("status") or "")
-    return status if status in {"succeeded", "failed", "cancelled"} else None
+    return (
+        status if status in {"succeeded", "failed", "cancelled"} else None,
+        event.get("result_succeeded") is True,
+        event.get("checkpoint_observed") is True,
+    )

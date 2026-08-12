@@ -22,11 +22,13 @@ _MCP_MODULES = {
     },
     "claude_runner.mcp_web_search": {"web_search"},
     "claude_runner.mcp_market_data": {"market_quote"},
+    "claude_runner.mcp_schedule_control": {"schedule_create"},
 }
 _MCP_COMPATIBILITY_PATHS = {
     "claude_runner.mcp_process": "/app/claude-runner/mcp_process.py",
     "claude_runner.mcp_web_search": "/app/claude-runner/mcp_web_search.py",
     "claude_runner.mcp_market_data": "/app/claude-runner/mcp_market_data.py",
+    "claude_runner.mcp_schedule_control": "/app/claude-runner/mcp_schedule_control.py",
 }
 
 

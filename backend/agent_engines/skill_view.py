@@ -202,6 +202,7 @@ def materialize_claude_skill_view(
                 "args": ["-I", "-m", "claude_runner.mcp_process"],
             }
         harness_egress_rules: list[dict[str, Any]] = []
+        harness_capabilities: list[str] = []
         enabled_tool_names = {
             str(name) for name in enabled_tools if isinstance(name, str)
         }
@@ -245,6 +246,18 @@ def materialize_claude_skill_view(
                 "url_prefix": normalized_market_url,
                 "methods": ["GET"],
             })
+        if "cronjob" in enabled_tool_names:
+            server_name = "chatds-schedule"
+            if server_name in mcp_servers:
+                raise SkillViewError(
+                    "Explicit Skill MCP identity conflicts with Harness capability"
+                )
+            mcp_servers[server_name] = {
+                "type": "stdio",
+                "command": "/usr/local/bin/python",
+                "args": ["-I", "-m", "claude_runner.mcp_schedule_control"],
+            }
+            harness_capabilities.append("schedule_control")
         if len(mcp_servers) > MAX_SKILL_MCP_SERVERS:
             raise SkillViewError("Compiled MCP server-count limit exceeded")
         mcp_config_path = plugin / ".mcp.json"
@@ -281,6 +294,7 @@ def materialize_claude_skill_view(
                 selected_primary_skill_names
             ),
             "harness_egress_rules": harness_egress_rules,
+            "harness_capabilities": sorted(harness_capabilities),
             "artifact_contracts": artifact_contracts,
             "runtime_requirements": runtime_requirements,
             "skill_diagnostics": skill_diagnostics,
