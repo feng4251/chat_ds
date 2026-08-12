@@ -1,3 +1,4 @@
+import json
 import unittest
 from datetime import datetime
 
@@ -91,6 +92,73 @@ class ScheduleControlProjectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job.run_count, 0)
         self.assertLessEqual(job.next_run_at, job.expires_at)
         self.assertIsInstance(job.expires_at, datetime)
+
+    async def test_visible_tool_aliases_compile_to_exact_session_subset(self):
+        write = self._write()
+        write["request"]["enabled_tools"] = [
+            "Bash",
+            "mcp__chatds-market-data__market_quote",
+        ]
+        async with self.sessions() as db:
+            created = await stage_schedule_control_writes(
+                db,
+                user_id=self.user_id,
+                conversation_id=self.conversation_id,
+                root_run_id="d" * 32,
+                model_id="renamed-model",
+                writes=[write],
+                allowed_tools=frozenset({"market_quote", "cronjob"}),
+            )
+            await db.commit()
+            job = await db.get(ScheduledJob, created[0])
+        self.assertEqual(json.loads(job.enabled_tools), ["market_quote"])
+
+    async def test_foreign_alias_and_authority_widening_fail_closed(self):
+        foreign = self._write()
+        foreign["request"]["enabled_tools"] = [
+            "mcp__renamed-foreign__market_quote"
+        ]
+        async with self.sessions() as db:
+            with self.assertRaisesRegex(ValueError, "unknown"):
+                await stage_schedule_control_writes(
+                    db,
+                    user_id=self.user_id,
+                    conversation_id=self.conversation_id,
+                    root_run_id="e" * 32,
+                    model_id="renamed-model",
+                    writes=[foreign],
+                    allowed_tools=frozenset({"market_quote"}),
+                )
+        widened = self._write()
+        widened["request"]["enabled_tools"] = ["web_search"]
+        async with self.sessions() as db:
+            with self.assertRaisesRegex(ValueError, "unauthorized"):
+                await stage_schedule_control_writes(
+                    db,
+                    user_id=self.user_id,
+                    conversation_id=self.conversation_id,
+                    root_run_id="f" * 32,
+                    model_id="renamed-model",
+                    writes=[widened],
+                    allowed_tools=frozenset({"market_quote"}),
+                )
+
+    async def test_explicit_empty_tools_remain_empty_in_durable_job(self):
+        write = self._write()
+        write["request"]["enabled_tools"] = []
+        async with self.sessions() as db:
+            created = await stage_schedule_control_writes(
+                db,
+                user_id=self.user_id,
+                conversation_id=self.conversation_id,
+                root_run_id="1" * 32,
+                model_id="renamed-model",
+                writes=[write],
+                allowed_tools=frozenset({"market_quote"}),
+            )
+            await db.commit()
+            job = await db.get(ScheduledJob, created[0])
+        self.assertEqual(job.enabled_tools, "[]")
 
 
 if __name__ == "__main__":

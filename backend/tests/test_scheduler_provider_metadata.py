@@ -11,6 +11,7 @@ from scheduler import (
     _job_may_run,
     _provider_payload,
     _resolve_job_model,
+    _scheduled_job_tools,
 )
 
 
@@ -146,6 +147,15 @@ class SchedulerProviderMetadataTests(unittest.IsolatedAsyncioTestCase):
         )
         flight = SimpleNamespace(force_requested=True)
         self.assertFalse(_job_may_run(job, flight))
+
+    def test_explicit_empty_scheduled_authority_is_not_defaulted(self):
+        self.assertEqual(
+            _scheduled_job_tools(SimpleNamespace(enabled_tools="[]")),
+            [],
+        )
+        self.assertTrue(
+            _scheduled_job_tools(SimpleNamespace(enabled_tools=None))
+        )
 
 
 if __name__ == "__main__":

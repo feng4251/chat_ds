@@ -748,6 +748,22 @@ class ClaudeSkillViewTests(unittest.TestCase):
         )
         self.assertEqual(manifest["harness_capabilities"], ["schedule_control"])
         self.assertEqual(manifest["harness_egress_rules"], [])
+        aliases = manifest["schedule_tool_aliases"]
+        self.assertEqual(aliases["cronjob"], "cronjob")
+        self.assertEqual(
+            aliases["mcp__chatds-schedule__schedule_create"],
+            "cronjob",
+        )
+        self.assertIsNone(aliases["Bash"])
+        self.assertEqual(
+            json.loads(
+                mcp["mcpServers"]["chatds-schedule"]["env"][
+                    "CHATDS_SCHEDULE_TOOL_ALIASES_JSON"
+                ]
+            ),
+            aliases,
+        )
+        self.assertNotIn("mcp__foreign__cronjob", aliases)
 
     def test_market_quote_compiles_typed_gateway_not_public_provider_origins(self):
         with tempfile.TemporaryDirectory() as temporary:

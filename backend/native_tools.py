@@ -57,6 +57,70 @@ DEFAULT_NATIVE_TOOLS: tuple[str, ...] = (
 
 DEFAULT_NATIVE_TOOL_SET = frozenset(DEFAULT_NATIVE_TOOLS)
 
+# ``enabled_tools`` stored on a scheduled job is a ChatDS capability set, not
+# a copy of Claude Code's display names.  Older schedule-controller views did
+# not publish that distinction in their JSON schema, so models reasonably
+# returned the MCP-qualified names they could see (and occasionally listed a
+# built-in Claude tool such as Bash).  Keep this compatibility translation at
+# the typed controller boundary.  It is deliberately limited to platform-
+# owned tool identities; a foreign MCP prefix must never be allowed to mint a
+# ChatDS capability merely because its final component happens to match.
+LEGACY_CLAUDE_SCHEDULE_TOOL_ALIASES: dict[str, str | None] = {
+    "mcp__chatds-web-search__web_search": "web_search",
+    "mcp__chatds-market-data__market_quote": "market_quote",
+    "mcp__chatds-schedule__schedule_create": "cronjob",
+    # Claude's built-ins are supplied by the native ``default`` tool surface
+    # on every scheduled Claude Turn.  They are ambient to this particular
+    # capability selector, so retaining them in the DB would be misleading.
+    "Bash": None,
+    "Read": None,
+    "Write": None,
+    "Edit": None,
+    "Glob": None,
+    "Grep": None,
+    "Agent": None,
+}
+
+
+def canonicalize_scheduled_tools(
+    values: list[str] | None,
+    *,
+    allowed_tools: set[str] | frozenset[str],
+) -> tuple[str, ...]:
+    """Bind a scheduled capability subset to the current Session authority.
+
+    ``None`` means "use the safe unattended default intersected with the
+    current Session".  An explicit empty list remains empty; it must not be
+    widened later by truthiness-based defaulting.
+    """
+
+    allowed = frozenset(allowed_tools)
+    if allowed - DEFAULT_NATIVE_TOOL_SET:
+        raise ValueError("schedule_control_allowed_tools_invalid")
+    if values is None:
+        return tuple(
+            name for name in UNATTENDED_DEFAULT_NATIVE_TOOLS
+            if name in allowed
+        )
+    if not isinstance(values, list):
+        raise ValueError("schedule_control_tools_invalid")
+    canonical: list[str] = []
+    observed: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError("schedule_control_tools_invalid")
+        mapped = LEGACY_CLAUDE_SCHEDULE_TOOL_ALIASES.get(value, value)
+        if mapped is None:
+            continue
+        if mapped not in DEFAULT_NATIVE_TOOL_SET:
+            raise ValueError("schedule_control_tools_unknown")
+        if mapped not in allowed:
+            raise ValueError("schedule_control_tools_unauthorized")
+        if mapped not in observed:
+            observed.add(mapped)
+            canonical.append(mapped)
+    return tuple(canonical)
+
 # Unattended runs must not recursively schedule work, stop for interactive
 # clarification, or create child agents unless those tools were explicitly
 # saved on the scheduled job. This preserves the existing scheduler default.

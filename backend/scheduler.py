@@ -27,6 +27,11 @@ from model_routing import (
     canonical_agent_model_id,
     filter_agentic_fallback_model_ids,
 )
+from native_tools import (
+    DEFAULT_NATIVE_TOOL_SET,
+    UNATTENDED_DEFAULT_NATIVE_TOOLS,
+    canonicalize_scheduled_tools,
+)
 from models import (
     AgentRun,
     Conversation,
@@ -315,6 +320,14 @@ def _job_may_run(job: ScheduledJob | None, flight: _JobExecutionFlight) -> bool:
     )
 
 
+def _scheduled_job_tools(job: ScheduledJob) -> list[str]:
+    """Resolve the persisted three-state tool contract without widening it."""
+
+    if job.enabled_tools is None:
+        return list(UNATTENDED_DEFAULT_NATIVE_TOOLS)
+    return serialize_json_list(job.enabled_tools, [])
+
+
 async def stage_schedule_control_writes(
     db,
     *,
@@ -323,6 +336,7 @@ async def stage_schedule_control_writes(
     root_run_id: str,
     model_id: str,
     writes: object,
+    allowed_tools: set[str] | frozenset[str] | None = None,
 ) -> tuple[str, ...]:
     """Stage validated, idempotent schedule rows in the root projection txn.
 
@@ -336,7 +350,11 @@ async def stage_schedule_control_writes(
         raise ValueError("schedule_control_writes_invalid")
     created: list[str] = []
     observed_tool_calls: set[str] = set()
-    from native_tools import DEFAULT_NATIVE_TOOL_SET
+    bound_allowed_tools = (
+        DEFAULT_NATIVE_TOOL_SET
+        if allowed_tools is None
+        else frozenset(allowed_tools)
+    )
 
     for row in writes:
         if (
@@ -355,9 +373,10 @@ async def stage_schedule_control_writes(
             raise ValueError("schedule_control_tool_call_invalid")
         observed_tool_calls.add(tool_call_id)
         request = _normalize_schedule_control_request(row.get("request"))
-        tools = request.get("enabled_tools")
-        if tools is not None and set(tools) - DEFAULT_NATIVE_TOOL_SET:
-            raise ValueError("schedule_control_tools_unknown")
+        tools = canonicalize_scheduled_tools(
+            request.get("enabled_tools"),
+            allowed_tools=bound_allowed_tools,
+        )
         threat = scan_cron_prompt(request["prompt"])
         if threat:
             raise ValueError(f"schedule_control_prompt_{threat}")
@@ -399,10 +418,10 @@ async def stage_schedule_control_writes(
             schedule_value=value,
             timezone=request["timezone"],
             model_id=model_id,
-            enabled_tools=(
-                json.dumps(tools, ensure_ascii=False)
-                if tools is not None else None
-            ),
+            # Persist the exact bound subset, including an explicit empty
+            # set. ``NULL`` remains reserved for legacy/direct jobs whose
+            # controller omitted a tool contract.
+            enabled_tools=json.dumps(list(tools), ensure_ascii=False),
             enabled=True,
             delete_after_run=request["delete_after_run"],
             max_runs=request.get("max_runs"),
@@ -679,10 +698,7 @@ async def _execute_job_bound(
         model_id = canonical_agent_model_id(
             job.model_id or conv.model_id or DEFAULT_AGENT_MODEL_ID
         )
-        tools = serialize_json_list(job.enabled_tools, [])
-        if not tools:
-            from native_tools import UNATTENDED_DEFAULT_NATIVE_TOOLS
-            tools = list(UNATTENDED_DEFAULT_NATIVE_TOOLS)
+        tools = _scheduled_job_tools(job)
 
         if conv.engine_id == "claude_code":
             await _execute_claude_scheduled_turn(

@@ -103,7 +103,10 @@ async def _create_for_user_in_session(
         schedule_value=value,
         timezone=payload.timezone,
         model_id=payload.model_id,
-        enabled_tools=json.dumps(payload.enabled_tools) if payload.enabled_tools else None,
+        enabled_tools=(
+            json.dumps(payload.enabled_tools)
+            if payload.enabled_tools is not None else None
+        ),
         delete_after_run=payload.delete_after_run,
         max_runs=payload.max_runs,
         expires_at=expires_at,

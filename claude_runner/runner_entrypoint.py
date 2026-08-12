@@ -33,7 +33,10 @@ from chatds_browser_runtime.proxy_bridge import (
     ProxyTrustAuthority,
 )
 from claude_runner.runtime_capabilities import render_runtime_capability_prompt
-from claude_runner.mcp_schedule_control import normalize_schedule_create
+from claude_runner.mcp_schedule_control import (
+    normalize_schedule_create,
+    normalize_schedule_tool_aliases,
+)
 
 
 MAX_NATIVE_LINE_BYTES = 64 * 1024 * 1024
@@ -100,6 +103,9 @@ def main() -> int:
         ledger = EventLedger(Path(os.environ["CHATDS_EVENT_LEDGER"]))
         controller_stage = "load_config"
         config = _load_config(Path(os.environ["CHATDS_RUN_CONFIG"]))
+        ledger.bind_schedule_tool_aliases(
+            config.get("schedule_tool_aliases")
+        )
         ledger.append_event({
             "type": "chatds.runtime.config",
             "context_window_tokens": int(config["context_window_tokens"]),
@@ -440,6 +446,7 @@ class EventLedger:
         self._native_tasks: dict[str, dict[str, Any]] = {}
         self._task_output_calls: dict[str, str] = {}
         self._schedule_control_calls: dict[str, dict[str, Any]] = {}
+        self._schedule_tool_aliases: dict[str, str | None] | None = None
         self._pending_control_writes: list[dict[str, Any]] = []
         self._settled_control_tool_calls: set[str] = set()
         self._invoked_skill_names: set[str] = set()
@@ -591,6 +598,18 @@ class EventLedger:
     def pending_control_writes(self) -> tuple[dict[str, Any], ...]:
         return tuple(dict(row) for row in self._pending_control_writes)
 
+    def bind_schedule_tool_aliases(self, value: object) -> None:
+        """Bind the immutable controller vocabulary before native output.
+
+        ``None`` preserves rolling compatibility for views compiled before
+        the vocabulary became part of the Skill-view identity. New views
+        always provide an exact map shared with their schedule MCP process.
+        """
+
+        self._schedule_tool_aliases = (
+            None if value is None else normalize_schedule_tool_aliases(value)
+        )
+
     def reconcile_worker_process_exit(self) -> int:
         """Close local shell tasks after the controller reaps the Turn group.
 
@@ -690,7 +709,10 @@ class EventLedger:
                 and len(tool_use_id) <= 256
             ):
                 try:
-                    normalized = normalize_schedule_create(arguments)
+                    normalized = normalize_schedule_create(
+                        arguments,
+                        tool_aliases=self._schedule_tool_aliases,
+                    )
                 except (TypeError, ValueError):
                     continue
                 self._schedule_control_calls[tool_use_id] = normalized

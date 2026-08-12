@@ -10,7 +10,16 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from models import AgentRun, AgentRunEvent, Base, Conversation, TaskItem, User
+from models import (
+    AgentEngineSession,
+    AgentRun,
+    AgentRunEvent,
+    Base,
+    Conversation,
+    Message,
+    TaskItem,
+    User,
+)
 from routers import chat_router
 
 
@@ -829,6 +838,87 @@ class AgentEventPersistenceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(child.total_tokens, 999)
             self.assertEqual(conversation.total_tokens, 18)
             self.assertEqual(message.total_tokens, 18)
+
+    async def test_projection_failure_terminalizes_and_releases_session(self):
+        terminal = _event("run.completed", 2, run_id="root")
+        async with self.sessions() as session:
+            session.add(Message(
+                id="user-message",
+                conversation_id="conversation",
+                role="user",
+                content="Create a recurring cross-domain observation.",
+                model_id="model",
+            ))
+            session.add(AgentEngineSession(
+                id="engine-state",
+                user_id="user",
+                conversation_id="conversation",
+                engine_id="claude_code",
+                status="running",
+                active_run_id="root",
+            ))
+            await session.commit()
+        with (
+            patch.object(chat_router, "async_session", self.sessions),
+            patch.object(chat_router, "emit_event", new=AsyncMock()),
+            patch.object(chat_router.settings, "agent_event_immediate_persist", True),
+            patch.object(chat_router.settings, "agent_debug_trace", True),
+        ):
+            self.assertTrue(await chat_router._persist_agent_event_immediate(
+                conv_id="conversation",
+                user_id="user",
+                root_run_id="root",
+                requested_model_id="model",
+                resolved_model_id="model",
+                event=terminal,
+            ))
+            with patch.object(
+                chat_router,
+                "_persist_stream_projection_once",
+                new=AsyncMock(side_effect=ValueError(
+                    "schedule_control_tools_unknown"
+                )),
+            ):
+                self.assertTrue(await chat_router._persist_after_stream(
+                    "conversation",
+                    "model",
+                    "A controller effect was accepted.",
+                    "",
+                    "",
+                    "",
+                    "root",
+                    "model",
+                    {"input_tokens": 4, "output_tokens": 6, "total_tokens": 10},
+                    "stop",
+                    None,
+                    [terminal],
+                ))
+
+        async with self.sessions() as session:
+            run = await session.get(AgentRun, "root")
+            engine_state = await session.get(AgentEngineSession, "engine-state")
+            messages = (await session.execute(
+                select(Message).where(
+                    Message.conversation_id == "conversation"
+                ).order_by(Message.created_at, Message.id)
+            )).scalars().all()
+            projection_events = (await session.execute(
+                select(AgentRunEvent).where(
+                    AgentRunEvent.run_id == "root",
+                    AgentRunEvent.event_type == "run.projection_failed",
+                )
+            )).scalars().all()
+            task = (await session.execute(
+                select(TaskItem).where(TaskItem.run_id == "root")
+            )).scalar_one()
+        self.assertEqual(run.status, "failed")
+        self.assertEqual(run.finish_reason, "terminal_projection_failed")
+        self.assertEqual(task.status, "failed")
+        self.assertEqual(engine_state.status, "failed")
+        self.assertIsNone(engine_state.active_run_id)
+        self.assertEqual([message.role for message in messages], ["user", "assistant"])
+        self.assertIn("schedule_control_tools_unknown", messages[-1].content)
+        self.assertEqual(len(projection_events), 1)
 
     async def test_post_projection_hook_uses_persisted_root_projection(self):
         child_completed = _event("run.completed", 1)

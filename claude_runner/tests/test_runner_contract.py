@@ -437,6 +437,56 @@ class RunnerCommandContractTests(unittest.TestCase):
             self.assertEqual(write["request"]["max_runs"], 12)
             ledger.close()
 
+    def test_schedule_receipt_uses_same_compiled_names_at_both_boundaries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            aliases = {
+                "Bash": None,
+                "mcp__chatds-market-data__market_quote": "market_quote",
+            }
+            arguments = {
+                "name": "Renamed public metric monitor",
+                "prompt": "Report the selected public metric.",
+                "schedule": "every 5m",
+                "timezone": "UTC",
+                "enabled_tools": [
+                    "Bash",
+                    "mcp__chatds-market-data__market_quote",
+                ],
+            }
+            ledger = EventLedger(Path(temporary) / "events.jsonl")
+            ledger.bind_schedule_tool_aliases(aliases)
+            ledger.append_line(json.dumps({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "tool_use",
+                    "id": "schedule-tool-renamed",
+                    "name": "mcp__chatds-schedule__schedule_create",
+                    "input": arguments,
+                }]},
+            }).encode(), channel="stdout")
+            from claude_runner.mcp_schedule_control import (
+                SCHEDULE_TOOL_ALIASES_ENV,
+                _accepted_receipt,
+            )
+            with patch.dict(os.environ, {
+                SCHEDULE_TOOL_ALIASES_ENV: json.dumps(aliases),
+            }):
+                receipt = _accepted_receipt(arguments)
+            ledger.append_line(json.dumps({
+                "type": "user",
+                "message": {"content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "schedule-tool-renamed",
+                    "is_error": False,
+                    "content": receipt,
+                }]},
+            }).encode(), channel="stdout")
+            self.assertEqual(
+                ledger.pending_control_writes[0]["request"]["enabled_tools"],
+                ["market_quote"],
+            )
+            ledger.close()
+
     def test_controller_reaps_only_local_bash_not_delegated_agent(self):
         with tempfile.TemporaryDirectory() as temporary:
             ledger = EventLedger(Path(temporary) / "events.jsonl")
