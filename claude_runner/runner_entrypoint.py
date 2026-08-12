@@ -32,12 +32,7 @@ from chatds_browser_runtime.proxy_bridge import (
     ProxySocketAuthority,
     ProxyTrustAuthority,
 )
-try:
-    from claude_runner.runtime_capabilities import (
-        render_runtime_capability_prompt,
-    )
-except ModuleNotFoundError:  # Isolated image copies files beside entrypoint.
-    from runtime_capabilities import render_runtime_capability_prompt
+from claude_runner.runtime_capabilities import render_runtime_capability_prompt
 
 
 MAX_NATIVE_LINE_BYTES = 64 * 1024 * 1024
@@ -77,6 +72,11 @@ SAFE_CONTROLLER_RUNTIME_CODES = frozenset({
     "artifact_contract_audit_failed",
     "egress_bridge_did_not_stop",
 })
+SAFE_RUNNER_FATAL_CODES = frozenset({
+    "runner_controller_not_root",
+    "runner_event_ledger_unavailable",
+    "runner_bootstrap_failed",
+})
 _child: subprocess.Popen[bytes] | None = None
 _termination_reason: str | None = None
 
@@ -91,9 +91,13 @@ def main() -> int:
     if os.geteuid() != 0:
         return _fatal("runner_controller_not_root")
     try:
+        # Establish the durable diagnostic boundary before parsing the larger
+        # request. The dependency-free outer bootstrap covers failures that
+        # occur before this installed module can load at all.
+        controller_stage = "event_ledger_init"
+        ledger = EventLedger(Path(os.environ["CHATDS_EVENT_LEDGER"]))
         controller_stage = "load_config"
         config = _load_config(Path(os.environ["CHATDS_RUN_CONFIG"]))
-        ledger = EventLedger(Path(os.environ["CHATDS_EVENT_LEDGER"]))
         ledger.append_event({
             "type": "chatds.runtime.config",
             "context_window_tokens": int(config["context_window_tokens"]),
@@ -290,7 +294,11 @@ def main() -> int:
         try:
             ledger
         except UnboundLocalError:
-            return _fatal(type(exc).__name__)
+            return _fatal(
+                "runner_event_ledger_unavailable"
+                if controller_stage == "event_ledger_init"
+                else "runner_bootstrap_failed"
+            )
         terminal_event = {
             "type": "chatds.supervisor.terminal",
             "status": "failed",
@@ -1569,6 +1577,8 @@ def _install_signal_handlers() -> None:
 
 
 def _fatal(code: str) -> int:
+    if code not in SAFE_RUNNER_FATAL_CODES:
+        code = "runner_bootstrap_failed"
     print(json.dumps({"type": "chatds.runner.fatal", "code": code}), file=sys.stderr)
     return 1
 

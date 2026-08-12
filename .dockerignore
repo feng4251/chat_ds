@@ -10,10 +10,16 @@
 !claude_runner/Dockerfile.runner
 !claude_runner/Dockerfile.supervisor
 !claude_runner/__init__.py
+!claude_runner/bootstrap.py
 !claude_runner/config.py
+!claude_runner/image_selftest.py
+!claude_runner/mcp_market_data.py
+!claude_runner/mcp_process.py
+!claude_runner/mcp_web_search.py
 !claude_runner/policy.py
 !claude_runner/requirements.txt
 !claude_runner/runner_entrypoint.py
+!claude_runner/runtime_capabilities.py
 !claude_runner/seccomp_profile.json
 !claude_runner/server.py
 

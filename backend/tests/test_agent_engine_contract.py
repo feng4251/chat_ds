@@ -473,6 +473,10 @@ class ClaudeSkillViewTests(unittest.TestCase):
             "contradictory_automation_evasion_policy",
         )
         self.assertEqual(set(mcp["mcpServers"]), {"chatds-process"})
+        self.assertEqual(
+            mcp["mcpServers"]["chatds-process"]["args"],
+            ["-I", "-m", "claude_runner.mcp_process"],
+        )
 
     def test_size_checks_cannot_be_miscompiled_as_line_checks(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -676,6 +680,10 @@ class ClaudeSkillViewTests(unittest.TestCase):
             set(enabled_mcp["mcpServers"]),
             {"chatds-web-search"},
         )
+        self.assertEqual(
+            enabled_mcp["mcpServers"]["chatds-web-search"]["args"],
+            ["-I", "-m", "claude_runner.mcp_web_search"],
+        )
         self.assertEqual(disabled_mcp, {"mcpServers": {}})
         self.assertEqual(manifest["harness_egress_rules"], [{
             "capability": "web_search",
@@ -708,6 +716,10 @@ class ClaudeSkillViewTests(unittest.TestCase):
             manifest = json.loads((view.root / "manifest.json").read_text())
         self.assertEqual(set(mcp["mcpServers"]), {"chatds-market-data"})
         config = mcp["mcpServers"]["chatds-market-data"]
+        self.assertEqual(
+            config["args"],
+            ["-I", "-m", "claude_runner.mcp_market_data"],
+        )
         self.assertEqual(
             config["env"]["CHATDS_MARKET_DATA_URL"],
             "http://market-data.internal:8090/v1/quote",
