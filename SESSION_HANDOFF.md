@@ -2,6 +2,76 @@
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
+## 2026-08-12 Claude 控制写入能力编译与终态投影失败收敛闭环
+
+- 本轮按约定完整关联 session `92609477b43645a383b93963df75d28e` 的三类证据。持久对话最后一条
+  用户请求是通过公开行情接口每 5 分钟报告一次所选数字资产价格、共 10 次，最后没有 assistant 行；
+  root AgentRun `fdf16e79b12c4510bc12c492b28c28f2` 长期停在 `committing /
+  terminal_projection_pending`，Engine Session 仍错误保留 `active_run_id`，且该 Conversation 没有任何
+  ScheduledJob。Runner/Supervisor 原始事件却有唯一成功 native result、checkpoint、零 pending native
+  task、成功 authoritative `run.completed` 和一条 pending schedule control write。Backend 精确异常是
+  `stage_schedule_control_writes -> schedule_control_tools_unknown`，随后 `_persist_after_stream` 只返回 false，
+  没有把 `committing` 收敛为失败终态。故障不是 Provider、网络、行情上游或模型执行失败。
+- exact immutable Skill-view digest 为
+  `1bd74217f15a79587cd16cfee5f021b6a5094d5c46a4455d489781984c1e7521`；manifest 的
+  `skills`、`selected_primary_skill_names`、`artifact_contracts` 都为空，只编译了 Harness 自有的
+  `schedule_control`、`web_search`、`market_quote` 能力。因此这不是 Skill 路由/指令遵循问题。触发器是
+  模型在 `enabled_tools` 返回 Claude 可见的 `Bash` 与 MCP 全限定名，而 Backend 持久控制面只接受稳定
+  ChatDS capability ID；之前 Skill-view、MCP schema、Runner receipt 和 Backend 各自猜测名字，没有一份
+  内容寻址的共享编译产物。
+- 通用不变量现为：持久任务只保存跨引擎稳定 capability ID，Skill-view 编译并固化 exact
+  model-visible→canonical map；Schedule MCP schema、MCP receipt、Runner ledger 和 Backend commit 使用
+  同一映射；只允许平台拥有的 exact alias，伪造/外部 MCP 前缀不得按后缀获得能力；当前 Conversation
+  authority 是上限；`NULL`（controller omitted）和显式 `[]`（无额外能力）严格区分，空集合不得按
+  truthiness 扩张为 unattended defaults。Claude 的 `Bash/Read/Write` 等内建工具是每个 native Turn 的
+  ambient runtime surface，不作为 ChatDS capability grant 持久化。
+- root engine terminal 现在只是 application commit candidate。assistant row、usage、controller effect 与
+  AgentRun lifecycle 的最终事务若失败，会用独立、幂等、无原始异常泄露的事务落
+  `run.projection_failed` 诊断，把 root/task/Engine Session 收敛为
+  `failed/terminal_projection_failed`、释放 `active_run_id` 并补一条明确失败 assistant 消息；公开 SSE
+  terminal 会重新读取 durable AgentRun，不能继续显示过期的 native success。重启遇到
+  `committing + durable engine terminal` 也不再冒充成功或重放不确定副作用，而是
+  `terminal_projection_interrupted` fail-closed、保留唯一原始 terminal 并解锁 Session。该失败终态不会
+  发布 native checkpoint；普通执行成功和 transcript-only 既有语义不变。
+- 成熟实现对照冻结独立 `claude-code/` commit
+  `6f6f12b37f529488b10e53928dd5508bb93535c7`。采用并适配
+  `src/utils/cronTasks.ts` 的写边界 validate/normalize、`src/Task.ts` 的显式 typed terminal，以及
+  `src/utils/cronScheduler.ts` 对 scheduler ownership/in-flight 与持久状态的区分；把这些模式置于 ChatDS
+  现有 Session authority、DB pending-write receipt 和 exactly-one terminal 合同后。拒绝把 Claude
+  display/MCP transport 名直接变成长期 DB 身份，也拒绝用进程内 native cron 取代 Backend durable
+  scheduler。本地相关源码完整，无需 Web 搜索补足 stub。
+- 确定性回归包含 factory sensor/renamed public metric 等非业务 holdout，覆盖 alias rename、MCP receipt
+  与 Runner hash 同源、外部前缀伪造、Conversation 权限扩张、显式空权限、投影异常释放 Session、重启
+  中断不误报成功和 schedule 运行期不默认扩权。Backend 最终全套 `297 passed`；Claude
+  Runner/Supervisor `85 passed, 1 skipped, 14 subtests passed`；相关组合另为 `83 passed`。compile、
+  diff check、secret/genericity scan、clean archive 文件计数与三个候选真实镜像 smoke 均通过。没有运行
+  V2.3 或其他模型重型 E2E。
+- 功能提交为 `e8480032094bfcf1de669e1b27836e84a0155e8c fix: make terminal control writes
+  converge`。clean archive `/tmp/chat_ds_deploy_.v8DBvaRF` 与 Git tree 均为 22,507 files。切换前唯一
+  active root 就是上述已完成 native execution、但 application commit 卡住的目标 run；没有 running
+  ScheduledJobRun 或动态 Turn container。SQLite online backup volume 为
+  `chat_ds_db_backup_pre_e8480032_20260812_153826`，460,627,968 bytes，SHA-256
+  `f3ae2ba66230530bd34084d1a5a16dcd4f20dd2a29d84530d4da2a6ccbffc1e7`，quick/FK 正常。
+  当前 Backend/Runner/Supervisor image 分别为
+  `sha256:8449388a3fc621bea321f7703a39a5f146c0a77112f517149b2ad0cd059c4b85`、
+  `sha256:654d75226a19c1974cd64b2dab8aa59368ae8a16931d3404cfbdd69afa0d98f5`、
+  `sha256:4a330744555f723f6ba35e238fc61c3b0c41aadac7c88a4d5bd478ae6619c2c3`，revision 均精确为
+  `e8480032...`；旧镜像保留 `rollback-pre-e8480032`。三容器 restart 0、Backend/Supervisor healthy，
+  `127.0.0.1`、`10.10.132.126`、`172.30.100.128` 的 5173 `/api/health` 均为 200。
+- 启动恢复已将历史 root 明确终态化为 `failed/terminal_projection_interrupted`，补 assistant 并清除
+  active Engine Session。原请求的模型生成 expiry 已因排障只剩不足 10 个触发点；没有伪造或快速补跑
+  错过的历史价格，而是通过正式 internal schedule API 从当前时刻重建同一 cadence/max-runs 意图：job
+  `7e2490162b674775975e9d051738fa9d`，`*/5 * * * *`、`max_runs=10`、绑定原 Conversation/模型，
+  exact capability subset 为 `web_search + market_quote`。15:45 CST 首个自然 tick 已完成：
+  ScheduledJobRun `600443d10755447b876c3e51052d7804=succeeded`，cron AgentRun
+  `6951d26aa2204dbda0018adcc679cd89=succeeded/end_turn`，assistant cron message
+  `c2bcbab352da497c9257b850594e1a5a` 已持久化。15:50 第二个自然 tick 也独立完成：
+  ScheduledJobRun `23e9f0d962c74532a138a6351996e5d8=succeeded`、cron AgentRun
+  `18bcfa407e0a4698be16477a8a83bdbf=succeeded/end_turn`、assistant message
+  `2ab71661fb5447478dd7310cf06dd4de`。job 当前 `run_count=2`、`last_status=succeeded`、
+  `consecutive_errors=0`、下一时点 15:55，证明 recurring reschedule 也成立；后续由持久 scheduler 继续
+  直到达到 10 次或恢复窗口结束。
+
 ## 2026-08-12 Claude 定时 Turn 单锁、终态刷新与能力网关网络闭环
 
 - 本轮继续诊断 session `63a312df7a1d462fac00ac0926381de3` 的“已声明 13:03–14:53
