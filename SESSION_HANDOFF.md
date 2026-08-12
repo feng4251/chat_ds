@@ -2,6 +2,66 @@
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
+## 2026-08-12 调度规格单一权威与工具边界可恢复校验闭环
+
+- 本轮按三源要求诊断 session `92609477b43645a383b93963df75d28e` 的最新失败。持久对话中用户要求
+  每 2 分钟查询一次公开数字资产价格、共 5 次；root AgentRun
+  `cc5f5c56f01f4483bbfed652f4ab7e40` 的 Claude 原生执行、Bash 行情查询、result、checkpoint 和
+  Supervisor terminal 都成功，但 application terminal projection 以
+  `schedule_control_no_occurrence_before_expiry` fail closed。exact immutable Skill-view digest 为
+  `a689f3ba8a8bd62f28ca09c65c22065a5540ac5d3b0b87af27a3eae82aec8e45`，manifest 中 Skills、
+  primary selection 和 artifact contracts 均为空，只装配了
+  Harness 自有 `schedule_control`、`web_search`、`market_quote`，故不是 Skill、网络、Provider、行情
+  上游、文件沙箱或前端问题。
+- Debug/tool 时间线显示模型在 09:14--09:15 UTC 调用 `schedule_create` 时提交
+  `*/2 * * * *`、`max_runs=5`，却把 `expires_at` 写成已经过去约 20 分钟的
+  `2026-08-12T08:55:00Z`。旧 MCP 只检查 expiry 是非空字符串，错误返回
+  `accepted_pending_terminal_commit`；Runner 因而形成 pending control write。Backend 在唯一权威终端
+  事务中重新计算首个时点并正确拒绝，导致模型已经输出“已创建”后整轮才失败。历史 root 保留
+  `failed/terminal_projection_failed`；失败事务没有创建 ScheduledJob。该 Session 当前
+  `active_run_id=NULL`，已有的两个旧 job 都是用户此前明确创建且已达到各自 `max_runs` 的完成记录，
+  没有第三个或 enabled job。
+- 通用不变量现为：schedule expression、IANA timezone、expiry normalization、首个 eligible occurrence
+  与 occurrence-before-expiry 必须由一个纯控制面模块解释；MCP 在模型仍可纠正参数的 tool-call 边界同步
+  校验并用 `chatds.schedule.rejected.v1`/稳定错误码返回，只有语义有效的请求才能产生 accepted receipt；
+  Runner 只把匹配 accepted hash 的成功结果变成 pending write；Backend HTTP create/update 和 root terminal
+  commit 使用同一源码再次校验，后者继续作为 TOCTOU/幂等防线。`max_runs` 已足够表达纯次数边界时，
+  工具说明要求不再凭空添加 expiry；用户明确给出时钟边界时才同时使用 expiry。直接 API 更新不再把
+  不可能的 schedule 静默改为 disabled，也仍允许显式关闭一个已过期 job。
+- 单一实现位于 `backend/schedule_spec.py`，Backend 直接导入；Runner 镜像从同一 Git 文件复制，并在
+  immutable build stage 以哈希锁定 `croniter==6.2.4`。运行镜像仍无 pip/npm/apt，不存在动态安装、第二
+  沙箱或网络权限变化。跨域 deterministic regression 使用 factory、warehouse、inventory 和 renamed
+  sensor 场景，覆盖已经过期、expiry 虽在未来但早于下一 cron、边界相等、零 duration、naive expiry、
+  typed MCP rejection、rejected result 不形成 pending write、terminal 二次拒绝、API update fail-fast 与
+  关闭 expired job；没有 Session、资产、Skill、疾病、文件名或固定 workflow 分支。
+- 成熟实现对照冻结本地独立 `claude-code/` commit
+  `6f6f12b37f529488b10e53928dd5508bb93535c7`。采用并适配
+  `src/utils/cronTasks.ts` 的“写入前 validate、读取时 revalidate”、`src/utils/cron.ts` 的单一
+  parse/next-run 语义，以及 `src/utils/cronScheduler.ts` 的 typed next-fire/in-flight ownership；ChatDS
+  将其置于既有 Session authority、receipt hash、terminal transaction 与 durable Scheduler 之后。拒绝
+  只在 Backend terminal 加 Session 特判、静默删掉错误 expiry、接受模型 prose 为控制状态或以 native
+  process cron 取代持久 Scheduler。本地参考代码完整，无需 Web 搜索补足 stub。
+- 回归结果：Backend 全套 `304 passed`；Claude Runner/Supervisor 全套
+  `87 passed, 1 skipped, 14 subtests passed`；候选与生产 Runner 的真实 `python -I` image self-test、
+  module/compatibility MCP entrypoint、跨时区有效请求和 stale-expiry typed rejection 均通过；Backend
+  候选镜像使用精确 parser 版本并通过 semantic smoke。compileall、diff check、secret/genericity scan、
+  clean archive 文件计数均通过，没有启动模型重型 Skill E2E。
+- 功能提交为 `3cf5d06ffee90aee9e3a73c54d2ebac35eede0fc fix: validate schedule effects
+  before acceptance`。clean archive `/tmp/chat_ds_deploy_3cf5d06f.jxdQsJ` 与 Git tree 均为 22,513
+  files。切换前 nonterminal AgentRun、active Engine Session、running ScheduledJobRun 和动态 Claude Turn
+  container 均为 0。SQLite online backup volume
+  `chat_ds_db_backup_pre_3cf5d06f_20260812_174747` 为 464,461,824 bytes，SHA-256
+  `4412207210b37248a66181068c07f585090350f558271ef99bf4145236504781`，quick/FK 正常。
+- 当前生产 Backend/Runner image 分别为
+  `sha256:29b188a33cb38337490764170082bdd9faf109203ee2fdd1f88f30b03b953f66`、
+  `sha256:56ec4f1befab84ba7af333e0468ad3840443e94f2cef0892ebec8bb8e13958c2`，revision label 精确
+  为 `3cf5d06f...`；旧镜像保留 `rollback-pre-3cf5d06f`。只重建了 Backend 与 inert Runner anchor；
+  Frontend、Claude Supervisor、Legacy Harness、Scheduler、数据库及其他服务未改。Backend healthy、
+  restart=0，Supervisor healthy、restart=0，`127.0.0.1`、`10.10.132.126`、
+  `172.30.100.128` 三入口 `/api/health` 均为 200，生产 SQLite quick/FK 正常。历史失败不重写、不自动
+  改变原请求时间；用户现在可在原 Session 重新发送该调度请求，新 Turn 会在工具调用现场纠正任何不一致
+  的时钟边界，而不会等到终端才失败。
+
 ## 2026-08-12 后台会话消息前端重同步与成功终态去噪闭环
 
 - 本轮按三源要求诊断 session `92609477b43645a383b93963df75d28e`。持久对话中用户先后两次要求每
