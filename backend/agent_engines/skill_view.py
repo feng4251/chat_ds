@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 from .skill_contracts import SkillContractError, compile_skill_contract
+from native_tools import LEGACY_CLAUDE_SCHEDULE_TOOL_ALIASES
 
 
 MAX_SKILL_VIEW_FILES = 8_192
@@ -203,6 +204,7 @@ def materialize_claude_skill_view(
             }
         harness_egress_rules: list[dict[str, Any]] = []
         harness_capabilities: list[str] = []
+        schedule_tool_aliases: dict[str, str | None] = {}
         enabled_tool_names = {
             str(name) for name in enabled_tools if isinstance(name, str)
         }
@@ -247,6 +249,19 @@ def materialize_claude_skill_view(
                 "methods": ["GET"],
             })
         if "cronjob" in enabled_tool_names:
+            # The job store uses canonical ChatDS capability names, while the
+            # model sees native and MCP-qualified names. Compile their exact
+            # translation into this immutable view so every later boundary
+            # consumes the same capability vocabulary.
+            schedule_tool_aliases.update({
+                name: name for name in sorted(enabled_tool_names)
+            })
+            schedule_tool_aliases.update({
+                alias: canonical
+                for alias, canonical
+                in LEGACY_CLAUDE_SCHEDULE_TOOL_ALIASES.items()
+                if canonical is None or canonical in enabled_tool_names
+            })
             server_name = "chatds-schedule"
             if server_name in mcp_servers:
                 raise SkillViewError(
@@ -256,6 +271,14 @@ def materialize_claude_skill_view(
                 "type": "stdio",
                 "command": "/usr/local/bin/python",
                 "args": ["-I", "-m", "claude_runner.mcp_schedule_control"],
+                "env": {
+                    "CHATDS_SCHEDULE_TOOL_ALIASES_JSON": json.dumps(
+                        dict(sorted(schedule_tool_aliases.items())),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                },
             }
             harness_capabilities.append("schedule_control")
         if len(mcp_servers) > MAX_SKILL_MCP_SERVERS:
@@ -295,6 +318,9 @@ def materialize_claude_skill_view(
             ),
             "harness_egress_rules": harness_egress_rules,
             "harness_capabilities": sorted(harness_capabilities),
+            "schedule_tool_aliases": dict(
+                sorted(schedule_tool_aliases.items())
+            ),
             "artifact_contracts": artifact_contracts,
             "runtime_requirements": runtime_requirements,
             "skill_diagnostics": skill_diagnostics,

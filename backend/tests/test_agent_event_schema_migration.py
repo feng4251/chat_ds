@@ -340,7 +340,7 @@ class AgentEventSchemaContractTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await engine.dispose()
 
-    async def test_startup_replays_committing_terminal_without_second_terminal(
+    async def test_startup_fails_uncommitted_terminal_without_second_terminal(
         self,
     ):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -419,7 +419,10 @@ class AgentEventSchemaContractTests(unittest.IsolatedAsyncioTestCase):
                             "WHERE id = 'root'"
                         ))
                     ).one()
-                    self.assertEqual(("succeeded", "stop"), tuple(root))
+                    self.assertEqual(
+                        ("failed", "terminal_projection_interrupted"),
+                        tuple(root),
+                    )
                     child = (
                         await connection.execute(text(
                             "SELECT status, finish_reason FROM agent_runs "
@@ -443,6 +446,28 @@ class AgentEventSchemaContractTests(unittest.IsolatedAsyncioTestCase):
                         ))
                     ).scalars().all()
                     self.assertEqual(["run.completed"], terminal_types)
+                    projected_roles = (
+                        await connection.execute(text(
+                            "SELECT role FROM messages "
+                            "WHERE conversation_id = 'conversation' "
+                            "ORDER BY created_at, id"
+                        ))
+                    ).scalars().all()
+                    self.assertEqual(
+                        ["user", "assistant"],
+                        projected_roles,
+                    )
+                    projection_diagnostics = (
+                        await connection.execute(text(
+                            "SELECT event_type FROM agent_run_events "
+                            "WHERE run_id = 'root' "
+                            "AND event_type = 'run.projection_aborted'"
+                        ))
+                    ).scalars().all()
+                    self.assertEqual(
+                        ["run.projection_aborted"],
+                        projection_diagnostics,
+                    )
                     projection_events = (
                         await connection.execute(text(
                             "SELECT event_type FROM agent_run_events "

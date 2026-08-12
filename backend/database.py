@@ -604,6 +604,7 @@ async def _reconcile_orphaned_descendant_runs(conn) -> None:
             text(
                 "SELECT child.id, child.conversation_id, child.user_id, "
                 "child.parent_run_id, child.root_run_id, "
+                "child.status AS run_status, "
                 "root.status AS root_status "
                 "FROM agent_runs AS child "
                 "LEFT JOIN agent_runs AS root "
@@ -641,6 +642,8 @@ async def _reconcile_orphaned_descendant_runs(conn) -> None:
         if terminal is not None:
             durable_terminals[str(row["id"])] = terminal
 
+    reconciled_root_statuses: dict[str, str] = {}
+
     for row in rows:
         run_id = str(row["id"])
         root_run_id = str(row.get("root_run_id") or run_id)
@@ -650,7 +653,9 @@ async def _reconcile_orphaned_descendant_runs(conn) -> None:
         )
         root_status = str(row.get("root_status") or "")
         root_terminal = durable_terminals.get(root_run_id)
-        if root_terminal is not None:
+        if root_run_id in reconciled_root_statuses:
+            root_status = reconciled_root_statuses[root_run_id]
+        elif root_terminal is not None:
             root_status = {
                 "run.completed": "succeeded",
                 "run.failed": "failed",
@@ -659,30 +664,46 @@ async def _reconcile_orphaned_descendant_runs(conn) -> None:
         durable_terminal = durable_terminals.get(run_id)
         if durable_terminal is not None:
             event_type, terminal_payload = durable_terminal
-            projected_status = {
-                "run.completed": "succeeded",
-                "run.failed": "failed",
-                "run.cancelled": "cancelled",
-            }[event_type]
-            finish_reason = str(
-                terminal_payload.get("finish_reason")
-                or terminal_payload.get("terminal_reason")
-                or (
-                    "stop"
-                    if projected_status == "succeeded"
-                    else "task_cancelled"
-                    if projected_status == "cancelled"
-                    else "agent_run_failed"
-                )
-            )[:256]
-            projected_error = (
-                str(
-                    terminal_payload.get("error")
-                    or "Agent run failed."
-                )[:4000]
-                if projected_status == "failed"
-                else None
+            projection_interrupted = bool(
+                is_root and str(row.get("run_status") or "") == "committing"
             )
+            if projection_interrupted:
+                # ``committing`` means the engine terminal was recorded but
+                # the assistant/control-write transaction never committed.
+                # Replaying native success here would manufacture effects and
+                # lie about the application-level outcome.
+                projected_status = "failed"
+                finish_reason = "terminal_projection_interrupted"
+                projected_error = (
+                    "Controller-owned terminal projection was interrupted "
+                    "by Backend restart."
+                )
+                reconciled_root_statuses[root_run_id] = "failed"
+            else:
+                projected_status = {
+                    "run.completed": "succeeded",
+                    "run.failed": "failed",
+                    "run.cancelled": "cancelled",
+                }[event_type]
+                finish_reason = str(
+                    terminal_payload.get("finish_reason")
+                    or terminal_payload.get("terminal_reason")
+                    or (
+                        "stop"
+                        if projected_status == "succeeded"
+                        else "task_cancelled"
+                        if projected_status == "cancelled"
+                        else "agent_run_failed"
+                    )
+                )[:256]
+                projected_error = (
+                    str(
+                        terminal_payload.get("error")
+                        or "Agent run failed."
+                    )[:4000]
+                    if projected_status == "failed"
+                    else None
+                )
             await conn.execute(
                 text(
                     "UPDATE agent_runs "
@@ -716,7 +737,9 @@ async def _reconcile_orphaned_descendant_runs(conn) -> None:
                     "status": projected_status,
                     "error": projected_error,
                     "summary": (
-                        "backend_projection_recovered_after_restart"
+                        "terminal_projection_interrupted"
+                        if projection_interrupted
+                        else "backend_projection_recovered_after_restart"
                     ),
                 },
             )
@@ -755,6 +778,7 @@ async def _reconcile_orphaned_descendant_runs(conn) -> None:
                             {
                                 "reason": "backend_process_restart",
                                 "recovered_terminal_event_type": event_type,
+                                "projection_committed": False,
                                 "authoritative": False,
                             },
                             ensure_ascii=False,
@@ -799,10 +823,11 @@ async def _reconcile_orphaned_descendant_runs(conn) -> None:
                             "conversation_id": row["conversation_id"],
                             "run_id": run_id,
                             "content": (
-                                "⚠️ Backend restarted after the task terminal "
+                                "⚠️ Backend restarted after the engine terminal "
                                 "was received but before the assistant response "
-                                "was durably projected. Existing artifacts and "
-                                "run records were preserved."
+                                "and controller-owned effects were durably "
+                                "committed. Existing artifacts and run records "
+                                "were preserved, but this Turn failed closed."
                             ),
                         },
                     )

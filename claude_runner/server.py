@@ -39,6 +39,7 @@ from pydantic import BaseModel, Field, model_validator
 from .config import ProviderProfile, RunnerSettings, load_settings
 from .policy import compile_turn_egress_policy, verify_skill_view
 from .runtime_capabilities import compile_runtime_capability_contract
+from .mcp_schedule_control import normalize_schedule_tool_aliases
 from workspace_lock import workspace_mutation_guard
 
 
@@ -232,6 +233,14 @@ class RunManager:
             manifest=skill_view_receipt.manifest,
             egress_policy=policy,
         )
+        raw_schedule_tool_aliases = skill_view_receipt.manifest.get(
+            "schedule_tool_aliases"
+        )
+        schedule_tool_aliases = (
+            None
+            if raw_schedule_tool_aliases is None
+            else normalize_schedule_tool_aliases(raw_schedule_tool_aliases)
+        )
         if self._admission_cancelled(request.run_id):
             raise _PreflightCancelled
         sanitized = {
@@ -265,6 +274,7 @@ class RunManager:
                 "runtime_requirements", []
             ),
             "runtime_capability_contract": runtime_capability_contract,
+            "schedule_tool_aliases": schedule_tool_aliases,
             "skill_diagnostics": skill_view_receipt.manifest.get(
                 "skill_diagnostics", []
             ),

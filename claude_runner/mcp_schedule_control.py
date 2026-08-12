@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sys
 from typing import Any
@@ -23,9 +24,50 @@ MAX_TIMEZONE_CHARS = 64
 MAX_RUNS = 10_000
 MAX_ENABLED_TOOLS = 64
 _SAFE_TOOL = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$")
+SCHEDULE_TOOL_ALIASES_ENV = "CHATDS_SCHEDULE_TOOL_ALIASES_JSON"
+_ALIASES_UNSET = object()
 
 
-def normalize_schedule_create(arguments: object) -> dict[str, Any]:
+def normalize_schedule_tool_aliases(
+    value: object,
+) -> dict[str, str | None]:
+    """Validate a compiler-owned model-visible -> canonical tool map."""
+
+    if not isinstance(value, dict) or len(value) > 256:
+        raise ValueError("invalid_schedule_tool_aliases")
+    normalized: dict[str, str | None] = {}
+    for alias, canonical in value.items():
+        if not isinstance(alias, str) or _SAFE_TOOL.fullmatch(alias) is None:
+            raise ValueError("invalid_schedule_tool_aliases")
+        if canonical is not None and (
+            not isinstance(canonical, str)
+            or _SAFE_TOOL.fullmatch(canonical) is None
+        ):
+            raise ValueError("invalid_schedule_tool_aliases")
+        normalized[alias] = canonical
+    return dict(sorted(normalized.items()))
+
+
+def schedule_tool_aliases_from_environment() -> dict[str, str | None] | None:
+    raw = os.environ.get(SCHEDULE_TOOL_ALIASES_ENV)
+    if raw is None:
+        # Rolling compatibility for immutable views compiled before aliases
+        # became part of the content-addressed control contract.
+        return None
+    if len(raw.encode("utf-8")) > 32_768:
+        raise ValueError("invalid_schedule_tool_aliases")
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid_schedule_tool_aliases") from exc
+    return normalize_schedule_tool_aliases(value)
+
+
+def normalize_schedule_create(
+    arguments: object,
+    *,
+    tool_aliases: object = _ALIASES_UNSET,
+) -> dict[str, Any]:
     if not isinstance(arguments, dict) or set(arguments) - {
         "name", "prompt", "schedule", "timezone", "max_runs",
         "expires_at", "enabled_tools", "delete_after_run",
@@ -71,6 +113,26 @@ def normalize_schedule_create(arguments: object) -> dict[str, Any]:
         or len(set(enabled_tools)) != len(enabled_tools)
     ):
         raise ValueError("invalid_schedule_tools")
+    aliases = (
+        schedule_tool_aliases_from_environment()
+        if tool_aliases is _ALIASES_UNSET
+        else (
+            None
+            if tool_aliases is None
+            else normalize_schedule_tool_aliases(tool_aliases)
+        )
+    )
+    if enabled_tools is not None and aliases is not None:
+        canonical_tools: list[str] = []
+        observed: set[str] = set()
+        for alias in enabled_tools:
+            if alias not in aliases:
+                raise ValueError("invalid_schedule_tools")
+            canonical = aliases[alias]
+            if canonical is not None and canonical not in observed:
+                observed.add(canonical)
+                canonical_tools.append(canonical)
+        enabled_tools = canonical_tools
     delete_after_run = arguments.get("delete_after_run", False)
     if type(delete_after_run) is not bool:
         raise ValueError("invalid_schedule_delete_policy")
@@ -103,6 +165,12 @@ def _accepted_receipt(arguments: object) -> str:
     }, ensure_ascii=False, separators=(",", ":"))
 
 
+_COMPILED_TOOL_ALIASES = schedule_tool_aliases_from_environment()
+_ENABLED_TOOL_ITEMS: dict[str, Any] = {"type": "string"}
+if _COMPILED_TOOL_ALIASES is not None:
+    _ENABLED_TOOL_ITEMS["enum"] = sorted(_COMPILED_TOOL_ALIASES)
+
+
 TOOLS = [{
     "name": "schedule_create",
     "description": (
@@ -130,7 +198,14 @@ TOOLS = [{
             },
             "enabled_tools": {
                 "type": "array", "maxItems": MAX_ENABLED_TOOLS,
-                "items": {"type": "string"}, "uniqueItems": True,
+                "items": _ENABLED_TOOL_ITEMS,
+                "uniqueItems": True,
+                "description": (
+                    "Optional subset of the compiler-published ChatDS "
+                    "capability aliases. Native Claude tools such as Bash, "
+                    "Read, and Write are ambient and do not grant a ChatDS "
+                    "capability."
+                ),
             },
             "delete_after_run": {"type": "boolean", "default": False},
         },

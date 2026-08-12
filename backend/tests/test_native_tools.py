@@ -1,6 +1,7 @@
 import unittest
 
 from native_tools import (
+    canonicalize_scheduled_tools,
     DEFAULT_NATIVE_TOOL_SET,
     DEFAULT_NATIVE_TOOLS,
     UNATTENDED_DEFAULT_NATIVE_TOOLS,
@@ -26,6 +27,40 @@ class NativeToolCatalogTests(unittest.TestCase):
         self.assertFalse(
             {"cronjob", "clarify", "delegate_task"}
             & set(UNATTENDED_DEFAULT_NATIVE_TOOLS)
+        )
+
+    def test_scheduled_tool_compiler_binds_visible_aliases_to_authority(self):
+        self.assertEqual(
+            canonicalize_scheduled_tools(
+                [
+                    "Bash",
+                    "mcp__chatds-market-data__market_quote",
+                    "market_quote",
+                ],
+                allowed_tools=frozenset({"market_quote", "cronjob"}),
+            ),
+            ("market_quote",),
+        )
+        with self.assertRaisesRegex(ValueError, "unauthorized"):
+            canonicalize_scheduled_tools(
+                ["web_search"],
+                allowed_tools=frozenset({"market_quote"}),
+            )
+        with self.assertRaisesRegex(ValueError, "unknown"):
+            canonicalize_scheduled_tools(
+                ["mcp__foreign__market_quote"],
+                allowed_tools=frozenset({"market_quote"}),
+            )
+
+    def test_scheduled_tool_defaults_do_not_widen_explicit_empty_set(self):
+        allowed = frozenset({"market_quote", "web_search", "cronjob"})
+        self.assertEqual(
+            canonicalize_scheduled_tools([], allowed_tools=allowed),
+            (),
+        )
+        self.assertEqual(
+            canonicalize_scheduled_tools(None, allowed_tools=allowed),
+            ("web_search", "market_quote"),
         )
         self.assertEqual(
             list(UNATTENDED_DEFAULT_NATIVE_TOOLS),

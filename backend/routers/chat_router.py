@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import uuid
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timedelta
@@ -2423,6 +2424,10 @@ async def _persist_stream_projection_once(
                     root_run_id=run_id,
                     model_id=resolved_model_id or model_id,
                     writes=pending_control_writes,
+                    allowed_tools=frozenset(serialize_json_list(
+                        conv.enabled_tools,
+                        DEFAULT_NATIVE_TOOLS,
+                    )),
                 )
             elif pending_control_writes:
                 # Failed/cancelled Turns never commit unattended effects.
@@ -2554,6 +2559,164 @@ async def _persist_stream_projection_once(
             raise
 
 
+def _terminal_projection_failure_code(exc: BaseException) -> str:
+    """Return a bounded controller-owned diagnostic, never raw exception text."""
+
+    if isinstance(exc, ValueError) and len(exc.args) == 1:
+        candidate = str(exc.args[0])
+        if re.fullmatch(
+            r"(?:schedule_control|session_workspace|artifact)_[a-z0-9_]{1,96}",
+            candidate,
+        ):
+            return candidate
+    return "terminal_projection_failed"
+
+
+async def _persist_terminal_projection_failure_once(
+    *,
+    conv_id: str,
+    model_id: str,
+    content: str,
+    reasoning: str,
+    tool_progress: str,
+    run_id: str,
+    resolved_model_id: str,
+    usage: dict,
+    failure_code: str,
+) -> tuple[str | None, str | None, str]:
+    """Fail closed when the success projection transaction cannot commit.
+
+    The native terminal event proves only that execution ended.  It does not
+    prove that controller-owned effects, the assistant row, and Session state
+    committed.  This independent transaction makes that distinction durable
+    and releases the Session without manufacturing a second run terminal.
+    """
+
+    async with async_session() as s:
+        conv = await s.get(Conversation, conv_id)
+        run = await s.get(AgentRun, run_id)
+        if conv is None or run is None:
+            raise _ConversationProjectionBarrierError(
+                "Terminal projection recovery lost its Session identity."
+            )
+        event_user_id = str(conv.user_id)
+        message_source = (
+            str(run.source)
+            if str(run.source or "") in {"chat", "cron"}
+            else "chat"
+        )
+        assistant_message_id: str | None = None
+        latest = (await s.execute(
+            select(Message).where(
+                Message.conversation_id == conv_id
+            ).order_by(Message.created_at.desc(), Message.id.desc()).limit(1)
+        )).scalar_one_or_none()
+        if latest is not None and latest.role == "user":
+            notice = _chat_stream_failure_notice(
+                (
+                    "The task reached the terminal commit boundary, but its "
+                    f"controller-owned effects could not be committed ({failure_code})."
+                ),
+                execution_failed=True,
+                has_partial_content=bool(content),
+            )
+            failure_content = content
+            if not any(
+                marker in failure_content
+                for marker in _INCOMPLETE_RESPONSE_MARKERS
+            ):
+                failure_content += notice
+            reconciled = _normalized_usage(usage)
+            assistant = Message(
+                conversation_id=conv_id,
+                role="assistant",
+                content=failure_content,
+                reasoning=reasoning or None,
+                tool_progress=tool_progress or None,
+                model_id=resolved_model_id or model_id,
+                input_tokens=reconciled["input_tokens"],
+                output_tokens=reconciled["output_tokens"],
+                total_tokens=reconciled["total_tokens"],
+                source=message_source,
+                created_at=await _next_message_created_at(s, conv_id),
+            )
+            s.add(assistant)
+            await s.flush()
+            assistant_message_id = assistant.id
+            conv.input_tokens += reconciled["input_tokens"]
+            conv.output_tokens += reconciled["output_tokens"]
+            conv.total_tokens += reconciled["total_tokens"]
+
+        now = datetime.utcnow()
+        run.status = "failed"
+        run.finish_reason = "terminal_projection_failed"
+        run.error = (
+            "Controller-owned terminal projection failed closed: "
+            + failure_code
+        )
+        run.ended_at = now
+        reconciled = _normalized_usage(usage)
+        _merge_monotonic_run_usage(run, reconciled)
+        active_tasks = (await s.execute(
+            select(TaskItem).where(
+                TaskItem.conversation_id == conv_id,
+                TaskItem.root_run_id == run_id,
+                TaskItem.status.in_((
+                    "pending", "planned", "queued", "running", "committing",
+                )),
+            )
+        )).scalars().all()
+        for task in active_tasks:
+            task.status = "failed"
+            task.summary = "terminal_projection_failed"
+            task.error = run.error
+            task.ended_at = now
+            task.updated_at = now
+
+        diagnostic_exists = (await s.execute(
+            select(AgentRunEvent.id).where(
+                AgentRunEvent.conversation_id == conv_id,
+                AgentRunEvent.run_id == run_id,
+                AgentRunEvent.event_type == "run.projection_failed",
+            ).limit(1)
+        )).scalar_one_or_none()
+        if diagnostic_exists is None:
+            next_seq = int((await s.execute(
+                select(func.max(AgentRunEvent.seq)).where(
+                    AgentRunEvent.conversation_id == conv_id,
+                    AgentRunEvent.run_id == run_id,
+                )
+            )).scalar_one() or 0) + 1
+            s.add(AgentRunEvent(
+                run_id=run_id,
+                conversation_id=conv_id,
+                user_id=event_user_id,
+                parent_run_id=None,
+                seq=next_seq,
+                event_type="run.projection_failed",
+                payload=json.dumps({
+                    "stage": "terminal_projection",
+                    "code": failure_code,
+                    "authoritative": False,
+                }, ensure_ascii=False, separators=(",", ":")),
+                event_time=now,
+            ))
+
+        engine_state = (await s.execute(
+            select(AgentEngineSession).where(
+                AgentEngineSession.conversation_id == conv_id,
+                AgentEngineSession.active_run_id == run_id,
+            )
+        )).scalar_one_or_none()
+        if engine_state is not None:
+            engine_state.status = "failed"
+            engine_state.active_run_id = None
+            engine_state.error = run.error
+        require_session_workspace_active(event_user_id, conv_id)
+        await s.commit()
+        return assistant_message_id, event_user_id, message_source
+
+
 async def _persist_after_stream(
     conv_id: str,
     model_id: str,
@@ -2576,6 +2739,9 @@ async def _persist_after_stream(
     # SQLite writer.
     await _drain_agent_event_immediate_persists(conv_id, run_id)
     lock = _agent_event_persist_lock(conv_id)
+    assistant_message_id: str | None = None
+    event_user_id: str | None = None
+    projected_message_source = "chat"
     try:
         async with lock:
             persisted_terminal, persisted_max_seq = (
@@ -2644,13 +2810,42 @@ async def _persist_after_stream(
             )
     except asyncio.CancelledError:
         raise
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "Terminal stream projection failed after retries conv=%s run=%s",
             conv_id,
             run_id,
         )
-        return False
+        failure_code = _terminal_projection_failure_code(exc)
+        try:
+            (
+                assistant_message_id,
+                event_user_id,
+                projected_message_source,
+            ) = await _run_sqlite_persist_with_retry(
+                lambda: _persist_terminal_projection_failure_once(
+                    conv_id=conv_id,
+                    model_id=model_id,
+                    content=content,
+                    reasoning=reasoning,
+                    tool_progress=tool_progress,
+                    run_id=run_id,
+                    resolved_model_id=resolved_model_id,
+                    usage=usage,
+                    failure_code=failure_code,
+                ),
+                description=(
+                    "failed terminal projection convergence "
+                    f"conv={conv_id} run={run_id}"
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Terminal projection failure did not converge conv=%s run=%s",
+                conv_id,
+                run_id,
+            )
+            return False
     finally:
         _cleanup_agent_event_persist_lock(conv_id, lock)
 
@@ -2790,6 +2985,11 @@ async def _finalize_native_engine_session(run_id: str, conv_id: str) -> None:
                 and raw_result_succeeded
                 and raw_terminal_status in {"succeeded", "failed"}
                 and terminal_status in {"succeeded", "failed"}
+                and persisted_run.finish_reason
+                not in {
+                    "terminal_projection_failed",
+                    "terminal_projection_interrupted",
+                }
             )
             if publish_transcript_checkpoint:
                 if not persisted_run.native_session_id:
@@ -4244,6 +4444,36 @@ async def _chat_stream_with_turn(
                         raise _ConversationProjectionBarrierError(
                             "Terminal conversation projection was not durable."
                         )
+                    # The native terminal is only a commit candidate.  The
+                    # projection transaction may fail closed after the model
+                    # stream has ended, so the public terminal envelope must
+                    # reflect the durable AgentRun rather than stale native
+                    # success prose.
+                    async with async_session() as projection_db:
+                        projected_run = await projection_db.get(
+                            AgentRun,
+                            run.id,
+                        )
+                    if (
+                        projected_run is not None
+                        and projected_run.status == "failed"
+                        and projected_run.finish_reason
+                        == "terminal_projection_failed"
+                    ):
+                        terminal_envelope_payload = {
+                            "stream_terminal": {
+                                "status": "failed",
+                                "complete": False,
+                                "finish_reason": (
+                                    "terminal_projection_failed"
+                                ),
+                                "termination_source": (
+                                    "backend_terminal_projection_failed"
+                                ),
+                            },
+                            "conversation_id": conv_id,
+                            "run_id": run.id,
+                        }
             finally:
                 # On disconnect the shielded task remains registered.  The
                 # next turn acquires this lock and drains it before history.

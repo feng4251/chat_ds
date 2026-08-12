@@ -41,6 +41,43 @@ class ScheduleControlMcpTests(unittest.TestCase):
                 **base, "conversation_id": "forged-owner",
             })
 
+    def test_compiled_aliases_are_shared_by_receipt_and_ledger(self):
+        aliases = {
+            "Bash": None,
+            "mcp__chatds-market-data__market_quote": "market_quote",
+            "market_quote": "market_quote",
+        }
+        normalized = mcp_schedule_control.normalize_schedule_create(
+            {
+                "name": "Renamed observation",
+                "prompt": "Observe the selected public value.",
+                "schedule": "every 5m",
+                "timezone": "UTC",
+                "enabled_tools": [
+                    "Bash",
+                    "mcp__chatds-market-data__market_quote",
+                    "market_quote",
+                ],
+            },
+            tool_aliases=aliases,
+        )
+        self.assertEqual(normalized["enabled_tools"], ["market_quote"])
+
+    def test_compiled_aliases_reject_foreign_or_unknown_tool_names(self):
+        with self.assertRaisesRegex(ValueError, "invalid_schedule_tools"):
+            mcp_schedule_control.normalize_schedule_create(
+                {
+                    "name": "Renamed observation",
+                    "prompt": "Observe the selected public value.",
+                    "schedule": "every 5m",
+                    "timezone": "UTC",
+                    "enabled_tools": ["mcp__foreign__market_quote"],
+                },
+                tool_aliases={
+                    "mcp__chatds-market-data__market_quote": "market_quote",
+                },
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
