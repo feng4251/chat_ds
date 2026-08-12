@@ -2,6 +2,62 @@
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
+## 2026-08-12 Claude 定时 Turn 单锁、终态刷新与能力网关网络闭环
+
+- 本轮继续诊断 session `63a312df7a1d462fac00ac0926381de3` 的“已声明 13:03–14:53
+  每 10 分钟报告但没有后续消息”。三类证据完整关联：持久对话中的最终请求是 600183 生益科技与
+  002636 金安国纪当日 13:00–15:00 监控；首个正式 `ScheduledJobRun`
+  `c11e5f12c1414c5bbca162946bb19780` 自 13:00 起一直为 running，`last_status` 为空且
+  `next_run_at` 停在 13:10，同时没有 cron AgentRun；exact immutable Skill-view 的 primary 仍是只适用
+  临床试验/CDISC/监管任务的 `healthsim-trialsim` 加 18 个生物医学 supporting Skills，本轮没有 Skill
+  receipt/artifact contract，证券监控与这些 Skill 无关。故障发生在模型、Skill、工具和网络之前。
+- 确定性根因是 Scheduler 在 `registered_conversation_execution` 中先持有 Conversation maintenance
+  lock，再调用 Claude `_chat_stream`；普通 Turn ingestion 又获取同一把非重入 `asyncio.Lock`，形成
+  自锁。通用修复把 lifecycle producer 注册与 Turn lease 分开：Claude scheduled Turn 只注册 producer，
+  由普通 `_chat_stream` 唯一持锁；不经过该入口的 Legacy 路径仍显式持一个 maintenance lease。跨域
+  回归用任意 `session/job/model` 注入真正的 Conversation lock，修复前稳定 timeout，修复后通过；不存在
+  Session、股票、Skill、V2.3、文件名或固定数量分支。
+- 部署后首个恢复 run 真正产生 Claude cron AgentRun 并落 assistant 消息，但外层 Schedule 被错误记为
+  failed。第二个确定性复现证明 `_chat_stream` 由 Scheduler 的 DB Session 创建 `AgentRun=running`，
+  terminal projector 则在独立 Session 提交 succeeded；Scheduler 的主键 get 命中了旧 identity-map
+  对象。现在外层只能在 `refresh(agent_run)` 后从 `succeeded/failed/cancelled` durable terminal 派生状态，
+  其他值明确 fail closed，不能再把 stale running 映射成无错误信息的 failed。
+- 同两次恢复 Turn 的 `market_quote` 在 0.2 秒内返回 HTTPError，而网关自身及代理容器内并行探针均为
+  HTTP 200。机器配置证据显示能力网关同时挂载 `browser_egress` 与 `search_net`，代理 DNS 只解析到
+  `172.31.0.4`，但 private DNS pin 仅授权应用内 `172.29.250.0/24`，所以代理按设计在连接上游前拒绝。
+  修复没有扩大 CIDR/公网权限，而是使 typed capability broker 只在 `search_net` 暴露一个 Harness
+  可见坐标；该网络本身仍向固定公共行情上游出网。静态 topology regression 防止受控私有 broker 再次
+  被多网卡 DNS 坐标破坏。
+- 生产中还发现同一请求存在两条 enabled job：`47d0448...` 是按用户边界建立的 typed
+  `market_quote` job，`41987971...` 是此前维护操作与模型创建路径重叠后留下的 13:03 job。已通过正式
+  internal schedule API 停用后者，保留前者，防止恢复后双重播报。已错过的历史时点没有伪造或补写为
+  实时行情。
+- 成熟实现对照继续冻结独立 `claude-code/` commit
+  `6f6f12b37f529488b10e53928dd5508bb93535c7`。采用并适配
+  `src/utils/cronScheduler.ts` 的独立 scheduler ownership/`inFlight`、从当前时刻重排而不快速补跑，及
+  `src/Task.ts` 的 typed terminal/terminal predicate；这些模式被放入 ChatDS 的 DB schedule、
+  Conversation lifecycle、durable receipt 与 exactly-one terminal 合同中。拒绝把原生进程内 cron
+  作为 disposable print Turn 的持久 owner，也拒绝用 timeout/retry 掩盖锁重入或 stale projection。
+  本地源码路径完整，本轮无需 Web 搜索。
+- 提交依次为 `82a511ceaecd34ecb8926bd6e6c5113144846c69 fix: serialize scheduled Claude
+  turns once`、`e5712b9f37d3d5b03fdb9e5c75cde535cbb9bdc1 fix: refresh scheduled child
+  terminal projection`、`1194cc12 fix: pin typed gateways to one network plane`。Backend 全套最终
+  `290 passed`；锁/调度专项 `24 passed`；部署拓扑、market MCP 与完整 proxy 组合
+  `86 passed, 122 subtests passed`；diff/compile、候选 AST/import、Compose config 均通过。
+- 生产 Backend 当前 image 为
+  `sha256:b7010df5eb2e9b13e363fadd1ef635a67dede3099ee40c12076ac059720a65ce`，revision
+  `e5712b9f...`，running/healthy；旧镜像保留 `rollback-pre-e5712b9f`。切换前 SQLite online backup
+  volume `chat_ds_db_backup_pre_82a511ce_20260812_140739` 为 457,011,200 bytes，SHA-256
+  `07356dc4142a9db10828d32c76f23d6095ad17057bb0ae5f19ebf1824ee30191`，quick/FK 正常。生产
+  `market-data-gateway` 现只有 `search_net` 地址 `172.29.250.6`，代理侧真实 quote probe 为 200。
+- 14:30 CST 自然 tick 已完成业务验收：ScheduledJobRun
+  `fc0bc2430fa945e4a243fcfc7f1c15ef=succeeded`，cron AgentRun
+  `67b2e61b90e544f08270bdcf4780d623=succeeded/end_turn`，assistant cron message
+  `62eab17e78f84fa0aefb24e3f5f1beb` 持久化；两次 typed quote 均成功，报告了 600183/002636 的现价、
+  涨跌幅、昨收和 14:30 数据时间。保留 job 的 `run_count=4`、`next_run_at=2026-08-12 14:40 CST`、
+  `last_status=succeeded`；13:00 自锁 run 已由启动恢复器明确 cancelled，14:11/14:20 消息如实保留当时
+  网络拒绝结果，不改写历史。
+
 ## 2026-08-12 Claude 持久调度、计划权威与失败续接闭环
 
 - 本轮诊断 session `63a312df7a1d462fac00ac0926381de3` 的最后两轮时完整关联了三类证据。
