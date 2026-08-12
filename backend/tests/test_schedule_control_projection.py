@@ -160,6 +160,28 @@ class ScheduleControlProjectionTests(unittest.IsolatedAsyncioTestCase):
             job = await db.get(ScheduledJob, created[0])
         self.assertEqual(job.enabled_tools, "[]")
 
+    async def test_expired_holdout_write_fails_before_any_job_is_staged(self):
+        write = self._write()
+        write["request"]["expires_at"] = "2000-01-01T00:00:00Z"
+        async with self.sessions() as db:
+            with self.assertRaisesRegex(
+                ValueError,
+                "schedule_control_no_occurrence_before_expiry",
+            ):
+                await stage_schedule_control_writes(
+                    db,
+                    user_id=self.user_id,
+                    conversation_id=self.conversation_id,
+                    root_run_id="2" * 32,
+                    model_id="renamed-model",
+                    writes=[write],
+                    allowed_tools=frozenset({"web_search"}),
+                )
+            count = (await db.execute(
+                select(func.count()).select_from(ScheduledJob)
+            )).scalar_one()
+        self.assertEqual(count, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

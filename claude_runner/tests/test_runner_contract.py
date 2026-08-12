@@ -409,7 +409,7 @@ class RunnerCommandContractTests(unittest.TestCase):
                 "schedule": "*/10 13-14 12 8 *",
                 "timezone": "Asia/Shanghai",
                 "max_runs": 12,
-                "expires_at": "2026-08-12T15:00:00+08:00",
+                "expires_at": "2099-08-12T15:00:00+08:00",
             }
             from claude_runner.mcp_schedule_control import _accepted_receipt
             ledger.append_line(json.dumps({
@@ -485,6 +485,42 @@ class RunnerCommandContractTests(unittest.TestCase):
                 ledger.pending_control_writes[0]["request"]["enabled_tools"],
                 ["market_quote"],
             )
+            ledger.close()
+
+    def test_rejected_schedule_never_becomes_a_pending_control_write(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = EventLedger(Path(temporary) / "events.jsonl")
+            arguments = {
+                "name": "Renamed inventory monitor",
+                "prompt": "Report the selected inventory reading.",
+                "schedule": "*/2 * * * *",
+                "timezone": "UTC",
+                "max_runs": 5,
+                "expires_at": "2000-01-01T00:10:00Z",
+            }
+            ledger.append_line(json.dumps({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "tool_use",
+                    "id": "schedule-tool-rejected",
+                    "name": "mcp__chatds-schedule__schedule_create",
+                    "input": arguments,
+                }]},
+            }).encode(), channel="stdout")
+            ledger.append_line(json.dumps({
+                "type": "user",
+                "message": {"content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "schedule-tool-rejected",
+                    "is_error": True,
+                    "content": json.dumps({
+                        "schema": "chatds.schedule.rejected.v1",
+                        "status": "rejected",
+                        "code": "schedule_no_occurrence_before_expiry",
+                    }),
+                }]},
+            }).encode(), channel="stdout")
+            self.assertEqual(ledger.pending_control_writes, ())
             ledger.close()
 
     def test_controller_reaps_only_local_bash_not_delegated_agent(self):

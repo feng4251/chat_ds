@@ -20,8 +20,13 @@
 !claude_runner/requirements.txt
 !claude_runner/runner_entrypoint.py
 !claude_runner/runtime_capabilities.py
+!claude_runner/schedule-requirements.txt
 !claude_runner/seccomp_profile.json
 !claude_runner/server.py
+
+# One source of truth for HTTP, terminal-projector and isolated-MCP schedule
+# semantics. The Runner image copies this exact file into its Python package.
+!backend/schedule_spec.py
 
 !executor/
 !executor/browser_runtime/
