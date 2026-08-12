@@ -2,6 +2,70 @@
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
+## 2026-08-12 Claude 当前能力收据与公网读取语义闭环
+
+- 本轮诊断 session `63a312df7a1d462fac00ac0926381de3` 时按约定关联了三类证据。持久
+  对话的最后三轮均在询问德明利（001309）最新价/昨收；最新 AgentRun
+  `65ef0218f13e4873afc7325c6fd90664` 为 ClaudeCodeEngine succeeded/end_turn，原生 init
+  明确显示 `chatds-market-data`、`chatds-web-search` 均 connected，effective tools 中存在
+  `mcp__chatds-market-data__market_quote`，但模型只调用了两次 web_search，并在终答中沿用旧
+  会话的“没有行情 MCP/沙箱禁外联”说法。terminal receipt 为成功、无 budget rejection；因此这
+  不是 provider、代理、行情上游或 terminal lifecycle 失败，而是 durable session 中历史能力判断
+  压过当前工具清单的 capability selection/grounding 缺陷。
+- 该 Session 当前 immutable Skill-view digest 为
+  `52beb03b17aab27a8aae1723689604624008c8fd1ce18f64f325aeae30847259`，primary Skill 为
+  `healthsim-trialsim`，另有 18 个生物医学 supporting Skills。完整读取的 primary `SKILL.md`
+  明确只在临床试验/CDISC/SDTM/ADaM/监管数据请求中启用；本轮没有 Skill tool receipt、没有
+  artifact contract 激活，证券行情问题不属于这些 Skill。故本次也不是 Skill 错路由，更不能通过
+  修改 TrialSim/V2.3 指令修复。
+- 生产 `market-data-gateway` 对同一证券的真实探针成功返回
+  `source=tencent_public_quote`、`last`、`previous_close`、`as_of`，两个固定上游本次均成功；现有
+  `CLAUDE_PUBLIC_READ_EGRESS_ENABLED=true` 与
+  `SESSION_SANDBOX_PUBLIC_READ_EGRESS_ENABLED=true` 也已启用统一公网 HTTP(S)
+  `GET/HEAD`、80/443 profile。旧回答中的 `request_url_not_allowed` 来自更早 Turn 的 Bash 尝试；
+  最新 Turn 没有重试 Bash，反而忽略了已经装配的 typed quote MCP。因此用户原始“通过接口读取
+  价格/昨收”不需要任意 TCP 或直接 Docker 网络。
+- 文件系统隔离不等于出站保密：完全开放网络仍可外传当前 Session 上传文件/产物、把数据编码进
+  URL/DNS/TCP，或泄露 Claude 子进程继承的 provider credential，也会放开内网扫描/C2。生产继续
+  使用唯一 session-wise sandbox、`network_mode=none` 和 signed proxy；保留已经通用开放的公网
+  HTTP(S) 只读 profile，不开放任意双向 TCP、私网、未列端口或写方法。这个取舍没有域名白名单，
+  可覆盖公开行情、天气、文献、新闻和任意规范 HTTP API；确需非 HTTP 协议时应新增部署拥有、可审计
+  的协议 broker/显式 authority，而不是让模型选择第二个沙箱或直连网卡。
+- 新增 `claude_runner/runtime_capabilities.py`：Supervisor 从已验证 Skill-view 的
+  `harness_egress_rules` 与当轮签名 `egress_policy.public_read` 编译有界 typed contract，保存进
+  durable `request.json`。Runner 再验证该 contract，通过 Claude Code 原生
+  `--append-system-prompt` 每个 fresh/resumed Turn 注入；它明确当前 structured capability 名称、
+  公网读取方法/端口、直接 NIC 仍隔离，并规定当前机器收据覆盖历史助手说法、优先最具体结构化工具、
+  未尝试不得声称不可用。相同 contract 同时写入 `chatds.runtime.config` 原生 debug 事件，后续可从
+  debug 直接审计当轮能力。行情 MCP/Legacy tool description 同步补充 `previous_close` 语义。这些
+  逻辑没有证券名/代码、Session、Skill、V2.3、疾病、route/worker 或固定文件分支；mutation holdout
+  使用 `renamed_catalog_lookup`/`renamed_evidence_lookup` 验证跨领域泛化。
+- 成熟实现对照冻结独立仓库 `claude-code/` commit
+  `6f6f12b37f529488b10e53928dd5508bb93535c7`。采用并适配
+  `src/QueryEngine.ts` 中 controller/SDK 用 `appendSystemPrompt` 叠加当前运行策略、工具权限继续由
+  structured tool/MCP state 控制的模式；ChatDS 将它放在自身 verified Skill-view、签名 egress、
+  session mount 和 durable request/receipt 之后。拒绝仅靠会话 prose、强制关键词路由或直接放开
+  NIC；相关本地代码路径完整，无需 Web 搜索补足未知 stub。
+- 回归结果：Claude Runner/Supervisor 全套 `71 passed, 1 skipped, 10 subtests passed`；行情、
+  public-read、isolated executor 组合 `63 passed, 64 subtests passed`；egress proxy 全套
+  `82 passed`；Backend 全套 `283 passed`；compileall、diff check、Compose config、候选镜像 import/
+  revision smoke 均通过。未启动 V2.3 或其他模型重型 E2E。
+- 代码提交为 `768dd745267daed3ed79b6661e606c28aaa6e627 fix: attest current Claude runtime
+  capabilities`；clean Git archive 为 `/tmp/chat_ds_build_768dd745.OTIEej`（22,500 files）。切换前
+  nonterminal AgentRun、active engine session、running/enabled schedule、动态 Turn container 均为
+  0。SQLite online backup volume 为
+  `chat_ds_db_backup_pre_768dd745_20260812_092943`，449,777,664 bytes，SHA-256
+  `5b5c50b90fc25675a06aed46cda47574a57594124e64675dd3d6f103cadd65ef`，quick/FK 正常。
+- 当前生产 Runner/Supervisor/保留的 Legacy Harness image 分别为
+  `sha256:c461e34adbc6739a76d45173cd581b2f454600eb1235b64f3ffb29ced0887297`、
+  `sha256:ad10cdcace6924d12c3e2d8261c616f8717833d83de76a80cd7274b9a5eadb48`、
+  `sha256:97c7b4f2e1feefae2954ebcb68fdead55b9abbee8a05abd58d2c41a91a7cd10f`，revision
+  均精确为 `768dd745...`；切换前镜像保留 `rollback-pre-768dd745`。容器 healthy/running、restart
+  0，Claude 2.1.152；`127.0.0.1`、`10.10.132.126`、`172.30.100.128` 的 `/api/health`
+  均为 200；生产 SQLite quick/FK 正常，切换后 active run/session 仍为 0，相关新容器日志无严重错误。
+  用户可以在原 Session 直接重试同一行情问题；只有部署后的新 Turn 会收到当前能力 contract，历史
+  错误回答本身不会被改写。
+
 ## 2026-08-11 Claude Skill 合约、持久进程与唯一执行引擎闭环
 
 - 本轮把近期 ClaudeCodeEngine 会话暴露的问题统一重述为五个跨领域不变量：Skill 声明的最终
