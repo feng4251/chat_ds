@@ -2,6 +2,51 @@
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
+## 2026-08-12 后台会话消息前端重同步与成功终态去噪闭环
+
+- 本轮按三源要求诊断 session `92609477b43645a383b93963df75d28e`。持久对话中用户先后两次要求每
+  5 分钟报告数字资产价格、各 10 次；两个 ScheduledJob
+  `7e2490162b674775975e9d051738fa9d`、`ac5adca2ca9bb66fc6d07ff3f41aef79` 均已
+  `run_count=10/max_runs=10`、`last_status=succeeded`、`enabled=false`。生产消息共 52 条，其中
+  20 条为 `source=cron` 的 assistant 报告；AgentRun/run-card 无活动 root。exact immutable Skill-view
+  digest 仍为 `1bd74217f15a79587cd16cfee5f021b6a5094d5c46a4455d489781984c1e7521`，Skill、primary
+  selection 与 artifact contract 均为空。因此后台执行、ClaudeEngine、Provider、网络、Skill、Scheduler
+  和消息持久化都没有失败；两倍报告来自用户第二次明确创建同一有界任务，不是单个 job 越界。
+- 用户观察到的第一项问题发生在 UI 生命周期：原前端只在路由进入、当前交互 SSE 结束或已知 active
+  AgentRun 时读取消息。后台 job 在页面空闲后创建的 durable message 不会启动该 poll，故 DB 已有结果但
+  浏览器要等刷新或下一次交互。按用户要求保持 Harness/Backend/Runner/Scheduler/数据库不变，前端现在用
+  一个通用、可见页面限定的 Session 投影同步器读取既有 authenticated read API：空闲时每 5 秒先读取
+  bounded run-card；仅在新 root、active/terminal/assistant mapping 边界变化时读取完整消息；另有 30 秒
+  全量兜底。窗口 focus、网络 online、页面重新 visible 会立即强制全量校准。所有触发共用不可重叠的
+  coordinator；在途请求只合并为一次 pending refresh，并保留 force-full 意图；会话切换、组件卸载或
+  live SSE draft 会撤销投影写权限，旧响应不能污染新 Session。DB/API 投影仍是唯一权威，轮询不是新的
+  workflow state。
+- 第二项是纯前端投影噪声：无 Backend-proven assistant mapping 的每个普通 succeeded root 曾生成一个
+  空 assistant placeholder，唯一正文即“任务已完成；以下为持久化的执行记录。”；多个 cron root 因而
+  堆积相同卡片。普通成功 root 现在只保留在 Tasks/run audit 视图，不再制造聊天 turn；active、failed、
+  cancelled、degraded、recovered 等需要用户关注的状态仍保留生命周期占位。生产真实目标 Session 用新
+  hydration 零模型验收为 `persisted_messages=52`、`projected_messages=52`、`roots=26`、
+  `assistant_cron_messages=20`、`lifecycle_notices=0`、`ordinary_success_notices=0`。
+- 成熟实现对照冻结独立 `claude-code/` commit
+  `6f6f12b37f529488b10e53928dd5508bb93535c7`。采用并适配
+  `src/hooks/useTasksV2.ts` 的单一共享 watcher、进程内通知与有界 fallback poll、不可见/完成后去噪思想；
+  ChatDS 浏览器没有文件 watcher，故用现有 authenticated DB projection API 作为跨进程/重启兜底。拒绝
+  把 ephemeral browser notification 或模型 prose 变成状态权威，也拒绝为 cron、行情、Session ID 或
+  Skill 增加特判。本地源码完整，本轮无需 Web 搜索。
+- 跨域 deterministic regression 使用 factory line、inventory 与 sensor 场景，覆盖消息边界 revision、
+  tool progress 不重复下载 transcript、重叠请求 coalesce、在途 force-full 保留、route ownership 撤销、
+  普通成功去噪及异常终态可见。Frontend 全套 `29 passed`，目标 ESLint 零错误，production build 通过；
+  全仓 ESLint 仍有 `ModelSelector.jsx` 与 `SkillLibrary.jsx` 两个既有 `set-state-in-effect` 错误，本轮没有
+  扩 scope 修改。`git diff --check` 通过。
+- 功能提交为 `18961e04e9a34d2dee6284dc975618c9e40d07e8 fix: reconcile durable session
+  updates in chat`。clean archive `/tmp/chat_ds_deploy_18961e04.My2zXb7W` 与 Git tree 均为 22,509
+  files；Frontend image 为
+  `sha256:7b87ef91942fbfb6ec79076d33b7f79c02168d679a66855a97b7c7dc51bdb798`，revision label 精确
+  匹配提交，旧镜像保留 `chat_ds-frontend:rollback-pre-18961e04`。仅 Frontend 被 force-recreate；
+  Backend、Legacy Harness、Claude Supervisor/Runner、Scheduler、数据库和其他容器未重建。当前 Frontend
+  running/restart=0，`127.0.0.1`、`10.10.132.126`、`172.30.100.128` 三入口页面与 `/api/health`
+  均为 200，三入口均加载 `/assets/index-DpeAHPNp.js`。
+
 ## 2026-08-12 Claude 控制写入能力编译与终态投影失败收敛闭环
 
 - 本轮按约定完整关联 session `92609477b43645a383b93963df75d28e` 的三类证据。持久对话最后一条
