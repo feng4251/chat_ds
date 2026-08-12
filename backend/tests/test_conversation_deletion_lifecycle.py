@@ -623,6 +623,66 @@ class ConversationDeletionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             )).scalars().all())
             self.assertEqual(2, len(cron_messages))
 
+    async def test_claude_schedule_acquires_the_conversation_turn_exactly_once(
+        self,
+    ):
+        """A scheduled Claude Turn must not deadlock on its own session lock."""
+
+        await self._seed_full_session()
+        async with self.sessions() as db:
+            conversation = await db.get(Conversation, "session")
+            conversation.engine_id = "claude_code"
+            await db.commit()
+
+        entered_native_turn = asyncio.Event()
+
+        async def execute_self_serializing_turn(
+            db,
+            *,
+            job,
+            conv,
+            scheduled_run,
+            tools,
+        ):
+            del tools
+            lease = await chat_router._acquire_conversation_turn(str(conv.id))
+            try:
+                entered_native_turn.set()
+                scheduled_run.status = "succeeded"
+                scheduled_run.ended_at = scheduler._utcnow()
+                job.last_status = "succeeded"
+                await scheduler._commit_scheduled_session_state(
+                    db,
+                    user_id=str(job.user_id),
+                    conversation_id=str(conv.id),
+                )
+            finally:
+                chat_router._release_conversation_turn(str(conv.id), lease)
+
+        with (
+            patch.object(scheduler, "async_session", self.sessions),
+            patch.object(
+                scheduler,
+                "_execute_claude_scheduled_turn",
+                new=execute_self_serializing_turn,
+            ),
+            patch.object(
+                scheduler,
+                "emit_event",
+                new=AsyncMock(return_value=None),
+            ),
+        ):
+            scheduled, started = scheduler.enqueue_job_execution(
+                "job",
+                force=True,
+            )
+            self.assertTrue(started)
+            await asyncio.wait_for(entered_native_turn.wait(), timeout=1)
+            await asyncio.wait_for(scheduled, timeout=2)
+
+        run = await self._new_scheduled_run()
+        self.assertEqual("succeeded", run.status)
+
     async def test_scheduler_shutdown_cancels_long_run_with_terminal_state(
         self,
     ):

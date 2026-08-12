@@ -794,15 +794,18 @@ async def conversation_maintenance_lease(conv_id: str):
 
 
 @asynccontextmanager
-async def registered_conversation_execution(
+async def registered_conversation_producer(
     user_id: str,
     conv_id: str,
 ):
-    """Register a non-chat producer and hold the conversation turn lease.
+    """Register one cancellable producer without acquiring its turn lease.
 
-    Scheduled jobs use this path so delete observes/cancels them through the
-    same registry as chat producers. Double marker checks close the
-    publish-vs-register race before any session-owned commit can begin.
+    This is the lifecycle half of scheduled execution.  A producer which
+    calls the ordinary chat path must let that path acquire the conversation
+    lease itself; acquiring it here as well would recursively wait on the
+    same non-reentrant lock.  Direct producers use
+    ``registered_conversation_execution`` below to compose registration with
+    exactly one maintenance lease.
     """
 
     conversation_key = str(conv_id)
@@ -817,12 +820,7 @@ async def registered_conversation_execution(
     ).add(task)
     try:
         require_session_workspace_active(str(user_id), conversation_key)
-        async with conversation_maintenance_lease(conversation_key):
-            require_session_workspace_active(
-                str(user_id),
-                conversation_key,
-            )
-            yield
+        yield
     finally:
         conversation_tasks = _detached_chat_producers_by_conversation.get(
             conversation_key
@@ -835,6 +833,23 @@ async def registered_conversation_execution(
                     None,
                 )
         _background_tasks.discard(task)
+
+
+@asynccontextmanager
+async def registered_conversation_execution(
+    user_id: str,
+    conv_id: str,
+):
+    """Register a direct producer and hold exactly one conversation lease."""
+
+    conversation_key = str(conv_id)
+    async with registered_conversation_producer(user_id, conversation_key):
+        async with conversation_maintenance_lease(conversation_key):
+            require_session_workspace_active(
+                str(user_id),
+                conversation_key,
+            )
+            yield
 
 
 def _track_conversation_projection(

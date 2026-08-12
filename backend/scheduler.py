@@ -18,6 +18,7 @@ except ImportError:  # Local source checks may run before requirements are insta
     croniter = None
 from sqlalchemy import select
 
+from agent_engines.base import ENGINE_ID_CLAUDE_CODE
 from config import settings
 from database import async_session
 from hooks import emit_event
@@ -510,15 +511,37 @@ async def _execute_job_once(
                 await db.flush()
                 job.conversation_id = conv.id
                 await db.commit()
+            else:
+                conv = (await db.execute(
+                    select(Conversation).where(
+                        Conversation.id == job.conversation_id,
+                        Conversation.user_id == job.user_id,
+                    )
+                )).scalar_one_or_none()
+                if conv is None:
+                    return
             user_id = str(job.user_id)
             conversation_id = str(job.conversation_id)
 
-        from routers.chat_router import registered_conversation_execution
-        async with registered_conversation_execution(
+        from routers.chat_router import (
+            conversation_maintenance_lease,
+            registered_conversation_producer,
+        )
+        async with registered_conversation_producer(
             user_id,
             conversation_id,
         ):
-            await _execute_job_bound(job_id, flight=flight)
+            if str(conv.engine_id) == ENGINE_ID_CLAUDE_CODE:
+                # The ordinary Claude chat path owns the conversation turn
+                # lease from history snapshot through durable projection.
+                # Holding it here as well would self-deadlock on the same
+                # non-reentrant per-Conversation lock.
+                await _execute_job_bound(job_id, flight=flight)
+            else:
+                # The direct Legacy path does not acquire the chat lease, so
+                # compose one here to preserve turn/delete serialization.
+                async with conversation_maintenance_lease(conversation_id):
+                    await _execute_job_bound(job_id, flight=flight)
     except asyncio.CancelledError:
         try:
             await _persist_job_run_terminal(
