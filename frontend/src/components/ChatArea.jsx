@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react'
 import {
   FiSend, FiPaperclip, FiX, FiMessageSquare, FiFile,
   FiSliders, FiCode, FiBookOpen, FiImage, FiSearch,
@@ -27,9 +27,11 @@ import {
 } from '../utils/agentRunHydration'
 import {
   createSessionRefreshCoordinator,
+  createSessionRefreshLoop,
   messageProjectionRevision,
   runCardMessageRevision,
   runCardProjectionRevision,
+  shouldFollowMessageUpdate,
 } from '../utils/sessionProjectionSync'
 
 const SAMPLE_PROMPTS = [
@@ -52,6 +54,7 @@ const RUN_DTO_FIELD_LABELS = {
   tool_events: '工具事件',
 }
 const IDLE_SESSION_SYNC_MS = 5000
+const HIDDEN_SESSION_SYNC_MS = 30000
 const FULL_SESSION_RECONCILE_MS = 30000
 
 function withClientStreamError(
@@ -272,14 +275,14 @@ export default function ChatArea({
   const activeConvRef = useRef(activeConv)
   const onConvRefreshRef = useRef(onConvRefresh)
   const liveRequestRef = useRef(null)
-  const busyRef = useRef(busy)
   const runCardMessageRevisionRef = useRef('')
   const runCardProjectionRevisionRef = useRef('')
   const messageProjectionRevisionRef = useRef('')
   const lastFullSessionSyncRef = useRef(0)
+  const sessionSyncWakeRef = useRef(() => {})
+  const shouldStickToBottomRef = useRef(true)
   activeConvRef.current = activeConv
   onConvRefreshRef.current = onConvRefresh
-  busyRef.current = busy
   const effectiveDurableRunUnknown = Boolean(
     activeConv
     && (
@@ -295,6 +298,18 @@ export default function ChatArea({
     )
   }
 
+  function releaseLiveRequest(scope) {
+    const ownedCurrentView = requestOwnsCurrentView(scope)
+    if (liveRequestRef.current === scope) liveRequestRef.current = null
+    if (!ownedCurrentView) return
+    setBusy(false)
+    onConvRefreshRef.current?.()
+    setTimeout(() => onConvRefreshRef.current?.(), 1500)
+    // The idle loop may have spent the entire Turn behind live-request
+    // ownership. Explicitly wake it only after that ownership is released.
+    sessionSyncWakeRef.current?.()
+  }
+
   useEffect(() => {
     const liveRequest = liveRequestRef.current
     if (liveRequest) {
@@ -308,6 +323,7 @@ export default function ChatArea({
     }
 
     if (!activeConv) {
+      shouldStickToBottomRef.current = true
       setMsgs((previous) => (
         liveRequestRef.current
         && conversationRequestOwnsRoute(liveRequestRef.current, null)
@@ -331,6 +347,7 @@ export default function ChatArea({
     runCardProjectionRevisionRef.current = ''
     messageProjectionRevisionRef.current = ''
     lastFullSessionSyncRef.current = 0
+    shouldStickToBottomRef.current = true
     setDurableRunActive(false)
     setDurableRunUnknown(true)
     setDurableRunConversation(activeConv)
@@ -409,16 +426,13 @@ export default function ChatArea({
     if (!activeConv) return
     const convId = activeConv
     let cancelled = false
-    let timer = null
     let nextDelay = IDLE_SESSION_SYNC_MS
 
     const coordinator = createSessionRefreshCoordinator({
       canRefresh: () => (
         !cancelled
         && activeConvRef.current === convId
-        && !busyRef.current
         && !liveRequestRef.current
-        && document.visibilityState !== 'hidden'
       ),
       refresh: async ({ forceFull }) => {
         const runCards = await getRunCards(convId)
@@ -471,32 +485,39 @@ export default function ChatArea({
         setDurableRunActive(stillActive)
         setDurableRunUnknown(false)
         setDurableRunConversation(convId)
-        nextDelay = runCards.poll_after_ms || IDLE_SESSION_SYNC_MS
+        const projectionDelay = runCards.poll_after_ms || IDLE_SESSION_SYNC_MS
+        nextDelay = document.visibilityState === 'hidden'
+          ? Math.max(projectionDelay, HIDDEN_SESSION_SYNC_MS)
+          : projectionDelay
       },
     })
 
-    const poll = async () => {
-      await coordinator.request(false)
-      if (!cancelled) timer = setTimeout(poll, nextDelay)
+    const loop = createSessionRefreshLoop({
+      request: (forceFull) => coordinator.request(forceFull),
+      getDelay: () => nextDelay,
+      initialDelay: IDLE_SESSION_SYNC_MS,
+    })
+    const forceReconcile = () => loop.wake()
+    const onVisibilityChange = () => {
+      if (document.visibilityState !== 'hidden') forceReconcile()
     }
 
-    const forceReconcile = () => {
-      if (document.visibilityState !== 'hidden') {
-        void coordinator.request(true)
-      }
-    }
-    const onVisibilityChange = () => forceReconcile()
-
-    timer = setTimeout(poll, IDLE_SESSION_SYNC_MS)
+    sessionSyncWakeRef.current = forceReconcile
+    loop.start()
     window.addEventListener('focus', forceReconcile)
     window.addEventListener('online', forceReconcile)
+    window.addEventListener('pageshow', forceReconcile)
     document.addEventListener('visibilitychange', onVisibilityChange)
     return () => {
       cancelled = true
-      if (timer) clearTimeout(timer)
+      if (sessionSyncWakeRef.current === forceReconcile) {
+        sessionSyncWakeRef.current = () => {}
+      }
+      loop.stop()
       coordinator.stop()
       window.removeEventListener('focus', forceReconcile)
       window.removeEventListener('online', forceReconcile)
+      window.removeEventListener('pageshow', forceReconcile)
       document.removeEventListener('visibilitychange', onVisibilityChange)
     }
   }, [activeConv])
@@ -548,24 +569,31 @@ export default function ChatArea({
 
     const onScroll = () => {
       const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
-      setShowScrollBtn(distanceFromBottom > 200)
+      const pinnedToBottom = distanceFromBottom <= 200
+      shouldStickToBottomRef.current = pinnedToBottom
+      setShowScrollBtn(!pinnedToBottom)
     }
 
     el.addEventListener('scroll', onScroll, { passive: true })
     return () => el.removeEventListener('scroll', onScroll)
   }, [hasNoMessages]) // re-attach when switching between welcome/chat
 
-  // Auto-scroll to bottom when new content arrives — but only if user is already
-  // near the bottom (don't fight manual scroll-up)
+  // Preserve the pre-update scroll intent. Measuring only after a large
+  // background append makes a previously pinned view look "far from bottom"
+  // and hides the new durable message below the fold.
   const lastMsg = msgs[msgs.length - 1]
   const isStreaming = lastMsg?.streaming
-  useEffect(() => {
+  useLayoutEffect(() => {
     const el = scrollContainerRef.current
     if (!el) return
-    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
-    if (distanceFromBottom < 300 || isStreaming) {
-      endRef.current?.scrollIntoView({ behavior: 'smooth' })
+    if (shouldFollowMessageUpdate(shouldStickToBottomRef.current, isStreaming)) {
+      endRef.current?.scrollIntoView({ behavior: isStreaming ? 'auto' : 'smooth' })
+      shouldStickToBottomRef.current = true
+      setShowScrollBtn(false)
+      return
     }
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+    setShowScrollBtn(distanceFromBottom > 200)
   }, [msgs, isStreaming])
 
   useEffect(() => {
@@ -858,14 +886,7 @@ export default function ChatArea({
           }
         }
       }
-      if (requestOwnsCurrentView(requestScope)) {
-        setBusy(false)
-        onConvRefresh()
-        setTimeout(() => onConvRefresh(), 1500)
-      }
-      if (liveRequestRef.current === requestScope) {
-        liveRequestRef.current = null
-      }
+      releaseLiveRequest(requestScope)
     }
   }
 
@@ -1006,14 +1027,7 @@ export default function ChatArea({
           }
         }
       }
-      if (requestOwnsCurrentView(requestScope)) {
-        setBusy(false)
-        onConvRefresh()
-        setTimeout(() => onConvRefresh(), 1500)
-      }
-      if (liveRequestRef.current === requestScope) {
-        liveRequestRef.current = null
-      }
+      releaseLiveRequest(requestScope)
     }
   }
 
@@ -1025,6 +1039,8 @@ export default function ChatArea({
   const canSend = (inp.trim().length > 0 || images.length > 0) && !interactionBusy
 
   function scrollToBottom() {
+    shouldStickToBottomRef.current = true
+    setShowScrollBtn(false)
     endRef.current?.scrollIntoView({ behavior: 'smooth' })
   }
 
@@ -1062,7 +1078,12 @@ export default function ChatArea({
   }
 
   return (
-    <div className="h-full min-h-0 flex flex-col bg-stone-50">
+    <div
+      className="h-full min-h-0 flex flex-col bg-stone-50"
+      data-chatds-reload-blocked={
+        interactionBusy || inp.trim() || images.length > 0 ? 'true' : 'false'
+      }
+    >
       <div
         ref={scrollContainerRef}
         className="flex-1 min-h-0 overflow-y-auto px-6 py-8 relative"

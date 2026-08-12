@@ -3,7 +3,9 @@ import test from 'node:test'
 
 import {
   createSessionRefreshCoordinator,
+  createSessionRefreshLoop,
   runCardMessageRevision,
+  shouldFollowMessageUpdate,
 } from './sessionProjectionSync.js'
 
 test('message revision changes only at durable message boundaries', () => {
@@ -69,4 +71,72 @@ test('refresh coordinator does not run after route ownership is revoked', async 
   ownsRoute = false
   await coordinator.request(true)
   assert.equal(callCount, 1)
+})
+
+test('refresh loop rearms after a skipped or failed reconciliation', async () => {
+  const timers = new Map()
+  let nextTimer = 0
+  let attempts = 0
+  const loop = createSessionRefreshLoop({
+    request: async () => {
+      attempts += 1
+      if (attempts === 1) throw new Error('transient read failure')
+    },
+    getDelay: () => 17,
+    initialDelay: 11,
+    setTimer: (callback, delay) => {
+      const id = ++nextTimer
+      timers.set(id, { callback, delay })
+      return id
+    },
+    clearTimer: (id) => timers.delete(id),
+  })
+
+  loop.start()
+  assert.deepEqual([...timers.values()].map((timer) => timer.delay), [11])
+  const first = [...timers.values()][0]
+  timers.clear()
+  first.callback()
+  await new Promise((resolve) => globalThis.setTimeout(resolve, 0))
+  assert.equal(attempts, 1)
+  assert.deepEqual([...timers.values()].map((timer) => timer.delay), [17])
+
+  const second = [...timers.values()][0]
+  timers.clear()
+  second.callback()
+  await new Promise((resolve) => globalThis.setTimeout(resolve, 0))
+  assert.equal(attempts, 2)
+  assert.equal(timers.size, 1)
+  loop.stop()
+  assert.equal(timers.size, 0)
+})
+
+test('refresh loop wake cancels the stale timer and forces reconciliation', async () => {
+  const timers = new Map()
+  let nextTimer = 0
+  const forces = []
+  const loop = createSessionRefreshLoop({
+    request: async (forceFull) => { forces.push(forceFull) },
+    initialDelay: 50,
+    setTimer: (callback, delay) => {
+      const id = ++nextTimer
+      timers.set(id, { callback, delay })
+      return id
+    },
+    clearTimer: (id) => timers.delete(id),
+  })
+
+  loop.start()
+  assert.equal(timers.size, 1)
+  loop.wake()
+  await new Promise((resolve) => globalThis.setTimeout(resolve, 0))
+  assert.deepEqual(forces, [true])
+  assert.equal(timers.size, 1)
+  loop.stop()
+})
+
+test('message following uses the pre-append pin state', () => {
+  assert.equal(shouldFollowMessageUpdate(true, false), true)
+  assert.equal(shouldFollowMessageUpdate(false, true), true)
+  assert.equal(shouldFollowMessageUpdate(false, false), false)
 })
