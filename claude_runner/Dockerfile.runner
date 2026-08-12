@@ -28,32 +28,45 @@ LABEL org.opencontainers.image.title="ChatDS isolated Claude Code Turn runner" \
       org.opencontainers.image.version="${CLAUDE_CODE_VERSION}" \
       org.opencontainers.image.chatds.network="none+signed-exact-and-public-read-egress-v3" \
       org.opencontainers.image.chatds.egress-policy="signed-public-read-v1" \
+      org.opencontainers.image.chatds.runner-runtime="installed-isolated-package-v1" \
       org.opencontainers.image.chatds.workspace-scope="one-session" \
       org.opencontainers.image.chatds.setid-stripped="true"
 
 COPY --from=claude-package /build/node_modules /opt/chatds-claude-code/node_modules
-COPY claude_runner/runner_entrypoint.py /app/claude-runner/runner_entrypoint.py
-COPY claude_runner/runtime_capabilities.py /app/claude-runner/runtime_capabilities.py
-COPY claude_runner/mcp_web_search.py /app/claude-runner/mcp_web_search.py
-COPY claude_runner/mcp_market_data.py /app/claude-runner/mcp_market_data.py
-COPY claude_runner/mcp_process.py /app/claude-runner/mcp_process.py
+COPY claude_runner/bootstrap.py /opt/chatds-claude-runner/bootstrap.py
+COPY claude_runner/__init__.py \
+     claude_runner/runner_entrypoint.py \
+     claude_runner/runtime_capabilities.py \
+     claude_runner/image_selftest.py \
+     claude_runner/mcp_web_search.py \
+     claude_runner/mcp_market_data.py \
+     claude_runner/mcp_process.py \
+     /opt/chatds-claude-runner/python/claude_runner/
 
 RUN ln -s /opt/chatds-claude-code/node_modules/.bin/claude /usr/local/bin/claude \
-    && mkdir -p /run/chatds /state /skill-view /runtime \
-    && chmod 0555 /app/claude-runner/runner_entrypoint.py \
-    && chmod 0555 /app/claude-runner/runtime_capabilities.py \
-    && chmod 0555 /app/claude-runner/mcp_web_search.py \
-    && chmod 0555 /app/claude-runner/mcp_market_data.py \
-    && chmod 0555 /app/claude-runner/mcp_process.py \
-    && chmod -R a-w /opt/chatds-claude-code \
+    && mkdir -p /run/chatds /state /skill-view /runtime /app/claude-runner \
+    && purelib="$(python -I -c 'import sysconfig; print(sysconfig.get_path("purelib"))')" \
+    && test -d "${purelib}" \
+    && ln -s /opt/chatds-claude-runner/python/claude_runner "${purelib}/claude_runner" \
+    # Compatibility aliases permit an old, already-frozen Skill view to run
+    # during a rolling Backend/Runner transition. Newly compiled views use
+    # the installed ``python -I -m claude_runner.*`` entrypoints.
+    && ln -s /opt/chatds-claude-runner/python/claude_runner/mcp_web_search.py /app/claude-runner/mcp_web_search.py \
+    && ln -s /opt/chatds-claude-runner/python/claude_runner/mcp_market_data.py /app/claude-runner/mcp_market_data.py \
+    && ln -s /opt/chatds-claude-runner/python/claude_runner/mcp_process.py /app/claude-runner/mcp_process.py \
+    && chmod 0555 /opt/chatds-claude-runner/bootstrap.py \
+    && chmod -R a-w /opt/chatds-claude-code /opt/chatds-claude-runner \
     && find / -xdev -type f -perm /6000 -exec chmod a-s {} + \
     && getcap -r / 2>/dev/null | cut -d ' ' -f 1 | xargs -r setcap -r \
     && test -z "$(find / -xdev -type f -perm /6000 -print -quit)" \
     && test -z "$(getcap -r / 2>/dev/null)" \
     && test "$(python -I -c 'from chatds_browser_runtime.proxy_bridge import EGRESS_POLICY_RUNTIME_VERSION; print(EGRESS_POLICY_RUNTIME_VERSION)')" = "signed-public-read-v1" \
-    && claude --version | grep -F "${CLAUDE_CODE_VERSION}"
+    && claude --version | grep -F "${CLAUDE_CODE_VERSION}" \
+    # This is the same Python/bootstrap command used by the final ENTRYPOINT;
+    # it also performs real stdio MCP handshakes under isolated mode.
+    && /usr/local/bin/python -I /opt/chatds-claude-runner/bootstrap.py --chatds-image-self-test
 
 USER 0:0
 HEALTHCHECK NONE
-ENTRYPOINT ["/usr/bin/dumb-init", "--", "/usr/local/bin/python", "-I", "/app/claude-runner/runner_entrypoint.py"]
+ENTRYPOINT ["/usr/bin/dumb-init", "--", "/usr/local/bin/python", "-I", "/opt/chatds-claude-runner/bootstrap.py"]
 CMD []

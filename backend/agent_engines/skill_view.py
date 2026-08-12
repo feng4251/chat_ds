@@ -199,7 +199,7 @@ def materialize_claude_skill_view(
             mcp_servers[server_name] = {
                 "type": "stdio",
                 "command": "/usr/local/bin/python",
-                "args": ["-I", "/app/claude-runner/mcp_process.py"],
+                "args": ["-I", "-m", "claude_runner.mcp_process"],
             }
         harness_egress_rules: list[dict[str, Any]] = []
         enabled_tool_names = {
@@ -217,7 +217,7 @@ def materialize_claude_skill_view(
             mcp_servers[server_name] = {
                 "type": "stdio",
                 "command": "/usr/local/bin/python",
-                "args": ["-I", "/app/claude-runner/mcp_web_search.py"],
+                "args": ["-I", "-m", "claude_runner.mcp_web_search"],
                 "env": {"CHATDS_SEARXNG_SEARCH_URL": normalized_search_url},
             }
             harness_egress_rules.append({
@@ -237,7 +237,7 @@ def materialize_claude_skill_view(
             mcp_servers[server_name] = {
                 "type": "stdio",
                 "command": "/usr/local/bin/python",
-                "args": ["-I", "/app/claude-runner/mcp_market_data.py"],
+                "args": ["-I", "-m", "claude_runner.mcp_market_data"],
                 "env": {"CHATDS_MARKET_DATA_URL": normalized_market_url},
             }
             harness_egress_rules.append({

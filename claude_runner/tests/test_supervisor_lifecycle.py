@@ -25,6 +25,7 @@ from claude_runner.server import (
     _terminal_status,
     _update_status,
     _validate_runner_image_security,
+    _validate_runner_image_self_test_output,
 )
 from claude_runner.runtime_capabilities import (
     compile_runtime_capability_contract,
@@ -223,12 +224,42 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
             "org.opencontainers.image.chatds.egress-policy": (
                 "signed-public-read-v1"
             ),
+            "org.opencontainers.image.chatds.runner-runtime": (
+                "installed-isolated-package-v1"
+            ),
         })
         _validate_runner_image_security(image, "seccomp_stripped_setid")
 
         image.labels.pop("org.opencontainers.image.chatds.egress-policy")
         with self.assertRaisesRegex(RuntimeError, "egress_policy_attestation"):
             _validate_runner_image_security(image, "seccomp_stripped_setid")
+
+        image.labels["org.opencontainers.image.chatds.egress-policy"] = (
+            "signed-public-read-v1"
+        )
+        image.labels.pop("org.opencontainers.image.chatds.runner-runtime")
+        with self.assertRaisesRegex(RuntimeError, "runtime_attestation"):
+            _validate_runner_image_security(image, "seccomp_stripped_setid")
+
+    def test_runner_image_self_test_receipt_is_exact_and_bounded(self):
+        _validate_runner_image_self_test_output(json.dumps({
+            "schema": "chatds.claude-runner-image-self-test.v1",
+            "status": "ok",
+            "mcp_entrypoints": 3,
+            "compatibility_entrypoints": 3,
+        }).encode())
+        for payload in (
+            b"",
+            b'{"schema":"wrong","status":"ok","mcp_entrypoints":3,'
+            b'"compatibility_entrypoints":3}\n',
+            b'{"schema":"chatds.claude-runner-image-self-test.v1",'
+            b'"status":"ok","mcp_entrypoints":2,'
+            b'"compatibility_entrypoints":3}\n',
+            b"not-json\n",
+        ):
+            with self.subTest(payload=payload):
+                with self.assertRaisesRegex(RuntimeError, "self_test"):
+                    _validate_runner_image_self_test_output(payload)
 
     async def test_missing_dynamic_runner_image_is_structured_503(self):
         class MissingImages:
@@ -830,6 +861,87 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(container.kill_signals, ["SIGUSR1"])
         self.assertEqual(_terminal_status(run_dir / "events.jsonl"), "failed")
         self.assertEqual(_read_json(status_path)["status"], "failed")
+
+    async def test_early_process_exit_preserves_stage_and_exit_code(self):
+        run_id = uuid.uuid4().hex
+        run_dir = self.manager._run_dir(
+            self.user_id, self.conversation_id, run_id
+        )
+        run_dir.mkdir(parents=True)
+        status_path = run_dir / "status.json"
+        status_path.write_text(json.dumps({
+            "run_id": run_id,
+            "user_id": self.user_id,
+            "conversation_id": self.conversation_id,
+            "status": "running",
+            "phase": "running",
+            "container_id": "container-" + run_id,
+        }))
+        container = _FakeContainer(self.client.containers, run_id)
+        container.status = "exited"
+        self.client.containers.attach(container)
+        await self.manager._monitor_container(
+            container,
+            run_id=run_id,
+            run_dir=run_dir,
+            status_path=status_path,
+            remaining_seconds=120,
+        )
+        envelope = json.loads(
+            (run_dir / "events.jsonl").read_text(encoding="utf-8")
+        )
+        event = envelope["event"]
+        self.assertEqual(event["error"], "runner_process_exited_before_terminal")
+        self.assertEqual(event["error_stage"], "bootstrap_or_controller")
+        self.assertEqual(event["exit_code"], 143)
+        status = _read_json(status_path)
+        self.assertEqual(status["error"], event["error"])
+        self.assertEqual(status["error_stage"], event["error_stage"])
+
+    async def test_bootstrap_terminal_is_authoritative_in_status_projection(self):
+        run_id = uuid.uuid4().hex
+        run_dir = self.manager._run_dir(
+            self.user_id, self.conversation_id, run_id
+        )
+        run_dir.mkdir(parents=True)
+        status_path = run_dir / "status.json"
+        status_path.write_text(json.dumps({
+            "run_id": run_id,
+            "user_id": self.user_id,
+            "conversation_id": self.conversation_id,
+            "status": "running",
+            "phase": "running",
+            "container_id": "container-" + run_id,
+        }))
+        (run_dir / "events.jsonl").write_text(json.dumps({
+            "seq": 1,
+            "channel": "bootstrap",
+            "event": {
+                "type": "chatds.supervisor.terminal",
+                "status": "failed",
+                "error": "runner_runtime_import_failed",
+                "error_code": "runner_runtime_import_failed",
+                "error_stage": "bootstrap_import",
+                "exit_code": 70,
+            },
+        }) + "\n")
+        container = _FakeContainer(self.client.containers, run_id)
+        container.status = "exited"
+        self.client.containers.attach(container)
+        await self.manager._monitor_container(
+            container,
+            run_id=run_id,
+            run_dir=run_dir,
+            status_path=status_path,
+            remaining_seconds=120,
+        )
+        self.assertEqual(
+            len((run_dir / "events.jsonl").read_text().splitlines()),
+            1,
+        )
+        status = _read_json(status_path)
+        self.assertEqual(status["error"], "runner_runtime_import_failed")
+        self.assertEqual(status["error_stage"], "bootstrap_import")
 
     async def test_durable_queued_run_is_requeued_after_restart(self):
         await self.manager._semaphore.acquire()

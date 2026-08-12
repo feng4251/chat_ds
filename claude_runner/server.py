@@ -50,7 +50,11 @@ MAX_WORKSPACE_ENTRIES = 200_000
 SECCOMP_PROFILE_PATH = Path("/app/claude_runner/seccomp_profile.json")
 SETID_STRIPPED_LABEL = "org.opencontainers.image.chatds.setid-stripped"
 EGRESS_POLICY_LABEL = "org.opencontainers.image.chatds.egress-policy"
+RUNNER_RUNTIME_LABEL = "org.opencontainers.image.chatds.runner-runtime"
 EXPECTED_EGRESS_POLICY_RUNTIME = "signed-public-read-v1"
+EXPECTED_RUNNER_RUNTIME = "installed-isolated-package-v1"
+RUNNER_IMAGE_SELF_TEST_ARGUMENT = "--chatds-image-self-test"
+RUNNER_IMAGE_SELF_TEST_SCHEMA = "chatds.claude-runner-image-self-test.v1"
 EXPECTED_SKILL_PLUGIN_NAME = "chatds-session-skills"
 EXPECTED_SKILL_ENTRYPOINT_NAME = "chatds-harness-session-entry"
 _STATUS_UPDATE_LOCK = threading.RLock()
@@ -1062,29 +1066,60 @@ class RunManager:
                     pass
                 except DockerException:
                     logger.warning("Could not remove Claude runner container run=%s", run_id)
-        terminal = _terminal_status(run_dir / "events.jsonl")
+        persisted_terminal = _terminal_event(run_dir / "events.jsonl")
+        terminal = (
+            str(persisted_terminal.get("status"))
+            if persisted_terminal is not None
+            else None
+        )
+        error: str | None = None
+        error_stage: str | None = None
+        if persisted_terminal is not None:
+            candidate_error = persisted_terminal.get("error")
+            candidate_stage = persisted_terminal.get("error_stage")
+            if (
+                isinstance(candidate_error, str)
+                and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,127}", candidate_error)
+            ):
+                error = candidate_error
+            if (
+                isinstance(candidate_stage, str)
+                and re.fullmatch(r"[a-z][a-z0-9_]{0,127}", candidate_stage)
+            ):
+                error_stage = candidate_stage
         if terminal is None:
             status = _read_json(status_path)
             terminal = (
                 "cancelled" if status.get("cancellation_requested") else "failed"
             )
-            error = None if terminal == "cancelled" else (
-                "runner_container_disappeared"
-                if disappeared
-                else "runner_exited_without_terminal"
-            )
+            if terminal != "cancelled":
+                error = (
+                    "runner_container_disappeared"
+                    if disappeared
+                    else "runner_process_exited_before_terminal"
+                )
+                error_stage = (
+                    "container_lifecycle"
+                    if disappeared
+                    else "bootstrap_or_controller"
+                )
             _ensure_terminal_event(
                 run_dir / "events.jsonl",
                 status=terminal,
                 error=error,
+                exit_code=exit_code,
+                error_stage=error_stage,
             )
-        _update_status(
-            status_path,
-            status=terminal,
-            phase="terminal",
-            exit_code=exit_code,
-            container_id=None,
-        )
+        changes: dict[str, Any] = {
+            "status": terminal,
+            "phase": "terminal",
+            "exit_code": exit_code,
+            "container_id": None,
+        }
+        if terminal == "failed" and error is not None:
+            changes["error"] = error
+            changes["error_stage"] = error_stage
+        _update_status(status_path, **changes)
 
     async def cancel(self, run_id: str, identity: RunIdentityRequest) -> bool:
         locator = self._read_run_locator(run_id)
@@ -1673,8 +1708,58 @@ def _validate_runner_image_security(image, mode: str) -> None:
     labels = image.labels if isinstance(getattr(image, "labels", None), dict) else {}
     if labels.get(EGRESS_POLICY_LABEL) != EXPECTED_EGRESS_POLICY_RUNTIME:
         raise RuntimeError("runner_image_egress_policy_attestation_missing")
+    if labels.get(RUNNER_RUNTIME_LABEL) != EXPECTED_RUNNER_RUNTIME:
+        raise RuntimeError("runner_image_runtime_attestation_missing")
     if mode == "seccomp_stripped_setid" and labels.get(SETID_STRIPPED_LABEL) != "true":
         raise RuntimeError("runner_image_setid_attestation_missing")
+
+
+def _validate_runner_image_self_test_output(payload: object) -> None:
+    if not isinstance(payload, (bytes, bytearray)) or len(payload) > 64 * 1024:
+        raise RuntimeError("runner_image_self_test_invalid")
+    try:
+        rows = [
+            json.loads(line)
+            for line in bytes(payload).decode("utf-8").splitlines()
+            if line.strip()
+        ]
+    except (UnicodeError, ValueError, TypeError) as exc:
+        raise RuntimeError("runner_image_self_test_invalid") from exc
+    if rows != [{
+        "schema": RUNNER_IMAGE_SELF_TEST_SCHEMA,
+        "status": "ok",
+        "mcp_entrypoints": 3,
+        "compatibility_entrypoints": 3,
+    }]:
+        raise RuntimeError("runner_image_self_test_failed")
+
+
+def _run_runner_image_self_test(client, image_name: str) -> None:
+    """Run the immutable image through its unmodified production ENTRYPOINT."""
+
+    try:
+        payload = client.containers.run(
+            image_name,
+            command=[RUNNER_IMAGE_SELF_TEST_ARGUMENT],
+            detach=False,
+            remove=True,
+            network_mode="none",
+            read_only=True,
+            user="0:0",
+            cap_drop=["ALL"],
+            security_opt=["no-new-privileges:true"],
+            pids_limit=64,
+            mem_limit="512m",
+            nano_cpus=1_000_000_000,
+            tmpfs={
+                "/tmp": "rw,noexec,nosuid,nodev,size=64m,mode=1777",
+            },
+            stdout=True,
+            stderr=True,
+        )
+    except DockerException as exc:
+        raise RuntimeError("runner_image_self_test_failed") from exc
+    _validate_runner_image_self_test_output(payload)
 
 
 def _exact_real_path(value: str, expected: Path) -> Path:
@@ -1777,7 +1862,7 @@ def _update_status(path: Path, **changes: Any) -> None:
         _atomic_json(path, current, mode=0o600)
 
 
-def _terminal_status(path: Path) -> str | None:
+def _terminal_event(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
     try:
@@ -1787,13 +1872,25 @@ def _terminal_status(path: Path) -> str | None:
             if isinstance(event, dict) and event.get("type") == "chatds.supervisor.terminal":
                 status = str(event.get("status") or "")
                 if status in TERMINAL_STATUSES:
-                    return status
+                    return dict(event)
     except (OSError, ValueError, TypeError):
         return None
     return None
 
 
-def _ensure_terminal_event(path: Path, *, status: str, error: str | None) -> None:
+def _terminal_status(path: Path) -> str | None:
+    event = _terminal_event(path)
+    return str(event["status"]) if event is not None else None
+
+
+def _ensure_terminal_event(
+    path: Path,
+    *,
+    status: str,
+    error: str | None,
+    exit_code: int | None = None,
+    error_stage: str | None = None,
+) -> None:
     with _STATUS_UPDATE_LOCK:
         if _terminal_status(path) is not None:
             return
@@ -1806,15 +1903,22 @@ def _ensure_terminal_event(path: Path, *, status: str, error: str | None) -> Non
                     seq = int(json.loads(lines[-1]).get("seq") or 0) + 1
             except (OSError, ValueError, TypeError):
                 seq = 1
+        event: dict[str, Any] = {
+            "type": "chatds.supervisor.terminal",
+            "status": status,
+            "error": error,
+        }
+        if exit_code is not None:
+            event["exit_code"] = exit_code
+        if error_stage is not None:
+            event["error_stage"] = error_stage
+        if error is not None:
+            event["error_code"] = error
         envelope = {
             "seq": seq,
             "received_at_unix_ms": int(time.time() * 1000),
             "channel": "supervisor",
-            "event": {
-                "type": "chatds.supervisor.terminal",
-                "status": status,
-                "error": error,
-            },
+            "event": event,
         }
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
@@ -1953,6 +2057,11 @@ async def lifespan(_app: FastAPI):
     _validate_runner_image_security(image, settings.security_mode)
     client.volumes.get(settings.egress_proxy_volume)
     client.volumes.get(settings.workspace_lock_volume)
+    await asyncio.to_thread(
+        _run_runner_image_self_test,
+        client,
+        settings.runner_image,
+    )
     manager = RunManager(settings, client)
     reconciliation = await manager.reconcile_existing_containers()
     if any(reconciliation.values()):
