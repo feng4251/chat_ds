@@ -83,3 +83,68 @@ export function createSessionRefreshCoordinator({
     },
   }
 }
+
+/**
+ * Own the refresh heartbeat independently from any one React render or live
+ * request.  Every completed (or failed) cycle rearms itself.  `wake()`
+ * invalidates the prior timer and requests an immediate authoritative read;
+ * this is used after SSE release and browser lifecycle transitions.
+ */
+export function createSessionRefreshLoop({
+  request,
+  getDelay = () => 5000,
+  initialDelay = 5000,
+  setTimer = globalThis.setTimeout,
+  clearTimer = globalThis.clearTimeout,
+}) {
+  let stopped = false
+  let timer = null
+  let generation = 0
+
+  const arm = (delay = getDelay()) => {
+    if (stopped) return
+    if (timer !== null) clearTimer(timer)
+    timer = setTimer(() => {
+      timer = null
+      void run(false)
+    }, Math.max(0, Number(delay) || 0))
+  }
+
+  const run = async (forceFull) => {
+    if (stopped) return
+    const cycle = ++generation
+    try {
+      await request(Boolean(forceFull))
+    } catch {
+      // Reconciliation is best-effort at the transport edge.  The durable
+      // projection remains authority and the next heartbeat must still run.
+    } finally {
+      if (!stopped && cycle === generation) arm()
+    }
+  }
+
+  return {
+    start() {
+      arm(initialDelay)
+    },
+    wake() {
+      if (stopped) return
+      if (timer !== null) {
+        clearTimer(timer)
+        timer = null
+      }
+      void run(true)
+    },
+    stop() {
+      stopped = true
+      generation += 1
+      if (timer !== null) clearTimer(timer)
+      timer = null
+    },
+  }
+}
+
+/** Keep the user's pre-update scroll intent, not the post-append distance. */
+export function shouldFollowMessageUpdate(wasPinnedToBottom, isStreaming) {
+  return Boolean(wasPinnedToBottom || isStreaming)
+}
