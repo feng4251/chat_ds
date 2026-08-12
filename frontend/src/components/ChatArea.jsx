@@ -25,6 +25,12 @@ import {
   toolStatusPresentation,
   updateAgentRuns,
 } from '../utils/agentRunHydration'
+import {
+  createSessionRefreshCoordinator,
+  messageProjectionRevision,
+  runCardMessageRevision,
+  runCardProjectionRevision,
+} from '../utils/sessionProjectionSync'
 
 const SAMPLE_PROMPTS = [
   { icon: FiCode,      text: '帮我写一个红黑树的 Python 实现' },
@@ -45,6 +51,8 @@ const RUN_DTO_FIELD_LABELS = {
   policy: '运行策略',
   tool_events: '工具事件',
 }
+const IDLE_SESSION_SYNC_MS = 5000
+const FULL_SESSION_RECONCILE_MS = 30000
 
 function withClientStreamError(
   message,
@@ -262,8 +270,16 @@ export default function ChatArea({
   const fileRef = useRef(null)
   const dragCounter = useRef(0)
   const activeConvRef = useRef(activeConv)
+  const onConvRefreshRef = useRef(onConvRefresh)
   const liveRequestRef = useRef(null)
+  const busyRef = useRef(busy)
+  const runCardMessageRevisionRef = useRef('')
+  const runCardProjectionRevisionRef = useRef('')
+  const messageProjectionRevisionRef = useRef('')
+  const lastFullSessionSyncRef = useRef(0)
   activeConvRef.current = activeConv
+  onConvRefreshRef.current = onConvRefresh
+  busyRef.current = busy
   const effectiveDurableRunUnknown = Boolean(
     activeConv
     && (
@@ -305,8 +321,16 @@ export default function ChatArea({
       setDurableRunConversation(null)
       const defaultModel = models.find((m) => m.is_default)?.id || models[0]?.id || ''
       setSelectedModel(defaultModel)
+      runCardMessageRevisionRef.current = ''
+      runCardProjectionRevisionRef.current = ''
+      messageProjectionRevisionRef.current = ''
+      lastFullSessionSyncRef.current = 0
       return
     }
+    runCardMessageRevisionRef.current = ''
+    runCardProjectionRevisionRef.current = ''
+    messageProjectionRevisionRef.current = ''
+    lastFullSessionSyncRef.current = 0
     setDurableRunActive(false)
     setDurableRunUnknown(true)
     setDurableRunConversation(activeConv)
@@ -325,6 +349,10 @@ export default function ChatArea({
           roots: [],
           has_active_runs: false,
         }
+        runCardMessageRevisionRef.current = runCardMessageRevision(runCards)
+        runCardProjectionRevisionRef.current = runCardProjectionRevision(runCards)
+        messageProjectionRevisionRef.current = messageProjectionRevision(server)
+        lastFullSessionSyncRef.current = Date.now()
         setMsgs((prev) => (
           liveRequestRef.current
           && conversationRequestOwnsRoute(liveRequestRef.current, activeConv)
@@ -372,58 +400,106 @@ export default function ChatArea({
     }
   }, [activeConv, models])
 
-  // A refreshed tab has no live SSE subscription. Rehydrate from durable
-  // AgentRun projections and poll only while Backend reports an active run.
+  // Keep the visible Session synchronized with durable Backend projections.
+  // Notifications are not authority: timer/focus/online reconciliation reads
+  // the existing message and run-card APIs, coalesces overlap, and never
+  // replaces a live local SSE draft. Full transcript reads are bounded by
+  // message boundaries plus a slower fallback; active run cards stay fresh.
   useEffect(() => {
-    if (
-      !activeConv
-      || busy
-      || (!durableRunActive && !effectiveDurableRunUnknown)
-    ) return
+    if (!activeConv) return
+    const convId = activeConv
     let cancelled = false
     let timer = null
+    let nextDelay = IDLE_SESSION_SYNC_MS
 
-    const poll = async () => {
-      try {
-        const runCards = await getRunCards(activeConv)
-        if (cancelled) return
-        const stillActive = Boolean(runCards?.has_active_runs)
-        if (stillActive) {
+    const coordinator = createSessionRefreshCoordinator({
+      canRefresh: () => (
+        !cancelled
+        && activeConvRef.current === convId
+        && !busyRef.current
+        && !liveRequestRef.current
+        && document.visibilityState !== 'hidden'
+      ),
+      refresh: async ({ forceFull }) => {
+        const runCards = await getRunCards(convId)
+        if (cancelled || activeConvRef.current !== convId) return
+        const now = Date.now()
+        const messageBoundary = runCardMessageRevision(runCards)
+        const runProjection = runCardProjectionRevision(runCards)
+        const needsFullReconcile = (
+          forceFull
+          || messageBoundary !== runCardMessageRevisionRef.current
+          || now - lastFullSessionSyncRef.current >= FULL_SESSION_RECONCILE_MS
+        )
+        let server = null
+        if (needsFullReconcile) server = await getMessages(convId)
+        if (
+          cancelled
+          || activeConvRef.current !== convId
+          || liveRequestRef.current
+        ) return
+
+        if (server) {
+          const messageRevision = messageProjectionRevision(server)
+          const messageChanged = (
+            messageRevision !== messageProjectionRevisionRef.current
+          )
+          if (
+            messageChanged
+            || runProjection !== runCardProjectionRevisionRef.current
+          ) {
+            setMsgs((prev) => (
+              prev.some((message) => message.streaming)
+                ? prev
+                : hydrateAgentRunCards(server, runCards)
+            ))
+          }
+          messageProjectionRevisionRef.current = messageRevision
+          lastFullSessionSyncRef.current = now
+          if (messageChanged) onConvRefreshRef.current?.()
+        } else if (runProjection !== runCardProjectionRevisionRef.current) {
           setMsgs((prev) => (
             prev.some((message) => message.streaming)
               ? prev
               : hydrateAgentRunCards(prev, runCards)
           ))
-        } else {
-          const server = await getMessages(activeConv)
-          if (cancelled) return
-          setMsgs((prev) => (
-            prev.some((message) => message.streaming)
-              ? prev
-              : hydrateAgentRunCards(server, runCards)
-          ))
         }
+
+        runCardMessageRevisionRef.current = messageBoundary
+        runCardProjectionRevisionRef.current = runProjection
+        const stillActive = Boolean(runCards?.has_active_runs)
         setDurableRunActive(stillActive)
         setDurableRunUnknown(false)
-        setDurableRunConversation(activeConv)
-        if (stillActive) {
-          timer = setTimeout(poll, runCards.poll_after_ms || 2500)
-        }
-      } catch {
-        if (!cancelled) {
-          setDurableRunUnknown(true)
-          setDurableRunConversation(activeConv)
-          timer = setTimeout(poll, 5000)
-        }
-      }
+        setDurableRunConversation(convId)
+        nextDelay = runCards.poll_after_ms || IDLE_SESSION_SYNC_MS
+      },
+    })
+
+    const poll = async () => {
+      await coordinator.request(false)
+      if (!cancelled) timer = setTimeout(poll, nextDelay)
     }
 
-    timer = setTimeout(poll, 1000)
+    const forceReconcile = () => {
+      if (document.visibilityState !== 'hidden') {
+        void coordinator.request(true)
+      }
+    }
+    const onVisibilityChange = () => forceReconcile()
+
+    timer = setTimeout(poll, IDLE_SESSION_SYNC_MS)
+    window.addEventListener('focus', forceReconcile)
+    window.addEventListener('online', forceReconcile)
+    document.addEventListener('visibilitychange', onVisibilityChange)
     return () => {
       cancelled = true
       if (timer) clearTimeout(timer)
+      coordinator.stop()
+      window.removeEventListener('focus', forceReconcile)
+      window.removeEventListener('online', forceReconcile)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
     }
-  }, [activeConv, durableRunActive, effectiveDurableRunUnknown, busy])
+  }, [activeConv])
 
   async function reconcileDurableRuns(convId, requestScope) {
     if (!convId) return

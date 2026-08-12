@@ -126,6 +126,48 @@ test('terminal hydration clears a prior active lifecycle notice', () => {
   assert.equal(hydrated[0].lifecycleNotice, undefined)
 })
 
+test('ordinary successful roots without a message mapping stay in the audit view', () => {
+  const hydrated = hydrateAgentRunCards(
+    [{ id: 'factory-trigger', role: 'user', content: 'inspect the line' }],
+    {
+      roots: [{
+        root_run_id: 'factory-root',
+        assistant_message_id: null,
+        trigger_message_id: 'factory-trigger',
+        mapping_status: 'exact_no_assistant',
+        active: false,
+        status: 'succeeded',
+        runs: [{ id: 'factory-root', lifecycle_status: 'succeeded' }],
+      }],
+    },
+  )
+
+  assert.deepEqual(hydrated, [
+    { id: 'factory-trigger', role: 'user', content: 'inspect the line' },
+  ])
+})
+
+test('non-success terminal roots without a message mapping remain visible', () => {
+  const hydrated = hydrateAgentRunCards(
+    [{ id: 'sensor-trigger', role: 'user', content: 'calibrate the sensor' }],
+    {
+      roots: [{
+        root_run_id: 'sensor-root',
+        assistant_message_id: null,
+        trigger_message_id: 'sensor-trigger',
+        mapping_status: 'exact_no_assistant',
+        active: false,
+        status: 'failed',
+        runs: [{ id: 'sensor-root', lifecycle_status: 'failed' }],
+      }],
+    },
+  )
+
+  assert.equal(hydrated.length, 2)
+  assert.equal(hydrated[1].durableRunPlaceholder, true)
+  assert.match(hydrated[1].lifecycleNotice, /失败/)
+})
+
 test('ambiguous assistant mapping is never guessed onto an existing response', () => {
   const hydrated = hydrateAgentRunCards(
     [

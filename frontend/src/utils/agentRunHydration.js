@@ -615,6 +615,12 @@ export function hydrateAgentRunCards(messages = [], payload = {}) {
       continue
     }
 
+    // A normal success without a Backend-proven assistant mapping remains
+    // available in the Tasks/run audit projection. It must not manufacture an
+    // empty chat turn whose only content says that a task completed. Active or
+    // exceptional terminals still need an in-conversation lifecycle marker.
+    if (!root.active && root.status === 'succeeded') continue
+
     const placeholder = durablePlaceholder(root, projectionTruncated)
     const triggerIndex = root.trigger_message_id
       ? next.findIndex(
