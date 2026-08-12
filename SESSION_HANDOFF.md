@@ -2,6 +2,55 @@
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
+## 2026-08-12 后台消息可见性、前端同步生命周期与部署版本闭环
+
+- 本轮继续按三源要求复核 session `92609477b43645a383b93963df75d28e`。用户最新明确请求为每 2 分钟
+  查询一次公开数字资产价格、共 5 次；新 ScheduledJob
+  `1e2c9e9a1ed4ecf636651556b977db45` 已 `run_count=5/max_runs=5`、`last_status=succeeded`、
+  `enabled=false`，五个 cron root 均为 durable `succeeded/end_turn`，对应五条 assistant 报告已在
+  09:58--10:06 UTC 持久化。chat root 的 exact immutable Skill-view digest 为
+  `a689f3ba8a8bd62f28ca09c65c22065a5540ac5d3b0b87af27a3eae82aec8e45`，cron root 为
+  `39ee440000ef2a0d6535620782a3c6e87cd0d986425003a5983377fd0b51af5f`；两者均无 Skill、primary
+  selection 或 artifact contract。因此 Scheduler、ClaudeEngine、Provider、网络、Skill、AgentRun
+  终态和消息落库均正常，本轮只涉及浏览器投影可见性。
+- Frontend Nginx access log 证明 09:57 Turn 结束后，部署前已打开的旧 SPA 到 10:05 之间没有任何
+  run-card/message 请求；10:05 手工刷新才加载当时的新入口 `/assets/index-DpeAHPNp.js`，随后 5 秒
+  run-card 与 30 秒全量对账持续运行。第 5 条报告 10:06:27 落库，浏览器 10:06:30 已取到增长后的
+  message response。故第一段“不刷新无消息”来自存量页面仍运行旧 bundle；第二段“已取回但看不到”
+  来自滚动算法用 append 后的距离判断，后台一次追加 cron trigger+report 超过 300px 后错误地把原本贴底
+  的页面当成用户主动上滚。
+- 通用前端不变量现为：当前 Session 的 durable projection heartbeat 独立于一次 React render/live SSE，
+  skipped/failed read 后必须重武装；SSE ownership 释放后，以及 focus/online/pageshow/visible 时立即强制
+  全量对账；隐藏页面不再彻底断掉观察，而以 30 秒低频保持同步。所有读仍经既有 coordinator 串行/coalesce，
+  route ownership 与 live draft 防污染不变。滚动使用 append 前的 pinned intent：原本贴底或正在 streaming
+  才自动跟随，用户主动上滚则只显示“到底部”按钮。
+- 前端部署生命周期也已闭环。Vite 每次构建从真实 entry chunk 生成 `/build-info.json`；运行页面每 60 秒及
+  focus/online/pageshow/visible 时以 `no-store` 读取并和当前 script fingerprint 比较。发现新版本后，仅在页面
+  visible、无 live/durable/unknown Turn、无未发送文本/图片且焦点不在编辑控件时自动 reload；否则保留旧页并
+  等下一次安全检查。Nginx 对 SPA shell/build-info 明确 `Cache-Control: no-store`，fingerprinted assets 仍
+  immutable 一年。此次部署前已打开且不含 version guard 的历史页面技术上仍需最后刷新一次；加载本版后，
+  后续部署不再要求人工发现并刷新。
+- 成熟实现对照冻结独立 `claude-code/` commit
+  `6f6f12b37f529488b10e53928dd5508bb93535c7`。采用并适配
+  `src/remote/SessionsWebSocket.ts` 的显式连接生命周期、wake/reconnect、keepalive 与临时失败不永久停机，
+  以及 `src/state/AppStateStore.ts` 的 typed reconnecting/disconnected 状态思想；ChatDS 当前已有 authenticated
+  durable REST projection，因此本轮把该模式适配成可重武装 heartbeat+权威对账，没有为单个 Session、cron、
+  行情或 Skill 引入 WebSocket/后端特判，也没有改动 Harness。相关本地源码完整，无需 Web 搜索。
+- deterministic regression 覆盖跨域 inventory/factory/sensor 投影、临时失败后 rearm、wake 强制全量、route
+  revoke、重叠请求 coalesce、pre-append scroll intent、build fingerprint、cache bypass 与 safe reload gate。
+  Frontend `36 passed`，本轮全部变更文件 ESLint 通过，production build 生成
+  `/assets/index-Bk0M6hUf.js`；全仓 ESLint 仍只有既有 `ModelSelector.jsx`、`SkillLibrary.jsx` 两个
+  `set-state-in-effect` 错误，未借本轮扩大修改范围。candidate Nginx smoke 验证 build-info/任意 SPA route
+  `no-store`、fingerprinted asset immutable，`git diff --check` 通过。
+- 功能提交为 `3810abad9b70b8011088fccf3c538c9f10745f4c fix: keep durable session updates live in
+  the frontend`。clean archive `/tmp/chat_ds_deploy_3810abad.hmGWA0` 与 Git tree 均为 22,515 files。
+  仅 Frontend 被 force-recreate；Backend、Scheduler、Claude Runner/Supervisor、Legacy Harness、数据库和
+  其他容器未重建。当前 Frontend image 为
+  `sha256:6bbcf864b9264c0d897dedce2d07f80fcb525dd83c0dbac218d3c10f8ddc94a7`，revision label 精确
+  匹配功能提交，旧镜像保留 `chat_ds-frontend:rollback-pre-3810abad`。切换时 nonterminal AgentRun 与
+  running ScheduledJobRun 均为 0；当前容器 running/restart=0，`127.0.0.1`、`10.10.132.126`、
+  `172.30.100.128` 三入口页面、`build-info.json` 和 `/api/health` 均为 200 且返回相同 entry fingerprint。
+
 ## 2026-08-12 调度规格单一权威与工具边界可恢复校验闭环
 
 - 本轮按三源要求诊断 session `92609477b43645a383b93963df75d28e` 的最新失败。持久对话中用户要求
