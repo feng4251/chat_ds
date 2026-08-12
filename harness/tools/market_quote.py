@@ -14,7 +14,9 @@ MARKET_QUOTE_SCHEMA = {
     "name": "market_quote",
     "description": (
         "Get a current public near-real-time quote for a mainland China, "
-        "Hong Kong, or US security. Prefer this over web search for current prices."
+        "Hong Kong, or US security, including the previous close when "
+        "available. Prefer this over web search for current or previous "
+        "closing prices."
     ),
     "parameters": {
         "type": "object",

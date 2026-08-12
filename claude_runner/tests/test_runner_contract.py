@@ -37,6 +37,15 @@ def _config(*, resume: bool = False) -> dict:
         "provider_claude_base_url": "https://api.shaiengine.com",
         "native_web_tools": False,
         "prompt": "test",
+        "runtime_capability_contract": {
+            "schema": "chatds.runtime-capabilities.v1",
+            "structured_capabilities": ["renamed_lookup"],
+            "public_http_read": {
+                "enabled": True,
+                "methods": ["GET", "HEAD"],
+                "ports": [80, 443],
+            },
+        },
     }
 
 
@@ -71,6 +80,12 @@ class RunnerCommandContractTests(unittest.TestCase):
             "/skill-view/plugin/.mcp.json",
         )
         self.assertEqual(command[command.index("--tools") + 1], "default")
+        capability_prompt = command[
+            command.index("--append-system-prompt") + 1
+        ]
+        self.assertIn("renamed_lookup", capability_prompt)
+        self.assertIn("supersedes", capability_prompt)
+        self.assertNotEqual(capability_prompt, fresh["prompt"])
         self.assertEqual(
             command[command.index("--disallowedTools") + 1],
             "WebFetch,WebSearch",
@@ -86,6 +101,7 @@ class RunnerCommandContractTests(unittest.TestCase):
         )
         self.assertIn("--fork-session", command)
         self.assertEqual(command[command.index("--session-id") + 1], resumed["native_session_id"])
+        self.assertIn("--append-system-prompt", command)
 
         native_web = {**fresh, "native_web_tools": True}
         command, _ = _claude_command(native_web)
@@ -132,6 +148,30 @@ class RunnerCommandContractTests(unittest.TestCase):
                     "model_context_window_invalid",
                 ):
                     _claude_command(config)
+
+    def test_invalid_runtime_capability_contract_fails_before_native_start(self):
+        for contract in (
+            None,
+            {"schema": "wrong"},
+            {
+                "schema": "chatds.runtime-capabilities.v1",
+                "structured_capabilities": ["unsafe capability"],
+                "public_http_read": {
+                    "enabled": True,
+                    "methods": ["POST"],
+                    "ports": [443],
+                },
+            },
+        ):
+            with self.subTest(contract=contract):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "runtime_capability_contract_invalid",
+                ):
+                    _claude_command({
+                        **_config(),
+                        "runtime_capability_contract": contract,
+                    })
 
     def test_worker_environment_is_explicit_and_binds_output_and_proxy(self):
         config = _config()

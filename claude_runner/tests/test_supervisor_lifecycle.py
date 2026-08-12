@@ -26,6 +26,10 @@ from claude_runner.server import (
     _update_status,
     _validate_runner_image_security,
 )
+from claude_runner.runtime_capabilities import (
+    compile_runtime_capability_contract,
+    render_runtime_capability_prompt,
+)
 
 
 class _FakeContainer:
@@ -393,6 +397,57 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
             supervisor_server._attach_runtime_contract("plain", []),
             "plain",
         )
+
+    def test_current_capability_contract_supersedes_stale_session_claims(self):
+        contract = compile_runtime_capability_contract(
+            manifest={
+                "harness_egress_rules": [
+                    {
+                        "capability": "renamed_catalog_lookup",
+                        "url_prefix": "http://catalog.internal:8090/v1/item",
+                        "methods": ["GET"],
+                    },
+                    {
+                        "capability": "web_search",
+                        "url_prefix": "http://search.internal:8080/search",
+                        "methods": ["GET"],
+                    },
+                ],
+            },
+            egress_policy={
+                "public_read": {
+                    "methods": ["GET", "HEAD"],
+                    "ports": [80, 443],
+                },
+            },
+        )
+        prompt = render_runtime_capability_prompt(contract)
+        self.assertEqual(
+            contract["structured_capabilities"],
+            ["renamed_catalog_lookup", "web_search"],
+        )
+        self.assertIn("supersedes", prompt)
+        self.assertIn("renamed_catalog_lookup", prompt)
+        self.assertIn("GET/HEAD", prompt)
+        self.assertIn("80, 443", prompt)
+        self.assertIn("most specific structured capability", prompt)
+        self.assertIn("current tool result", prompt)
+
+    def test_capability_contract_does_not_invent_generic_network_authority(self):
+        contract = compile_runtime_capability_contract(
+            manifest={
+                "harness_egress_rules": [{
+                    "capability": "renamed_evidence_lookup",
+                    "url_prefix": "https://evidence.example.test/v2/query",
+                    "methods": ["POST"],
+                }],
+            },
+            egress_policy={"public_read": None},
+        )
+        prompt = render_runtime_capability_prompt(contract)
+        self.assertFalse(contract["public_http_read"]["enabled"])
+        self.assertIn("No generic public HTTP read grant", prompt)
+        self.assertIn("renamed_evidence_lookup", prompt)
 
     def test_skill_entrypoint_manifest_fails_closed_when_inconsistent(self):
         valid = {

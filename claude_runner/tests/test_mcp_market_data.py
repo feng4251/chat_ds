@@ -60,6 +60,9 @@ class MarketDataMcpTests(unittest.TestCase):
             [tool["name"] for tool in response["result"]["tools"]],
             ["market_quote"],
         )
+        description = response["result"]["tools"][0]["description"]
+        self.assertIn("previous close", description)
+        self.assertIn("instead of web search", description)
         self.assertFalse(
             response["result"]["tools"][0]["inputSchema"]["additionalProperties"]
         )

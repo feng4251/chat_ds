@@ -112,8 +112,10 @@ def _handle(message: dict[str, Any]) -> None:
             "name": "market_quote",
             "description": (
                 "Get a current public near-real-time quote for a mainland "
-                "China, Hong Kong, or US security. Use this instead of web "
-                "search when the user asks for the latest/current price. "
+                "China, Hong Kong, or US security, including last price, "
+                "previous close, open, high, and low when the provider returns "
+                "them. Use this instead of web search when the user asks for "
+                "a latest/current price or previous closing price. "
                 "Always report the returned source timestamp and freshness caveat."
             ),
             "inputSchema": {

@@ -38,6 +38,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from .config import ProviderProfile, RunnerSettings, load_settings
 from .policy import compile_turn_egress_policy, verify_skill_view
+from .runtime_capabilities import compile_runtime_capability_contract
 from workspace_lock import workspace_mutation_guard
 
 
@@ -223,6 +224,10 @@ class RunManager:
                 self.settings.public_read_egress_enabled
             ),
         )
+        runtime_capability_contract = compile_runtime_capability_contract(
+            manifest=skill_view_receipt.manifest,
+            egress_policy=policy,
+        )
         if self._admission_cancelled(request.run_id):
             raise _PreflightCancelled
         sanitized = {
@@ -255,6 +260,7 @@ class RunManager:
             "runtime_requirements": skill_view_receipt.manifest.get(
                 "runtime_requirements", []
             ),
+            "runtime_capability_contract": runtime_capability_contract,
             "skill_diagnostics": skill_view_receipt.manifest.get(
                 "skill_diagnostics", []
             ),
