@@ -21,6 +21,18 @@ RUN npm install --ignore-scripts --omit=dev --no-audit --no-fund \
     && test "$(node -p "require('/build/node_modules/@anthropic-ai/claude-code/package.json').version")" = "${CLAUDE_CODE_VERSION}" \
     && /build/node_modules/.bin/claude --version | grep -F "${CLAUDE_CODE_VERSION}"
 
+# The schedule parser is a controller dependency, not a model-installable
+# package. Build it immutably outside the final no-package-manager runtime.
+FROM python:3.12-slim@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36 AS schedule-package
+COPY claude_runner/schedule-requirements.txt /tmp/schedule-requirements.txt
+RUN python -m pip install \
+      --prefix=/install \
+      --no-deps \
+      --no-cache-dir \
+      --require-hashes \
+      -i https://pypi.tuna.tsinghua.edu.cn/simple \
+      -r /tmp/schedule-requirements.txt
+
 FROM ${SESSION_SANDBOX_IMAGE}
 ARG CLAUDE_CODE_VERSION=2.1.152
 
@@ -33,6 +45,7 @@ LABEL org.opencontainers.image.title="ChatDS isolated Claude Code Turn runner" \
       org.opencontainers.image.chatds.setid-stripped="true"
 
 COPY --from=claude-package /build/node_modules /opt/chatds-claude-code/node_modules
+COPY --from=schedule-package /install/ /usr/local/
 COPY claude_runner/bootstrap.py /opt/chatds-claude-runner/bootstrap.py
 COPY claude_runner/__init__.py \
      claude_runner/runner_entrypoint.py \
@@ -43,6 +56,7 @@ COPY claude_runner/__init__.py \
      claude_runner/mcp_schedule_control.py \
      claude_runner/mcp_process.py \
      /opt/chatds-claude-runner/python/claude_runner/
+COPY backend/schedule_spec.py /opt/chatds-claude-runner/python/claude_runner/schedule_spec.py
 
 RUN ln -s /opt/chatds-claude-code/node_modules/.bin/claude /usr/local/bin/claude \
     && mkdir -p /run/chatds /state /skill-view /runtime /app/claude-runner \
@@ -63,6 +77,7 @@ RUN ln -s /opt/chatds-claude-code/node_modules/.bin/claude /usr/local/bin/claude
     && test -z "$(find / -xdev -type f -perm /6000 -print -quit)" \
     && test -z "$(getcap -r / 2>/dev/null)" \
     && test "$(python -I -c 'from chatds_browser_runtime.proxy_bridge import EGRESS_POLICY_RUNTIME_VERSION; print(EGRESS_POLICY_RUNTIME_VERSION)')" = "signed-public-read-v1" \
+    && test "$(python -I -c 'import importlib.metadata; print(importlib.metadata.version("croniter"))')" = "6.2.4" \
     && claude --version | grep -F "${CLAUDE_CODE_VERSION}" \
     # This is the same Python/bootstrap command used by the final ENTRYPOINT;
     # it also performs real stdio MCP handshakes under isolated mode.

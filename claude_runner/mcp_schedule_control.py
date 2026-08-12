@@ -14,7 +14,16 @@ import json
 import os
 import re
 import sys
+from datetime import datetime
 from typing import Any
+
+try:
+    from claude_runner.schedule_spec import (
+        ScheduleSpecError,
+        resolve_schedule_spec,
+    )
+except ModuleNotFoundError:  # Local source tests use the Backend source copy.
+    from backend.schedule_spec import ScheduleSpecError, resolve_schedule_spec
 
 
 MAX_NAME_CHARS = 128
@@ -148,8 +157,21 @@ def normalize_schedule_create(
     }
 
 
-def _accepted_receipt(arguments: object) -> str:
+def _accepted_receipt(
+    arguments: object,
+    *,
+    now: datetime | None = None,
+) -> str:
     request = normalize_schedule_create(arguments)
+    # Recoverable semantic errors must be visible while the model can still
+    # correct the tool call. The Backend repeats this exact validation at the
+    # authoritative terminal transaction as a TOCTOU defense.
+    resolve_schedule_spec(
+        request["schedule"],
+        request["timezone"],
+        expires_at=request.get("expires_at"),
+        now=now,
+    )
     encoded = json.dumps(
         request, ensure_ascii=False, allow_nan=False,
         sort_keys=True, separators=(",", ":"),
@@ -159,7 +181,8 @@ def _accepted_receipt(arguments: object) -> str:
         "status": "accepted_pending_terminal_commit",
         "request_sha256": hashlib.sha256(encoded).hexdigest(),
         "message": (
-            "The exact schedule request was accepted by the Turn controller. "
+            "The exact schedule and its first eligible occurrence were "
+            "validated and accepted by the Turn controller. "
             "It becomes active only after the authoritative ChatDS terminal commit."
         ),
     }, ensure_ascii=False, separators=(",", ":"))
@@ -179,7 +202,12 @@ TOOLS = [{
         "per-Turn and cannot own background work. Preserve user-specified "
         "clock boundaries exactly; do not add jitter or shift minutes. Use an "
         "explicit IANA timezone. For a bounded request, set max_runs and/or "
-        "expires_at so a recurring cron cannot silently continue forever."
+        "expires_at so a recurring cron cannot silently continue forever. "
+        "max_runs alone is sufficient for a count-bounded recurring request; "
+        "omit expires_at unless the user also specified a clock boundary. "
+        "The tool validates the first eligible occurrence against expires_at; "
+        "if it rejects a stale or inconsistent boundary, correct the request "
+        "and call it again."
     ),
     "inputSchema": {
         "type": "object",
@@ -249,6 +277,18 @@ def _handle(message: dict[str, Any]) -> None:
             _reply(identifier, {
                 "content": [{"type": "text", "text": receipt}],
                 "isError": False,
+            })
+        except ScheduleSpecError as exc:
+            rejection = json.dumps({
+                "schema": "chatds.schedule.rejected.v1",
+                "status": "rejected",
+                "code": exc.code,
+                "message": str(exc),
+                "correction_required": True,
+            }, ensure_ascii=False, separators=(",", ":"))
+            _reply(identifier, {
+                "content": [{"type": "text", "text": rejection}],
+                "isError": True,
             })
         except (TypeError, ValueError) as exc:
             _reply(identifier, {

@@ -1,5 +1,8 @@
 import json
+import io
 import unittest
+from contextlib import redirect_stdout
+from datetime import datetime, timezone
 
 from claude_runner import mcp_schedule_control
 
@@ -16,7 +19,10 @@ class ScheduleControlMcpTests(unittest.TestCase):
             "enabled_tools": ["web_search"],
         }
         normalized = mcp_schedule_control.normalize_schedule_create(arguments)
-        receipt = json.loads(mcp_schedule_control._accepted_receipt(arguments))
+        receipt = json.loads(mcp_schedule_control._accepted_receipt(
+            arguments,
+            now=datetime(2026, 8, 12, 4, 0, tzinfo=timezone.utc),
+        ))
 
         self.assertEqual(normalized["schedule"], "*/10 13-14 12 8 *")
         self.assertEqual(normalized["max_runs"], 12)
@@ -77,6 +83,45 @@ class ScheduleControlMcpTests(unittest.TestCase):
                     "mcp__chatds-market-data__market_quote": "market_quote",
                 },
             )
+
+    def test_stale_expiry_is_a_typed_recoverable_tool_rejection(self):
+        arguments = {
+            "name": "Renamed production-line monitor",
+            "prompt": "Report the selected production-line reading.",
+            "schedule": "*/2 * * * *",
+            "timezone": "UTC",
+            "max_runs": 5,
+            "expires_at": "2000-01-01T00:10:00Z",
+        }
+        with self.assertRaises(
+            mcp_schedule_control.ScheduleSpecError,
+        ) as raised:
+            mcp_schedule_control._accepted_receipt(arguments)
+        self.assertEqual(
+            raised.exception.code,
+            "schedule_no_occurrence_before_expiry",
+        )
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            mcp_schedule_control._handle({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {
+                    "name": "schedule_create",
+                    "arguments": arguments,
+                },
+            })
+        response = json.loads(output.getvalue())
+        result = response["result"]
+        rejection = json.loads(result["content"][0]["text"])
+        self.assertTrue(result["isError"])
+        self.assertEqual(rejection["schema"], "chatds.schedule.rejected.v1")
+        self.assertEqual(
+            rejection["code"],
+            "schedule_no_occurrence_before_expiry",
+        )
 
 
 if __name__ == "__main__":

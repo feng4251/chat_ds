@@ -16,8 +16,12 @@ from session_lifecycle import session_control_plane_mutation
 from scheduler import (
     enqueue_job_execution,
     next_run_for,
-    parse_schedule,
     scan_cron_prompt,
+)
+from schedule_spec import (
+    ScheduleSpecError,
+    normalize_schedule_expiry,
+    resolve_schedule_spec,
 )
 from schemas import ScheduledJobCreate, ScheduledJobUpdate
 
@@ -82,8 +86,12 @@ async def _create_for_user_in_session(
     await _validate_model_id(payload.model_id, user_id, db)
     _validate_enabled_tools(payload.enabled_tools)
     try:
-        kind, value, next_run = parse_schedule(payload.schedule, payload.timezone)
-    except ValueError as exc:
+        resolved = resolve_schedule_spec(
+            payload.schedule,
+            payload.timezone,
+            expires_at=payload.expires_at,
+        )
+    except ScheduleSpecError as exc:
         raise HTTPException(400, str(exc))
     threat = scan_cron_prompt(payload.prompt)
     if threat:
@@ -91,16 +99,13 @@ async def _create_for_user_in_session(
             400,
             f"Unsafe unattended prompt blocked by security rule: {threat}",
         )
-    expires_at = _normalize_expiry(payload.expires_at)
-    if expires_at is not None and next_run > expires_at:
-        raise HTTPException(400, "The schedule has no occurrence before expires_at")
     job = ScheduledJob(
         user_id=user_id,
         conversation_id=payload.conversation_id,
         name=payload.name,
         prompt=payload.prompt,
-        schedule_kind=kind,
-        schedule_value=value,
+        schedule_kind=resolved.kind,
+        schedule_value=resolved.value,
         timezone=payload.timezone,
         model_id=payload.model_id,
         enabled_tools=(
@@ -109,8 +114,8 @@ async def _create_for_user_in_session(
         ),
         delete_after_run=payload.delete_after_run,
         max_runs=payload.max_runs,
-        expires_at=expires_at,
-        next_run_at=next_run,
+        expires_at=resolved.expires_at,
+        next_run_at=resolved.next_run_at,
     )
     db.add(job)
     if payload.conversation_id:
@@ -179,6 +184,10 @@ async def _apply_job_update(
         value = getattr(payload, field)
         if value is not None:
             setattr(job, field, value)
+    occurrence_contract_changed = bool(
+        payload.model_fields_set
+        & {"schedule", "timezone", "expires_at"}
+    ) or payload.enabled is True
     if payload.expires_at is not None:
         job.expires_at = _normalize_expiry(payload.expires_at)
     if payload.enabled_tools is not None:
@@ -192,31 +201,41 @@ async def _apply_job_update(
             )
     if payload.schedule is not None:
         try:
-            kind, value, next_run = parse_schedule(
+            resolved = resolve_schedule_spec(
                 payload.schedule,
                 payload.timezone or job.timezone,
+                expires_at=_persisted_expiry_as_aware(job.expires_at),
             )
-        except ValueError as exc:
+        except ScheduleSpecError as exc:
             raise HTTPException(400, str(exc))
-        job.schedule_kind = kind
-        job.schedule_value = value
-        job.next_run_at = next_run
+        job.schedule_kind = resolved.kind
+        job.schedule_value = resolved.value
+        job.next_run_at = resolved.next_run_at
     elif payload.timezone is not None and job.schedule_kind == "cron":
-        _, _, job.next_run_at = parse_schedule(
-            job.schedule_value,
-            job.timezone,
-        )
+        try:
+            resolved = resolve_schedule_spec(
+                job.schedule_value,
+                job.timezone,
+                expires_at=_persisted_expiry_as_aware(job.expires_at),
+            )
+        except ScheduleSpecError as exc:
+            raise HTTPException(400, str(exc))
+        job.next_run_at = resolved.next_run_at
     elif (
         payload.enabled is True
         and job.next_run_at is None
         and job.schedule_kind != "once"
     ):
         job.next_run_at = next_run_for(job)
-    if job.expires_at is not None and (
-        job.next_run_at is None or job.next_run_at > job.expires_at
+    if (
+        occurrence_contract_changed
+        and job.expires_at is not None
+        and (job.next_run_at is None or job.next_run_at > job.expires_at)
     ):
-        job.next_run_at = None
-        job.enabled = False
+        raise HTTPException(
+            400,
+            "The schedule has no occurrence on or before expires_at.",
+        )
     if job.conversation_id:
         from workspace import require_session_workspace_active
 
@@ -229,13 +248,18 @@ async def _apply_job_update(
 
 
 def _normalize_expiry(value):
+    try:
+        return normalize_schedule_expiry(value)
+    except ScheduleSpecError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def _persisted_expiry_as_aware(value):
     if value is None:
         return None
     from datetime import timezone
 
-    if value.tzinfo is None:
-        raise HTTPException(400, "expires_at must include a timezone offset")
-    return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value.replace(tzinfo=timezone.utc)
 
 
 async def _update_for_user(

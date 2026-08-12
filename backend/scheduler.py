@@ -9,13 +9,8 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
-try:
-    from croniter import croniter
-except ImportError:  # Local source checks may run before requirements are installed.
-    croniter = None
 from sqlalchemy import select
 
 from agent_engines.base import ENGINE_ID_CLAUDE_CODE
@@ -44,13 +39,14 @@ from models import (
 from workspace import ensure_workspace_async, serialize_json_list
 from workspace_lock import WorkspaceMutationLockError
 from schemas import ScheduledJobCreate
+from schedule_spec import (
+    ScheduleSpecError,
+    next_cron_occurrence,
+    resolve_schedule_spec,
+)
 
 logger = logging.getLogger(__name__)
 
-_DURATION_RE = re.compile(
-    r"^(\d+)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$",
-    re.I,
-)
 _CRON_THREAT_PATTERNS = (
     (re.compile(r"ignore\s+(?:\w+\s+)*(?:previous|all|above|prior)\s+(?:\w+\s+)*instructions", re.I), "prompt_injection"),
     (re.compile(r"do\s+not\s+tell\s+the\s+user", re.I), "deception_hide"),
@@ -84,20 +80,6 @@ def _utcnow() -> datetime:
     return datetime.utcnow()
 
 
-def _parse_duration(value: str) -> timedelta:
-    match = _DURATION_RE.match(value.strip())
-    if not match:
-        raise ValueError("Use a duration like 30m, 2h, or 1d.")
-    amount = int(match.group(1))
-    unit = match.group(2).lower()[0]
-    return {
-        "s": timedelta(seconds=amount),
-        "m": timedelta(minutes=amount),
-        "h": timedelta(hours=amount),
-        "d": timedelta(days=amount),
-    }[unit]
-
-
 def scan_cron_prompt(prompt: str) -> str | None:
     """Return a stable threat identifier for unsafe unattended prompts."""
     for char in _CRON_INVISIBLE:
@@ -109,51 +91,18 @@ def scan_cron_prompt(prompt: str) -> str | None:
     return None
 
 
-def parse_schedule(schedule: str, timezone_name: str = "UTC") -> tuple[str, str, datetime]:
-    raw = schedule.strip()
-    lower = raw.lower()
-    try:
-        tz = ZoneInfo(timezone_name)
-    except ZoneInfoNotFoundError as exc:
-        raise ValueError(f"Unknown timezone: {timezone_name}") from exc
-    now_local = datetime.now(tz)
-
-    if lower.startswith("every "):
-        duration = _parse_duration(raw[6:].strip())
-        return "interval", str(int(duration.total_seconds())), (now_local + duration).astimezone(timezone.utc).replace(tzinfo=None)
-
-    parts = raw.split()
-    if len(parts) in {5, 6}:
-        if croniter is None:
-            raise ValueError("Cron expressions require the croniter dependency.")
-        try:
-            next_local = croniter(raw, now_local).get_next(datetime)
-            if next_local.tzinfo is None:
-                next_local = next_local.replace(tzinfo=tz)
-            return "cron", raw, next_local.astimezone(timezone.utc).replace(tzinfo=None)
-        except Exception:
-            pass
-
-    if lower.startswith("in "):
-        duration = _parse_duration(raw[3:].strip())
-        return "once", (now_local + duration).isoformat(), (now_local + duration).astimezone(timezone.utc).replace(tzinfo=None)
-
-    try:
-        duration = _parse_duration(raw)
-        run_at = now_local + duration
-        return "once", run_at.isoformat(), run_at.astimezone(timezone.utc).replace(tzinfo=None)
-    except ValueError:
-        pass
-
-    try:
-        run_at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        if run_at.tzinfo is None:
-            run_at = run_at.replace(tzinfo=tz)
-        return "once", run_at.isoformat(), run_at.astimezone(timezone.utc).replace(tzinfo=None)
-    except ValueError as exc:
-        raise ValueError(
-            "Invalid schedule. Use '30m', 'every 2h', an ISO timestamp, or a cron expression."
-        ) from exc
+def parse_schedule(
+    schedule: str,
+    timezone_name: str = "UTC",
+    *,
+    now: datetime | None = None,
+) -> tuple[str, str, datetime]:
+    resolved = resolve_schedule_spec(
+        schedule,
+        timezone_name,
+        now=now,
+    )
+    return resolved.kind, resolved.value, resolved.next_run_at
 
 
 def next_run_for(job: ScheduledJob, after: datetime | None = None) -> datetime | None:
@@ -163,14 +112,11 @@ def next_run_for(job: ScheduledJob, after: datetime | None = None) -> datetime |
     if job.schedule_kind == "interval":
         return (base_utc + timedelta(seconds=int(job.schedule_value))).replace(tzinfo=None)
     if job.schedule_kind == "cron":
-        if croniter is None:
-            raise RuntimeError("croniter is required to advance cron schedules")
-        tz = ZoneInfo(job.timezone)
-        local_base = base_utc.astimezone(tz)
-        next_local = croniter(job.schedule_value, local_base).get_next(datetime)
-        if next_local.tzinfo is None:
-            next_local = next_local.replace(tzinfo=tz)
-        return next_local.astimezone(timezone.utc).replace(tzinfo=None)
+        return next_cron_occurrence(
+            job.schedule_value,
+            job.timezone,
+            after=base_utc,
+        )
     return None
 
 
@@ -380,17 +326,22 @@ async def stage_schedule_control_writes(
         threat = scan_cron_prompt(request["prompt"])
         if threat:
             raise ValueError(f"schedule_control_prompt_{threat}")
-        kind, value, next_run = parse_schedule(
-            request["schedule"], request["timezone"]
-        )
-        expires_at = None
-        parsed_expiry = request.get("expires_at")
-        if parsed_expiry is not None:
-            if parsed_expiry.tzinfo is None:
-                raise ValueError("schedule_control_expiry_timezone_missing")
-            expires_at = parsed_expiry.astimezone(timezone.utc).replace(tzinfo=None)
-            if next_run > expires_at:
-                raise ValueError("schedule_control_no_occurrence_before_expiry")
+        try:
+            resolved = resolve_schedule_spec(
+                request["schedule"],
+                request["timezone"],
+                expires_at=request.get("expires_at"),
+            )
+        except ScheduleSpecError as exc:
+            if exc.code == "schedule_expiry_timezone_missing":
+                raise ValueError(
+                    "schedule_control_expiry_timezone_missing"
+                ) from exc
+            if exc.code == "schedule_no_occurrence_before_expiry":
+                raise ValueError(
+                    "schedule_control_no_occurrence_before_expiry"
+                ) from exc
+            raise ValueError(f"schedule_control_{exc.code}") from exc
         job_id = hashlib.sha256(
             (
                 "chatds.schedule-control.v1\0"
@@ -414,8 +365,8 @@ async def stage_schedule_control_writes(
             conversation_id=conversation_id,
             name=request["name"],
             prompt=request["prompt"],
-            schedule_kind=kind,
-            schedule_value=value,
+            schedule_kind=resolved.kind,
+            schedule_value=resolved.value,
             timezone=request["timezone"],
             model_id=model_id,
             # Persist the exact bound subset, including an explicit empty
@@ -426,8 +377,8 @@ async def stage_schedule_control_writes(
             delete_after_run=request["delete_after_run"],
             max_runs=request.get("max_runs"),
             run_count=0,
-            expires_at=expires_at,
-            next_run_at=next_run,
+            expires_at=resolved.expires_at,
+            next_run_at=resolved.next_run_at,
         ))
         created.append(job_id)
     return tuple(created)
