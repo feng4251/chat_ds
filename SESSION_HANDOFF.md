@@ -2,6 +2,68 @@
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
+## 2026-08-12 Claude 持久调度、计划权威与失败续接闭环
+
+- 本轮诊断 session `63a312df7a1d462fac00ac0926381de3` 的最后两轮时完整关联了三类证据。
+  持久对话中用户明确要求“生益科技和金安国纪、当日 13:00–15:00、每 10 分钟、共 12 次”；首个
+  AgentRun `90240be03bbb44d291c7cbc148f6e626` 实际已写出正确脚本、成功查询 600183/002636，并调用
+  native `CronCreate` 建立 13:03–14:53 的 12 个 session-only 时点和 15:03 收尾，但模型留下两项
+  TaskCreate 状态未完成，Runner 因 `native_plan_tasks_pending` 把 native result/exit/checkpoint 均成功的
+  Turn 判失败。随后“继续”的 AgentRun `b7aa4ea1e5d948fd8434eb975350bcd0` 没有 resume 这个失败
+  checkpoint，而是回退到更早的成功 checkpoint `c1e4...`，所以恢复成了德明利旧主题并写入错误
+  durable native cron。两轮均无 provider、网络、egress、工具上游或 Skill 失败。
+- 两轮 exact immutable Skill-view digest 均为
+  `cd77e110ddd6f405edcc4d8bc8abf1f5b0a3d8a4caf7312947d7123027b31bd1`，primary 为
+  `healthsim-trialsim`，另有 18 个生物医学 supporting Skills；primary `SKILL.md` 仅适用于临床试验/
+  CDISC/监管数据任务。本轮没有 Skill tool receipt，artifact contract `activated_contract_count=0`，证券
+  watchdog 明确不属于该 Skill。因此修复没有修改 V2.3/疾病/证券路由，也没有添加 Skill/session/股票/
+  worker/文件名或固定数量特判。
+- 根因被重述为五个跨领域控制面不变量：model-owned TaskCreate/TaskUpdate 只是计划/UI 诊断，不能取代
+  native task、artifact、egress 等机器收据；外层合约失败但 native result 与 checkpoint 完整时，应提交
+  transcript checkpoint 而继续保留失败 outcome；一次性 `claude --print` 进程不能拥有后台定时器；
+  定时控制写必须在 root terminal 事务中按 run/tool receipt 幂等提交；定时 Turn 必须复用 Conversation
+  选择的 ClaudeEngine、Skill view、workspace、checkpoint 与终态投影，不能漂移到已禁用的 Legacy
+  Harness。周期任务另增加 `max_runs/run_count/expires_at`，有界请求不会按年无限复发。
+- Runner 不再用 pending plan item 阻断成功，但仍把计数保留在 debug terminal；完整失败 Turn 的 raw
+  `result_succeeded/checkpoint_observed` 可发布 transcript-only checkpoint，Backend 启动恢复也遵循同一
+  语义。Claude 原生 CronCreate/Delete/List 在 per-Turn 模式下统一禁用，历史
+  `.claude/scheduled_tasks.json` 会在当前 Session 内移出 active load path 并归档。`cronjob` 能力现在编译
+  为 `chatds-schedule` receipt-only MCP；成功 tool result 形成 controller-owned pending write，Backend 在
+  authoritative `run.completed` 的同一事务中用 `SHA256(root_run_id,tool_call_id)` 派生 job ID，绑定当前
+  user/Session 并幂等落库。失败/取消 Turn 不提交无人值守副作用。
+- 成熟实现对照冻结独立 `claude-code/` commit
+  `6f6f12b37f529488b10e53928dd5508bb93535c7`。采用并适配
+  `src/hooks/useTasksV2.ts:120-170` 中 task list 仅驱动 UI/poll 的语义；采用
+  `src/utils/cronTasks.ts:180-205` 对 session-only/durable state 的区分；同时依据
+  `src/cli/print.ts:2685-2720` 与 `src/utils/cronScheduler.ts:450-500` 明确的 print-mode timer `unref`/
+  process-exit 行为，拒绝照搬需要常驻 REPL 的 native cron ownership。ChatDS 改用已有 DB scheduler 与
+  pending-write/terminal receipt 边界承接持久权威。本地路径完整，无需 Web 搜索补足 stub。
+- 确定性回归使用 factory sensor/equipment/renamed-model 等跨域 holdout，覆盖 plan 非权威、失败外层合约
+  checkpoint 续接、native cron 隔离归档、12 次有界请求、无 owner/session 伪造、root terminal 写入
+  幂等、max-run 即使 force 也不能越界、Claude schedule 不触达 Legacy Harness，以及四个 MCP 的真实
+  镜像握手。Runner/Supervisor 全套为 `81 passed, 1 skipped, 14 subtests passed`；Backend 全套
+  `289 passed`；Legacy cron control 专项 `3 passed`。compileall、diff check、Compose config、生产代码
+  fixture/genericity scan、clean archive 文件计数与四镜像候选自检均通过；未启动 V2.3/模型重型 E2E。
+- 代码提交为 `7603475df48ca7d4ddc51210b018d02696967438 fix: make Claude schedules durable
+  and bounded`。clean archive `/tmp/chat_ds_deploy_7603475d.gvsBpT` 与 Git tree 均为 22,506 files。
+  切换前 nonterminal AgentRun、active engine session、running/enabled schedule 均为 0。SQLite online backup
+  volume 为 `chat_ds_db_backup_pre_7603475d_20260812_115848`，455,733,248 bytes，SHA-256
+  `4e8138c7d46250e1b311e12b7ad54b100fe9fb1e4f4c482af9ef782413927e84`，quick/FK 正常。
+  当前 Backend/Harness/Supervisor/Runner image 分别为
+  `sha256:6cd7d4afca40c23664271dde415d81c29219db1ea07d7f383f38e88e480fd701`、
+  `sha256:6def3454ae0e6830694fc657ece15485acb6b829bb36cf58de648278db25d2db`、
+  `sha256:e997880492b3519be12a646878eb0700d57696dd0f5d12c2e6495ceafceb0db2`、
+  `sha256:6f3f9a0355f24b62fb451a37cd45779ae941f1d55491b1f60add584779a6c63c`，revision 均精确为
+  `7603475d...`；旧镜像保留 `rollback-pre-7603475d`。四容器 running/healthy（anchor 无 healthcheck）、
+  restart 0，LAN 与 172.30 映射 health 200，部署后 DB quick/FK、active run/session 和严重日志均正常。
+- 为修复该历史 session 已发生的 transcript 分叉，在确认无 active run 后仅清空了它的旧 native resume
+  指针（对话/消息/审计记录均未删除或改写）。正式内部 schedule API 已创建 job
+  `47d0448b8dfb4c5db7612e2ca396270c`：`*/10 13-14 12 8 *`、`Asia/Shanghai`、
+  `max_runs=12`、`expires_at=2026-08-12T15:00:00+08:00`、仅启用 typed `market_quote`，绑定原
+  Claude Conversation 与原模型；首个 next run 为 2026-08-12 13:00 CST，最后一个计划时点为 14:50。
+  prompt 明确同时查询 600183/002636、禁止替换证券或递归创建 schedule。该真实时间任务尚未到首个
+  firing；后续可检查 12 个 `ScheduledJobRun`/cron 消息及终态收据，不应把“已排程”表述为“12 次均已执行”。
+
 ## 2026-08-12 Claude Runner 隔离启动、镜像准入与可诊断终态闭环
 
 - 本轮继续诊断 session `63a312df7a1d462fac00ac0926381de3` 的最新
