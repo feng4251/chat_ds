@@ -68,7 +68,11 @@ class SchedulerProviderMetadataTests(unittest.IsolatedAsyncioTestCase):
         user = SimpleNamespace(id="u")
         agent_run = SimpleNamespace(
             source="cron",
-            status="succeeded",
+            # _chat_stream creates this row in the caller's Session before
+            # the detached terminal projector commits through another
+            # Session.  Reproduce the stale identity-map value retained by
+            # the scheduling Session after that external commit.
+            status="running",
             error=None,
             finish_reason="stop",
             resolved_model_id="renamed-model",
@@ -85,7 +89,9 @@ class SchedulerProviderMetadataTests(unittest.IsolatedAsyncioTestCase):
             async def rollback(self):
                 return None
 
-            async def refresh(self, _value):
+            async def refresh(self, value):
+                if value is agent_run:
+                    value.status = "succeeded"
                 return None
 
         async def chunks():

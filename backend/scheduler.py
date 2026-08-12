@@ -917,6 +917,17 @@ async def _execute_claude_scheduled_turn(
     agent_run = await db.get(AgentRun, agent_run_id)
     if agent_run is None or agent_run.source != "cron":
         raise RuntimeError("Scheduled Claude Turn projection is missing")
+    # _chat_stream inserted this AgentRun through the request Session, while
+    # its terminal projector committed through an independent Session.  A
+    # primary-key get may therefore return the request Session's stale
+    # identity-map object even though the terminal SSE is already durable.
+    # Force a database refresh before deriving the outer schedule terminal.
+    await db.refresh(agent_run)
+    if agent_run.status not in {"succeeded", "failed", "cancelled"}:
+        raise RuntimeError(
+            "Scheduled Claude Turn durable projection is nonterminal: "
+            f"{agent_run.status}"
+        )
     await db.refresh(scheduled_run)
     await db.refresh(job)
     scheduled_run.ended_at = _utcnow()
