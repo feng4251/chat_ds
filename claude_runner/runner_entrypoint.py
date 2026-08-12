@@ -32,6 +32,12 @@ from chatds_browser_runtime.proxy_bridge import (
     ProxySocketAuthority,
     ProxyTrustAuthority,
 )
+try:
+    from claude_runner.runtime_capabilities import (
+        render_runtime_capability_prompt,
+    )
+except ModuleNotFoundError:  # Isolated image copies files beside entrypoint.
+    from runtime_capabilities import render_runtime_capability_prompt
 
 
 MAX_NATIVE_LINE_BYTES = 64 * 1024 * 1024
@@ -93,6 +99,9 @@ def main() -> int:
             "context_window_tokens": int(config["context_window_tokens"]),
             "max_output_tokens": int(config["max_output_tokens"]),
             "extended_context_marker": int(config["context_window_tokens"]) > 200_000,
+            "runtime_capability_contract": config.get(
+                "runtime_capability_contract"
+            ),
         }, channel="controller")
         for diagnostic in config.get("skill_diagnostics") or ():
             if not isinstance(diagnostic, dict):
@@ -1225,6 +1234,12 @@ def _claude_command(config: dict[str, Any]) -> tuple[list[str], bytes]:
         # the authority boundary without a version-fragile tool-name list.
         "--tools", "default",
     ]
+    command.extend([
+        "--append-system-prompt",
+        render_runtime_capability_prompt(
+            config.get("runtime_capability_contract")
+        ),
+    ])
     if not bool(config.get("native_web_tools")):
         # WebSearch/WebFetch are provider-hosted server tools, not ordinary
         # local tools. A generic Messages facade can accept their schemas yet
