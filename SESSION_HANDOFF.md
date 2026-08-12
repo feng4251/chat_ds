@@ -1,6 +1,63 @@
-# ChatDS 当前会话交接（2026-08-11）
+# ChatDS 当前会话交接（2026-08-12）
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
+
+## 2026-08-12 Claude Runner 隔离启动、镜像准入与可诊断终态闭环
+
+- 本轮继续诊断 session `63a312df7a1d462fac00ac0926381de3` 的最新
+  `runner_exited_without_terminal`，并关联了三类证据：AgentRun/debug 中 run
+  `602d62...`、`a471e0...` 只有 Supervisor 合成终态，退出码为 1，之前没有
+  `runtime.config`、模型、工具或网络事件；持久对话是普通行情问答；该 Session 的 exact immutable
+  Skill-view 仍以 `healthsim-trialsim` 为 primary，Skill 没有在本轮激活，也没有 artifact/工具
+  receipt。因此故障不属于 Skill、provider、模型、网络策略或上游，而发生在所有 Claude Turn 共用的
+  Runner bootstrap 边界。
+- 对生产镜像用其真实默认 ENTRYPOINT 复现：
+  `python -I /app/claude-runner/runner_entrypoint.py` 在导入
+  `claude_runner`/`runtime_capabilities` 时即 `ModuleNotFoundError`。根因是镜像只复制了相邻 Python
+  文件，但 `-I` 按设计移除脚本目录；此前候选 smoke 覆盖了 ENTRYPOINT 并手工插入 `sys.path`，所以
+  测试的是另一条启动路径。跨域不变量重述为：生产镜像必须包含可由 isolated Python 导入的自包含
+  runtime；构建、Supervisor 启动和部署验收都必须执行未改写的真实 ENTRYPOINT；bootstrap 在主包
+  完全无法导入时仍必须写出一个有界、机器拥有的 authoritative terminal。
+- Runner 现将 `claude_runner` 安装为只读 isolated package，最终 ENTRYPOINT 为 stdlib-only
+  `/opt/chatds-claude-runner/bootstrap.py`。bootstrap 仅接受精确
+  `/state/control/runs/<32hex>/events.jsonl` ledger，导入/语法故障固定写
+  `runner_runtime_import_failed/bootstrap_import/exit 70`，其他早期故障收敛为
+  `runner_bootstrap_failed`，不泄露异常路径或原始配置。主 controller 在解析大 request 前先建立
+  EventLedger；Supervisor 保留 bootstrap 已写终态并把 error/stage 投影到 status，不再用模糊的
+  `runner_exited_without_terminal` 覆盖它。无终态的真实进程退出则明确区分
+  `runner_process_exited_before_terminal/bootstrap_or_controller` 与容器消失。
+- 新增镜像 conformance receipt `chatds.claude-runner-image-self-test.v1`。镜像构建和 Supervisor
+  lifespan 都通过最终 ENTRYPOINT 在只读、`network=none`、drop-all-capabilities、NNP、有限
+  CPU/内存/PID 条件下运行它；它导入完整 controller graph，校验 Claude 2.1.152，并对 process、
+  web-search、market-data 三个 MCP 做真实 JSON-RPC initialize/tools-list 握手。新 Skill-view 编译为
+  `python -I -m claude_runner.*`；旧已冻结 view 的三个绝对路径作为滚动兼容入口也同时握手。Supervisor
+  还要求 image runtime label，receipt 缺项、额外输出或入口损坏都会在服务准入阶段 fail closed。
+- 泛化回归没有 V2.3/疾病/行情/Session/Skill ID、固定报告名或 worker 数分支。确定性缺包镜像注入使用
+  真实 ENTRYPOINT，验证只产生一个 stable bootstrap terminal；mutation/rename holdout 使用
+  `renamed-model-holdout`、`renamed_holdout_lookup`，Backend 另验证任意 Skill 编译的三个 canonical MCP
+  module entry。Claude Runner/Supervisor 全套为 `78 tests OK, 1 skipped`，Backend 引擎契约为
+  `42 tests OK`；本轮 Backend 全套此前为 `283 passed`，最终兼容补充未改变 Backend 逻辑。
+  compileall、diff check、Compose config、干净 Git archive 三镜像构建、生产/候选 exact ENTRYPOINT
+  自检及 Supervisor Docker-API 准入均通过。未自动启动 V2.3 或其他模型重型 E2E。
+- 成熟实现对照冻结独立 `claude-code/` commit
+  `6f6f12b37f529488b10e53928dd5508bb93535c7`。采用并适配
+  `src/entrypoints/cli.tsx:28-47,292-298` 的薄 bootstrap/快速诊断/延迟主模块模式，
+  `src/utils/gracefulShutdown.ts:299-429` 的顶层诊断与有界 shutdown/failsafe，以及
+  `src/cli/print.ts:729-733` 的启动失败不继续执行语义；它们被置于 ChatDS 的 Session mount、verified
+  Skill-view、durable ledger、authority 和 exactly-one-terminal 合同内。拒绝用 smoke 专用入口、
+  `sys.path` 注入、模型 prose 或 fixture 特判掩盖真实镜像路径；相关本地源码完整，本轮无需 Web 搜索。
+- 代码提交为 `1ed177f791fc495210285f4cbdc16bc24038eebe fix: make Claude runner startup
+  self-verifying`。生产 Runner/Supervisor/Backend 镜像分别为
+  `sha256:0b3076675c74543f4644baff95c4787490df069b06a2e745ce9cedaa4aa91d00`、
+  `sha256:905e535d574fa5f8388ac7ce7c597d11648bf1f468295c992338ba2365507134`、
+  `sha256:825f9f9bb7832abcfec15797845b257cb457f72a805815d50d9ec7ffb83960a3`，revision
+  均为该提交；旧镜像保留 `rollback-pre-1ed177f7`。切换前 active AgentRun/Engine Session/schedule/
+  dynamic Turn container 均为 0。SQLite 在线备份卷为
+  `chat_ds_chat_ds_db_backup_20260812_1ed177f7`，449,863,680 bytes，SHA-256
+  `22489bc7e8c725c4fbd6534eb01c6f54d745266e63996abb52da296947d51409`，quick/FK 正常。
+  部署后三容器 restart 0 且 healthy/running；Supervisor 内部 health 200，`127.0.0.1`、
+  `10.10.132.126`、`172.30.100.128` 的 `/api/health` 均为 200；生产 DB 仍 quick/FK 正常且 active
+  run/session 为 0。用户可在原 Session 发起新 Turn 验证；历史失败记录不会被改写。
 
 ## 2026-08-12 Claude 当前能力收据与公网读取语义闭环
 
