@@ -170,10 +170,12 @@ services:
       - /tmp:size=16m,mode=1777
     networks:
       # The gateway is the only component that translates typed quote
-      # arguments into fixed public-provider requests. Agent Turns can reach
-      # only its private /v1/quote coordinate through the signed proxy.
+      # arguments into fixed public-provider requests.  Keep one private
+      # application coordinate: multi-homing this broker made Docker DNS
+      # select an address outside the proxy's pinned application CIDR.  The
+      # search network already supplies outbound access for both SearXNG and
+      # this fixed-upstream broker.
       - search_net
-      - browser_egress
     healthcheck:
       test: ["CMD", "python", "-I", "/app/server.py", "--healthcheck"]
       interval: 5s
