@@ -3159,6 +3159,29 @@ BUILTIN = {
         "context_length": 200000,
         "discover_runtime_metadata": True,
     },
+    "shaiengine_kimi_k3": {
+        "api_model": "kimi-k3",
+        "base_url": settings.shaiengine_base_url,
+        "api_key": settings.shaiengine_api_key,
+        "is_multimodal": True,
+        "max_tokens": 86400,
+        "display_name": "Kimi K3 (Shaiengine · 多模态)",
+        "is_default": False,
+        "agentic_auxiliary_only": False,
+        "supports_thinking_toggle": True,
+        "thinking_enabled_by_default": True,
+        "thinking_request_format": "thinking_object",
+        "thinking_send_enabled_explicitly": True,
+        "capabilities": ["text", "vision", "tools", "reasoning"],
+        "provider": "shaiengine",
+        "claude_provider_profile": "shaiengine",
+        "protocol": "openai",
+        # Shaiengine's /v1/models entry advertises the route but omits
+        # capacity fields.  Kimi's first-party K3 specification is therefore
+        # the deployment-owned authority for this 1M-token bound.
+        "context_length": 1000000,
+        "discover_runtime_metadata": True,
+    },
     # 10.10.132.2 local GLM-5.2 (918528 ctx) — retained for existing sessions
     "deepseek_v4_pro": {
         "api_model": "AgentModel",
