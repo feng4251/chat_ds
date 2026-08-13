@@ -2,6 +2,32 @@
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
+## 2026-08-13 ClaudeCodeEngine 薄适配边界
+
+- 用户再次明确架构边界：ChatDS 的 ClaudeCodeEngine 只承担浏览器/Backend 与未修改的原生
+  Claude Code CLI 之间的接口，包括用户与 Session 身份、单 Workspace 挂载、模型/provider
+  绑定、附件协议转换、Skill/plugin/MCP 投影、SSE 事件透传、持久化和取消/清理。Claude 的
+  规划、工具循环、子 Agent、上下文压缩和 provider retry 由原生 Claude Code 负责；后续不得
+  为某个模型、图片、Session 或 Skill 新建第二套 agent loop、retry/compaction 状态机或控制性
+  prompt。安全挂载、签名出网、凭据隔离和 durable terminal 属于多用户 Web 外壳，仍须保留。
+- 生产 Claude Code 内核没有被修改。Runner 从固定 npm 平台包安装原生
+  `@anthropic-ai/claude-code` 2.1.152 二进制，当前 `/usr/local/bin/claude --version` 仍为
+  `2.1.152 (Claude Code)`；本地独立 `claude-code/` 仓库只作源码参考，不进入生产构建。
+  `23eea5c5` 只使用官方 CLI 已公开的 `--input-format stream-json`，把浏览器图片降低为 native
+  top-level image content block；没有 patch、替换或重编译 Claude 二进制。
+- conversation `3984e69bb77a452f8172bc1ca479048a` 的三源证据：持久对话是 Kimi K3 的单张图片
+  OCR 请求；exact immutable Skill view 的 `skills`、primary selection 和 artifact contracts 均为空；
+  原生 ledger 中 Claude 先执行 2 次 Bash 和 1 次 Read，随后自行发出 10 个 `system/api_retry`，
+  最终 result 包含 `ECONNRESET` 并以 exit 1 结束。ChatDS 没有发起这 10 次 retry，也没有重放
+  Turn。该现象仍是 Kimi Anthropic 兼容面与 Claude 原生 Read/tool-result image 路径的组合问题，
+  不是 Skill、ChatDS retry、compaction、SSE 或 artifact gate。
+- 当前薄化改动删除了附件 receipt 在用户 prompt 中的 XML/“不要 Read”控制性说明。receipt 仍在
+  control plane 做 path/digest/Session 复验，图片 bytes 仍只在隔离 Turn 内通过官方 stream-json
+  顶层 block 传给 Claude；Claude 是否再次使用 Bash/Read、如何重试完全保持原生行为。冻结的本地
+  参考 commit 仍为 `6f6f12b37f529488b10e53928dd5508bb93535c7`，其
+  `src/main.tsx:getInputPrompt` 和 `src/screens/REPL.tsx` 也把 complex image content 直接交给
+  native query，而不追加 controller 工具选择提示。
+
 ## 2026-08-13 Claude 原生多模态输入与 Kimi 兼容性闭环
 
 - 本轮按三源要求诊断 conversation `c6eeb0a8c672495cb8ee084709169ebf`。持久对话是无

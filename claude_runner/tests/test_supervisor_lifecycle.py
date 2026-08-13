@@ -436,9 +436,11 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         prompt = supervisor_server._build_prompt(messages, resume=False)
 
-        self.assertIn(f"/workspace/{relative}", prompt)
-        self.assertIn("top-level image", prompt)
-        self.assertNotIn("Use the Read tool", prompt)
+        self.assertIn("Extract the factory label.", prompt)
+        self.assertNotIn(f"/workspace/{relative}", prompt)
+        self.assertNotIn("CHATDS_IMAGE_ATTACHMENT", prompt)
+        self.assertNotIn("top-level image", prompt)
+        self.assertNotIn("Read", prompt)
         self.assertNotIn("tool_result", prompt)
 
     def test_workspace_image_receipt_fails_closed_after_content_mutation(self):
@@ -504,8 +506,9 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(durable["input_attachments"], [receipt])
         self.assertNotIn("prompt_content", durable)
-        self.assertIn("top-level image", durable["prompt"])
-        self.assertNotIn("Use the Read tool", durable["prompt"])
+        self.assertIn("Read the inventory label.", durable["prompt"])
+        self.assertNotIn("CHATDS_IMAGE_ATTACHMENT", durable["prompt"])
+        self.assertNotIn(f"/workspace/{relative}", durable["prompt"])
         serialized = json.dumps(durable)
         self.assertNotIn("data:image", serialized)
         self.assertNotIn("base64", serialized)

@@ -1678,16 +1678,10 @@ def _message_text(value: object) -> str:
                 relative = str(receipt.get("path") or "")
                 if INPUT_ATTACHMENT_PATH.fullmatch(relative) is None:
                     raise RuntimeError("input_attachment_path_invalid")
-                pieces.append(
-                    "<CHATDS_IMAGE_ATTACHMENT "
-                    f'path="/workspace/{relative}" '
-                    f'media_type="{receipt.get("media_type")}" '
-                    f'sha256="{receipt.get("sha256")}">\n'
-                    "The controller supplies this verified file as a top-level "
-                    "image in the same user input. Inspect that attached image "
-                    "directly; do not call Read solely to load it.\n"
-                    "</CHATDS_IMAGE_ATTACHMENT>"
-                )
+                # The receipt is verified separately and the Runner lowers the
+                # corresponding bytes into Claude Code's native top-level image
+                # content block.  Do not add controller advice or a duplicate
+                # textual attachment representation to the user's prompt.
             elif isinstance(item, dict) and item.get("type") == "image_url":
                 raise RuntimeError("input_attachment_transport_unlowered")
         return "\n".join(pieces)

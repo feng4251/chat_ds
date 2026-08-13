@@ -13,6 +13,18 @@ Key operating constraints:
 - Every such fix must add a synthetic generic regression and, where applicable, at least one non-V2.3 cross-domain holdout or mutation/rename test. V2.3 E2E is an acceptance test, never the sole regression proving generality.
 - Do not automatically launch a model-heavy V2.3 E2E unless the user asks; the next expected test is user-driven.
 - Git commits are local-only unless the user explicitly changes that instruction.
+- Treat `ClaudeCodeEngine` as a thin adapter around the unmodified, pinned
+  Claude Code CLI, not as another ChatDS-owned Harness. Never patch, rebuild,
+  fork, or replace the Claude Code binary/core. The adapter may own only the
+  Web/user/Session boundary, one-Workspace mount and isolation, provider/model
+  protocol binding, attachment lowering, Skill/plugin/MCP projection, SSE
+  projection, persistence, cancellation/cleanup, and deployment-owned security
+  policy. Planning, tool loops, sub-agents, compaction, provider retries, and
+  native session behavior remain Claude Code-owned. Do not add a parallel
+  agent loop, retry/compaction state machine, control prompt, or model/Skill/
+  Session-specific workaround to ClaudeCodeEngine. When a third-party model or
+  compatibility facade disagrees with native Claude Code, fix only the protocol
+  adapter if possible; otherwise report the compatibility boundary explicitly.
 - Every session diagnosis must correlate all three evidence sources before
   proposing a fix: the session debug/AgentRun logs, the persisted conversation
   context, and the exact Skill package/instructions/resources enabled for that
