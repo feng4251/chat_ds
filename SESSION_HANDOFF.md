@@ -3116,3 +3116,34 @@ Round 17 的两个全新 case。不得复用
   暂时为 `harness_health_unavailable`；未重启、取消或干预该任务后探针自行恢复并连续返回 200。
   这不是镜像删除造成的容器/网络缺失，而是一条后续应以独立测试复现的 Legacy 长任务事件循环
   饥饿观测，不能通过放宽健康超时掩盖。
+
+## 12. 2026-08-13 Shaiengine Kimi K3 接入
+
+- 提交 `20d950890cc1dc6f3e31c0925d6515e87c83d734` 将
+  `shaiengine_kimi_k3` 加入 Backend、保留的 Legacy provider catalog 和 Claude Runner
+  `shaiengine` profile；它是非默认、可 agentic 的多模态候选模型，默认模型仍为
+  `shaiengine_glm_5_2`。
+- 现有生产 `SHAIENGINE_API_KEY` 的无泄漏探测结果：`GET /v1/models` 为 200，精确列出
+  `kimi-k3`；Anthropic Messages facade 为 200/`end_turn`，OpenAI chat completions 也能
+  进入 reasoning。目录条目只有 `id/object/created/owned_by/supported_endpoint_types`，没有
+  `max_model_len` 或 `context_length`，单模型端点同样不提供容量。因此 1,000,000 token
+  声明来自 Kimi first-party K3 规格，不得记录成 shaiengine runtime discovery。
+- 使用 1206x2622 的无敏感合成 PNG 直接调用 shaiengine `kimi-k3` Anthropic facade，返回
+  200 并正确识别为纵向。这证明 Claude Code `Read` 的 2000x2000 失败是本地客户端图像
+  预处理边界，不是 Kimi 或 qwen 服务端视觉尺寸上限。仅切换到 Kimi 不会绕过同一 Claude
+  Code `Read` 前置处理；统一 Session attachment rendition/tiling 与 Turn deliverable terminal
+  contract 仍是后续独立通用修复。
+- 回归：Backend 52 项、Harness/model routing 16 项、Claude Runner config 6 项，共 74 项
+  通过；`docker compose config --quiet` 通过。候选来自 clean archive
+  `/tmp/chat_ds_deploy_20d95089.NfFRSy`，archive/tracked tree 都为 22,518 files。
+- 部署前连续确认 nonterminal AgentRun、engine active run、running/enabled schedule 与 5173
+  established connection 均为 0，SQLite `quick_check=ok`、外键违规 0。只滚动 Claude Runner
+  Supervisor 和 Backend，Frontend 原容器仅在切换窗口停止后原样启动；数据库卷、Claude Turn
+  image、四个 Legacy slot、Harness、Proxy、Browser、搜索和其他生产容器均未重建。回滚 tag 为
+  `rollback-pre-20d95089`。
+- 部署后 Backend image 为
+  `sha256:b86d627a36e5ca7d5d63663046d4a1c59ea0b3066e49615e8b861bf9a64c7664`，Supervisor
+  image 为 `sha256:cd1c7e97e7f63c40e67c8ab143ddf614bef296b28e9375f8a9673fb628c1207a`；
+  两者 revision 都为完整 `20d950890cc1dc6f3e31c0925d6515e87c83d734`、healthy/restart 0。
+  Backend 与 Supervisor 均回读 `kimi-k3`/1M，四个 Frontend 入口 `/api/health` 为 200，
+  Supervisor 鉴权 health 为 200，SQLite 仍健康、active run 为 0，严重启动日志匹配为 0。
