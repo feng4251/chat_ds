@@ -17,6 +17,7 @@ COPY harness/skills/path_safety.py /app/harness/skills/path_safety.py
 COPY harness/tools/session_sandbox_policy.py /app/harness/tools/session_sandbox_policy.py
 COPY harness/tools/context.py /app/harness/tools/context.py
 COPY backend/workspace_lock.py /app/shared/workspace_lock.py
+COPY backend/schedule_spec.py /app/claude_runner/schedule_spec.py
 
 RUN mkdir -p /var/lib/chatds-claude-runner \
     && chmod -R a-w /app \

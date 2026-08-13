@@ -70,6 +70,10 @@ from agent_engines.base import (
     AgentEngineError,
     AgentEngineRequest,
 )
+from agent_engines.input_attachments import (
+    InputAttachmentError,
+    materialize_message_attachments,
+)
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -3249,6 +3253,28 @@ def claude_code_model_compatible(provider_config: dict) -> bool:
     )
 
 
+def _require_turn_input_capabilities(
+    *,
+    engine_id: str,
+    image_urls: list[str] | None,
+    provider_config: dict,
+) -> None:
+    """Reject a binary input before creating a run with an incapable model."""
+
+    if (
+        engine_id == ENGINE_ID_CLAUDE_CODE
+        and image_urls
+        and not bool(provider_config.get("is_multimodal"))
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "The selected model does not accept image input. "
+                "Choose a vision-capable model for this Turn."
+            ),
+        )
+
+
 async def resolve_model(model_id: str, cur_user: User, db: AsyncSession):
     """Return (base_url, api_key, is_multimodal, max_tokens, api_model)."""
     model_id = canonical_agent_model_id(model_id)
@@ -3653,6 +3679,11 @@ async def _chat_stream_with_turn(
             400,
             "The selected model is not allowed by a configured Claude Code provider profile",
         )
+    _require_turn_input_capabilities(
+        engine_id=conv.engine_id,
+        image_urls=req.image_urls,
+        provider_config=provider_config,
+    )
     max_tokens = (
         BUILTIN.get(model_id, {}).get("max_tokens")
         if model_id in BUILTIN else DEFAULT_CUSTOM_MAX_TOKENS
@@ -3924,6 +3955,39 @@ async def _chat_stream_with_turn(
             # Stream from harness — agent loop with full tool set
             try:
                 stream_observation.upstream_state = "connecting"
+                engine_messages = tuple(final)
+                input_attachments: tuple[dict, ...] = ()
+                if conv.engine_id == ENGINE_ID_CLAUDE_CODE:
+                    if any(
+                        isinstance(message.get("content"), list)
+                        and any(
+                            isinstance(part, dict)
+                            and part.get("type") == "image_url"
+                            for part in message["content"]
+                        )
+                        for message in final
+                        if isinstance(message, dict)
+                    ):
+                        try:
+                            projection = await (
+                                workspace_store.run_session_workspace_mutation_async(
+                                    cur_user.id,
+                                    conv_id,
+                                    lambda workspace: materialize_message_attachments(
+                                        final,
+                                        workspace=workspace,
+                                    ),
+                                )
+                            )
+                        except InputAttachmentError as exc:
+                            raise AgentEngineError(
+                                str(exc),
+                                code=exc.code,
+                                retryable=False,
+                                exception_class=type(exc).__name__,
+                            ) from exc
+                        engine_messages = projection.messages
+                        input_attachments = projection.attachments
                 legacy_payload = {
                     "model": model_id,
                     "messages": final,
@@ -3955,7 +4019,8 @@ async def _chat_stream_with_turn(
                     conversation_id=conv_id,
                     model_id=model_id,
                     api_model=str(provider_config.get("api_model") or model_id),
-                    messages=tuple(final),
+                    messages=engine_messages,
+                    input_attachments=input_attachments,
                     max_output_tokens=max_tokens,
                     temperature=0.6,
                     provider_config=provider_config,
