@@ -982,7 +982,11 @@ class EngineModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         claude = next(item for item in options if item["id"] == "claude_code")
         self.assertEqual(
             claude["compatible_model_ids"],
-            ["shaiengine_glm_5_2", "shaiengine_deepseek_v4_pro"],
+            [
+                "shaiengine_glm_5_2",
+                "shaiengine_deepseek_v4_pro",
+                "shaiengine_kimi_k3",
+            ],
         )
         self.assertEqual(claude["default_model_id"], "shaiengine_glm_5_2")
         self.assertNotIn("deepseek_v4_pro", claude["compatible_model_ids"])
@@ -1009,6 +1013,7 @@ class EngineModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(claude["compatible_model_ids"], [
             "shaiengine_glm_5_2",
             "shaiengine_deepseek_v4_pro",
+            "shaiengine_kimi_k3",
             "deepseek_v4_pro",
             "local_deepseek_v4_flash",
             "qwen3_5",
@@ -1290,6 +1295,7 @@ class EngineModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         identifiers = {item["id"] for item in result["models"]}
         self.assertIn("shaiengine_glm_5_2", identifiers)
         self.assertIn("shaiengine_deepseek_v4_pro", identifiers)
+        self.assertIn("shaiengine_kimi_k3", identifiers)
         self.assertIn("deepseek_v4_pro", identifiers)
 
     async def test_claude_chat_entry_materializes_session_skill_before_run(self):

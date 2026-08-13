@@ -181,6 +181,27 @@ PROVIDERS: dict[str, dict] = {
         "max_output_tokens": 86400,
         "discover_runtime_metadata": True,
     },
+    "shaiengine_kimi_k3": {
+        "base_url": settings.shaiengine_base_url,
+        "api_model": "kimi-k3",
+        "api_key": settings.shaiengine_api_key,
+        "provider": "Shaiengine",
+        "display_name": "Kimi K3 (Shaiengine · 多模态)",
+        "is_multimodal": True,
+        "is_default": False,
+        "agentic_auxiliary_only": False,
+        "capabilities": ["text", "vision", "tools", "reasoning"],
+        "supports_thinking_toggle": True,
+        "thinking_enabled_by_default": True,
+        "thinking_request_format": "thinking_object",
+        "thinking_send_enabled_explicitly": True,
+        "protocol": "openai",
+        # Shaiengine's model catalog currently omits capacity metadata.  The
+        # first-party K3 specification is the authority for this declaration.
+        "context_length": 1000000,
+        "max_output_tokens": 86400,
+        "discover_runtime_metadata": True,
+    },
     "deepseek_v4_pro": {
         "base_url": settings.deepseek_pro_url,
         "api_model": "AgentModel",

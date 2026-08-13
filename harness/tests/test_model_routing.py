@@ -21,6 +21,10 @@ QWEN = {
     **PROVIDERS["qwen3_5"],
     "id": "qwen3_5",
 }
+KIMI = {
+    **PROVIDERS["shaiengine_kimi_k3"],
+    "id": "shaiengine_kimi_k3",
+}
 
 
 class AgenticModelRoutingDecisionTests(unittest.TestCase):
@@ -39,6 +43,15 @@ class AgenticModelRoutingDecisionTests(unittest.TestCase):
         self.assertNotEqual(local_glm["base_url"], local_deepseek["base_url"])
         self.assertEqual(local_glm["context_length"], 918_528)
         self.assertEqual(local_deepseek["context_length"], 1_048_576)
+
+    def test_kimi_k3_is_a_non_default_multimodal_agent_model(self):
+        self.assertEqual("kimi-k3", KIMI["api_model"])
+        self.assertEqual(1_000_000, KIMI["context_length"])
+        self.assertEqual(86_400, KIMI["max_output_tokens"])
+        self.assertTrue(KIMI["is_multimodal"])
+        self.assertFalse(KIMI["is_default"])
+        self.assertFalse(KIMI["agentic_auxiliary_only"])
+        self.assertIn("vision", KIMI["capabilities"])
 
     def _resolve(self, **overrides):
         kwargs = {
