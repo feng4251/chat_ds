@@ -1,14 +1,20 @@
 .env
 .env.*
 !.env.example
+.local_secrets/
 
 .claude/
 .deepseek/
 hermes-agent/
+claude-code/
+claude-code-analysis-main/
+openclaw/
 
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.coverage
+htmlcov/
 
 frontend/node_modules/
 frontend/dist/
@@ -16,9 +22,14 @@ frontend/dist/
 *.db
 *.db-shm
 *.db-wal
-data/memories/
-data/mcp/
-data/skills/harnessprobe/
+data/*
+!data/.gitkeep
+harness/data/memories/*
+!harness/data/memories/.gitkeep
+workspace/*
+!workspace/.gitkeep
+skills_and_refs/
+backups/
 
 *.key
 *.pem

@@ -450,7 +450,7 @@ services:
       # /v1/messages route; both local providers expose that facade.
       CLAUDE_PROVIDER_PROFILES_JSON: >-
         {"shaiengine":{"backend_base_url":"${SHAIENGINE_BASE_URL:-https://api.shaiengine.com/v1}","api_key_env":"SHAIENGINE_API_KEY","backend_protocol":"openai","models":["glm-5.2","deepseek-v4-pro"],"context_windows":{"glm-5.2":1000000,"deepseek-v4-pro":200000}},"local_agentmodel":{"backend_base_url":"${DEEPSEEK_PRO_BASE_URL:-http://10.10.132.2:1025/v1}","api_key_env":"DEEPSEEK_PRO_API_KEY","backend_protocol":"openai","models":["AgentModel"],"context_windows":{"AgentModel":918528}},"local_deepseek_v4_flash":{"backend_base_url":"${LOCAL_DEEPSEEK_V4_FLASH_BASE_URL:-http://10.10.132.126:1025/v1}","api_key_env":"LOCAL_DEEPSEEK_V4_FLASH_API_KEY","backend_protocol":"openai","models":["AgentModel"],"context_windows":{"AgentModel":1048576}},"local_qwen":{"backend_base_url":"${QWEN3_5_BASE_URL:-http://10.10.132.128:1025/v1}","api_key_env":"QWEN3_5_API_KEY","backend_protocol":"openai","models":["qwen3_5"],"context_windows":{"qwen3_5":262144}}}
-      CLAUDE_WORKSPACE_HOST_ROOT: /nfs/temp/chat_ds
+      CLAUDE_WORKSPACE_HOST_ROOT: ${CHATDS_WORKSPACE_ROOT:?Set CHATDS_WORKSPACE_ROOT to the absolute host Session workspace directory}
       CLAUDE_RUNNER_STATE_ROOT: /var/lib/chatds-claude-runner
       CLAUDE_RUNNER_IMAGE: chat_ds-claude-runner:2.1.152
       CLAUDE_EGRESS_PROXY_VOLUME_NAME: ${SKILL_EGRESS_PROXY_VOLUME_NAME:-chat_ds_skill_egress_proxy_socket}
@@ -481,7 +481,11 @@ services:
       - /tmp:size=128m,mode=1777
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - /nfs/temp/chat_ds:/nfs/temp/chat_ds
+      - type: bind
+        source: ${CHATDS_WORKSPACE_ROOT:?Set CHATDS_WORKSPACE_ROOT to the absolute host Session workspace directory}
+        target: /nfs/temp/chat_ds
+        bind:
+          create_host_path: false
       - claude_runner_state:/var/lib/chatds-claude-runner
       - type: volume
         source: workspace_mutation_locks
@@ -667,7 +671,11 @@ services:
         target: /app/data/memories
         bind:
           create_host_path: false
-      - /nfs/temp/chat_ds:/nfs/temp/chat_ds
+      - type: bind
+        source: ${CHATDS_WORKSPACE_ROOT:?Set CHATDS_WORKSPACE_ROOT to the absolute host Session workspace directory}
+        target: /nfs/temp/chat_ds
+        bind:
+          create_host_path: false
       - executor_socket:/run/chat-ds-executor:ro
       - executor_socket_2:/run/chat-ds-executor-2:ro
       - executor_socket_3:/run/chat-ds-executor-3:ro
@@ -765,7 +773,11 @@ services:
         bind:
           create_host_path: false
       - chat_ds_db:/app/db
-      - /nfs/temp/chat_ds:/nfs/temp/chat_ds
+      - type: bind
+        source: ${CHATDS_WORKSPACE_ROOT:?Set CHATDS_WORKSPACE_ROOT to the absolute host Session workspace directory}
+        target: /nfs/temp/chat_ds
+        bind:
+          create_host_path: false
       - type: volume
         source: workspace_mutation_locks
         target: /run/chatds-workspace-lock-plane

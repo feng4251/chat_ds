@@ -1,4 +1,4 @@
-# Third-party material and reference repositories
+# Third-party software and excluded material
 
 The root `LICENSE` applies only to original ChatDS contributions for which the
 ChatDS contributors can grant a license. It does not relicense third-party
@@ -6,24 +6,27 @@ software, documentation, generated material, datasets, model outputs, uploaded
 Skill packages, or reference repositories. Those materials remain subject to
 their own notices and applicable rights.
 
-Known repository-local boundaries include:
+The public ChatDS repository does not distribute the historical reference
+repositories, production/runtime data, uploaded Skills, or generated business
+artifacts that may have existed in private development workspaces.
 
-- `openclaw/` is third-party software and retains the MIT license in
-  `openclaw/LICENSE`. It is historical reference material and is not a current
-  Harness design reference.
-- `claude-code-analysis-main/` is a third-party static-analysis/reference tree.
-  No license grant is inferred from the absence of a repository-local license.
-  It is not a current Harness design reference.
-- `searxng-master/` contains third-party SearXNG material; its upstream license
-  remains controlling. ChatDS-specific integration files are licensed only to
-  the extent their ChatDS authors have rights to those contributions.
-- `claude-code/` and `hermes-agent/` are independent, untracked nested Git
-  repositories and are not distributed as part of the ChatDS Git tree. Their
-  contents are not covered by the root `LICENSE`.
-- User/session runtime data under `data/`, `workspace/`, `skills_and_refs/`,
-  and related generated directories is not relicensed by the root `LICENSE`.
+Important runtime/build boundaries include:
 
-For future Harness work, the local nested repository `claude-code/` at its
-recorded commit is the sole mature-Harness implementation reference requested
-by the project owner. Reference use does not make it a build dependency and
-does not change its own license status.
+- The optional Claude Turn image downloads a pinned
+  `@anthropic-ai/claude-code` package and its platform package during the image
+  build. Those packages remain subject to Anthropic's terms and are not
+  relicensed by ChatDS.
+- The `local-search` profile runs the pinned official SearXNG and Valkey
+  container images. Their upstream licenses and notices remain controlling.
+- Python, npm, browser, base-image, and system dependencies listed in component
+  manifests or Dockerfiles retain their own licenses.
+- Model weights and external model services are not distributed by this
+  repository and remain subject to their respective licenses and provider
+  terms.
+- User/session runtime data under `data/` and `workspace/`, uploaded Skill
+  archives, MCP servers, reference datasets, and generated artifacts are not
+  covered by the root license merely because ChatDS processes them.
+
+Independent local reference repositories used during private development are
+not ChatDS build dependencies and are not part of this Git tree. Reference use
+does not change their own license status.
