@@ -27,6 +27,19 @@
   参考 commit 仍为 `6f6f12b37f529488b10e53928dd5508bb93535c7`，其
   `src/main.tsx:getInputPrompt` 和 `src/screens/REPL.tsx` 也把 complex image content 直接交给
   native query，而不追加 controller 工具选择提示。
+- 功能提交为 `f43a3740f2a45e1c607ee63664f5b6cd5006a10f refactor: keep Claude engine
+  adaptation thin`。Claude Runner/Supervisor 全套为 `93 passed, 1 skipped, 14 subtests passed`；
+  图片 lowering 三项聚焦为 `3 passed`，compile/diff/secret/protected-deletion 检查通过。候选来自
+  exact clean archive `/tmp/chat_ds_deploy_f43a3740.ciiCi5`，Runner 最终 ENTRYPOINT 的只读、无网、
+  drop-all-capabilities 自检通过，并真实握手 4 个 MCP 及 4 个滚动兼容入口。没有运行模型重型 E2E。
+- 切换前 nonterminal AgentRun、active Engine Session 和 running schedule 均为 0；只重建 Runner
+  anchor 与 Supervisor，Backend、Frontend、Legacy Harness、数据库和其他组件均未重建。生产 Runner
+  image 为 `sha256:416d2c1a15a9e71eb514ebfc469b3bf5522b8ac736c8fbdb8cc561fc7bb4a62c`，
+  Supervisor 为 `sha256:7e31c4e353cec198c1e2357e5d8e5c0e2e2c8dc2b6faaf1df27ba9951d354a70`，
+  revision 均精确为 `f43a3740...`；两者 restart 0，Supervisor healthy，Claude version 仍为
+  2.1.152。`127.0.0.1`、`10.10.132.126`、`172.30.100.128` 三入口 `/api/health` 均 200，
+  SQLite quick/FK 正常且生产仍空闲，Supervisor 严重日志 0。旧镜像保留
+  `rollback-pre-f43a3740`。
 
 ## 2026-08-13 Claude 原生多模态输入与 Kimi 兼容性闭环
 
