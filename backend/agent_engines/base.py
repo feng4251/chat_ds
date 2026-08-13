@@ -38,6 +38,11 @@ class AgentEngineRequest:
     max_output_tokens: int
     temperature: float
     provider_config: Mapping[str, Any]
+    # Immutable, engine-neutral receipts for binary inputs that were lowered
+    # into the exact Session workspace before dispatch. Messages reference
+    # these receipts by value; raw attachment bytes never cross the engine
+    # control plane.
+    input_attachments: tuple[Mapping[str, Any], ...] = ()
     fallback_configs: tuple[Mapping[str, Any], ...] = ()
     tools: tuple[str, ...] = ()
     enabled_user_skills: tuple[str, ...] = ()

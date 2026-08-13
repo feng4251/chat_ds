@@ -33,6 +33,7 @@ from chatds_browser_runtime.proxy_bridge import (
     ProxyTrustAuthority,
 )
 from claude_runner.runtime_capabilities import render_runtime_capability_prompt
+from claude_runner.input_attachments import verify_input_attachments
 from claude_runner.mcp_schedule_control import (
     normalize_schedule_create,
     normalize_schedule_tool_aliases,
@@ -76,6 +77,14 @@ SAFE_CONTROLLER_RUNTIME_CODES = frozenset({
     "artifact_contract_audit_failed",
     "native_cron_state_invalid",
     "egress_bridge_did_not_stop",
+    "input_attachment_count_invalid",
+    "input_attachment_workspace_invalid",
+    "input_attachment_receipt_invalid",
+    "input_attachment_path_invalid",
+    "input_attachment_digest_invalid",
+    "input_attachment_manifest_unreferenced",
+    "input_attachment_transport_unlowered",
+    "input_attachment_message_invalid",
 })
 SAFE_RUNNER_FATAL_CODES = frozenset({
     "runner_controller_not_root",
@@ -114,6 +123,9 @@ def main() -> int:
             "runtime_capability_contract": config.get(
                 "runtime_capability_contract"
             ),
+            "input_attachment_count": len(
+                config.get("input_attachments") or []
+            ),
         }, channel="controller")
         for diagnostic in config.get("skill_diagnostics") or ():
             if not isinstance(diagnostic, dict):
@@ -140,6 +152,11 @@ def main() -> int:
         os.chown(worker_tmp, worker_uid, worker_gid)
         controller_stage = "workspace_lock"
         with _session_workspace_lock(config):
+            controller_stage = "input_attachment_audit"
+            verify_input_attachments(
+                attachments=config.get("input_attachments") or [],
+                workspace=Path("/workspace"),
+            )
             controller_stage = "native_cron_quarantine"
             if _quarantine_native_cron_state(
                 Path("/state/home/.claude"),

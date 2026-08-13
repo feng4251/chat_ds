@@ -58,7 +58,9 @@ class ClaudeCodeEngine:
                 id=self.engine_id,
                 display_name="Claude Code",
                 available=False,
-                capabilities=("skills", "multi_agent", "sandbox", "native_resume"),
+                capabilities=(
+                    "skills", "multi_agent", "sandbox", "native_resume", "vision",
+                ),
                 unavailable_reason=type(exc).__name__,
             )
         available = payload.get("status") == "ok"
@@ -67,7 +69,9 @@ class ClaudeCodeEngine:
             display_name="Claude Code",
             available=available,
             version=str(payload.get("claude_version") or "") or None,
-            capabilities=("skills", "multi_agent", "sandbox", "native_resume"),
+            capabilities=(
+                "skills", "multi_agent", "sandbox", "native_resume", "vision",
+            ),
             unavailable_reason=None if available else str(payload.get("code") or "unhealthy"),
         )
 
@@ -103,6 +107,10 @@ class ClaudeCodeEngine:
             "provider_base_url": str(provider.get("base_url") or ""),
             "provider_protocol": str(provider.get("protocol") or ""),
             "messages": [dict(item) for item in request.messages],
+            "input_attachments": [
+                dict(item)
+                for item in getattr(request, "input_attachments", ())
+            ],
             "max_output_tokens": request.max_output_tokens,
             "context_window_tokens": context_window_tokens,
             "workspace_path": str(request.metadata.get("workspace_path") or ""),

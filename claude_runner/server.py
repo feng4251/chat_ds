@@ -39,6 +39,12 @@ from pydantic import BaseModel, Field, model_validator
 from .config import ProviderProfile, RunnerSettings, load_settings
 from .policy import compile_turn_egress_policy, verify_skill_view
 from .runtime_capabilities import compile_runtime_capability_contract
+from .input_attachments import (
+    INPUT_ATTACHMENT_DIRECTORY,
+    INPUT_ATTACHMENT_PATH,
+    MAX_INPUT_ATTACHMENTS,
+    verify_input_attachments as _verify_input_attachments,
+)
 from .mcp_schedule_control import normalize_schedule_tool_aliases
 from workspace_lock import workspace_mutation_guard
 
@@ -80,6 +86,10 @@ class StartRunRequest(BaseModel):
     provider_base_url: str = Field(min_length=8, max_length=2048)
     provider_protocol: str = Field(max_length=32)
     messages: list[dict[str, Any]] = Field(max_length=4096)
+    input_attachments: list[dict[str, Any]] = Field(
+        default_factory=list,
+        max_length=MAX_INPUT_ATTACHMENTS,
+    )
     max_output_tokens: int = Field(ge=1, le=262144)
     context_window_tokens: int = Field(ge=200_000, le=4_000_000)
     workspace_path: str = Field(min_length=1, max_length=4096)
@@ -204,6 +214,11 @@ class RunManager:
         skill_entrypoint = _manifest_skill_entrypoint(
             skill_view_receipt.manifest
         )
+        _verify_input_attachments(
+            messages=request.messages,
+            attachments=request.input_attachments,
+            workspace=workspace,
+        )
         prompt = _build_prompt(
             request.messages,
             resume=resume_from_native_session_id is not None,
@@ -261,6 +276,7 @@ class RunManager:
             "max_output_tokens": request.max_output_tokens,
             "context_window_tokens": request.context_window_tokens,
             "prompt": prompt,
+            "input_attachments": request.input_attachments,
             "workspace_path": str(workspace),
             "skill_view_path": str(skill_view),
             "skill_view_sha256": request.skill_view_sha256,
@@ -973,6 +989,24 @@ class RunManager:
                     request.conversation_id.encode()
                 ).hexdigest(),
             }
+            volumes = {
+                str(workspace): {"bind": "/workspace", "mode": "rw"},
+                str(state): {"bind": "/state", "mode": "rw"},
+                str(skill_view): {"bind": "/skill-view", "mode": "ro"},
+                str(request_path): {"bind": "/run/chatds/request.json", "mode": "ro"},
+                self.settings.egress_proxy_volume: {
+                    "bind": "/run/chatds-skill-egress", "mode": "ro"
+                },
+                self.settings.workspace_lock_volume: {
+                    "bind": "/run/chatds-workspace-lock-plane", "mode": "rw"
+                },
+            }
+            if request.input_attachments:
+                attachment_root = workspace / INPUT_ATTACHMENT_DIRECTORY
+                volumes[str(attachment_root)] = {
+                    "bind": f"/workspace/{INPUT_ATTACHMENT_DIRECTORY}",
+                    "mode": "ro",
+                }
             try:
                 container = self.client.containers.run(
                     self.settings.runner_image,
@@ -995,18 +1029,7 @@ class RunManager:
                         "/runtime": "rw,nosuid,nodev,size=64m,mode=0755",
                         "/dev/shm": "rw,nosuid,nodev,size=1g,mode=1777",
                     },
-                    volumes={
-                        str(workspace): {"bind": "/workspace", "mode": "rw"},
-                        str(state): {"bind": "/state", "mode": "rw"},
-                        str(skill_view): {"bind": "/skill-view", "mode": "ro"},
-                        str(request_path): {"bind": "/run/chatds/request.json", "mode": "ro"},
-                        self.settings.egress_proxy_volume: {
-                            "bind": "/run/chatds-skill-egress", "mode": "ro"
-                        },
-                        self.settings.workspace_lock_volume: {
-                            "bind": "/run/chatds-workspace-lock-plane", "mode": "rw"
-                        },
-                    },
+                    volumes=volumes,
                     environment=environment,
                     labels=labels,
                 )
@@ -1617,6 +1640,7 @@ def _recover_start_request(path: Path) -> StartRunRequest:
         "provider_base_url": value.get("provider_backend_base_url"),
         "provider_protocol": value.get("provider_protocol") or "anthropic",
         "messages": [],
+        "input_attachments": value.get("input_attachments") or [],
         "max_output_tokens": value.get("max_output_tokens"),
         "context_window_tokens": value.get("context_window_tokens"),
         "workspace_path": value.get("workspace_path"),
@@ -1647,8 +1671,24 @@ def _message_text(value: object) -> str:
         for item in value:
             if isinstance(item, dict) and item.get("type") == "text":
                 pieces.append(str(item.get("text") or ""))
+            elif isinstance(item, dict) and item.get("type") == "image_file":
+                receipt = item.get("image_file")
+                if not isinstance(receipt, dict):
+                    raise RuntimeError("input_attachment_receipt_invalid")
+                relative = str(receipt.get("path") or "")
+                if INPUT_ATTACHMENT_PATH.fullmatch(relative) is None:
+                    raise RuntimeError("input_attachment_path_invalid")
+                pieces.append(
+                    "<CHATDS_IMAGE_ATTACHMENT "
+                    f'path="/workspace/{relative}" '
+                    f'media_type="{receipt.get("media_type")}" '
+                    f'sha256="{receipt.get("sha256")}">\n'
+                    "Use the Read tool on this exact path to inspect the image. "
+                    "Do not search or guess another path.\n"
+                    "</CHATDS_IMAGE_ATTACHMENT>"
+                )
             elif isinstance(item, dict) and item.get("type") == "image_url":
-                pieces.append("[Image attachment available through the Session workspace]")
+                raise RuntimeError("input_attachment_transport_unlowered")
         return "\n".join(pieces)
     return str(value or "")
 

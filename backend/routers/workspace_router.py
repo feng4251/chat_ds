@@ -173,7 +173,7 @@ async def _engine_options_for_user(
             "compatible_model_ids": claude_model_ids,
             "default_model_id": claude_default,
             "capabilities": [
-                "skills", "multi_agent", "sandbox", "native_resume",
+                "skills", "multi_agent", "sandbox", "native_resume", "vision",
             ],
         })
     return options

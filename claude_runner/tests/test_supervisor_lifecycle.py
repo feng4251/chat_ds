@@ -171,6 +171,21 @@ def _make_readonly_view(view: Path) -> str:
 
 
 class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def test_supervisor_image_closes_transitive_schedule_dependency(self):
+        root = Path(__file__).resolve().parents[2]
+        dockerfile = (
+            root / "claude_runner" / "Dockerfile.supervisor"
+        ).read_text(encoding="utf-8")
+        requirements = (
+            root / "claude_runner" / "requirements.txt"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "COPY backend/schedule_spec.py /app/claude_runner/schedule_spec.py",
+            dockerfile,
+        )
+        self.assertIn("croniter==6.2.4", requirements.splitlines())
+
     async def asyncSetUp(self):
         self.temporary = tempfile.mkdtemp()
         self.root = Path(self.temporary)
@@ -389,6 +404,109 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(fresh.startswith(f"/{entrypoint}\n\n<SYSTEM>"))
         self.assertEqual(resumed, f"/{entrypoint}\n\nnext")
 
+    def test_verified_workspace_image_is_rendered_as_a_real_read_target(self):
+        payload = b"\x89PNG\r\n\x1a\nfixture"
+        digest = hashlib.sha256(payload).hexdigest()
+        relative = f".chatds/input-attachments/{digest}.png"
+        target = self.workspace / relative
+        target.parent.mkdir(parents=True)
+        target.write_bytes(payload)
+        receipt = {
+            "schema": "chatds.input-attachment.v1",
+            "kind": "image",
+            "path": relative,
+            "sha256": digest,
+            "media_type": "image/png",
+            "size_bytes": len(payload),
+            "width": 1,
+            "height": 1,
+        }
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Extract the factory label."},
+                {"type": "image_file", "image_file": receipt},
+            ],
+        }]
+
+        supervisor_server._verify_input_attachments(
+            messages=messages,
+            attachments=[receipt],
+            workspace=self.workspace,
+        )
+        prompt = supervisor_server._build_prompt(messages, resume=False)
+
+        self.assertIn(f"/workspace/{relative}", prompt)
+        self.assertIn("Read", prompt)
+        self.assertNotIn("available through the Session workspace", prompt)
+
+    def test_workspace_image_receipt_fails_closed_after_content_mutation(self):
+        payload = b"\x89PNG\r\n\x1a\nfixture"
+        digest = hashlib.sha256(payload).hexdigest()
+        relative = f".chatds/input-attachments/{digest}.png"
+        target = self.workspace / relative
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"changed")
+        receipt = {
+            "schema": "chatds.input-attachment.v1",
+            "kind": "image",
+            "path": relative,
+            "sha256": digest,
+            "media_type": "image/png",
+            "size_bytes": len(payload),
+            "width": 1,
+            "height": 1,
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "attachment_digest"):
+            supervisor_server._verify_input_attachments(
+                messages=[{
+                    "role": "user",
+                    "content": [{"type": "image_file", "image_file": receipt}],
+                }],
+                attachments=[receipt],
+                workspace=self.workspace,
+            )
+
+    def test_preflight_persists_only_verified_attachment_receipts(self):
+        payload = b"\x89PNG\r\n\x1a\nfixture"
+        digest = hashlib.sha256(payload).hexdigest()
+        relative = f".chatds/input-attachments/{digest}.png"
+        target = self.workspace / relative
+        target.parent.mkdir(parents=True)
+        target.write_bytes(payload)
+        receipt = {
+            "schema": "chatds.input-attachment.v1",
+            "kind": "image",
+            "path": relative,
+            "sha256": digest,
+            "media_type": "image/png",
+            "size_bytes": len(payload),
+            "width": 1,
+            "height": 1,
+        }
+        request = self._request().model_copy(update={
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Read the inventory label."},
+                    {"type": "image_file", "image_file": receipt},
+                ],
+            }],
+            "input_attachments": [receipt],
+        })
+
+        _workspace, _view, state, run_dir, _status, _profile = (
+            self.manager._prepare_run_sync(request, self.profile)
+        )
+        durable = _read_json(run_dir / "request.json")
+
+        self.assertEqual(durable["input_attachments"], [receipt])
+        self.assertIn(f"/workspace/{relative}", durable["prompt"])
+        serialized = json.dumps(durable)
+        self.assertNotIn("data:image", serialized)
+        self.assertNotIn("base64", serialized)
+
     def test_native_skill_discovery_does_not_force_installed_skill_on_turn(self):
         manifest = {
             "plugin_name": "chatds-session-skills",
@@ -584,6 +702,76 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         # unexpected ``containers.run`` kwarg.  Shutdown deadlines are passed
         # explicitly to ``container.stop`` by the Supervisor instead.
         self.assertNotIn("stop_timeout", launch)
+        self.assertEqual(
+            launch["volumes"][str(workspace)],
+            {"bind": "/workspace", "mode": "rw"},
+        )
+
+    async def test_input_attachment_directory_is_a_read_only_child_mount(self):
+        payload = b"\x89PNG\r\n\x1a\nfixture"
+        digest = hashlib.sha256(payload).hexdigest()
+        relative = f".chatds/input-attachments/{digest}.png"
+        target = self.workspace / relative
+        target.parent.mkdir(parents=True)
+        target.write_bytes(payload)
+        receipt = {
+            "schema": "chatds.input-attachment.v1",
+            "kind": "image",
+            "path": relative,
+            "sha256": digest,
+            "media_type": "image/png",
+            "size_bytes": len(payload),
+            "width": 1,
+            "height": 1,
+        }
+        request = self._request().model_copy(update={
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "image_file", "image_file": receipt}],
+            }],
+            "input_attachments": [receipt],
+        })
+        workspace, skill_view, state = self.manager._validate_paths(request)
+        run_dir = state / "control" / "runs" / request.run_id
+        run_dir.mkdir(parents=True)
+        request_path = run_dir / "request.json"
+        request_path.write_text("{}", encoding="utf-8")
+        status_path = run_dir / "status.json"
+        status_path.write_text(json.dumps({
+            "run_id": request.run_id,
+            "user_id": request.user_id,
+            "conversation_id": request.conversation_id,
+            "status": "starting",
+            "phase": "starting",
+        }), encoding="utf-8")
+        with (
+            patch.dict(os.environ, {"SKILL_EGRESS_POLICY_TOKEN": "x" * 32}),
+            patch.object(
+                supervisor_server,
+                "_seccomp_security_option",
+                return_value="seccomp={}",
+            ),
+        ):
+            self.manager._create_container_sync(
+                request,
+                workspace,
+                skill_view,
+                state,
+                run_dir,
+                request_path,
+                status_path,
+                self.profile,
+            )
+
+        launch = self.client.containers.last_run
+        attachment_root = str(workspace / ".chatds/input-attachments")
+        self.assertEqual(
+            launch["volumes"][attachment_root],
+            {
+                "bind": "/workspace/.chatds/input-attachments",
+                "mode": "ro",
+            },
+        )
         self.assertEqual(
             launch["volumes"][str(workspace)],
             {"bind": "/workspace", "mode": "rw"},

@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import httpx
+from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -985,6 +986,7 @@ class EngineModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(claude["default_model_id"], "shaiengine_glm_5_2")
         self.assertNotIn("deepseek_v4_pro", claude["compatible_model_ids"])
+        self.assertIn("vision", claude["capabilities"])
 
     async def test_explicit_local_profiles_expose_only_their_bound_models(self):
         profiles = [
@@ -1043,6 +1045,26 @@ class EngineModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                 "provider": "builtin",
                 "claude_provider_profile": "local_agentmodel",
             }))
+
+    def test_image_turn_requires_a_vision_capable_model_before_dispatch(self):
+        with self.assertRaises(HTTPException) as raised:
+            chat_router._require_turn_input_capabilities(
+                engine_id="claude_code",
+                image_urls=["data:image/png;base64,fixture"],
+                provider_config={"is_multimodal": False},
+            )
+        self.assertEqual(raised.exception.status_code, 400)
+
+        chat_router._require_turn_input_capabilities(
+            engine_id="claude_code",
+            image_urls=["data:image/png;base64,fixture"],
+            provider_config={"is_multimodal": True},
+        )
+        chat_router._require_turn_input_capabilities(
+            engine_id="claude_code",
+            image_urls=None,
+            provider_config={"is_multimodal": False},
+        )
 
     def test_colliding_wire_model_names_keep_distinct_route_capabilities(self):
         local_glm = chat_router.BUILTIN["deepseek_v4_pro"]
@@ -1140,6 +1162,57 @@ class EngineModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["context_window_tokens"], 303872)
         self.assertNotIn("api_key", payload)
         self.assertNotIn("must-not-cross", json.dumps(payload))
+
+    def test_claude_payload_forwards_only_attachment_receipts(self):
+        engine = ClaudeCodeEngine(
+            base_url="http://runner.test",
+            internal_token="fixture-internal-token",
+            timeout_seconds=60,
+        )
+        digest = "a" * 64
+        receipt = {
+            "schema": "chatds.input-attachment.v1",
+            "kind": "image",
+            "path": f".chatds/input-attachments/{digest}.png",
+            "sha256": digest,
+            "media_type": "image/png",
+            "size_bytes": 128,
+            "width": 10,
+            "height": 10,
+        }
+        request = SimpleNamespace(
+            run_id="1" * 32,
+            root_run_id="1" * 32,
+            user_id="2" * 32,
+            conversation_id="3" * 32,
+            model_id="qwen3_5",
+            api_model="qwen3_5",
+            provider_config={
+                "claude_provider_profile": "local_qwen",
+                "base_url": "http://10.10.132.128:1025/v1",
+                "protocol": "openai",
+                "context_length": 262144,
+            },
+            messages=({
+                "role": "user",
+                "content": [{"type": "image_file", "image_file": receipt}],
+            },),
+            input_attachments=(receipt,),
+            max_output_tokens=8,
+            metadata={"workspace_path": "/workspace", "user_turn_text": "fixture"},
+            skill_view_path="/skill-view",
+            skill_view_sha256="b" * 64,
+            native_session_id=str(uuid.uuid4()),
+            resume_from_native_session_id=None,
+            source="chat",
+        )
+
+        payload = engine._start_payload(request)
+
+        self.assertEqual(payload["input_attachments"], [receipt])
+        serialized = json.dumps(payload)
+        self.assertNotIn("data:image", serialized)
+        self.assertNotIn("base64", serialized)
 
     def test_claude_payload_rejects_unbound_model_capacity(self):
         engine = ClaudeCodeEngine(

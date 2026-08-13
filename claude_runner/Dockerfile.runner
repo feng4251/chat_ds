@@ -50,6 +50,7 @@ COPY claude_runner/bootstrap.py /opt/chatds-claude-runner/bootstrap.py
 COPY claude_runner/__init__.py \
      claude_runner/runner_entrypoint.py \
      claude_runner/runtime_capabilities.py \
+     claude_runner/input_attachments.py \
      claude_runner/image_selftest.py \
      claude_runner/mcp_web_search.py \
      claude_runner/mcp_market_data.py \
