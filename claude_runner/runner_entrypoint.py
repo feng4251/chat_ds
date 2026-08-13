@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import fnmatch
 import fcntl
@@ -41,6 +42,7 @@ from claude_runner.mcp_schedule_control import (
 
 
 MAX_NATIVE_LINE_BYTES = 64 * 1024 * 1024
+MAX_NATIVE_INPUT_BYTES = 96 * 1024 * 1024
 SYNC_EVERY_EVENTS = 20
 MAX_WORKSPACE_SNAPSHOT_FILES = 65_536
 MAX_WORKSPACE_ARTIFACTS = 8_192
@@ -1349,7 +1351,11 @@ def _quarantine_native_cron_state(claude_root: Path, run_id: str) -> bool:
     return True
 
 
-def _claude_command(config: dict[str, Any]) -> tuple[list[str], bytes]:
+def _claude_command(
+    config: dict[str, Any],
+    *,
+    workspace_root: Path = Path("/workspace"),
+) -> tuple[list[str], bytes]:
     native_session_id = str(config["native_session_id"])
     api_model = str(config["api_model"])
     context_window_tokens = config.get("context_window_tokens")
@@ -1372,6 +1378,7 @@ def _claude_command(config: dict[str, Any]) -> tuple[list[str], bytes]:
         "/usr/local/bin/claude",
         "--print",
         "--verbose",
+        "--input-format", "stream-json",
         "--output-format", "stream-json",
         "--include-partial-messages",
         "--no-chrome",
@@ -1415,7 +1422,58 @@ def _claude_command(config: dict[str, Any]) -> tuple[list[str], bytes]:
         ])
     else:
         command.extend(["--session-id", native_session_id])
-    return command, str(config["prompt"]).encode("utf-8")
+    return command, _native_stream_json_input(
+        config,
+        workspace_root=workspace_root,
+    )
+
+
+def _native_stream_json_input(
+    config: dict[str, Any],
+    *,
+    workspace_root: Path,
+) -> bytes:
+    """Lower receipt-only prompt blocks into one Claude SDK user message."""
+
+    attachments = config.get("input_attachments") or []
+    if not isinstance(attachments, list):
+        raise RuntimeError("input_attachment_count_invalid")
+    if attachments:
+        verify_input_attachments(
+            attachments=attachments,
+            workspace=workspace_root,
+        )
+    content: list[dict[str, Any]] = []
+    prompt = str(config.get("prompt") or "")
+    if prompt:
+        content.append({"type": "text", "text": prompt})
+    for receipt in attachments:
+        payload = (workspace_root / str(receipt["path"])).read_bytes()
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": str(receipt.get("media_type") or ""),
+                "data": base64.b64encode(payload).decode("ascii"),
+            },
+        })
+    if not content:
+        raise RuntimeError("input_attachment_message_invalid")
+    envelope = {
+        "type": "user",
+        "message": {"role": "user", "content": content},
+        "parent_tool_use_id": None,
+        "session_id": "",
+    }
+    encoded = json.dumps(
+        envelope,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+    if len(encoded) > MAX_NATIVE_INPUT_BYTES:
+        raise RuntimeError("native_input_size_limit")
+    return encoded
 
 
 def _worker_environment(

@@ -90,8 +90,10 @@ def _result() -> dict[str, Any]:
     })
     if (
         command[:2] != ["/usr/local/bin/claude", "--print"]
+        or command[command.index("--input-format") + 1] != "stream-json"
         or "--append-system-prompt" not in command
-        or user_prompt != b"entrypoint holdout"
+        or json.loads(user_prompt)["message"]["content"]
+        != [{"type": "text", "text": "entrypoint holdout"}]
     ):
         raise RuntimeError("controller_entrypoint_self_test_failed")
     for module, expected in _MCP_MODULES.items():

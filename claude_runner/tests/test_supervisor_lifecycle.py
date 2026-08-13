@@ -404,7 +404,7 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(fresh.startswith(f"/{entrypoint}\n\n<SYSTEM>"))
         self.assertEqual(resumed, f"/{entrypoint}\n\nnext")
 
-    def test_verified_workspace_image_is_rendered_as_a_real_read_target(self):
+    def test_verified_workspace_image_is_compiled_as_top_level_input(self):
         payload = b"\x89PNG\r\n\x1a\nfixture"
         digest = hashlib.sha256(payload).hexdigest()
         relative = f".chatds/input-attachments/{digest}.png"
@@ -437,8 +437,9 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         prompt = supervisor_server._build_prompt(messages, resume=False)
 
         self.assertIn(f"/workspace/{relative}", prompt)
-        self.assertIn("Read", prompt)
-        self.assertNotIn("available through the Session workspace", prompt)
+        self.assertIn("top-level image", prompt)
+        self.assertNotIn("Use the Read tool", prompt)
+        self.assertNotIn("tool_result", prompt)
 
     def test_workspace_image_receipt_fails_closed_after_content_mutation(self):
         payload = b"\x89PNG\r\n\x1a\nfixture"
@@ -502,7 +503,9 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         durable = _read_json(run_dir / "request.json")
 
         self.assertEqual(durable["input_attachments"], [receipt])
-        self.assertIn(f"/workspace/{relative}", durable["prompt"])
+        self.assertNotIn("prompt_content", durable)
+        self.assertIn("top-level image", durable["prompt"])
+        self.assertNotIn("Use the Read tool", durable["prompt"])
         serialized = json.dumps(durable)
         self.assertNotIn("data:image", serialized)
         self.assertNotIn("base64", serialized)

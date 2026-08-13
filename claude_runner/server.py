@@ -1683,8 +1683,9 @@ def _message_text(value: object) -> str:
                     f'path="/workspace/{relative}" '
                     f'media_type="{receipt.get("media_type")}" '
                     f'sha256="{receipt.get("sha256")}">\n'
-                    "Use the Read tool on this exact path to inspect the image. "
-                    "Do not search or guess another path.\n"
+                    "The controller supplies this verified file as a top-level "
+                    "image in the same user input. Inspect that attached image "
+                    "directly; do not call Read solely to load it.\n"
                     "</CHATDS_IMAGE_ATTACHMENT>"
                 )
             elif isinstance(item, dict) and item.get("type") == "image_url":

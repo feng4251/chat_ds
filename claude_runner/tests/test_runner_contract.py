@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import os
@@ -38,6 +39,7 @@ def _config(*, resume: bool = False) -> dict:
         "provider_claude_base_url": "https://api.shaiengine.com",
         "native_web_tools": False,
         "prompt": "test",
+        "input_attachments": [],
         "runtime_capability_contract": {
             "schema": "chatds.runtime-capabilities.v1",
             "structured_capabilities": ["renamed_lookup"],
@@ -71,8 +73,20 @@ class RunnerCommandContractTests(unittest.TestCase):
     def test_fresh_and_resumed_turns_use_transactional_native_sessions(self):
         fresh = _config()
         command, prompt = _claude_command(fresh)
-        self.assertEqual(prompt, b"test")
+        native_input = json.loads(prompt)
+        self.assertEqual(native_input["type"], "user")
+        self.assertEqual(native_input["message"], {
+            "role": "user",
+            "content": [{"type": "text", "text": "test"}],
+        })
+        self.assertEqual(native_input["parent_tool_use_id"], None)
+        self.assertEqual(native_input["session_id"], "")
+        self.assertTrue(prompt.endswith(b"\n"))
         self.assertNotIn("--bare", command)
+        self.assertEqual(
+            command[command.index("--input-format") + 1],
+            "stream-json",
+        )
         self.assertIn("--no-chrome", command)
         self.assertIn("--thinking", command)
         self.assertIn("--strict-mcp-config", command)
@@ -110,6 +124,46 @@ class RunnerCommandContractTests(unittest.TestCase):
             command[command.index("--disallowedTools") + 1],
             "CronCreate,CronDelete,CronList",
         )
+
+    def test_verified_image_is_top_level_sdk_input_not_a_tool_result(self):
+        payload = b"\x89PNG\r\n\x1a\nrenamed-cross-domain-image-payload"
+        digest = hashlib.sha256(payload).hexdigest()
+        receipt = {
+            "schema": "chatds.input-attachment.v1",
+            "kind": "image",
+            "path": f".chatds/input-attachments/{digest}.png",
+            "sha256": digest,
+            "media_type": "image/png",
+            "size_bytes": len(payload),
+            "width": 17,
+            "height": 29,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            target = workspace / receipt["path"]
+            target.parent.mkdir(parents=True)
+            target.write_bytes(payload)
+            command, prompt = _claude_command(
+                {
+                    **_config(),
+                    "prompt": "Inspect the renamed holdout image.",
+                    "input_attachments": [receipt],
+                },
+                workspace_root=workspace,
+            )
+
+        native_input = json.loads(prompt)
+        content = native_input["message"]["content"]
+        self.assertEqual([block["type"] for block in content], ["text", "image"])
+        self.assertEqual(content[1]["source"]["type"], "base64")
+        self.assertEqual(content[1]["source"]["media_type"], "image/png")
+        self.assertEqual(
+            base64.b64decode(content[1]["source"]["data"]),
+            payload,
+        )
+        self.assertNotIn("tool_result", prompt.decode("utf-8"))
+        self.assertNotIn("Read", prompt.decode("utf-8"))
+        self.assertIn("--input-format", command)
 
     def test_extended_context_is_a_client_marker_not_an_upstream_model_id(self):
         config = {
