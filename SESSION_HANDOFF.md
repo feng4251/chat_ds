@@ -2,6 +2,47 @@
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
+## 2026-08-13 Claude 原生多模态输入与 Kimi 兼容性闭环
+
+- 本轮按三源要求诊断 conversation `c6eeb0a8c672495cb8ee084709169ebf`。持久对话是无
+  Skill 的普通图片转 Markdown 请求；exact immutable Skill view 中 Skills、primary selection 和
+  artifact contract 均为空。Runner 原始时间线显示 Claude `Read` 受 2000×2000 限制后把
+  1206×2622 图像切为两段；每次 Read tool-result 携带大块嵌套 base64 图片，上游随后分别
+  发生 429 和 `ECONNRESET`，最终被折叠为 `runner_exit_nonzero`。累计 cache/input 超过一百万
+  token 来自多次 retry 计费汇总，不是单次超出 Kimi 上下文；签名出网收据没有预算拒绝，
+  Backend/SSE 也没有先于上游终止。
+- 确定性 Provider 复现证明：直接 user image 请求正常；同类图片放入嵌套 tool-result 时被
+  Shaiengine Kimi Anthropic facade 放大为数万 input tokens。因此根因是 Claude `Read`→tool-result
+  的间接图片回输与该 Provider 兼容层组合不稳定，不是 Kimi 纯文本接入、图片能力、
+  Session workspace、Skill、网络白名单或前端问题。跨 Provider 不变量重述为：已验证的
+  Session-scoped 输入图片必须在首次 native user message 中作为顶层 image content block 传入，
+  不应强迫模型先 Read 后把同一输入图片回填成 tool-result。
+- 成熟实现对照冻结本地独立 `claude-code/` commit
+  `6f6f12b37f529488b10e53928dd5508bb93535c7`。采用其 `src/main.tsx` 支持的
+  `--input-format stream-json` 与 SDK user message 顶层 content blocks；继续适配 ChatDS 现有
+  Session 单 workspace mount、typed attachment receipt、digest 复验、长期 mutation lease 和 durable
+  request redaction。拒绝为 Kimi、Session ID、图片尺寸或任何 Skill 增加分支，也拒绝新建
+  prompt compiler、Backend retry 状态机或 Provider 错误分类层。本地相关路径完整，无需 Web 补证。
+- 最终生产改动仅是：Runner 用 `stream-json` 发送原 prompt text，并在已有 PID 1 收据/文件
+  复验后将 manifest 内图片追加为顶层 base64 image block；Supervisor prompt 不再要求模型
+  为加载输入图片单独调用 Read。base64 只在隔离 Turn 进程内短暂存在，不进 Backend、
+  Supervisor durable request 或 debug；纯文本也统一走 Claude 原生 stream-json user message。
+- 修复提交为 `23eea5c57d98e03b843928cec1c9e59d71c3ec28 fix: pass images through Claude
+  native input`，共 5 个文件、新增 128/删除 10 行；生产代码净新增 61 行，其余为自检和
+  通用 rename/cross-domain holdout。Runner/Supervisor 专项 `66 passed`，py_compile、diff check、
+  fixture/genericity scan 通过。clean archive `/tmp/chat_ds_deploy_23eea5c5.qehU1J` 与 Git tree
+  均为 22,518 个文件；候选 Runner 在 read-only/network-none/cap-drop/tmpfs 的真实生产
+  ENTRYPOINT 自检通过。
+- 切换前 nonterminal AgentRun、active Engine Session、running ScheduledJobRun 均为 0；没有
+  数据库 schema/data 修改。仅重建 Runner anchor 和 Supervisor，Backend、Frontend、Scheduler、
+  Legacy Harness、Proxy 和数据库均未重建。当前 Runner image 为
+  `sha256:2b2810bfb104091f57142f7c1c8ef1b1338ebe65918676d4957ed3caa0be876b`，Supervisor
+  为 `sha256:514faa3c109dbeb4b749ae8571fa91278a60438b9260e224c099289a6f76b264`，revision 都精确
+  为 `23eea5c5...`，旧镜像保留 `rollback-pre-23eea5c5`。两容器 restart=0，Supervisor
+  healthy；`127.0.0.1`、`10.10.132.126`、`172.30.100.128` 三入口 `/api/health` 均
+  200，生产 SQLite quick/FK 正常且仍无 active run/session。未自动重跑用户原图片或
+  V2.3 E2E；用户可在新 Turn 用 Kimi 重测原类型图片请求。
+
 ## 2026-08-13 Claude 多模态输入的 Session 文件投影与执行闭环
 
 - 本轮按三源要求诊断 conversation `3df46ebc307943f498e8724f268d1b0b`。持久化消息中的图片是有效
