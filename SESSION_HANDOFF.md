@@ -1,6 +1,61 @@
-# ChatDS 当前会话交接（2026-08-12）
+# ChatDS 当前会话交接（2026-08-13）
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
+
+## 2026-08-13 Claude 多模态输入的 Session 文件投影与执行闭环
+
+- 本轮按三源要求诊断 conversation `3df46ebc307943f498e8724f268d1b0b`。持久化消息中的图片是有效
+  JPEG（约 251 KB、1206×2622），前端请求和数据库均完整；该 Turn 的 exact immutable Skill view
+  没有 Skills、primary selection 或 artifact contract，因此不是 Skill 路由/指令问题。Runner debug
+  显示旧 Backend 只把图片变成文本占位符，Session workspace 中没有对应文件；Claude 随后发出两个
+  空参数 `Read` 并 `Glob` 到空目录。故根因是 Backend→Claude Runner 的多模态 lowering 缺失，不是
+  图片损坏、模型上下文、网络、Provider 或前端上传失败。
+- 通用不变量现为：浏览器/DB 的 data URL 只属于输入传输和历史渲染；Backend 在持有当前 Session
+  workspace mutation lease 时，先完整校验数量、总量、格式 magic、MIME、尺寸和像素边界，再把图片
+  原子发布为 `.chatds/input-attachments/<sha256>.<ext>`，并把消息降低为 typed
+  `chatds.input-attachment.v1` receipt。原始 bytes/base64 不进入 Backend→Supervisor 请求、Runner
+  durable request 或 debug。重复输入内容寻址去重；远程 URL、畸形 base64、MIME 伪装、symlink 逃逸、
+  digest 冲突和跨 Session 路径均 fail closed。当前新 Turn 携带图片而模型不具备 `is_multimodal`
+  能力时，在创建 AgentRun 前返回明确 400；Claude engine/UI capability 现在显式包含 `vision`。
+- Supervisor 在 prompt 编译前把 receipt、lowered message 与 exact Session workspace 重验；只渲染一个
+  明确 `/workspace/...` 的 `Read` 目标，旧的伪占位符成为稳定的
+  `input_attachment_transport_unlowered` 错误。PID 1 在取得整个 Turn 的长期 Session mutation lease 后、
+  执行 Claude 前再次核对路径、regular-file、size 和 SHA-256，关闭 preflight/execute TOCTOU 窗口；
+  附件目录在可写 workspace 下以只读 child bind 重新挂载。文件为 `0444`，确保 root Backend 发布后
+  Claude 的 UID/GID 65529 worker 可读但不可写；真实 Docker worker smoke 已验证读取成功。
+- 成熟实现对照冻结独立 `claude-code/` commit
+  `6f6f12b37f529488b10e53928dd5508bb93535c7`。采用并适配
+  `src/utils/attachments.ts` 对图片构造真实 base64 content block，以及
+  `src/tools/FileReadTool/FileReadTool.ts` 把图片作为真实 Read tool-result block 返回的原则；ChatDS 将
+  二进制投影为 Session-scoped immutable file，以保留既有 one-workspace mount、authority、receipt 和
+  debug redaction 合同。拒绝继续输出“图片在 workspace”但没有文件的占位符，也拒绝把 data URL 塞进
+  durable control plane。本地参考路径完整，无需 Web 搜索补足 stub。
+- 镜像候选验证同时暴露一个既有部署闭包缺口：当前 Supervisor source 会导入共享 schedule parser，
+  但旧 `Dockerfile.supervisor` 没复制该模块/安装锁定 parser；生产未暴露仅因为 Supervisor 仍停在
+  `e8480032` 老镜像。本轮按“运行时源码的全部 transitive dependency 必须在 immutable image 中闭包”
+  的通用不变量，复制同一 `backend/schedule_spec.py` 并锁定 `croniter==6.2.4`，增加源码级闭包回归和
+  真实候选 import smoke；没有修改调度语义。
+- 最终 Backend 全套 `317 passed`；Claude Runner/Supervisor 全套 `93 passed, 1 skipped`；相关附件/
+  engine 合同 `58 passed`。compile、`git diff --check`、secret/fixture scan、三候选 image import/self-test、
+  非 root worker 文件读取及 nested read-only mount smoke 全部通过。生产受控视觉 E2E 使用全新临时
+  Session、空 Skill view、Qwen 多模态模型和原问题中的有效图片字节；原生事件共 215 个，机器证据同时
+  包含精确附件路径的 `Read`、对应 tool result 和唯一 `succeeded` Supervisor terminal。测试 Session、
+  Runner state 和 workspace 随后全部清理，没有篡改原 conversation 或自动运行模型重型 V2.3 E2E。
+- 功能提交为 `09234289b29a2dfa469468e1bc362ee26113e514 fix: deliver image inputs to
+  isolated Claude turns`。clean archive `/tmp/chat_ds_deploy_09234289.DuGDAA` 与 Git tree 均为
+  22,518 files。切换前连续确认 nonterminal AgentRun、active Engine Session、running
+  ScheduledJobRun 和动态 Claude Turn container 均为 0。SQLite online backup volume
+  `chat_ds_chat_ds_db_backup_pre_09234289_20260813_103443` 为 517,136,384 bytes，SHA-256
+  `1112fc11d7776fff9d6671bfa264d3119bda5fb89c1a4dadef11384312c6ab73`，quick/FK 正常。
+- 当前生产 Backend/Supervisor/Runner image 分别为
+  `sha256:77cf058579b7e4bb9e5f89b7cd191b7b5744daafe689df3cd5ff65955789c89c`、
+  `sha256:28a14ef77eaeb750705df3f6d11e04c179e3f98612b5911d7f041c1ca185f95c`、
+  `sha256:813ec6561b9e674410b548f963ac95bd57ba778d2e64ebd63ba14bde5e7caf27`，revision label 均精确为
+  `09234289...`；旧镜像保留 `rollback-pre-09234289`。只重建这三个组件，Frontend、Scheduler、
+  Legacy Harness、数据库和其他容器未改。三组件 running/healthy（inert Runner anchor 无 healthcheck）、
+  restart 0，`127.0.0.1`、`10.10.132.126`、`172.30.100.128` 三入口 `/api/health` 均 200，
+  生产 SQLite quick/FK、active run/session 和严重启动日志均正常/为 0。用户现在可在原 Session 重新发送
+  带图请求；历史失败消息不会被重写。
 
 ## 2026-08-12 后台消息可见性、前端同步生命周期与部署版本闭环
 
