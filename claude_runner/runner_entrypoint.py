@@ -1696,6 +1696,36 @@ def _drop_worker(uid: int, gid: int) -> None:
     os.umask(0o077)
 
 
+def _close_stdin_after_native_result(
+    process: subprocess.Popen[bytes],
+    input_lock: threading.Lock,
+    ledger: EventLedger,
+    *,
+    keep_stdin_open: bool,
+) -> bool:
+    """End one stream-json input after Claude durably publishes its result.
+
+    Interactive permission mode must keep stdin available for native
+    ``control_response`` messages during the Turn.  The CLI also treats an
+    open stream-json stdin as a signal that another user message may follow,
+    so leaving it open after the native result prevents ``--print`` from
+    exiting.  The ledger observation is authoritative and stderr cannot set
+    it.
+    """
+
+    if not keep_stdin_open or not ledger.saw_native_result:
+        return False
+    try:
+        with input_lock:
+            stream = process.stdin
+            if stream is None or stream.closed:
+                return False
+            stream.close()
+        return True
+    except (BrokenPipeError, OSError, ValueError):
+        return False
+
+
 def _run_child(
     command: list[str],
     prompt: bytes,
@@ -1868,6 +1898,12 @@ def _run_child(
                 buffers[channel] = bytearray(rest)
                 native_seq = ledger.append_line(line, channel=channel)
                 observe_control_request(line, channel, native_seq)
+                _close_stdin_after_native_result(
+                    _child,
+                    input_lock,
+                    ledger,
+                    keep_stdin_open=keep_stdin_open,
+                )
             if len(buffers[channel]) > MAX_NATIVE_LINE_BYTES:
                 ledger.append_line(bytes(buffers[channel]), channel=channel)
                 buffers[channel].clear()

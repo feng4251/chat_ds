@@ -1,11 +1,14 @@
 import base64
 import hashlib
+import io
 import json
 import os
 import tempfile
+import threading
 import unittest
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from chatds_browser_runtime.proxy_bridge import BridgeConfigurationError
@@ -17,6 +20,7 @@ from claude_runner.policy import (
 from claude_runner.runner_entrypoint import (
     EventLedger,
     _claude_command,
+    _close_stdin_after_native_result,
     _native_checkpoint_exists,
     _pending_plan_task_count,
     _quarantine_native_cron_state,
@@ -53,6 +57,28 @@ def _config(*, resume: bool = False) -> dict:
 
 
 class RunnerCommandContractTests(unittest.TestCase):
+    def test_interactive_stream_input_closes_only_after_native_result(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = EventLedger(Path(temporary) / "events.jsonl")
+            process = SimpleNamespace(stdin=io.BytesIO())
+            lock = threading.Lock()
+            self.assertFalse(_close_stdin_after_native_result(
+                process, lock, ledger, keep_stdin_open=True,
+            ))
+            ledger.append_line(
+                json.dumps({
+                    "type": "result",
+                    "subtype": "success",
+                    "result": "renamed cross-domain response",
+                }).encode(),
+                channel="stdout",
+            )
+            self.assertTrue(_close_stdin_after_native_result(
+                process, lock, ledger, keep_stdin_open=True,
+            ))
+            self.assertTrue(process.stdin.closed)
+            ledger.close()
+
     def test_native_ledger_returns_the_exact_controller_sequence(self):
         with tempfile.TemporaryDirectory() as temporary:
             ledger = EventLedger(Path(temporary) / "events.jsonl")
