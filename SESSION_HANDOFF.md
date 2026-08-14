@@ -38,11 +38,46 @@
   map、exact request id 和重复响应处理；不推测 stub，也不修改生产 Claude 内核。本轮本地路径完整，
   无需 Web 搜索。
 - 回归为跨域/rename fixtures，不含 V2.3、疾病、Session、worker 数量或报告名特判。Backend 在生产依赖
-  补齐的隔离测试路径为 331 项全量；Claude Runner/Supervisor 为 97 passed、1 skipped、14 subtests；
+  补齐的隔离测试路径为 331 项全量；Claude Runner/Supervisor 最终为 98 passed、1 skipped、14 subtests；
   Legacy Harness clean mount 为 1984 passed、1 skipped、813 subtests；Frontend 为 44 passed，变更文件
   ESLint 和 production build 通过。宿主 Python 未装 `croniter` 时 Backend/Runner 分别只出现 2/3 个
   `schedule_parser_unavailable`，使用 `/tmp` 临时依赖及生产镜像复验后全部通过；未自动运行模型重型
-  V2.3 E2E。最终提交、clean archive、数据库备份、镜像 revision 和生产验收记录将在本节部署后补齐。
+  V2.3 E2E。
+- 主功能提交为 `32a215428dd41af99a4ddee25a68fd6e130c4c23 feat: add durable Turn timeline and
+  Session permissions`。首次真实轻量 E2E 在默认 `workspace_write` 下确认原生 Claude 已发布成功
+  `result`，同时暴露 `--input-format stream-json` 为接收后续权限决定而保持 stdin 打开时，Claude
+  `--print` 会等待 EOF、导致权威 Run 迟迟不提交的通用生命周期缺口。该缺口重述为“收到 ledger 已确认的
+  native result 后，交互输入通道必须关闭，使原生进程能够完成退出；stderr 或模型文本不得触发”，并以
+  `BytesIO` scripted native-result failure injection 回归修复。修复提交为
+  `9dc2b69fdf11ea209ad73edcfaa961a6946d59fd fix: close interactive Claude input after result`；
+  没有增加 Provider、Skill、Session、文件名或业务域分支，也没有修改 Claude 二进制/内部 agent loop。
+- 首次完整候选来自 exact clean archive `/tmp/chat_ds_deploy_32a21542.2NfI4Z`；最终 Runner 修复候选来自
+  `/tmp/chat_ds_deploy_9dc2b69f.eBLMWu`，二者及对应 Git tree 均为 22,524 files，后者为
+  251,976,166 bytes。部署前 SQLite online backup volume 为
+  `chat_ds_chat_ds_db_backup_pre_32a21542_20260814_154623`（540,258,304 bytes，SHA-256
+  `d2d350defaaa5e1a2d35fc0ba08e7eb66cd981aa9a3e0dfc76b3c96efa90f9c9`），备份和生产库均
+  `quick_check=ok`、foreign-key violations 0。Git 回滚锚点为
+  `rollback/pre-turn-activity-20260814-9dfc334d`；镜像回滚标签为
+  `chat_ds-backend:rollback-pre-32a21542`、`chat_ds-frontend:rollback-pre-32a21542`、
+  `chat_ds-claude-runner-supervisor:rollback-pre-32a21542`、
+  `chat_ds-claude-runner:rollback-pre-32a21542`，中间 Runner 版本另保留
+  `chat_ds-claude-runner:deploy-32a21542`，最终版本保留 `chat_ds-claude-runner:deploy-9dc2b69f`。
+- 最终生产 Backend、Frontend、Supervisor image 分别为
+  `sha256:52921a0687e46ef2c05dd486002492249e9a5dcfa5281e32d9bfcbe1810b8bf4`、
+  `sha256:3f9e33d9ea0002e5a5aef8c87f4bf8f806dfc7eaec76a6eb41f18922c10bb39c`、
+  `sha256:8b996b0c0066a0397e730418a6188c78760ca01d01bc4ad3a837b609a3d47526`，revision label
+  精确为 `32a21542...`；Runner 为
+  `sha256:3b172c1b8b0c00a0e9aa037249b5d34b73fe911ed4d53484e205db054370ed1a`，revision 精确为
+  `9dc2b69f...`。Runner 内原生 Claude Code 仍为 2.1.152，二进制 SHA-256 与部署前相同：
+  `5155bdca27f754aba0d2fe2f80336f5fd4793224561c234a723f0ccef654a8e8`。四容器均 running、
+  restart 0，Backend/Supervisor healthy；`127.0.0.1`、`10.10.132.126`、`172.30.100.128`
+  三入口 `/api/health` 均 200，部署后严重日志 0。
+- 最终真实轻量 E2E 使用全新临时 Session、空 Skill、`deepseek_v4_pro` 和固定纯文本请求；新 Session
+  默认权限为 `workspace_write`。SSE 唯一终态为 `succeeded/end_turn`，termination source 为
+  `upstream_claude_code_completed`；持久 Run 为 `succeeded`，assistant Message 带精确 `run_id`，
+  七个 durable activity events 覆盖 workflow/progress/content/projection，最后以
+  `projection.status=committed` 收口。临时 Session 随后通过正常删除 API 清理，数据库残留、动态 Turn
+  容器、nonterminal Run、active Engine Session 和 enabled schedule 均为 0。
 
 ## 2026-08-13 ClaudeCodeEngine 薄适配边界
 
