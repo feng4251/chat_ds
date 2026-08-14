@@ -53,12 +53,21 @@ def test_native_root_and_child_streams_preserve_authority_boundaries():
     root_chunk = projector.project(_native(
         2, "assistant/chunk", {"chunk": {"type": "text-delta", "text": "answer"}}
     ))
-    assert [(event.kind, event.data.get("delta")) for event in root_chunk] == [
+    assert [(event.kind, event.data.get("text")) for event in root_chunk] == [
         ("content", "answer")
     ]
 
-    child = projector.project(_native(
+    root_reasoning = projector.project(_native(
         3,
+        "assistant/chunk",
+        {"chunk": {"type": "reasoning-delta", "text": "inspect evidence"}},
+    ))
+    assert [(event.kind, event.data.get("text")) for event in root_reasoning] == [
+        ("reasoning", "inspect evidence")
+    ]
+
+    child = projector.project(_native(
+        4,
         "assistant/chunk",
         {"chunk": {"type": "text-delta", "text": "worker evidence"}},
         session="renamed-worker-session",
@@ -70,13 +79,13 @@ def test_native_root_and_child_streams_preserve_authority_boundaries():
     assert child[0].data["parent_run_id"] == root
 
     native_end = projector.project(_native(
-        4, "turn/end", {"reason": {"kind": "completed"}}
+        5, "turn/end", {"reason": {"kind": "completed"}}
     ))
     assert native_end[0].data["event_type"] == "run.progress"
     assert native_end[0].data["payload"]["stage"] == "native_turn_settled"
 
     terminal = projector.project({
-        "seq": 5,
+        "seq": 6,
         "event": {"type": "chatds.supervisor.terminal", "status": "succeeded"},
     })
     assert [event.kind for event in terminal] == ["agent_event", "finish"]

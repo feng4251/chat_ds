@@ -179,11 +179,11 @@ class DeepSeekEventProjector:
                 text = str(chunk.get("text") or "")
                 if text and chunk_type == "text-delta" and depth <= 0:
                     projected.append(EngineStreamEvent(
-                        "content", {"delta": text}, raw=dict(envelope)
+                        "content", {"text": text}, raw=dict(envelope)
                     ))
                 elif text and chunk_type == "reasoning-delta" and depth <= 0:
                     projected.append(EngineStreamEvent(
-                        "reasoning", {"delta": text}, raw=dict(envelope)
+                        "reasoning", {"text": text}, raw=dict(envelope)
                     ))
                 elif text and depth > 0:
                     # A child Session is observable workflow state, not a
