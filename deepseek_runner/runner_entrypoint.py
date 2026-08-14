@@ -393,21 +393,6 @@ def _environment(
         str(value) for value in config.get("tools", [])
         if isinstance(value, str)
     }
-
-
-def _native_command(config: dict[str, Any], mcp_patch: Path) -> list[str]:
-    """Build the immutable upstream CLI invocation for one isolated Turn."""
-
-    return [
-        "/usr/local/bin/node",
-        "--expose-internals",
-        "--use-env-proxy",
-        "/opt/deepseek-harness/apps/cli/lib/bin.js",
-        "--profile", "headless",
-        "--patch", "/opt/chatds-deepseek-plugins/chatds.patch.yml",
-        "--patch", str(mcp_patch),
-        str(config["prompt"]),
-    ]
     shell_tools = {
         "execute_code", "run_skill_python", "run_skill_script",
         "run_declared_command", "skill_http_get", "skill_http_post_json",
@@ -456,6 +441,21 @@ def _native_command(config: dict[str, Any], mcp_patch: Path) -> list[str]:
         "NODE_USE_ENV_PROXY": "1",
         **trust,
     }
+
+
+def _native_command(config: dict[str, Any], mcp_patch: Path) -> list[str]:
+    """Build the immutable upstream CLI invocation for one isolated Turn."""
+
+    return [
+        "/usr/local/bin/node",
+        "--expose-internals",
+        "--use-env-proxy",
+        "/opt/deepseek-harness/apps/cli/lib/bin.js",
+        "--profile", "headless",
+        "--patch", "/opt/chatds-deepseek-plugins/chatds.patch.yml",
+        "--patch", str(mcp_patch),
+        str(config["prompt"]),
+    ]
 
 
 def main() -> int:

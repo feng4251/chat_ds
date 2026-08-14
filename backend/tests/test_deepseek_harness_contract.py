@@ -20,6 +20,7 @@ from agent_engines.deepseek_harness import (  # noqa: E402
 from deepseek_runner.runner_entrypoint import (  # noqa: E402
     NativeEventForwarder,
     _compile_mcp_patch,
+    _environment,
     _native_command,
 )
 from deepseek_runner.config import state_volume_host_root  # noqa: E402
@@ -184,6 +185,30 @@ def test_native_headless_command_satisfies_upstream_loader_contract(tmp_path):
         "/opt/deepseek-harness/apps/cli/lib/bin.js",
     ]
     assert command[-1] == "renamed cross-domain task"
+
+
+def test_native_worker_environment_is_explicit_and_session_scoped(monkeypatch, tmp_path):
+    monkeypatch.setenv("DEEPSEEK_HARNESS_PROVIDER_API_KEY", "test-only-provider-key")
+    environment = _environment(
+        {
+            "permission_preset": "workspace_write",
+            "tools": ["read_file", "web_search"],
+            "provider_base_url": "https://provider.invalid/v1",
+            "api_model": "renamed-model",
+            "context_window_tokens": 128_000,
+            "max_output_tokens": 8_192,
+            "web_search_enabled": True,
+            "searxng_search_url": "http://search.invalid/search",
+        },
+        proxy_url="http://127.0.0.1:43123",
+        trust={"SSL_CERT_FILE": str(tmp_path / "ca.pem")},
+        worker_tmp=tmp_path,
+    )
+    assert environment["HOME"] == "/state/home"
+    assert environment["DSH_HOME"] == "/state/dsh"
+    assert environment["DSH_PERMISSION_MODE"] == "workspace-write"
+    assert environment["CHATDS_DSH_MODEL"] == "renamed-model"
+    assert environment["DEEPSEEK_API_KEY"] == "test-only-provider-key"
 
 
 class _RecordingLedger:
