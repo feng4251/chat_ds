@@ -2,6 +2,68 @@
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
+## 2026-08-14 DeepSeek Harness 平级引擎最终部署闭环
+
+- DeepSeek Harness 平级引擎已完成、提交并部署生产。功能提交链为
+  `1de97739`（平级引擎、Session/Turn 隔离、UI Harness 选择器、SearXNG）、
+  `71f4aa93`（模型/provider binding）、`d4f71e33`（Docker daemon volume
+  namespace）、`c3a91cd8`（官方 workspace package/plugin graph）、`8fbc5277`
+  （官方 permission preset）、`1a2131bb`（官方 headless loader flag）、
+  `e5cef02e`（显式 Session worker environment）和 `e61ab07e`（原生 assistant
+  event 到 ChatDS DTO 的正文/思考投影）。上游
+  `deepseek-harness-clean/` 仍是未修改的独立子模块，精确 commit
+  `47f943859bef60e4160492346772ded9b24f765a` / `0.1.0-rc.5`；ChatDS 只在
+  `deepseek_runner/` 和 Backend `AgentEngine` adapter 中做多用户 Web 外壳适配。
+- 每个 Turn 使用一个 fresh、`network_mode=none` 的非特权容器；只挂当前 user/current
+  Session 的 workspace、Session-owned state、immutable Skill view 和 controller receipt，
+  不挂其他 user/Session、宿主代码、Docker socket 或 ambient HOME。PID 1 是唯一可信控制面，
+  负责签名 exact egress、artifact audit、cancel/cleanup 和唯一 authoritative terminal。
+  Turn 完成后容器被删除，workspace/state 通过精确 Session mount 保留。
+- Frontend 输入区的 Harness selector 已位于 model selector 左侧。Engine/model compatibility
+  是部署数据驱动、fail-closed；首次 durable message/run 后 engine 锁定，切换需 fork。
+  Scheduler、Conversation cleanup 和 lifecycle 使用通用 native-engine 路径，同时覆盖 Claude
+  Code 与 DeepSeek Harness；Legacy 仍保留为 history/rollback，Claude Code 原生内核未改。
+- DeepSeek Harness 的 `web_search` 使用官方 Web provider plugin 接到 ChatDS SearXNG。
+  模型/搜索都经 policy-v3 签名 exact egress，Turn 容器本身没有网络；SearXNG 由
+  `deepseek-harness` Compose profile 启动，未开放成任意宿主端口。真实生产 E2E 中 DSH
+  发出 `web_search`、得到成功 tool result，并返回
+  `https://github.com/deepseek-ai/deepseek-harness`；SSE、持久 assistant 和唯一成功终态一致。
+- 最后一项真实 E2E 缺陷不是 DSH/model/provider/sandbox/network：官方 ledger 已包含完整
+  `assistant/chunk` 的 `text-delta`/`reasoning-delta`，但旧 adapter 把 ChatDS 标准字段误写为
+  `delta` 而 `_NormalizedEngineResponse` 只接受 `text`，造成持久 assistant 为空。
+  `e61ab07e` 将跨引擎 DTO 统一为 `{"text": ...}`，并用官方事件形状及重命名 child fixture
+  回归。官方 DSH `apps/cli/tests/built-bin.e2e.ts` 同样逐个累加 `chunk.text`，
+  `packages/bundle/headless/src/index.ts` 从 `assistant/message` 汇总最终文本；采用实时 chunk +
+  machine terminal，拒绝从模型 prose 推断控制状态。成熟对照冻结本地 `claude-code/`
+  `6f6f12b37f529488b10e53928dd5508bb93535c7`；其 `src/cli/print.ts` 分离流事件与最终
+  `result` 的做法被适配在同一个 normalized event/authoritative terminal 边界后，没有复制
+  stub 或修改任一原生内核。
+- 最终真实文本 E2E 经 `127.0.0.1:5173` 完整通过：stream 文本、持久 assistant 均精确为
+  `DSH_PROXY_OK`，reasoning 有 72 字符，且只有一个 `run.completed` 和一个
+  `stream_terminal=succeeded`；成功临时 Session 已用正常删除 API 清理。前述真实搜索 E2E
+  也通过并清理。没有运行模型重型 V2.3；它仍由用户手工验收。
+- 最终回归为 Backend `341 passed`（临时测试路径补入与生产相同的
+  `croniter==6.2.4`；缺该环境依赖时先得到 339 pass + 2 个预期
+  `schedule_parser_unavailable`）、DeepSeek/Claude engine 契约 `58 passed`、Frontend
+  `47 passed` 与 production build。Compose `deepseek-harness` profile、SQLite
+  `quick_check=ok`/foreign-key violations 0、三入口
+  `127.0.0.1`/`10.10.132.126`/`172.30.100.128` `/api/health` 200、零 nonterminal
+  AgentRun/active Engine Session/running schedule/dynamic DSH Turn container 均通过。
+- 最终 Backend 从 exact clean archive `/tmp/chat_ds_deploy_e61ab07e.s9aeLB` 构建，image
+  `sha256:f20234a48aeb5468e6b7b9a25ea111060b41c79b7279541bc5a4cfc30b0cb742`；
+  Frontend 为 `sha256:116685c5a4a9ac779e00305c27421f08935826275c547b88ef9332a4ab3293db`；
+  DeepSeek Supervisor 为
+  `sha256:505430c29a5a62076c7ab6d0ed0de204b0710c7c2852fb62391327848625b08f`；
+  Runner 为 `sha256:7487f260e26f9902ce57df65bb4ebaf248c25502613112df03dca9bdb7ee1030`。
+  容器均 running、restart 0，Backend/Supervisor healthy。Backend 切换前镜像保留为
+  `chat_ds-backend:rollback-pre-e61ab07e`（image
+  `sha256:0eb7fc25a910856ed785adf70d47e11e78fd3fdbe22382cef993b9580fd98cde`）；整个功能前
+  Git 回滚锚点为 annotated tag `rollback/pre-deepseek-engine-20260814`，peeled commit
+  `ff0e7971b4aa6701a1f439f0df30702ffb4212af`。
+- 两项用户自有 tracked deletion 继续只留在 worktree，未 stage/恢复/提交：
+  `XGAL-101_Galectin-3_AD_Comprehensive_Development_Plan_v1.0_claudecode执行参考.md`
+  与 `xClinicalTrial-Design-V2.2.zip`。Git 仍仅本地提交，未 push。
+
 ## 2026-08-14 DeepSeek Harness 平级引擎实现（部署前）
 
 - 官方 `deepseek-ai/deepseek-harness` 以独立 Git 子模块固定在
