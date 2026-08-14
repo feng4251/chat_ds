@@ -27,6 +27,7 @@ class Settings:
     internal_token: str
     workspace_host_root: Path
     state_root: Path
+    state_volume: str
     runner_image: str
     egress_proxy_volume: str
     workspace_lock_volume: str
@@ -87,6 +88,24 @@ def _canonical_http_base(value: str) -> str:
     ):
         raise DeepSeekRunnerConfigurationError("Provider base URL is invalid")
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
+
+
+def state_volume_host_root(client, volume_name: str) -> Path:
+    """Translate a named volume into the Docker daemon's path namespace."""
+
+    volume = client.volumes.get(volume_name)
+    attrs = volume.attrs or {}
+    mountpoint = str(attrs.get("Mountpoint") or "")
+    if (
+        attrs.get("Name") != volume_name
+        or attrs.get("Driver") != "local"
+        or not mountpoint.startswith("/")
+        or ".." in Path(mountpoint).parts
+    ):
+        raise DeepSeekRunnerConfigurationError(
+            "DeepSeek Harness state volume attestation is unavailable"
+        )
+    return Path(mountpoint)
 
 
 def _profiles() -> dict[str, ProviderProfile]:
@@ -154,7 +173,11 @@ def load_settings() -> Settings:
         "DEEPSEEK_HARNESS_WORKSPACE_LOCK_VOLUME_NAME",
         "chat_ds_workspace_mutation_locks",
     ).strip()
-    if not image or not proxy_volume or not lock_volume:
+    state_volume = os.environ.get(
+        "DEEPSEEK_HARNESS_RUNNER_STATE_VOLUME_NAME",
+        "chat_ds_deepseek_runner_state",
+    ).strip()
+    if not image or not proxy_volume or not lock_volume or not state_volume:
         raise DeepSeekRunnerConfigurationError("Runtime image or volume is unavailable")
     search_url = _canonical_http_base(
         os.environ.get(
@@ -194,6 +217,7 @@ def load_settings() -> Settings:
             ),
             must_exist=False,
         ),
+        state_volume=state_volume,
         runner_image=image,
         egress_proxy_volume=proxy_volume,
         workspace_lock_volume=lock_volume,

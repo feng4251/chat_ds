@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field, model_validator
 from claude_runner.policy import compile_turn_egress_policy, verify_skill_view
 from workspace_lock import workspace_mutation_guard
 
-from .config import ProviderProfile, Settings, load_settings
+from .config import ProviderProfile, Settings, load_settings, state_volume_host_root
 
 
 SAFE_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -226,9 +226,10 @@ def _prompt(messages: list[dict[str, Any]]) -> str:
 
 
 class Manager:
-    def __init__(self, settings: Settings, client) -> None:
+    def __init__(self, settings: Settings, client, *, state_host_root: Path) -> None:
         self.settings = settings
         self.client = client
+        self.state_host_root = state_host_root
         self.tasks: dict[str, asyncio.Task[None]] = {}
         self.semaphore = asyncio.Semaphore(settings.max_concurrent_runs)
         self.guard = asyncio.Lock()
@@ -236,6 +237,9 @@ class Manager:
 
     def _control(self, user: str, conversation: str, run: str) -> Path:
         return self.settings.state_root / "users" / user / conversation / "runs" / run
+
+    def _control_host(self, user: str, conversation: str, run: str) -> Path:
+        return self.state_host_root / "users" / user / conversation / "runs" / run
 
     def _locator(self, run: str) -> Path:
         if not SAFE_ID.fullmatch(run):
@@ -355,10 +359,9 @@ class Manager:
                 },
                 str(state): {"bind": "/state", "mode": "rw"},
                 str(skill): {"bind": "/skill-view", "mode": "ro"},
-                str(control): {"bind": "/run/chatds-control", "mode": "rw"},
-                str(control / "request.json"): {
-                    "bind": "/run/chatds-control/request.json", "mode": "ro",
-                },
+                str(self._control_host(
+                    request.user_id, request.conversation_id, request.run_id
+                )): {"bind": "/run/chatds-control", "mode": "rw"},
                 self.settings.egress_proxy_volume: {
                     "bind": "/run/chatds-skill-egress", "mode": "ro",
                 },
@@ -442,10 +445,11 @@ class Manager:
                     if _terminal(events) is None:
                         _append_terminal(events, "failed", "run_hard_timeout")
                 if _terminal(events) is None:
+                    failure_code = _container_failure_code(container, exit_code)
                     _append_terminal(
                         events,
                         "failed",
-                        "runner_process_exited_before_terminal" if exit_code else "terminal_missing",
+                        failure_code if exit_code else "terminal_missing",
                     )
         except asyncio.CancelledError:
             if container is not None:
@@ -583,6 +587,24 @@ def _verify_runner_image(image) -> None:
         raise RuntimeError("deepseek_runner_image_attestation_missing")
 
 
+def _container_failure_code(container, exit_code: int) -> str:
+    """Persist a bounded machine code, never arbitrary container stderr."""
+
+    try:
+        payload = container.logs(stdout=False, stderr=True, tail=32)
+    except (DockerException, NotFound):
+        payload = b""
+    for raw in reversed(payload.decode("utf-8", errors="replace").splitlines()):
+        try:
+            row = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        code = str(row.get("code") or "") if isinstance(row, dict) else ""
+        if re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", code):
+            return code
+    return f"runner_process_exited_before_terminal:exit_{exit_code}"
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global settings, manager
@@ -591,10 +613,11 @@ async def lifespan(_app: FastAPI):
     client = docker.from_env()
     client.ping()
     image = client.images.get(settings.runner_image)
+    state_host_root = state_volume_host_root(client, settings.state_volume)
     client.volumes.get(settings.egress_proxy_volume)
     client.volumes.get(settings.workspace_lock_volume)
     _verify_runner_image(image)
-    manager = Manager(settings, client)
+    manager = Manager(settings, client, state_host_root=state_host_root)
     # This supervisor deliberately does not replay an in-flight model process
     # after its trusted controller has been replaced. Revoke every exact-owned
     # container first; only then may stale rows receive a durable failed

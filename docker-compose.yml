@@ -579,6 +579,7 @@ services:
         {"shaiengine":{"base_url":"${SHAIENGINE_BASE_URL:-https://api.shaiengine.com/v1}","api_key_env":"SHAIENGINE_API_KEY","protocol":"openai","models":["glm-5.2","deepseek-v4-pro","kimi-k3"],"context_windows":{"glm-5.2":1000000,"deepseek-v4-pro":200000,"kimi-k3":1000000}},"local_agentmodel":{"base_url":"${DEEPSEEK_PRO_BASE_URL:-http://10.10.132.2:1025/v1}","api_key_env":"DEEPSEEK_PRO_API_KEY","protocol":"openai","models":["AgentModel"],"context_windows":{"AgentModel":918528}},"local_deepseek_v4_flash":{"base_url":"${LOCAL_DEEPSEEK_V4_FLASH_BASE_URL:-http://10.10.132.126:1025/v1}","api_key_env":"LOCAL_DEEPSEEK_V4_FLASH_API_KEY","protocol":"openai","models":["AgentModel"],"context_windows":{"AgentModel":1048576}},"local_qwen":{"base_url":"${QWEN3_5_BASE_URL:-http://10.10.132.128:1025/v1}","api_key_env":"QWEN3_5_API_KEY","protocol":"openai","models":["qwen3_5"],"context_windows":{"qwen3_5":262144}}}
       DEEPSEEK_HARNESS_WORKSPACE_HOST_ROOT: /nfs/temp/chat_ds
       DEEPSEEK_HARNESS_RUNNER_STATE_ROOT: /var/lib/chatds-deepseek-harness-runner
+      DEEPSEEK_HARNESS_RUNNER_STATE_VOLUME_NAME: ${DEEPSEEK_HARNESS_RUNNER_STATE_VOLUME_NAME:-chat_ds_deepseek_runner_state}
       DEEPSEEK_HARNESS_RUNNER_IMAGE: chat_ds-deepseek-harness-runner:0.1.0-rc.5
       DEEPSEEK_HARNESS_EGRESS_PROXY_VOLUME_NAME: ${SKILL_EGRESS_PROXY_VOLUME_NAME:-chat_ds_skill_egress_proxy_socket}
       DEEPSEEK_HARNESS_WORKSPACE_LOCK_VOLUME_NAME: ${WORKSPACE_MUTATION_LOCK_VOLUME_NAME:-chat_ds_workspace_mutation_locks}
@@ -977,6 +978,7 @@ volumes:
   claude_runner_state:
     driver: local
   deepseek_runner_state:
+    name: ${DEEPSEEK_HARNESS_RUNNER_STATE_VOLUME_NAME:-chat_ds_deepseek_runner_state}
     driver: local
   searxng_data:
     driver: local

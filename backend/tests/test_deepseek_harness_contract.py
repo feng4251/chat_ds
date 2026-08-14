@@ -21,6 +21,7 @@ from deepseek_runner.runner_entrypoint import (  # noqa: E402
     NativeEventForwarder,
     _compile_mcp_patch,
 )
+from deepseek_runner.config import state_volume_host_root  # noqa: E402
 from routers.chat_router import (  # noqa: E402
     BUILTIN,
     _effective_engine_tools,
@@ -149,6 +150,28 @@ def test_engine_payload_binds_only_exact_session_workspace_and_profile():
     assert payload["provider_profile"] == "deployment-profile"
     assert payload["tools"] == ["read_file", "write_file"]
     assert "api_key" not in payload
+
+
+def test_daemon_volume_mountpoint_is_used_for_dynamic_run_bind(tmp_path):
+    class Volume:
+        attrs = {
+            "Name": "renamed-state-volume",
+            "Driver": "local",
+            "Mountpoint": str(tmp_path / "daemon-volume-data"),
+        }
+
+    class Volumes:
+        @staticmethod
+        def get(name):
+            assert name == "renamed-state-volume"
+            return Volume()
+
+    class Client:
+        volumes = Volumes()
+
+    root = state_volume_host_root(Client(), "renamed-state-volume")
+    assert root == tmp_path / "daemon-volume-data"
+    assert str(root).startswith(str(tmp_path))
 
 
 class _RecordingLedger:
