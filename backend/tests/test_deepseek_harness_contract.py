@@ -21,7 +21,11 @@ from deepseek_runner.runner_entrypoint import (  # noqa: E402
     NativeEventForwarder,
     _compile_mcp_patch,
 )
-from routers.chat_router import _effective_engine_tools  # noqa: E402
+from routers.chat_router import (  # noqa: E402
+    BUILTIN,
+    _effective_engine_tools,
+    resolve_model_config,
+)
 
 
 def _native(seq, native_type, data=None, *, session="root-native", depth=0):
@@ -91,6 +95,22 @@ def test_tool_grants_compile_data_driven_and_fail_closed_for_unknown_names():
         "delegate_task",
     ]
     assert _effective_engine_tools("renamed_engine", requested) == requested
+
+
+@pytest.mark.asyncio
+async def test_builtin_model_resolution_preserves_native_engine_bindings():
+    """Dispatch resolution must not discard deployment-owned engine authority."""
+
+    for model_id, declared in BUILTIN.items():
+        if model_id == "AgentModel":
+            continue
+        resolved = await resolve_model_config(model_id, object(), None)
+        assert resolved.get("claude_provider_profile") == declared.get(
+            "claude_provider_profile"
+        )
+        assert resolved.get("deepseek_harness_provider_profile") == declared.get(
+            "deepseek_harness_provider_profile"
+        )
 
 
 def test_engine_payload_binds_only_exact_session_workspace_and_profile():

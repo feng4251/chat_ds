@@ -3463,6 +3463,9 @@ async def resolve_model_config(model_id: str, cur_user: User, db: AsyncSession) 
             "api_model": cfg["api_model"],
             "provider": cfg.get("provider", "builtin"),
             "claude_provider_profile": cfg.get("claude_provider_profile"),
+            "deepseek_harness_provider_profile": cfg.get(
+                "deepseek_harness_provider_profile"
+            ),
             "protocol": cfg.get("protocol", "openai"),
             "is_multimodal": cfg["is_multimodal"],
             "context_length": cfg.get("context_length", 262144),
