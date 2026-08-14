@@ -29,11 +29,12 @@
     mode: !!js process.env.DSH_PERMISSION_MODE
     workspaceRoot: !!js process.cwd()
 
-# Headless has no browser answerer. Operations inside workspace-write need no
-# escalation; every operation that does ask is deterministically rejected.
-- id: approval
+# Pin the same official preset selected by DSH_PERMISSION_MODE. The upstream
+# bundle owns the matching approval rule: confined modes ask (and fail closed
+# without an answerer), while danger-full-access uses never.
+- id: permission
   config:
-    policy: never
+    defaultPreset: !!js process.env.DSH_PERMISSION_MODE
 
 - id: tool-bash
   disabled: !!js process.env.CHATDS_DSH_SHELL_ENABLED !== '1'
