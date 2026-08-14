@@ -7,6 +7,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 import 'highlight.js/styles/github-dark.css'
+import TurnTimeline from './TurnTimeline'
 
 const PROJECTION_LABELS = {
   active_runs: '活动任务',
@@ -216,7 +217,7 @@ const mdComponents = {
   hr: () => <hr className="border-slate-200 my-4" />,
 }
 
-export function MessageBubble({ msg, onRegenerate }) {
+export function MessageBubble({ msg, onRegenerate, onApproval }) {
   const [copied, setCopied] = useState(false)
   const [userShowReasoning, setUserShowReasoning] = useState(null)
   const [showToolProgress, setShowToolProgress] = useState(false)
@@ -279,6 +280,7 @@ export function MessageBubble({ msg, onRegenerate }) {
   const hasToolProgress = !!msg.tool_progress
   const hasReasoning = !!msg.reasoning
   const toolLines = hasToolProgress ? msg.tool_progress.split('\n').filter(Boolean) : []
+  const hasActivityTimeline = Array.isArray(msg.activityNodes) && msg.activityNodes.length > 0
 
   return (
     <div className="flex justify-start mb-5 fade-in-up">
@@ -288,7 +290,7 @@ export function MessageBubble({ msg, onRegenerate }) {
         </div>
 
         <div className="flex-1 min-w-0">
-          {hasToolProgress && (
+          {!hasActivityTimeline && hasToolProgress && (
             <div className="mb-1.5">
               <button
                 onClick={() => setShowToolProgress((v) => !v)}
@@ -309,7 +311,7 @@ export function MessageBubble({ msg, onRegenerate }) {
             </div>
           )}
 
-          {hasReasoning && (
+          {!hasActivityTimeline && hasReasoning && (
             <div className="mb-1.5">
               <button
                 onClick={toggleReasoning}
@@ -349,7 +351,13 @@ export function MessageBubble({ msg, onRegenerate }) {
             </div>
           )}
 
-          {isError ? (
+          {hasActivityTimeline ? (
+            <TurnTimeline
+              nodes={msg.activityNodes}
+              streaming={Boolean(msg.streaming)}
+              onApproval={onApproval}
+            />
+          ) : isError ? (
             <div className="flex items-start gap-2 px-3.5 py-2.5 bg-red-50 border border-red-200 rounded-xl text-sm text-red-700">
               <FiAlertCircle className="mt-0.5 shrink-0" size={14} />
               <span className="flex-1 whitespace-pre-wrap">{msg.content.replace(/^错误:/, '').trim()}</span>

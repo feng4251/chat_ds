@@ -16,7 +16,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 
 try:
     import docker
@@ -110,6 +110,9 @@ class StartRunRequest(BaseModel):
     )
     source: str = Field(default="chat", max_length=24)
     user_turn_text: str = Field(default="", max_length=2_000_000)
+    permission_preset: Literal[
+        "read_only", "workspace_write", "session_full"
+    ] = "session_full"
 
     @model_validator(mode="after")
     def bounded_payload(self):
@@ -124,6 +127,11 @@ class StartRunRequest(BaseModel):
 class RunIdentityRequest(BaseModel):
     user_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     conversation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+
+
+class ApprovalDecisionRequest(RunIdentityRequest):
+    request_seq: int = Field(ge=1)
+    decision: Literal["allow", "deny"]
 
 
 class SessionIdentityRequest(BaseModel):
@@ -295,6 +303,7 @@ class RunManager:
                 "skill_diagnostics", []
             ),
             "source": request.source,
+            "permission_preset": request.permission_preset,
             "egress_policy": policy,
         }
         digest = _canonical_sha256(sanitized)
@@ -990,7 +999,12 @@ class RunManager:
                 ).hexdigest(),
             }
             volumes = {
-                str(workspace): {"bind": "/workspace", "mode": "rw"},
+                str(workspace): {
+                    "bind": "/workspace",
+                    "mode": (
+                        "ro" if request.permission_preset == "read_only" else "rw"
+                    ),
+                },
                 str(state): {"bind": "/state", "mode": "rw"},
                 str(skill_view): {"bind": "/skill-view", "mode": "ro"},
                 str(request_path): {"bind": "/run/chatds/request.json", "mode": "ro"},
@@ -1284,6 +1298,82 @@ class RunManager:
             admission / "status.json", status=terminal, phase="terminal"
         )
         return True
+
+    async def decide_approval(
+        self,
+        run_id: str,
+        request_id: str,
+        decision: ApprovalDecisionRequest,
+    ) -> dict[str, Any]:
+        """Commit one decision to the active Turn's controller mailbox."""
+
+        if re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request_id) is None:
+            raise HTTPException(400, "Invalid approval request id")
+        locator = self._read_run_locator(run_id)
+        if (
+            locator.get("user_id") != decision.user_id
+            or locator.get("conversation_id") != decision.conversation_id
+        ):
+            raise HTTPException(404, "Run not found")
+        run_dir = self._run_dir(
+            decision.user_id, decision.conversation_id, run_id
+        )
+        request = _read_json(run_dir / "request.json")
+        if request.get("permission_preset") != "workspace_write":
+            raise HTTPException(409, "Run does not accept interactive approvals")
+        if _terminal_status(run_dir / "events.jsonl") is not None:
+            raise HTTPException(409, "Run is no longer active")
+        native_request: dict[str, Any] | None = None
+        try:
+            with (run_dir / "events.jsonl").open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    envelope = json.loads(line)
+                    if int(envelope.get("seq") or 0) != decision.request_seq:
+                        continue
+                    event = envelope.get("event")
+                    inner = event.get("request") if isinstance(event, dict) else None
+                    if (
+                        isinstance(event, dict)
+                        and event.get("type") == "control_request"
+                        and event.get("request_id") == request_id
+                        and isinstance(inner, dict)
+                        and inner.get("subtype") == "can_use_tool"
+                    ):
+                        native_request = event
+                    break
+        except (OSError, ValueError, TypeError) as exc:
+            raise HTTPException(409, "Approval request is not durable") from exc
+        if native_request is None:
+            raise HTTPException(409, "Approval request is stale or not durable")
+        inner = native_request["request"]
+        mailbox = run_dir / "approvals"
+        mailbox.mkdir(mode=0o700, exist_ok=True)
+        response_path = mailbox / (
+            hashlib.sha256(request_id.encode()).hexdigest() + ".json"
+        )
+        response = {
+            "schema": "chatds.claude-approval.v1",
+            "run_id": run_id,
+            "request_id": request_id,
+            "request_seq": decision.request_seq,
+            "decision": decision.decision,
+            "tool_name": str(inner.get("tool_name") or "tool")[:512],
+        }
+        if response_path.exists():
+            existing = _read_json(response_path)
+            if existing != response:
+                raise HTTPException(409, "Approval request already has another decision")
+            return {
+                "accepted": True,
+                "idempotent": True,
+                "status": "allowed" if decision.decision == "allow" else "denied",
+            }
+        _atomic_json(response_path, response, mode=0o600)
+        return {
+            "accepted": True,
+            "idempotent": False,
+            "status": "allowed" if decision.decision == "allow" else "denied",
+        }
 
     async def cleanup_session(self, user_id: str, conversation_id: str) -> dict[str, Any]:
         state = self._session_state(user_id, conversation_id)
@@ -1652,6 +1742,7 @@ def _recover_start_request(path: Path) -> StartRunRequest:
         ),
         "source": value.get("source") or "chat",
         "user_turn_text": "",
+        "permission_preset": value.get("permission_preset") or "session_full",
     })
 
 
@@ -2190,6 +2281,17 @@ async def cancel_run(
 ):
     assert manager is not None
     return {"success": await manager.cancel(run_id, payload)}
+
+
+@app.post("/v1/runs/{run_id}/approvals/{request_id}")
+async def decide_approval(
+    run_id: str,
+    request_id: str,
+    payload: ApprovalDecisionRequest,
+    _auth=Depends(_require_internal_token),
+):
+    assert manager is not None
+    return await manager.decide_approval(run_id, request_id, payload)
 
 
 @app.post("/v1/sessions/{conversation_id}/cleanup")

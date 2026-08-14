@@ -25,6 +25,7 @@ from models import (
     AgentEngineSession,
     AgentRun,
     AgentRunEvent,
+    TurnActivityEvent,
     Artifact,
     Conversation,
     CustomModelConfig,
@@ -35,6 +36,7 @@ from models import (
     TaskItem,
 )
 from schemas import (
+    ApprovalDecision,
     ConversationSettingsUpdate,
     GoalUpdate,
     WorkspaceFileWrite,
@@ -344,6 +346,7 @@ async def get_conversation_settings(
         "enabled_tools": serialize_json_list(conv.enabled_tools, DEFAULT_NATIVE_TOOLS),
         "fallback_model_ids": fallback_model_ids,
         "enabled_user_skills": serialize_json_list(conv.enabled_user_skills, []),
+        "permission_preset": conv.permission_preset,
         "usage": {
             "input_tokens": conv.input_tokens,
             "output_tokens": conv.output_tokens,
@@ -415,6 +418,19 @@ async def update_conversation_settings(
         if invalid:
             raise HTTPException(400, f"Unknown user-level skills: {sorted(invalid)}")
         conv.enabled_user_skills = json.dumps(list(dict.fromkeys(payload.enabled_user_skills)))
+    if payload.permission_preset is not None:
+        active_runs = int((await db.execute(
+            select(func.count(AgentRun.id)).where(
+                AgentRun.conversation_id == cid,
+                AgentRun.status.in_(("queued", "running", "committing")),
+            )
+        )).scalar_one())
+        if active_runs:
+            raise HTTPException(
+                409,
+                "Permission preset cannot change while a Turn is active",
+            )
+        conv.permission_preset = payload.permission_preset
     if conv.engine_id == "claude_code":
         from routers.chat_router import (
             claude_code_model_compatible,
@@ -1362,6 +1378,7 @@ async def _fork_conversation_impl(
                         title=expected_title,
                         model_id=effective_target_model,
                         engine_id=effective_target_engine,
+                        permission_preset=source.permission_preset,
                         enabled_tools=source.enabled_tools,
                         fallback_model_ids=source.fallback_model_ids,
                         enabled_user_skills=source.enabled_user_skills,
@@ -3039,6 +3056,152 @@ async def get_native_run_events(
         "limit": limit,
         "after": after,
     }
+
+
+@router.get("/{cid}/activity-events")
+async def get_turn_activity_events(
+    cid: str,
+    root_run_id: str | None = Query(default=None, max_length=32),
+    after: int = Query(default=0, ge=0),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=1000, ge=1, le=2000),
+    user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Replay the same safe ordered DTO used by the live SSE stream."""
+
+    await _conversation(cid, user.id, db)
+    if root_run_id is None and after:
+        raise HTTPException(
+            400,
+            "The after cursor is root-run scoped; use offset for a Session replay",
+        )
+    query = select(TurnActivityEvent).where(
+        TurnActivityEvent.conversation_id == cid,
+        TurnActivityEvent.user_id == user.id,
+    )
+    if root_run_id:
+        owned = (await db.execute(
+            select(AgentRun.id).where(
+                AgentRun.id == root_run_id,
+                AgentRun.conversation_id == cid,
+                AgentRun.user_id == user.id,
+            )
+        )).scalar_one_or_none()
+        if owned is None:
+            raise HTTPException(404, "Run not found")
+        query = query.where(
+            TurnActivityEvent.root_run_id == root_run_id,
+            TurnActivityEvent.seq > after,
+        )
+    ordered = query.order_by(
+            TurnActivityEvent.event_time,
+            TurnActivityEvent.root_run_id,
+            TurnActivityEvent.seq,
+        )
+    if not root_run_id:
+        ordered = ordered.offset(offset)
+    rows = (await db.execute(ordered.limit(limit + 1))).scalars().all()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    return {
+        "events": [
+            {
+                "schema": "chatds.turn-activity.v1",
+                "event_id": row.id,
+                "conversation_id": row.conversation_id,
+                "root_run_id": row.root_run_id,
+                "run_id": row.run_id,
+                "seq": row.seq,
+                "node_id": row.node_id,
+                "kind": row.kind,
+                "operation": row.operation,
+                "payload": json.loads(row.payload),
+                "event_time": str(row.event_time),
+            }
+            for row in rows
+        ],
+        "has_more": has_more,
+        "next_after": rows[-1].seq if root_run_id and rows else None,
+        "next_offset": (
+            offset + len(rows) if not root_run_id and rows else None
+        ),
+    }
+
+
+@router.post("/{cid}/runs/{run_id}/approvals/{request_id}")
+async def decide_turn_approval(
+    cid: str,
+    run_id: str,
+    request_id: str,
+    payload: ApprovalDecision,
+    user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Resolve one native Claude permission request, once and fail-closed."""
+
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request_id):
+        raise HTTPException(400, "Invalid approval request id")
+    conv = await _conversation(cid, user.id, db)
+    run = (await db.execute(
+        select(AgentRun).where(
+            AgentRun.id == run_id,
+            AgentRun.conversation_id == cid,
+            AgentRun.user_id == user.id,
+        )
+    )).scalar_one_or_none()
+    if run is None:
+        raise HTTPException(404, "Run not found")
+    if conv.permission_preset != "workspace_write":
+        raise HTTPException(
+            409,
+            "This Session permission preset does not accept interactive decisions",
+        )
+    rows = (await db.execute(
+        select(TurnActivityEvent).where(
+            TurnActivityEvent.conversation_id == cid,
+            TurnActivityEvent.root_run_id == run_id,
+            TurnActivityEvent.kind == "approval",
+        ).order_by(TurnActivityEvent.seq)
+    )).scalars().all()
+    requested = None
+    terminal_status = None
+    for row in rows:
+        value = json.loads(row.payload)
+        if value.get("request_id") != request_id:
+            continue
+        if value.get("status") == "pending":
+            requested = value
+        elif value.get("status") in {"allowed", "denied"}:
+            terminal_status = value.get("status")
+    expected_status = "allowed" if payload.decision == "allow" else "denied"
+    if terminal_status is not None:
+        if terminal_status != expected_status:
+            raise HTTPException(409, "Approval request already has another decision")
+        return {"accepted": True, "idempotent": True, "status": terminal_status}
+    if requested is None or requested.get("request_seq") != payload.request_seq:
+        raise HTTPException(409, "Approval request is stale or not durable")
+    if run.status not in {"queued", "running", "committing"}:
+        raise HTTPException(409, "Run is no longer active")
+    from agent_engines.base import AgentEngineError, ENGINE_ID_CLAUDE_CODE
+    from agent_engines.registry import build_agent_engine_registry
+
+    if run.engine_id != ENGINE_ID_CLAUDE_CODE:
+        raise HTTPException(409, "Run engine does not support native approvals")
+    try:
+        result = await build_agent_engine_registry().get(
+            ENGINE_ID_CLAUDE_CODE
+        ).decide_approval(
+            user_id=str(user.id),
+            conversation_id=cid,
+            run_id=run_id,
+            request_id=request_id,
+            request_seq=payload.request_seq,
+            decision=payload.decision,
+        )
+    except AgentEngineError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    return result
 
 
 @router.get("/{cid}/trajectory")

@@ -227,6 +227,8 @@ def main() -> int:
                     worker_uid=worker_uid,
                     worker_gid=worker_gid,
                     ledger=ledger,
+                    run_id=str(config["run_id"]),
+                    permission_preset=str(config.get("permission_preset") or "session_full"),
                 )
             finally:
                 _stop_process_group(compositor)
@@ -479,20 +481,18 @@ class EventLedger:
         self._stream = path.open("xb", buffering=0)
         os.chmod(path, 0o600, follow_symlinks=False)
 
-    def append_line(self, line: bytes, *, channel: str) -> None:
+    def append_line(self, line: bytes, *, channel: str) -> int:
         if len(line) > MAX_NATIVE_LINE_BYTES:
-            self.append_event({
+            return self.append_event({
                 "type": "chatds.runner.diagnostic",
                 "code": "native_line_too_large",
                 "size_bytes": len(line),
             }, channel="controller")
-            return
         text = line.decode("utf-8", errors="replace").rstrip("\r\n")
         try:
             native = json.loads(text)
         except json.JSONDecodeError:
-            self._append({"channel": channel, "text": text})
-            return
+            return self._append({"channel": channel, "text": text})
         # Only Claude's stdout stream is part of the native stream-json
         # protocol. Stderr is untrusted diagnostic text and must never be able
         # to forge the commit candidate by printing result-shaped JSON.
@@ -560,7 +560,7 @@ class EventLedger:
                 self._observe_assistant_tool_calls(native)
             elif native.get("type") == "user":
                 self._observe_task_output_results(native)
-        self._append({"channel": channel, "event": native})
+        return self._append({"channel": channel, "event": native})
 
     @property
     def saw_native_result(self) -> bool:
@@ -823,15 +823,17 @@ class EventLedger:
         *,
         channel: str,
         terminal: bool = False,
-    ) -> None:
-        self._append({"channel": channel, "event": event}, terminal=terminal)
+    ) -> int:
+        return self._append(
+            {"channel": channel, "event": event}, terminal=terminal
+        )
 
     def close(self) -> None:
         if not self._stream.closed:
             os.fsync(self._stream.fileno())
             self._stream.close()
 
-    def _append(self, value: dict[str, Any], *, terminal: bool = False) -> None:
+    def _append(self, value: dict[str, Any], *, terminal: bool = False) -> int:
         self._seq += 1
         envelope = {
             "seq": self._seq,
@@ -853,6 +855,7 @@ class EventLedger:
             written += count
         if terminal or self._seq % SYNC_EVERY_EVENTS == 0:
             os.fsync(self._stream.fileno())
+        return self._seq
 
 
 def _load_config(path: Path) -> dict[str, Any]:
@@ -1383,8 +1386,6 @@ def _claude_command(
         "--include-partial-messages",
         "--no-chrome",
         "--thinking", "enabled",
-        "--permission-mode", "bypassPermissions",
-        "--dangerously-skip-permissions",
         "--setting-sources", "",
         "--plugin-dir", "/skill-view/plugin",
         "--mcp-config", "/skill-view/plugin/.mcp.json",
@@ -1399,6 +1400,18 @@ def _claude_command(
         # the authority boundary without a version-fragile tool-name list.
         "--tools", "default",
     ]
+    permission_preset = str(config.get("permission_preset") or "session_full")
+    if permission_preset == "session_full":
+        command.extend([
+            "--permission-mode", "bypassPermissions",
+            "--dangerously-skip-permissions",
+        ])
+    elif permission_preset == "workspace_write":
+        command.extend(["--permission-mode", "default"])
+    elif permission_preset == "read_only":
+        command.extend(["--permission-mode", "plan"])
+    else:
+        raise RuntimeError("permission_preset_invalid")
     command.extend([
         "--append-system-prompt",
         render_runtime_capability_prompt(
@@ -1691,6 +1704,8 @@ def _run_child(
     worker_uid: int,
     worker_gid: int,
     ledger: EventLedger,
+    run_id: str,
+    permission_preset: str,
 ) -> int:
     global _child
     _child = subprocess.Popen(
@@ -1704,18 +1719,33 @@ def _run_child(
         preexec_fn=lambda: _drop_worker(worker_uid, worker_gid),
     )
     assert _child.stdin is not None and _child.stdout is not None and _child.stderr is not None
+    input_lock = threading.Lock()
+    interactive = permission_preset == "workspace_write"
+    keep_stdin_open = permission_preset in {"read_only", "workspace_write"}
+
+    def write_input(value: bytes) -> bool:
+        try:
+            with input_lock:
+                if _child is None or _child.stdin is None or _child.poll() is not None:
+                    return False
+                _child.stdin.write(value)
+                _child.stdin.flush()
+            return True
+        except (BrokenPipeError, OSError, ValueError):
+            return False
+
     def feed_prompt() -> None:
         try:
-            assert _child is not None and _child.stdin is not None
-            _child.stdin.write(prompt)
+            write_input(prompt)
         except (BrokenPipeError, OSError):
             pass
         finally:
-            try:
-                assert _child is not None and _child.stdin is not None
-                _child.stdin.close()
-            except (OSError, ValueError):
-                pass
+            if not keep_stdin_open:
+                try:
+                    assert _child is not None and _child.stdin is not None
+                    _child.stdin.close()
+                except (OSError, ValueError):
+                    pass
 
     feeder = threading.Thread(target=feed_prompt, daemon=True, name="claude-prompt-writer")
     feeder.start()
@@ -1723,6 +1753,104 @@ def _run_child(
     selector.register(_child.stdout, selectors.EVENT_READ, "stdout")
     selector.register(_child.stderr, selectors.EVENT_READ, "stderr")
     buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    pending_approvals: dict[str, tuple[dict[str, Any], int]] = {}
+    resolved_approvals: set[str] = set()
+    approval_root = Path("/state/control/runs") / run_id / "approvals"
+
+    def observe_control_request(
+        line: bytes,
+        channel: str,
+        native_seq: int,
+    ) -> None:
+        if channel != "stdout":
+            return
+        try:
+            native = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return
+        inner = native.get("request") if isinstance(native, dict) else None
+        request_id = str(native.get("request_id") or "") if isinstance(native, dict) else ""
+        if (
+            not isinstance(native, dict)
+            or native.get("type") != "control_request"
+            or not isinstance(inner, dict)
+            or inner.get("subtype") != "can_use_tool"
+            or re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request_id) is None
+        ):
+            return
+        pending_approvals.setdefault(request_id, (native, native_seq))
+
+    def send_decision(request_id: str, native: dict[str, Any], decision: str) -> bool:
+        inner = native["request"]
+        response_payload = {
+            "behavior": decision,
+            **(
+                {"updatedInput": dict(inner.get("input") or {})}
+                if decision == "allow"
+                else {"message": "Denied by ChatDS Session permission policy or user"}
+            ),
+        }
+        response = {
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": request_id,
+                "response": response_payload,
+            },
+        }
+        encoded = json.dumps(
+            response,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        delivered = write_input(encoded)
+        if delivered:
+            # This is a delivery receipt, not an optimistic UI acknowledgement:
+            # only publish it after Claude's open stdin accepted the exact
+            # native control response.
+            ledger.append_event({
+                "type": "chatds.approval.decided",
+                "request_id": request_id,
+                "decision": decision,
+                "tool_name": str(inner.get("tool_name") or "tool")[:512],
+            }, channel="controller")
+        return delivered
+
+    def drain_approval_mailbox() -> None:
+        for request_id, pending in list(pending_approvals.items()):
+            native, native_seq = pending
+            if request_id in resolved_approvals:
+                continue
+            if permission_preset == "read_only":
+                if send_decision(request_id, native, "deny"):
+                    resolved_approvals.add(request_id)
+                    pending_approvals.pop(request_id, None)
+                continue
+            if not interactive:
+                continue
+            response_path = approval_root / (
+                hashlib.sha256(request_id.encode()).hexdigest() + ".json"
+            )
+            if not response_path.exists():
+                continue
+            try:
+                value = json.loads(response_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                continue
+            decision = str(value.get("decision") or "") if isinstance(value, dict) else ""
+            if (
+                not isinstance(value, dict)
+                or value.get("schema") != "chatds.claude-approval.v1"
+                or value.get("run_id") != run_id
+                or value.get("request_id") != request_id
+                or value.get("request_seq") != native_seq
+                or decision not in {"allow", "deny"}
+            ):
+                continue
+            if send_decision(request_id, native, decision):
+                resolved_approvals.add(request_id)
+                pending_approvals.pop(request_id, None)
     leader_exited_at: float | None = None
     while selector.get_map():
         for key, _mask in selector.select(timeout=0.5):
@@ -1738,10 +1866,12 @@ def _run_child(
             while b"\n" in buffers[channel]:
                 line, _, rest = buffers[channel].partition(b"\n")
                 buffers[channel] = bytearray(rest)
-                ledger.append_line(line, channel=channel)
+                native_seq = ledger.append_line(line, channel=channel)
+                observe_control_request(line, channel, native_seq)
             if len(buffers[channel]) > MAX_NATIVE_LINE_BYTES:
                 ledger.append_line(bytes(buffers[channel]), channel=channel)
                 buffers[channel].clear()
+        drain_approval_mailbox()
         if _child.poll() is not None:
             if leader_exited_at is None:
                 leader_exited_at = time.monotonic()
@@ -1754,6 +1884,13 @@ def _run_child(
             leader_exited_at = None
     exit_code = int(_child.wait())
     _stop_process_group(_child)
+    if keep_stdin_open:
+        try:
+            with input_lock:
+                if _child.stdin is not None and not _child.stdin.closed:
+                    _child.stdin.close()
+        except (OSError, ValueError):
+            pass
     # PID 1 has now synchronously reaped every process in the disposable Turn
     # group.  Native local-bash notifications can legitimately be absent when
     # TaskOutput was consumed directly or the parent returned first; convert

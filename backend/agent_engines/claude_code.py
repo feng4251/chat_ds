@@ -120,7 +120,40 @@ class ClaudeCodeEngine:
             "resume_from_native_session_id": request.resume_from_native_session_id,
             "source": request.source,
             "user_turn_text": str(request.metadata.get("user_turn_text") or ""),
+            "permission_preset": str(
+                request.metadata.get("permission_preset") or "session_full"
+            ),
         }
+
+    async def decide_approval(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        run_id: str,
+        request_id: str,
+        request_seq: int,
+        decision: str,
+    ) -> dict[str, Any]:
+        timeout = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
+        async with self._client_factory(timeout=timeout) as client:
+            response = await client.post(
+                f"{self._base_url}/v1/runs/{run_id}/approvals/{request_id}",
+                headers=self._headers,
+                json={
+                    "user_id": user_id,
+                    "conversation_id": conversation_id,
+                    "request_seq": request_seq,
+                    "decision": decision,
+                },
+            )
+        if response.status_code >= 400:
+            raise AgentEngineError(
+                f"Claude Runner rejected the approval decision (HTTP {response.status_code}).",
+                code="claude_approval_rejected",
+                retryable=response.status_code >= 500,
+            )
+        return dict(response.json())
 
     async def stream(
         self,
@@ -256,6 +289,16 @@ class ClaudeCodeEngine:
                                         yield EngineStreamEvent(
                                             kind=event.kind,
                                             data={**projected_data, "payload": payload},
+                                            raw=event.raw,
+                                            native_event_id=event.native_event_id,
+                                        )
+                                    elif event.kind == "approval":
+                                        yield EngineStreamEvent(
+                                            kind="approval",
+                                            data={
+                                                **dict(event.data),
+                                                "request_seq": int(seq),
+                                            },
                                             raw=event.raw,
                                             native_event_id=event.native_event_id,
                                         )

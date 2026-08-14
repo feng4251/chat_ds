@@ -65,7 +65,8 @@ class EngineStreamEvent:
     """One ordered, normalized engine observation.
 
     ``kind`` is one of ``content``, ``reasoning``, ``tool_progress``,
-    ``agent_event``, ``usage``, ``model``, ``finish``, or ``diagnostic``.
+    ``agent_event``, ``approval``, ``usage``, ``model``, ``finish``, or
+    ``diagnostic``.
     ``raw`` retains the complete native event for a lossless audit stream.
     """
 

@@ -798,6 +798,7 @@ class ChatCancellationProjectionTests(unittest.IsolatedAsyncioTestCase):
                     new=AsyncMock(),
                 ),
                 patch.object(chat_router, "emit_event", new=AsyncMock()),
+                patch.object(chat_router, "async_session", self.sessions),
                 patch.object(chat_router.httpx, "AsyncClient", FakeClient),
                 patch.object(
                     chat_router,

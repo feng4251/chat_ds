@@ -59,6 +59,17 @@ class Conversation(Base):
     engine_id: Mapped[str] = mapped_column(
         String(32), nullable=False, default="legacy", server_default=text("'legacy'")
     )
+    # The label describes authority inside this Session, never host access.
+    permission_preset: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="workspace_write",
+        # Fresh databases and ORM-created interactive Sessions start with
+        # native per-operation confirmation.  The lightweight migration keeps
+        # its explicit ``session_full`` default solely to preserve authority
+        # for rows that predate permission presets.
+        server_default=text("'workspace_write'"),
+    )
     enabled_tools: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     fallback_model_ids: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     enabled_user_skills: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -109,6 +120,10 @@ class Message(Base):
     tool_progress: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     image_urls: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     model_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # Exact join to the root run's durable activity projection.
+    run_id: Mapped[Optional[str]] = mapped_column(
+        String(32), nullable=True, index=True
+    )
     source: Mapped[str] = mapped_column(String(24), nullable=False, default="chat")
     input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -336,6 +351,39 @@ class AgentRunEvent(Base):
     payload: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     tool_name: Mapped[Optional[str]] = mapped_column(String(512), nullable=True, index=True)
     tool_call_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    event_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class TurnActivityEvent(Base):
+    """Safe, ordered browser projection of one accepted Turn."""
+
+    __tablename__ = "turn_activity_events"
+    __table_args__ = (
+        Index(
+            "ux_turn_activity_events_root_seq",
+            "root_run_id",
+            "seq",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    conversation_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    root_run_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    run_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    node_id: Mapped[str] = mapped_column(String(192), nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    operation: Mapped[str] = mapped_column(String(16), nullable=False, default="append")
+    payload: Mapped[str] = mapped_column(Text, nullable=False)
     event_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 

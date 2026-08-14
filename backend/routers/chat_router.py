@@ -28,10 +28,12 @@ from models import (
     CustomModelConfig,
     AgentRun,
     AgentRunEvent,
+    TurnActivityEvent,
     TaskItem,
     SkillPackage,
 )
 from schemas import ChatRequest
+from turn_activity import TurnActivityBuilder
 from workspace import (
     ensure_workspace_async,
     require_session_workspace_active,
@@ -122,6 +124,8 @@ class _NormalizedEngineResponse:
                 delta["tool_progress"] = str(event.data.get("text") or "")
             elif event.kind == "agent_event":
                 delta["agent_event"] = dict(event.data)
+            elif event.kind == "approval":
+                delta["approval"] = dict(event.data)
             elif event.kind == "usage":
                 delta["usage"] = dict(event.data)
             elif event.kind == "model":
@@ -294,6 +298,93 @@ async def _persist_engine_raw_events(
             run_id,
         )
         raise
+
+
+async def _persist_turn_activity_events(
+    *,
+    user_id: str,
+    conversation_id: str,
+    root_run_id: str,
+    events: list[dict],
+) -> None:
+    """Idempotently append a bounded safe presentation batch."""
+
+    if not events:
+        return
+    prepared: dict[int, dict] = {}
+    for event in events:
+        if event.get("root_run_id") != root_run_id:
+            raise RuntimeError("Turn activity root identity mismatch")
+        seq = event.get("seq")
+        if not isinstance(seq, int) or seq < 1:
+            raise RuntimeError("Turn activity sequence is invalid")
+        payload = json.dumps(
+            event.get("payload") or {},
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        candidate = {
+            "id": str(event.get("event_id") or "")[:32],
+            "run_id": str(event.get("run_id") or root_run_id)[:32],
+            "seq": seq,
+            "node_id": str(event.get("node_id") or "")[:192],
+            "kind": str(event.get("kind") or "progress")[:32],
+            "operation": str(event.get("operation") or "append")[:16],
+            "payload": payload,
+        }
+        if not candidate["id"] or not candidate["node_id"]:
+            raise RuntimeError("Turn activity identity is invalid")
+        previous = prepared.get(seq)
+        if previous is not None and previous != candidate:
+            raise RuntimeError("Conflicting Turn activity sequence in one batch")
+        prepared[seq] = candidate
+
+    async def persist_once() -> None:
+        async with async_session() as event_db:
+            rows = (await event_db.execute(
+                select(TurnActivityEvent).where(
+                    TurnActivityEvent.root_run_id == root_run_id,
+                    TurnActivityEvent.seq.in_(tuple(prepared)),
+                )
+            )).scalars().all()
+            existing = {row.seq: row for row in rows}
+            for seq, candidate in sorted(prepared.items()):
+                prior = existing.get(seq)
+                if prior is not None:
+                    prior_contract = (
+                        prior.id, prior.run_id, prior.node_id, prior.kind,
+                        prior.operation, prior.payload,
+                    )
+                    incoming_contract = (
+                        candidate["id"], candidate["run_id"],
+                        candidate["node_id"], candidate["kind"],
+                        candidate["operation"], candidate["payload"],
+                    )
+                    if prior_contract != incoming_contract:
+                        raise RuntimeError(
+                            "Turn activity replay changed a durable sequence"
+                        )
+                    continue
+                event_db.add(TurnActivityEvent(
+                    id=candidate["id"],
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    root_run_id=root_run_id,
+                    run_id=candidate["run_id"],
+                    seq=seq,
+                    node_id=candidate["node_id"],
+                    kind=candidate["kind"],
+                    operation=candidate["operation"],
+                    payload=candidate["payload"],
+                ))
+            await event_db.commit()
+
+    await _run_sqlite_persist_with_retry(
+        persist_once,
+        description=f"turn activity persistence run={root_run_id}",
+    )
 
 
 class _DetachedStreamRelay:
@@ -2469,6 +2560,7 @@ async def _persist_stream_projection_once(
                 reasoning=reasoning or None,
                 tool_progress=tool_progress or None,
                 model_id=resolved_model_id or model_id,
+                run_id=run_id,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 total_tokens=total_tokens,
@@ -2638,6 +2730,7 @@ async def _persist_terminal_projection_failure_once(
                 reasoning=reasoning or None,
                 tool_progress=tool_progress or None,
                 model_id=resolved_model_id or model_id,
+                run_id=run_id,
                 input_tokens=reconciled["input_tokens"],
                 output_tokens=reconciled["output_tokens"],
                 total_tokens=reconciled["total_tokens"],
@@ -3929,6 +4022,27 @@ async def _chat_stream_with_turn(
         terminal_envelope_payload: dict | None = None
         raw_engine_event_batch: list[dict] = []
         seen_raw_engine_event_seqs: set[int] = set()
+        activity_builder = TurnActivityBuilder(run.id, conv_id)
+        activity_event_batch: list[dict] = []
+
+        async def record_activity(
+            event: dict | None,
+            *,
+            force: bool = False,
+        ) -> dict | None:
+            if event is None:
+                return None
+            activity_event_batch.append(event)
+            if force or len(activity_event_batch) >= 32:
+                pending = list(activity_event_batch)
+                activity_event_batch.clear()
+                await _persist_turn_activity_events(
+                    user_id=str(cur_user.id),
+                    conversation_id=conv_id,
+                    root_run_id=run.id,
+                    events=pending,
+                )
+            return event
 
         def encode_sse(payload: dict) -> str:
             chunk = f"data: {json.dumps(payload)}\n\n"
@@ -4073,6 +4187,7 @@ async def _chat_stream_with_turn(
                             workspace_store.workspace_dir(cur_user.id, conv_id)
                         ),
                         "user_turn_text": req.content,
+                        "permission_preset": conv.permission_preset,
                     },
                 )
                 async with _open_agent_engine_stream(
@@ -4148,16 +4263,43 @@ async def _chat_stream_with_turn(
                                                     resolved_model_id=resolved_model_id,
                                                     event=agent_event,
                                                 )
+                                            activity_event = await record_activity(
+                                                activity_builder.agent(agent_event),
+                                                force=True,
+                                            )
                                             yield encode_sse({
                                                 "agent_event": agent_event,
+                                                "activity_event": activity_event,
                                                 "conversation_id": conv_id,
+                                            })
+                                    approval = delta.get("approval")
+                                    if isinstance(approval, dict):
+                                        request_id = str(approval.get("request_id") or "")
+                                        if request_id:
+                                            activity_event = await record_activity(
+                                                activity_builder.approval(
+                                                    request_id=request_id,
+                                                    status=str(approval.get("status") or "denied"),
+                                                    details=approval,
+                                                ),
+                                                force=True,
+                                            )
+                                            yield encode_sse({
+                                                "approval": approval,
+                                                "activity_event": activity_event,
+                                                "conversation_id": conv_id,
+                                                "run_id": run.id,
                                             })
                                     # Harness tool_progress
                                     tp = delta.get("tool_progress")
                                     if tp:
                                         full_tool_progress += (full_tool_progress and "\n" or "") + tp
+                                        activity_event = await record_activity(
+                                            activity_builder.progress(tp)
+                                        )
                                         yield encode_sse({
                                             "tool_progress": tp,
+                                            "activity_event": activity_event,
                                             "conversation_id": conv_id,
                                         })
                                     reasoning_piece = delta.get("reasoning") or ""
@@ -4177,9 +4319,15 @@ async def _chat_stream_with_turn(
                                             f"{switch.get('to_model')} ({switch.get('reason')})"
                                         )
                                         full_tool_progress += (full_tool_progress and "\n" or "") + msg
+                                        activity_event = await record_activity(
+                                            activity_builder.progress(
+                                                msg, category="model_switch"
+                                            )
+                                        )
                                         yield encode_sse({
                                             "tool_progress": msg,
                                             "model_switch": switch,
+                                            "activity_event": activity_event,
                                             "conversation_id": conv_id,
                                         })
                                     choice = data.get("choices", [{}])[0]
@@ -4193,14 +4341,26 @@ async def _chat_stream_with_turn(
                                         resolved_model_id = data["model"]
                                     if reasoning_piece:
                                         full_reasoning += reasoning_piece
+                                        activity_event = await record_activity(
+                                            activity_builder.stream_text(
+                                                "reasoning", reasoning_piece
+                                            )
+                                        )
                                         yield encode_sse({
                                             "reasoning_delta": reasoning_piece,
+                                            "activity_event": activity_event,
                                             "conversation_id": conv_id,
                                         })
                                     if content_piece:
                                         full_content += content_piece
+                                        activity_event = await record_activity(
+                                            activity_builder.stream_text(
+                                                "content", content_piece
+                                            )
+                                        )
                                         yield encode_sse({
                                             "delta": content_piece,
+                                            "activity_event": activity_event,
                                             "conversation_id": conv_id,
                                         })
                                 except (json.JSONDecodeError, KeyError, IndexError):
@@ -4242,15 +4402,23 @@ async def _chat_stream_with_turn(
                 )
                 if full_content:
                     full_content += warning
+                    activity_event = await record_activity(
+                        activity_builder.stream_text("content", warning)
+                    )
                     yield encode_sse({
                         "delta": warning,
+                        "activity_event": activity_event,
                         "conversation_id": conv_id,
                     })
                 else:
                     # Surface the error as the assistant's content so the user sees it
                     full_content = warning
+                    activity_event = await record_activity(
+                        activity_builder.stream_text("content", full_content)
+                    )
                     yield encode_sse({
                         "delta": full_content,
+                        "activity_event": activity_event,
                         "conversation_id": conv_id,
                     })
 
@@ -4385,6 +4553,10 @@ async def _chat_stream_with_turn(
                 seen_agent_events.add(
                     (run.id, "run.cancelled", root_seq + 1)
                 )
+                await record_activity(
+                    activity_builder.agent(cancellation_event),
+                    force=True,
+                )
             # Cancellation is control flow, but its source is not inferred
             # from the exception class alone. Only an observed ASGI disconnect
             # is labelled client_disconnected; otherwise the debug boundary
@@ -4424,8 +4596,15 @@ async def _chat_stream_with_turn(
                 for marker in _INCOMPLETE_RESPONSE_MARKERS
             ):
                 full_content += warning
+                activity_event = await record_activity(
+                    activity_builder.stream_text(
+                        "content",
+                        warning if full_content != warning else full_content,
+                    )
+                )
                 yield encode_sse({
                     "delta": warning if full_content != warning else full_content,
+                    "activity_event": activity_event,
                     "conversation_id": conv_id,
                 })
             terminal_envelope_payload = {
@@ -4509,6 +4688,48 @@ async def _chat_stream_with_turn(
                 and not error_message
             ):
                 error_message = "Stream ended before producing a response."
+            # Only after the missing native terminal has triggered fail-closed
+            # engine revocation may the presentation projection synthesize a
+            # terminal card.  Presentation state must never become authority
+            # for deciding whether a native process is still live.
+            if root_terminal_status is None:
+                sealed_events, finish_reason, error_message = (
+                    _seal_missing_root_terminal_for_projection(
+                        agent_events,
+                        run_id=run.id,
+                        usage=usage,
+                        finish_reason=finish_reason,
+                        error_message=error_message,
+                    )
+                )
+                synthetic_terminal = sealed_events[-1]
+                agent_events[:] = sealed_events
+                seen_agent_events.add((
+                    run.id,
+                    str(synthetic_terminal.get("event_type") or "run.failed"),
+                    int(synthetic_terminal.get("seq") or 0),
+                ))
+                activity_event_batch.append(
+                    activity_builder.agent(synthetic_terminal)
+                )
+            # A refresh uses a timeline only when this final marker and every
+            # preceding event are durable. An unsealed partial projection is
+            # ignored in favor of the assistant/run fallback.
+            activity_event_batch.append(activity_builder.commit())
+            if activity_event_batch:
+                try:
+                    await _persist_turn_activity_events(
+                        user_id=str(cur_user.id),
+                        conversation_id=conv_id,
+                        root_run_id=run.id,
+                        events=list(activity_event_batch),
+                    )
+                except Exception:
+                    logger.exception(
+                        "Turn activity projection persistence failed run=%s",
+                        run.id,
+                    )
+                activity_event_batch.clear()
             projection_task: asyncio.Task | None = None
             try:
                 projection_task = _spawn_persist_then_emit(

@@ -38,6 +38,28 @@ from routers import chat_router, conv_router, workspace_router
 
 
 class ClaudeEventProjectionTests(unittest.TestCase):
+    def test_native_permission_request_projects_metadata_without_tool_input(self):
+        projector = ClaudeEventProjector("9" * 32)
+        events = projector.project({
+            "seq": 7,
+            "event": {
+                "type": "control_request",
+                "request_id": "renamed-request",
+                "request": {
+                    "subtype": "can_use_tool",
+                    "tool_name": "RenamedWrite",
+                    "input": {"secret": "must-not-project"},
+                    "tool_use_id": "tool-use",
+                    "description": "Create a cross-domain artifact",
+                },
+            },
+        })
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].kind, "approval")
+        self.assertEqual(events[0].data["request_id"], "renamed-request")
+        self.assertNotIn("input", events[0].data)
+        self.assertNotIn("must-not-project", str(events[0].data))
+
     def test_native_result_is_candidate_until_supervisor_terminal(self):
         projector = ClaudeEventProjector("a" * 32)
         result = projector.project({

@@ -11,7 +11,7 @@ import SkillBar from './SkillBar'
 import {
   getMessages, chatCompletion, uploadSessionFile, createConversation, uploadSkill,
   getConversationSettings, updateConversationSettings,
-  getSkills, deleteSkill, getRunCards,
+  getSkills, deleteSkill, getRunCards, getTurnActivities, decideTurnApproval,
 } from '../api'
 import {
   bindConversationRequestScope,
@@ -33,6 +33,12 @@ import {
   runCardProjectionRevision,
   shouldFollowMessageUpdate,
 } from '../utils/sessionProjectionSync'
+import {
+  applyTurnActivity,
+  attachTurnActivities,
+  mergeTurnActivities,
+  turnActivityHighWater,
+} from '../utils/turnActivity'
 
 const SAMPLE_PROMPTS = [
   { icon: FiCode,      text: '帮我写一个红黑树的 Python 实现' },
@@ -281,6 +287,8 @@ export default function ChatArea({
   const lastFullSessionSyncRef = useRef(0)
   const sessionSyncWakeRef = useRef(() => {})
   const shouldStickToBottomRef = useRef(true)
+  const msgsRef = useRef(msgs)
+  msgsRef.current = msgs
   activeConvRef.current = activeConv
   onConvRefreshRef.current = onConvRefresh
   const effectiveDurableRunUnknown = Boolean(
@@ -359,8 +367,12 @@ export default function ChatArea({
         (payload) => ({ available: true, payload }),
         () => ({ available: false, payload: null }),
       ),
+      getTurnActivities(activeConv).then(
+        (payload) => ({ available: true, payload }),
+        () => ({ available: false, payload: { events: [] } }),
+      ),
     ])
-      .then(([server, settings, runCardResult]) => {
+      .then(([server, settings, runCardResult, activityResult]) => {
         if (aborted) return
         const runCards = runCardResult.payload || {
           roots: [],
@@ -375,7 +387,10 @@ export default function ChatArea({
           && conversationRequestOwnsRoute(liveRequestRef.current, activeConv)
           && prev.some((m) => m.streaming)
             ? prev
-            : hydrateAgentRunCards(server, runCards)
+            : attachTurnActivities(
+                hydrateAgentRunCards(server, runCards),
+                activityResult.payload?.events || [],
+              )
         ))
         if (runCardResult.available) {
           setDurableRunActive(Boolean(runCards?.has_active_runs))
@@ -447,6 +462,26 @@ export default function ChatArea({
         )
         let server = null
         if (needsFullReconcile) server = await getMessages(convId)
+        let activities = null
+        let incrementalActivities = false
+        if (needsFullReconcile) {
+          activities = await getTurnActivities(convId).catch(() => null)
+        } else if (runCards?.has_active_runs) {
+          const roots = (runCards.roots || []).filter((root) => root.active)
+          const pages = await Promise.all(roots.map((root) => (
+            getTurnActivities(convId, {
+              rootRunId: root.root_run_id,
+              after: turnActivityHighWater(
+                msgsRef.current,
+                root.root_run_id,
+              ),
+            }).catch(() => ({ events: [] }))
+          )))
+          activities = {
+            events: pages.flatMap((page) => page.events || []),
+          }
+          incrementalActivities = true
+        }
         if (
           cancelled
           || activeConvRef.current !== convId
@@ -465,17 +500,33 @@ export default function ChatArea({
             setMsgs((prev) => (
               prev.some((message) => message.streaming)
                 ? prev
-                : hydrateAgentRunCards(server, runCards)
+                : attachTurnActivities(
+                    hydrateAgentRunCards(server, runCards),
+                    activities?.events || [],
+                  )
             ))
           }
           messageProjectionRevisionRef.current = messageRevision
           lastFullSessionSyncRef.current = now
           if (messageChanged) onConvRefreshRef.current?.()
-        } else if (runProjection !== runCardProjectionRevisionRef.current) {
+        } else if (
+          activities
+          || runProjection !== runCardProjectionRevisionRef.current
+        ) {
           setMsgs((prev) => (
             prev.some((message) => message.streaming)
               ? prev
-              : hydrateAgentRunCards(prev, runCards)
+              : (
+                  incrementalActivities
+                    ? mergeTurnActivities(
+                        hydrateAgentRunCards(prev, runCards),
+                        activities?.events || [],
+                      )
+                    : attachTurnActivities(
+                        hydrateAgentRunCards(prev, runCards),
+                        activities?.events || [],
+                      )
+                )
           ))
         }
 
@@ -532,9 +583,14 @@ export default function ChatArea({
     ) return
     const stillActive = Boolean(runCards?.has_active_runs)
     if (stillActive) {
-      setMsgs((prev) => hydrateAgentRunCards(prev, runCards))
+      const activities = await getTurnActivities(convId).catch(() => ({ events: [] }))
+      setMsgs((prev) => attachTurnActivities(
+        hydrateAgentRunCards(prev, runCards),
+        activities.events || [],
+      ))
     } else {
       const server = await getMessages(convId)
+      const activities = await getTurnActivities(convId).catch(() => ({ events: [] }))
       if (
         requestScope
           ? !requestOwnsCurrentView(requestScope)
@@ -543,7 +599,10 @@ export default function ChatArea({
       setMsgs((prev) => (
         prev.some((message) => message.streaming)
           ? prev
-          : hydrateAgentRunCards(server, runCards)
+          : attachTurnActivities(
+              hydrateAgentRunCards(server, runCards),
+              activities.events || [],
+            )
       ))
     }
     setDurableRunActive(stillActive)
@@ -819,6 +878,12 @@ export default function ChatArea({
             if (!last || !last.streaming) return u
             const updated = { ...last }
             if (evt.run_id) updated.rootRunId = evt.run_id
+            if (evt.activity_event) {
+              updated.activityNodes = applyTurnActivity(
+                updated.activityNodes || [],
+                evt.activity_event,
+              )
+            }
             if (evt.tool_progress) {
               updated.tool_progress =
                 (updated.tool_progress ? updated.tool_progress + '\n' : '') + evt.tool_progress
@@ -962,6 +1027,12 @@ export default function ChatArea({
             if (!last || !last.streaming) return u
             const updated = { ...last }
             if (evt.run_id) updated.rootRunId = evt.run_id
+            if (evt.activity_event) {
+              updated.activityNodes = applyTurnActivity(
+                updated.activityNodes || [],
+                evt.activity_event,
+              )
+            }
             if (evt.tool_progress) {
               updated.tool_progress =
                 (updated.tool_progress ? updated.tool_progress + '\n' : '') + evt.tool_progress
@@ -1077,6 +1148,23 @@ export default function ChatArea({
     }
   }
 
+  async function handleApproval(message, approval, decision) {
+    const runId = message.rootRunId || message.run_id
+    if (
+      !activeConv
+      || !runId
+      || !approval?.request_id
+      || !approval?.request_seq
+    ) throw new Error('权限请求缺少持久化运行标识')
+    return decideTurnApproval(
+      activeConv,
+      runId,
+      approval.request_id,
+      approval.request_seq,
+      decision,
+    )
+  }
+
   return (
     <div
       className="h-full min-h-0 flex flex-col bg-stone-50"
@@ -1154,8 +1242,13 @@ export default function ChatArea({
                   <MessageBubble
                     msg={m}
                     onRegenerate={isLastAssistant ? regenerateLast : undefined}
+                    onApproval={(approval, decision) => (
+                      handleApproval(m, approval, decision)
+                    )}
                   />
-                  {m.role === 'assistant' && <AgentRunCards runs={m.agentRuns} />}
+                  {m.role === 'assistant' && !m.activityNodes?.length && (
+                    <AgentRunCards runs={m.agentRuns} />
+                  )}
                 </div>
               )
             })}

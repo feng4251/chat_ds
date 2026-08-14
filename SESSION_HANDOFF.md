@@ -2,6 +2,48 @@
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
+## 2026-08-14 Turn 时间线、多代理工作流与 Session 权限闭环
+
+- 用户批准将 ChatDS 的固定“工具调用 / 深度思考 / 正文”三段式改为同一 Turn 内按真实发生顺序
+  交替展示 reasoning、正文、工具、进度、工作流和权限请求；多代理改为一个可展开的总工作流卡，
+  以 Claude 原生 AgentRun 的语义名称展示子任务、状态、工具、产物和失败原因。历史消息仍保留旧
+  `reasoning/tool_progress/AgentRunCards` 降级渲染，只有具有完整 commit marker 的新投影才接管刷新后
+  的显示，因此没有重写历史消息或把浏览器状态当成控制面事实。
+- 新增引擎无关、安全白名单化的 `chatds.turn-activity.v1` 展示协议。Backend 按 root run 建立严格递增
+  sequence、稳定 node identity 和 append/merge 语义；同一 DTO 先持久化再经 SSE 发送，页面刷新经
+  authenticated Session API 重放。tool input、代码、provider 原始 payload 和凭据不进入展示表；消息
+  以新增 `run_id` 精确连接 root projection。缺失原生终态时，顺序固定为先撤销仍可能存活的原生 Run，
+  再合成失败展示并封存投影，最后执行既有 Message/AgentRun 权威终态事务。
+- ClaudeCodeEngine 仍是薄适配层，原生 Claude Code 2.1.152 二进制和内部 agent loop 没有修改。
+  `workspace_write` 使用 Claude 原生 `default` permission mode，并把原生 `control_request/can_use_tool`
+  按 exact request id + Runner ledger sequence 持久化为页面权限卡；允许/拒绝经独立 authenticated API、
+  Supervisor mailbox 和同一 stdin 返回原生 `control_response`，只有 stdin 实际接受后才发布决定收据。
+  重复决定幂等，冲突/stale/跨用户/跨 Session/跨 root/已终态请求均 fail closed。
+- 每个 Session 现在提供三个持久权限预设：`read_only`（workspace 只读 mount + Claude plan）、
+  `workspace_write`（当前 Session workspace 读写 + 每次原生请求确认）和 `session_full`（仍在当前
+  Session mount/出网边界内 bypass confirmation）。新交互 Session 默认为 `workspace_write`；历史行在
+  schema migration 时明确保留 `session_full`，避免静默收窄既有行为；无人值守 Scheduler Session
+  显式使用 `session_full`。活动 Turn 期间禁止修改权限，fork 精确继承。任何级别都没有其他用户、
+  其他 Session、宿主目录或 Docker socket 的挂载。
+- 前端设计证据冻结独立 `deepseek-harness-clean/` commit
+  `47f943859bef60e4160492346772ded9b24f765a`：采用其
+  `ui-conversation/conversation-nodes/assistant.ts`、`chat/ReasoningRow.tsx`、
+  `ui-tool/ToolCallTree.tsx` 的事件顺序/可折叠呈现，以及
+  `ui-conversation/skeleton/ApprovalPanel.tsx`、`PermissionSelect.tsx` 和
+  `interaction/permission-presets` 的“workspace-write + ask / full + never”分离思想；适配在 ChatDS
+  已有 durable AgentRun、用户/Session ACL 和 exact workspace mount 后面，没有搬入其单机目录模型或
+  Harness 内核。Claude 协议证据冻结独立 `claude-code/` commit
+  `6f6f12b37f529488b10e53928dd5508bb93535c7`：采用
+  `src/entrypoints/sdk/controlSchemas.ts` 与 `src/cli/structuredIO.ts` 的 typed request/response、pending
+  map、exact request id 和重复响应处理；不推测 stub，也不修改生产 Claude 内核。本轮本地路径完整，
+  无需 Web 搜索。
+- 回归为跨域/rename fixtures，不含 V2.3、疾病、Session、worker 数量或报告名特判。Backend 在生产依赖
+  补齐的隔离测试路径为 331 项全量；Claude Runner/Supervisor 为 97 passed、1 skipped、14 subtests；
+  Legacy Harness clean mount 为 1984 passed、1 skipped、813 subtests；Frontend 为 44 passed，变更文件
+  ESLint 和 production build 通过。宿主 Python 未装 `croniter` 时 Backend/Runner 分别只出现 2/3 个
+  `schedule_parser_unavailable`，使用 `/tmp` 临时依赖及生产镜像复验后全部通过；未自动运行模型重型
+  V2.3 E2E。最终提交、clean archive、数据库备份、镜像 revision 和生产验收记录将在本节部署后补齐。
+
 ## 2026-08-13 ClaudeCodeEngine 薄适配边界
 
 - 用户再次明确架构边界：ChatDS 的 ClaudeCodeEngine 只承担浏览器/Backend 与未修改的原生

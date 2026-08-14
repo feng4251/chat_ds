@@ -53,6 +53,32 @@ def _config(*, resume: bool = False) -> dict:
 
 
 class RunnerCommandContractTests(unittest.TestCase):
+    def test_native_ledger_returns_the_exact_controller_sequence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = EventLedger(Path(temporary) / "events.jsonl")
+            first = ledger.append_line(
+                json.dumps({"type": "system", "subtype": "init"}).encode(),
+                channel="stdout",
+            )
+            second = ledger.append_event(
+                {"type": "chatds.fixture"}, channel="controller"
+            )
+            ledger.close()
+        self.assertEqual((first, second), (1, 2))
+
+    def test_permission_presets_use_native_claude_modes_without_widening_tools(self):
+        full, _ = _claude_command({**_config(), "permission_preset": "session_full"})
+        writable, _ = _claude_command({**_config(), "permission_preset": "workspace_write"})
+        readonly, _ = _claude_command({**_config(), "permission_preset": "read_only"})
+        self.assertIn("--dangerously-skip-permissions", full)
+        self.assertEqual(full[full.index("--permission-mode") + 1], "bypassPermissions")
+        self.assertNotIn("--dangerously-skip-permissions", writable)
+        self.assertEqual(writable[writable.index("--permission-mode") + 1], "default")
+        self.assertNotIn("--dangerously-skip-permissions", readonly)
+        self.assertEqual(readonly[readonly.index("--permission-mode") + 1], "plan")
+        for command in (full, writable, readonly):
+            self.assertEqual(command[command.index("--tools") + 1], "default")
+
     def test_only_static_bridge_failures_receive_durable_diagnostic_codes(self):
         self.assertEqual(
             _safe_controller_exception_code(

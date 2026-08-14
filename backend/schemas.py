@@ -71,6 +71,14 @@ class ConversationSettingsUpdate(BaseModel):
     enabled_tools: Optional[list[str]] = None
     fallback_model_ids: Optional[list[str]] = None
     enabled_user_skills: Optional[list[str]] = None
+    permission_preset: Optional[
+        Literal["read_only", "workspace_write", "session_full"]
+    ] = None
+
+
+class ApprovalDecision(BaseModel):
+    decision: Literal["allow", "deny"]
+    request_seq: int = Field(ge=1)
 
 
 class GoalUpdate(BaseModel):

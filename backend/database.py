@@ -51,6 +51,8 @@ _LIGHTWEIGHT_MIGRATIONS = [
     "ALTER TABLE messages ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE messages ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE messages ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE messages ADD COLUMN run_id VARCHAR(32)",
+    "CREATE INDEX IF NOT EXISTS ix_messages_run_id ON messages (run_id)",
     "ALTER TABLE skill_packages ADD COLUMN session_id VARCHAR(32)",
     "CREATE INDEX IF NOT EXISTS ix_skill_packages_session_id ON skill_packages (session_id)",
     "ALTER TABLE skill_packages ADD COLUMN bundle_id VARCHAR(64)",
@@ -60,6 +62,7 @@ _LIGHTWEIGHT_MIGRATIONS = [
     "CREATE INDEX IF NOT EXISTS ix_skill_packages_bundle_id ON skill_packages (bundle_id)",
     "ALTER TABLE conversations ADD COLUMN enabled_tools TEXT",
     "ALTER TABLE conversations ADD COLUMN engine_id VARCHAR(32) NOT NULL DEFAULT 'legacy'",
+    "ALTER TABLE conversations ADD COLUMN permission_preset VARCHAR(32) NOT NULL DEFAULT 'session_full'",
     "ALTER TABLE conversations ADD COLUMN fallback_model_ids TEXT",
     "ALTER TABLE conversations ADD COLUMN enabled_user_skills TEXT",
     "ALTER TABLE conversations ADD COLUMN forked_from_conversation_id VARCHAR(32)",
@@ -155,6 +158,25 @@ _LIGHTWEIGHT_MIGRATIONS = [
     "CREATE INDEX IF NOT EXISTS ix_agent_run_events_event_type ON agent_run_events (event_type)",
     "CREATE INDEX IF NOT EXISTS ix_agent_run_events_tool_name ON agent_run_events (tool_name)",
     "CREATE INDEX IF NOT EXISTS ix_agent_run_events_tool_call_id ON agent_run_events (tool_call_id)",
+    "CREATE TABLE IF NOT EXISTS turn_activity_events ("
+    "id VARCHAR(32) PRIMARY KEY, "
+    "user_id VARCHAR(32) NOT NULL, "
+    "conversation_id VARCHAR(32) NOT NULL, "
+    "root_run_id VARCHAR(32) NOT NULL, "
+    "run_id VARCHAR(32) NOT NULL, "
+    "seq INTEGER NOT NULL, "
+    "node_id VARCHAR(192) NOT NULL, "
+    "kind VARCHAR(32) NOT NULL, "
+    "operation VARCHAR(16) NOT NULL DEFAULT 'append', "
+    "payload TEXT NOT NULL, "
+    "event_time DATETIME DEFAULT CURRENT_TIMESTAMP)",
+    "CREATE INDEX IF NOT EXISTS ix_turn_activity_events_user_id ON turn_activity_events (user_id)",
+    "CREATE INDEX IF NOT EXISTS ix_turn_activity_events_conversation_id ON turn_activity_events (conversation_id)",
+    "CREATE INDEX IF NOT EXISTS ix_turn_activity_events_root_run_id ON turn_activity_events (root_run_id)",
+    "CREATE INDEX IF NOT EXISTS ix_turn_activity_events_run_id ON turn_activity_events (run_id)",
+    "CREATE INDEX IF NOT EXISTS ix_turn_activity_events_node_id ON turn_activity_events (node_id)",
+    "CREATE INDEX IF NOT EXISTS ix_turn_activity_events_kind ON turn_activity_events (kind)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_turn_activity_events_root_seq ON turn_activity_events (root_run_id, seq)",
     "CREATE TABLE IF NOT EXISTS artifacts ("
     "id VARCHAR(32) PRIMARY KEY, "
     "user_id VARCHAR(32) NOT NULL, "

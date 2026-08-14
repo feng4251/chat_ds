@@ -237,6 +237,46 @@ export async function getRunEvents(convId, runId, params = {}) {
   return await res.json()
 }
 
+export async function getTurnActivities(convId, options = {}) {
+  const pageSize = Math.min(2000, Math.max(1, options.limit || 2000))
+  const maximum = Math.min(50000, Math.max(pageSize, options.maximum || 50000))
+  const events = []
+  const rootRunId = options.rootRunId || ''
+  let cursor = Math.max(0, options.after || 0)
+  while (events.length < maximum) {
+    const search = new URLSearchParams({
+      limit: String(Math.min(pageSize, maximum - events.length)),
+      ...(rootRunId
+        ? { root_run_id: rootRunId, after: String(cursor) }
+        : { offset: String(cursor) }),
+    })
+    const res = await request(`/conversations/${convId}/activity-events?${search}`)
+    const page = await res.json()
+    events.push(...(page.events || []))
+    const next = rootRunId ? page.next_after : page.next_offset
+    if (!page.has_more || next == null) break
+    cursor = next
+  }
+  return { events, truncated: events.length >= maximum }
+}
+
+export async function decideTurnApproval(
+  convId,
+  runId,
+  requestId,
+  requestSeq,
+  decision,
+) {
+  const res = await request(
+    `/conversations/${convId}/runs/${runId}/approvals/${encodeURIComponent(requestId)}`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ decision, request_seq: requestSeq }),
+    },
+  )
+  return await res.json()
+}
+
 export async function downloadTrajectory(convId) {
   const token = localStorage.getItem('token')
   const res = await fetch(`${API}/conversations/${convId}/trajectory`, {

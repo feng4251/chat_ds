@@ -208,6 +208,7 @@ export default function SessionWorkspace({
         model_id: settings.model_id,
         enabled_tools: settings.enabled_tools,
         fallback_model_ids: settings.fallback_model_ids,
+        permission_preset: settings.permission_preset,
       })
       setSettings(next)
       setError('')
@@ -465,6 +466,34 @@ export default function SessionWorkspace({
                     .map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
                 </select>
               </Section>
+              {settings.engine_id === 'claude_code' && (
+                <Section title="Session 权限">
+                  <div className="grid grid-cols-1 gap-2">
+                    {[
+                      ['read_only', '只读', '工作区以只读方式挂载；写入和执行权限请求会被策略拒绝。'],
+                      ['workspace_write', '工作区读写', '可读写当前 Session 工作区；Claude 原生权限请求由页面逐次确认。'],
+                      ['session_full', 'Session 完整权限', '在当前 Session 的挂载与出网边界内免确认执行；不包含主机或其他 Session。'],
+                    ].map(([value, title, description]) => (
+                      <label key={value} className={`cursor-pointer rounded-xl border p-3 ${settings.permission_preset === value ? 'border-indigo-400 bg-indigo-50' : 'border-stone-200 bg-white'}`}>
+                        <div className="flex items-center gap-2 text-sm font-medium text-slate-800">
+                          <input
+                            type="radio"
+                            name="permission-preset"
+                            value={value}
+                            checked={(settings.permission_preset || 'session_full') === value}
+                            onChange={() => setSettings({ ...settings, permission_preset: value })}
+                          />
+                          {title}
+                        </div>
+                        <div className="mt-1 pl-5 text-[11px] leading-relaxed text-slate-500">{description}</div>
+                      </label>
+                    ))}
+                  </div>
+                  <div className="mt-2 rounded-lg bg-stone-100 px-3 py-2 text-[11px] text-slate-600">
+                    所有级别始终只挂载当前用户的当前 Session 工作区；无法访问其他用户、其他 Session、宿主机目录或 Docker Socket。
+                  </div>
+                </Section>
+              )}
               {settings.engine_id === 'legacy' && <Section title="模型回退链">
                 <div className="grid grid-cols-2 gap-2">
                   {models.filter((m) => m.id !== settings.model_id).map((m) => (

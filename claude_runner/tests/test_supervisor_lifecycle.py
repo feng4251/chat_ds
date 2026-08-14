@@ -17,6 +17,7 @@ from fastapi import HTTPException
 from claude_runner.config import ProviderProfile, RunnerSettings
 from claude_runner import server as supervisor_server
 from claude_runner.server import (
+    ApprovalDecisionRequest,
     NotFound,
     RunIdentityRequest,
     RunManager,
@@ -712,6 +713,102 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
             launch["volumes"][str(workspace)],
             {"bind": "/workspace", "mode": "rw"},
         )
+
+    async def test_read_only_permission_is_enforced_by_the_workspace_mount(self):
+        request = self._request().model_copy(update={
+            "permission_preset": "read_only",
+        })
+        workspace, skill_view, state = self.manager._validate_paths(request)
+        run_dir = state / "control" / "runs" / request.run_id
+        run_dir.mkdir(parents=True)
+        request_path = run_dir / "request.json"
+        request_path.write_text("{}", encoding="utf-8")
+        status_path = run_dir / "status.json"
+        status_path.write_text(json.dumps({
+            "run_id": request.run_id,
+            "user_id": request.user_id,
+            "conversation_id": request.conversation_id,
+            "status": "starting",
+            "phase": "starting",
+        }), encoding="utf-8")
+        with (
+            patch.dict(os.environ, {"SKILL_EGRESS_POLICY_TOKEN": "x" * 32}),
+            patch.object(
+                supervisor_server,
+                "_seccomp_security_option",
+                return_value="seccomp={}",
+            ),
+        ):
+            self.manager._create_container_sync(
+                request,
+                workspace,
+                skill_view,
+                state,
+                run_dir,
+                request_path,
+                status_path,
+                self.profile,
+            )
+        self.assertEqual(
+            self.client.containers.last_run["volumes"][str(workspace)],
+            {"bind": "/workspace", "mode": "ro"},
+        )
+
+    async def test_approval_decision_is_identity_and_native_sequence_bound(self):
+        request = self._request().model_copy(update={
+            "permission_preset": "workspace_write",
+        })
+        self.manager._ensure_admission(request)
+        _workspace, _view, _state, run_dir, _status, _profile = (
+            self.manager._prepare_run_sync(request, self.profile)
+        )
+        native = {
+            "seq": 17,
+            "channel": "stdout",
+            "event": {
+                "type": "control_request",
+                "request_id": "generic-request-1",
+                "request": {
+                    "subtype": "can_use_tool",
+                    "tool_name": "RenamedTool",
+                    "input": {"path": "generic.txt"},
+                },
+            },
+        }
+        (run_dir / "events.jsonl").write_text(
+            json.dumps(native) + "\n",
+            encoding="utf-8",
+        )
+        decision = ApprovalDecisionRequest(
+            user_id=self.user_id,
+            conversation_id=self.conversation_id,
+            request_seq=17,
+            decision="allow",
+        )
+        accepted = await self.manager.decide_approval(
+            request.run_id,
+            "generic-request-1",
+            decision,
+        )
+        self.assertFalse(accepted["idempotent"])
+        replay = await self.manager.decide_approval(
+            request.run_id,
+            "generic-request-1",
+            decision,
+        )
+        self.assertTrue(replay["idempotent"])
+        with self.assertRaisesRegex(HTTPException, "another decision"):
+            await self.manager.decide_approval(
+                request.run_id,
+                "generic-request-1",
+                decision.model_copy(update={"decision": "deny"}),
+            )
+        with self.assertRaisesRegex(HTTPException, "stale or not durable"):
+            await self.manager.decide_approval(
+                request.run_id,
+                "generic-request-1",
+                decision.model_copy(update={"request_seq": 18}),
+            )
 
     async def test_input_attachment_directory_is_a_read_only_child_mount(self):
         payload = b"\x89PNG\r\n\x1a\nfixture"

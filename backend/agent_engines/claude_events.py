@@ -75,6 +75,35 @@ class ClaudeEventProjector:
             ),)
         if event_type == "result":
             return tuple(self._project_result(native, envelope))
+        if event_type == "control_request":
+            request = _mapping(native.get("request"))
+            if request.get("subtype") == "can_use_tool":
+                return (EngineStreamEvent(
+                    "approval",
+                    {
+                        "request_id": str(native.get("request_id") or "")[:128],
+                        "status": "pending",
+                        "tool_name": str(request.get("tool_name") or "tool")[:512],
+                        "title": str(request.get("title") or request.get("display_name") or "")[:1000],
+                        "description": str(request.get("description") or "")[:2000],
+                        "decision_reason": str(request.get("decision_reason") or "")[:2000],
+                    },
+                    envelope,
+                    native_event_id=str(native.get("request_id") or "") or None,
+                ),)
+        if event_type == "chatds.approval.decided":
+            return (EngineStreamEvent(
+                "approval",
+                {
+                    "request_id": str(native.get("request_id") or "")[:128],
+                    "status": (
+                        "allowed" if native.get("decision") == "allow" else "denied"
+                    ),
+                    "tool_name": str(native.get("tool_name") or "tool")[:512],
+                },
+                envelope,
+                native_event_id=str(native.get("request_id") or "") or None,
+            ),)
         if event_type == "chatds.workspace.artifact":
             source_event_key = str(native.get("source_event_key") or "")
             return (EngineStreamEvent(

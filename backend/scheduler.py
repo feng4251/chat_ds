@@ -476,6 +476,10 @@ async def _execute_job_once(
                     title=f"定时任务 · {job.name}",
                     model_id=job.model_id or DEFAULT_AGENT_MODEL_ID,
                     engine_id=settings.default_agent_engine_id,
+                    # A controller-created unattended Session has no browser
+                    # connected to resolve native one-shot prompts.  Its
+                    # authority remains confined to the dedicated Session.
+                    permission_preset="session_full",
                 )
                 db.add(conv)
                 await db.flush()
