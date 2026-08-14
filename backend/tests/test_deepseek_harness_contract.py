@@ -20,6 +20,7 @@ from agent_engines.deepseek_harness import (  # noqa: E402
 from deepseek_runner.runner_entrypoint import (  # noqa: E402
     NativeEventForwarder,
     _compile_mcp_patch,
+    _native_command,
 )
 from deepseek_runner.config import state_volume_host_root  # noqa: E402
 from routers.chat_router import (  # noqa: E402
@@ -172,6 +173,17 @@ def test_daemon_volume_mountpoint_is_used_for_dynamic_run_bind(tmp_path):
     root = state_volume_host_root(Client(), "renamed-state-volume")
     assert root == tmp_path / "daemon-volume-data"
     assert str(root).startswith(str(tmp_path))
+
+
+def test_native_headless_command_satisfies_upstream_loader_contract(tmp_path):
+    command = _native_command({"prompt": "renamed cross-domain task"}, tmp_path / "mcp.json")
+    assert command[:4] == [
+        "/usr/local/bin/node",
+        "--expose-internals",
+        "--use-env-proxy",
+        "/opt/deepseek-harness/apps/cli/lib/bin.js",
+    ]
+    assert command[-1] == "renamed cross-domain task"
 
 
 class _RecordingLedger:
