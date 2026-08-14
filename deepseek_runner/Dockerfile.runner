@@ -38,6 +38,11 @@ COPY claude_runner/__init__.py \
 
 RUN mkdir -p /run/chatds-control /runtime /state /skill-view \
         /opt/chatds-deepseek-plugins/node_modules/@deepseek-ai \
+        /opt/deepseek-harness/node_modules/@deepseek-ai \
+    && for package in /opt/deepseek-harness/node_modules/.pnpm/node_modules/@deepseek-ai/*; do \
+         name="$(basename "$package")"; \
+         ln -sfn "$package" "/opt/deepseek-harness/node_modules/@deepseek-ai/$name"; \
+       done \
     && ln -s /opt/deepseek-harness/vendor/schemastery \
         /opt/chatds-deepseek-plugins/node_modules/@deepseek-ai/schemastery \
     && ln -s /opt/deepseek-harness/packages/web/web \
@@ -51,6 +56,11 @@ RUN mkdir -p /run/chatds-control /runtime /state /skill-view \
     && getcap -r / 2>/dev/null | cut -d ' ' -f 1 | xargs -r setcap -r \
     && test -z "$(find / -xdev -type f -perm /6000 -print -quit)" \
     && test -z "$(getcap -r / 2>/dev/null)" \
+    && cd /opt/deepseek-harness/vendor/loader \
+    && node --input-type=module -e \
+         "await import('@deepseek-ai/dsh-llm-deepseek'); await import('@deepseek-ai/dsh-headless'); await import('@deepseek-ai/dsh-mcp-client')" \
+    && node --input-type=module -e \
+         "await import('/opt/chatds-deepseek-plugins/event_bridge.mjs'); await import('/opt/chatds-deepseek-plugins/searxng_provider.mjs')" \
     && node /opt/deepseek-harness/apps/cli/lib/bin.js --version | grep -F '0.1.0-rc.5'
 
 USER 0:0

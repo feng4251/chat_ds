@@ -102,10 +102,10 @@
 
 - insert:
     - id: chatds-searxng-search
-      name: !!js process.env.CHATDS_DSH_SEARXNG_PLUGIN
+      name: /opt/chatds-deepseek-plugins/searxng_provider.mjs
       disabled: !!js process.env.CHATDS_DSH_WEB_SEARCH_ENABLED !== '1'
       config:
         endpoint: !!js process.env.CHATDS_SEARXNG_SEARCH_URL
 
     - id: chatds-event-bridge
-      name: !!js process.env.CHATDS_DSH_EVENT_PLUGIN
+      name: /opt/chatds-deepseek-plugins/event_bridge.mjs
