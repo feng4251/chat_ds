@@ -6,11 +6,12 @@ import {
 } from 'react-icons/fi'
 import { MessageBubble } from './MessageBubble'
 import ModelSelector from './ModelSelector'
+import HarnessSelector from './HarnessSelector'
 import SessionWorkspace from './SessionWorkspace'
 import SkillBar from './SkillBar'
 import {
   getMessages, chatCompletion, uploadSessionFile, createConversation, uploadSkill,
-  getConversationSettings, updateConversationSettings,
+  getConversationSettings, updateConversationSettings, getEngines,
   getSkills, deleteSkill, getRunCards, getTurnActivities, decideTurnApproval,
 } from '../api'
 import {
@@ -33,6 +34,7 @@ import {
   runCardProjectionRevision,
   shouldFollowMessageUpdate,
 } from '../utils/sessionProjectionSync'
+import { compatibleModelsForEngine, modelForEngine } from '../utils/engineSelection'
 import {
   applyTurnActivity,
   attachTurnActivities,
@@ -270,6 +272,9 @@ export default function ChatArea({
   const [durableRunConversation, setDurableRunConversation] = useState(null)
   const [routedModel, setRoutedModel] = useState('')
   const [selectedModel, setSelectedModel] = useState('')
+  const [selectedEngine, setSelectedEngine] = useState('')
+  const [engineOptions, setEngineOptions] = useState([])
+  const [engineLocked, setEngineLocked] = useState(false)
   const [workspaceOpen, setWorkspaceOpen] = useState(false)
   const [showScrollBtn, setShowScrollBtn] = useState(false)
   const [isDragging, setIsDragging] = useState(false)
@@ -298,6 +303,29 @@ export default function ChatArea({
       || durableRunUnknown
     )
   )
+  const compatibleModels = compatibleModelsForEngine(models, selectedEngine)
+
+  useEffect(() => {
+    let cancelled = false
+    getEngines().then((engines) => {
+      if (cancelled) return
+      const options = Array.isArray(engines) ? engines : []
+      setEngineOptions((current) => (activeConv ? current : options))
+      if (!activeConv) {
+        const preferred = options.find((engine) => engine.is_default && engine.available)
+          || options.find((engine) => engine.available)
+        setSelectedEngine(preferred?.id || '')
+      }
+    }).catch(() => {})
+    return () => { cancelled = true }
+  }, [activeConv])
+
+  useEffect(() => {
+    if (activeConv || !selectedEngine) return
+    setSelectedModel((current) => (
+      modelForEngine(models, selectedEngine, current, '') || current
+    ))
+  }, [activeConv, models, selectedEngine])
 
   function requestOwnsCurrentView(scope) {
     return (
@@ -343,6 +371,7 @@ export default function ChatArea({
       setDurableRunActive(false)
       setDurableRunUnknown(false)
       setDurableRunConversation(null)
+      setEngineLocked(false)
       const defaultModel = models.find((m) => m.is_default)?.id || models[0]?.id || ''
       setSelectedModel(defaultModel)
       runCardMessageRevisionRef.current = ''
@@ -404,6 +433,9 @@ export default function ChatArea({
           setDurableRunConversation(activeConv)
         }
         setSelectedModel(settings.model_id || '')
+        setSelectedEngine(settings.engine_id || '')
+        setEngineOptions(settings.engine_options || [])
+        setEngineLocked(Boolean(settings.engine_locked))
         getSkills(activeConv, settings.enabled_user_skills || [])
           .then((list) => {
             if (aborted) return
@@ -679,6 +711,16 @@ export default function ChatArea({
     }
   }, [activeConv])
 
+  const createConfiguredConversation = useCallback(async () => {
+    const conv = await createConversation()
+    if (!selectedEngine && !selectedModel) return conv
+    await updateConversationSettings(conv.id, {
+      ...(selectedEngine ? { engine_id: selectedEngine } : {}),
+      ...(selectedModel ? { model_id: selectedModel } : {}),
+    })
+    return conv
+  }, [selectedEngine, selectedModel])
+
   // Auto-dismiss "已安装 Skill" success chips after 4 seconds so the chat
   // area doesn't accumulate stale installation notices.
   useEffect(() => {
@@ -729,7 +771,7 @@ export default function ChatArea({
         if (isZip) {
           let sid = lastConvId
           if (!sid) {
-            const conv = await createConversation()
+            const conv = await createConfiguredConversation()
             sid = conv.id
             lastConvId = sid
             onConvCreated(sid)
@@ -743,7 +785,7 @@ export default function ChatArea({
         } else {
           let convId = lastConvId
           if (!convId) {
-            const conv = await createConversation()
+            const conv = await createConfiguredConversation()
             convId = conv.id
             lastConvId = convId
             onConvCreated(convId)
@@ -763,7 +805,7 @@ export default function ChatArea({
     if (installedAnySkill) {
       setTimeout(() => refreshSessionSkills(lastConvId), 100)
     }
-  }, [activeConv, onConvCreated, refreshSessionSkills])
+  }, [activeConv, createConfiguredConversation, onConvCreated, refreshSessionSkills])
 
   function onFileInput(e) {
     const files = Array.from(e.target.files || [])
@@ -907,7 +949,10 @@ export default function ChatArea({
             return u
           })
         },
-        { signal: requestScope.controller.signal },
+        {
+          signal: requestScope.controller.signal,
+          engineId: selectedEngine || undefined,
+        },
       )
       if (requestOwnsCurrentView(requestScope)) {
         setMsgs((p) => p.map((m) => (
@@ -1056,7 +1101,10 @@ export default function ChatArea({
             return u
           })
         },
-        { signal: requestScope.controller.signal },
+        {
+          signal: requestScope.controller.signal,
+          engineId: selectedEngine || undefined,
+        },
       )
       if (requestOwnsCurrentView(requestScope)) {
         setMsgs((p) => p.map((m) => (
@@ -1121,7 +1169,7 @@ export default function ChatArea({
       return
     }
     try {
-      const conv = await createConversation()
+      const conv = await createConfiguredConversation()
       onConvCreated(conv.id)
       setWorkspaceOpen(true)
     } catch (err) {
@@ -1143,6 +1191,44 @@ export default function ChatArea({
       setUploads((p) => [...p, {
         name: 'model',
         label: `模型切换失败: ${err.message}`,
+        error: true,
+      }])
+    }
+  }
+
+  async function changeEngine(engineId) {
+    const option = engineOptions.find((engine) => engine.id === engineId)
+    if (!option?.available) return
+    const nextModel = modelForEngine(
+      models,
+      engineId,
+      selectedModel,
+      option.default_model_id,
+    )
+    if (!nextModel) {
+      setUploads((previous) => [...previous, {
+        name: 'engine',
+        label: 'Harness 切换失败: 没有兼容模型',
+        error: true,
+      }])
+      return
+    }
+    try {
+      if (activeConv) {
+        const settings = await updateConversationSettings(activeConv, {
+          engine_id: engineId,
+          model_id: nextModel,
+        })
+        setEngineOptions(settings.engine_options || engineOptions)
+        setEngineLocked(Boolean(settings.engine_locked))
+      }
+      setSelectedEngine(engineId)
+      setSelectedModel(nextModel)
+      onConvRefresh()
+    } catch (err) {
+      setUploads((previous) => [...previous, {
+        name: 'engine',
+        label: `Harness 切换失败: ${err.message}`,
         error: true,
       }])
     }
@@ -1398,8 +1484,16 @@ export default function ChatArea({
               className="flex-1 bg-transparent text-slate-800 resize-none outline-none text-[14px] placeholder-slate-400 py-2 px-1 max-h-[200px] leading-relaxed"
             />
 
+            <HarnessSelector
+              engines={engineOptions}
+              selectedEngine={selectedEngine}
+              busy={interactionBusy}
+              locked={engineLocked}
+              onChange={changeEngine}
+            />
+
             <ModelSelector
-              models={models}
+              models={compatibleModels}
               selectedModel={selectedModel}
               routedModel={routedModel}
               busy={interactionBusy}
@@ -1434,6 +1528,9 @@ export default function ChatArea({
         models={models}
         onSettingsChanged={(settings) => {
           setSelectedModel(settings.model_id)
+          setSelectedEngine(settings.engine_id)
+          setEngineOptions(settings.engine_options || [])
+          setEngineLocked(Boolean(settings.engine_locked))
           onConvRefresh()
         }}
         onConversationForked={(conversationId) => {

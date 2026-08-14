@@ -78,6 +78,7 @@ services:
   searxng-valkey:
     profiles:
       - local-search
+      - deepseek-harness
     image: docker.io/valkey/valkey:9-alpine@sha256:c9b77919daeba2c02ad954d0c844cc4e7142069d177b89c5fd771f405daf9e02
     container_name: chat_acits_searxng_valkey
     restart: unless-stopped
@@ -107,6 +108,7 @@ services:
   searxng:
     profiles:
       - local-search
+      - deepseek-harness
     # Pinned official image for upstream commit 8456831a (2026-07-09).
     # Keeping the complete SearXNG source tree outside this application repo
     # makes a clean checkout reproducible instead of relying on local files.
@@ -505,6 +507,119 @@ services:
       start_period: 20s
     stop_grace_period: 10s
 
+  # Pinned upstream DeepSeek Harness runtime. The anchor protects the image
+  # referenced by dynamically-created networkless Turn containers from image
+  # cleanup; it never processes model input itself.
+  deepseek-harness-runner-image:
+    profiles:
+      - deepseek-harness
+    image: chat_ds-deepseek-harness-runner:0.1.0-rc.5
+    build:
+      context: .
+      dockerfile: deepseek_runner/Dockerfile.runner
+      args:
+        SESSION_SANDBOX_IMAGE: chat_ds-session-sandbox
+    container_name: chat_acits_deepseek_harness_runner_image_anchor
+    restart: unless-stopped
+    depends_on:
+      executor:
+        condition: service_started
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=unconfined
+    pids_limit: 16
+    mem_limit: 64m
+    cpus: 0.05
+    entrypoint: ["python", "-I", "-c"]
+    command: ["import time; time.sleep(315360000)"]
+
+  # Trusted control plane for DeepSeek Harness. It owns the Docker socket but
+  # executes no model-authored command; each Turn container gets only one
+  # exact user/Session workspace and network_mode:none.
+  deepseek-runner-supervisor:
+    profiles:
+      - deepseek-harness
+    image: chat_ds-deepseek-runner-supervisor
+    build:
+      context: .
+      dockerfile: deepseek_runner/Dockerfile.supervisor
+    container_name: chat_acits_deepseek_runner_supervisor
+    restart: unless-stopped
+    depends_on:
+      deepseek-harness-runner-image:
+        condition: service_started
+      skill-egress-proxy:
+        condition: service_healthy
+      searxng:
+        condition: service_healthy
+    user: "0:0"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=unconfined
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 1.0
+    environment:
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-chat-ds-internal-token}
+      SKILL_EGRESS_POLICY_TOKEN: ${EXECUTOR_V2_AUTH_TOKEN:-}
+      SHAIENGINE_BASE_URL: ${SHAIENGINE_BASE_URL:-https://api.shaiengine.com/v1}
+      SHAIENGINE_API_KEY: ${SHAIENGINE_API_KEY:-}
+      DEEPSEEK_PRO_BASE_URL: ${DEEPSEEK_PRO_BASE_URL:-http://10.10.132.2:1025/v1}
+      DEEPSEEK_PRO_API_KEY: ${DEEPSEEK_PRO_API_KEY:-EMPTY}
+      LOCAL_DEEPSEEK_V4_FLASH_BASE_URL: ${LOCAL_DEEPSEEK_V4_FLASH_BASE_URL:-http://10.10.132.126:1025/v1}
+      LOCAL_DEEPSEEK_V4_FLASH_API_KEY: ${LOCAL_DEEPSEEK_V4_FLASH_API_KEY:-EMPTY}
+      QWEN3_5_BASE_URL: ${QWEN3_5_BASE_URL:-http://10.10.132.128:1025/v1}
+      QWEN3_5_API_KEY: ${QWEN3_5_API_KEY:-EMPTY}
+      DEEPSEEK_HARNESS_PROVIDER_PROFILES_JSON: >-
+        {"shaiengine":{"base_url":"${SHAIENGINE_BASE_URL:-https://api.shaiengine.com/v1}","api_key_env":"SHAIENGINE_API_KEY","protocol":"openai","models":["glm-5.2","deepseek-v4-pro","kimi-k3"],"context_windows":{"glm-5.2":1000000,"deepseek-v4-pro":200000,"kimi-k3":1000000}},"local_agentmodel":{"base_url":"${DEEPSEEK_PRO_BASE_URL:-http://10.10.132.2:1025/v1}","api_key_env":"DEEPSEEK_PRO_API_KEY","protocol":"openai","models":["AgentModel"],"context_windows":{"AgentModel":918528}},"local_deepseek_v4_flash":{"base_url":"${LOCAL_DEEPSEEK_V4_FLASH_BASE_URL:-http://10.10.132.126:1025/v1}","api_key_env":"LOCAL_DEEPSEEK_V4_FLASH_API_KEY","protocol":"openai","models":["AgentModel"],"context_windows":{"AgentModel":1048576}},"local_qwen":{"base_url":"${QWEN3_5_BASE_URL:-http://10.10.132.128:1025/v1}","api_key_env":"QWEN3_5_API_KEY","protocol":"openai","models":["qwen3_5"],"context_windows":{"qwen3_5":262144}}}
+      DEEPSEEK_HARNESS_WORKSPACE_HOST_ROOT: /nfs/temp/chat_ds
+      DEEPSEEK_HARNESS_RUNNER_STATE_ROOT: /var/lib/chatds-deepseek-harness-runner
+      DEEPSEEK_HARNESS_RUNNER_IMAGE: chat_ds-deepseek-harness-runner:0.1.0-rc.5
+      DEEPSEEK_HARNESS_EGRESS_PROXY_VOLUME_NAME: ${SKILL_EGRESS_PROXY_VOLUME_NAME:-chat_ds_skill_egress_proxy_socket}
+      DEEPSEEK_HARNESS_WORKSPACE_LOCK_VOLUME_NAME: ${WORKSPACE_MUTATION_LOCK_VOLUME_NAME:-chat_ds_workspace_mutation_locks}
+      DEEPSEEK_HARNESS_RUNNER_MAX_CONCURRENT: ${DEEPSEEK_HARNESS_RUNNER_MAX_CONCURRENT:-4}
+      DEEPSEEK_HARNESS_RUNNER_MAX_RUN_SECONDS: ${DEEPSEEK_HARNESS_RUNNER_MAX_RUN_SECONDS:-14400}
+      DEEPSEEK_HARNESS_RUNNER_MEMORY_LIMIT: ${DEEPSEEK_HARNESS_RUNNER_MEMORY_LIMIT:-8g}
+      DEEPSEEK_HARNESS_RUNNER_CPUS: ${DEEPSEEK_HARNESS_RUNNER_CPUS:-6}
+      DEEPSEEK_HARNESS_EGRESS_MAX_REQUESTS: ${SKILL_EGRESS_MAX_REQUESTS:-8192}
+      DEEPSEEK_HARNESS_EGRESS_MAX_OUTBOUND_BYTES: ${SKILL_EGRESS_MAX_OUTBOUND_BYTES:-67108864}
+      DEEPSEEK_HARNESS_EGRESS_MAX_RESPONSE_WIRE_BYTES: ${SKILL_EGRESS_MAX_RESPONSE_WIRE_BYTES:-2147483648}
+      DEEPSEEK_HARNESS_PUBLIC_READ_EGRESS_ENABLED: ${DEEPSEEK_HARNESS_PUBLIC_READ_EGRESS_ENABLED:-true}
+      DEEPSEEK_HARNESS_PRIVATE_ORIGIN_ALLOWLIST: >-
+        ${BROWSER_PRIVATE_ORIGIN_ALLOWLIST:-},http://10.10.132.2:1025,http://10.10.132.126:1025,http://10.10.132.128:1025,http://searxng:8080
+      DEEPSEEK_HARNESS_SEARXNG_SEARCH_URL: ${CLAUDE_WEB_SEARCH_URL:-http://searxng:8080/search}
+      WORKSPACE_MUTATION_LOCK_ROOT: /run/chatds-workspace-lock-plane/locks
+      WORKSPACE_MUTATION_LOCK_REQUIRE_MOUNTPOINT: "1"
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /nfs/temp/chat_ds:/nfs/temp/chat_ds
+      - deepseek_runner_state:/var/lib/chatds-deepseek-harness-runner
+      - type: volume
+        source: workspace_mutation_locks
+        target: /run/chatds-workspace-lock-plane
+        volume:
+          nocopy: true
+    networks:
+      - deepseek_control_net
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,urllib.request; r=urllib.request.Request('http://127.0.0.1:8040/health',headers={'X-Internal-Token':os.environ['INTERNAL_API_TOKEN']}); raise SystemExit(0 if urllib.request.urlopen(r,timeout=3).status==200 else 1)"
+      interval: 5s
+      timeout: 4s
+      retries: 30
+      start_period: 30s
+    stop_grace_period: 25s
+
   # A one-shot, networkless permission initializer is retained even though a
   # brand-new volume copies the sidecar image's ownership metadata.  It also
   # makes upgrades safe when the named volume already exists with root:root
@@ -721,6 +836,9 @@ services:
       claude-runner-supervisor:
         condition: service_healthy
         required: false
+      deepseek-runner-supervisor:
+        condition: service_healthy
+        required: false
     environment:
       # SQLite on local Docker volume — NFS locks break aiosqlite
       DATABASE_URL: sqlite+aiosqlite:////app/db/chat_ds.db
@@ -739,6 +857,11 @@ services:
       CLAUDE_RUNNER_STREAM_TIMEOUT_SECONDS: ${CLAUDE_RUNNER_STREAM_TIMEOUT_SECONDS:-18000}
       CLAUDE_CODE_PROVIDER_PROFILES: >-
         ["shaiengine","local_agentmodel","local_deepseek_v4_flash","local_qwen"]
+      DEEPSEEK_HARNESS_ENGINE_ENABLED: ${DEEPSEEK_HARNESS_ENGINE_ENABLED:-false}
+      DEEPSEEK_HARNESS_PROVIDER_PROFILES: >-
+        ["shaiengine","local_agentmodel","local_deepseek_v4_flash","local_qwen"]
+      DEEPSEEK_RUNNER_URL: http://deepseek-runner-supervisor:8040
+      DEEPSEEK_RUNNER_STREAM_TIMEOUT_SECONDS: ${DEEPSEEK_RUNNER_STREAM_TIMEOUT_SECONDS:-18000}
       # Primary AgentModel (GLM-5.2) and auxiliary multimodal endpoint.
       DEEPSEEK_PRO_BASE_URL: ${DEEPSEEK_PRO_BASE_URL:-http://10.10.132.2:1025/v1}
       DEEPSEEK_PRO_API_KEY: ${DEEPSEEK_PRO_API_KEY:-EMPTY}
@@ -774,6 +897,7 @@ services:
     networks:
       - chat_net
       - claude_control_net
+      - deepseek_control_net
     # Backend health includes a cross-container /app/data inode attestation
     # against Harness.  This catches relative bind mounts rebased by a clean
     # archive deployment before Frontend accepts user traffic.
@@ -814,6 +938,9 @@ networks:
   claude_control_net:
     driver: bridge
     internal: true
+  deepseek_control_net:
+    driver: bridge
+    internal: true
   # Egress-only browser network.  Harness/backend/frontend are deliberately
   # absent, so a compromised renderer cannot resolve or dial chat_net peers.
   browser_egress:
@@ -848,6 +975,8 @@ volumes:
   browser_cdp_socket:
     driver: local
   claude_runner_state:
+    driver: local
+  deepseek_runner_state:
     driver: local
   searxng_data:
     driver: local

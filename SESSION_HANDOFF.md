@@ -2,6 +2,32 @@
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
+## 2026-08-14 DeepSeek Harness 平级引擎实现（部署前）
+
+- 官方 `deepseek-ai/deepseek-harness` 以独立 Git 子模块固定在
+  `deepseek-harness-clean/`，commit 为
+  `47f943859bef60e4160492346772ded9b24f765a`（`0.1.0-rc.5`，MIT）。
+  ChatDS 不修改该源码树；`deepseek_runner/` 仅实现适配与可信控制面。
+- 新增平级 `AgentEngine`：`deepseek_harness`。每个 Turn 启动一个
+  `network_mode=none` 容器，只挂载该用户当前 Session 的 workspace、Session
+  自有运行状态、不可变 Skill 编译视图和控制器收据。模型进程以非特权用户运行；
+  PID 1 独占出网、产物发现和唯一权威终态。
+- 模型/Provider 绑定由部署配置精确授权并 fail closed。OpenAI 模型流量与
+  SearXNG `/search` 都经过已有签名精确出网代理；不挂载宿主代码、Docker
+  socket、其他用户或其他 Session 路径。`deepseek-harness` Compose profile
+  会同时启用 SearXNG。
+- 输入框内新增 Harness 选择器，位于模型选择器左侧；模型列表依据显式引擎兼容
+  关系过滤。首次持久消息/Run 后 Harness 锁定，已有 Session 需 fork 才能切换。
+- Scheduler、清理和生命周期事务以通用 native-engine 路径同时覆盖 Claude Code
+  与 DeepSeek Harness；Claude Code 仍为薄原生适配器，本轮未修改其运行内核。
+- 部署前验证：Backend `337 passed`；Frontend `47 passed`、定向 ESLint 与生产
+  build 通过；DeepSeek/Claude contract suites 通过（旧 Claude 测试镜像仅有一项
+  与本轮无关的 `/usr/bin/python3` 固定 fixture 差异）；Compose 校验、SearXNG
+  实际查询和 DeepSeek 原生 SearX 适配器均通过。未启动模型重型 V2.3 E2E。
+- 两项用户自有 tracked deletion 仍不得恢复或提交：
+  `XGAL-101_Galectin-3_AD_Comprehensive_Development_Plan_v1.0_claudecode执行参考.md`
+  与 `xClinicalTrial-Design-V2.2.zip`。
+
 ## 2026-08-14 Turn 时间线、多代理工作流与 Session 权限闭环
 
 - 用户批准将 ChatDS 的固定“工具调用 / 深度思考 / 正文”三段式改为同一 Turn 内按真实发生顺序
@@ -3304,3 +3330,36 @@ Round 17 的两个全新 case。不得复用
   两者 revision 都为完整 `20d950890cc1dc6f3e31c0925d6515e87c83d734`、healthy/restart 0。
   Backend 与 Supervisor 均回读 `kimi-k3`/1M，四个 Frontend 入口 `/api/health` 为 200，
   Supervisor 鉴权 health 为 200，SQLite 仍健康、active run 为 0，严重启动日志匹配为 0。
+# 2026-08-14 DeepSeek Harness peer-engine implementation (pre-deployment)
+
+- Added the official `deepseek-ai/deepseek-harness` as the pinned, independent
+  `deepseek-harness-clean/` Git submodule at commit
+  `47f943859bef60e4160492346772ded9b24f765a` (`0.1.0-rc.5`, MIT). ChatDS does
+  not patch that source tree; `deepseek_runner/` is the adapter/control plane.
+- DeepSeek Harness is now a peer `AgentEngine` (`deepseek_harness`) rather than
+  Legacy Harness policy. Each Turn runs in a fresh `network_mode=none`
+  container which mounts only that user's exact Session workspace, the
+  Session-owned runtime state, the immutable compiled Skill view, and
+  controller-owned receipts. The model process runs unprivileged; PID 1 owns
+  egress, artifact discovery and the single authoritative terminal.
+- Model/provider bindings fail closed and are deployment-owned. OpenAI model
+  traffic and SearXNG `/search` traffic use the existing signed exact-egress
+  proxy; arbitrary Docker/host/other-user/other-Session paths are not mounted.
+  SearXNG is activated by the `deepseek-harness` Compose profile.
+- The composer now shows a Harness selector immediately left of the model
+  selector. Model choices are filtered by explicit engine compatibility;
+  Harness is immutable after the first durable message/run and switching an
+  existing Session requires a fork.
+- Generic native-engine scheduling, cleanup and lifecycle handling now cover
+  both Claude Code and DeepSeek Harness. Claude Code remains a thin native
+  adapter and its runtime behavior was not changed.
+- Verification completed before deployment: backend `337 passed`; frontend
+  `47 passed`, targeted ESLint and production build; DeepSeek/Claude contract
+  suites passed (the old Claude test image has one unrelated pre-existing
+  `/usr/bin/python3` fixture mismatch); Compose validation passed; SearXNG live
+  query and the native DeepSeek SearX adapter both returned results. No V2.3
+  model-heavy E2E was launched.
+- Protected user-owned tracked deletions remain unstaged and must not be
+  restored or committed:
+  `XGAL-101_Galectin-3_AD_Comprehensive_Development_Plan_v1.0_claudecode执行参考.md`
+  and `xClinicalTrial-Design-V2.2.zip`.

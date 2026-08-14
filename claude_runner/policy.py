@@ -54,6 +54,7 @@ def compile_turn_egress_policy(
     budget_scope_sha256: str,
     call_id_sha256: str,
     limits: dict[str, int],
+    provider_protocol: str = "anthropic",
     public_read_enabled: bool = False,
 ) -> dict[str, Any]:
     # The Supervisor attests the immutable view before compiling execution
@@ -171,21 +172,29 @@ def compile_turn_egress_policy(
         for prefix in user_urls
     ]
 
-    # Claude Code 2.x uses the Anthropic SDK's beta transport coordinate and
-    # may ask the provider to count tokens before sending a long Messages
-    # request. Grant only those four exact protocol coordinates; in
-    # particular, ``beta=true`` is not widened into arbitrary query access.
-    provider_prefixes = tuple(
-        normalize_http_url_prefix(
-            provider_base_url.rstrip("/") + suffix
+    # Grant only the exact transport coordinates used by the selected native
+    # engine.  This compiler is shared control-plane policy; it must not make
+    # the model choose between Anthropic and OpenAI execution routes.
+    if provider_protocol == "anthropic":
+        provider_prefixes = tuple(
+            normalize_http_url_prefix(
+                provider_base_url.rstrip("/") + suffix
+            )
+            for suffix in (
+                "/v1/messages",
+                "/v1/messages?beta=true",
+                "/v1/messages/count_tokens",
+                "/v1/messages/count_tokens?beta=true",
+            )
         )
-        for suffix in (
-            "/v1/messages",
-            "/v1/messages?beta=true",
-            "/v1/messages/count_tokens",
-            "/v1/messages/count_tokens?beta=true",
+    elif provider_protocol == "openai":
+        provider_prefixes = (
+            normalize_http_url_prefix(
+                provider_base_url.rstrip("/") + "/chat/completions"
+            ),
         )
-    )
+    else:
+        raise ClaudeEgressPolicyError("Provider protocol is unsupported")
     exact_query_rows.extend(
         {"url_prefix": prefix, "methods": ["POST"]}
         for prefix in provider_prefixes

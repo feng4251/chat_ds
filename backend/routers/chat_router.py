@@ -68,6 +68,7 @@ from stream_observability import (
 )
 from agent_engines.base import (
     ENGINE_ID_CLAUDE_CODE,
+    ENGINE_ID_DEEPSEEK_HARNESS,
     ENGINE_ID_LEGACY,
     AgentEngineError,
     AgentEngineRequest,
@@ -3228,6 +3229,7 @@ BUILTIN = {
         "capabilities": ["text", "tools", "reasoning"],
         "provider": "shaiengine",
         "claude_provider_profile": "shaiengine",
+        "deepseek_harness_provider_profile": "shaiengine",
         "protocol": "openai",
         "context_length": 1000000,
         "discover_runtime_metadata": True,
@@ -3248,6 +3250,7 @@ BUILTIN = {
         "capabilities": ["text", "tools", "reasoning"],
         "provider": "shaiengine",
         "claude_provider_profile": "shaiengine",
+        "deepseek_harness_provider_profile": "shaiengine",
         "protocol": "openai",
         "context_length": 200000,
         "discover_runtime_metadata": True,
@@ -3268,6 +3271,7 @@ BUILTIN = {
         "capabilities": ["text", "vision", "tools", "reasoning"],
         "provider": "shaiengine",
         "claude_provider_profile": "shaiengine",
+        "deepseek_harness_provider_profile": "shaiengine",
         "protocol": "openai",
         # Shaiengine's /v1/models entry advertises the route but omits
         # capacity fields.  Kimi's first-party K3 specification is therefore
@@ -3291,6 +3295,7 @@ BUILTIN = {
         "capabilities": ["text", "tools", "reasoning"],
         "provider": "builtin",
         "claude_provider_profile": "local_agentmodel",
+        "deepseek_harness_provider_profile": "local_agentmodel",
         "protocol": "openai",
         "context_length": 918528,
         "discover_runtime_metadata": True,
@@ -3313,6 +3318,7 @@ BUILTIN = {
         "capabilities": ["text", "tools", "reasoning"],
         "provider": "builtin",
         "claude_provider_profile": "local_deepseek_v4_flash",
+        "deepseek_harness_provider_profile": "local_deepseek_v4_flash",
         "protocol": "openai",
         "context_length": 1048576,
         "discover_runtime_metadata": True,
@@ -3333,6 +3339,7 @@ BUILTIN = {
         "capabilities": ["text", "vision", "tools"],
         "provider": "builtin",
         "claude_provider_profile": "local_qwen",
+        "deepseek_harness_provider_profile": "local_qwen",
         "protocol": "openai",
         "context_length": 262144,
         "discover_runtime_metadata": True,
@@ -3369,6 +3376,39 @@ def claude_code_model_compatible(provider_config: dict) -> bool:
     )
 
 
+def deepseek_harness_model_compatible(provider_config: dict) -> bool:
+    """Require an exact deployment-owned OpenAI-compatible runner binding."""
+
+    profile = provider_config.get("deepseek_harness_provider_profile")
+    return (
+        provider_config.get("protocol") == "openai"
+        and isinstance(profile, str)
+        and bool(profile)
+        and profile in settings.deepseek_harness_provider_profiles
+    )
+
+
+_DEEPSEEK_HARNESS_TOOL_CAPABILITIES = frozenset({
+    "web_search", "web_extract", "market_quote",
+    "execute_code", "run_skill_python", "run_skill_script",
+    "run_declared_command", "skill_http_get", "skill_http_post_json",
+    "read_file", "write_file", "patch_file", "merge_files", "search_files",
+    "todo", "skills_list", "skill_view", "skill_copy_resource",
+    "delegate_task", "get_goal", "create_goal", "update_goal",
+})
+
+
+def _effective_engine_tools(engine_id: str, requested: list[str]) -> list[str]:
+    """Compile canonical ChatDS grants onto one native engine surface."""
+
+    if engine_id != ENGINE_ID_DEEPSEEK_HARNESS:
+        return list(requested)
+    return [
+        name for name in requested
+        if name in _DEEPSEEK_HARNESS_TOOL_CAPABILITIES
+    ]
+
+
 def _require_turn_input_capabilities(
     *,
     engine_id: str,
@@ -3378,9 +3418,12 @@ def _require_turn_input_capabilities(
     """Reject a binary input before creating a run with an incapable model."""
 
     if (
-        engine_id == ENGINE_ID_CLAUDE_CODE
+        engine_id in {ENGINE_ID_CLAUDE_CODE, ENGINE_ID_DEEPSEEK_HARNESS}
         and image_urls
-        and not bool(provider_config.get("is_multimodal"))
+        and (
+            not bool(provider_config.get("is_multimodal"))
+            or engine_id == ENGINE_ID_DEEPSEEK_HARNESS
+        )
     ):
         raise HTTPException(
             status_code=400,
@@ -3508,6 +3551,12 @@ async def get_models(cur_user=Depends(get_current_user), db=Depends(get_db)):
                     else []
                 ),
                 *(["claude_code"] if claude_code_model_compatible(cfg) else []),
+                *(
+                    ["deepseek_harness"]
+                    if settings.deepseek_harness_engine_enabled
+                    and deepseek_harness_model_compatible(cfg)
+                    else []
+                ),
             ],
         }
         for mid, cfg in BUILTIN.items()
@@ -3545,6 +3594,7 @@ async def get_agent_engines(cur_user=Depends(get_current_user)):
             {
                 "id": item.id,
                 "name": item.display_name,
+                "is_default": item.id == settings.default_agent_engine_id,
                 "available": (
                     item.available
                     and not (
@@ -3695,6 +3745,15 @@ async def _chat_stream(
                     409,
                     "Legacy Harness execution is disabled; fork this Conversation to Claude Code",
                 )
+            if conv.engine_id != ENGINE_ID_LEGACY:
+                from agent_engines.registry import build_agent_engine_registry
+                try:
+                    build_agent_engine_registry().get(conv.engine_id)
+                except LookupError as exc:
+                    raise HTTPException(
+                        409,
+                        "The Conversation's Agent Engine is not configured",
+                    ) from exc
             model_id = canonical_agent_model_id(
                 req.model_id
                 or conv.model_id
@@ -3795,6 +3854,14 @@ async def _chat_stream_with_turn(
             400,
             "The selected model is not allowed by a configured Claude Code provider profile",
         )
+    if (
+        conv.engine_id == ENGINE_ID_DEEPSEEK_HARNESS
+        and not deepseek_harness_model_compatible(provider_config)
+    ):
+        raise HTTPException(
+            400,
+            "The selected model is not allowed by a configured DeepSeek Harness provider profile",
+        )
     _require_turn_input_capabilities(
         engine_id=conv.engine_id,
         image_urls=req.image_urls,
@@ -3804,11 +3871,12 @@ async def _chat_stream_with_turn(
         BUILTIN.get(model_id, {}).get("max_tokens")
         if model_id in BUILTIN else DEFAULT_CUSTOM_MAX_TOKENS
     ) or DEFAULT_CUSTOM_MAX_TOKENS
-    enabled_tools = (
+    requested_tools = (
         list(enabled_tools_override)
         if enabled_tools_override is not None
         else serialize_json_list(conv.enabled_tools, DEFAULT_NATIVE_TOOLS)
     )
+    enabled_tools = _effective_engine_tools(conv.engine_id, requested_tools)
     enabled_user_skills = serialize_json_list(conv.enabled_user_skills, [])
     skill_registry_query = select(SkillPackage).where(
         SkillPackage.user_id == cur_user.id,
@@ -3859,11 +3927,11 @@ async def _chat_stream_with_turn(
         except HTTPException:
             continue
 
-    claude_skill_view = None
+    native_skill_view = None
     engine_session: AgentEngineSession | None = None
     resume_from_native_session_id: str | None = None
     candidate_native_session_id: str | None = None
-    if conv.engine_id == ENGINE_ID_CLAUDE_CODE:
+    if conv.engine_id in {ENGINE_ID_CLAUDE_CODE, ENGINE_ID_DEEPSEEK_HARNESS}:
         from agent_engines.skill_view import (
             authorized_skill_sources,
             materialize_claude_skill_view,
@@ -3887,7 +3955,7 @@ async def _chat_stream_with_turn(
                 registry_rows=fresh_rows,
                 skills_data_dir=skill_api.SKILLS_DATA_DIR,
             )
-            claude_skill_view = await asyncio.to_thread(
+            native_skill_view = await asyncio.to_thread(
                 materialize_claude_skill_view,
                 session_root=workspace_store.session_root(cur_user.id, conv_id),
                 sources=sources,
@@ -3896,6 +3964,7 @@ async def _chat_stream_with_turn(
                 market_data_url=settings.claude_market_data_url,
             )
 
+    if conv.engine_id == ENGINE_ID_CLAUDE_CODE:
         engine_session = (await db.execute(
             select(AgentEngineSession).where(
                 AgentEngineSession.user_id == cur_user.id,
@@ -3986,7 +4055,7 @@ async def _chat_stream_with_turn(
         agent_name="primary",
         depth=0,
         workspace_scope="shared_session",
-        requested_tools=json.dumps(enabled_tools, ensure_ascii=False),
+        requested_tools=json.dumps(requested_tools, ensure_ascii=False),
         effective_tools=json.dumps(enabled_tools, ensure_ascii=False),
         started_at=user_created_at,
     )
@@ -3994,7 +4063,7 @@ async def _chat_stream_with_turn(
     if engine_session is not None:
         engine_session.status = "running"
         engine_session.active_run_id = run_id
-        engine_session.skill_view_sha256 = claude_skill_view.sha256
+        engine_session.skill_view_sha256 = native_skill_view.sha256
         engine_session.last_model_id = model_id
         engine_session.error = None
     await db.commit()
@@ -4166,13 +4235,13 @@ async def _chat_stream_with_turn(
                     enabled_user_skills=tuple(enabled_user_skills),
                     session_skill_registry=tuple(session_skill_registry),
                     skill_view_path=(
-                        str(claude_skill_view.root)
-                        if claude_skill_view is not None
+                        str(native_skill_view.root)
+                        if native_skill_view is not None
                         else None
                     ),
                     skill_view_sha256=(
-                        claude_skill_view.sha256
-                        if claude_skill_view is not None
+                        native_skill_view.sha256
+                        if native_skill_view is not None
                         else None
                     ),
                     native_session_id=(
@@ -4430,7 +4499,9 @@ async def _chat_stream_with_turn(
                 run_id=run.id,
             )
             engine_source = (
-                "claude_code" if conv.engine_id == ENGINE_ID_CLAUDE_CODE else "harness"
+                conv.engine_id
+                if conv.engine_id != ENGINE_ID_LEGACY
+                else "harness"
             )
             if root_terminal_status == "succeeded":
                 termination_source = f"upstream_{engine_source}_completed"
@@ -4652,14 +4723,17 @@ async def _chat_stream_with_turn(
                 _agent_event_terminal_status(agent_events, run_id=run.id)
             )
             if (
-                conv.engine_id == ENGINE_ID_CLAUDE_CODE
+                conv.engine_id in {
+                    ENGINE_ID_CLAUDE_CODE,
+                    ENGINE_ID_DEEPSEEK_HARNESS,
+                }
                 and root_terminal_status is None
             ):
                 try:
                     from agent_engines.registry import build_agent_engine_registry
 
                     revoked = await build_agent_engine_registry().get(
-                        ENGINE_ID_CLAUDE_CODE
+                        conv.engine_id
                     ).cancel_run(
                         user_id=str(cur_user.id),
                         conversation_id=conv_id,
@@ -4672,9 +4746,8 @@ async def _chat_stream_with_turn(
                         )
                 except Exception:
                     logger.exception(
-                        "Claude Code execution revocation failed conv=%s run=%s",
-                        conv_id,
-                        run.id,
+                        "Native Agent Engine revocation failed engine=%s conv=%s run=%s",
+                        conv.engine_id, conv_id, run.id,
                     )
                     error_message = (
                         error_message

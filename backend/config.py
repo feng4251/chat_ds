@@ -46,10 +46,16 @@ class Settings(BaseSettings):
     # Keep the adapter and historical Sessions readable while allowing a
     # deployment to route every newly executed Turn through Claude Code.
     legacy_engine_new_runs_enabled: bool = True
-    default_agent_engine_id: Literal["legacy", "claude_code"] = "legacy"
+    deepseek_harness_engine_enabled: bool = False
+    default_agent_engine_id: Literal[
+        "legacy", "claude_code", "deepseek_harness"
+    ] = "legacy"
     claude_runner_url: str = "http://claude-runner-supervisor:8030"
     claude_runner_stream_timeout_seconds: int = 18000
     claude_code_provider_profiles: list[str] = ["shaiengine"]
+    deepseek_harness_provider_profiles: list[str] = ["shaiengine"]
+    deepseek_runner_url: str = "http://deepseek-runner-supervisor:8040"
+    deepseek_runner_stream_timeout_seconds: int = 18000
     claude_web_search_url: str = "http://searxng:8080/search"
     claude_market_data_url: str = (
         "http://market-data-gateway:8090/v1/quote"
@@ -78,6 +84,14 @@ class Settings(BaseSettings):
             raise ValueError(
                 "DEFAULT_AGENT_ENGINE_ID=legacy requires "
                 "LEGACY_ENGINE_NEW_RUNS_ENABLED=true"
+            )
+        if (
+            self.default_agent_engine_id == "deepseek_harness"
+            and not self.deepseek_harness_engine_enabled
+        ):
+            raise ValueError(
+                "DEFAULT_AGENT_ENGINE_ID=deepseek_harness requires "
+                "DEEPSEEK_HARNESS_ENGINE_ENABLED=true"
             )
         return self
 

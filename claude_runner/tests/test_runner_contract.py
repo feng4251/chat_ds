@@ -10,6 +10,7 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.parse import urlsplit
 
 from chatds_browser_runtime.proxy_bridge import BridgeConfigurationError
 
@@ -935,6 +936,44 @@ class RunnerEgressPolicyTests(unittest.TestCase):
             "http://search.internal:8080",
             allowed["private_origins"],
         )
+
+    def test_openai_native_engine_receives_only_exact_completion_endpoint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            view, digest = self._view(Path(temporary))
+            common = dict(
+                skill_view_root=view,
+                skill_view_sha256=digest,
+                user_turn_text="produce a cross-domain artifact",
+                provider_base_url="https://provider.example.test/v1",
+                configured_private_origins=(),
+                budget_scope_sha256=hashlib.sha256(b"budget").hexdigest(),
+                call_id_sha256=hashlib.sha256(b"call").hexdigest(),
+                limits={
+                    "max_outbound_bytes": 1024,
+                    "max_requests": 10,
+                    "max_response_wire_bytes": 4096,
+                },
+            )
+            policy = compile_turn_egress_policy(
+                provider_protocol="openai",
+                **common,
+            )
+            with self.assertRaises(ClaudeEgressPolicyError):
+                compile_turn_egress_policy(
+                    provider_protocol="renamed-unsupported-protocol",
+                    **common,
+                )
+        provider_rules = [
+            row for row in policy["egress_rules"]
+            if urlsplit(row["url_prefix"]).hostname == "provider.example.test"
+        ]
+        self.assertEqual(len(provider_rules), 1)
+        self.assertEqual(
+            urlsplit(provider_rules[0]["url_prefix"]).path,
+            "/v1/chat/completions",
+        )
+        self.assertEqual(provider_rules[0]["methods"], ["POST"])
+        self.assertIs(provider_rules[0]["query_exact"], True)
 
     def test_public_read_profile_is_signed_data_not_wildcard_rules(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -109,6 +109,7 @@ async def _engine_options_for_user(
     from routers.chat_router import (
         BUILTIN,
         claude_code_model_compatible,
+        deepseek_harness_model_compatible,
         resolve_model_config,
     )
 
@@ -126,6 +127,7 @@ async def _engine_options_for_user(
         *custom_ids,
     ]))
     claude_model_ids: list[str] = []
+    deepseek_model_ids: list[str] = []
     for model_id in model_ids:
         try:
             provider = await resolve_model_config(model_id, user, db)
@@ -133,6 +135,8 @@ async def _engine_options_for_user(
             continue
         if claude_code_model_compatible(provider):
             claude_model_ids.append(model_id)
+        if deepseek_harness_model_compatible(provider):
+            deepseek_model_ids.append(model_id)
 
     canonical_current = canonical_agent_model_id(current_model_id)
     legacy_default = (
@@ -176,6 +180,31 @@ async def _engine_options_for_user(
             "default_model_id": claude_default,
             "capabilities": [
                 "skills", "multi_agent", "sandbox", "native_resume", "vision",
+            ],
+        })
+    if settings.deepseek_harness_engine_enabled:
+        deepseek_default = (
+            canonical_current
+            if canonical_current in deepseek_model_ids
+            else DEFAULT_AGENT_MODEL_ID
+            if DEFAULT_AGENT_MODEL_ID in deepseek_model_ids
+            else deepseek_model_ids[0]
+            if deepseek_model_ids
+            else None
+        )
+        options.append({
+            "id": "deepseek_harness",
+            "name": "DeepSeek Harness",
+            "available": bool(deepseek_model_ids),
+            "unavailable_reason": (
+                None
+                if deepseek_model_ids
+                else "No deployment-owned compatible model profile"
+            ),
+            "compatible_model_ids": deepseek_model_ids,
+            "default_model_id": deepseek_default,
+            "capabilities": [
+                "skills", "multi_agent", "sandbox", "web_search",
             ],
         })
     return options
@@ -442,6 +471,18 @@ async def update_conversation_settings(
             raise HTTPException(
                 400,
                 "The selected model is not compatible with the Claude Code engine",
+            )
+    if conv.engine_id == "deepseek_harness":
+        from routers.chat_router import (
+            deepseek_harness_model_compatible,
+            resolve_model_config,
+        )
+
+        provider_config = await resolve_model_config(conv.model_id, user, db)
+        if not deepseek_harness_model_compatible(provider_config):
+            raise HTTPException(
+                400,
+                "The selected model is not compatible with the DeepSeek Harness engine",
             )
     await db.commit()
     return await get_conversation_settings(cid, user, db)
@@ -1089,7 +1130,10 @@ async def _fork_conversation_impl(
             )
             effective_target_engine = requested_target_engine or source.engine_id
             effective_target_model = requested_target_model or source.model_id
-            from agent_engines.base import ENGINE_ID_CLAUDE_CODE
+            from agent_engines.base import (
+                ENGINE_ID_CLAUDE_CODE,
+                ENGINE_ID_DEEPSEEK_HARNESS,
+            )
             from agent_engines.registry import build_agent_engine_registry
             if (
                 effective_target_engine == "legacy"
@@ -1123,6 +1167,22 @@ async def _fork_conversation_impl(
                     raise HTTPException(
                         400,
                         "The target model has no deployment-owned Claude Code provider profile",
+                    )
+            if effective_target_engine == ENGINE_ID_DEEPSEEK_HARNESS:
+                from routers.chat_router import (
+                    deepseek_harness_model_compatible,
+                    resolve_model_config,
+                )
+
+                target_provider = await resolve_model_config(
+                    effective_target_model,
+                    user,
+                    db,
+                )
+                if not deepseek_harness_model_compatible(target_provider):
+                    raise HTTPException(
+                        400,
+                        "The target model has no deployment-owned DeepSeek Harness provider profile",
                     )
             target = (await db.execute(
                 select(Conversation).where(

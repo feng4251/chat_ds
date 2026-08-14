@@ -13,7 +13,12 @@ from typing import Any, AsyncIterator, Mapping, Protocol, runtime_checkable
 
 ENGINE_ID_LEGACY = "legacy"
 ENGINE_ID_CLAUDE_CODE = "claude_code"
-SUPPORTED_ENGINE_IDS = frozenset({ENGINE_ID_LEGACY, ENGINE_ID_CLAUDE_CODE})
+ENGINE_ID_DEEPSEEK_HARNESS = "deepseek_harness"
+SUPPORTED_ENGINE_IDS = frozenset({
+    ENGINE_ID_LEGACY,
+    ENGINE_ID_CLAUDE_CODE,
+    ENGINE_ID_DEEPSEEK_HARNESS,
+})
 
 
 @dataclass(frozen=True, slots=True)

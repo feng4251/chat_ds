@@ -466,12 +466,18 @@ export default function SessionWorkspace({
                     .map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
                 </select>
               </Section>
-              {settings.engine_id === 'claude_code' && (
+              {settings.engine_id !== 'legacy' && (
                 <Section title="Session 权限">
                   <div className="grid grid-cols-1 gap-2">
                     {[
                       ['read_only', '只读', '工作区以只读方式挂载；写入和执行权限请求会被策略拒绝。'],
-                      ['workspace_write', '工作区读写', '可读写当前 Session 工作区；Claude 原生权限请求由页面逐次确认。'],
+                      [
+                        'workspace_write',
+                        '工作区读写',
+                        settings.engine_id === 'claude_code'
+                          ? '可读写当前 Session 工作区；Claude 原生权限请求由页面逐次确认。'
+                          : '可读写当前 Session 工作区；越界操作由无交互策略自动拒绝。',
+                      ],
                       ['session_full', 'Session 完整权限', '在当前 Session 的挂载与出网边界内免确认执行；不包含主机或其他 Session。'],
                     ].map(([value, title, description]) => (
                       <label key={value} className={`cursor-pointer rounded-xl border p-3 ${settings.permission_preset === value ? 'border-indigo-400 bg-indigo-50' : 'border-stone-200 bg-white'}`}>

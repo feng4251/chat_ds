@@ -62,11 +62,15 @@ class ChatRequest(BaseModel):
     content: str
     image_urls: Optional[list[str]] = None
     model_id: Optional[str] = None
-    engine_id: Optional[Literal["legacy", "claude_code"]] = None
+    engine_id: Optional[
+        Literal["legacy", "claude_code", "deepseek_harness"]
+    ] = None
 
 
 class ConversationSettingsUpdate(BaseModel):
-    engine_id: Optional[Literal["legacy", "claude_code"]] = None
+    engine_id: Optional[
+        Literal["legacy", "claude_code", "deepseek_harness"]
+    ] = None
     model_id: Optional[str] = None
     enabled_tools: Optional[list[str]] = None
     fallback_model_ids: Optional[list[str]] = None

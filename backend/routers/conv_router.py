@@ -530,45 +530,60 @@ async def _cleanup_agent_runtimes(user_id: str, session_id: str) -> dict:
     """Revoke every configured runtime before deleting Session authority."""
 
     legacy = await _cleanup_harness_session(user_id, session_id)
-    claude = {"success": True, "execution_revocation": {"success": True}}
-    if settings.claude_code_engine_enabled:
-        from agent_engines.base import ENGINE_ID_CLAUDE_CODE
-        from agent_engines.registry import build_agent_engine_registry
+    from agent_engines.base import (
+        ENGINE_ID_CLAUDE_CODE,
+        ENGINE_ID_DEEPSEEK_HARNESS,
+    )
+    from agent_engines.registry import build_agent_engine_registry
 
-        try:
-            claude = dict(await build_agent_engine_registry().get(
-                ENGINE_ID_CLAUDE_CODE
-            ).cleanup_session(
-                user_id=user_id,
-                conversation_id=session_id,
-            ))
-        except Exception as exc:
-            logger.warning(
-                "Claude Runner session cleanup failed user=%s session=%s type=%s",
-                user_id,
-                session_id,
-                type(exc).__name__,
-            )
-            claude = {"success": False, "execution_revocation": {"success": False}}
+    native: dict[str, dict] = {}
+    configured_native = (
+        (ENGINE_ID_CLAUDE_CODE, settings.claude_code_engine_enabled),
+        (ENGINE_ID_DEEPSEEK_HARNESS, settings.deepseek_harness_engine_enabled),
+    )
+    registry = build_agent_engine_registry()
+    for engine_id, enabled in configured_native:
+        result = {"success": True, "execution_revocation": {"success": True}}
+        if enabled:
+            try:
+                result = dict(await registry.get(engine_id).cleanup_session(
+                    user_id=user_id,
+                    conversation_id=session_id,
+                ))
+            except Exception as exc:
+                logger.warning(
+                    "Native Runner session cleanup failed engine=%s user=%s session=%s type=%s",
+                    engine_id, user_id, session_id, type(exc).__name__,
+                )
+                result = {
+                    "success": False,
+                    "execution_revocation": {"success": False},
+                }
+        native[engine_id] = result
     legacy_revocation = legacy.get("execution_revocation")
     legacy_revoked = bool(
         isinstance(legacy_revocation, dict)
         and legacy_revocation.get("success") is True
     )
-    claude_revocation = claude.get("execution_revocation")
-    claude_revoked = bool(
-        isinstance(claude_revocation, dict)
-        and claude_revocation.get("success") is True
+    native_revoked = {
+        engine_id: result.get("execution_revocation")
+        for engine_id, result in native.items()
+    }
+    native_revocation_success = all(
+        isinstance(value, dict) and value.get("success") is True
+        for value in native_revoked.values()
     )
     return {
-        "success": legacy.get("success") is True and claude.get("success") is True,
+        "success": legacy.get("success") is True and all(
+            result.get("success") is True for result in native.values()
+        ),
         "execution_revocation": {
-            "success": legacy_revoked and claude_revoked,
+            "success": legacy_revoked and native_revocation_success,
             "legacy": legacy_revocation,
-            "claude_code": claude_revocation,
+            **native_revoked,
         },
         "legacy": legacy,
-        "claude_code": claude,
+        **native,
     }
 
 @router.get("/{cid}/messages")

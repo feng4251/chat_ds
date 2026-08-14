@@ -1,0 +1,111 @@
+- id: session-title-llm
+  disabled: true
+
+- id: session-telemetry-otel
+  disabled: true
+
+- id: agent-default-model
+  config:
+    provider: deepseek-official
+    model: !!js process.env.CHATDS_DSH_MODEL
+
+- id: llm-deepseek
+  config:
+    apiKeyEnv: DEEPSEEK_API_KEY
+    baseURL: !!js process.env.DEEPSEEK_BASE_URL
+    thinking: enabled
+    reasoningEffort: max
+    maxTokens: !!js Number(process.env.CHATDS_DSH_MAX_OUTPUT_TOKENS)
+    defaultContextWindow: !!js Number(process.env.CHATDS_DSH_CONTEXT_WINDOW)
+    streamIdleTimeoutMs: 7200000
+    models:
+      - id: !!js process.env.CHATDS_DSH_MODEL
+        name: !!js process.env.CHATDS_DSH_MODEL
+        contextWindow: !!js Number(process.env.CHATDS_DSH_CONTEXT_WINDOW)
+        maxTokens: !!js Number(process.env.CHATDS_DSH_MAX_OUTPUT_TOKENS)
+
+- id: sandbox-policy
+  config:
+    mode: !!js process.env.DSH_PERMISSION_MODE
+    workspaceRoot: !!js process.cwd()
+
+# Headless has no browser answerer. Operations inside workspace-write need no
+# escalation; every operation that does ask is deterministically rejected.
+- id: approval
+  config:
+    policy: never
+
+- id: tool-bash
+  disabled: !!js process.env.CHATDS_DSH_SHELL_ENABLED !== '1'
+
+- id: tool-jobs
+  disabled: !!js process.env.CHATDS_DSH_SHELL_ENABLED !== '1'
+
+- id: tool-fs
+  disabled: !!js process.env.CHATDS_DSH_FILES_ENABLED !== '1'
+
+- id: tool-fs-search
+  disabled: !!js process.env.CHATDS_DSH_FILES_ENABLED !== '1'
+
+- id: tool-str-replace-editor
+  disabled: !!js process.env.CHATDS_DSH_FILES_ENABLED !== '1'
+
+- id: tool-skill
+  disabled: !!js process.env.CHATDS_DSH_SKILLS_ENABLED !== '1'
+
+- id: tool-subagent-control
+  disabled: !!js process.env.CHATDS_DSH_SUBAGENTS_ENABLED !== '1'
+
+- id: tool-subagent-list-agents
+  disabled: !!js process.env.CHATDS_DSH_SUBAGENTS_ENABLED !== '1'
+
+- id: tool-subagent
+  disabled: !!js process.env.CHATDS_DSH_SUBAGENTS_ENABLED !== '1'
+
+- id: tool-subagent-fork
+  disabled: !!js process.env.CHATDS_DSH_SUBAGENTS_ENABLED !== '1'
+
+- id: tool-subagent-report
+  disabled: !!js process.env.CHATDS_DSH_SUBAGENTS_ENABLED !== '1'
+
+- id: tool-workflow
+  disabled: !!js process.env.CHATDS_DSH_SUBAGENTS_ENABLED !== '1'
+
+- id: tool-todo
+  disabled: !!js process.env.CHATDS_DSH_TODO_ENABLED !== '1'
+
+- id: tool-goal
+  disabled: !!js process.env.CHATDS_DSH_GOALS_ENABLED !== '1'
+
+- id: tool-ralph
+  disabled: true
+
+- id: skill-filesystem
+  config:
+    includeDefaultRoots: false
+    customSkillDirs: ['/skill-view/plugin/skills']
+    watch: false
+
+- id: web
+  config:
+    searchProvider: chatds-searxng
+
+- id: web-search-deepseek
+  disabled: true
+
+- id: tool-web
+  disabled: !!js process.env.CHATDS_DSH_WEB_SEARCH_ENABLED !== '1'
+  config:
+    search: true
+    fetch: false
+    searchTimeoutMs: 60000
+
+- insert:
+    - id: chatds-searxng-search
+      name: !!js process.env.CHATDS_DSH_SEARXNG_PLUGIN
+      disabled: !!js process.env.CHATDS_DSH_WEB_SEARCH_ENABLED !== '1'
+      config:
+        endpoint: !!js process.env.CHATDS_SEARXNG_SEARCH_URL
+
+    - id: chatds-event-bridge
+      name: !!js process.env.CHATDS_DSH_EVENT_PLUGIN

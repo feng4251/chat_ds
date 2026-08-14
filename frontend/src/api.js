@@ -50,6 +50,11 @@ export async function getModels() {
   return (await res.json()).models
 }
 
+export async function getEngines() {
+  const res = await request('/chat/engines')
+  return (await res.json()).engines
+}
+
 export async function getCustomModels() {
   const res = await request('/models/config')
   return await res.json()
@@ -495,6 +500,7 @@ export async function chatCompletion(
       content,
       conversation_id: conversationId,
       ...(modelId ? { model_id: modelId } : {}),
+      ...(options.engineId ? { engine_id: options.engineId } : {}),
       image_urls: imageUrls,
     }),
     signal: options.signal,

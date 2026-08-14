@@ -8,6 +8,11 @@ their own notices and applicable rights.
 
 Known repository-local boundaries include:
 
+- `deepseek-harness-clean/` is the pinned
+  `https://github.com/deepseek-ai/deepseek-harness.git` Git submodule and a
+  production build dependency of the optional DeepSeek Harness engine. It
+  remains licensed under its own MIT `LICENSE`; ChatDS adapter code lives in
+  `deepseek_runner/` and does not modify the pinned upstream source tree.
 - `openclaw/` is third-party software and retains the MIT license in
   `openclaw/LICENSE`. It is historical reference material and is not a current
   Harness design reference.

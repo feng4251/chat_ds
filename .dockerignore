@@ -24,6 +24,13 @@
 !claude_runner/seccomp_profile.json
 !claude_runner/server.py
 
+!deepseek_runner/
+!deepseek_runner/**
+
+!deepseek-harness-clean/
+!deepseek-harness-clean/**
+deepseek-harness-clean/.git
+
 # One source of truth for HTTP, terminal-projector and isolated-MCP schedule
 # semantics. The Runner image copies this exact file into its Python package.
 !backend/schedule_spec.py

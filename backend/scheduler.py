@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from sqlalchemy import select
 
-from agent_engines.base import ENGINE_ID_CLAUDE_CODE
+from agent_engines.base import ENGINE_ID_CLAUDE_CODE, ENGINE_ID_LEGACY
 from config import settings
 from database import async_session
 from hooks import emit_event
@@ -505,8 +505,8 @@ async def _execute_job_once(
             user_id,
             conversation_id,
         ):
-            if str(conv.engine_id) == ENGINE_ID_CLAUDE_CODE:
-                # The ordinary Claude chat path owns the conversation turn
+            if str(conv.engine_id) != ENGINE_ID_LEGACY:
+                # The ordinary native-engine chat path owns the conversation turn
                 # lease from history snapshot through durable projection.
                 # Holding it here as well would self-deadlock on the same
                 # non-reentrant per-Conversation lock.
@@ -655,8 +655,13 @@ async def _execute_job_bound(
         )
         tools = _scheduled_job_tools(job)
 
-        if conv.engine_id == "claude_code":
-            await _execute_claude_scheduled_turn(
+        if conv.engine_id != ENGINE_ID_LEGACY:
+            native_executor = (
+                _execute_claude_scheduled_turn
+                if conv.engine_id == ENGINE_ID_CLAUDE_CODE
+                else _execute_native_scheduled_turn
+            )
+            await native_executor(
                 db,
                 job=job,
                 conv=conv,
@@ -823,15 +828,16 @@ async def _execute_job_bound(
             )
 
 
-async def _execute_claude_scheduled_turn(
+async def _execute_native_scheduled_turn(
     db,
     *,
     job: ScheduledJob,
     conv: Conversation,
     scheduled_run: ScheduledJobRun,
     tools: list[str],
+    _engine_id_override: str | None = None,
 ) -> None:
-    """Execute unattended work through the Conversation's ClaudeEngine.
+    """Execute unattended work through the Conversation's native engine.
 
     This deliberately reuses the ordinary chat ingestion/projection path, so
     checkpoints, exact Skills, workspace locking, terminal receipts and model
@@ -849,7 +855,7 @@ async def _execute_claude_scheduled_turn(
             conversation_id=str(conv.id),
             content=str(job.prompt),
             model_id=(str(job.model_id) if job.model_id else None),
-            engine_id="claude_code",
+            engine_id=_engine_id_override or str(conv.engine_id),
         ),
         user,
         db,
@@ -936,6 +942,26 @@ async def _execute_claude_scheduled_turn(
             "error": scheduled_run.error,
         },
         str(conv.id),
+    )
+
+
+async def _execute_claude_scheduled_turn(
+    db,
+    *,
+    job: ScheduledJob,
+    conv: Conversation,
+    scheduled_run: ScheduledJobRun,
+    tools: list[str],
+) -> None:
+    """Backward-compatible name for the shared native-engine transaction."""
+
+    await _execute_native_scheduled_turn(
+        db,
+        job=job,
+        conv=conv,
+        scheduled_run=scheduled_run,
+        tools=tools,
+        _engine_id_override=ENGINE_ID_CLAUDE_CODE,
     )
 
 

@@ -52,4 +52,14 @@ def build_agent_engine_registry() -> AgentEngineRegistry:
                 timeout_seconds=settings.claude_runner_stream_timeout_seconds,
             )
         )
+    if settings.deepseek_harness_engine_enabled:
+        from .deepseek_harness import DeepSeekHarnessEngine
+
+        engines.append(
+            DeepSeekHarnessEngine(
+                base_url=settings.deepseek_runner_url,
+                internal_token=settings.internal_api_token,
+                timeout_seconds=settings.deepseek_runner_stream_timeout_seconds,
+            )
+        )
     return AgentEngineRegistry(engines)
