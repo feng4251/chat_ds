@@ -62,7 +62,12 @@
   `ff0e7971b4aa6701a1f439f0df30702ffb4212af`。
 - 两项用户自有 tracked deletion 继续只留在 worktree，未 stage/恢复/提交：
   `XGAL-101_Galectin-3_AD_Comprehensive_Development_Plan_v1.0_claudecode执行参考.md`
-  与 `xClinicalTrial-Design-V2.2.zip`。Git 仍仅本地提交，未 push。
+  与 `xClinicalTrial-Design-V2.2.zip`。用户于 2026-08-15 明确授权本轮远端同步；当前完整
+  历史已推送到 `https://github.com/feng4251/chat_ds` 的
+  `fix/deepseek-harness-peer-engine-20260815` 分支，回滚标签
+  `rollback/pre-deepseek-engine-20260814` 也已推送。远端原有同名历史分支
+  `fix/generic-skill-harness-20260717` 与本地没有共同祖先，因此未 force-push、未做
+  unrelated-history merge、也未改写该远端分支。
 
 ## 2026-08-14 DeepSeek Harness 平级引擎实现（部署前）
 
