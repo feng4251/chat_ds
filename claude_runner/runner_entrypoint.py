@@ -1407,7 +1407,7 @@ def _claude_command(
             "--dangerously-skip-permissions",
         ])
     elif permission_preset == "workspace_write":
-        command.extend(["--permission-mode", "default"])
+        command.extend(["--permission-mode", "default", "--permission-prompt-tool", "stdio"])
     elif permission_preset == "read_only":
         command.extend(["--permission-mode", "plan"])
     else:

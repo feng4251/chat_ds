@@ -466,8 +466,7 @@ export default function SessionWorkspace({
                     .map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
                 </select>
               </Section>
-              {settings.engine_id !== 'legacy' && (
-                <Section title="Session 权限">
+              <Section title="Session 权限">
                   <div className="grid grid-cols-1 gap-2">
                     {[
                       ['read_only', '只读', '工作区以只读方式挂载；写入和执行权限请求会被策略拒绝。'],
@@ -499,7 +498,6 @@ export default function SessionWorkspace({
                     所有级别始终只挂载当前用户的当前 Session 工作区；无法访问其他用户、其他 Session、宿主机目录或 Docker Socket。
                   </div>
                 </Section>
-              )}
               {settings.engine_id === 'legacy' && <Section title="模型回退链">
                 <div className="grid grid-cols-2 gap-2">
                   {models.filter((m) => m.id !== settings.model_id).map((m) => (
