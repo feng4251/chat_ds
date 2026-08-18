@@ -91,6 +91,66 @@ def _session_workspace_lock(config: dict[str, Any]):
         os.close(parent)
 
 
+
+
+class ControlDecisionForwarder:
+    """Forward supervisor control decisions into worker-readable tmpfs.
+
+    The supervisor receives approval decisions via HTTP and writes them to a
+    controller-owned mailbox. This forwarder copies complete JSONL rows into
+    the worker-readable tmpfs path where the DSH control bridge polls them.
+    """
+
+    def __init__(self, mailbox: Path, worker_path: Path) -> None:
+        self.mailbox = mailbox
+        self.worker_path = worker_path
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="control-decision-forwarder",
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+    def _run(self) -> None:
+        position = 0
+        pending = bytearray()
+        self.worker_path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+        try:
+            while True:
+                try:
+                    with self.mailbox.open("rb") as stream:
+                        stream.seek(position)
+                        block = stream.read(16384)
+                except FileNotFoundError:
+                    block = b""
+                if block:
+                    position += len(block)
+                    pending.extend(block)
+                    while True:
+                        boundary = pending.find(b"\n")
+                        if boundary < 0:
+                            break
+                        line = bytes(pending[:boundary])
+                        del pending[:boundary + 1]
+                        if len(line) > 0:
+                            with self.worker_path.open("ab") as out:
+                                out.write(line + b"\n")
+                                out.flush()
+                                os.fsync(out.fileno())
+                    continue
+                if self._stop.is_set():
+                    break
+                time.sleep(0.05)
+        except Exception:
+            pass
+
 class Ledger:
     def __init__(self, path: Path) -> None:
         if path.as_posix() != "/run/chatds-control/events.jsonl":
@@ -480,9 +540,13 @@ def main() -> int:
         native_spool.touch(mode=0o600, exist_ok=False)
         os.chown(native_spool, worker_uid, worker_gid)
         mcp_patch = Path("/runtime/worker/mcp.patch.json")
+        control_decisions = Path("/runtime/worker/control-decisions.jsonl")
         mcp_mapping = _compile_mcp_patch(Path("/skill-view"), mcp_patch)
         os.chown(mcp_patch, worker_uid, worker_gid)
         os.chmod(mcp_patch, 0o400)
+        control_decisions.touch(mode=0o600, exist_ok=False)
+        os.chown(control_decisions, worker_uid, worker_gid)
+        os.chmod(control_decisions, 0o600)
         ledger.append({
             "type": "chatds.deepseek.runtime.config",
             "context_window_tokens": config["context_window_tokens"],
@@ -533,6 +597,7 @@ def main() -> int:
             environment = _environment(
                 config, proxy_url=proxy_url, trust=trust, worker_tmp=worker_tmp
             )
+            environment["CHATDS_CONTROL_DECISIONS"] = "/runtime/worker/control-decisions.jsonl"
             command = _native_command(config, mcp_patch)
             stage = "native_execution"
             for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGUSR1):
@@ -542,6 +607,12 @@ def main() -> int:
             stderr_path = Path("/runtime/worker/stderr.log")
             forwarder = NativeEventForwarder(native_spool, ledger)
             forwarder.start()
+
+            # Forward supervisor control decisions into worker-readable tmpfs
+            # Supervisor writes decisions to /run/chatds-control/control-decisions.jsonl
+            control_mailbox = Path("/run/chatds-control/control-decisions.jsonl")
+            control_forwarder = ControlDecisionForwarder(control_mailbox, control_decisions)
+            control_forwarder.start()
             with stdout_path.open("w+b") as stdout_file, stderr_path.open("w+b") as stderr_file:
                 _child = subprocess.Popen(
                     command,
@@ -563,6 +634,7 @@ def main() -> int:
                 stderr_file.seek(max(0, stderr_file.tell() - 64_000))
                 stdout = stdout_file.read()
                 stderr = stderr_file.read()
+            control_forwarder.stop()
             forwarder.stop()
             forwarder = None
             if stdout:

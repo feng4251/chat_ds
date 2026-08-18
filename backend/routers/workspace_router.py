@@ -3243,15 +3243,15 @@ async def decide_turn_approval(
         raise HTTPException(409, "Approval request is stale or not durable")
     if run.status not in {"queued", "running", "committing"}:
         raise HTTPException(409, "Run is no longer active")
-    from agent_engines.base import AgentEngineError, ENGINE_ID_CLAUDE_CODE
+    from agent_engines.base import AgentEngineError
     from agent_engines.registry import build_agent_engine_registry
 
-    if run.engine_id != ENGINE_ID_CLAUDE_CODE:
+    registry = build_agent_engine_registry()
+    engine = registry.get(run.engine_id)
+    if not hasattr(engine, 'decide_approval'):
         raise HTTPException(409, "Run engine does not support native approvals")
     try:
-        result = await build_agent_engine_registry().get(
-            ENGINE_ID_CLAUDE_CODE
-        ).decide_approval(
+        result = await engine.decide_approval(
             user_id=str(user.id),
             conversation_id=cid,
             run_id=run_id,

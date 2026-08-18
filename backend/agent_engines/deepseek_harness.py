@@ -250,6 +250,74 @@ class DeepSeekEventProjector:
                 depth=depth,
                 session_id=session_id,
             ))
+        elif native_type == "approval/asked":
+            request_id = str(data.get("id") or "")
+            tool_name = str(data.get("toolName") or "")
+            reason = str(data.get("reason") or "")
+            if request_id and depth <= 0:
+                projected.append(EngineStreamEvent(
+                    "approval",
+                    {
+                        "request_id": request_id,
+                        "request_seq": sub_seq,
+                        "status": "pending",
+                        "tool_name": tool_name,
+                        "title": f"Approve {tool_name}",
+                        "description": reason or f"The agent needs permission to use {tool_name}",
+                    },
+                    raw=dict(envelope)
+                ))
+        elif native_type == "approval/decided":
+            request_id = str(data.get("id") or "")
+            outcome = str(data.get("outcome") or "")
+            if request_id and depth <= 0:
+                status = "allowed" if outcome == "allowed-once" else "denied"
+                projected.append(EngineStreamEvent(
+                    "approval",
+                    {
+                        "request_id": request_id,
+                        "request_seq": sub_seq,
+                        "status": status,
+                    },
+                    raw=dict(envelope)
+                ))
+        elif native_type == "chatds/approval/requested":
+            request_id = str(data.get("request_id") or "")
+            tool_name = str(data.get("tool_name") or "")
+            reason = data.get("reason")
+            if request_id and depth <= 0:
+                projected.append(EngineStreamEvent(
+                    "approval",
+                    {
+                        "request_id": request_id,
+                        "request_seq": sub_seq,
+                        "status": "pending",
+                        "tool_name": tool_name,
+                        "title": f"Approve {tool_name}",
+                        "description": str(reason) if reason else f"The agent needs permission to use {tool_name}",
+                    },
+                    raw=dict(envelope)
+                ))
+        elif native_type == "chatds/question/requested":
+            request_id = str(data.get("request_id") or "")
+            intent_kind = data.get("intent_kind")
+            intent_approve = data.get("intent_approve")
+            if request_id and depth <= 0 and intent_kind == "plan" and intent_approve is True:
+                question = str(data.get("question") or "Review the plan")
+                detail = data.get("detail")
+                projected.append(EngineStreamEvent(
+                    "approval",
+                    {
+                        "request_id": request_id,
+                        "request_seq": sub_seq,
+                        "status": "pending",
+                        "tool_name": "exit_plan_mode",
+                        "title": question,
+                        "description": str(detail) if detail else "Review and approve the implementation plan",
+                        "decision_reason": None,
+                    },
+                    raw=dict(envelope)
+                ))
         elif native_type == "llm/retry":
             failure = data.get("failure")
             projected.append(self._agent_event(
@@ -489,6 +557,36 @@ class DeepSeekHarnessEngine:
                 retryable=True,
                 exception_class=type(exc).__name__,
             ) from exc
+
+    async def decide_approval(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        run_id: str,
+        request_id: str,
+        request_seq: int,
+        decision: str,
+    ) -> dict[str, Any]:
+        timeout = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
+        async with self._client_factory(timeout=timeout) as client:
+            response = await client.post(
+                f"{self._base_url}/v1/runs/{run_id}/approvals/{request_id}",
+                headers=self._headers,
+                json={
+                    "user_id": user_id,
+                    "conversation_id": conversation_id,
+                    "decision": decision,
+                    "request_seq": request_seq,
+                },
+            )
+        if response.status_code >= 400:
+            raise AgentEngineError(
+                f"DeepSeek Runner rejected the approval decision (HTTP {response.status_code}).",
+                code="deepseek_runner_approval_rejected",
+                retryable=response.status_code >= 500,
+            )
+        return response.json()
 
     async def cancel_run(
         self, *, user_id: str, conversation_id: str, run_id: str

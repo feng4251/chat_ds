@@ -41,6 +41,9 @@ class ClaudeEventProjector:
     _started_tools: set[str] = field(default_factory=set)
     _terminal_tools: set[str] = field(default_factory=set)
     _tool_name_by_id: dict[str, str] = field(default_factory=dict)
+    # Retains the native envelope seq for each pending approval request_id so
+    # that chatds.approval.decided events can carry it even without the original.
+    _approval_seq_by_request_id: dict[str, int] = field(default_factory=dict)
 
     def project(self, envelope: Mapping[str, Any]) -> tuple[EngineStreamEvent, ...]:
         native = _mapping(envelope.get("event"))
@@ -78,10 +81,14 @@ class ClaudeEventProjector:
         if event_type == "control_request":
             request = _mapping(native.get("request"))
             if request.get("subtype") == "can_use_tool":
+                rid = str(native.get("request_id") or "")[:128]
+                # Cache the envelope seq so decided events can recall it.
+                if rid and isinstance(envelope.get("seq"), int):
+                    self._approval_seq_by_request_id[rid] = int(envelope["seq"])
                 return (EngineStreamEvent(
                     "approval",
                     {
-                        "request_id": str(native.get("request_id") or "")[:128],
+                        "request_id": rid,
                         "status": "pending",
                         "tool_name": str(request.get("tool_name") or "tool")[:512],
                         "title": str(request.get("title") or request.get("display_name") or "")[:1000],
@@ -89,20 +96,25 @@ class ClaudeEventProjector:
                         "decision_reason": str(request.get("decision_reason") or "")[:2000],
                     },
                     envelope,
-                    native_event_id=str(native.get("request_id") or "") or None,
+                    native_event_id=rid or None,
                 ),)
         if event_type == "chatds.approval.decided":
+            rid = str(native.get("request_id") or "")[:128]
+            cached_seq = self._approval_seq_by_request_id.get(rid)
+            decided_data: dict = {
+                "request_id": rid,
+                "status": (
+                    "allowed" if native.get("decision") == "allow" else "denied"
+                ),
+                "tool_name": str(native.get("tool_name") or "tool")[:512],
+            }
+            if cached_seq is not None:
+                decided_data["request_seq"] = cached_seq
             return (EngineStreamEvent(
                 "approval",
-                {
-                    "request_id": str(native.get("request_id") or "")[:128],
-                    "status": (
-                        "allowed" if native.get("decision") == "allow" else "denied"
-                    ),
-                    "tool_name": str(native.get("tool_name") or "tool")[:512],
-                },
+                decided_data,
                 envelope,
-                native_event_id=str(native.get("request_id") or "") or None,
+                native_event_id=rid or None,
             ),)
         if event_type == "chatds.workspace.artifact":
             source_event_key = str(native.get("source_event_key") or "")

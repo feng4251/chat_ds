@@ -74,7 +74,13 @@ export function applyTurnActivity(nodes, event) {
       }
     }
   } else if (event.kind === 'approval') {
-    node.payload = { ...current.payload, ...payload }
+    const merged = { ...current.payload, ...payload }
+    // Preserve request_seq from the pending event if the update omits it;
+    // the decision endpoint requires it and the update may not re-send it.
+    if (merged.request_seq == null && current.payload.request_seq != null) {
+      merged.request_seq = current.payload.request_seq
+    }
+    node.payload = merged
     node.status = payload.status || current.status
   }
   next[index] = node

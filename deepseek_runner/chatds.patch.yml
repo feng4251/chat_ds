@@ -4,6 +4,14 @@
 - id: session-telemetry-otel
   disabled: true
 
+- id: approval
+  config:
+    policy: ask
+
+- id: user-questions
+  config:
+    provider: chatds-control-bridge
+
 - id: agent-default-model
   config:
     provider: deepseek-official
@@ -110,3 +118,6 @@
 
     - id: chatds-event-bridge
       name: /opt/chatds-deepseek-plugins/event_bridge.mjs
+
+    - id: chatds-control-bridge
+      name: /opt/chatds-deepseek-plugins/control_bridge.mjs

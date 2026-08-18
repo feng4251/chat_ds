@@ -72,6 +72,13 @@ class RunIdentity(BaseModel):
     conversation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
 
 
+class ApprovalDecisionRequest(BaseModel):
+    user_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    conversation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    decision: Literal["allow", "deny"]
+    request_seq: int = Field(ge=1)
+
+
 class SessionIdentity(BaseModel):
     user_id: str = Field(pattern=r"^[0-9a-f]{32}$")
 
@@ -487,6 +494,26 @@ class Manager:
         _append_terminal(control / "events.jsonl", "cancelled", None)
         return True
 
+    async def decide_approval(self, run: str, request_id: str, payload: ApprovalDecisionRequest) -> dict[str, Any]:
+        if re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request_id) is None:
+            raise HTTPException(400, "Invalid approval request id")
+        locator = self._locate(run)
+        if locator["user_id"] != payload.user_id or locator["conversation_id"] != payload.conversation_id:
+            raise HTTPException(404, "Run not found")
+        control = self._control(payload.user_id, payload.conversation_id, run)
+        mailbox = control / "control-decisions.jsonl"
+        mailbox.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        row = {
+            "request_id": request_id,
+            "request_seq": payload.request_seq,
+            "decision": payload.decision,
+        }
+        with mailbox.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        return {"accepted": True, "request_id": request_id, "decision": payload.decision}
+
     async def cleanup(self, user: str, conversation: str) -> dict[str, Any]:
         if not SAFE_ID.fullmatch(user) or not SAFE_ID.fullmatch(conversation):
             raise HTTPException(404, "Session not found")
@@ -694,6 +721,12 @@ async def run_events(run_id: str, after: int = Query(default=0, ge=0), _=Depends
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.post("/v1/runs/{run_id}/approvals/{request_id}")
+async def decide_approval(run_id: str, request_id: str, payload: ApprovalDecisionRequest, _=Depends(_auth)):
+    assert manager is not None
+    return await manager.decide_approval(run_id, request_id, payload)
 
 
 @app.post("/v1/runs/{run_id}/cancel")
