@@ -57,6 +57,95 @@ DEFAULT_NATIVE_TOOLS: tuple[str, ...] = (
 
 DEFAULT_NATIVE_TOOL_SET = frozenset(DEFAULT_NATIVE_TOOLS)
 
+# DeepSeek Harness keeps its own upstream model-facing tool graph.  ChatDS
+# stores platform capability names, so the DeepSeek adapter must translate at
+# the boundary instead of handing legacy names to DSH as if they were native.
+# Keep this manifest ChatDS-owned: do not fork or patch deepseek-harness-clean.
+DEEPSEEK_HARNESS_NATIVE_TOOL_GROUPS: dict[str, tuple[str, ...]] = {
+    "shell": ("bash", "job_output", "job_list", "job_kill"),
+    "files": ("read", "write", "edit", "glob", "grep"),
+    "skills": ("skill",),
+    "subagents": ("subagent", "send_message", "interrupt_agent", "list_agents"),
+    "todo": ("todo_write",),
+    "goals": ("get_goal", "create_goal", "update_goal"),
+    "web": ("web_search",),
+}
+
+_DEEPSEEK_HARNESS_CAPABILITY_GROUPS: dict[str, tuple[str, ...]] = {
+    "execute_code": ("shell",),
+    "run_skill_python": ("shell",),
+    "run_skill_script": ("shell",),
+    "run_declared_command": ("shell",),
+    "skill_http_get": ("shell",),
+    "skill_http_post_json": ("shell",),
+    "web_extract": ("shell",),
+    "read_file": ("files",),
+    "write_file": ("files",),
+    "patch_file": ("files",),
+    "merge_files": ("files",),
+    "search_files": ("files",),
+    "skills_list": ("skills",),
+    "skill_view": ("skills",),
+    "skill_copy_resource": ("skills",),
+    "delegate_task": ("subagents",),
+    "todo": ("todo",),
+    "get_goal": ("goals",),
+    "create_goal": ("goals",),
+    "update_goal": ("goals",),
+    "web_search": ("web",),
+    "market_quote": (),
+}
+
+DEEPSEEK_HARNESS_TOOL_CAPABILITIES = frozenset(
+    _DEEPSEEK_HARNESS_CAPABILITY_GROUPS
+)
+
+
+def deepseek_harness_enabled_capabilities(requested: list[str]) -> tuple[str, ...]:
+    """Return the ChatDS capability subset implemented by DeepSeek Harness."""
+
+    return tuple(
+        name for name in requested
+        if name in DEEPSEEK_HARNESS_TOOL_CAPABILITIES
+    )
+
+
+def deepseek_harness_native_tool_groups(capabilities: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    """Compile ChatDS capability names into DSH native plugin groups.
+
+    The runner consumes these group names to enable upstream plugins.  This keeps
+    durable ChatDS settings backwards-compatible while preventing empty or
+    legacy-only tool names from leaking into the native DSH dispatcher.
+    """
+
+    groups: list[str] = []
+    seen: set[str] = set()
+    for capability in capabilities:
+        if not isinstance(capability, str) or not capability:
+            raise ValueError("deepseek_harness_capability_invalid")
+        mapped = _DEEPSEEK_HARNESS_CAPABILITY_GROUPS.get(capability)
+        if mapped is None:
+            raise ValueError("deepseek_harness_capability_unknown")
+        for group in mapped:
+            if group and group not in seen:
+                seen.add(group)
+                groups.append(group)
+    return tuple(groups)
+
+
+def deepseek_harness_native_tools(capabilities: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    """Return the model-facing upstream DSH tool names for diagnostics."""
+
+    native: list[str] = []
+    seen: set[str] = set()
+    for group in deepseek_harness_native_tool_groups(capabilities):
+        for tool_name in DEEPSEEK_HARNESS_NATIVE_TOOL_GROUPS[group]:
+            if tool_name not in seen:
+                seen.add(tool_name)
+                native.append(tool_name)
+    return tuple(native)
+
+
 # ``enabled_tools`` stored on a scheduled job is a ChatDS capability set, not
 # a copy of Claude Code's display names.  Older schedule-controller views did
 # not publish that distinction in their JSON schema, so models reasonably

@@ -6,7 +6,7 @@ import { closeSync, fsyncSync, openSync, readFileSync, writeSync } from 'node:fs
 import { randomUUID } from 'node:crypto'
 
 export const name = 'chatds-control-bridge'
-export const inject = { required: ['approval'], optional: ['userQuestions'] }
+export const inject = ['approval']
 const POLL_INTERVAL_MS = 200
 
 function append(path, envelope) {

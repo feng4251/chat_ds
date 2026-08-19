@@ -80,6 +80,18 @@ engines:
     max_keepalive_connections: 1
     keepalive_expiry: 30.0
 
+  - name: wikidata
+    engine: wikidata
+    disabled: true
+
+  - name: ahmia
+    engine: ahmia
+    disabled: true
+
+  - name: torch
+    engine: torch
+    disabled: true
+
 server:
   bind_address: "0.0.0.0"
   port: 8080
@@ -127,5 +139,15 @@ outgoing:
 # Harness broker; SearXNG does not cache general SERPs here. The local-search
 # Compose profile enables this through SEARXNG_VALKEY_URL; keeping the file
 # default false also lets the config be used safely without that profile.
+botdetection:
+  enabled: true
+  ipv4_prefix: 32
+  ipv6_prefix: 48
+  trusted_proxies:
+    - 127.0.0.1/32
+    - 10.10.0.0/16
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+
 valkey:
   url: false

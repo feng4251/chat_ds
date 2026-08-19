@@ -42,7 +42,11 @@ from workspace import (
     workspace_file_metadata,
 )
 from hooks import emit_event
-from native_tools import DEFAULT_NATIVE_TOOLS
+from native_tools import (
+    DEFAULT_NATIVE_TOOLS,
+    DEEPSEEK_HARNESS_TOOL_CAPABILITIES,
+    deepseek_harness_native_tools,
+)
 from model_routing import (
     DEFAULT_AGENT_MODEL_ID,
     canonical_agent_model_id,
@@ -3388,18 +3392,16 @@ def deepseek_harness_model_compatible(provider_config: dict) -> bool:
     )
 
 
-_DEEPSEEK_HARNESS_TOOL_CAPABILITIES = frozenset({
-    "web_search", "web_extract", "market_quote",
-    "execute_code", "run_skill_python", "run_skill_script",
-    "run_declared_command", "skill_http_get", "skill_http_post_json",
-    "read_file", "write_file", "patch_file", "merge_files", "search_files",
-    "todo", "skills_list", "skill_view", "skill_copy_resource",
-    "delegate_task", "get_goal", "create_goal", "update_goal",
-})
+_DEEPSEEK_HARNESS_TOOL_CAPABILITIES = frozenset(DEEPSEEK_HARNESS_TOOL_CAPABILITIES)
 
 
 def _effective_engine_tools(engine_id: str, requested: list[str]) -> list[str]:
-    """Compile canonical ChatDS grants onto one native engine surface."""
+    """Compile canonical ChatDS grants onto one engine-owned capability surface.
+
+    DeepSeek Harness receives ChatDS capability names as policy metadata.  The
+    runner translates those grants into the upstream DSH plugin graph; it must
+    never receive a ChatDS-only MCP name as a native DSH tool name.
+    """
 
     if engine_id != ENGINE_ID_DEEPSEEK_HARNESS:
         return list(requested)
@@ -4197,6 +4199,11 @@ async def _chat_stream_with_turn(
                             ) from exc
                         engine_messages = projection.messages
                         input_attachments = projection.attachments
+                deepseek_native_tools = (
+                    deepseek_harness_native_tools(tuple(enabled_tools))
+                    if conv.engine_id == ENGINE_ID_DEEPSEEK_HARNESS
+                    else tuple(enabled_tools)
+                )
                 legacy_payload = {
                     "model": model_id,
                     "messages": final,
@@ -4234,7 +4241,7 @@ async def _chat_stream_with_turn(
                     temperature=0.6,
                     provider_config=provider_config,
                     fallback_configs=tuple(fallback_configs),
-                    tools=tuple(enabled_tools),
+                    tools=tuple(deepseek_native_tools),
                     enabled_user_skills=tuple(enabled_user_skills),
                     session_skill_registry=tuple(session_skill_registry),
                     skill_view_path=(
@@ -4260,6 +4267,9 @@ async def _chat_stream_with_turn(
                         ),
                         "user_turn_text": req.content,
                         "permission_preset": conv.permission_preset,
+                        "chatds_requested_tools": list(requested_tools),
+                        "chatds_effective_tools": list(enabled_tools),
+                        "deepseek_native_tools": list(deepseek_native_tools),
                     },
                 )
                 async with _open_agent_engine_stream(

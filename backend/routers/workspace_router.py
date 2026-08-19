@@ -359,6 +359,13 @@ async def get_conversation_settings(
         serialize_json_list(conv.fallback_model_ids, []),
         requested_model_id=conv.model_id,
     )
+    enabled_tools = serialize_json_list(conv.enabled_tools, DEFAULT_NATIVE_TOOLS)
+    tool_surface = {"chatds_capabilities": enabled_tools}
+    if conv.engine_id == "deepseek_harness":
+        from native_tools import deepseek_harness_native_tools
+        tool_surface["deepseek_native_tools"] = list(
+            deepseek_harness_native_tools(enabled_tools)
+        )
     return {
         "engine_id": conv.engine_id,
         "engine_locked": bool((await db.execute(
@@ -372,10 +379,11 @@ async def get_conversation_settings(
             db=db,
         ),
         "model_id": canonical_agent_model_id(conv.model_id),
-        "enabled_tools": serialize_json_list(conv.enabled_tools, DEFAULT_NATIVE_TOOLS),
+        "enabled_tools": enabled_tools,
         "fallback_model_ids": fallback_model_ids,
         "enabled_user_skills": serialize_json_list(conv.enabled_user_skills, []),
         "permission_preset": conv.permission_preset,
+        "tool_surface": tool_surface,
         "usage": {
             "input_tokens": conv.input_tokens,
             "output_tokens": conv.output_tokens,

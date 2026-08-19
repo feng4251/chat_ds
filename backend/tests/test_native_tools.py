@@ -4,6 +4,8 @@ from native_tools import (
     canonicalize_scheduled_tools,
     DEFAULT_NATIVE_TOOL_SET,
     DEFAULT_NATIVE_TOOLS,
+    deepseek_harness_native_tool_groups,
+    deepseek_harness_native_tools,
     UNATTENDED_DEFAULT_NATIVE_TOOLS,
 )
 
@@ -52,23 +54,43 @@ class NativeToolCatalogTests(unittest.TestCase):
                 allowed_tools=frozenset({"market_quote"}),
             )
 
-    def test_scheduled_tool_defaults_do_not_widen_explicit_empty_set(self):
-        allowed = frozenset({"market_quote", "web_search", "cronjob"})
+    def test_deepseek_native_tool_groups_compile_from_chatds_capabilities(self):
         self.assertEqual(
-            canonicalize_scheduled_tools([], allowed_tools=allowed),
-            (),
+            deepseek_harness_native_tool_groups([
+                "web_search",
+                "execute_code",
+                "read_file",
+                "delegate_task",
+                "market_quote",
+            ]),
+            ("web", "shell", "files", "subagents"),
         )
         self.assertEqual(
-            canonicalize_scheduled_tools(None, allowed_tools=allowed),
-            ("web_search", "market_quote"),
+            deepseek_harness_native_tools([
+                "web_search",
+                "execute_code",
+                "read_file",
+                "delegate_task",
+            ]),
+            (
+                "web_search",
+                "bash",
+                "job_output",
+                "job_list",
+                "job_kill",
+                "read",
+                "write",
+                "edit",
+                "glob",
+                "grep",
+                "subagent",
+                "send_message",
+                "interrupt_agent",
+                "list_agents",
+            ),
         )
-        self.assertEqual(
-            list(UNATTENDED_DEFAULT_NATIVE_TOOLS),
-            [
-                name for name in DEFAULT_NATIVE_TOOLS
-                if name not in {"cronjob", "clarify", "delegate_task"}
-            ],
-        )
+        with self.assertRaisesRegex(ValueError, "unknown"):
+            deepseek_harness_native_tool_groups(["nonexistent_capability"])
 
 
 if __name__ == "__main__":

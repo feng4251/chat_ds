@@ -214,18 +214,35 @@ class DeepSeekEventProjector:
                     "total_tokens": input_tokens + output_tokens,
                 }, raw=dict(envelope)))
         elif native_type == "tool/call":
-            projected.append(self._agent_event(
-                event_type="tool.started",
-                run_id=run_id,
-                seq=sub_seq,
-                payload={
-                    "tool_name": str(data.get("name") or "tool"),
-                    "tool_call_id": str(data.get("callId") or ""),
-                    "detail": "DeepSeek Harness tool call started",
-                },
-                depth=depth,
-                session_id=session_id,
-            ))
+            tool_name = str(data.get("name") or "")
+            tool_call_id = str(data.get("callId") or "")
+            if not tool_name or not tool_call_id:
+                projected.append(self._agent_event(
+                    event_type="tool.failed",
+                    run_id=run_id,
+                    seq=sub_seq,
+                    payload={
+                        "tool_name": tool_name or None,
+                        "tool_call_id": tool_call_id or None,
+                        "detail": "DeepSeek Harness emitted an invalid tool call",
+                        "error": "invalid_tool_call",
+                    },
+                    depth=depth,
+                    session_id=session_id,
+                ))
+            else:
+                projected.append(self._agent_event(
+                    event_type="tool.started",
+                    run_id=run_id,
+                    seq=sub_seq,
+                    payload={
+                        "tool_name": tool_name,
+                        "tool_call_id": tool_call_id,
+                        "detail": "DeepSeek Harness tool call started",
+                    },
+                    depth=depth,
+                    session_id=session_id,
+                ))
         elif native_type == "tool/result":
             message = data.get("message")
             error = data.get("error")

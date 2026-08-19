@@ -454,15 +454,19 @@ def _environment(
         if isinstance(value, str)
     }
     shell_tools = {
+        "bash", "job_output", "job_list", "job_kill",
         "execute_code", "run_skill_python", "run_skill_script",
         "run_declared_command", "skill_http_get", "skill_http_post_json",
         "web_extract",
     }
     file_tools = {
+        "read", "write", "edit", "glob", "grep",
         "read_file", "write_file", "patch_file", "merge_files", "search_files",
     }
-    skill_tools = {"skills_list", "skill_view", "skill_copy_resource"}
+    skill_tools = {"skill", "skills_list", "skill_view", "skill_copy_resource"}
     goal_tools = {"get_goal", "create_goal", "update_goal"}
+    subagent_tools = {"subagent", "send_message", "interrupt_agent", "list_agents", "delegate_task"}
+    todo_tools = {"todo_write", "todo"}
     return {
         "PATH": "/usr/local/bin:/usr/bin:/bin",
         "HOME": "/state/home",
@@ -481,8 +485,8 @@ def _environment(
         "CHATDS_DSH_SHELL_ENABLED": "1" if tools & shell_tools else "0",
         "CHATDS_DSH_FILES_ENABLED": "1" if tools & file_tools else "0",
         "CHATDS_DSH_SKILLS_ENABLED": "1" if tools & skill_tools else "0",
-        "CHATDS_DSH_SUBAGENTS_ENABLED": "1" if "delegate_task" in tools else "0",
-        "CHATDS_DSH_TODO_ENABLED": "1" if "todo" in tools else "0",
+        "CHATDS_DSH_SUBAGENTS_ENABLED": "1" if tools & subagent_tools else "0",
+        "CHATDS_DSH_TODO_ENABLED": "1" if tools & todo_tools else "0",
         "CHATDS_DSH_GOALS_ENABLED": "1" if tools & goal_tools else "0",
         "CHATDS_SEARXNG_SEARCH_URL": str(config["searxng_search_url"]),
         "CHATDS_DSH_EVENT_PLUGIN": "/opt/chatds-deepseek-plugins/event_bridge.mjs",

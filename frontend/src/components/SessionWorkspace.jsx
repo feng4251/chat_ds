@@ -18,7 +18,7 @@ import {
   forkConversation,
 } from '../api'
 
-const TOOL_GROUPS = {
+const CHATDS_TOOL_GROUPS = {
   '文件与执行': ['read_file', 'write_file', 'patch_file', 'search_files', 'execute_code'],
   '网络与浏览器': ['web_search', 'web_extract', 'market_quote', 'browser_navigate', 'browser_snapshot', 'browser_click', 'browser_type', 'browser_scroll', 'browser_back'],
   '知识与会话': ['memory', 'session_search', 'sessions_list', 'sessions_history', 'sessions_send', 'sessions_fork', 'session_status', 'skills_list', 'skill_view', 'skill_manage'],
@@ -26,23 +26,43 @@ const TOOL_GROUPS = {
   '多模态与扩展': ['image_generate', 'vision_analyze', 'mcp_server_list', 'mcp_server_status'],
 }
 
+const DEEPSEEK_NATIVE_TOOL_GROUPS = {
+  'Shell / Jobs': ['bash', 'job_output', 'job_list', 'job_kill'],
+  'Files': ['read', 'write', 'edit', 'glob', 'grep'],
+  'Skills': ['skill', 'skills_list', 'skill_view', 'skill_copy_resource'],
+  'Subagents': ['subagent', 'send_message', 'interrupt_agent', 'list_agents'],
+  'Goals / Todo': ['todo_write', 'get_goal', 'create_goal', 'update_goal'],
+  'Web': ['web_search'],
+}
+
 const TOOL_POLICY_BADGES = {
   read_file: ['read-only'],
+  read: ['read-only'],
   search_files: ['read-only'],
+  glob: ['read-only'],
+  grep: ['read-only'],
   web_search: ['read-only'],
   web_extract: ['read-only'],
   market_quote: ['read-only', 'typed-egress'],
   browser_snapshot: ['read-only'],
   write_file: ['workspace', 'parallel-child-off'],
+  write: ['workspace', 'parallel-child-off'],
   patch_file: ['workspace', 'parallel-child-off'],
+  edit: ['workspace', 'parallel-child-off'],
+  merge_files: ['workspace', 'parallel-child-off'],
   execute_code: ['sandbox'],
+  bash: ['sandbox'],
   skill_manage: ['workspace', 'parallel-child-off'],
+  skill: ['workspace', 'parallel-child-off'],
   clarify: ['child-off', 'user-visible'],
   memory: ['child-off', 'global-state'],
   sessions_fork: ['child-off', 'global-state'],
   sessions_send: ['child-off', 'global-state'],
   delegate_task: ['child-off'],
+  subagent: ['child-off'],
   cronjob: ['child-off', 'global-state'],
+  todo: ['child-off', 'global-state'],
+  todo_write: ['child-off', 'global-state'],
   create_goal: ['child-off', 'global-state'],
   update_goal: ['child-off', 'global-state'],
 }
@@ -469,15 +489,15 @@ export default function SessionWorkspace({
               <Section title="Session 权限">
                   <div className="grid grid-cols-1 gap-2">
                     {[
-                      ['read_only', '只读', '工作区以只读方式挂载；写入和执行权限请求会被策略拒绝。'],
+                      ['read_only', 'Read only / 只读', '仅允许读取当前 Session 工作区和只读信息源；写入、执行、调度等权限请求会被策略拒绝。'],
                       [
                         'workspace_write',
-                        '工作区读写',
+                        'Write but need allow / 可写但需授权',
                         settings.engine_id === 'claude_code'
-                          ? '可读写当前 Session 工作区；Claude 原生权限请求由页面逐次确认。'
-                          : '可读写当前 Session 工作区；越界操作由无交互策略自动拒绝。',
+                          ? '可读写当前 Session 工作区；Claude 原生权限请求由页面逐次确认后执行。'
+                          : '可读写当前 Session 工作区；需要授权的操作走引擎原生策略，越界操作自动拒绝。',
                       ],
-                      ['session_full', 'Session 完整权限', '在当前 Session 的挂载与出网边界内免确认执行；不包含主机或其他 Session。'],
+                      ['session_full', 'Full access / Session 内完整权限', '在当前 Session 的工作区、沙箱和出网边界内免逐次确认；仍不能访问其他 Session、宿主机目录或 Docker Socket。'],
                     ].map(([value, title, description]) => (
                       <label key={value} className={`cursor-pointer rounded-xl border p-3 ${settings.permission_preset === value ? 'border-indigo-400 bg-indigo-50' : 'border-stone-200 bg-white'}`}>
                         <div className="flex items-center gap-2 text-sm font-medium text-slate-800">
@@ -508,16 +528,36 @@ export default function SessionWorkspace({
                   ))}
                 </div>
               </Section>}
-              {Object.entries(TOOL_GROUPS).map(([group, tools]) => (
-                <Section key={group} title={group}>
-                  <div className="grid grid-cols-2 gap-2">
-                    {tools.map((tool) => <Check key={tool} label={tool} checked={settings.enabled_tools.includes(tool)} onChange={(checked) => setSettings({
-                      ...settings,
-                      enabled_tools: checked ? [...settings.enabled_tools, tool] : settings.enabled_tools.filter((name) => name !== tool),
-                    })} />)}
-                  </div>
-                </Section>
-              ))}
+              <Section title="ChatDS 能力视图">
+                <div className="space-y-3">
+                  {Object.entries(CHATDS_TOOL_GROUPS).map(([group, tools]) => (
+                    <div key={group} className="rounded-xl border border-stone-200 bg-white p-3">
+                      <div className="mb-2 text-xs font-medium text-slate-700">{group}</div>
+                      <div className="grid grid-cols-2 gap-2">
+                        {tools.map((tool) => <Check key={tool} label={tool} checked={settings.enabled_tools.includes(tool)} onChange={(checked) => setSettings({
+                          ...settings,
+                          enabled_tools: checked ? [...settings.enabled_tools, tool] : settings.enabled_tools.filter((name) => name !== tool),
+                        })} />)}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </Section>
+              <Section title="DeepSeek 原生视图">
+                <div className="space-y-3">
+                  {Object.entries(DEEPSEEK_NATIVE_TOOL_GROUPS).map(([group, tools]) => (
+                    <div key={group} className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                      <div className="mb-2 text-xs font-medium text-slate-700">{group}</div>
+                      <div className="flex flex-wrap gap-2">
+                        {tools.map((tool) => (
+                          <span key={tool} className="inline-flex items-center rounded-full border border-slate-200 bg-white px-2 py-1 text-[11px] text-slate-600">{tool}</span>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </Section>
+              <div className="text-xs text-slate-500">ChatDS capability 仍是保存与审计主键；DeepSeek 原生名仅用于说明 runner 内部闭环的实际工具面。</div>
               <div className="text-xs text-slate-500">累计 Token：{settings.usage.total_tokens.toLocaleString()}（输入 {settings.usage.input_tokens.toLocaleString()} / 输出 {settings.usage.output_tokens.toLocaleString()}）</div>
               <button onClick={saveSettings} disabled={saving} className="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm flex items-center gap-2"><FiSave />保存运行配置</button>
             </div>

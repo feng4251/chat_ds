@@ -126,9 +126,12 @@ services:
       # without a deployment-owned secret.
       SEARXNG_SECRET: ${SEARXNG_SECRET:-}
       SEARXNG_VALKEY_URL: ${SEARXNG_VALKEY_URL:-valkey://searxng-valkey:6379/0}
-      # limiter.toml pass-lists the production Harness. This protects the LAN
-      # endpoint without throttling the trusted JSON API caller.
-      SEARXNG_LIMITER: ${SEARXNG_LIMITER:-true}
+      # This SearXNG instance is a deployment-owned internal search boundary for
+      # Harness web_search, not a public metasearch service.  Direct container
+      # port publishing does not provide the trusted proxy headers required by
+      # SearXNG's bot detector, so keep the limiter off unless a deployment also
+      # ships a matching limiter.toml / trusted proxy configuration.
+      SEARXNG_LIMITER: ${SEARXNG_LIMITER:-false}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >-

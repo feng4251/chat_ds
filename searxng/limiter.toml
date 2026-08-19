@@ -1,12 +1,26 @@
-[botdetection.ip_lists]
+[botdetection]
 
-# The production Harness is the only remote JSON API caller. Direct host and
-# Docker-bridge addresses are included for local health/debug requests. Cloud
-# metadata and arbitrary LAN clients are never pass-listed.
-pass_ip = [
-  "10.10.130.178/32",
-  "10.10.132.126/32",
-  "172.29.250.0/24",
+ipv4_prefix = 32
+ipv6_prefix = 48
+
+trusted_proxies = [
+  '127.0.0.0/8',
+  '10.0.0.0/8',
+  '172.16.0.0/12',
+  '192.168.0.0/16',
+  '::1',
 ]
 
-pass_searxng_org = false
+[botdetection.ip_limit]
+filter_link_local = false
+link_token = false
+
+[botdetection.ip_lists]
+block_ip = []
+pass_ip = [
+  '10.0.0.0/8',
+  '172.16.0.0/12',
+  '192.168.0.0/16',
+  '127.0.0.0/8',
+]
+pass_searxng_org = true

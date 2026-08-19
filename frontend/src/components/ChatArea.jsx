@@ -275,7 +275,7 @@ export default function ChatArea({
   const [selectedEngine, setSelectedEngine] = useState('')
   const [engineOptions, setEngineOptions] = useState([])
   const [engineLocked, setEngineLocked] = useState(false)
-  const [workspaceOpen, setWorkspaceOpen] = useState(false)
+  const [settings, setSettings] = useState(null)
   const [showScrollBtn, setShowScrollBtn] = useState(false)
   const [isDragging, setIsDragging] = useState(false)
   const endRef = useRef(null)
@@ -303,7 +303,13 @@ export default function ChatArea({
       || durableRunUnknown
     )
   )
-  const compatibleModels = compatibleModelsForEngine(models, selectedEngine)
+  const permissionSummary = (() => {
+    const preset = settings?.permission_preset || 'session_full'
+    if (preset === 'read_only') return '只读'
+    if (preset === 'workspace_write') return selectedEngine === 'claude_code' ? '可写但需授权' : '可写但受引擎策略限制'
+    return 'Session 完整权限'
+  })()
+  const toolSurface = settings?.tool_surface || {}
 
   useEffect(() => {
     let cancelled = false
@@ -368,6 +374,7 @@ export default function ChatArea({
           : []
       ))
       setSessionSkills([])
+      setSettings(null)
       setDurableRunActive(false)
       setDurableRunUnknown(false)
       setDurableRunConversation(null)
@@ -436,6 +443,7 @@ export default function ChatArea({
         setSelectedEngine(settings.engine_id || '')
         setEngineOptions(settings.engine_options || [])
         setEngineLocked(Boolean(settings.engine_locked))
+        setSettings(settings)
         getSkills(activeConv, settings.enabled_user_skills || [])
           .then((list) => {
             if (aborted) return
@@ -1447,6 +1455,16 @@ export default function ChatArea({
             </div>
           )}
 
+          <div className="mb-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-[11px] text-slate-600 flex items-center justify-between gap-3">
+            <div>
+              <span className="font-medium text-slate-700">权限：</span>{permissionSummary}
+              {toolSurface.deepseek_native_tools ? (
+                <span className="ml-3 text-slate-400">DeepSeek 原生工具 {toolSurface.deepseek_native_tools.length} 个</span>
+              ) : null}
+            </div>
+            <button onClick={openWorkspace} className="text-indigo-600 hover:text-indigo-700 font-medium">打开工作区</button>
+          </div>
+
           <div className="flex items-end gap-1 bg-white rounded-3xl pl-2 pr-2 py-2 border border-stone-200 shadow-sm focus-within:border-indigo-300 focus-within:shadow-md transition">
             <button
               onClick={() => fileRef.current?.click()}
@@ -1531,6 +1549,7 @@ export default function ChatArea({
           setSelectedEngine(settings.engine_id)
           setEngineOptions(settings.engine_options || [])
           setEngineLocked(Boolean(settings.engine_locked))
+          setSettings(settings)
           onConvRefresh()
         }}
         onConversationForked={(conversationId) => {
