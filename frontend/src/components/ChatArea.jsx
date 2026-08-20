@@ -278,6 +278,7 @@ export default function ChatArea({
   const [settings, setSettings] = useState(null)
   const [showScrollBtn, setShowScrollBtn] = useState(false)
   const [isDragging, setIsDragging] = useState(false)
+  const [workspaceOpen, setWorkspaceOpen] = useState(false)
   const endRef = useRef(null)
   const scrollContainerRef = useRef(null)
   const inpRef = useRef(null)
@@ -310,6 +311,7 @@ export default function ChatArea({
     return 'Session 完整权限'
   })()
   const toolSurface = settings?.tool_surface || {}
+  const compatibleModels = compatibleModelsForEngine(models, selectedEngine)
 
   useEffect(() => {
     let cancelled = false
