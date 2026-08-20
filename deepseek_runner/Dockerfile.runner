@@ -1,4 +1,4 @@
-ARG SESSION_SANDBOX_IMAGE=chat_ds-session-sandbox
+ARG NATIVE_SESSION_RUNTIME_IMAGE=chat_ds-native-session-runtime
 
 FROM node:22.23.1-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS deepseek-build
 WORKDIR /build/deepseek-harness
@@ -13,26 +13,40 @@ RUN apt-get update \
     && node apps/cli/lib/bin.js --version | grep -F '0.1.0-rc.5' \
     && rm -rf /root/.cache /root/.local/share/pnpm/store
 
-FROM ${SESSION_SANDBOX_IMAGE}
+FROM ${NATIVE_SESSION_RUNTIME_IMAGE}
 
 LABEL org.opencontainers.image.title="ChatDS isolated DeepSeek Harness Turn runner" \
       org.opencontainers.image.version="0.1.0-rc.5" \
       org.opencontainers.image.revision="47f943859bef60e4160492346772ded9b24f765a" \
       org.opencontainers.image.chatds.network="none+signed-exact-egress-v3" \
       org.opencontainers.image.chatds.workspace-scope="one-session" \
+      org.opencontainers.image.chatds.native-session-driver="v1" \
       org.opencontainers.image.chatds.upstream-unmodified="true" \
       org.opencontainers.image.chatds.setid-stripped="true"
 
 COPY --from=deepseek-build /build/deepseek-harness /opt/deepseek-harness
 COPY --from=deepseek-build /usr/bin/bwrap /usr/bin/bwrap
 COPY deepseek_runner/event_bridge.mjs \
+     deepseek_runner/native_event_transport.mjs \
+     deepseek_runner/provider_compat_bridge.mjs \
      deepseek_runner/searxng_provider.mjs \
      deepseek_runner/control_bridge.mjs \
+     deepseek_runner/native_workflow_core.mjs \
+     deepseek_runner/native_workflow.mjs \
+     deepseek_runner/native_artifact_gate.mjs \
+     deepseek_runner/session_driver_core.mjs \
+     deepseek_runner/session_driver.mjs \
      deepseek_runner/chatds.patch.yml \
      /opt/chatds-deepseek-plugins/
 COPY deepseek_runner/__init__.py \
+     deepseek_runner/artifact_gate.py \
+     deepseek_runner/native_artifacts.py \
+     deepseek_runner/native_workflow.py \
      deepseek_runner/runner_entrypoint.py \
      /opt/chatds-deepseek-runner/python/deepseek_runner/
+COPY native_security/__init__.py \
+     native_security/artifact_contract.py \
+     /opt/chatds-deepseek-runner/python/native_security/
 COPY claude_runner/__init__.py \
      claude_runner/mcp_market_data.py \
      claude_runner/mcp_process.py \
@@ -49,9 +63,14 @@ RUN mkdir -p /run/chatds-control /runtime /state /skill-view \
         /opt/chatds-deepseek-plugins/node_modules/@deepseek-ai/schemastery \
     && ln -s /opt/deepseek-harness/packages/web/web \
         /opt/chatds-deepseek-plugins/node_modules/@deepseek-ai/dsh-web \
+    && for name in dsh-agent dsh-llm dsh-session dsh-tools; do \
+         ln -s "/opt/deepseek-harness/node_modules/@deepseek-ai/$name" \
+           "/opt/chatds-deepseek-plugins/node_modules/@deepseek-ai/$name"; \
+       done \
     && purelib="$(python -I -c 'import sysconfig; print(sysconfig.get_path("purelib"))')" \
     && ln -s /opt/chatds-deepseek-runner/python/deepseek_runner "${purelib}/deepseek_runner" \
     && ln -s /opt/chatds-deepseek-runner/python/claude_runner "${purelib}/claude_runner" \
+    && ln -s /opt/chatds-deepseek-runner/python/native_security "${purelib}/native_security" \
     && chmod +x /usr/bin/bwrap \
     && chmod -R a-w /opt/deepseek-harness /opt/chatds-deepseek-runner \
         /opt/chatds-deepseek-plugins \
@@ -63,7 +82,7 @@ RUN mkdir -p /run/chatds-control /runtime /state /skill-view \
     && node --input-type=module -e \
          "await import('@deepseek-ai/dsh-llm-deepseek'); await import('@deepseek-ai/dsh-headless'); await import('@deepseek-ai/dsh-mcp-client')" \
     && node --input-type=module -e \
-         "await import('/opt/chatds-deepseek-plugins/event_bridge.mjs'); await import('/opt/chatds-deepseek-plugins/searxng_provider.mjs'); await import('/opt/chatds-deepseek-plugins/control_bridge.mjs')" \
+         "await import('/opt/chatds-deepseek-plugins/native_event_transport.mjs'); await import('/opt/chatds-deepseek-plugins/event_bridge.mjs'); await import('/opt/chatds-deepseek-plugins/provider_compat_bridge.mjs'); await import('/opt/chatds-deepseek-plugins/searxng_provider.mjs'); await import('/opt/chatds-deepseek-plugins/control_bridge.mjs'); await import('/opt/chatds-deepseek-plugins/native_workflow_core.mjs'); await import('/opt/chatds-deepseek-plugins/native_workflow.mjs'); await import('/opt/chatds-deepseek-plugins/native_artifact_gate.mjs'); await import('/opt/chatds-deepseek-plugins/session_driver_core.mjs'); await import('/opt/chatds-deepseek-plugins/session_driver.mjs')" \
     && node /opt/deepseek-harness/apps/cli/lib/bin.js --version | grep -F '0.1.0-rc.5'
 
 USER 0:0

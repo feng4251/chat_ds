@@ -1,5 +1,5 @@
 ARG CLAUDE_CODE_VERSION=2.1.152
-ARG SESSION_SANDBOX_IMAGE=chat_ds-session-sandbox
+ARG NATIVE_SESSION_RUNTIME_IMAGE=chat_ds-native-session-runtime
 FROM node:22.23.1-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS claude-package
 ARG CLAUDE_CODE_VERSION
 WORKDIR /build
@@ -33,7 +33,7 @@ RUN python -m pip install \
       -i https://pypi.tuna.tsinghua.edu.cn/simple \
       -r /tmp/schedule-requirements.txt
 
-FROM ${SESSION_SANDBOX_IMAGE}
+FROM ${NATIVE_SESSION_RUNTIME_IMAGE}
 ARG CLAUDE_CODE_VERSION=2.1.152
 
 LABEL org.opencontainers.image.title="ChatDS isolated Claude Code Turn runner" \
@@ -50,6 +50,10 @@ COPY claude_runner/bootstrap.py /opt/chatds-claude-runner/bootstrap.py
 COPY claude_runner/__init__.py \
      claude_runner/runner_entrypoint.py \
      claude_runner/runtime_capabilities.py \
+     claude_runner/native_control.py \
+     claude_runner/artifact_stop_hook.py \
+     claude_runner/native_workflow.py \
+     claude_runner/native_lifecycle_hook.py \
      claude_runner/input_attachments.py \
      claude_runner/image_selftest.py \
      claude_runner/mcp_web_search.py \

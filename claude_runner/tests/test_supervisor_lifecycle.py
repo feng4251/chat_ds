@@ -25,12 +25,13 @@ from claude_runner.server import (
     _read_json,
     _terminal_status,
     _update_status,
+    _fresh_session_skill_binding,
     _validate_runner_image_security,
     _validate_runner_image_self_test_output,
 )
 from claude_runner.runtime_capabilities import (
     compile_runtime_capability_contract,
-    render_runtime_capability_prompt,
+    validate_runtime_capability_contract,
 )
 
 
@@ -112,7 +113,11 @@ class _FakeClient:
         self.containers = _FakeContainers()
 
 
-def _make_readonly_view(view: Path) -> str:
+def _make_readonly_view(
+    view: Path,
+    *,
+    include_schedule_capability_aliases: bool = True,
+) -> str:
     descriptor = view / "plugin" / ".claude-plugin" / "plugin.json"
     descriptor.parent.mkdir(parents=True)
     descriptor.write_text(
@@ -129,6 +134,15 @@ def _make_readonly_view(view: Path) -> str:
     instruction_payload = instruction.read_bytes()
     identity = {
         "schema": "chatds.claude-skill-view.v1",
+        "plugin_name": "chatds-session-skills",
+        "entrypoint_skill_name": None,
+        "selected_primary_skill_names": ["fixture"],
+        "platform_egress_rules": [],
+        "platform_capabilities": [],
+        "schedule_capability_aliases": {},
+        "artifact_contracts": [],
+        "runtime_requirements": [],
+        "skill_diagnostics": [],
         "skills": [{
             "name": "fixture",
             "scope": "session",
@@ -151,6 +165,8 @@ def _make_readonly_view(view: Path) -> str:
             },
         ],
     }
+    if not include_schedule_capability_aliases:
+        identity.pop("schedule_capability_aliases")
     digest = hashlib.sha256(json.dumps(
         identity,
         ensure_ascii=False,
@@ -358,6 +374,28 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.manager._provider(request)
 
+    def test_valid_content_addressed_view_without_optional_alias_map_preflights(self):
+        provisional = self.view.parent / "renamed-provisional"
+        digest = _make_readonly_view(
+            provisional,
+            include_schedule_capability_aliases=False,
+        )
+        view = self.view.parent / digest
+        provisional.rename(view)
+        request = self._request().model_copy(update={
+            "run_id": uuid.uuid4().hex,
+            "root_run_id": uuid.uuid4().hex,
+            "skill_view_path": str(view),
+            "skill_view_sha256": digest,
+        })
+
+        _workspace, _view, _state, run_dir, _status, _profile = (
+            self.manager._prepare_run_sync(request, self.profile)
+        )
+
+        durable = _read_json(run_dir / "request.json")
+        self.assertEqual(durable["schedule_capability_aliases"], {})
+
     async def test_start_admission_is_idempotent_and_identity_bound(self):
         await self.manager._semaphore.acquire()
         request = self._request()
@@ -383,15 +421,13 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         finally:
             self.manager._semaphore.release()
 
-    def test_selected_skill_entrypoint_precedes_fresh_and_resumed_prompts(self):
-        entrypoint = "chatds-session-skills:chatds-harness-session-entry"
+    def test_prompt_builder_leaves_native_system_and_skill_control_to_claude(self):
         fresh = supervisor_server._build_prompt(
             [
                 {"role": "system", "content": "system"},
                 {"role": "user", "content": "task"},
             ],
             resume=False,
-            skill_entrypoint=entrypoint,
         )
         resumed = supervisor_server._build_prompt(
             [
@@ -400,10 +436,11 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 {"role": "user", "content": "next"},
             ],
             resume=True,
-            skill_entrypoint=entrypoint,
         )
-        self.assertTrue(fresh.startswith(f"/{entrypoint}\n\n<SYSTEM>"))
-        self.assertEqual(resumed, f"/{entrypoint}\n\nnext")
+        self.assertEqual(fresh, "task")
+        self.assertNotIn("system", fresh)
+        self.assertNotIn("chatds-session-skills:", fresh)
+        self.assertEqual(resumed, "next")
 
     def test_verified_workspace_image_is_compiled_as_top_level_input(self):
         payload = b"\x89PNG\r\n\x1a\nfixture"
@@ -524,40 +561,223 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 "scope": "session",
             }],
         }
-        entrypoint = supervisor_server._manifest_skill_entrypoint(manifest)
-        self.assertIsNone(entrypoint)
+        self.assertIsNone(
+            supervisor_server._validate_native_skill_manifest(manifest)
+        )
         prompt = supervisor_server._build_prompt(
             [{"role": "user", "content": "unrelated current weather"}],
             resume=True,
-            skill_entrypoint=entrypoint,
         )
         self.assertEqual(prompt, "unrelated current weather")
-        with self.assertRaisesRegex(RuntimeError, "skill_entrypoint"):
-            supervisor_server._manifest_skill_entrypoint({
+        with self.assertRaisesRegex(RuntimeError, "native_skill_manifest"):
+            supervisor_server._validate_native_skill_manifest({
                 **manifest,
                 "selected_primary_skill_names": ["missing"],
             })
 
-    def test_compiled_persistent_process_requirement_adds_generic_guidance(self):
-        prompt = supervisor_server._attach_runtime_contract(
-            "unrelated task",
-            [{
-                "skill_name": "renamed-holdout",
-                "persistent_stdin_process": True,
-            }],
-        )
-        self.assertTrue(prompt.startswith("unrelated task\n\n"))
-        self.assertIn("chatds-process", prompt)
-        self.assertIn("process_write", prompt)
+    def test_fresh_session_binds_only_one_explicit_session_primary(self):
+        manifest = {
+            "plugin_name": "chatds-session-skills",
+            "entrypoint_skill_name": None,
+            "selected_primary_skill_names": [
+                "museum-provenance",
+                "ambient-factory-guide",
+            ],
+            "skills": [
+                {
+                    "name": "museum-provenance",
+                    "scope": "session",
+                    "bundle_role": "primary",
+                },
+                {
+                    "name": "museum-catalog-support",
+                    "scope": "session",
+                    "bundle_role": "supporting",
+                },
+                {
+                    "name": "ambient-factory-guide",
+                    "scope": "user",
+                    "bundle_role": "primary",
+                },
+            ],
+        }
         self.assertEqual(
-            supervisor_server._attach_runtime_contract("plain", []),
-            "plain",
+            _fresh_session_skill_binding(manifest, resume=False),
+            {
+                "skill_name": "museum-provenance",
+                "source": "fresh_session_primary",
+            },
+        )
+        self.assertIsNone(
+            _fresh_session_skill_binding(manifest, resume=True)
         )
 
-    def test_current_capability_contract_supersedes_stale_session_claims(self):
+        renamed_second_session_primary = {
+            **manifest,
+            "selected_primary_skill_names": [
+                *manifest["selected_primary_skill_names"],
+                "warehouse-planner",
+            ],
+            "skills": [
+                *manifest["skills"],
+                {
+                    "name": "warehouse-planner",
+                    "scope": "session",
+                    "bundle_role": "primary",
+                },
+            ],
+        }
+        self.assertIsNone(
+            _fresh_session_skill_binding(
+                renamed_second_session_primary,
+                resume=False,
+            )
+        )
+
+    def test_turn_workflow_selects_highest_priority_matching_route(self):
+        manifest = {
+            "selected_primary_skill_names": ["warehouse-audit"],
+            "workflow_routes": [
+                {
+                    "skill_name": "warehouse-audit",
+                    "route_id": "single_check",
+                    "source_path": "orchestration/orchestrator.yaml",
+                    "priority": 1,
+                    "patterns": ["audit.*inventory"],
+                    "phases": [{
+                        "mode": "sequential",
+                        "workers": [{
+                            "worker_id": "stock-auditor",
+                            "native_agent_type": (
+                                "chatds-session-skills:warehouse-audit:"
+                                "stock-auditor"
+                            ),
+                        }],
+                    }],
+                },
+                {
+                    "skill_name": "warehouse-audit",
+                    "route_id": "full_inventory_review",
+                    "source_path": "orchestration/orchestrator.yaml",
+                    "priority": 7,
+                    "patterns": ["(audit|reconcile).*(warehouse|inventory)"],
+                    "phases": [
+                        {
+                            "mode": "parallel",
+                            "workers": [
+                                {
+                                    "worker_id": "stock-auditor",
+                                    "native_agent_type": (
+                                        "chatds-session-skills:warehouse-audit:"
+                                        "stock-auditor"
+                                    ),
+                                },
+                                {
+                                    "worker_id": "ledger-reviewer",
+                                    "native_agent_type": (
+                                        "chatds-session-skills:warehouse-audit:"
+                                        "ledger-reviewer"
+                                    ),
+                                },
+                            ],
+                        },
+                        {
+                            "mode": "sequential",
+                            "workers": [{
+                                "worker_id": "signoff-reviewer",
+                                "native_agent_type": (
+                                    "chatds-session-skills:warehouse-audit:"
+                                    "signoff-reviewer"
+                                ),
+                            }],
+                        },
+                    ],
+                },
+            ],
+        }
+
+        contract = supervisor_server._compile_turn_workflow_contract(
+            manifest=manifest,
+            user_turn_text="Please audit the full warehouse inventory.",
+            bound_skill_name="warehouse-audit",
+        )
+
+        self.assertEqual(contract["schema"], "chatds.skill-workflow-contract.v1")
+        self.assertEqual(contract["route_id"], "full_inventory_review")
+        self.assertEqual(contract["matched_pattern_index"], 0)
+        self.assertRegex(contract["route_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            [[worker["worker_id"] for worker in phase["workers"]]
+             for phase in contract["phases"]],
+            [["stock-auditor", "ledger-reviewer"], ["signoff-reviewer"]],
+        )
+
+    def test_turn_workflow_selection_is_domain_rename_invariant(self):
+        route = {
+            "skill_name": "museum-provenance-renamed",
+            "route_id": "collection_chain",
+            "source_path": "orchestration/orchestrator.yml",
+            "priority": 4,
+            "patterns": ["(trace|review).*(museum|collection)"],
+            "phases": [{
+                "mode": "parallel",
+                "workers": [{
+                    "worker_id": "catalog-reader",
+                    "native_agent_type": (
+                        "chatds-session-skills:museum-provenance-renamed:"
+                        "catalog-reader"
+                    ),
+                }],
+            }],
+        }
+        contract = supervisor_server._compile_turn_workflow_contract(
+            manifest={
+                "selected_primary_skill_names": [
+                    "museum-provenance-renamed"
+                ],
+                "workflow_routes": [route],
+            },
+            user_turn_text="Trace the museum collection records.",
+            bound_skill_name="museum-provenance-renamed",
+        )
+        self.assertEqual(contract["route_id"], "collection_chain")
+        self.assertNotIn("warehouse", json.dumps(contract))
+
+    def test_equal_priority_workflow_match_fails_closed(self):
+        routes = []
+        for route_id in ("alpha_route", "beta_route"):
+            routes.append({
+                "skill_name": "generic-review",
+                "route_id": route_id,
+                "source_path": "orchestration/orchestrator.yaml",
+                "priority": 3,
+                "patterns": ["review.*evidence"],
+                "phases": [{
+                    "mode": "sequential",
+                    "workers": [{
+                        "worker_id": "reviewer",
+                        "native_agent_type": (
+                            "chatds-session-skills:generic-review:reviewer"
+                        ),
+                    }],
+                }],
+            })
+        with self.assertRaisesRegex(
+            RuntimeError, "skill_workflow_route_ambiguous"
+        ):
+            supervisor_server._compile_turn_workflow_contract(
+                manifest={
+                    "selected_primary_skill_names": ["generic-review"],
+                    "workflow_routes": routes,
+                },
+                user_turn_text="Review all evidence.",
+                bound_skill_name="generic-review",
+            )
+
+    def test_current_capability_contract_is_audit_state_not_prompt_text(self):
         contract = compile_runtime_capability_contract(
             manifest={
-                "harness_egress_rules": [
+                "platform_egress_rules": [
                     {
                         "capability": "renamed_catalog_lookup",
                         "url_prefix": "http://catalog.internal:8090/v1/item",
@@ -577,22 +797,16 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 },
             },
         )
-        prompt = render_runtime_capability_prompt(contract)
         self.assertEqual(
             contract["structured_capabilities"],
             ["renamed_catalog_lookup", "web_search"],
         )
-        self.assertIn("supersedes", prompt)
-        self.assertIn("renamed_catalog_lookup", prompt)
-        self.assertIn("GET/HEAD", prompt)
-        self.assertIn("80, 443", prompt)
-        self.assertIn("most specific structured capability", prompt)
-        self.assertIn("current tool result", prompt)
+        self.assertEqual(validate_runtime_capability_contract(contract), contract)
 
     def test_capability_contract_does_not_invent_generic_network_authority(self):
         contract = compile_runtime_capability_contract(
             manifest={
-                "harness_egress_rules": [{
+                "platform_egress_rules": [{
                     "capability": "renamed_evidence_lookup",
                     "url_prefix": "https://evidence.example.test/v2/query",
                     "methods": ["POST"],
@@ -600,32 +814,25 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
             },
             egress_policy={"public_read": None},
         )
-        prompt = render_runtime_capability_prompt(contract)
         self.assertFalse(contract["public_http_read"]["enabled"])
-        self.assertIn("No generic public HTTP read grant", prompt)
-        self.assertIn("renamed_evidence_lookup", prompt)
+        self.assertEqual(validate_runtime_capability_contract(contract), contract)
 
-    def test_skill_entrypoint_manifest_fails_closed_when_inconsistent(self):
+    def test_native_skill_manifest_rejects_historic_synthetic_entrypoint(self):
         valid = {
             "plugin_name": "chatds-session-skills",
-            "entrypoint_skill_name": "chatds-harness-session-entry",
+            "entrypoint_skill_name": None,
             "selected_primary_skill_names": ["fixture"],
-            "skills": [
-                {"name": "fixture", "scope": "session"},
-                {
-                    "name": "chatds-harness-session-entry",
-                    "scope": "harness",
-                    "bundle_role": "entrypoint",
-                },
-            ],
+            "skills": [{"name": "fixture", "scope": "session"}],
         }
-        self.assertEqual(
-            supervisor_server._manifest_skill_entrypoint(valid),
-            "chatds-session-skills:chatds-harness-session-entry",
+        self.assertIsNone(
+            supervisor_server._validate_native_skill_manifest(valid)
         )
-        invalid = {**valid, "selected_primary_skill_names": ["missing"]}
-        with self.assertRaisesRegex(RuntimeError, "skill_entrypoint"):
-            supervisor_server._manifest_skill_entrypoint(invalid)
+        historic = {
+            **valid,
+            "entrypoint_skill_name": "chatds-harness-session-entry",
+        }
+        with self.assertRaisesRegex(RuntimeError, "native_skill_manifest"):
+            supervisor_server._validate_native_skill_manifest(historic)
 
     def test_verified_manifest_carries_policy_inputs_without_second_read(self):
         receipt = supervisor_server.verify_skill_view(
@@ -808,6 +1015,73 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 request.run_id,
                 "generic-request-1",
                 decision.model_copy(update={"request_seq": 18}),
+            )
+
+    async def test_read_only_native_question_round_trip_preserves_exact_input(self):
+        request = self._request().model_copy(update={
+            "permission_preset": "read_only",
+        })
+        self.manager._ensure_admission(request)
+        _workspace, _view, _state, run_dir, _status, _profile = (
+            self.manager._prepare_run_sync(request, self.profile)
+        )
+        native_input = {
+            "questions": [{
+                "question": "Which museum wing should be audited?",
+                "header": "Wing",
+                "multiSelect": False,
+                "options": [
+                    {"label": "East", "description": "Audit the east wing"},
+                    {"label": "West", "description": "Audit the west wing"},
+                ],
+            }],
+            "metadata": {"source": "native-fixture"},
+        }
+        (run_dir / "events.jsonl").write_text(json.dumps({
+            "seq": 27,
+            "channel": "stdout",
+            "event": {
+                "type": "control_request",
+                "request_id": "museum-question-1",
+                "request": {
+                    "subtype": "can_use_tool",
+                    "tool_name": "AskUserQuestion",
+                    "tool_use_id": "question-use-1",
+                    "input": native_input,
+                },
+            },
+        }) + "\n", encoding="utf-8")
+        decision = ApprovalDecisionRequest(
+            user_id=self.user_id,
+            conversation_id=self.conversation_id,
+            request_seq=27,
+            decision="allow",
+            answers={"Which museum wing should be audited?": "East"},
+        )
+        accepted = await self.manager.decide_approval(
+            request.run_id,
+            "museum-question-1",
+            decision,
+        )
+        self.assertFalse(accepted["idempotent"])
+        response = _read_json(
+            run_dir
+            / "approvals"
+            / f"{hashlib.sha256(b'museum-question-1').hexdigest()}.json"
+        )
+        self.assertEqual(response["updated_input"]["questions"], native_input["questions"])
+        self.assertEqual(
+            response["updated_input"]["answers"],
+            {"Which museum wing should be audited?": "East"},
+        )
+
+        with self.assertRaisesRegex(HTTPException, "another decision"):
+            await self.manager.decide_approval(
+                request.run_id,
+                "museum-question-1",
+                decision.model_copy(update={
+                    "answers": {"Which museum wing should be audited?": "West"},
+                }),
             )
 
     async def test_input_attachment_directory_is_a_read_only_child_mount(self):

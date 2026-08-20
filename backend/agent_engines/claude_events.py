@@ -13,6 +13,45 @@ def _mapping(value: object) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
+def _safe_questions(value: object) -> list[dict[str, Any]] | None:
+    """Project only bounded display fields from native question input."""
+
+    if not isinstance(value, list) or not 1 <= len(value) <= 4:
+        return None
+    projected: list[dict[str, Any]] = []
+    observed: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, Mapping):
+            return None
+        question = str(raw.get("question") or "")[:4_000]
+        if not question or question in observed:
+            return None
+        observed.add(question)
+        raw_options = raw.get("options")
+        if not isinstance(raw_options, list) or not 2 <= len(raw_options) <= 4:
+            return None
+        options: list[dict[str, str]] = []
+        labels: set[str] = set()
+        for option in raw_options:
+            if not isinstance(option, Mapping):
+                return None
+            label = str(option.get("label") or "")[:256]
+            if not label or label in labels:
+                return None
+            labels.add(label)
+            options.append({
+                "label": label,
+                "description": str(option.get("description") or "")[:2_000],
+            })
+        projected.append({
+            "question": question,
+            "header": str(raw.get("header") or "")[:256],
+            "multi_select": raw.get("multiSelect") is True,
+            "options": options,
+        })
+    return projected
+
+
 def _child_run_id(root_run_id: str, native_task_id: object) -> str:
     return hashlib.sha256(
         f"chatds.claude.task.v1\0{root_run_id}\0{native_task_id}".encode()
@@ -44,6 +83,9 @@ class ClaudeEventProjector:
     # Retains the native envelope seq for each pending approval request_id so
     # that chatds.approval.decided events can carry it even without the original.
     _approval_seq_by_request_id: dict[str, int] = field(default_factory=dict)
+    _interaction_kind_by_request_id: dict[str, str] = field(
+        default_factory=dict
+    )
 
     def project(self, envelope: Mapping[str, Any]) -> tuple[EngineStreamEvent, ...]:
         native = _mapping(envelope.get("event"))
@@ -82,15 +124,53 @@ class ClaudeEventProjector:
             request = _mapping(native.get("request"))
             if request.get("subtype") == "can_use_tool":
                 rid = str(native.get("request_id") or "")[:128]
+                tool_name = str(request.get("tool_name") or "tool")[:512]
+                questions = (
+                    _safe_questions(
+                        _mapping(request.get("input")).get("questions")
+                    )
+                    if tool_name == "AskUserQuestion"
+                    else None
+                )
+                if tool_name == "AskUserQuestion" and questions is None:
+                    if rid:
+                        self._interaction_kind_by_request_id[rid] = (
+                            "invalid_question"
+                        )
+                    return (EngineStreamEvent(
+                        "diagnostic",
+                        {
+                            "code": "claude_native_question_invalid",
+                            "request_id": rid,
+                        },
+                        envelope,
+                        native_event_id=rid or None,
+                    ),)
+                interaction_kind = (
+                    "question"
+                    if questions is not None
+                    else "user_action"
+                    if tool_name in {"ExitPlanMode", "ReviewArtifact"}
+                    else "approval"
+                )
                 # Cache the envelope seq so decided events can recall it.
                 if rid and isinstance(envelope.get("seq"), int):
                     self._approval_seq_by_request_id[rid] = int(envelope["seq"])
+                    self._interaction_kind_by_request_id[rid] = (
+                        interaction_kind
+                    )
                 return (EngineStreamEvent(
                     "approval",
                     {
                         "request_id": rid,
                         "status": "pending",
-                        "tool_name": str(request.get("tool_name") or "tool")[:512],
+                        "tool_name": tool_name,
+                        "interaction_kind": interaction_kind,
+                        **(
+                            {"questions": questions}
+                            if questions is not None
+                            else {}
+                        ),
                         "title": str(request.get("title") or request.get("display_name") or "")[:1000],
                         "description": str(request.get("description") or "")[:2000],
                         "decision_reason": str(request.get("decision_reason") or "")[:2000],
@@ -101,12 +181,28 @@ class ClaudeEventProjector:
         if event_type == "chatds.approval.decided":
             rid = str(native.get("request_id") or "")[:128]
             cached_seq = self._approval_seq_by_request_id.get(rid)
+            cached_kind = self._interaction_kind_by_request_id.get(rid)
+            if cached_kind == "invalid_question":
+                return (EngineStreamEvent(
+                    "diagnostic",
+                    {
+                        "code": "claude_native_question_rejected",
+                        "request_id": rid,
+                    },
+                    envelope,
+                    native_event_id=rid or None,
+                ),)
             decided_data: dict = {
                 "request_id": rid,
                 "status": (
                     "allowed" if native.get("decision") == "allow" else "denied"
                 ),
                 "tool_name": str(native.get("tool_name") or "tool")[:512],
+                "interaction_kind": str(
+                    native.get("interaction_kind")
+                    or cached_kind
+                    or "approval"
+                )[:32],
             }
             if cached_seq is not None:
                 decided_data["request_seq"] = cached_seq

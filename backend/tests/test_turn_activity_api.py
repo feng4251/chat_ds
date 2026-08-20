@@ -232,6 +232,7 @@ class TurnActivityIsolationTests(unittest.IsolatedAsyncioTestCase):
             "request_id": request_id,
             "request_seq": 17,
             "decision": "allow",
+            "answers": None,
         }])
 
         async with self.sessions() as db:
@@ -274,6 +275,86 @@ class TurnActivityIsolationTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertTrue(replay["idempotent"])
         self.assertEqual(len(engine.calls), 1)
+
+    async def test_native_question_is_answerable_in_read_only_session(self):
+        request_id = "museum-question-1"
+        question_text = "Which museum wing should be audited?"
+        async with self.sessions() as db:
+            conversation = await db.get(Conversation, self.conversation_id)
+            conversation.permission_preset = "read_only"
+            db.add(TurnActivityEvent(
+                id="a" * 32,
+                user_id=self.owner.id,
+                conversation_id=self.conversation_id,
+                root_run_id=self.run_id,
+                run_id=self.run_id,
+                seq=4,
+                node_id="approval:museum-question",
+                kind="approval",
+                operation="merge",
+                payload=json.dumps({
+                    "request_id": request_id,
+                    "request_seq": 29,
+                    "status": "pending",
+                    "tool_name": "AskUserQuestion",
+                    "interaction_kind": "question",
+                    "questions": [{
+                        "question": question_text,
+                        "header": "Wing",
+                        "multi_select": False,
+                        "options": [
+                            {"label": "East", "description": "East wing"},
+                            {"label": "West", "description": "West wing"},
+                        ],
+                    }],
+                }),
+            ))
+            await db.commit()
+
+        class Engine:
+            def __init__(self):
+                self.calls = []
+
+            async def decide_approval(self, **kwargs):
+                self.calls.append(kwargs)
+                return {
+                    "accepted": True,
+                    "idempotent": False,
+                    "status": "allowed",
+                }
+
+        engine = Engine()
+        with patch(
+            "agent_engines.registry.build_agent_engine_registry",
+            return_value=SimpleNamespace(get=lambda _engine_id: engine),
+        ):
+            async with self.sessions() as db:
+                result = await workspace_router.decide_turn_approval(
+                    self.conversation_id,
+                    self.run_id,
+                    request_id,
+                    ApprovalDecision(
+                        decision="allow",
+                        request_seq=29,
+                        answers={question_text: "East"},
+                    ),
+                    user=self.owner,
+                    db=db,
+                )
+        self.assertTrue(result["accepted"])
+        self.assertEqual(engine.calls[0]["answers"], {question_text: "East"})
+
+        async with self.sessions() as db:
+            with self.assertRaises(HTTPException) as missing:
+                await workspace_router.decide_turn_approval(
+                    self.conversation_id,
+                    self.run_id,
+                    request_id,
+                    ApprovalDecision(decision="allow", request_seq=29),
+                    user=self.owner,
+                    db=db,
+                )
+        self.assertEqual(missing.exception.status_code, 400)
 
 
 if __name__ == "__main__":

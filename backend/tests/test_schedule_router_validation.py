@@ -4,7 +4,10 @@ from datetime import datetime, timedelta, timezone
 from fastapi import HTTPException
 
 from models import ScheduledJob
-from routers.schedule_router import _apply_job_update
+from routers.schedule_router import (
+    _apply_job_update,
+    _validate_platform_capabilities,
+)
 from schemas import ScheduledJobUpdate
 
 
@@ -17,6 +20,11 @@ class _CommitRecorder:
 
 
 class ScheduleRouterValidationTests(unittest.IsolatedAsyncioTestCase):
+    def test_native_tool_names_are_not_platform_schedule_capabilities(self):
+        with self.assertRaises(HTTPException) as raised:
+            _validate_platform_capabilities(["write", "delegate_task"])
+        self.assertEqual(raised.exception.status_code, 400)
+
     @staticmethod
     def _job() -> ScheduledJob:
         now = datetime.now(timezone.utc).replace(tzinfo=None)

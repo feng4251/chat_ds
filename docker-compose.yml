@@ -1,78 +1,3 @@
-x-session-sandbox-environment: &session-sandbox-environment
-  EXECUTOR_SOCKET: /run/chat-ds-executor/executor.sock
-  EXECUTOR_SOCKET_MODE: "0660"
-  EXECUTOR_SOCKET_GID: "65533"
-  EXECUTOR_V2_AUTH_TOKEN: ${EXECUTOR_V2_AUTH_TOKEN:-}
-  SKILL_EGRESS_POLICY_TOKEN: ${EXECUTOR_V2_AUTH_TOKEN:-}
-  EXECUTOR_RUNTIME_PROFILE: session-sandbox-v1
-  EXECUTOR_WORKER_UID: "65529"
-  EXECUTOR_WORKER_GID: "65529"
-  EXECUTOR_ENFORCE_SHARED_STATE_ISOLATION: "1"
-  EXECUTOR_EXECUTION_TEMP_ROOT: /run/chatds-executor-work
-  EXECUTOR_ALLOWED_REQUEST_KINDS: >-
-    runtime_capabilities,process_lease,skill_script,declared_command,session_code,legacy_code
-  EXECUTOR_MAX_PROCESS_LEASES: "1"
-  EXECUTOR_MAX_PROCESS_LEASES_PER_SCOPE: "1"
-  EXECUTOR_MAX_ADDRESS_SPACE_BYTES: "unlimited"
-  EXECUTOR_PROCESS_MAX_CPU_SECONDS: "3600"
-  # RLIMIT_NPROC is host-real-UID-global across the four containers.  The
-  # per-slot cgroup pids_limit below remains the actual hard concurrency bound.
-  EXECUTOR_PROCESS_MAX_NPROC: "4096"
-  EXECUTOR_PROCESS_MAX_NOFILE: "1024"
-  # Policy-v3 budgets are root-run scoped at the proxy, so delegates and
-  # retries cannot each reset the disclosure allowance.
-  EXECUTOR_EGRESS_MAX_REQUESTS_PER_SCOPE: ${SKILL_EGRESS_MAX_REQUESTS:-2048}
-  EXECUTOR_EGRESS_MAX_OUTBOUND_BYTES_PER_SCOPE: ${SKILL_EGRESS_MAX_OUTBOUND_BYTES:-16777216}
-  EXECUTOR_EGRESS_MAX_RESPONSE_WIRE_BYTES_PER_SCOPE: ${SKILL_EGRESS_MAX_RESPONSE_WIRE_BYTES:-536870912}
-  EXECUTOR_REQUIRE_EGRESS_POLICY_V3: "1"
-  SE_OFFLINE: "true"
-  SE_AVOID_STATS: "true"
-  SE_AVOID_BROWSER_DOWNLOAD: "true"
-
-x-session-sandbox-slot: &session-sandbox-slot
-  image: chat_ds-session-sandbox
-  build:
-    context: ./executor
-    dockerfile: Dockerfile.browser-runtime
-    target: session-sandbox
-  restart: unless-stopped
-  depends_on:
-    skill-egress-proxy:
-      condition: service_healthy
-  network_mode: none
-  user: "0:0"
-  group_add:
-    - "65530"
-  read_only: true
-  pids_limit: 512
-  mem_limit: 3g
-  cpus: 2.0
-  environment: *session-sandbox-environment
-  cap_drop:
-    - ALL
-  cap_add:
-    - CHOWN
-    - DAC_OVERRIDE
-    - FOWNER
-    - KILL
-    - SETGID
-    - SETUID
-    - SYS_CHROOT
-  security_opt:
-    - no-new-privileges:true
-    - seccomp:./executor/browser_runtime/seccomp_profile.json
-  healthcheck:
-    test: ["CMD", "python", "-I", "/app/server.py", "--healthcheck"]
-    interval: 5s
-    timeout: 3s
-    retries: 20
-    start_period: 15s
-  tmpfs:
-    - /tmp:size=1536m,mode=0755
-    - /dev/shm:size=768m,mode=0755
-    - /run/chatds-executor-work:size=1536m,mode=0755,exec
-  stop_grace_period: 20s
-
 services:
 
   searxng-valkey:
@@ -126,12 +51,10 @@ services:
       # without a deployment-owned secret.
       SEARXNG_SECRET: ${SEARXNG_SECRET:-}
       SEARXNG_VALKEY_URL: ${SEARXNG_VALKEY_URL:-valkey://searxng-valkey:6379/0}
-      # This SearXNG instance is a deployment-owned internal search boundary for
-      # Harness web_search, not a public metasearch service.  Direct container
-      # port publishing does not provide the trusted proxy headers required by
-      # SearXNG's bot detector, so keep the limiter off unless a deployment also
-      # ships a matching limiter.toml / trusted proxy configuration.
-      SEARXNG_LIMITER: ${SEARXNG_LIMITER:-false}
+      # The fixed search_net and exact operator hosts are pass-listed in the
+      # deployment-owned limiter.toml. Keep the published LAN endpoint
+      # protected without throttling Harness JSON requests.
+      SEARXNG_LIMITER: ${SEARXNG_LIMITER:-true}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >-
@@ -188,33 +111,30 @@ services:
       retries: 12
       start_period: 5s
 
-  executor:
-    <<: *session-sandbox-slot
-    container_name: chat_acits_executor
-    volumes:
-      - executor_socket:/run/chat-ds-executor
-      - skill_egress_proxy_socket:/run/chatds-skill-egress:ro
-
-  executor-2:
-    <<: *session-sandbox-slot
-    container_name: chat_acits_executor_2
-    volumes:
-      - executor_socket_2:/run/chat-ds-executor
-      - skill_egress_proxy_socket:/run/chatds-skill-egress:ro
-
-  executor-3:
-    <<: *session-sandbox-slot
-    container_name: chat_acits_executor_3
-    volumes:
-      - executor_socket_3:/run/chat-ds-executor
-      - skill_egress_proxy_socket:/run/chatds-skill-egress:ro
-
-  executor-4:
-    <<: *session-sandbox-slot
-    container_name: chat_acits_executor_4
-    volumes:
-      - executor_socket_4:/run/chat-ds-executor
-      - skill_egress_proxy_socket:/run/chatds-skill-egress:ro
+  # Build/anchor the neutral dependency substrate used by both native Runner
+  # images. It contains no executor server or ChatDS-owned agent loop.
+  native-session-runtime-image:
+    profiles:
+      - claude-code
+      - deepseek-harness
+    image: chat_ds-native-session-runtime
+    build:
+      context: ./executor
+      dockerfile: Dockerfile.browser-runtime
+      target: native-session-runtime
+    container_name: chat_acits_native_session_runtime_image_anchor
+    restart: unless-stopped
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=unconfined
+    pids_limit: 16
+    mem_limit: 64m
+    cpus: 0.05
+    entrypoint: ["python", "-I", "-c"]
+    command: ["import time; time.sleep(315360000)"]
 
   # The proxy socket directory is owned by the proxy identity. Its setgid
   # bridge group is injected only into the root controller; worker children
@@ -346,9 +266,8 @@ services:
       SKILL_EGRESS_MAX_POLICY_SCOPE_ENTRIES: ${SKILL_EGRESS_MAX_POLICY_SCOPE_ENTRIES:-65536}
       SKILL_EGRESS_POLICY_SCOPE_TTL_SECONDS: ${SKILL_EGRESS_POLICY_SCOPE_TTL_SECONDS:-86400}
       SKILL_EGRESS_REQUIRE_POLICY_V3: "1"
-      # Four homogeneous executor slots expose at most eight bridge
-      # connections each. Keep the global proxy ceiling equal to that fixed
-      # topology so one execution cannot consume every proxy worker.
+      # Native Turn Supervisors share this bounded proxy. Keep a global
+      # ceiling so one Session cannot consume every proxy worker.
       SKILL_EGRESS_MAX_CONCURRENT_CONNECTIONS: ${SKILL_EGRESS_MAX_CONCURRENT_CONNECTIONS:-32}
     tmpfs:
       - /tmp:size=64m,mode=1777
@@ -357,9 +276,9 @@ services:
       # Private CA/leaf keys never enter any executor mount.
       - skill_egress_proxy_private:/var/lib/chatds-skill-egress-private
     networks:
-      - browser_egress
+      - public_egress
       # The proxy is the only execution component joining this network. Turn
-      # containers remain network=none and Harness-owned signed policy grants
+      # containers remain network=none and controller-owned signed policy grants
       # only GET /search on the exact SearXNG origin.
       - search_net
     healthcheck:
@@ -382,16 +301,12 @@ services:
       context: .
       dockerfile: claude_runner/Dockerfile.runner
       args:
-        SESSION_SANDBOX_IMAGE: chat_ds-session-sandbox
+        NATIVE_SESSION_RUNTIME_IMAGE: chat_ds-native-session-runtime
         CLAUDE_CODE_VERSION: 2.1.152
     container_name: chat_acits_claude_runner_image_anchor
     restart: unless-stopped
     depends_on:
-      executor:
-        # This is an image-build dependency, not a request-path dependency.
-        # Requiring health here can deadlock an opt-in Claude deployment on an
-        # unrelated pre-existing Legacy executor healthcheck even though the
-        # immutable sandbox base image was built successfully.
+      native-session-runtime-image:
         condition: service_started
     network_mode: none
     read_only: true
@@ -410,7 +325,7 @@ services:
     command: ["import time; time.sleep(315360000)"]
 
   # Trusted control plane only. Backend never receives the Docker socket and
-  # per-Turn containers never join chat_net or browser_egress.
+  # per-Turn containers never join chat_net or public_egress.
   claude-runner-supervisor:
     profiles:
       - claude-code
@@ -450,11 +365,11 @@ services:
       QWEN3_5_API_KEY: ${QWEN3_5_API_KEY:-EMPTY}
       CLAUDE_PROVIDER_PRIVATE_ORIGIN_ALLOWLIST: >-
         ${CLAUDE_PROVIDER_PRIVATE_ORIGIN_ALLOWLIST:-http://10.10.132.2:1025,http://10.10.132.126:1025,http://10.10.132.128:1025,http://searxng:8080},${MARKET_DATA_PRIVATE_ORIGIN:-http://market-data-gateway:8090}
-      # backend_protocol attests the existing ChatDS/Legacy model catalog.
+      # backend_protocol attests the Backend-owned provider model catalog.
       # Every Claude Turn below still uses ANTHROPIC_BASE_URL and the native
       # /v1/messages route; both local providers expose that facade.
       CLAUDE_PROVIDER_PROFILES_JSON: >-
-        {"shaiengine":{"backend_base_url":"${SHAIENGINE_BASE_URL:-https://api.shaiengine.com/v1}","api_key_env":"SHAIENGINE_API_KEY","backend_protocol":"openai","models":["glm-5.2","deepseek-v4-pro","kimi-k3"],"context_windows":{"glm-5.2":1000000,"deepseek-v4-pro":200000,"kimi-k3":1000000}},"local_agentmodel":{"backend_base_url":"${DEEPSEEK_PRO_BASE_URL:-http://10.10.132.2:1025/v1}","api_key_env":"DEEPSEEK_PRO_API_KEY","backend_protocol":"openai","models":["AgentModel"],"context_windows":{"AgentModel":918528}},"local_deepseek_v4_flash":{"backend_base_url":"${LOCAL_DEEPSEEK_V4_FLASH_BASE_URL:-http://10.10.132.126:1025/v1}","api_key_env":"LOCAL_DEEPSEEK_V4_FLASH_API_KEY","backend_protocol":"openai","models":["AgentModel"],"context_windows":{"AgentModel":1048576}},"local_qwen":{"backend_base_url":"${QWEN3_5_BASE_URL:-http://10.10.132.128:1025/v1}","api_key_env":"QWEN3_5_API_KEY","backend_protocol":"openai","models":["qwen3_5"],"context_windows":{"qwen3_5":262144}}}
+        {"shaiengine":{"backend_base_url":"${SHAIENGINE_BASE_URL:-https://api.shaiengine.com/v1}","api_key_env":"SHAIENGINE_API_KEY","backend_protocol":"openai","models":["glm-5.2","deepseek-v4-pro","kimi-k3"],"context_windows":{"glm-5.2":1000000,"deepseek-v4-pro":200000,"kimi-k3":1000000}},"local_agentmodel":{"backend_base_url":"${DEEPSEEK_PRO_BASE_URL:-http://10.10.132.2:1025/v1}","api_key_env":"DEEPSEEK_PRO_API_KEY","backend_protocol":"openai","models":["AgentModel"],"context_windows":{"AgentModel":303872}},"local_deepseek_v4_flash":{"backend_base_url":"${LOCAL_DEEPSEEK_V4_FLASH_BASE_URL:-http://10.10.132.126:1025/v1}","api_key_env":"LOCAL_DEEPSEEK_V4_FLASH_API_KEY","backend_protocol":"openai","models":["AgentModel"],"context_windows":{"AgentModel":1048576}},"local_qwen":{"backend_base_url":"${QWEN3_5_BASE_URL:-http://10.10.132.128:1025/v1}","api_key_env":"QWEN3_5_API_KEY","backend_protocol":"openai","models":["qwen3_5"],"context_windows":{"qwen3_5":262144}}}
       CLAUDE_WORKSPACE_HOST_ROOT: /nfs/temp/chat_ds
       CLAUDE_RUNNER_STATE_ROOT: /var/lib/chatds-claude-runner
       CLAUDE_RUNNER_IMAGE: chat_ds-claude-runner:2.1.152
@@ -521,11 +436,11 @@ services:
       context: .
       dockerfile: deepseek_runner/Dockerfile.runner
       args:
-        SESSION_SANDBOX_IMAGE: chat_ds-session-sandbox
+        NATIVE_SESSION_RUNTIME_IMAGE: chat_ds-native-session-runtime
     container_name: chat_acits_deepseek_harness_runner_image_anchor
     restart: unless-stopped
     depends_on:
-      executor:
+      native-session-runtime-image:
         condition: service_started
     network_mode: none
     read_only: true
@@ -579,7 +494,7 @@ services:
       QWEN3_5_BASE_URL: ${QWEN3_5_BASE_URL:-http://10.10.132.128:1025/v1}
       QWEN3_5_API_KEY: ${QWEN3_5_API_KEY:-EMPTY}
       DEEPSEEK_HARNESS_PROVIDER_PROFILES_JSON: >-
-        {"shaiengine":{"base_url":"${SHAIENGINE_BASE_URL:-https://api.shaiengine.com/v1}","api_key_env":"SHAIENGINE_API_KEY","protocol":"openai","models":["glm-5.2","deepseek-v4-pro","kimi-k3"],"context_windows":{"glm-5.2":1000000,"deepseek-v4-pro":200000,"kimi-k3":1000000}},"local_agentmodel":{"base_url":"${DEEPSEEK_PRO_BASE_URL:-http://10.10.132.2:1025/v1}","api_key_env":"DEEPSEEK_PRO_API_KEY","protocol":"openai","models":["AgentModel"],"context_windows":{"AgentModel":918528}},"local_deepseek_v4_flash":{"base_url":"${LOCAL_DEEPSEEK_V4_FLASH_BASE_URL:-http://10.10.132.126:1025/v1}","api_key_env":"LOCAL_DEEPSEEK_V4_FLASH_API_KEY","protocol":"openai","models":["AgentModel"],"context_windows":{"AgentModel":1048576}},"local_qwen":{"base_url":"${QWEN3_5_BASE_URL:-http://10.10.132.128:1025/v1}","api_key_env":"QWEN3_5_API_KEY","protocol":"openai","models":["qwen3_5"],"context_windows":{"qwen3_5":262144}}}
+        {"shaiengine":{"base_url":"${SHAIENGINE_BASE_URL:-https://api.shaiengine.com/v1}","api_key_env":"SHAIENGINE_API_KEY","protocol":"openai","models":["glm-5.2","deepseek-v4-pro","kimi-k3"],"context_windows":{"glm-5.2":1000000,"deepseek-v4-pro":200000,"kimi-k3":1000000}},"local_agentmodel":{"base_url":"${DEEPSEEK_PRO_BASE_URL:-http://10.10.132.2:1025/v1}","api_key_env":"DEEPSEEK_PRO_API_KEY","protocol":"openai","models":["AgentModel"],"context_windows":{"AgentModel":303872}},"local_deepseek_v4_flash":{"base_url":"${LOCAL_DEEPSEEK_V4_FLASH_BASE_URL:-http://10.10.132.126:1025/v1}","api_key_env":"LOCAL_DEEPSEEK_V4_FLASH_API_KEY","protocol":"openai","models":["AgentModel"],"context_windows":{"AgentModel":1048576}},"local_qwen":{"base_url":"${QWEN3_5_BASE_URL:-http://10.10.132.128:1025/v1}","api_key_env":"QWEN3_5_API_KEY","protocol":"openai","models":["qwen3_5"],"context_windows":{"qwen3_5":262144}}}
       DEEPSEEK_HARNESS_WORKSPACE_HOST_ROOT: /nfs/temp/chat_ds
       DEEPSEEK_HARNESS_RUNNER_STATE_ROOT: /var/lib/chatds-deepseek-harness-runner
       DEEPSEEK_HARNESS_RUNNER_STATE_VOLUME_NAME: ${DEEPSEEK_HARNESS_RUNNER_STATE_VOLUME_NAME:-chat_ds_deepseek_runner_state}
@@ -624,198 +539,6 @@ services:
       start_period: 30s
     stop_grace_period: 25s
 
-  # A one-shot, networkless permission initializer is retained even though a
-  # brand-new volume copies the sidecar image's ownership metadata.  It also
-  # makes upgrades safe when the named volume already exists with root:root
-  # ownership from an older deployment.  Reuse the locally-built browser
-  # image so production startup never depends on pulling a utility image from
-  # an external registry.
-  browser-socket-init:
-    image: chat_ds-browser
-    pull_policy: never
-    container_name: chat_acits_browser_socket_init
-    restart: "no"
-    network_mode: none
-    user: "0:0"
-    read_only: true
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - FOWNER
-    security_opt:
-      - no-new-privileges:true
-    entrypoint: ["/bin/sh", "-c"]
-    command: ["chown 65532:65532 /run/chat-ds-browser && chmod 0700 /run/chat-ds-browser"]
-    volumes:
-      - browser_cdp_socket:/run/chat-ds-browser
-
-  browser:
-    image: chat_ds-browser
-    build:
-      context: ./browser_sidecar
-    container_name: chat_acits_browser
-    restart: unless-stopped
-    init: true
-    depends_on:
-      browser-socket-init:
-        condition: service_completed_successfully
-    user: "65532:65532"
-    read_only: true
-    pids_limit: 256
-    mem_limit: 2g
-    cpus: 2.0
-    cap_drop:
-      - ALL
-    cap_add:
-      - SYS_CHROOT
-    security_opt:
-      - no-new-privileges:true
-      - seccomp:./executor/browser_runtime/seccomp_profile.json
-    environment:
-      BROWSER_CDP_SOCKET: /run/chat-ds-browser/cdp.sock
-      # Optional certificate-scoped exceptions for explicitly allowlisted
-      # internal HTTPS origins. Never replace this with a global TLS bypass.
-      BROWSER_TLS_SPKI_ALLOWLIST: ${BROWSER_TLS_SPKI_ALLOWLIST:-}
-    tmpfs:
-      - /tmp:size=1g,mode=1777
-      - /dev/shm:size=512m,mode=1777
-    volumes:
-      - browser_cdp_socket:/run/chat-ds-browser
-    networks:
-      - browser_egress
-    healthcheck:
-      test: ["CMD", "python", "-I", "/app/server.py", "--healthcheck"]
-      interval: 2s
-      timeout: 3s
-      retries: 20
-      start_period: 10s
-    stop_grace_period: 10s
-
-  harness:
-    build:
-      context: ./harness
-    container_name: chat_acits_harness
-    restart: unless-stopped
-    depends_on:
-      executor:
-        condition: service_healthy
-      executor-2:
-        condition: service_healthy
-      executor-3:
-        condition: service_healthy
-      executor-4:
-        condition: service_healthy
-      browser:
-        condition: service_healthy
-    environment:
-      # Backward-compatible env key; this endpoint serves AgentModel (GLM-5.2).
-      DEEPSEEK_PRO_URL: ${DEEPSEEK_PRO_URL:-http://10.10.132.2:1025/v1}
-      LOCAL_DEEPSEEK_V4_FLASH_URL: ${LOCAL_DEEPSEEK_V4_FLASH_URL:-http://10.10.132.126:1025/v1}
-      QWEN3_5_URL: ${QWEN3_5_URL:-http://10.10.132.128:1025/v1}
-      SHAIENGINE_BASE_URL: ${SHAIENGINE_BASE_URL:-https://api.shaiengine.com/v1}
-      SHAIENGINE_API_KEY: ${SHAIENGINE_API_KEY:-}
-      BACKEND_INTERNAL_URL: http://backend:8010
-      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-chat-ds-internal-token}
-      AGENT_DEBUG_TRACE: ${AGENT_DEBUG_TRACE:-true}
-      AGENT_DEBUG_TRACE_RESULT_CHARS: ${AGENT_DEBUG_TRACE_RESULT_CHARS:-4000}
-      AGENT_DEBUG_TRACE_WORKSPACE: ${AGENT_DEBUG_TRACE_WORKSPACE:-true}
-      # Process-local AgentModel admission. The weighted budget is calibrated
-      # for this deployment's provider capacity; it is not a Skill threshold.
-      PROVIDER_ADMISSION_MAX_INFLIGHT_REQUESTS: ${PROVIDER_ADMISSION_MAX_INFLIGHT_REQUESTS:-3}
-      PROVIDER_ADMISSION_MAX_INFLIGHT_ESTIMATED_TOKENS: ${PROVIDER_ADMISSION_MAX_INFLIGHT_ESTIMATED_TOKENS:-240000}
-      PROVIDER_ADMISSION_ESTIMATE_SAFETY_FACTOR: ${PROVIDER_ADMISSION_ESTIMATE_SAFETY_FACTOR:-1.10}
-      # Zero means wait until ordinary run/batch cancellation.
-      PROVIDER_ADMISSION_WAIT_TIMEOUT_SECONDS: ${PROVIDER_ADMISSION_WAIT_TIMEOUT_SECONDS:-0}
-      # Per-child no-material-progress lease. Runtime-owned provider-admission
-      # waiting is exempt and healthy lifecycle/model/tool progress renews it.
-      DELEGATION_BATCH_TIMEOUT_SECONDS: ${DELEGATION_BATCH_TIMEOUT_SECONDS:-3600}
-      # Independent async batch hard deadline; neither progress nor admission
-      # waiting may extend it. Long operations run in async/sandbox lanes so
-      # they do not synchronously block the Harness event loop.
-      DELEGATION_BATCH_HARD_TIMEOUT_SECONDS: ${DELEGATION_BATCH_HARD_TIMEOUT_SECONDS:-21600}
-      # Absolute ceiling for a stream that continues making real progress.
-      # Initial-response and read-stall leases remain independently shorter.
-      LLM_STREAM_TOTAL_TIMEOUT_SECONDS: ${LLM_STREAM_TOTAL_TIMEOUT_SECONDS:-14400}
-      # Zero-byte provider transport failures have no emitted model state and
-      # may be replayed under a separate reconnect budget.  Semantic/API errors
-      # retain their short bounded retry policy.
-      LLM_PREBYTE_TRANSPORT_RETRY_BUDGET_SECONDS: ${LLM_PREBYTE_TRANSPORT_RETRY_BUDGET_SECONDS:-600}
-      LLM_PREBYTE_TRANSPORT_RETRY_MAX_ATTEMPTS: ${LLM_PREBYTE_TRANSPORT_RETRY_MAX_ATTEMPTS:-32}
-      # Ordinary standard Skills use the same progressive-disclosure loop as
-      # mature Agent-Skills Harnesses. Explicit declarative contracts continue
-      # to compile into deterministic DAGs. The legacy model-authored
-      # capability-plan gate remains available only as a rollback switch.
-      STANDARD_SKILL_EXECUTION_ENGINE: ${STANDARD_SKILL_EXECUTION_ENGINE:-progressive}
-      WEB_SEARCH_PROVIDERS: ${WEB_SEARCH_PROVIDERS:-searxng}
-      SEARXNG_BASE_URL: ${SEARXNG_BASE_URL:-http://searxng:8080}
-      SEARXNG_TIMEOUT_SECONDS: ${SEARXNG_TIMEOUT_SECONDS:-10}
-      MARKET_DATA_URL: ${MARKET_DATA_URL:-http://market-data-gateway:8090/v1/quote}
-      SESSION_SANDBOX_PUBLIC_READ_EGRESS_ENABLED: ${SESSION_SANDBOX_PUBLIC_READ_EGRESS_ENABLED:-true}
-      BROWSER_PRIVATE_ORIGIN_ALLOWLIST: ${BROWSER_PRIVATE_ORIGIN_ALLOWLIST:-}
-      BROWSER_DNS_SYNTHETIC_PUBLIC_RANGES: ${BROWSER_DNS_SYNTHETIC_PUBLIC_RANGES:-}
-      # Chromium is reachable only through a dedicated named-volume socket.
-      # No CDP port or browser service name exists on chat_net.
-      BROWSER_CDP_SOCKET: /run/chat-ds-browser/cdp.sock
-      BROWSER_CDP_CONNECT_TIMEOUT_SECONDS: ${BROWSER_CDP_CONNECT_TIMEOUT_SECONDS:-10}
-      # Compatibility key intentionally resolves to the same physical sandbox.
-      # Runtime feature analysis cannot select a second execution environment.
-      SKILL_BROWSER_EXECUTOR_SOCKET: /run/chat-ds-executor/executor.sock
-      EXECUTOR_SOCKET: /run/chat-ds-executor/executor.sock
-      # Keep Backend and Harness on the same bounded local-flock timeout.
-      WORKSPACE_MUTATION_LOCK_TIMEOUT_SECONDS: ${WORKSPACE_MUTATION_LOCK_TIMEOUT_SECONDS:-2}
-      # Cross-service coordination must stay on the host-local Docker volume.
-      # Session content remains on NFS, but no flock operation may reach it.
-      WORKSPACE_MUTATION_LOCK_ROOT: /run/chatds-workspace-lock-plane/locks
-      WORKSPACE_MUTATION_LOCK_REQUIRE_MOUNTPOINT: "1"
-      # Ordered physical membership is trusted Harness configuration.  Tools
-      # and model prompts receive only the content-bound logical pool digest.
-      EXECUTOR_POOL_SOCKETS: >-
-        /run/chat-ds-executor/executor.sock,/run/chat-ds-executor-2/executor.sock,/run/chat-ds-executor-3/executor.sock,/run/chat-ds-executor-4/executor.sock
-      EXECUTOR_V2_AUTH_TOKEN: ${EXECUTOR_V2_AUTH_TOKEN:-}
-    group_add:
-      - "65533"
-    volumes:
-      - type: bind
-        source: ${CHATDS_DATA_ROOT:?Set CHATDS_DATA_ROOT to the canonical shared host data directory}
-        target: /app/data
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${CHATDS_MEMORY_ROOT:?Set CHATDS_MEMORY_ROOT to the canonical host memory directory}
-        target: /app/data/memories
-        bind:
-          create_host_path: false
-      - /nfs/temp/chat_ds:/nfs/temp/chat_ds
-      - executor_socket:/run/chat-ds-executor:ro
-      - executor_socket_2:/run/chat-ds-executor-2:ro
-      - executor_socket_3:/run/chat-ds-executor-3:ro
-      - executor_socket_4:/run/chat-ds-executor-4:ro
-      - browser_cdp_socket:/run/chat-ds-browser:ro
-      - type: volume
-        source: workspace_mutation_locks
-        target: /run/chatds-workspace-lock-plane
-        volume:
-          nocopy: true
-    networks:
-      - chat_net
-      - search_net
-    healthcheck:
-      test:
-        - CMD
-        - python
-        - -I
-        - -c
-        - "import urllib.request; raise SystemExit(0 if urllib.request.urlopen('http://127.0.0.1:8020/health', timeout=2).status == 200 else 1)"
-      interval: 5s
-      timeout: 3s
-      retries: 12
-      start_period: 10s
-    # Runtime-owned process cleanup can spend up to 60s draining an already
-    # dispatched close transaction.  Keep the Harness alive long enough to
-    # publish that terminal state before the executor slots are stopped.
-    stop_grace_period: 90s
-
   backend:
     build:
       context: ./backend
@@ -832,11 +555,8 @@ services:
     # bounded 3s producer-cancel window plus 8s for terminal projection.
     stop_grace_period: 30s
     depends_on:
-      harness:
-        condition: service_healthy
-      # Optional in Legacy-only deployments; when the claude-code profile is
-      # selected this prevents startup reconciliation from racing Supervisor
-      # health after a host or Compose restart.
+      # Native supervisors own their respective execution lifecycles. Backend
+      # has no dependency or fallback path to the retired ChatDS Harness.
       claude-runner-supervisor:
         condition: service_healthy
         required: false
@@ -849,11 +569,7 @@ services:
       # Override JWT secret in production. Generate with: python -c 'import secrets; print(secrets.token_urlsafe(48))'
       SECRET_KEY: ${SECRET_KEY:-chat-acits-CHANGE-ME-IN-PRODUCTION}
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-chat-ds-internal-token}
-      # Idle/read boundary: must exceed Harness's four-hour absolute
-      # provider-stream ceiling so this outer transport cannot fire first.
-      HARNESS_STREAM_TIMEOUT_SECONDS: ${HARNESS_STREAM_TIMEOUT_SECONDS:-18000}
       CLAUDE_CODE_ENGINE_ENABLED: ${CLAUDE_CODE_ENGINE_ENABLED:-true}
-      LEGACY_ENGINE_NEW_RUNS_ENABLED: ${LEGACY_ENGINE_NEW_RUNS_ENABLED:-false}
       DEFAULT_AGENT_ENGINE_ID: ${DEFAULT_AGENT_ENGINE_ID:-claude_code}
       CLAUDE_WEB_SEARCH_URL: ${CLAUDE_WEB_SEARCH_URL:-http://searxng:8080/search}
       CLAUDE_MARKET_DATA_URL: ${CLAUDE_MARKET_DATA_URL:-http://market-data-gateway:8090/v1/quote}
@@ -902,9 +618,8 @@ services:
       - chat_net
       - claude_control_net
       - deepseek_control_net
-    # Backend health includes a cross-container /app/data inode attestation
-    # against Harness.  This catches relative bind mounts rebased by a clean
-    # archive deployment before Frontend accepts user traffic.
+    # Backend health attests its durable storage before Frontend accepts user
+    # traffic; native Supervisors attest their own Session mounts separately.
     healthcheck:
       test:
         - CMD
@@ -937,6 +652,10 @@ services:
 networks:
   chat_net:
     driver: bridge
+  # Only the signed egress proxy joins this public network. Native Turn
+  # containers and both Supervisors remain network-isolated.
+  public_egress:
+    driver: bridge
   # Backend-to-Claude-Supervisor control plane only. ``internal`` removes the
   # default egress route; Turn containers themselves still use network=none.
   claude_control_net:
@@ -945,12 +664,8 @@ networks:
   deepseek_control_net:
     driver: bridge
     internal: true
-  # Egress-only browser network.  Harness/backend/frontend are deliberately
-  # absent, so a compromised renderer cannot resolve or dial chat_net peers.
-  browser_egress:
-    driver: bridge
   # Stable, application-owned source range for SearXNG limiter pass-listing.
-  # Only the search stack and trusted Harness join this network.
+  # Only the search stack and signed egress proxy join this network.
   search_net:
     driver: bridge
     ipam:
@@ -960,14 +675,6 @@ networks:
 volumes:
   chat_ds_db:
     driver: local
-  executor_socket:
-    driver: local
-  executor_socket_2:
-    driver: local
-  executor_socket_3:
-    driver: local
-  executor_socket_4:
-    driver: local
   workspace_mutation_locks:
     driver: local
     name: ${WORKSPACE_MUTATION_LOCK_VOLUME_NAME:-chat_ds_workspace_mutation_locks}
@@ -975,8 +682,6 @@ volumes:
     driver: local
     name: ${SKILL_EGRESS_PROXY_VOLUME_NAME:-chat_ds_skill_egress_proxy_socket}
   skill_egress_proxy_private:
-    driver: local
-  browser_cdp_socket:
     driver: local
   claude_runner_state:
     driver: local

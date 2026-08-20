@@ -1,0 +1,7 @@
+{
+  "schema": "chatds.deepseek-native-turn.v1",
+  "native_session_id": "chatds-0123456789abcdef0123456789abcdef",
+  "permission_preset": "read-only",
+  "initial_prompt": "Reply with exactly: FIRST_NATIVE_TURN",
+  "turn_prompt": "Reply with exactly: SECOND_NATIVE_TURN"
+}

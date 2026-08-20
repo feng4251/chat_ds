@@ -19,15 +19,13 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
     def setUpClass(cls):
         cls.compose = yaml.safe_load(COMPOSE_PATH.read_text(encoding="utf-8"))
         cls.services = cls.compose["services"]
-        cls.executor_names = (
-            "executor",
-            "executor-2",
-            "executor-3",
-            "executor-4",
+        cls.native_runner_anchors = (
+            "claude-runner-image",
+            "deepseek-harness-runner-image",
         )
 
     def test_session_sandbox_has_no_docker_network_or_direct_route_inputs(self):
-        for name in self.executor_names:
+        for name in self.native_runner_anchors:
             sandbox = self.services[name]
             self.assertEqual(sandbox["network_mode"], "none")
             for forbidden in (
@@ -40,17 +38,17 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
             ):
                 self.assertNotIn(forbidden, sandbox)
         self.assertNotIn("skill_browser_internal", self.compose["networks"])
-        self.assertTrue(all(
-            "SKILL_EGRESS_PROXY_URL"
-            not in self.services[name]["environment"]
-            for name in self.executor_names
-        ))
+        self.assertNotIn("browser_egress", self.compose["networks"])
+        self.assertFalse({
+            "harness", "browser", "executor", "executor-2",
+            "executor-3", "executor-4",
+        } & set(self.services))
 
     def test_proxy_is_the_only_networked_session_sandbox_component(self):
         proxy = self.services["skill-egress-proxy"]
         self.assertEqual(
             proxy["networks"],
-            ["browser_egress", "search_net"],
+            ["public_egress", "search_net"],
         )
         self.assertEqual(proxy["group_add"], ["65530"])
         self.assertEqual(
@@ -91,30 +89,6 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
         }
         for name, expected in expected_budget_environment.items():
             self.assertEqual(proxy["environment"][name], expected)
-        for name in self.executor_names:
-            environment = self.services[name]["environment"]
-            self.assertEqual(
-                environment[
-                    "EXECUTOR_EGRESS_MAX_REQUESTS_PER_SCOPE"
-                ],
-                "${SKILL_EGRESS_MAX_REQUESTS:-2048}",
-            )
-            self.assertEqual(
-                environment[
-                    "EXECUTOR_EGRESS_MAX_OUTBOUND_BYTES_PER_SCOPE"
-                ],
-                "${SKILL_EGRESS_MAX_OUTBOUND_BYTES:-16777216}",
-            )
-            self.assertEqual(
-                environment[
-                    "EXECUTOR_EGRESS_MAX_RESPONSE_WIRE_BYTES_PER_SCOPE"
-                ],
-                "${SKILL_EGRESS_MAX_RESPONSE_WIRE_BYTES:-536870912}",
-            )
-            self.assertEqual(
-                "1",
-                environment["EXECUTOR_REQUIRE_EGRESS_POLICY_V3"],
-            )
         self.assertEqual(
             "1",
             proxy["environment"]["SKILL_EGRESS_REQUIRE_POLICY_V3"],
@@ -145,7 +119,8 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
         self.assertIn("find / -xdev -type f -perm /6000", proxy_dockerfile)
         self.assertIn("getcap -r /", proxy_dockerfile)
         self.assertNotIn("ports", proxy)
-        self.assertEqual(self.services["executor"]["network_mode"], "none")
+        for name in self.native_runner_anchors:
+            self.assertEqual(self.services[name]["network_mode"], "none")
         self.assertEqual(
             self.services["skill-egress-proxy-socket-init"]["network_mode"],
             "none",
@@ -161,10 +136,6 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
         self.assertEqual(
             proxy_socket_consumers,
             {
-                "executor",
-                "executor-2",
-                "executor-3",
-                "executor-4",
                 "skill-egress-proxy",
                 "skill-egress-proxy-socket-init",
             },
@@ -186,22 +157,17 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
                 "skill-egress-proxy-socket-init",
             },
         )
-        for name in self.executor_names:
-            mounts = self.services[name]["volumes"]
-            self.assertIn(
-                (
-                    "skill_egress_proxy_socket:"
-                    "/run/chatds-skill-egress:ro"
-                ),
-                mounts,
-            )
-            self.assertFalse(any(
-                str(volume).startswith(
-                    "skill_egress_proxy_private:"
-                )
-                for volume in mounts
-            ))
+        # Native Turn containers are created dynamically by their trusted
+        # supervisors, so the static Compose graph must not mount the proxy
+        # socket into Backend, Frontend, or either image anchor.
+        self.assertTrue(
+            set(self.native_runner_anchors).isdisjoint(proxy_socket_consumers)
+        )
 
+    @unittest.skip(
+        "Archived executor-pool topology; native control planes are covered "
+        "by claude_runner/tests/test_deployment_topology.py"
+    )
     def test_harness_reaches_only_the_unified_controller_uds(self):
         harness = self.services["harness"]
         short_mounts = {
@@ -258,7 +224,7 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
             )
         )
 
-    def test_workspace_lock_plane_is_local_and_backend_harness_only(self):
+    def test_workspace_lock_plane_is_local_and_native_control_planes_only(self):
         self.assertEqual(
             self.compose["volumes"]["workspace_mutation_locks"],
             {
@@ -295,7 +261,11 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
                     )
         self.assertEqual(
             consumers,
-            {"backend", "harness", "claude-runner-supervisor"},
+            {
+                "backend",
+                "claude-runner-supervisor",
+                "deepseek-runner-supervisor",
+            },
         )
         for name in consumers:
             environment = self.services[name]["environment"]
@@ -310,7 +280,7 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
                 "1",
             )
         for name in (
-            *self.executor_names,
+            *self.native_runner_anchors,
             "browser",
             "skill-egress-proxy",
             "frontend",
@@ -319,6 +289,10 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
         ):
             self.assertNotIn(name, consumers)
 
+    @unittest.skip(
+        "Archived executor-pool topology; native per-Turn launch security is "
+        "covered by both supervisor lifecycle suites"
+    )
     def test_unified_sandbox_has_root_controller_and_fixed_nonroot_worker(self):
         sandbox = self.services["executor"]
         environment = sandbox["environment"]
@@ -398,6 +372,10 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
         self.assertNotIn("browser_cdp_socket", mounts)
         self.assertNotIn("docker.sock", mounts)
 
+    @unittest.skip(
+        "Archived executor-pool topology; native Skill-view mounts are covered "
+        "by both supervisor lifecycle suites"
+    )
     def test_exact_skill_snapshots_use_private_executable_tmpfs(self):
         sandbox = self.services["executor"]
         self.assertEqual(
@@ -468,6 +446,9 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
             ],
         )
 
+    @unittest.skip(
+        "The retired browser service is absent from the native deployment"
+    )
     def test_legacy_browser_keeps_browser_sandbox_security(self):
         legacy = self.services["browser"]
         self.assertEqual(legacy["cap_drop"], ["ALL"])
@@ -479,6 +460,9 @@ class BrowserRuntimeTopologyTests(unittest.TestCase):
         )
         self.assertNotIn("seccomp:unconfined", legacy["security_opt"])
 
+    @unittest.skip(
+        "The retired four-slot executor pool is absent from the native deployment"
+    )
     def test_four_homogeneous_executor_slots_have_private_socket_volumes(self):
         self.assertNotIn("skill-browser-executor", self.services)
         self.assertNotIn("skill-browser-executor-socket-init", self.services)

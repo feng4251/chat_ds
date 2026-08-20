@@ -3,7 +3,7 @@ FROM python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f14
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    PYTHONPATH=/app:/app/harness:/app/shared
+    PYTHONPATH=/app:/app/shared
 
 WORKDIR /app
 COPY claude_runner/requirements.txt /tmp/requirements.txt
@@ -12,10 +12,7 @@ RUN python -m pip install --no-cache-dir -r /tmp/requirements.txt \
 
 COPY deepseek_runner /app/deepseek_runner
 COPY claude_runner/__init__.py claude_runner/policy.py /app/claude_runner/
-COPY harness/skills/http_grants.py /app/harness/skills/http_grants.py
-COPY harness/skills/path_safety.py /app/harness/skills/path_safety.py
-COPY harness/tools/session_sandbox_policy.py /app/harness/tools/session_sandbox_policy.py
-COPY harness/tools/context.py /app/harness/tools/context.py
+COPY native_security /app/native_security
 COPY backend/workspace_lock.py /app/shared/workspace_lock.py
 
 RUN mkdir -p /var/lib/chatds-deepseek-harness-runner \

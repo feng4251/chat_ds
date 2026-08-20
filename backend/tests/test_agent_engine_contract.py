@@ -60,6 +60,76 @@ class ClaudeEventProjectionTests(unittest.TestCase):
         self.assertNotIn("input", events[0].data)
         self.assertNotIn("must-not-project", str(events[0].data))
 
+    def test_native_questions_are_safe_and_generic_under_domain_rename(self):
+        projector = ClaudeEventProjector("8" * 32)
+        events = projector.project({
+            "seq": 8,
+            "event": {
+                "type": "control_request",
+                "request_id": "museum-question",
+                "request": {
+                    "subtype": "can_use_tool",
+                    "tool_name": "AskUserQuestion",
+                    "tool_use_id": "question-use",
+                    "input": {
+                        "questions": [{
+                            "question": "Which gallery should be audited?",
+                            "header": "Gallery",
+                            "multiSelect": False,
+                            "options": [
+                                {
+                                    "label": "North wing",
+                                    "description": "Audit the north collection",
+                                    "preview": "private curator material",
+                                },
+                                {
+                                    "label": "South wing",
+                                    "description": "Audit the south collection",
+                                },
+                            ],
+                        }],
+                        "metadata": {"secret": "must-not-project"},
+                    },
+                },
+            },
+        })
+        self.assertEqual([event.kind for event in events], ["approval"])
+        data = events[0].data
+        self.assertEqual(data["interaction_kind"], "question")
+        self.assertEqual(
+            data["questions"][0]["question"],
+            "Which gallery should be audited?",
+        )
+        self.assertNotIn("preview", data["questions"][0]["options"][0])
+        self.assertNotIn("must-not-project", str(data))
+
+        malformed = projector.project({
+            "seq": 9,
+            "event": {
+                "type": "control_request",
+                "request_id": "factory-question",
+                "request": {
+                    "subtype": "can_use_tool",
+                    "tool_name": "AskUserQuestion",
+                    "tool_use_id": "renamed-use",
+                    "input": {
+                        "questions": [{
+                            "question": "Choose a production line?",
+                            "header": "Line",
+                            "options": [
+                                {"label": "Line A", "description": "First"},
+                                {"label": "Line A", "description": "Duplicate"},
+                            ],
+                        }],
+                    },
+                },
+            },
+        })
+        self.assertEqual([event.kind for event in malformed], ["diagnostic"])
+        self.assertEqual(
+            malformed[0].data["code"], "claude_native_question_invalid"
+        )
+
     def test_native_result_is_candidate_until_supervisor_terminal(self):
         projector = ClaudeEventProjector("a" * 32)
         result = projector.project({
@@ -474,6 +544,331 @@ class ClaudeEventProjectionTests(unittest.TestCase):
 
 
 class ClaudeSkillViewTests(unittest.TestCase):
+    def test_structured_workers_compile_to_native_plugin_agents(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            skill = root / "skills" / "warehouse-audit"
+            workers = skill / "orchestration" / "workers"
+            workers.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(
+                "---\n"
+                "name: warehouse-audit\n"
+                "description: Audit warehouse inventory.\n"
+                "---\n",
+                encoding="utf-8",
+            )
+            (workers / "stock-review.yaml").write_text(
+                "worker_id: stock-auditor\n"
+                "name: Stock Auditor\n"
+                "description: >\n"
+                "  Reconcile physical stock with the durable catalog and\n"
+                "  report discrepancies to the parent.\n"
+                "instructions: |\n"
+                "  Read the inventory evidence before producing findings.\n",
+                encoding="utf-8",
+            )
+
+            view = materialize_claude_skill_view(
+                session_root=root / "session",
+                sources=[SimpleNamespace(
+                    name="warehouse-audit",
+                    scope="session",
+                    root=skill,
+                    bundle_id=None,
+                    bundle_role=None,
+                )],
+            )
+            manifest = json.loads((view.root / "manifest.json").read_text())
+            agent_path = (
+                view.plugin_root
+                / "agents"
+                / "warehouse-audit"
+                / "stock-auditor.md"
+            )
+            agent = agent_path.read_text(encoding="utf-8")
+
+        self.assertEqual(manifest["worker_agents"], [{
+            "skill_name": "warehouse-audit",
+            "worker_id": "stock-auditor",
+            "source_path": "orchestration/workers/stock-review.yaml",
+            "agent_path": (
+                "plugin/agents/warehouse-audit/stock-auditor.md"
+            ),
+            "native_agent_type": (
+                "chatds-session-skills:warehouse-audit:stock-auditor"
+            ),
+        }])
+        self.assertIn('name: "stock-auditor"', agent)
+        self.assertIn('skills: ["warehouse-audit"]', agent)
+        self.assertIn("model: inherit", agent)
+        self.assertIn(
+            "${CLAUDE_PLUGIN_ROOT}/skills/warehouse-audit/"
+            "orchestration/workers/stock-review.yaml",
+            agent,
+        )
+        self.assertNotIn("permissionMode", agent)
+        self.assertIn(
+            "plugin/agents/warehouse-audit/stock-auditor.md",
+            {row["path"] for row in manifest["files"]},
+        )
+
+    def test_structured_worker_projection_is_domain_rename_invariant(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            skill = root / "skills" / "museum-provenance-renamed"
+            workers = skill / "orchestration" / "workers"
+            workers.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(
+                "---\n"
+                "name: museum-provenance-renamed\n"
+                "description: Review collection provenance.\n"
+                "---\n",
+                encoding="utf-8",
+            )
+            (workers / "catalog-review.yml").write_text(
+                "id: provenance-reviewer\n"
+                "name: Provenance Reviewer\n"
+                "description: Trace acquisition evidence across catalogs.\n",
+                encoding="utf-8",
+            )
+
+            view = materialize_claude_skill_view(
+                session_root=root / "session",
+                sources=[SimpleNamespace(
+                    name="museum-provenance-renamed",
+                    scope="session",
+                    root=skill,
+                    bundle_id=None,
+                    bundle_role=None,
+                )],
+            )
+            manifest = json.loads((view.root / "manifest.json").read_text())
+
+        self.assertEqual(
+            manifest["worker_agents"][0]["worker_id"],
+            "provenance-reviewer",
+        )
+        self.assertEqual(
+            manifest["worker_agents"][0]["native_agent_type"],
+            "chatds-session-skills:museum-provenance-renamed:"
+            "provenance-reviewer",
+        )
+
+    def test_duplicate_or_invalid_structured_worker_identity_fails_closed(self):
+        for second_id, expected in (
+            ("stock-auditor", "skill_worker_identity_duplicate"),
+            ("unsafe worker", "skill_worker_identity_invalid"),
+        ):
+            with self.subTest(second_id=second_id):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    skill = root / "skills" / "factory-review"
+                    workers = skill / "orchestration" / "workers"
+                    workers.mkdir(parents=True)
+                    (skill / "SKILL.md").write_text(
+                        "Review factory evidence.", encoding="utf-8"
+                    )
+                    for name, worker_id in (
+                        ("alpha.yaml", "stock-auditor"),
+                        ("beta.yaml", second_id),
+                    ):
+                        (workers / name).write_text(
+                            f"worker_id: {worker_id!r}\n"
+                            "description: Review one independent stream.\n",
+                            encoding="utf-8",
+                        )
+                    with self.assertRaisesRegex(SkillViewError, expected):
+                        materialize_claude_skill_view(
+                            session_root=root / "session",
+                            sources=[SimpleNamespace(
+                                name="factory-review",
+                                scope="session",
+                                root=skill,
+                                bundle_id=None,
+                                bundle_role=None,
+                            )],
+                        )
+
+    def test_structured_workflow_routes_compile_to_native_worker_phases(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            skill = root / "skills" / "warehouse-audit"
+            workers = skill / "orchestration" / "workers"
+            workers.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(
+                "---\n"
+                "name: warehouse-audit\n"
+                "description: Audit warehouse inventory.\n"
+                "---\n",
+                encoding="utf-8",
+            )
+            for filename, worker_id in (
+                ("stock.yaml", "stock-auditor"),
+                ("ledger.yaml", "ledger-reviewer"),
+                ("signoff.yaml", "signoff-reviewer"),
+            ):
+                (workers / filename).write_text(
+                    f"worker_id: {worker_id}\n"
+                    f"description: Execute the {worker_id} evidence pass.\n",
+                    encoding="utf-8",
+                )
+            (skill / "orchestration" / "orchestrator.yaml").write_text(
+                """routing_rules:
+  full_inventory_review:
+    patterns:
+      - "(audit|reconcile).*(warehouse|inventory)"
+    workers:
+      - stock-auditor
+      - ledger-reviewer
+    spawn_mode: parallel
+    sequential_workers:
+      - signoff-reviewer
+    priority: 7
+""",
+                encoding="utf-8",
+            )
+
+            view = materialize_claude_skill_view(
+                session_root=root / "session",
+                sources=[SimpleNamespace(
+                    name="warehouse-audit",
+                    scope="session",
+                    root=skill,
+                    bundle_id=None,
+                    bundle_role=None,
+                )],
+            )
+            manifest = json.loads((view.root / "manifest.json").read_text())
+
+        self.assertEqual(manifest["workflow_routes"], [{
+            "skill_name": "warehouse-audit",
+            "route_id": "full_inventory_review",
+            "source_path": "orchestration/orchestrator.yaml",
+            "priority": 7,
+            "patterns": ["(audit|reconcile).*(warehouse|inventory)"],
+            "phases": [
+                {
+                    "mode": "parallel",
+                    "workers": [
+                        {
+                            "worker_id": "stock-auditor",
+                            "native_agent_type": (
+                                "chatds-session-skills:warehouse-audit:"
+                                "stock-auditor"
+                            ),
+                        },
+                        {
+                            "worker_id": "ledger-reviewer",
+                            "native_agent_type": (
+                                "chatds-session-skills:warehouse-audit:"
+                                "ledger-reviewer"
+                            ),
+                        },
+                    ],
+                },
+                {
+                    "mode": "sequential",
+                    "workers": [{
+                        "worker_id": "signoff-reviewer",
+                        "native_agent_type": (
+                            "chatds-session-skills:warehouse-audit:"
+                            "signoff-reviewer"
+                        ),
+                    }],
+                },
+            ],
+        }])
+
+    def test_structured_workflow_compilation_survives_domain_rename(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            skill = root / "skills" / "museum-provenance-renamed"
+            workers = skill / "orchestration" / "workers"
+            workers.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(
+                "Review collection provenance.", encoding="utf-8"
+            )
+            for filename, worker_id in (
+                ("catalog.yml", "catalog-reader"),
+                ("provenance.yml", "provenance-judge"),
+                ("signoff.yml", "curator-signoff"),
+            ):
+                (workers / filename).write_text(
+                    f"id: {worker_id}\n"
+                    f"description: Review the {worker_id} evidence.\n",
+                    encoding="utf-8",
+                )
+            (skill / "orchestration" / "orchestrator.yml").write_text(
+                """routing_rules:
+  collection_chain:
+    patterns: ["(trace|review).*(museum|collection)"]
+    workers: [catalog-reader, provenance-judge]
+    spawn_mode: parallel
+    sequential_workers: [curator-signoff]
+    priority: 4
+""",
+                encoding="utf-8",
+            )
+
+            view = materialize_claude_skill_view(
+                session_root=root / "session",
+                sources=[SimpleNamespace(
+                    name="museum-provenance-renamed",
+                    scope="session",
+                    root=skill,
+                    bundle_id=None,
+                    bundle_role=None,
+                )],
+            )
+            manifest = json.loads((view.root / "manifest.json").read_text())
+
+        route = manifest["workflow_routes"][0]
+        self.assertEqual(route["route_id"], "collection_chain")
+        self.assertEqual(
+            [[worker["worker_id"] for worker in phase["workers"]]
+             for phase in route["phases"]],
+            [["catalog-reader", "provenance-judge"], ["curator-signoff"]],
+        )
+        self.assertNotIn("warehouse", json.dumps(route))
+
+    def test_structured_workflow_unknown_worker_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            skill = root / "skills" / "renamed-review"
+            workers = skill / "orchestration" / "workers"
+            workers.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(
+                "Review generic evidence.", encoding="utf-8"
+            )
+            (workers / "known.yaml").write_text(
+                "worker_id: known-reviewer\n"
+                "description: Review one evidence stream.\n",
+                encoding="utf-8",
+            )
+            (skill / "orchestration" / "orchestrator.yaml").write_text(
+                """routing_rules:
+  renamed_route:
+    patterns: ["review.*evidence"]
+    workers: [known-reviewer, absent-reviewer]
+    spawn_mode: parallel
+""",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                SkillViewError, "skill_workflow_worker_unknown"
+            ):
+                materialize_claude_skill_view(
+                    session_root=root / "session",
+                    sources=[SimpleNamespace(
+                        name="renamed-review",
+                        scope="session",
+                        root=skill,
+                        bundle_id=None,
+                        bundle_role=None,
+                    )],
+                )
+
     def test_generic_artifact_and_runtime_contracts_are_compiled(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -691,7 +1086,7 @@ class ClaudeSkillViewTests(unittest.TestCase):
                 ).exists()
             )
 
-    def test_enabled_web_search_compiles_one_harness_owned_mcp_capability(self):
+    def test_enabled_web_search_compiles_one_platform_owned_mcp_capability(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             skill = root / "skills" / "renamed-holdout"
@@ -710,13 +1105,13 @@ class ClaudeSkillViewTests(unittest.TestCase):
             enabled = materialize_claude_skill_view(
                 session_root=root / "enabled",
                 sources=[source],
-                enabled_tools=["read_file", "web_search"],
+                platform_capabilities=["web_search"],
                 web_search_url="http://search.internal:8080/search",
             )
             disabled = materialize_claude_skill_view(
                 session_root=root / "disabled",
                 sources=[source],
-                enabled_tools=["read_file"],
+                platform_capabilities=[],
             )
             enabled_mcp = json.loads(
                 (enabled.plugin_root / ".mcp.json").read_text()
@@ -736,7 +1131,7 @@ class ClaudeSkillViewTests(unittest.TestCase):
             ["-I", "-m", "claude_runner.mcp_web_search"],
         )
         self.assertEqual(disabled_mcp, {"mcpServers": {}})
-        self.assertEqual(manifest["harness_egress_rules"], [{
+        self.assertEqual(manifest["platform_egress_rules"], [{
             "capability": "web_search",
             "url_prefix": "http://search.internal:8080/search",
             "methods": ["GET"],
@@ -759,7 +1154,7 @@ class ClaudeSkillViewTests(unittest.TestCase):
                     bundle_id=None,
                     bundle_role=None,
                 )],
-                enabled_tools=["cronjob"],
+                platform_capabilities=["cronjob"],
             )
             mcp = json.loads((view.plugin_root / ".mcp.json").read_text())
             manifest = json.loads((view.root / "manifest.json").read_text())
@@ -769,19 +1164,19 @@ class ClaudeSkillViewTests(unittest.TestCase):
             mcp["mcpServers"]["chatds-schedule"]["args"],
             ["-I", "-m", "claude_runner.mcp_schedule_control"],
         )
-        self.assertEqual(manifest["harness_capabilities"], ["schedule_control"])
-        self.assertEqual(manifest["harness_egress_rules"], [])
-        aliases = manifest["schedule_tool_aliases"]
+        self.assertEqual(manifest["platform_capabilities"], ["schedule_control"])
+        self.assertEqual(manifest["platform_egress_rules"], [])
+        aliases = manifest["schedule_capability_aliases"]
         self.assertEqual(aliases["cronjob"], "cronjob")
         self.assertEqual(
             aliases["mcp__chatds-schedule__schedule_create"],
             "cronjob",
         )
-        self.assertIsNone(aliases["Bash"])
+        self.assertNotIn("Bash", aliases)
         self.assertEqual(
             json.loads(
                 mcp["mcpServers"]["chatds-schedule"]["env"][
-                    "CHATDS_SCHEDULE_TOOL_ALIASES_JSON"
+                    "CHATDS_SCHEDULE_CAPABILITY_ALIASES_JSON"
                 ]
             ),
             aliases,
@@ -806,7 +1201,7 @@ class ClaudeSkillViewTests(unittest.TestCase):
                     bundle_id=None,
                     bundle_role=None,
                 )],
-                enabled_tools=["market_quote"],
+                platform_capabilities=["market_quote"],
                 market_data_url="http://market-data.internal:8090/v1/quote",
             )
             mcp = json.loads((view.plugin_root / ".mcp.json").read_text())
@@ -821,7 +1216,7 @@ class ClaudeSkillViewTests(unittest.TestCase):
             config["env"]["CHATDS_MARKET_DATA_URL"],
             "http://market-data.internal:8090/v1/quote",
         )
-        self.assertEqual(manifest["harness_egress_rules"], [{
+        self.assertEqual(manifest["platform_egress_rules"], [{
             "capability": "market_quote",
             "url_prefix": "http://market-data.internal:8090/v1/quote",
             "methods": ["GET"],
@@ -831,23 +1226,34 @@ class ClaudeSkillViewTests(unittest.TestCase):
         self.assertNotIn("gtimg", serialized)
         self.assertNotIn("eastmoney", serialized)
 
-    def test_harness_entrypoint_name_is_reserved(self):
+    def test_historic_synthetic_name_is_an_ordinary_native_skill(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             skill = root / "skills" / "reserved"
             skill.mkdir(parents=True)
             (skill / "SKILL.md").write_text("fixture", encoding="utf-8")
-            with self.assertRaisesRegex(SkillViewError, "reserved"):
-                materialize_claude_skill_view(
-                    session_root=root / "session",
-                    sources=[SimpleNamespace(
-                        name="chatds-harness-session-entry",
-                        scope="session",
-                        root=skill,
-                        bundle_id=None,
-                        bundle_role=None,
-                    )],
-                )
+            view = materialize_claude_skill_view(
+                session_root=root / "session",
+                sources=[SimpleNamespace(
+                    name="chatds-harness-session-entry",
+                    scope="session",
+                    root=skill,
+                    bundle_id=None,
+                    bundle_role=None,
+                )],
+            )
+            self.assertIsNone(view.entrypoint_skill_name)
+            self.assertEqual(
+                ("chatds-harness-session-entry",),
+                view.selected_primary_skill_names,
+            )
+            self.assertTrue(
+                view.plugin_root.joinpath(
+                    "skills",
+                    "chatds-harness-session-entry",
+                    "SKILL.md",
+                ).is_file()
+            )
 
     def test_content_addressed_view_reuses_nfs_enotempty_winner(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -925,6 +1331,36 @@ class ClaudeSkillViewTests(unittest.TestCase):
             )
             self.assertEqual(
                 view.mcp_server_names, ("local-db", "remote-db")
+            )
+
+    def test_session_mcp_is_compiled_by_data_for_renamed_domains(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            view = materialize_claude_skill_view(
+                session_root=root / "session",
+                sources=[],
+                session_mcp_servers={
+                    "warehouse-catalog": {
+                        "type": "http",
+                        "url": "https://warehouse.example.test/mcp",
+                    },
+                    "lab-runner": {
+                        "type": "stdio",
+                        "command": "python",
+                        "args": ["/workspace/lab_runner.py"],
+                    },
+                },
+            )
+            config = json.loads(
+                (view.plugin_root / ".mcp.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                set(config["mcpServers"]),
+                {"warehouse-catalog", "lab-runner"},
+            )
+            self.assertEqual(
+                config["mcpServers"]["lab-runner"]["args"],
+                ["/workspace/lab_runner.py"],
             )
 
     def test_mcp_helpers_that_can_escape_policy_are_rejected(self):
@@ -1042,17 +1478,14 @@ class EngineModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual(claude["default_model_id"], "deepseek_v4_pro")
 
-    async def test_legacy_engine_can_be_retained_for_history_only(self):
-        with patch.object(settings, "legacy_engine_new_runs_enabled", False):
-            async with self.sessions() as db:
-                options = await workspace_router._engine_options_for_user(
-                    current_model_id="deepseek_v4_pro",
-                    user=self.user,
-                    db=db,
-                )
-        legacy = next(item for item in options if item["id"] == "legacy")
-        self.assertFalse(legacy["available"])
-        self.assertIn("history", legacy["unavailable_reason"])
+    async def test_retired_legacy_engine_is_absent_from_execution_options(self):
+        async with self.sessions() as db:
+            options = await workspace_router._engine_options_for_user(
+                current_model_id="deepseek_v4_pro",
+                user=self.user,
+                db=db,
+            )
+        self.assertNotIn("legacy", {item["id"] for item in options})
 
     def test_provider_family_without_explicit_profile_is_not_compatible(self):
         with patch.object(
@@ -1102,7 +1535,8 @@ class EngineModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             local_glm["claude_provider_profile"],
             local_deepseek["claude_provider_profile"],
         )
-        self.assertEqual(local_glm["context_length"], 918_528)
+        self.assertEqual(local_glm["context_length"], 303_872)
+        self.assertEqual(local_glm["max_tokens"], 65_536)
         self.assertEqual(local_deepseek["context_length"], 1_048_576)
 
     async def test_new_session_uses_configured_engine_without_rebinding_existing(self):
@@ -1142,15 +1576,11 @@ class EngineModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                 default_agent_engine_id="claude_code",
             )
 
-    def test_disabled_legacy_cannot_remain_the_default_engine(self):
-        with self.assertRaisesRegex(
-            ValueError,
-            "LEGACY_ENGINE_NEW_RUNS_ENABLED=true",
-        ):
+    def test_retired_legacy_cannot_be_configured_as_default_engine(self):
+        with self.assertRaises(ValueError):
             Settings(
                 _env_file=None,
                 claude_code_engine_enabled=True,
-                legacy_engine_new_runs_enabled=False,
                 default_agent_engine_id="legacy",
             )
 

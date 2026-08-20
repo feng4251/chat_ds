@@ -26,6 +26,16 @@ from claude_runner.policy import compile_turn_egress_policy, verify_skill_view
 from workspace_lock import workspace_mutation_guard
 
 from .config import ProviderProfile, Settings, load_settings, state_volume_host_root
+from .control_decisions import (
+    answerable_control_request,
+    append_control_decision,
+    existing_control_decision,
+    lower_native_question_answer,
+)
+from .native_session import NativeSessionInputError, native_turn_prompts
+from .native_workflow import compile_deepseek_workflow_projection
+from .terminal_receipts import append_terminal
+from native_security.workflow_contract import compile_turn_workflow_contract
 
 
 SAFE_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -39,13 +49,13 @@ class StartRunRequest(BaseModel):
     root_run_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     user_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     conversation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    native_session_id: str = Field(pattern=r"^chatds-[0-9a-f]{32}$")
     model_id: str = Field(min_length=1, max_length=128)
     api_model: str = Field(min_length=1, max_length=128)
     provider_profile: str = Field(min_length=1, max_length=64)
     provider_base_url: str = Field(min_length=8, max_length=2048)
     provider_protocol: Literal["openai"]
     messages: list[dict[str, Any]] = Field(max_length=4096)
-    tools: list[str] = Field(default_factory=list, max_length=256)
     max_output_tokens: int = Field(ge=1, le=262_144)
     context_window_tokens: int = Field(ge=32_000, le=4_000_000)
     workspace_path: str = Field(min_length=1, max_length=4096)
@@ -73,10 +83,30 @@ class RunIdentity(BaseModel):
 
 
 class ApprovalDecisionRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
     user_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     conversation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     decision: Literal["allow", "deny"]
     request_seq: int = Field(ge=1)
+    answers: dict[str, str] | None = None
+
+    @model_validator(mode="after")
+    def bounded_answers(self):
+        if self.answers is not None and (
+            len(self.answers) != 1
+            or any(
+                not key
+                or len(key) > 4_000
+                or not value.strip()
+                or len(value) > 4_000
+                or "\x00" in key
+                or "\x00" in value
+                for key, value in self.answers.items()
+            )
+        ):
+            raise ValueError("Native question answers are invalid")
+        return self
 
 
 class SessionIdentity(BaseModel):
@@ -124,40 +154,6 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise HTTPException(404, "DeepSeek Harness run state is unavailable")
     return value
-
-
-def _append_terminal(path: Path, status: str, error: str | None) -> None:
-    if path.exists():
-        for line in path.read_text(encoding="utf-8").splitlines():
-            try:
-                event = json.loads(line).get("event", {})
-            except (ValueError, TypeError):
-                continue
-            if event.get("type") == "chatds.supervisor.terminal":
-                return
-    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
-    seq = int(json.loads(lines[-1]).get("seq") or 0) + 1 if lines else 1
-    envelope = {
-        "seq": seq,
-        "received_at_unix_ms": int(time.time() * 1000),
-        "channel": "supervisor",
-        "event": {
-            "type": "chatds.supervisor.terminal",
-            "status": status,
-            "error": error,
-        },
-    }
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    try:
-        payload = json.dumps(envelope, separators=(",", ":")).encode() + b"\n"
-        view = memoryview(payload)
-        offset = 0
-        while offset < len(view):
-            offset += os.write(fd, view[offset:])
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 def _terminal(path: Path) -> str | None:
@@ -213,23 +209,6 @@ def _prepare_workspace(root: Path, gid: int) -> None:
                     raise RuntimeError("workspace_contains_special_file")
                 os.chown(path, -1, gid, follow_symlinks=False)
                 os.chmod(path, stat.S_IMODE(item.st_mode) | 0o060)
-
-
-def _prompt(messages: list[dict[str, Any]]) -> str:
-    rows: list[str] = []
-    for message in messages:
-        role = str(message.get("role") or "user").upper()
-        content = message.get("content")
-        if isinstance(content, list):
-            text = "\n".join(
-                str(item.get("text") or "")
-                for item in content
-                if isinstance(item, dict) and item.get("type") == "text"
-            )
-        else:
-            text = str(content or "")
-        rows.append(f"<{role}>\n{text}\n</{role}>")
-    return "\n\n".join(rows)
 
 
 class Manager:
@@ -317,10 +296,16 @@ class Manager:
         status_path = control / "status.json"
         events = control / "events.jsonl"
         container = None
+        stage = "path_validation"
         try:
             workspace, skill, state = await asyncio.to_thread(self._paths, request)
+            stage = "skill_attestation"
             receipt = await asyncio.to_thread(verify_skill_view, skill, request.skill_view_sha256)
-            web_enabled = "web_search" in request.tools
+            # This deployment replaces only DSH's search provider with the
+            # bounded SearXNG adapter. The upstream web tool itself remains a
+            # native, always-present part of the engine tool graph.
+            web_enabled = True
+            stage = "egress_policy"
             policy = await asyncio.to_thread(
                 compile_turn_egress_policy,
                 skill_view_root=skill,
@@ -343,22 +328,69 @@ class Manager:
                 for rule in policy.get("egress_rules", [])
             ):
                 raise RuntimeError("searxng_capability_policy_missing")
+            stage = "native_session_binding"
+            try:
+                initial_prompt, turn_prompt = native_turn_prompts(
+                    request.messages,
+                    request.user_turn_text,
+                )
+            except NativeSessionInputError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            execution_request = request.model_dump(mode="json")
+            stage = "workflow_compilation"
+            selected_primary = receipt.manifest.get(
+                "selected_primary_skill_names", []
+            )
+            if not isinstance(selected_primary, list):
+                raise RuntimeError("native_skill_manifest_invalid")
+            bound_skill_name = (
+                selected_primary[0]
+                if len(selected_primary) == 1
+                and isinstance(selected_primary[0], str)
+                else None
+            )
+            workflow_contract = compile_turn_workflow_contract(
+                manifest=receipt.manifest,
+                user_turn_text=request.user_turn_text,
+                bound_skill_name=bound_skill_name,
+            )
+            workflow_projection = compile_deepseek_workflow_projection(
+                manifest=receipt.manifest,
+                workflow_contract=workflow_contract,
+                user_turn_text=request.user_turn_text,
+                native_session_id=request.native_session_id,
+            )
+            # The trusted admission record retains the browser transcript. The
+            # isolated runner receives only the two native Session inputs and
+            # never replays the whole transcript after persistence exists.
+            execution_request.pop("messages", None)
             sanitized = {
                 "schema": "chatds.deepseek-run.v1",
-                **request.model_dump(mode="json"),
-                "prompt": _prompt(request.messages),
+                **execution_request,
+                "initial_prompt": initial_prompt,
+                "turn_prompt": turn_prompt,
                 "provider_base_url": profile.base_url,
                 "searxng_search_url": self.settings.searxng_search_url,
                 "web_search_enabled": web_enabled,
                 "egress_policy": policy,
+                "workflow_contract": workflow_contract,
+                "workflow_projection": workflow_projection,
+                "bound_skill_name": bound_skill_name,
+                "artifact_contracts": receipt.manifest.get(
+                    "artifact_contracts", []
+                ),
             }
+            stage = "execution_request_persist"
             _atomic_json(control / "request.json", sanitized)
+            stage = "workspace_preparation"
             await asyncio.to_thread(_prepare_workspace, workspace, self.settings.worker_gid)
             home = state / "home"
             home.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chown(home, self.settings.worker_uid, self.settings.worker_gid)
+            stage = "runner_attestation"
             image = await asyncio.to_thread(self.client.images.get, self.settings.runner_image)
             _verify_runner_image(image)
+            stage = "container_preparation"
             volumes = {
                 str(workspace): {
                     "bind": "/workspace",
@@ -380,6 +412,7 @@ class Manager:
             status.update({"status": "starting", "phase": "starting"})
             _atomic_json(status_path, status)
             async with self.semaphore:
+                stage = "native_container_start"
                 container = await asyncio.to_thread(
                     self.client.containers.run,
                     self.settings.runner_image,
@@ -418,6 +451,7 @@ class Manager:
                 status = _read_json(status_path)
                 status.update({"status": "running", "phase": "running", "container_id": container.id})
                 _atomic_json(status_path, status)
+                stage = "native_execution"
                 try:
                     result = await asyncio.wait_for(
                         asyncio.to_thread(container.wait),
@@ -450,13 +484,19 @@ class Manager:
                             pass
                     exit_code = 124
                     if _terminal(events) is None:
-                        _append_terminal(events, "failed", "run_hard_timeout")
+                        append_terminal(
+                            events,
+                            "failed",
+                            "run_hard_timeout",
+                            error_stage="native_execution",
+                        )
                 if _terminal(events) is None:
                     failure_code = _container_failure_code(container, exit_code)
-                    _append_terminal(
+                    append_terminal(
                         events,
                         "failed",
                         failure_code if exit_code else "terminal_missing",
+                        error_stage="terminal_reconciliation",
                     )
         except asyncio.CancelledError:
             if container is not None:
@@ -464,10 +504,15 @@ class Manager:
                     await asyncio.to_thread(container.stop, timeout=15)
                 except (DockerException, NotFound):
                     pass
-            _append_terminal(events, "cancelled", None)
+            append_terminal(events, "cancelled", None)
             raise
         except BaseException as exc:
-            _append_terminal(events, "failed", (str(exc) or type(exc).__name__)[:128])
+            append_terminal(
+                events,
+                "failed",
+                (str(exc) or type(exc).__name__)[:128],
+                error_stage=stage,
+            )
         finally:
             if container is not None:
                 try:
@@ -491,7 +536,7 @@ class Manager:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         control = self._control(identity.user_id, identity.conversation_id, run)
-        _append_terminal(control / "events.jsonl", "cancelled", None)
+        append_terminal(control / "events.jsonl", "cancelled", None)
         return True
 
     async def decide_approval(self, run: str, request_id: str, payload: ApprovalDecisionRequest) -> dict[str, Any]:
@@ -501,18 +546,87 @@ class Manager:
         if locator["user_id"] != payload.user_id or locator["conversation_id"] != payload.conversation_id:
             raise HTTPException(404, "Run not found")
         control = self._control(payload.user_id, payload.conversation_id, run)
-        mailbox = control / "control-decisions.jsonl"
-        mailbox.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        row = {
+        async with self.guard:
+            events = control / "events.jsonl"
+            if _terminal(events) is not None:
+                raise HTTPException(409, "Run is no longer active")
+            request_receipt = answerable_control_request(events, request_id)
+            if (
+                request_receipt is None
+                or request_receipt[0] != payload.request_seq
+            ):
+                raise HTTPException(409, "Approval request is stale or not durable")
+            native_request = request_receipt[1]
+            native_type = str(native_request.get("type") or "")
+            native_data = native_request.get("data")
+            native_data = native_data if isinstance(native_data, dict) else {}
+            if native_type == "chatds/question/requested":
+                plan_review = native_data.get("intent_kind") == "plan-review"
+                if plan_review:
+                    if payload.answers is not None:
+                        raise HTTPException(
+                            400,
+                            "Plan review accepts a binary decision, not answers",
+                        )
+                    selected = None
+                    custom = None
+                else:
+                    question = str(native_data.get("question") or "")
+                    if (
+                        payload.decision == "allow"
+                        and (
+                            payload.answers is None
+                            or set(payload.answers) != {question}
+                        )
+                    ):
+                        raise HTTPException(400, "Question answer does not match the durable request")
+                    if payload.decision == "deny" and payload.answers is not None:
+                        raise HTTPException(400, "Denied questions cannot include answers")
+                    answer = (
+                        payload.answers[question]
+                        if payload.answers is not None
+                        else ""
+                    )
+                    try:
+                        selected, custom = lower_native_question_answer(
+                            native_data,
+                            answer,
+                        )
+                    except ValueError as exc:
+                        raise HTTPException(
+                            409, "Native question request is invalid"
+                        ) from exc
+            else:
+                if payload.answers is not None:
+                    raise HTTPException(400, "Approval requests do not accept answers")
+                selected = None
+                custom = None
+            mailbox = control / "control-decisions.jsonl"
+            mailbox.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            row = {
+                "request_id": request_id,
+                "request_seq": payload.request_seq,
+                "decision": payload.decision,
+                **({"selected": selected} if selected is not None else {}),
+                **({"custom": custom} if custom is not None else {}),
+            }
+            existing = existing_control_decision(mailbox, request_id)
+            if existing is not None:
+                if existing != row:
+                    raise HTTPException(409, "Approval request already has another decision")
+                return {
+                    "accepted": True,
+                    "idempotent": True,
+                    "request_id": request_id,
+                    "decision": payload.decision,
+                }
+            append_control_decision(mailbox, row)
+        return {
+            "accepted": True,
+            "idempotent": False,
             "request_id": request_id,
-            "request_seq": payload.request_seq,
             "decision": payload.decision,
         }
-        with mailbox.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        return {"accepted": True, "request_id": request_id, "decision": payload.decision}
 
     async def cleanup(self, user: str, conversation: str) -> dict[str, Any]:
         if not SAFE_ID.fullmatch(user) or not SAFE_ID.fullmatch(conversation):
@@ -604,6 +718,7 @@ def _verify_runner_image(image) -> None:
             "47f943859bef60e4160492346772ded9b24f765a"
         ),
         "org.opencontainers.image.chatds.workspace-scope": "one-session",
+        "org.opencontainers.image.chatds.native-session-driver": "v1",
         "org.opencontainers.image.chatds.network": (
             "none+signed-exact-egress-v3"
         ),
@@ -666,7 +781,12 @@ async def lifespan(_app: FastAPI):
             row = _read_json(locator)
             control = manager._control(row["user_id"], row["conversation_id"], row["run_id"])
             if _terminal(control / "events.jsonl") is None:
-                _append_terminal(control / "events.jsonl", "failed", "supervisor_restart_before_adoption")
+                append_terminal(
+                    control / "events.jsonl",
+                    "failed",
+                    "supervisor_restart_before_adoption",
+                    error_stage="supervisor_recovery",
+                )
         except Exception:
             continue
     yield

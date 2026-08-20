@@ -14,6 +14,7 @@ from hooks import emit_event
 from models import CustomModelConfig, ScheduledJob, ScheduledJobRun
 from session_lifecycle import session_control_plane_mutation
 from scheduler import (
+    _scheduled_job_platform_capabilities,
     enqueue_job_execution,
     next_run_for,
     scan_cron_prompt,
@@ -39,7 +40,7 @@ def _job_dict(job: ScheduledJob) -> dict:
         "schedule_value": job.schedule_value,
         "timezone": job.timezone,
         "model_id": job.model_id,
-        "enabled_tools": json.loads(job.enabled_tools) if job.enabled_tools else [],
+        "platform_capabilities": _scheduled_job_platform_capabilities(job),
         "enabled": job.enabled,
         "delete_after_run": job.delete_after_run,
         "max_runs": job.max_runs,
@@ -69,13 +70,16 @@ async def _validate_model_id(model_id: str | None, user_id: str, db) -> None:
         raise HTTPException(400, f"Unknown model: {model_id}")
 
 
-def _validate_enabled_tools(enabled_tools: list[str] | None) -> None:
-    if enabled_tools is None:
+def _validate_platform_capabilities(values: list[str] | None) -> None:
+    if values is None:
         return
-    from native_tools import DEFAULT_NATIVE_TOOL_SET
-    unknown = set(enabled_tools) - DEFAULT_NATIVE_TOOL_SET
+    from native_tools import PLATFORM_IO_CAPABILITY_SET
+    unknown = set(values) - PLATFORM_IO_CAPABILITY_SET
     if unknown:
-        raise HTTPException(400, f"Unknown tools: {sorted(unknown)}")
+        raise HTTPException(
+            400,
+            f"Unknown platform capabilities: {sorted(unknown)}",
+        )
 
 
 async def _create_for_user_in_session(
@@ -84,7 +88,7 @@ async def _create_for_user_in_session(
     db,
 ):
     await _validate_model_id(payload.model_id, user_id, db)
-    _validate_enabled_tools(payload.enabled_tools)
+    _validate_platform_capabilities(payload.platform_capabilities)
     try:
         resolved = resolve_schedule_spec(
             payload.schedule,
@@ -109,8 +113,8 @@ async def _create_for_user_in_session(
         timezone=payload.timezone,
         model_id=payload.model_id,
         enabled_tools=(
-            json.dumps(payload.enabled_tools)
-            if payload.enabled_tools is not None else None
+            json.dumps(payload.platform_capabilities)
+            if payload.platform_capabilities is not None else None
         ),
         delete_after_run=payload.delete_after_run,
         max_runs=payload.max_runs,
@@ -171,7 +175,7 @@ async def _apply_job_update(
     db,
 ) -> dict:
     await _validate_model_id(payload.model_id, user_id, db)
-    _validate_enabled_tools(payload.enabled_tools)
+    _validate_platform_capabilities(payload.platform_capabilities)
     for field in (
         "name",
         "prompt",
@@ -190,8 +194,8 @@ async def _apply_job_update(
     ) or payload.enabled is True
     if payload.expires_at is not None:
         job.expires_at = _normalize_expiry(payload.expires_at)
-    if payload.enabled_tools is not None:
-        job.enabled_tools = json.dumps(payload.enabled_tools)
+    if payload.platform_capabilities is not None:
+        job.enabled_tools = json.dumps(payload.platform_capabilities)
     if payload.prompt is not None:
         threat = scan_cron_prompt(payload.prompt)
         if threat:

@@ -26,6 +26,7 @@ from models import (
     CustomModelConfig,
     EventHook,
     Message,
+    MCPServerRegistration,
     ScheduledJob,
     ScheduledJobRun,
     SkillPackage,
@@ -33,55 +34,6 @@ from models import (
     User,
 )
 from routers import chat_router, conv_router, skill_router
-
-
-class _PausedHarnessClient:
-    def __init__(self, entered: asyncio.Event) -> None:
-        self.entered = entered
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *_args):
-        return False
-
-    async def post(self, *_args, **_kwargs):
-        self.entered.set()
-        await asyncio.Future()
-
-
-class _SuccessfulHarnessResponse:
-    status_code = 200
-    text = ""
-
-    @staticmethod
-    def json():
-        return {
-            "choices": [{
-                "message": {"content": "scheduled result"},
-            }],
-            "usage": {
-                "input_tokens": 3,
-                "output_tokens": 5,
-                "total_tokens": 8,
-            },
-            "model": "model",
-        }
-
-
-class _CountingHarnessClient:
-    def __init__(self, calls: list[dict]) -> None:
-        self.calls = calls
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *_args):
-        return False
-
-    async def post(self, *_args, **kwargs):
-        self.calls.append(dict(kwargs))
-        return _SuccessfulHarnessResponse()
 
 
 class ConversationDeletionLifecycleTests(unittest.IsolatedAsyncioTestCase):
@@ -150,6 +102,13 @@ class ConversationDeletionLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 user_id="user",
                 session_id="session",
                 name="fixture-skill",
+            ))
+            db.add(MCPServerRegistration(
+                id="mcp-registration",
+                user_id="user",
+                session_id="session",
+                name="warehouse",
+                config_json='{"type":"http","url":"https://warehouse.example.invalid/mcp"}',
             ))
             db.add(AgentRun(
                 id="run",
@@ -246,12 +205,14 @@ class ConversationDeletionLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     new=AsyncMock(return_value=None),
                 ),
                 patch.object(
-                    conv_router,
-                    "_cleanup_harness_session",
-                    new=AsyncMock(return_value={
-                        "success": True,
-                        "execution_revocation": {"success": True},
-                    }),
+                    conv_router.settings,
+                    "claude_code_engine_enabled",
+                    False,
+                ),
+                patch.object(
+                    conv_router.settings,
+                    "deepseek_harness_engine_enabled",
+                    False,
                 ),
             ):
                 return await conv_router.delete_conv(
@@ -259,19 +220,6 @@ class ConversationDeletionLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     SimpleNamespace(id="user"),
                     db,
                 )
-
-    @staticmethod
-    def _provider_config() -> dict:
-        return {
-            "id": "model",
-            "base_url": "http://provider.invalid",
-            "api_key": "",
-            "api_model": "model",
-            "provider": "openai",
-            "protocol": "openai",
-            "is_multimodal": False,
-            "context_length": 4096,
-        }
 
     async def _new_scheduled_run(self) -> ScheduledJobRun:
         async with self.sessions() as db:
@@ -293,6 +241,10 @@ class ConversationDeletionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             for model, predicate in (
                 (Message, Message.conversation_id == "session"),
                 (SkillPackage, SkillPackage.session_id == "session"),
+                (
+                    MCPServerRegistration,
+                    MCPServerRegistration.session_id == "session",
+                ),
                 (
                     AgentEngineRawEvent,
                     AgentEngineRawEvent.conversation_id == "session",
@@ -479,26 +431,17 @@ class ConversationDeletionLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_delete_cancels_and_drains_paused_scheduled_execution(self):
         await self._seed_full_session()
         entered = asyncio.Event()
+
+        async def paused_native_turn(*_args, **_kwargs):
+            entered.set()
+            await asyncio.Future()
+
         with (
             patch.object(scheduler, "async_session", self.sessions),
             patch.object(
                 scheduler,
-                "_resolve_job_model",
-                new=AsyncMock(return_value={
-                    "id": "model",
-                    "base_url": "http://provider.invalid",
-                    "api_key": "",
-                    "api_model": "model",
-                    "provider": "openai",
-                    "protocol": "openai",
-                    "is_multimodal": False,
-                    "context_length": 4096,
-                }),
-            ),
-            patch.object(
-                scheduler,
-                "_harness_client",
-                new=lambda: _PausedHarnessClient(entered),
+                "_execute_claude_scheduled_turn",
+                new=paused_native_turn,
             ),
             patch.object(
                 scheduler,
@@ -544,27 +487,50 @@ class ConversationDeletionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             job.next_run_at = scheduler._utcnow() - timedelta(seconds=1)
             await db.commit()
 
-        harness_calls: list[dict] = []
+        native_calls: list[dict] = []
+
+        async def complete_native_turn(
+            db, *, job, conv, scheduled_run, platform_capabilities,
+        ):
+            lease = await chat_router._acquire_conversation_turn(str(conv.id))
+            try:
+                native_calls.append({
+                    "platform_capabilities": list(platform_capabilities),
+                })
+                db.add_all([
+                    Message(
+                        conversation_id=conv.id,
+                        role="user",
+                        content=job.prompt,
+                        model_id=job.model_id,
+                        source="cron",
+                    ),
+                    Message(
+                        conversation_id=conv.id,
+                        role="assistant",
+                        content="scheduled result",
+                        model_id=job.model_id,
+                        source="cron",
+                    ),
+                ])
+                scheduled_run.status = "succeeded"
+                scheduled_run.ended_at = scheduler._utcnow()
+                job.last_status = "succeeded"
+                job.consecutive_errors = 0
+                await scheduler._commit_scheduled_session_state(
+                    db,
+                    user_id=str(job.user_id),
+                    conversation_id=str(conv.id),
+                )
+            finally:
+                chat_router._release_conversation_turn(str(conv.id), lease)
+
         with (
             patch.object(scheduler, "async_session", self.sessions),
             patch.object(
                 scheduler,
-                "_resolve_job_model",
-                new=AsyncMock(return_value={
-                    "id": "model",
-                    "base_url": "http://provider.invalid",
-                    "api_key": "",
-                    "api_model": "model",
-                    "provider": "openai",
-                    "protocol": "openai",
-                    "is_multimodal": False,
-                    "context_length": 4096,
-                }),
-            ),
-            patch.object(
-                scheduler,
-                "_harness_client",
-                new=lambda: _CountingHarnessClient(harness_calls),
+                "_execute_claude_scheduled_turn",
+                new=complete_native_turn,
             ),
             patch.object(
                 scheduler,
@@ -598,13 +564,13 @@ class ConversationDeletionLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(forced_started)
                 self.assertIs(first_task, forced_task)
                 self.assertTrue(first_flight.force_requested)
-                self.assertEqual([], harness_calls)
+                self.assertEqual([], native_calls)
 
             self.assertIsNotNone(first_task)
             await asyncio.wait_for(first_task, timeout=5)
             await asyncio.sleep(0)
 
-        self.assertEqual(1, len(harness_calls))
+        self.assertEqual(1, len(native_calls))
         self.assertNotIn("job", scheduler._JOB_EXECUTION_FLIGHTS)
         async with self.sessions() as db:
             new_runs = list((await db.execute(
@@ -642,9 +608,9 @@ class ConversationDeletionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             job,
             conv,
             scheduled_run,
-            tools,
+            platform_capabilities,
         ):
-            del tools
+            del platform_capabilities
             lease = await chat_router._acquire_conversation_turn(str(conv.id))
             try:
                 entered_native_turn.set()
@@ -688,26 +654,17 @@ class ConversationDeletionLifecycleTests(unittest.IsolatedAsyncioTestCase):
     ):
         await self._seed_full_session()
         entered = asyncio.Event()
+
+        async def paused_native_turn(*_args, **_kwargs):
+            entered.set()
+            await asyncio.Future()
+
         with (
             patch.object(scheduler, "async_session", self.sessions),
             patch.object(
                 scheduler,
-                "_resolve_job_model",
-                new=AsyncMock(return_value={
-                    "id": "model",
-                    "base_url": "http://provider.invalid",
-                    "api_key": "",
-                    "api_model": "model",
-                    "provider": "openai",
-                    "protocol": "openai",
-                    "is_multimodal": False,
-                    "context_length": 4096,
-                }),
-            ),
-            patch.object(
-                scheduler,
-                "_harness_client",
-                new=lambda: _PausedHarnessClient(entered),
+                "_execute_claude_scheduled_turn",
+                new=paused_native_turn,
             ),
             patch.object(
                 scheduler,
@@ -750,14 +707,16 @@ class ConversationDeletionLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self,
     ):
         await self._seed_full_session()
+
+        async def provider_failure(*_args, **_kwargs):
+            raise RuntimeError("provider metadata failed")
+
         with (
             patch.object(scheduler, "async_session", self.sessions),
             patch.object(
                 scheduler,
-                "_resolve_job_model",
-                new=AsyncMock(side_effect=RuntimeError(
-                    "provider metadata failed"
-                )),
+                "_execute_claude_scheduled_turn",
+                new=provider_failure,
             ),
             patch.object(
                 scheduler,
@@ -880,18 +839,34 @@ class ConversationDeletionLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError("injected final commit failure")
             return await original_commit(db, **kwargs)
 
-        harness_calls: list[dict] = []
+        native_calls: list[dict] = []
+
+        async def commit_native_turn(
+            db, *, job, conv, scheduled_run, platform_capabilities,
+        ):
+            native_calls.append({
+                "platform_capabilities": list(platform_capabilities),
+            })
+            await scheduler._commit_scheduled_session_state(
+                db,
+                user_id=str(job.user_id),
+                conversation_id=str(conv.id),
+            )
+            scheduled_run.status = "succeeded"
+            scheduled_run.ended_at = scheduler._utcnow()
+            job.last_status = "succeeded"
+            await scheduler._commit_scheduled_session_state(
+                db,
+                user_id=str(job.user_id),
+                conversation_id=str(conv.id),
+            )
+
         with (
             patch.object(scheduler, "async_session", self.sessions),
             patch.object(
                 scheduler,
-                "_resolve_job_model",
-                new=AsyncMock(return_value=self._provider_config()),
-            ),
-            patch.object(
-                scheduler,
-                "_harness_client",
-                new=lambda: _CountingHarnessClient(harness_calls),
+                "_execute_claude_scheduled_turn",
+                new=commit_native_turn,
             ),
             patch.object(
                 scheduler,
@@ -913,7 +888,7 @@ class ConversationDeletionLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 return_exceptions=True,
             ))[0]
         self.assertIsInstance(outcome, RuntimeError)
-        self.assertEqual(1, len(harness_calls))
+        self.assertEqual(1, len(native_calls))
         self.assertEqual(3, commit_calls)
         run = await self._new_scheduled_run()
         self.assertEqual("failed", run.status)
@@ -930,18 +905,38 @@ class ConversationDeletionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             if emit_calls == 3:
                 raise RuntimeError("completion event failed")
 
-        harness_calls: list[dict] = []
+        async def complete_native_turn(
+            db, *, job, conv, scheduled_run, platform_capabilities,
+        ):
+            del platform_capabilities
+            scheduled_run.status = "succeeded"
+            scheduled_run.ended_at = scheduler._utcnow()
+            scheduled_run.error = None
+            job.last_status = "succeeded"
+            await scheduler._commit_scheduled_session_state(
+                db,
+                user_id=str(job.user_id),
+                conversation_id=str(conv.id),
+            )
+            await scheduler.emit_event(
+                str(job.user_id),
+                "cron.completed",
+                {"job_id": str(job.id)},
+                str(conv.id),
+            )
+            await scheduler.emit_event(
+                str(job.user_id),
+                "message.created",
+                {"job_id": str(job.id)},
+                str(conv.id),
+            )
+
         with (
             patch.object(scheduler, "async_session", self.sessions),
             patch.object(
                 scheduler,
-                "_resolve_job_model",
-                new=AsyncMock(return_value=self._provider_config()),
-            ),
-            patch.object(
-                scheduler,
-                "_harness_client",
-                new=lambda: _CountingHarnessClient(harness_calls),
+                "_execute_claude_scheduled_turn",
+                new=complete_native_turn,
             ),
             patch.object(
                 scheduler,

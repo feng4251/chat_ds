@@ -7,9 +7,6 @@ from collections.abc import Iterable
 from config import settings
 
 from .base import AgentEngine, SUPPORTED_ENGINE_IDS
-from .legacy import LegacyHarnessEngine
-
-
 class AgentEngineRegistry:
     def __init__(self, engines: Iterable[AgentEngine]) -> None:
         self._engines = {engine.engine_id: engine for engine in engines}
@@ -32,16 +29,9 @@ class AgentEngineRegistry:
 
 def build_agent_engine_registry() -> AgentEngineRegistry:
     engines: list[AgentEngine] = []
-    if settings.legacy_engine_new_runs_enabled:
-        engines.append(LegacyHarnessEngine(
-            base_url=settings.harness_url,
-            internal_token=settings.internal_api_token,
-            timeout_seconds=settings.harness_stream_timeout_seconds,
-        ))
-    # ClaudeCodeEngine is registered only when its supervisor is explicitly
-    # enabled. This keeps the existing production path rollback-compatible
-    # while making missing isolation infrastructure fail closed rather than
-    # silently executing Claude in the Backend container.
+    # Native engines are registered only when their trusted Supervisor is
+    # enabled. Missing isolation infrastructure fails closed; there is no
+    # fallback into the retired ChatDS Harness.
     if settings.claude_code_engine_enabled:
         from .claude_code import ClaudeCodeEngine
 

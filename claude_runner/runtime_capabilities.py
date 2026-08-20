@@ -1,10 +1,8 @@
-"""Typed, controller-owned current-Turn capability contract.
+"""Typed, controller-owned current-Turn capability audit receipt.
 
-Claude sessions are durable, while deployment capabilities can change between
-Turns.  Conversation prose is therefore not authoritative for whether a tool
-or network profile is available now.  This module compiles the verified Skill
-view and signed egress policy into a small bounded contract and renders it as
-an appended system prompt on every native invocation.
+The receipt is diagnostic/control-plane state only. It is never rendered into
+Claude's system or user prompt: native tool discovery, Skill instructions and
+MCP schemas remain the model-facing authority.
 """
 
 from __future__ import annotations
@@ -15,7 +13,6 @@ from typing import Any
 
 RUNTIME_CAPABILITY_SCHEMA = "chatds.runtime-capabilities.v1"
 MAX_STRUCTURED_CAPABILITIES = 128
-MAX_CAPABILITY_PROMPT_CHARS = 16_384
 _SAFE_CAPABILITY = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$")
 _PUBLIC_READ_METHODS = frozenset({"GET", "HEAD"})
 
@@ -92,11 +89,11 @@ def compile_runtime_capability_contract(
 
     if not isinstance(manifest, dict) or not isinstance(egress_policy, dict):
         raise _invalid()
-    rules = manifest.get("harness_egress_rules", [])
+    rules = manifest.get("platform_egress_rules", [])
     if not isinstance(rules, list) or len(rules) > MAX_STRUCTURED_CAPABILITIES:
         raise _invalid()
     capabilities: set[str] = set()
-    declared_capabilities = manifest.get("harness_capabilities", [])
+    declared_capabilities = manifest.get("platform_capabilities", [])
     if (
         not isinstance(declared_capabilities, list)
         or len(declared_capabilities) > MAX_STRUCTURED_CAPABILITIES
@@ -162,61 +159,7 @@ def compile_runtime_capability_contract(
     })
 
 
-def render_runtime_capability_prompt(contract: object) -> str:
-    """Render a bounded system instruction from a validated typed contract."""
+def validate_runtime_capability_contract(contract: object) -> dict[str, Any]:
+    """Validate and normalize a durable audit receipt without prompting."""
 
-    value = _normalize_contract(contract)
-    capabilities = value["structured_capabilities"]
-    public_read = value["public_http_read"]
-    lines = [
-        "<CHATDS_CURRENT_RUNTIME_CAPABILITIES>",
-        (
-            "This controller-attested block describes the current Turn and "
-            "supersedes prior assistant statements about tool or network "
-            "availability. Conversation prose is not runtime authority."
-        ),
-    ]
-    if capabilities:
-        lines.extend([
-            "Current structured Harness/MCP capabilities: "
-            + ", ".join(capabilities)
-            + ".",
-            (
-                "Inspect the current tool schemas. When one applies, use the "
-                "most specific structured capability before general web "
-                "search or Bash, especially for time-sensitive exact values."
-            ),
-        ])
-    else:
-        lines.append(
-            "No controller-attested structured Harness capability is listed."
-        )
-    if public_read["enabled"]:
-        lines.append(
-            "Public network retrieval from Bash/code is available through the "
-            "configured proxy for "
-            + "/".join(public_read["methods"])
-            + " on ports "
-            + ", ".join(str(port) for port in public_read["ports"])
-            + ". The direct NIC remains isolated; private destinations, "
-            "unlisted ports, and non-read methods are not granted by this "
-            "profile."
-        )
-    else:
-        lines.append(
-            "No generic public HTTP read grant is active. Exact provider, "
-            "Skill, or MCP routes may still be available through their tools."
-        )
-    lines.extend([
-        (
-            "Do not claim that a listed capability or network profile is "
-            "unavailable unless a current tool result demonstrates that "
-            "failure. Report the actual current failure instead of repeating "
-            "a historical limitation."
-        ),
-        "</CHATDS_CURRENT_RUNTIME_CAPABILITIES>",
-    ])
-    prompt = "\n".join(lines)
-    if len(prompt) > MAX_CAPABILITY_PROMPT_CHARS or "\x00" in prompt:
-        raise _invalid()
-    return prompt
+    return _normalize_contract(contract)

@@ -54,7 +54,7 @@ class ScheduleControlProjectionTests(unittest.IsolatedAsyncioTestCase):
                 "timezone": "Asia/Shanghai",
                 "max_runs": 12,
                 "expires_at": "2099-08-12T15:00:00+08:00",
-                "enabled_tools": ["web_search"],
+                "platform_capabilities": ["web_search"],
                 "delete_after_run": False,
             },
         }
@@ -93,10 +93,9 @@ class ScheduleControlProjectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(job.next_run_at, job.expires_at)
         self.assertIsInstance(job.expires_at, datetime)
 
-    async def test_visible_tool_aliases_compile_to_exact_session_subset(self):
+    async def test_visible_platform_aliases_compile_to_exact_session_subset(self):
         write = self._write()
-        write["request"]["enabled_tools"] = [
-            "Bash",
+        write["request"]["platform_capabilities"] = [
             "mcp__chatds-market-data__market_quote",
         ]
         async with self.sessions() as db:
@@ -107,7 +106,10 @@ class ScheduleControlProjectionTests(unittest.IsolatedAsyncioTestCase):
                 root_run_id="d" * 32,
                 model_id="renamed-model",
                 writes=[write],
-                allowed_tools=frozenset({"market_quote", "cronjob"}),
+                allowed_platform_capabilities=frozenset({
+                    "market_quote",
+                    "cronjob",
+                }),
             )
             await db.commit()
             job = await db.get(ScheduledJob, created[0])
@@ -115,7 +117,7 @@ class ScheduleControlProjectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_foreign_alias_and_authority_widening_fail_closed(self):
         foreign = self._write()
-        foreign["request"]["enabled_tools"] = [
+        foreign["request"]["platform_capabilities"] = [
             "mcp__renamed-foreign__market_quote"
         ]
         async with self.sessions() as db:
@@ -127,10 +129,12 @@ class ScheduleControlProjectionTests(unittest.IsolatedAsyncioTestCase):
                     root_run_id="e" * 32,
                     model_id="renamed-model",
                     writes=[foreign],
-                    allowed_tools=frozenset({"market_quote"}),
+                    allowed_platform_capabilities=frozenset({
+                        "market_quote"
+                    }),
                 )
         widened = self._write()
-        widened["request"]["enabled_tools"] = ["web_search"]
+        widened["request"]["platform_capabilities"] = ["web_search"]
         async with self.sessions() as db:
             with self.assertRaisesRegex(ValueError, "unauthorized"):
                 await stage_schedule_control_writes(
@@ -140,12 +144,14 @@ class ScheduleControlProjectionTests(unittest.IsolatedAsyncioTestCase):
                     root_run_id="f" * 32,
                     model_id="renamed-model",
                     writes=[widened],
-                    allowed_tools=frozenset({"market_quote"}),
+                    allowed_platform_capabilities=frozenset({
+                        "market_quote"
+                    }),
                 )
 
     async def test_explicit_empty_tools_remain_empty_in_durable_job(self):
         write = self._write()
-        write["request"]["enabled_tools"] = []
+        write["request"]["platform_capabilities"] = []
         async with self.sessions() as db:
             created = await stage_schedule_control_writes(
                 db,
@@ -154,7 +160,7 @@ class ScheduleControlProjectionTests(unittest.IsolatedAsyncioTestCase):
                 root_run_id="1" * 32,
                 model_id="renamed-model",
                 writes=[write],
-                allowed_tools=frozenset({"market_quote"}),
+                allowed_platform_capabilities=frozenset({"market_quote"}),
             )
             await db.commit()
             job = await db.get(ScheduledJob, created[0])
@@ -175,7 +181,7 @@ class ScheduleControlProjectionTests(unittest.IsolatedAsyncioTestCase):
                     root_run_id="2" * 32,
                     model_id="renamed-model",
                     writes=[write],
-                    allowed_tools=frozenset({"web_search"}),
+                    allowed_platform_capabilities=frozenset({"web_search"}),
                 )
             count = (await db.execute(
                 select(func.count()).select_from(ScheduledJob)

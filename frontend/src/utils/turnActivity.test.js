@@ -137,6 +137,32 @@ test('approval decision updates the original pending card', () => {
   assert.equal(nodes[0].payload.request_seq, 9)
 })
 
+test('native question decision preserves the exact projected question card', () => {
+  const questions = [{
+    question: 'Which museum wing should be audited?',
+    header: 'Wing',
+    multi_select: false,
+    options: [
+      { label: 'East', description: 'East wing' },
+      { label: 'West', description: 'West wing' },
+    ],
+  }]
+  const nodes = reduceTurnActivities([
+    event(10, 'approval:question', 'approval', {
+      request_id: 'museum-question', request_seq: 90, status: 'pending',
+      interaction_kind: 'question', questions,
+    }),
+    event(11, 'approval:question', 'approval', {
+      request_id: 'museum-question', status: 'allowed',
+      interaction_kind: 'question',
+    }),
+  ])
+  assert.equal(nodes.length, 1)
+  assert.equal(nodes[0].payload.status, 'allowed')
+  assert.equal(nodes[0].payload.request_seq, 90)
+  assert.deepEqual(nodes[0].payload.questions, questions)
+})
+
 test('root-scoped incremental replay advances without replacing prior nodes', () => {
   const initial = attachTurnActivities([{
     role: 'assistant', durableRunPlaceholder: true, rootRunId: 'root',

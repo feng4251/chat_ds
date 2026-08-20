@@ -40,6 +40,46 @@ def _bounded(value: object, limit: int = _LABEL_LIMIT) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def _safe_questions(value: object) -> list[dict[str, Any]] | None:
+    if not isinstance(value, list) or not 1 <= len(value) <= 4:
+        return None
+    result: list[dict[str, Any]] = []
+    observed_questions: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, Mapping):
+            return None
+        question = _bounded(raw.get("question"), 4_000)
+        options = raw.get("options")
+        if (
+            not question
+            or question in observed_questions
+            or not isinstance(options, list)
+            or not 2 <= len(options) <= 4
+        ):
+            return None
+        observed_questions.add(question)
+        safe_options: list[dict[str, str]] = []
+        observed_labels: set[str] = set()
+        for option in options:
+            if not isinstance(option, Mapping):
+                return None
+            label = _bounded(option.get("label"), 256)
+            if not label or label in observed_labels:
+                return None
+            observed_labels.add(label)
+            safe_options.append({
+                "label": label,
+                "description": _bounded(option.get("description"), 2_000),
+            })
+        result.append({
+            "question": question,
+            "header": _bounded(raw.get("header"), 256),
+            "multi_select": raw.get("multi_select") is True,
+            "options": safe_options,
+        })
+    return result
+
+
 def safe_agent_event(value: Mapping[str, Any]) -> dict[str, Any]:
     """Allowlist a normalized lifecycle event for browser presentation.
 
@@ -210,6 +250,14 @@ class TurnActivityBuilder:
         for key in ("tool_name", "title", "description", "decision_reason"):
             if details.get(key) is not None:
                 payload[key] = _bounded(details[key], 2_000)
+        interaction_kind = str(details.get("interaction_kind") or "approval")
+        if interaction_kind == "question":
+            questions = _safe_questions(details.get("questions"))
+            if questions is not None:
+                payload["interaction_kind"] = "question"
+                payload["questions"] = questions
+        elif interaction_kind == "user_action":
+            payload["interaction_kind"] = "user_action"
         request_seq = details.get("request_seq")
         if isinstance(request_seq, int) and request_seq > 0:
             payload["request_seq"] = request_seq

@@ -13,8 +13,21 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
-from .skill_contracts import SkillContractError, compile_skill_contract
-from native_tools import LEGACY_CLAUDE_SCHEDULE_TOOL_ALIASES
+from .skill_contracts import (
+    SkillContractError,
+    compile_skill_contract,
+    compile_skill_workflows,
+    compile_skill_workers,
+)
+from native_tools import (
+    PLATFORM_IO_CAPABILITY_SET,
+    SCHEDULE_PLATFORM_CAPABILITY_ALIASES,
+)
+from native_mcp import (
+    NativeMCPError,
+    normalize_mcp_declaration,
+    normalize_mcp_name,
+)
 
 
 MAX_SKILL_VIEW_FILES = 8_192
@@ -23,7 +36,6 @@ MAX_SKILL_VIEW_FILE_BYTES = 64 * 1024 * 1024
 MAX_SKILL_MCP_SERVERS = 128
 MAX_SKILL_MCP_CONFIG_BYTES = 2 * 1024 * 1024
 CLAUDE_SKILL_PLUGIN_NAME = "chatds-session-skills"
-CLAUDE_SKILL_ENTRYPOINT_NAME = "chatds-harness-session-entry"
 
 
 class SkillViewError(RuntimeError):
@@ -95,17 +107,14 @@ def materialize_claude_skill_view(
     *,
     session_root: Path,
     sources: Iterable[SkillViewSource],
-    enabled_tools: Iterable[str] = (),
+    platform_capabilities: Iterable[str] = (),
+    session_mcp_servers: dict[str, dict[str, Any]] | None = None,
     web_search_url: str = "",
     market_data_url: str = "",
 ) -> ClaudeSkillView:
     """Publish one immutable plugin tree or reuse its verified digest path."""
 
     source_rows = tuple(sources)
-    if any(source.name == CLAUDE_SKILL_ENTRYPOINT_NAME for source in source_rows):
-        raise SkillViewError(
-            f"Skill name '{CLAUDE_SKILL_ENTRYPOINT_NAME}' is reserved by the Harness"
-        )
     selected_primary_skill_names = tuple(
         source.name
         for source in source_rows
@@ -124,6 +133,8 @@ def materialize_claude_skill_view(
     artifact_contracts: list[dict[str, Any]] = []
     runtime_requirements: list[dict[str, Any]] = []
     skill_diagnostics: list[dict[str, str]] = []
+    worker_agents: list[dict[str, str]] = []
+    workflow_routes: list[dict[str, Any]] = []
     file_rows: list[dict[str, Any]] = []
     total_bytes = 0
     try:
@@ -135,13 +146,26 @@ def materialize_claude_skill_view(
             if not any(path.as_posix() == "SKILL.md" for path in relative_files):
                 raise SkillViewError(f"Skill '{source.name}' has no regular SKILL.md")
             try:
-                artifact_contract, requirements, diagnostics = (
-                    compile_skill_contract(
+                artifact_contract, requirements, diagnostics = compile_skill_contract(
+                    skill_name=source.name,
+                    root=root,
+                    relative_files=relative_files,
+                    primary=source.bundle_role != "supporting",
+                )
+                workers = compile_skill_workers(
+                    skill_name=source.name,
+                    root=root,
+                    relative_files=relative_files,
+                )
+                workflows = (
+                    compile_skill_workflows(
                         skill_name=source.name,
                         root=root,
                         relative_files=relative_files,
-                        primary=source.bundle_role != "supporting",
+                        workers=workers,
                     )
+                    if source.bundle_role != "supporting"
+                    else []
                 )
             except SkillContractError as exc:
                 raise SkillViewError(str(exc)) from exc
@@ -177,6 +201,70 @@ def materialize_claude_skill_view(
                 "bundle_role": source.bundle_role,
                 "files": skill_files,
             })
+            if workers:
+                agents_root = plugin / "agents" / source.name
+                agents_root.mkdir(parents=True, mode=0o700)
+            for worker in workers:
+                if len(file_rows) >= MAX_SKILL_VIEW_FILES:
+                    raise SkillViewError("Skill view file-count limit exceeded")
+                relative_agent_path = (
+                    PurePosixPath("plugin")
+                    / "agents"
+                    / source.name
+                    / f"{worker['worker_id']}.md"
+                )
+                payload = _render_native_worker_agent(worker).encode("utf-8")
+                if len(payload) > MAX_SKILL_VIEW_FILE_BYTES:
+                    raise SkillViewError(
+                        "Generated native worker exceeds the view file limit"
+                    )
+                destination = staging.joinpath(*relative_agent_path.parts)
+                _write_bytes_exclusive(destination, payload)
+                digest = hashlib.sha256(payload).hexdigest()
+                size = len(payload)
+                total_bytes += size
+                if total_bytes > MAX_SKILL_VIEW_BYTES:
+                    raise SkillViewError("Skill view byte limit exceeded")
+                os.chmod(destination, 0o444, follow_symlinks=False)
+                file_rows.append({
+                    "path": relative_agent_path.as_posix(),
+                    "sha256": digest,
+                    "size": size,
+                })
+                worker_agents.append({
+                    "skill_name": source.name,
+                    "worker_id": worker["worker_id"],
+                    "source_path": worker["source_path"],
+                    "agent_path": relative_agent_path.as_posix(),
+                    "native_agent_type": (
+                        f"{CLAUDE_SKILL_PLUGIN_NAME}:{source.name}:"
+                        f"{worker['worker_id']}"
+                    ),
+                })
+            for workflow in workflows:
+                workflow_routes.append({
+                    **{
+                        key: value
+                        for key, value in workflow.items()
+                        if key != "phases"
+                    },
+                    "phases": [
+                        {
+                            "mode": phase["mode"],
+                            "workers": [
+                                {
+                                    "worker_id": worker_id,
+                                    "native_agent_type": (
+                                        f"{CLAUDE_SKILL_PLUGIN_NAME}:"
+                                        f"{source.name}:{worker_id}"
+                                    ),
+                                }
+                                for worker_id in phase["worker_ids"]
+                            ],
+                        }
+                        for phase in workflow["phases"]
+                    ],
+                })
 
         # Installed Skills remain available to Claude's native description-
         # based Skill router. Do not prepend a synthetic slash command: doing
@@ -188,6 +276,19 @@ def materialize_claude_skill_view(
             sources=source_rows,
             plugin_root=plugin,
         )
+        for raw_name, raw_config in sorted(
+            (session_mcp_servers or {}).items()
+        ):
+            try:
+                name = normalize_mcp_name(raw_name)
+                normalized_config = normalize_mcp_declaration(raw_config)
+            except NativeMCPError as exc:
+                raise SkillViewError(str(exc)) from exc
+            if name in mcp_servers:
+                raise SkillViewError(
+                    f"Duplicate explicit MCP server identity: {name}"
+                )
+            mcp_servers[name] = normalized_config
         if any(
             row.get("persistent_stdin_process") is True
             for row in runtime_requirements
@@ -195,27 +296,31 @@ def materialize_claude_skill_view(
             server_name = "chatds-process"
             if server_name in mcp_servers:
                 raise SkillViewError(
-                    "Explicit Skill MCP identity conflicts with Harness capability"
+                    "Explicit Skill MCP identity conflicts with platform capability"
                 )
             mcp_servers[server_name] = {
                 "type": "stdio",
                 "command": "/usr/local/bin/python",
                 "args": ["-I", "-m", "claude_runner.mcp_process"],
             }
-        harness_egress_rules: list[dict[str, Any]] = []
-        harness_capabilities: list[str] = []
-        schedule_tool_aliases: dict[str, str | None] = {}
-        enabled_tool_names = {
-            str(name) for name in enabled_tools if isinstance(name, str)
+        platform_egress_rules: list[dict[str, Any]] = []
+        projected_platform_capabilities: list[str] = []
+        schedule_capability_aliases: dict[str, str] = {}
+        enabled_platform_capabilities = {
+            str(name)
+            for name in platform_capabilities
+            if isinstance(name, str)
         }
-        if "web_search" in enabled_tool_names:
-            normalized_search_url = _normalize_harness_web_search_url(
+        if enabled_platform_capabilities - PLATFORM_IO_CAPABILITY_SET:
+            raise SkillViewError("Unknown platform I/O capability")
+        if "web_search" in enabled_platform_capabilities:
+            normalized_search_url = _normalize_platform_web_search_url(
                 web_search_url
             )
             server_name = "chatds-web-search"
             if server_name in mcp_servers:
                 raise SkillViewError(
-                    "Explicit Skill MCP identity conflicts with Harness capability"
+                    "Explicit Skill MCP identity conflicts with platform capability"
                 )
             mcp_servers[server_name] = {
                 "type": "stdio",
@@ -223,19 +328,19 @@ def materialize_claude_skill_view(
                 "args": ["-I", "-m", "claude_runner.mcp_web_search"],
                 "env": {"CHATDS_SEARXNG_SEARCH_URL": normalized_search_url},
             }
-            harness_egress_rules.append({
+            platform_egress_rules.append({
                 "capability": "web_search",
                 "url_prefix": normalized_search_url,
                 "methods": ["GET"],
             })
-        if "market_quote" in enabled_tool_names:
-            normalized_market_url = _normalize_harness_market_data_url(
+        if "market_quote" in enabled_platform_capabilities:
+            normalized_market_url = _normalize_platform_market_data_url(
                 market_data_url
             )
             server_name = "chatds-market-data"
             if server_name in mcp_servers:
                 raise SkillViewError(
-                    "Explicit Skill MCP identity conflicts with Harness capability"
+                    "Explicit Skill MCP identity conflicts with platform capability"
                 )
             mcp_servers[server_name] = {
                 "type": "stdio",
@@ -243,44 +348,45 @@ def materialize_claude_skill_view(
                 "args": ["-I", "-m", "claude_runner.mcp_market_data"],
                 "env": {"CHATDS_MARKET_DATA_URL": normalized_market_url},
             }
-            harness_egress_rules.append({
+            platform_egress_rules.append({
                 "capability": "market_quote",
                 "url_prefix": normalized_market_url,
                 "methods": ["GET"],
             })
-        if "cronjob" in enabled_tool_names:
+        if "cronjob" in enabled_platform_capabilities:
             # The job store uses canonical ChatDS capability names, while the
             # model sees native and MCP-qualified names. Compile their exact
             # translation into this immutable view so every later boundary
             # consumes the same capability vocabulary.
-            schedule_tool_aliases.update({
-                name: name for name in sorted(enabled_tool_names)
+            schedule_capability_aliases.update({
+                name: name
+                for name in sorted(enabled_platform_capabilities)
             })
-            schedule_tool_aliases.update({
+            schedule_capability_aliases.update({
                 alias: canonical
                 for alias, canonical
-                in LEGACY_CLAUDE_SCHEDULE_TOOL_ALIASES.items()
-                if canonical is None or canonical in enabled_tool_names
+                in SCHEDULE_PLATFORM_CAPABILITY_ALIASES.items()
+                if canonical in enabled_platform_capabilities
             })
             server_name = "chatds-schedule"
             if server_name in mcp_servers:
                 raise SkillViewError(
-                    "Explicit Skill MCP identity conflicts with Harness capability"
+                    "Explicit Skill MCP identity conflicts with platform capability"
                 )
             mcp_servers[server_name] = {
                 "type": "stdio",
                 "command": "/usr/local/bin/python",
                 "args": ["-I", "-m", "claude_runner.mcp_schedule_control"],
                 "env": {
-                    "CHATDS_SCHEDULE_TOOL_ALIASES_JSON": json.dumps(
-                        dict(sorted(schedule_tool_aliases.items())),
+                    "CHATDS_SCHEDULE_CAPABILITY_ALIASES_JSON": json.dumps(
+                        dict(sorted(schedule_capability_aliases.items())),
                         ensure_ascii=False,
                         sort_keys=True,
                         separators=(",", ":"),
                     ),
                 },
             }
-            harness_capabilities.append("schedule_control")
+            projected_platform_capabilities.append("schedule_control")
         if len(mcp_servers) > MAX_SKILL_MCP_SERVERS:
             raise SkillViewError("Compiled MCP server-count limit exceeded")
         mcp_config_path = plugin / ".mcp.json"
@@ -316,14 +422,16 @@ def materialize_claude_skill_view(
             "selected_primary_skill_names": list(
                 selected_primary_skill_names
             ),
-            "harness_egress_rules": harness_egress_rules,
-            "harness_capabilities": sorted(harness_capabilities),
-            "schedule_tool_aliases": dict(
-                sorted(schedule_tool_aliases.items())
+            "platform_egress_rules": platform_egress_rules,
+            "platform_capabilities": sorted(projected_platform_capabilities),
+            "schedule_capability_aliases": dict(
+                sorted(schedule_capability_aliases.items())
             ),
             "artifact_contracts": artifact_contracts,
             "runtime_requirements": runtime_requirements,
             "skill_diagnostics": skill_diagnostics,
+            "worker_agents": worker_agents,
+            "workflow_routes": workflow_routes,
             "skills": manifest_skills,
             "files": sorted(file_rows, key=lambda row: row["path"]),
         }
@@ -378,7 +486,33 @@ def _safe_component(value: str, *, field: str) -> str:
     return value
 
 
-def _normalize_harness_web_search_url(value: object) -> str:
+def _render_native_worker_agent(worker: dict[str, str]) -> str:
+    skill_name = worker["skill_name"]
+    worker_id = worker["worker_id"]
+    authoritative_path = (
+        "${CLAUDE_PLUGIN_ROOT}/skills/"
+        f"{skill_name}/{worker['source_path']}"
+    )
+    return (
+        "---\n"
+        f"name: {json.dumps(worker_id, ensure_ascii=False)}\n"
+        "description: "
+        f"{json.dumps(worker['description'], ensure_ascii=False)}\n"
+        "skills: "
+        f"{json.dumps([skill_name], ensure_ascii=False)}\n"
+        "model: inherit\n"
+        "---\n\n"
+        "This is a native subagent for a structured worker declared by the "
+        "installed Skill.\n\n"
+        "Read the authoritative worker definition below completely before "
+        "acting:\n\n"
+        f"`{authoritative_path}`\n\n"
+        "Follow that definition exactly. Return its requested output to the "
+        "parent agent through the native Agent lifecycle.\n"
+    )
+
+
+def _normalize_platform_web_search_url(value: object) -> str:
     """Validate the deployment-owned metasearch coordinate."""
 
     from urllib.parse import urlsplit, urlunsplit
@@ -410,7 +544,7 @@ def _normalize_harness_web_search_url(value: object) -> str:
     ))
 
 
-def _normalize_harness_market_data_url(value: object) -> str:
+def _normalize_platform_market_data_url(value: object) -> str:
     """Validate the fixed typed quote-gateway coordinate."""
 
     from urllib.parse import urlsplit, urlunsplit

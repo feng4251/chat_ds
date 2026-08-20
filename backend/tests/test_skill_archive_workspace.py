@@ -190,10 +190,9 @@ def test_json_session_upload_persists_archive_before_canonical_install(tmp_path:
     with (
         patch.object(workspace, "WORKSPACE_ROOT", tmp_path),
         patch.object(skill_router, "SKILLS_DATA_DIR", tmp_path / "skills"),
-        patch.object(skill_router, "_invalidate_skills_cache"),
         patch.object(
             skill_router,
-            "_auto_register_mcp",
+            "_project_skill_mcp",
             new=AsyncMock(return_value={
                 "registered": [],
                 "skipped": [],

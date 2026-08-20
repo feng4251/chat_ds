@@ -31,55 +31,60 @@ MAX_PROMPT_CHARS = 40_000
 MAX_SCHEDULE_CHARS = 256
 MAX_TIMEZONE_CHARS = 64
 MAX_RUNS = 10_000
-MAX_ENABLED_TOOLS = 64
-_SAFE_TOOL = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$")
-SCHEDULE_TOOL_ALIASES_ENV = "CHATDS_SCHEDULE_TOOL_ALIASES_JSON"
+MAX_PLATFORM_CAPABILITIES = 16
+_SAFE_CAPABILITY = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$")
+SCHEDULE_CAPABILITY_ALIASES_ENV = (
+    "CHATDS_SCHEDULE_CAPABILITY_ALIASES_JSON"
+)
+_DEFAULT_PLATFORM_CAPABILITY_ALIASES = {
+    "web_search": "web_search",
+    "market_quote": "market_quote",
+    "cronjob": "cronjob",
+}
 _ALIASES_UNSET = object()
 
 
-def normalize_schedule_tool_aliases(
+def normalize_schedule_capability_aliases(
     value: object,
-) -> dict[str, str | None]:
-    """Validate a compiler-owned model-visible -> canonical tool map."""
+) -> dict[str, str]:
+    """Validate a compiler-owned model-visible -> platform I/O map."""
 
     if not isinstance(value, dict) or len(value) > 256:
-        raise ValueError("invalid_schedule_tool_aliases")
-    normalized: dict[str, str | None] = {}
+        raise ValueError("invalid_schedule_capability_aliases")
+    normalized: dict[str, str] = {}
     for alias, canonical in value.items():
-        if not isinstance(alias, str) or _SAFE_TOOL.fullmatch(alias) is None:
-            raise ValueError("invalid_schedule_tool_aliases")
-        if canonical is not None and (
+        if not isinstance(alias, str) or _SAFE_CAPABILITY.fullmatch(alias) is None:
+            raise ValueError("invalid_schedule_capability_aliases")
+        if (
             not isinstance(canonical, str)
-            or _SAFE_TOOL.fullmatch(canonical) is None
+            or _SAFE_CAPABILITY.fullmatch(canonical) is None
         ):
-            raise ValueError("invalid_schedule_tool_aliases")
+            raise ValueError("invalid_schedule_capability_aliases")
         normalized[alias] = canonical
     return dict(sorted(normalized.items()))
 
 
-def schedule_tool_aliases_from_environment() -> dict[str, str | None] | None:
-    raw = os.environ.get(SCHEDULE_TOOL_ALIASES_ENV)
+def schedule_capability_aliases_from_environment() -> dict[str, str]:
+    raw = os.environ.get(SCHEDULE_CAPABILITY_ALIASES_ENV)
     if raw is None:
-        # Rolling compatibility for immutable views compiled before aliases
-        # became part of the content-addressed control contract.
-        return None
+        return dict(_DEFAULT_PLATFORM_CAPABILITY_ALIASES)
     if len(raw.encode("utf-8")) > 32_768:
-        raise ValueError("invalid_schedule_tool_aliases")
+        raise ValueError("invalid_schedule_capability_aliases")
     try:
         value = json.loads(raw)
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise ValueError("invalid_schedule_tool_aliases") from exc
-    return normalize_schedule_tool_aliases(value)
+        raise ValueError("invalid_schedule_capability_aliases") from exc
+    return normalize_schedule_capability_aliases(value)
 
 
 def normalize_schedule_create(
     arguments: object,
     *,
-    tool_aliases: object = _ALIASES_UNSET,
+    capability_aliases: object = _ALIASES_UNSET,
 ) -> dict[str, Any]:
     if not isinstance(arguments, dict) or set(arguments) - {
         "name", "prompt", "schedule", "timezone", "max_runs",
-        "expires_at", "enabled_tools", "delete_after_run",
+        "expires_at", "platform_capabilities", "delete_after_run",
     }:
         raise ValueError("invalid_schedule_request")
     name = arguments.get("name")
@@ -111,37 +116,34 @@ def normalize_schedule_create(
         or len(expires_at) > 64
     ):
         raise ValueError("invalid_schedule_expiry")
-    enabled_tools = arguments.get("enabled_tools")
-    if enabled_tools is not None and (
-        not isinstance(enabled_tools, list)
-        or len(enabled_tools) > MAX_ENABLED_TOOLS
+    platform_capabilities = arguments.get("platform_capabilities")
+    if platform_capabilities is not None and (
+        not isinstance(platform_capabilities, list)
+        or len(platform_capabilities) > MAX_PLATFORM_CAPABILITIES
         or any(
-            not isinstance(value, str) or _SAFE_TOOL.fullmatch(value) is None
-            for value in enabled_tools
+            not isinstance(value, str)
+            or _SAFE_CAPABILITY.fullmatch(value) is None
+            for value in platform_capabilities
         )
-        or len(set(enabled_tools)) != len(enabled_tools)
+        or len(set(platform_capabilities)) != len(platform_capabilities)
     ):
-        raise ValueError("invalid_schedule_tools")
+        raise ValueError("invalid_schedule_platform_capabilities")
     aliases = (
-        schedule_tool_aliases_from_environment()
-        if tool_aliases is _ALIASES_UNSET
-        else (
-            None
-            if tool_aliases is None
-            else normalize_schedule_tool_aliases(tool_aliases)
-        )
+        schedule_capability_aliases_from_environment()
+        if capability_aliases is _ALIASES_UNSET
+        else normalize_schedule_capability_aliases(capability_aliases)
     )
-    if enabled_tools is not None and aliases is not None:
-        canonical_tools: list[str] = []
+    if platform_capabilities is not None:
+        canonical_capabilities: list[str] = []
         observed: set[str] = set()
-        for alias in enabled_tools:
+        for alias in platform_capabilities:
             if alias not in aliases:
-                raise ValueError("invalid_schedule_tools")
+                raise ValueError("invalid_schedule_platform_capabilities")
             canonical = aliases[alias]
-            if canonical is not None and canonical not in observed:
+            if canonical not in observed:
                 observed.add(canonical)
-                canonical_tools.append(canonical)
-        enabled_tools = canonical_tools
+                canonical_capabilities.append(canonical)
+        platform_capabilities = canonical_capabilities
     delete_after_run = arguments.get("delete_after_run", False)
     if type(delete_after_run) is not bool:
         raise ValueError("invalid_schedule_delete_policy")
@@ -152,7 +154,7 @@ def normalize_schedule_create(
         "timezone": timezone.strip(),
         "max_runs": max_runs,
         "expires_at": expires_at.strip() if isinstance(expires_at, str) else None,
-        "enabled_tools": enabled_tools,
+        "platform_capabilities": platform_capabilities,
         "delete_after_run": delete_after_run,
     }
 
@@ -188,10 +190,10 @@ def _accepted_receipt(
     }, ensure_ascii=False, separators=(",", ":"))
 
 
-_COMPILED_TOOL_ALIASES = schedule_tool_aliases_from_environment()
-_ENABLED_TOOL_ITEMS: dict[str, Any] = {"type": "string"}
-if _COMPILED_TOOL_ALIASES is not None:
-    _ENABLED_TOOL_ITEMS["enum"] = sorted(_COMPILED_TOOL_ALIASES)
+_PLATFORM_CAPABILITY_ITEMS: dict[str, Any] = {
+    "type": "string",
+    "enum": sorted(schedule_capability_aliases_from_environment()),
+}
 
 
 TOOLS = [{
@@ -224,15 +226,14 @@ TOOLS = [{
                 "type": "string",
                 "description": "Timezone-aware ISO-8601 upper execution boundary.",
             },
-            "enabled_tools": {
-                "type": "array", "maxItems": MAX_ENABLED_TOOLS,
-                "items": _ENABLED_TOOL_ITEMS,
+            "platform_capabilities": {
+                "type": "array", "maxItems": MAX_PLATFORM_CAPABILITIES,
+                "items": _PLATFORM_CAPABILITY_ITEMS,
                 "uniqueItems": True,
                 "description": (
-                    "Optional subset of the compiler-published ChatDS "
-                    "capability aliases. Native Claude tools such as Bash, "
-                    "Read, and Write are ambient and do not grant a ChatDS "
-                    "capability."
+                    "Optional subset of compiler-published platform I/O "
+                    "capabilities. Native Claude file, shell, Skill, and "
+                    "agent tools are engine-owned and are not selected here."
                 ),
             },
             "delete_after_run": {"type": "boolean", "default": False},

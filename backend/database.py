@@ -61,7 +61,7 @@ _LIGHTWEIGHT_MIGRATIONS = [
     "ALTER TABLE skill_packages ADD COLUMN bundle_source_path VARCHAR(512)",
     "CREATE INDEX IF NOT EXISTS ix_skill_packages_bundle_id ON skill_packages (bundle_id)",
     "ALTER TABLE conversations ADD COLUMN enabled_tools TEXT",
-    "ALTER TABLE conversations ADD COLUMN engine_id VARCHAR(32) NOT NULL DEFAULT 'legacy'",
+    "ALTER TABLE conversations ADD COLUMN engine_id VARCHAR(32) NOT NULL DEFAULT 'claude_code'",
     "ALTER TABLE conversations ADD COLUMN permission_preset VARCHAR(32) NOT NULL DEFAULT 'session_full'",
     "ALTER TABLE conversations ADD COLUMN fallback_model_ids TEXT",
     "ALTER TABLE conversations ADD COLUMN enabled_user_skills TEXT",
@@ -93,7 +93,7 @@ _LIGHTWEIGHT_MIGRATIONS = [
     "ALTER TABLE agent_runs ADD COLUMN requested_tools TEXT",
     "ALTER TABLE agent_runs ADD COLUMN effective_tools TEXT",
     "ALTER TABLE agent_runs ADD COLUMN policy TEXT",
-    "ALTER TABLE agent_runs ADD COLUMN engine_id VARCHAR(32) NOT NULL DEFAULT 'legacy'",
+    "ALTER TABLE agent_runs ADD COLUMN engine_id VARCHAR(32) NOT NULL DEFAULT 'claude_code'",
     "CREATE INDEX IF NOT EXISTS ix_agent_runs_engine_id ON agent_runs (engine_id)",
     "ALTER TABLE agent_runs ADD COLUMN engine_version VARCHAR(64)",
     "ALTER TABLE agent_runs ADD COLUMN native_session_id VARCHAR(128)",
@@ -277,6 +277,63 @@ _USER_OWNED_TABLES = (
     ("custom_model_configs", "user_id"),
     ("conversations", "user_id"),
 )
+
+_ENGINE_IDENTITY_UPGRADE_TABLES = (
+    "conversations",
+    "agent_runs",
+)
+
+
+async def _engine_identity_upgrade_targets(conn) -> frozenset[str]:
+    """Freeze old tables whose rows predate an explicit engine identity.
+
+    A fresh table must inherit the current native default.  Conversely, rows
+    in an already-existing table without ``engine_id`` were produced by the
+    retired executor and must remain honestly attributable to it.  Capturing
+    the distinction before ``create_all``/column migration lets one startup
+    transaction preserve both facts without making Legacy the future default.
+    """
+
+    if conn.dialect.name != "sqlite":
+        return frozenset()
+    targets: set[str] = set()
+    for table_name in _ENGINE_IDENTITY_UPGRADE_TABLES:
+        exists = (await conn.execute(
+            text(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = :table_name"
+            ),
+            {"table_name": table_name},
+        )).scalar_one_or_none()
+        if exists is None:
+            continue
+        columns = {
+            str(row["name"])
+            for row in (
+                await conn.execute(text(f'PRAGMA table_info("{table_name}")'))
+            ).mappings().all()
+        }
+        if "engine_id" not in columns:
+            targets.add(table_name)
+    return frozenset(targets)
+
+
+async def _backfill_retired_engine_identity(
+    conn,
+    targets: frozenset[str],
+) -> None:
+    """Attribute only rows frozen before the native engine column existed."""
+
+    if conn.dialect.name != "sqlite":
+        return
+    unknown = targets - frozenset(_ENGINE_IDENTITY_UPGRADE_TABLES)
+    if unknown:
+        raise ValueError("Unknown engine identity migration target")
+    for table_name in _ENGINE_IDENTITY_UPGRADE_TABLES:
+        if table_name in targets:
+            await conn.execute(text(
+                f'UPDATE "{table_name}" SET engine_id = \'legacy\''
+            ))
 
 
 async def _delete_legacy_conversation_orphans(
@@ -1001,12 +1058,19 @@ async def init_db():
                 raise RuntimeError(
                     "SQLite foreign key enforcement is disabled."
                 )
+        engine_identity_upgrade_targets = (
+            await _engine_identity_upgrade_targets(conn)
+        )
         await conn.run_sync(ModelBase.metadata.create_all)
         for sql in _LIGHTWEIGHT_MIGRATIONS:
             try:
                 await conn.execute(text(sql))
             except Exception:
                 pass  # column already exists
+        await _backfill_retired_engine_identity(
+            conn,
+            engine_identity_upgrade_targets,
+        )
         await _repair_legacy_foreign_key_orphans(conn)
         await _ensure_skill_package_scope_identity(conn)
         await _ensure_agent_run_event_identity(conn)

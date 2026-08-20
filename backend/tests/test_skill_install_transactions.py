@@ -119,10 +119,9 @@ class SkillInstallTransactionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(conv_router, "SANDBOX_BASE", self.workspace_root),
             patch.object(
                 skill_router,
-                "_auto_register_mcp",
+                "_project_skill_mcp",
                 new=AsyncMock(side_effect=lambda *_args, **_kwargs: _empty_mcp()),
             ),
-            patch.object(skill_router, "_invalidate_skills_cache"),
         )
         for active_patch in self.patches:
             active_patch.start()

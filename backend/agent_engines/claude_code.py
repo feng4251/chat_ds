@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import asyncio
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from typing import Any
 
 import httpx
@@ -97,10 +97,8 @@ class ClaudeCodeEngine:
             "conversation_id": request.conversation_id,
             "model_id": request.model_id,
             "api_model": request.api_model,
-            # This is an explicit deployment binding, not the broad provider
-            # family used by Legacy Harness routing.  A model becomes Claude
-            # compatible only when its catalog row names one configured
-            # Supervisor profile.
+            # A model becomes Claude-compatible only when its catalog row
+            # names one configured Supervisor profile.
             "provider_profile": str(
                 provider.get("claude_provider_profile") or ""
             ),
@@ -121,7 +119,7 @@ class ClaudeCodeEngine:
             "source": request.source,
             "user_turn_text": str(request.metadata.get("user_turn_text") or ""),
             "permission_preset": str(
-                request.metadata.get("permission_preset") or "session_full"
+                request.metadata.get("permission_preset") or "workspace_write"
             ),
         }
 
@@ -134,6 +132,7 @@ class ClaudeCodeEngine:
         request_id: str,
         request_seq: int,
         decision: str,
+        answers: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         timeout = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
         async with self._client_factory(timeout=timeout) as client:
@@ -145,6 +144,11 @@ class ClaudeCodeEngine:
                     "conversation_id": conversation_id,
                     "request_seq": request_seq,
                     "decision": decision,
+                    **(
+                        {"answers": dict(answers)}
+                        if answers is not None
+                        else {}
+                    ),
                 },
             )
         if response.status_code >= 400:

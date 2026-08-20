@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import stat
 import tempfile
 import threading
 import unittest
@@ -18,15 +19,31 @@ from claude_runner.policy import (
     ClaudeEgressPolicyError,
     compile_turn_egress_policy,
 )
+from claude_runner.native_control import (
+    build_native_updated_input,
+    native_user_interaction_kind,
+)
+from claude_runner.artifact_stop_hook import evaluate_stop_hook
+from claude_runner.native_lifecycle_hook import evaluate_lifecycle_hook
+from claude_runner.native_workflow import (
+    build_workflow_receipt,
+    evaluate_workflow_hook,
+    terminal_workflow_receipt,
+)
 from claude_runner.runner_entrypoint import (
     EventLedger,
     _claude_command,
     _close_stdin_after_native_result,
     _native_checkpoint_exists,
+    _native_transcript_watermark,
+    _native_stream_json_input,
+    _materialize_bound_artifact_stop_contract,
+    _materialize_bound_native_lifecycle_contract,
     _pending_plan_task_count,
     _quarantine_native_cron_state,
     _safe_controller_exception_code,
     _terminal_error,
+    _turn_skill_binding,
     _validate_artifact_contracts,
     _emit_workspace_artifacts,
     _workspace_snapshot,
@@ -58,6 +75,59 @@ def _config(*, resume: bool = False) -> dict:
 
 
 class RunnerCommandContractTests(unittest.TestCase):
+    def test_native_question_answers_bind_to_exact_durable_input(self):
+        museum_input = {
+            "questions": [{
+                "question": "Which gallery should be audited?",
+                "header": "Gallery",
+                "multiSelect": False,
+                "options": [
+                    {"label": "East", "description": "Audit the east wing"},
+                    {"label": "West", "description": "Audit the west wing"},
+                ],
+            }],
+            "metadata": {"source": "renamed-domain"},
+        }
+        self.assertEqual(
+            native_user_interaction_kind("AskUserQuestion", museum_input),
+            "question",
+        )
+        updated = build_native_updated_input(
+            tool_name="AskUserQuestion",
+            native_input=museum_input,
+            answers={"Which gallery should be audited?": "East"},
+        )
+        self.assertEqual(
+            updated["answers"],
+            {"Which gallery should be audited?": "East"},
+        )
+        self.assertEqual(updated["metadata"], museum_input["metadata"])
+
+        with self.assertRaisesRegex(ValueError, "answers_invalid"):
+            build_native_updated_input(
+                tool_name="AskUserQuestion",
+                native_input=museum_input,
+                answers={"Which factory line should be audited?": "Line A"},
+            )
+
+        mutated = {
+            "questions": [{
+                "question": "Which factory line should be audited?",
+                "header": "Line",
+                "options": [
+                    {"label": "Line A", "description": "First line"},
+                    {"label": "Line A", "description": "Duplicate label"},
+                ],
+            }],
+        }
+        self.assertIsNone(
+            native_user_interaction_kind("AskUserQuestion", mutated)
+        )
+        self.assertEqual(
+            native_user_interaction_kind("ExitPlanMode", {"plan": "# Plan"}),
+            "user_action",
+        )
+
     def test_interactive_stream_input_closes_only_after_native_result(self):
         with tempfile.TemporaryDirectory() as temporary:
             ledger = EventLedger(Path(temporary) / "events.jsonl")
@@ -105,6 +175,85 @@ class RunnerCommandContractTests(unittest.TestCase):
         self.assertEqual(readonly[readonly.index("--permission-mode") + 1], "plan")
         for command in (full, writable, readonly):
             self.assertEqual(command[command.index("--tools") + 1], "default")
+            self.assertEqual(
+                command[command.index("--permission-prompt-tool") + 1],
+                "stdio",
+            )
+
+    def test_immutable_skill_resources_are_a_native_read_root_in_every_tier(self):
+        for permission_preset in (
+            "read_only",
+            "workspace_write",
+            "session_full",
+        ):
+            with self.subTest(permission_preset=permission_preset):
+                command, _ = _claude_command({
+                    **_config(),
+                    "permission_preset": permission_preset,
+                })
+                self.assertIn("--add-dir", command)
+                self.assertEqual(
+                    command[command.index("--add-dir") + 1],
+                    "/skill-view/plugin/skills",
+                )
+                self.assertNotIn("/state", command)
+
+    def test_missing_permission_is_native_confirmation_not_full_access(self):
+        command, _ = _claude_command(_config())
+        self.assertNotIn("--dangerously-skip-permissions", command)
+        self.assertEqual(
+            command[command.index("--permission-mode") + 1],
+            "default",
+        )
+        self.assertEqual(
+            command[command.index("--permission-prompt-tool") + 1],
+            "stdio",
+        )
+
+    def test_fresh_session_primary_uses_native_skill_command_lowering(self):
+        config = {
+            **_config(),
+            "prompt": "Audit the renamed museum collection",
+            "turn_skill_binding": {
+                "skill_name": "museum-provenance",
+                "source": "fresh_session_primary",
+            },
+        }
+        command, encoded = _claude_command(config)
+        envelope = json.loads(encoded)
+        self.assertEqual(
+            envelope["message"]["content"][0]["text"],
+            "/chatds-session-skills:museum-provenance "
+            "Audit the renamed museum collection",
+        )
+        self.assertNotIn("--append-system-prompt", command)
+        self.assertEqual(
+            _turn_skill_binding(config),
+            ("museum-provenance", "fresh_session_primary"),
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError, "turn_skill_binding_invalid"
+        ):
+            _native_stream_json_input(
+                {
+                    **_config(resume=True),
+                    "turn_skill_binding": config["turn_skill_binding"],
+                },
+                workspace_root=Path("/workspace"),
+            )
+
+        renamed_mutation = {
+            **config,
+            "turn_skill_binding": {
+                "skill_name": "warehouse planner",
+                "source": "fresh_session_primary",
+            },
+        }
+        with self.assertRaisesRegex(
+            RuntimeError, "turn_skill_binding_invalid"
+        ):
+            _turn_skill_binding(renamed_mutation)
 
     def test_only_static_bridge_failures_receive_durable_diagnostic_codes(self):
         self.assertEqual(
@@ -148,12 +297,7 @@ class RunnerCommandContractTests(unittest.TestCase):
             "/skill-view/plugin/.mcp.json",
         )
         self.assertEqual(command[command.index("--tools") + 1], "default")
-        capability_prompt = command[
-            command.index("--append-system-prompt") + 1
-        ]
-        self.assertIn("renamed_lookup", capability_prompt)
-        self.assertIn("supersedes", capability_prompt)
-        self.assertNotEqual(capability_prompt, fresh["prompt"])
+        self.assertNotIn("--append-system-prompt", command)
         self.assertEqual(
             command[command.index("--disallowedTools") + 1],
             "CronCreate,CronDelete,CronList,WebFetch,WebSearch",
@@ -169,7 +313,7 @@ class RunnerCommandContractTests(unittest.TestCase):
         )
         self.assertIn("--fork-session", command)
         self.assertEqual(command[command.index("--session-id") + 1], resumed["native_session_id"])
-        self.assertIn("--append-system-prompt", command)
+        self.assertNotIn("--append-system-prompt", command)
 
         native_web = {**fresh, "native_web_tools": True}
         command, _ = _claude_command(native_web)
@@ -400,6 +544,29 @@ class RunnerCommandContractTests(unittest.TestCase):
             )
             ledger.close()
 
+    def test_workflow_receipt_failure_precedes_artifact_audit_at_terminal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = EventLedger(Path(temporary) / "events.jsonl")
+            ledger.append_line(
+                b'{"type":"result","subtype":"success","is_error":false}',
+                channel="stdout",
+            )
+            self.assertEqual(
+                _terminal_error(
+                    termination_reason=None,
+                    exit_code=0,
+                    ledger=ledger,
+                    checkpoint_ready=True,
+                    egress_receipt={"exhausted": False},
+                    pending_plan_task_count=0,
+                    pending_native_task_count=0,
+                    workflow_contract_passed=False,
+                    artifact_contract_passed=False,
+                ),
+                "workflow_contract_failed",
+            )
+            ledger.close()
+
     def test_native_subtask_lifecycle_and_plan_tasks_are_diagnostic_only(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -453,6 +620,415 @@ class RunnerCommandContractTests(unittest.TestCase):
                 _pending_plan_task_count(root / "tasks", native_session_id),
                 0,
             )
+
+    def test_mandatory_worker_receipts_gate_fan_in_and_allow_retry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            project = projects / "-workspace"
+            project.mkdir(parents=True)
+            native_session_id = str(uuid.uuid4())
+            (project / f"{native_session_id}.jsonl").write_text(
+                "{}\n", encoding="utf-8"
+            )
+            subagents = project / native_session_id / "subagents"
+            subagents.mkdir(parents=True)
+            contract = {
+                "schema": "chatds.skill-workflow-contract.v1",
+                "skill_name": "warehouse-audit",
+                "route_id": "full_inventory_review",
+                "source_path": "orchestration/orchestrator.yaml",
+                "priority": 7,
+                "matched_pattern_index": 0,
+                "route_sha256": "a" * 64,
+                "phases": [
+                    {
+                        "mode": "parallel",
+                        "workers": [
+                            {
+                                "worker_id": "stock-auditor",
+                                "native_agent_type": (
+                                    "chatds-session-skills:warehouse-audit:"
+                                    "stock-auditor"
+                                ),
+                            },
+                            {
+                                "worker_id": "ledger-reviewer",
+                                "native_agent_type": (
+                                    "chatds-session-skills:warehouse-audit:"
+                                    "ledger-reviewer"
+                                ),
+                            },
+                        ],
+                    },
+                    {
+                        "mode": "sequential",
+                        "workers": [{
+                            "worker_id": "signoff-reviewer",
+                            "native_agent_type": (
+                                "chatds-session-skills:warehouse-audit:"
+                                "signoff-reviewer"
+                            ),
+                        }],
+                    },
+                ],
+            }
+            receipt_path = root / "workflow-receipt.json"
+            ledger = EventLedger(root / "events.jsonl")
+            ledger.bind_native_task_state(
+                projects_root=projects,
+                native_session_id=native_session_id,
+            )
+            ledger.bind_workflow_contract(
+                contract=contract,
+                receipt_path=receipt_path,
+            )
+
+            def start(task_id: str, tool_id: str, agent_type: str) -> None:
+                ledger.append_line(json.dumps({
+                    "type": "system",
+                    "subtype": "task_started",
+                    "task_id": task_id,
+                    "task_type": "local_agent",
+                    "tool_use_id": tool_id,
+                    "session_id": native_session_id,
+                    "subagent_type": agent_type,
+                }).encode(), channel="stdout")
+
+            def finish(
+                task_id: str,
+                tool_id: str,
+                agent_type: str,
+                *,
+                api_error: bool = False,
+            ) -> None:
+                (subagents / f"agent-{task_id}.meta.json").write_text(
+                    json.dumps({
+                        "agentType": agent_type,
+                        "description": "generic fixture",
+                        "toolUseId": tool_id,
+                    }),
+                    encoding="utf-8",
+                )
+                record = {
+                    "type": "assistant",
+                    "agentId": task_id,
+                    "sessionId": native_session_id,
+                    "message": {
+                        "stop_reason": (
+                            "stop_sequence" if api_error else "end_turn"
+                        ),
+                        "content": [{
+                            "type": "text",
+                            "text": (
+                                "API Error: disconnected"
+                                if api_error else "Completed evidence review."
+                            ),
+                        }],
+                    },
+                    **(
+                        {"isApiErrorMessage": True, "error": "unknown"}
+                        if api_error else {}
+                    ),
+                }
+                (subagents / f"agent-{task_id}.jsonl").write_text(
+                    json.dumps(record) + "\n", encoding="utf-8"
+                )
+                ledger.append_line(json.dumps({
+                    "type": "system",
+                    "subtype": "task_updated",
+                    "task_id": task_id,
+                    "patch": {"status": "completed"},
+                }).encode(), channel="stdout")
+
+            stock_type = contract["phases"][0]["workers"][0][
+                "native_agent_type"
+            ]
+            ledger_type = contract["phases"][0]["workers"][1][
+                "native_agent_type"
+            ]
+            signoff_type = contract["phases"][1]["workers"][0][
+                "native_agent_type"
+            ]
+            start("agent-stock", "tool-stock", stock_type)
+            finish("agent-stock", "tool-stock", stock_type)
+            start("agent-ledger-1", "tool-ledger-1", ledger_type)
+            finish(
+                "agent-ledger-1", "tool-ledger-1", ledger_type,
+                api_error=True,
+            )
+            receipt = json.loads(receipt_path.read_text())
+            self.assertEqual(receipt["frontier_index"], 0)
+            self.assertEqual(
+                [worker["status"] for worker in receipt["phases"][0]["workers"]],
+                ["succeeded", "failed"],
+            )
+            self.assertEqual(
+                evaluate_workflow_hook(
+                    hook_input={
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": "Agent",
+                        "tool_use_id": "later-phase",
+                        "tool_input": {"subagent_type": signoff_type},
+                    },
+                    contract=contract,
+                    receipt=receipt,
+                    artifact_contracts=[{
+                        "declared_final_artifact": "{NAME}_FINAL.md",
+                        "declared_modular_files": ["01_*.md"],
+                    }],
+                )["hookSpecificOutput"]["permissionDecision"],
+                "deny",
+            )
+            self.assertEqual(
+                evaluate_workflow_hook(
+                    hook_input={
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": "Write",
+                        "tool_use_id": "early-write",
+                        "tool_input": {
+                            "file_path": "/workspace/output/01_report.md"
+                        },
+                    },
+                    contract=contract,
+                    receipt=receipt,
+                    artifact_contracts=[{
+                        "declared_final_artifact": "{NAME}_FINAL.md",
+                        "declared_modular_files": ["01_*.md"],
+                    }],
+                )["hookSpecificOutput"]["permissionDecision"],
+                "deny",
+            )
+            self.assertEqual(
+                evaluate_workflow_hook(
+                    hook_input={
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": "Agent",
+                        "tool_use_id": "retry",
+                        "tool_input": {"subagent_type": ledger_type},
+                    },
+                    contract=contract,
+                    receipt=receipt,
+                    artifact_contracts=[],
+                ),
+                {},
+            )
+
+            start("agent-ledger-2", "tool-ledger-2", ledger_type)
+            finish("agent-ledger-2", "tool-ledger-2", ledger_type)
+            receipt = json.loads(receipt_path.read_text())
+            self.assertEqual(receipt["frontier_index"], 1)
+            start("agent-signoff", "tool-signoff", signoff_type)
+            finish("agent-signoff", "tool-signoff", signoff_type)
+            receipt = json.loads(receipt_path.read_text())
+            self.assertEqual(receipt["status"], "passed")
+            self.assertEqual(receipt["frontier_index"], 2)
+            self.assertEqual(
+                terminal_workflow_receipt(contract, receipt)["status"],
+                "passed",
+            )
+            self.assertEqual(
+                evaluate_workflow_hook(
+                    hook_input={
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": "Write",
+                        "tool_use_id": "final-write",
+                        "tool_input": {
+                            "file_path": "/workspace/output/01_report.md"
+                        },
+                    },
+                    contract=contract,
+                    receipt=receipt,
+                    artifact_contracts=[{
+                        "declared_final_artifact": "{NAME}_FINAL.md",
+                        "declared_modular_files": ["01_*.md"],
+                    }],
+                ),
+                {},
+            )
+            ledger.close()
+
+    def test_missing_sequential_worker_is_a_machine_terminal_failure(self):
+        contract = {
+            "schema": "chatds.skill-workflow-contract.v1",
+            "skill_name": "museum-provenance-renamed",
+            "route_id": "collection_chain",
+            "source_path": "orchestration/orchestrator.yml",
+            "priority": 4,
+            "matched_pattern_index": 0,
+            "route_sha256": "b" * 64,
+            "phases": [{
+                "mode": "sequential",
+                "workers": [{
+                    "worker_id": "curator-signoff",
+                    "native_agent_type": (
+                        "chatds-session-skills:museum-provenance-renamed:"
+                        "curator-signoff"
+                    ),
+                }],
+            }],
+        }
+        receipt = {
+            "schema": "chatds.native-workflow-receipt.v1",
+            "skill_name": contract["skill_name"],
+            "route_id": contract["route_id"],
+            "route_sha256": contract["route_sha256"],
+            "status": "pending",
+            "frontier_index": 0,
+            "phases": [{
+                "mode": "sequential",
+                "status": "pending",
+                "workers": [{
+                    **contract["phases"][0]["workers"][0],
+                    "status": "missing",
+                    "attempt_count": 0,
+                    "terminal_by_status": {},
+                }],
+            }],
+            "violations": [],
+        }
+        terminal = terminal_workflow_receipt(contract, receipt)
+        self.assertEqual(terminal["status"], "failed")
+        self.assertEqual(
+            terminal["findings"][0]["code"], "workflow_worker_missing"
+        )
+
+    def test_fresh_native_session_binds_before_projects_tree_exists(self):
+        contract = {
+            "schema": "chatds.skill-workflow-contract.v1",
+            "skill_name": "museum-audit-renamed",
+            "route_id": "new_collection_review",
+            "source_path": "orchestration/orchestrator.yml",
+            "priority": 2,
+            "matched_pattern_index": 0,
+            "route_sha256": "e" * 64,
+            "phases": [{
+                "mode": "sequential",
+                "workers": [{
+                    "worker_id": "curator",
+                    "native_agent_type": (
+                        "chatds-session-skills:museum-audit-renamed:curator"
+                    ),
+                }],
+            }],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "state" / "home"
+            home.mkdir(parents=True)
+            projects = home / ".claude" / "projects"
+            self.assertFalse(projects.exists())
+            ledger = EventLedger(root / "events.jsonl")
+            ledger.bind_native_task_state(
+                projects_root=projects,
+                native_session_id=str(uuid.uuid4()),
+            )
+            receipt_path = root / "workflow-receipt.json"
+            ledger.bind_workflow_contract(
+                contract=contract,
+                receipt_path=receipt_path,
+            )
+            self.assertEqual(
+                json.loads(receipt_path.read_text())["frontier_index"], 0
+            )
+            # Claude Code creates the transcript tree on its first write.
+            self.assertFalse(projects.exists())
+            ledger.close()
+
+    def test_terminal_notification_waits_for_durable_subagent_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            project = projects / "-workspace"
+            project.mkdir(parents=True)
+            native_session_id = str(uuid.uuid4())
+            (project / f"{native_session_id}.jsonl").write_text(
+                "{}\n", encoding="utf-8"
+            )
+            subagents = project / native_session_id / "subagents"
+            subagents.mkdir(parents=True)
+            native_agent_type = (
+                "chatds-session-skills:satellite-review:telemetry-reader"
+            )
+            contract = {
+                "schema": "chatds.skill-workflow-contract.v1",
+                "skill_name": "satellite-review",
+                "route_id": "telemetry_chain",
+                "source_path": "orchestration/orchestrator.yaml",
+                "priority": 5,
+                "matched_pattern_index": 0,
+                "route_sha256": "f" * 64,
+                "phases": [{
+                    "mode": "sequential",
+                    "workers": [{
+                        "worker_id": "telemetry-reader",
+                        "native_agent_type": native_agent_type,
+                    }],
+                }],
+            }
+            receipt_path = root / "workflow-receipt.json"
+            ledger = EventLedger(root / "events.jsonl")
+            ledger.bind_native_task_state(
+                projects_root=projects,
+                native_session_id=native_session_id,
+            )
+            ledger.bind_workflow_contract(
+                contract=contract,
+                receipt_path=receipt_path,
+            )
+            ledger.append_line(json.dumps({
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": "telemetry-task",
+                "task_type": "local_agent",
+                "tool_use_id": "telemetry-tool",
+                "session_id": native_session_id,
+                "subagent_type": native_agent_type,
+            }).encode(), channel="stdout")
+
+            # Claude Code deliberately publishes the task status before its
+            # asynchronous transcript write queue is guaranteed durable.
+            ledger.append_line(json.dumps({
+                "type": "system",
+                "subtype": "task_notification",
+                "task_id": "telemetry-task",
+                "status": "completed",
+            }).encode(), channel="stdout")
+            pending = json.loads(receipt_path.read_text())
+            self.assertEqual(
+                pending["phases"][0]["workers"][0]["status"], "running"
+            )
+
+            (subagents / "agent-telemetry-task.meta.json").write_text(
+                json.dumps({
+                    "agentType": native_agent_type,
+                    "description": "generic satellite fixture",
+                    "toolUseId": "telemetry-tool",
+                }),
+                encoding="utf-8",
+            )
+            (subagents / "agent-telemetry-task.jsonl").write_text(
+                json.dumps({
+                    "type": "assistant",
+                    "agentId": "telemetry-task",
+                    "sessionId": native_session_id,
+                    "message": {
+                        "stop_reason": "end_turn",
+                        "content": [{
+                            "type": "text",
+                            "text": "TELEMETRY_RECEIPT=passed",
+                        }],
+                    },
+                }) + "\n",
+                encoding="utf-8",
+            )
+            ledger.append_line(
+                b'{"type":"system","subtype":"status","status":"ready"}',
+                channel="stdout",
+            )
+            settled = json.loads(receipt_path.read_text())
+            self.assertEqual(settled["status"], "passed")
+            ledger.close()
 
     def test_native_cron_file_is_archived_out_of_active_load_path(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -547,7 +1123,6 @@ class RunnerCommandContractTests(unittest.TestCase):
     def test_schedule_receipt_uses_same_compiled_names_at_both_boundaries(self):
         with tempfile.TemporaryDirectory() as temporary:
             aliases = {
-                "Bash": None,
                 "mcp__chatds-market-data__market_quote": "market_quote",
             }
             arguments = {
@@ -555,13 +1130,12 @@ class RunnerCommandContractTests(unittest.TestCase):
                 "prompt": "Report the selected public metric.",
                 "schedule": "every 5m",
                 "timezone": "UTC",
-                "enabled_tools": [
-                    "Bash",
+                "platform_capabilities": [
                     "mcp__chatds-market-data__market_quote",
                 ],
             }
             ledger = EventLedger(Path(temporary) / "events.jsonl")
-            ledger.bind_schedule_tool_aliases(aliases)
+            ledger.bind_schedule_capability_aliases(aliases)
             ledger.append_line(json.dumps({
                 "type": "assistant",
                 "message": {"content": [{
@@ -572,11 +1146,11 @@ class RunnerCommandContractTests(unittest.TestCase):
                 }]},
             }).encode(), channel="stdout")
             from claude_runner.mcp_schedule_control import (
-                SCHEDULE_TOOL_ALIASES_ENV,
+                SCHEDULE_CAPABILITY_ALIASES_ENV,
                 _accepted_receipt,
             )
             with patch.dict(os.environ, {
-                SCHEDULE_TOOL_ALIASES_ENV: json.dumps(aliases),
+                SCHEDULE_CAPABILITY_ALIASES_ENV: json.dumps(aliases),
             }):
                 receipt = _accepted_receipt(arguments)
             ledger.append_line(json.dumps({
@@ -589,7 +1163,9 @@ class RunnerCommandContractTests(unittest.TestCase):
                 }]},
             }).encode(), channel="stdout")
             self.assertEqual(
-                ledger.pending_control_writes[0]["request"]["enabled_tools"],
+                ledger.pending_control_writes[0]["request"][
+                    "platform_capabilities"
+                ],
                 ["market_quote"],
             )
             ledger.close()
@@ -652,6 +1228,187 @@ class RunnerCommandContractTests(unittest.TestCase):
             )
             ledger.close()
 
+    def test_persisted_native_queue_terminal_recovers_renamed_agents(self):
+        for task_id, tool_use_id, project_name in (
+            ("warehouse-audit-77", "tool-warehouse-77", "-warehouse"),
+            ("museum-catalog-91", "tool-museum-91", "-museum"),
+        ):
+            with self.subTest(task_id=task_id), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "projects"
+                native_session_id = str(uuid.uuid4())
+                watermark = _native_transcript_watermark(
+                    root,
+                    native_session_id,
+                )
+                project = root / project_name
+                project.mkdir(parents=True)
+                transcript = project / f"{native_session_id}.jsonl"
+                content = (
+                    "<task-notification>\n"
+                    f"<task-id>{task_id}</task-id>\n"
+                    f"<tool-use-id>{tool_use_id}</tool-use-id>\n"
+                    f"<output-file>/runtime/tasks/{task_id}.output</output-file>\n"
+                    "<status>completed</status>\n"
+                    "<summary>Native worker completed</summary>\n"
+                    "<result>domain text is not lifecycle state</result>\n"
+                    "</task-notification>"
+                )
+                transcript.write_text(json.dumps({
+                    "type": "queue-operation",
+                    "operation": "enqueue",
+                    "sessionId": native_session_id,
+                    "content": content,
+                }) + "\n", encoding="utf-8")
+
+                ledger = EventLedger(Path(temporary) / "events.jsonl")
+                ledger.append_line(json.dumps({
+                    "type": "system",
+                    "subtype": "task_started",
+                    "task_id": task_id,
+                    "tool_use_id": tool_use_id,
+                    "task_type": "local_agent",
+                    "session_id": native_session_id,
+                }).encode(), channel="stdout")
+                ledger.append_line(
+                    b'{"type":"result","subtype":"success","is_error":false}',
+                    channel="stdout",
+                )
+
+                self.assertEqual(ledger.reconcile_native_transcript_queue(
+                    projects_root=root,
+                    native_session_id=native_session_id,
+                    watermark=watermark,
+                ), 1)
+                self.assertEqual(ledger.active_native_task_count, 0)
+                self.assertEqual(
+                    ledger.native_task_summary["reconciled_by"][
+                        "native_transcript_queue"
+                    ],
+                    1,
+                )
+                self.assertEqual(
+                    ledger.native_task_summary["terminal_by_status"],
+                    {"completed": 1},
+                )
+                ledger.close()
+
+    def test_native_queue_recovery_rejects_stale_or_unbound_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "projects"
+            project = root / "-inventory"
+            project.mkdir(parents=True)
+            native_session_id = str(uuid.uuid4())
+            task_id = "inventory-review-5"
+            tool_use_id = "tool-inventory-5"
+            transcript = project / f"{native_session_id}.jsonl"
+            stale_content = (
+                "<task-notification>\n"
+                f"<task-id>{task_id}</task-id>\n"
+                f"<tool-use-id>{tool_use_id}</tool-use-id>\n"
+                f"<output-file>/runtime/tasks/{task_id}.output</output-file>\n"
+                "<status>completed</status>\n"
+                "<summary>Stale terminal</summary>\n"
+                "</task-notification>"
+            )
+            transcript.write_text(json.dumps({
+                "type": "queue-operation",
+                "operation": "enqueue",
+                "sessionId": native_session_id,
+                "content": stale_content,
+            }) + "\n", encoding="utf-8")
+            watermark = _native_transcript_watermark(root, native_session_id)
+            with transcript.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps({
+                    "type": "queue-operation",
+                    "operation": "enqueue",
+                    "sessionId": native_session_id,
+                    "content": stale_content.replace(
+                        tool_use_id,
+                        "tool-unbound-mutation",
+                    ),
+                }) + "\n")
+                stream.write(json.dumps({
+                    "type": "assistant",
+                    "message": {
+                        "stop_reason": "end_turn",
+                        "content": [{
+                            "type": "text",
+                            "text": "I finished the work.",
+                        }],
+                    },
+                }) + "\n")
+
+            ledger = EventLedger(Path(temporary) / "events.jsonl")
+            ledger.append_line(json.dumps({
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": task_id,
+                "tool_use_id": tool_use_id,
+                "task_type": "local_agent",
+                "session_id": native_session_id,
+            }).encode(), channel="stdout")
+            ledger.append_line(
+                b'{"type":"result","subtype":"success","is_error":false}',
+                channel="stdout",
+            )
+
+            self.assertEqual(ledger.reconcile_native_transcript_queue(
+                projects_root=root,
+                native_session_id=native_session_id,
+                watermark=watermark,
+            ), 0)
+            self.assertEqual(ledger.active_native_task_count, 1)
+            ledger.close()
+
+    def test_native_queue_recovery_requires_successful_native_result(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "projects"
+            native_session_id = str(uuid.uuid4())
+            watermark = _native_transcript_watermark(root, native_session_id)
+            project = root / "-lab"
+            project.mkdir(parents=True)
+            task_id = "sample-review-3"
+            tool_use_id = "tool-sample-3"
+            content = (
+                "<task-notification>\n"
+                f"<task-id>{task_id}</task-id>\n"
+                f"<tool-use-id>{tool_use_id}</tool-use-id>\n"
+                f"<output-file>/runtime/tasks/{task_id}.output</output-file>\n"
+                "<status>completed</status>\n"
+                "<summary>Completed</summary>\n"
+                "</task-notification>"
+            )
+            (project / f"{native_session_id}.jsonl").write_text(
+                json.dumps({
+                    "type": "queue-operation",
+                    "operation": "enqueue",
+                    "sessionId": native_session_id,
+                    "content": content,
+                }) + "\n",
+                encoding="utf-8",
+            )
+            ledger = EventLedger(Path(temporary) / "events.jsonl")
+            ledger.append_line(json.dumps({
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": task_id,
+                "tool_use_id": tool_use_id,
+                "task_type": "local_agent",
+                "session_id": native_session_id,
+            }).encode(), channel="stdout")
+            ledger.append_line(
+                b'{"type":"result","subtype":"error_during_execution",'
+                b'"is_error":true}',
+                channel="stdout",
+            )
+            self.assertEqual(ledger.reconcile_native_transcript_queue(
+                projects_root=root,
+                native_session_id=native_session_id,
+                watermark=watermark,
+            ), 0)
+            self.assertEqual(ledger.active_native_task_count, 1)
+            ledger.close()
+
     def test_artifact_contract_is_machine_checked_only_after_skill_receipt(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -689,12 +1446,25 @@ class RunnerCommandContractTests(unittest.TestCase):
                 "artifact_declared_sections_not_met",
                 {finding["code"] for finding in active["findings"]},
             )
+            bound = _validate_artifact_contracts(
+                contracts=contract,
+                invoked_skill_names=frozenset(),
+                bound_skill_name="inventory-audit",
+                before={},
+                after=after,
+                workspace_root=root,
+            )
+            self.assertEqual(bound, active)
 
     def test_artifact_contract_accepts_renamed_cross_domain_package(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            (root / "01_inventory.md").write_text("module\n", encoding="utf-8")
-            report = root / "WAREHOUSE_FULL.md"
+            output = root / "renamed-output"
+            output.mkdir()
+            (output / "01_inventory.md").write_text(
+                "module\n", encoding="utf-8"
+            )
+            report = output / "WAREHOUSE_FULL.md"
             report.write_text("# One\nbody\n## Two\nbody\n", encoding="utf-8")
             after = _workspace_snapshot(root)
             receipt = _validate_artifact_contracts(
@@ -706,12 +1476,274 @@ class RunnerCommandContractTests(unittest.TestCase):
                     "expected_min_lines": 4,
                     "declared_section_count": 2,
                 }],
-                invoked_skill_names=frozenset({"warehouse-planner"}),
+                invoked_skill_names=frozenset(),
+                bound_skill_name="warehouse-planner",
                 before={},
                 after=after,
                 workspace_root=root,
             )
             self.assertEqual(receipt["status"], "passed")
+
+            (output / "01_inventory.md").unlink()
+            archive = root / "unrelated-archive"
+            archive.mkdir()
+            (archive / "01_inventory.md").write_text(
+                "stale module\n", encoding="utf-8"
+            )
+            missing = _validate_artifact_contracts(
+                contracts=[{
+                    "skill_name": "warehouse-planner",
+                    "declared_final_artifact": "{NAME}_FULL.md",
+                    "declared_modular_files": ["01_*.md"],
+                }],
+                invoked_skill_names=frozenset(),
+                bound_skill_name="warehouse-planner",
+                before={},
+                after=_workspace_snapshot(root),
+                workspace_root=root,
+            )
+            self.assertEqual(missing["status"], "failed")
+            self.assertEqual(
+                missing["findings"],
+                [{
+                    "code": "artifact_declared_module_missing",
+                    "skill_name": "warehouse-planner",
+                    "pattern": "01_*.md",
+                    "final_parent": "renamed-output",
+                }],
+            )
+
+    def test_bound_contract_uses_one_native_stop_hook_without_control_prompt(self):
+        config = _config()
+        config["permission_preset"] = "session_full"
+        config["artifact_contracts"] = [{
+            "skill_name": "warehouse-planner",
+            "declared_final_artifact": "{NAME}_FULL.md",
+            "declared_modular_files": ["01_*.md"],
+            "expected_min_lines": 4,
+        }, {
+            "skill_name": "unrelated-package",
+            "declared_final_artifact": "OTHER.md",
+        }]
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime_root = Path(temporary)
+            contract_path = _materialize_bound_artifact_stop_contract(
+                config=config,
+                turn_skill_binding=(
+                    "warehouse-planner",
+                    "fresh_session_primary",
+                ),
+                workspace_before={},
+                runtime_root=runtime_root,
+                controller_uid=os.getuid(),
+                worker_gid=os.getgid(),
+            )
+            self.assertIsNotNone(contract_path)
+            assert contract_path is not None
+            self.assertEqual(
+                stat.S_IMODE(os.lstat(contract_path).st_mode),
+                0o440,
+            )
+            payload = json.loads(contract_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["skill_name"], "warehouse-planner")
+            self.assertEqual(len(payload["contracts"]), 1)
+
+        command, _ = _claude_command(
+            config,
+            artifact_stop_contract_path=Path(
+                "/runtime/artifact-stop-contract.json"
+            ),
+        )
+        self.assertNotIn("--append-system-prompt", command)
+        settings = json.loads(command[command.index("--settings") + 1])
+        self.assertEqual(set(settings), {"hooks"})
+        stop_hooks = settings["hooks"]["Stop"]
+        self.assertEqual(len(stop_hooks), 1)
+        command_hook = stop_hooks[0]["hooks"][0]
+        self.assertEqual(command_hook["type"], "command")
+        self.assertIn("claude_runner.artifact_stop_hook", command_hook["command"])
+
+    def test_bound_workflow_uses_native_pretooluse_and_stop_hooks(self):
+        config = _config()
+        config["permission_preset"] = "session_full"
+        command, _ = _claude_command(
+            config,
+            native_lifecycle_contract_path=Path(
+                "/runtime/native-lifecycle-contract.json"
+            ),
+        )
+        self.assertNotIn("--append-system-prompt", command)
+        settings = json.loads(command[command.index("--settings") + 1])
+        self.assertEqual(set(settings["hooks"]), {"PreToolUse", "Stop"})
+        pre_tool = settings["hooks"]["PreToolUse"][0]
+        self.assertEqual(
+            pre_tool["matcher"],
+            "Agent|Task|Write|Edit|MultiEdit|NotebookEdit|Bash",
+        )
+        commands = [
+            settings["hooks"][event][0]["hooks"][0]["command"]
+            for event in ("PreToolUse", "Stop")
+        ]
+        self.assertEqual(commands[0], commands[1])
+        self.assertIn("claude_runner.native_lifecycle_hook", commands[0])
+
+    def test_native_lifecycle_contract_preserves_phase_before_artifact_order(self):
+        workflow = {
+            "schema": "chatds.skill-workflow-contract.v1",
+            "skill_name": "museum-audit",
+            "route_id": "collection_review",
+            "source_path": "orchestration/orchestrator.yml",
+            "priority": 3,
+            "matched_pattern_index": 0,
+            "route_sha256": "c" * 64,
+            "phases": [{
+                "mode": "sequential",
+                "workers": [{
+                    "worker_id": "curator",
+                    "native_agent_type": (
+                        "chatds-session-skills:museum-audit:curator"
+                    ),
+                }],
+            }],
+        }
+        artifact = {
+            "skill_name": "museum-audit",
+            "declared_final_artifact": "{NAME}_FINAL.md",
+            "expected_min_lines": 3,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary) / "runtime"
+            runtime.mkdir(mode=0o700)
+            config = _config()
+            config["workflow_contract"] = workflow
+            config["artifact_contracts"] = [artifact]
+            path = _materialize_bound_native_lifecycle_contract(
+                config=config,
+                turn_skill_binding=("museum-audit", "fresh_session_primary"),
+                workspace_before={},
+                runtime_root=runtime,
+                controller_uid=os.getuid(),
+                worker_gid=os.getgid(),
+            )
+            self.assertIsNotNone(path)
+            assert path is not None
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                payload["schema"], "chatds.native-lifecycle-contract.v1"
+            )
+            receipt = build_workflow_receipt(workflow, [])
+            workspace = Path(temporary) / "workspace"
+            workspace.mkdir()
+            stop = evaluate_lifecycle_hook(
+                hook_input={
+                    "hook_event_name": "Stop",
+                    "stop_hook_active": False,
+                },
+                contract=payload,
+                workflow_receipt=receipt,
+                workspace_root=workspace,
+            )
+            self.assertIn("workflow_worker_missing", stop["reason"])
+            self.assertNotIn("artifact_final_missing", stop["reason"])
+
+            passed = build_workflow_receipt(workflow, [{
+                "native_agent_type": (
+                    "chatds-session-skills:museum-audit:curator"
+                ),
+                "status": "completed",
+            }])
+            artifact_stop = evaluate_lifecycle_hook(
+                hook_input={
+                    "hook_event_name": "Stop",
+                    "stop_hook_active": False,
+                },
+                contract=payload,
+                workflow_receipt=passed,
+                workspace_root=workspace,
+            )
+            self.assertIn("artifact_final_missing", artifact_stop["reason"])
+
+    def test_native_stop_feedback_is_bounded_and_cross_domain(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            output = workspace / "renamed-output"
+            output.mkdir()
+            (output / "01_inventory.md").write_text(
+                "module\n", encoding="utf-8"
+            )
+            report = output / "WAREHOUSE_FULL.md"
+            report.write_text("# One\nbody\n", encoding="utf-8")
+            contract = {
+                "schema": "chatds.artifact-stop-contract.v1",
+                "skill_name": "warehouse-planner",
+                "workspace_before": {},
+                "contracts": [{
+                    "skill_name": "warehouse-planner",
+                    "declared_final_artifact": "{NAME}_FULL.md",
+                    "declared_modular_files": ["01_*.md"],
+                    "expected_min_lines": 4,
+                    "declared_section_count": 2,
+                }],
+            }
+            first = evaluate_stop_hook(
+                hook_input={
+                    "hook_event_name": "Stop",
+                    "stop_hook_active": False,
+                },
+                contract=contract,
+                workspace_root=workspace,
+            )
+            self.assertEqual(first["decision"], "block")
+            self.assertIn("artifact_min_lines_not_met", first["reason"])
+            self.assertIn("artifact_declared_sections_not_met", first["reason"])
+
+            stale_contract = dict(contract)
+            stale_contract["workspace_before"] = {
+                relative: list(identity)
+                for relative, identity in _workspace_snapshot(workspace).items()
+            }
+            stale = evaluate_stop_hook(
+                hook_input={
+                    "hook_event_name": "Stop",
+                    "stop_hook_active": False,
+                },
+                contract=stale_contract,
+                workspace_root=workspace,
+            )
+            self.assertEqual(stale["decision"], "block")
+            self.assertIn(
+                "artifact_final_not_committed_this_turn", stale["reason"]
+            )
+
+            # Claude Code marks the native continuation.  The hook never
+            # creates an adapter-owned retry loop; the terminal audit remains
+            # the fail-closed authority after this single correction pass.
+            self.assertEqual(
+                evaluate_stop_hook(
+                    hook_input={
+                        "hook_event_name": "Stop",
+                        "stop_hook_active": True,
+                    },
+                    contract=contract,
+                    workspace_root=workspace,
+                ),
+                {},
+            )
+
+            report.write_text(
+                "# One\nbody\n## Two\nbody\n", encoding="utf-8"
+            )
+            self.assertEqual(
+                evaluate_stop_hook(
+                    hook_input={
+                        "hook_event_name": "Stop",
+                        "stop_hook_active": False,
+                    },
+                    contract=contract,
+                    workspace_root=workspace,
+                ),
+                {},
+            )
 
     def test_current_final_is_selected_without_deleting_prior_deliverables(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -815,7 +1847,7 @@ class RunnerEgressPolicyTests(unittest.TestCase):
         root: Path,
         *,
         mcp_servers: dict | None = None,
-        harness_egress_rules: list[dict] | None = None,
+        platform_egress_rules: list[dict] | None = None,
     ):
         view = root / "view"
         skill = view / "plugin" / "skills" / "fixture"
@@ -855,8 +1887,8 @@ class RunnerEgressPolicyTests(unittest.TestCase):
         identity = {
             "schema": "chatds.claude-skill-view.v1",
             **(
-                {"harness_egress_rules": harness_egress_rules}
-                if harness_egress_rules is not None
+                {"platform_egress_rules": platform_egress_rules}
+                if platform_egress_rules is not None
                 else {}
             ),
             "skills": [{
@@ -891,7 +1923,7 @@ class RunnerEgressPolicyTests(unittest.TestCase):
         os.chmod(view, 0o555)
         return view, digest
 
-    def test_harness_web_capability_has_exact_rule_and_private_origin_gate(self):
+    def test_platform_web_capability_has_exact_rule_and_private_origin_gate(self):
         rule = {
             "capability": "web_search",
             "url_prefix": "http://search.internal:8080/search",
@@ -900,7 +1932,7 @@ class RunnerEgressPolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             view, digest = self._view(
                 Path(temporary),
-                harness_egress_rules=[rule],
+                platform_egress_rules=[rule],
             )
             common = dict(
                 skill_view_root=view,
@@ -1011,7 +2043,7 @@ class RunnerEgressPolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             view, digest = self._view(
                 Path(temporary),
-                harness_egress_rules=[rule],
+                platform_egress_rules=[rule],
             )
             policy = compile_turn_egress_policy(
                 skill_view_root=view,
@@ -1047,11 +2079,11 @@ class RunnerEgressPolicyTests(unittest.TestCase):
             for provider in ("sinajs", "gtimg", "eastmoney")
         ))
 
-    def test_unknown_harness_capability_cannot_mint_egress(self):
+    def test_unknown_platform_capability_cannot_mint_egress(self):
         with tempfile.TemporaryDirectory() as temporary:
             view, digest = self._view(
                 Path(temporary),
-                harness_egress_rules=[{
+                platform_egress_rules=[{
                     "capability": "arbitrary_http",
                     "url_prefix": "https://attacker.invalid/",
                     "methods": ["GET"],
@@ -1059,7 +2091,7 @@ class RunnerEgressPolicyTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(
                 ClaudeEgressPolicyError,
-                "Harness capability rule is malformed",
+                "Platform I/O capability rule is malformed",
             ):
                 compile_turn_egress_policy(
                     skill_view_root=view,

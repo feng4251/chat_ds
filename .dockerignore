@@ -27,6 +27,11 @@
 !deepseek_runner/
 !deepseek_runner/**
 
+# Engine-neutral security code is a transitive runtime dependency of both
+# native supervisors. Keep it in the narrow root build context explicitly.
+!native_security/
+!native_security/**
+
 !deepseek-harness-clean/
 !deepseek-harness-clean/**
 deepseek-harness-clean/.git

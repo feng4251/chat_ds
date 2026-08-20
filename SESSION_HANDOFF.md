@@ -2,6 +2,69 @@
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
+## 2026-08-21 原生双引擎、通用 Skill 执行与 V2.3 新鲜验收闭环
+
+- 已恢复并审计 Claude 会话 `59903124-d548-48c5-bf38-f069322cd5e3` 的工作。恢复基线提交链为
+  `341df61c`（统一审批控制环）、`ecbfdfc5`（Claude 原生 stdio permission relay）、
+  `a3a2a487`（DeepSeek 原生工具面与 SearXNG）和 `1d72515c`（前端白屏修复）。本轮在该基线上完成
+  通用修正；`claude-code/` 与 `deepseek-harness-clean/` 两个独立上游仓库都保持未修改。
+- `LegacyAgentEngine` 已从 registry、runtime health、Compose 和生产容器彻底退出；
+  `backend/agent_engines/legacy.py` 是本轮有意删除。Claude Code 和 DeepSeek Harness 都由各自原生
+  loop 负责 planning、tool loop、multi-agent、compaction/retry 与 session 行为，ChatDS 只保留
+  Web/user/Session、精确 workspace、provider/model、Skill/plugin/MCP、权限、SSE/persistence、
+  cancellation、artifact audit 和唯一 terminal 的边界适配。不得重新引入 ChatDS-owned agent loop。
+- 通用 Skill compiler 现在把包内声明编译为不可变 Skill view、worker/route workflow IR、条件 authority、
+  mandatory frontier 和 artifact contract。顺序固定为 compile/bind -> decide authority -> mandatory receipts
+  -> optional retrieval -> synthesize/fan-in -> artifact validation -> exactly-one terminal。恢复不得跳过当前
+  mandatory frontier，模型 prose 不得替代机器 receipt。所有生产逻辑均不含 V2.3、疾病、Session/Skill ID、
+  固定 worker/file 数、route 名或报告名特判；对应回归含重命名的非医疗/跨领域 fixture。
+- Claude 权限保持原生 stdio `can_use_tool` 往返，页面提供 `read_only`、`workspace_write`（逐次 Allow/Reject）
+  和 `session_full` 三档；三档真实 E2E 均通过。DeepSeek 使用经 `SO_PEERCRED` 校验父 PID 的 Unix event
+  socket、原生 Session/event stream、exact tool identity 和原生 permission service；空 tool-name delta、
+  并行审批、stale/replay、artifact gate 与唯一 terminal 均有通用 regression。DSH 不再通过粗粒度 plugin
+  group 扩大精确工具授权。
+- 已恢复本机 SearXNG/Valkey，并恢复精确 limiter；Claude/DSH 只有 Web search 使用 ChatDS 的 SearXNG
+  接口，其余执行在各自 session-wise、无 ambient network、单 workspace 的原生沙箱闭环内。生产搜索
+  smoke `d0de2026082100000000000000000044` 精确调用一次 `web_search`、返回 8 个来源并唯一成功终止。
+- 历史 session 三源归因已经闭合：`ecbc00...` 是旧 Legacy compaction placeholder 泄漏到工具参数并被
+  盲目重试；`a993...` 是 provider 连续 60 次 `finish_reason=length` 后旧 Legacy continuation 不收敛，
+  不是 agent/chat 分类；`bf7f...` 暴露旧 workflow 编译、审批与搜索超时组合；`9aef...` 暴露 blank
+  tool identity 与搜索重试；`e140...` 本身是健康的简单 DSH turn；`5d66...` 是历史 plugin rollout；
+  `fc39...` 的 Claude/market 路径健康，天气检索受旧 SearX 429 影响。修复均落在通用 compiler、provider
+  bridge、native lifecycle、authority/receipt、SearX policy 上，没有按这些 session 分支。
+- 生产已从当前源码重建并整体切换：Backend `sha256:862dd156...`、Frontend `sha256:5f1dd9bd...`、
+  Claude Supervisor `sha256:e70054b3...`、DeepSeek Supervisor `sha256:f24a9ab...`、Skill egress
+  `sha256:b434765...`；Backend、两个 Supervisor、egress、SearXNG/Valkey 均 healthy/restart 0，Frontend
+  实际 Chromium 渲染非空且无应用 ReferenceError。`127.0.0.1`、`10.10.132.126`、`172.30.100.126`
+  三入口 `/` 与 `/api/health` 均 200，生产无 Legacy 容器。
+- 2026-08-20/21 的 V2.3 新鲜生产 E2E 使用 conversation `00e4881af558441595ab4e0bdba05992`、root
+  `2d0a6b1cef46411f87b1c60bed8053b7`、Claude Code + `AgentModel`、`session_full`。输入 ZIP SHA-256
+  `78b890eab57ff516c20a39a565631caa5d784f839b42f6ad9efbdbdd951eb0a0`；冻结 view
+  `9aee2a0596eff2e78c48c615332e70ed3d82abc9539b701663ea7076af96d7b8` 含 19 Skills、9 workers、
+  17 routes、0 compiler diagnostics。选中 `composite_full_protocol_design` 后 7 个并行 mandatory worker
+  和 1 个顺序 worker 全部 durable succeeded；workflow/artifact contract 都 passed、0 finding，最后只有
+  一个 `succeeded/end_turn` terminal。
+- 该轮产生完整 14 文件合同：11 个模块、README、checklist 和 canonical full report。最终报告
+  168,549 bytes/2,735 lines，SHA-256
+  `7f305bd828e47a7ce1cf4ed4569f6d05acf0d389ad813b9f15c4590947557507`，且是 11 个模块的逐字顺序
+  concat。12 个原生 Bash error tool-result 均位于可选分支（7 timeout，其余 nonzero/missing/runtime），
+  没有 placeholder、malformed JSON、approval deadlock、write retry storm 或 mandatory frontier 越级。
+- Ground truth 应作为业务/结构 acceptance oracle，不应要求随机生成文本逐字相等：新鲜结果与
+  `GAL3_AD_FULL_REPORT_v2.3_glm52.md` 的 token cosine 为 0.9076、字节量 84.2%；与 Claude modular
+  ground truth 的 token cosine 为 0.8884、字节量 87.3%。两份 ground truth 彼此也不逐字相同；三者均覆盖
+  同一 11 个核心模块和 14 文件交付合同。若未来要求 byte-identical，必须另定义确定性模板/复制产品，不能
+  将其伪装成通用 Harness 指令遵循。
+- 成熟参考冻结为 `claude-code/` commit `6f6f12b37f529488b10e53928dd5508bb93535c7` 与
+  `deepseek-harness-clean/` commit `47f943859bef60e4160492346772ded9b24f765a`。采用/适配的是 Claude
+  typed control、pending background-task result holdback、唯一 result，以及 DSH session-fenced job、
+  idempotent terminal 与 workspace boundary；拒绝复制上游 loop 或用模型自述补 controller state。
+- 最终回归：Backend `371 passed, 2 subtests`；Claude/DeepSeek Python contracts
+  `131 passed, 6 skipped, 19 subtests`；DeepSeek Node `15/15`；Frontend `49/49` 与 production Vite
+  build；`compileall`、`git diff --check` 均通过。本轮最终 Git 只做本地 commit，不向远端 push。
+- 两项用户自有 tracked deletion 继续只留在 worktree，严禁恢复或 stage：
+  `XGAL-101_Galectin-3_AD_Comprehensive_Development_Plan_v1.0_claudecode执行参考.md` 与
+  `xClinicalTrial-Design-V2.2.zip`。
+
 ## 2026-08-14 DeepSeek Harness 平级引擎最终部署闭环
 
 - DeepSeek Harness 平级引擎已完成、提交并部署生产。功能提交链为

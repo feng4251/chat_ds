@@ -19,7 +19,7 @@ import time
 import unicodedata
 import uuid
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterator
 
 from chatds_browser_runtime.proxy_bridge import (
@@ -33,16 +33,32 @@ from chatds_browser_runtime.proxy_bridge import (
     ProxySocketAuthority,
     ProxyTrustAuthority,
 )
-from claude_runner.runtime_capabilities import render_runtime_capability_prompt
+from claude_runner.runtime_capabilities import (
+    validate_runtime_capability_contract,
+)
+from claude_runner.native_control import (
+    is_native_user_interaction,
+    native_user_interaction_kind,
+)
 from claude_runner.input_attachments import verify_input_attachments
 from claude_runner.mcp_schedule_control import (
     normalize_schedule_create,
-    normalize_schedule_tool_aliases,
+    normalize_schedule_capability_aliases,
+)
+from claude_runner.native_workflow import (
+    build_workflow_receipt,
+    classify_native_subagent_outcome,
+    terminal_workflow_receipt,
+    validate_workflow_contract,
+    workflow_start_violation,
+    write_workflow_receipt,
 )
 
 
 MAX_NATIVE_LINE_BYTES = 64 * 1024 * 1024
 MAX_NATIVE_INPUT_BYTES = 96 * 1024 * 1024
+MAX_NATIVE_RECEIPT_DELTA_BYTES = 512 * 1024 * 1024
+MAX_NATIVE_RECEIPT_COUNT = 4_096
 SYNC_EVERY_EVENTS = 20
 MAX_WORKSPACE_SNAPSHOT_FILES = 65_536
 MAX_WORKSPACE_ARTIFACTS = 8_192
@@ -54,6 +70,19 @@ MAX_ARTIFACT_CONTRACT_FINDINGS = 128
 WORKSPACE_LOCK_IDENTITY_DOMAIN = b"chatds-workspace-mutation-lock-v1\0"
 SAFE_SESSION_ID = re.compile(r"^[0-9a-f]{32}$")
 SAFE_NATIVE_TASK_ID = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
+SAFE_NATIVE_TOOL_USE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,256}$")
+TRANSIENT_NATIVE_SUBAGENT_OUTCOMES = frozenset({
+    "native_subagent_checkpoint_missing",
+    "native_subagent_checkpoint_invalid",
+    "native_subagent_result_incomplete",
+})
+NATIVE_TASK_NOTIFICATION_PREFIX = re.compile(
+    r"\A<task-notification>\r?\n"
+    r"<task-id>([A-Za-z0-9._:-]{1,160})</task-id>\r?\n"
+    r"<tool-use-id>([A-Za-z0-9._:-]{1,256})</tool-use-id>\r?\n"
+    r"<output-file>[^<\r\n]{1,4096}</output-file>\r?\n"
+    r"<status>(completed|failed|killed)</status>(?:\r?\n|\Z)"
+)
 SAFE_NATIVE_TASK_TYPES = frozenset({
     "local_bash",
     "local_agent",
@@ -77,6 +106,8 @@ SAFE_CONTROLLER_RUNTIME_CODES = frozenset({
     "workspace_artifact_changed_during_audit",
     "artifact_contract_invalid",
     "artifact_contract_audit_failed",
+    "artifact_contract_runtime_root_invalid",
+    "workflow_contract_invalid",
     "native_cron_state_invalid",
     "egress_bridge_did_not_stop",
     "input_attachment_count_invalid",
@@ -87,6 +118,7 @@ SAFE_CONTROLLER_RUNTIME_CODES = frozenset({
     "input_attachment_manifest_unreferenced",
     "input_attachment_transport_unlowered",
     "input_attachment_message_invalid",
+    "turn_skill_binding_invalid",
 })
 SAFE_RUNNER_FATAL_CODES = frozenset({
     "runner_controller_not_root",
@@ -104,6 +136,7 @@ def main() -> int:
     checkpoint_ready: bool | None = None
     pending_plan_task_count: int | None = None
     artifact_contract_receipt: dict[str, Any] | None = None
+    workflow_terminal_receipt: dict[str, Any] | None = None
     if os.geteuid() != 0:
         return _fatal("runner_controller_not_root")
     try:
@@ -114,8 +147,9 @@ def main() -> int:
         ledger = EventLedger(Path(os.environ["CHATDS_EVENT_LEDGER"]))
         controller_stage = "load_config"
         config = _load_config(Path(os.environ["CHATDS_RUN_CONFIG"]))
-        ledger.bind_schedule_tool_aliases(
-            config.get("schedule_tool_aliases")
+        turn_skill_binding = _turn_skill_binding(config)
+        ledger.bind_schedule_capability_aliases(
+            config.get("schedule_capability_aliases")
         )
         ledger.append_event({
             "type": "chatds.runtime.config",
@@ -128,7 +162,23 @@ def main() -> int:
             "input_attachment_count": len(
                 config.get("input_attachments") or []
             ),
+            "turn_skill_binding": (
+                {
+                    "skill_name": turn_skill_binding[0],
+                    "source": turn_skill_binding[1],
+                }
+                if turn_skill_binding is not None
+                else None
+            ),
         }, channel="controller")
+        if turn_skill_binding is not None:
+            ledger.append_event({
+                "type": "chatds.skill.binding",
+                "skill_name": turn_skill_binding[0],
+                "source": turn_skill_binding[1],
+                "transport": "native_slash_command",
+                "required": True,
+            }, channel="controller")
         for diagnostic in config.get("skill_diagnostics") or ():
             if not isinstance(diagnostic, dict):
                 continue
@@ -149,6 +199,18 @@ def main() -> int:
         runtime_root = Path("/runtime/worker")
         runtime_root.mkdir(parents=True, exist_ok=False, mode=0o700)
         os.chown(runtime_root, worker_uid, worker_gid)
+        native_lifecycle_contract_path: Path | None = None
+        if config.get("workflow_contract") is not None:
+            controller_stage = "workflow_contract_bind"
+            ledger.bind_native_task_state(
+                projects_root=Path("/state/home/.claude/projects"),
+                native_session_id=str(config["native_session_id"]),
+            )
+            ledger.bind_workflow_contract(
+                contract=config["workflow_contract"],
+                receipt_path=Path("/runtime/workflow-receipt.json"),
+                worker_gid=worker_gid,
+            )
         worker_tmp = runtime_root / "tmp"
         worker_tmp.mkdir(mode=0o700)
         os.chown(worker_tmp, worker_uid, worker_gid)
@@ -170,6 +232,16 @@ def main() -> int:
                 }, channel="controller")
             controller_stage = "workspace_snapshot_before"
             workspace_before = _workspace_snapshot(Path("/workspace"))
+            native_lifecycle_contract_path = (
+                _materialize_bound_native_lifecycle_contract(
+                    config=config,
+                    turn_skill_binding=turn_skill_binding,
+                    workspace_before=workspace_before,
+                    runtime_root=Path("/runtime"),
+                    controller_uid=0,
+                    worker_gid=worker_gid,
+                )
+            )
             controller_stage = "egress_bridge_start"
             authority = ProxySocketAuthority(
                 PROXY_SOCKET_PATH,
@@ -218,7 +290,16 @@ def main() -> int:
             )
             try:
                 controller_stage = "native_execution"
-                command, prompt = _claude_command(config)
+                native_transcript_watermark = _native_transcript_watermark(
+                    Path("/state/home/.claude/projects"),
+                    str(config["native_session_id"]),
+                )
+                command, prompt = _claude_command(
+                    config,
+                    native_lifecycle_contract_path=(
+                        native_lifecycle_contract_path
+                    ),
+                )
                 _install_signal_handlers()
                 exit_code = _run_child(
                     command,
@@ -228,8 +309,15 @@ def main() -> int:
                     worker_gid=worker_gid,
                     ledger=ledger,
                     run_id=str(config["run_id"]),
-                    permission_preset=str(config.get("permission_preset") or "session_full"),
+                    permission_preset=str(config.get("permission_preset") or "workspace_write"),
                 )
+                controller_stage = "native_task_receipt_recovery"
+                ledger.reconcile_native_transcript_queue(
+                    projects_root=Path("/state/home/.claude/projects"),
+                    native_session_id=str(config["native_session_id"]),
+                    watermark=native_transcript_watermark,
+                )
+                ledger.reconcile_workflow_subagent_checkpoints(final=True)
             finally:
                 _stop_process_group(compositor)
                 for path in compositor_paths:
@@ -252,18 +340,48 @@ def main() -> int:
                 after=workspace_after,
                 workspace_root=Path("/workspace"),
             )
-            controller_stage = "artifact_contract_audit"
-            artifact_contract_receipt = _validate_artifact_contracts(
-                contracts=config.get("artifact_contracts"),
-                invoked_skill_names=ledger.invoked_skill_names,
-                before=workspace_before,
-                after=workspace_after,
-                workspace_root=Path("/workspace"),
+            controller_stage = "workflow_contract_audit"
+            workflow_terminal_receipt = ledger.workflow_terminal_receipt
+            workflow_contract_passed = (
+                workflow_terminal_receipt is None
+                or workflow_terminal_receipt.get("status") == "passed"
             )
             ledger.append_event({
-                "type": "chatds.artifact.contract",
-                **artifact_contract_receipt,
+                "type": "chatds.workflow.contract",
+                "status": (
+                    "not_applicable"
+                    if workflow_terminal_receipt is None
+                    else workflow_terminal_receipt.get("status")
+                ),
+                "receipt": workflow_terminal_receipt,
             }, channel="controller")
+            if workflow_contract_passed:
+                controller_stage = "artifact_contract_audit"
+                artifact_contract_receipt = _validate_artifact_contracts(
+                    contracts=config.get("artifact_contracts"),
+                    invoked_skill_names=ledger.invoked_skill_names,
+                    bound_skill_name=(
+                        turn_skill_binding[0]
+                        if turn_skill_binding is not None
+                        else None
+                    ),
+                    before=workspace_before,
+                    after=workspace_after,
+                    workspace_root=Path("/workspace"),
+                )
+                ledger.append_event({
+                    "type": "chatds.artifact.contract",
+                    **artifact_contract_receipt,
+                }, channel="controller")
+            else:
+                artifact_contract_receipt = {
+                    "status": "deferred",
+                    "reason": "workflow_contract_failed",
+                }
+                ledger.append_event({
+                    "type": "chatds.artifact.contract",
+                    **artifact_contract_receipt,
+                }, channel="controller")
         controller_stage = "native_checkpoint_audit"
         checkpoint_ready = _native_checkpoint_exists(
             Path("/state/home/.claude/projects"),
@@ -277,7 +395,13 @@ def main() -> int:
         pending_native_task_count = ledger.active_native_task_count
         artifact_contract_passed = (
             artifact_contract_receipt is not None
-            and artifact_contract_receipt.get("status") != "failed"
+            and artifact_contract_receipt.get("status") not in {
+                "failed", "deferred"
+            }
+        )
+        workflow_contract_passed = (
+            workflow_terminal_receipt is None
+            or workflow_terminal_receipt.get("status") == "passed"
         )
         controller_stage = "terminal_commit"
         status = (
@@ -291,6 +415,7 @@ def main() -> int:
                 and ledger.native_result_succeeded
                 and checkpoint_ready
                 and pending_native_task_count == 0
+                and workflow_contract_passed
                 and artifact_contract_passed
             )
             else "failed"
@@ -303,6 +428,7 @@ def main() -> int:
             egress_receipt=receipt,
             pending_plan_task_count=pending_plan_task_count,
             pending_native_task_count=pending_native_task_count,
+            workflow_contract_passed=workflow_contract_passed,
             artifact_contract_passed=artifact_contract_passed,
         )
         ledger.append_event({
@@ -317,6 +443,7 @@ def main() -> int:
             "pending_native_task_count": pending_native_task_count,
             "native_task_summary": ledger.native_task_summary,
             "pending_control_writes": list(ledger.pending_control_writes),
+            "workflow_contract": workflow_terminal_receipt,
             "artifact_contract": artifact_contract_receipt,
             "error": terminal_error,
             "error_code": terminal_error,
@@ -351,6 +478,7 @@ def main() -> int:
             "pending_native_task_count": ledger.active_native_task_count,
             "native_task_summary": ledger.native_task_summary,
             "pending_control_writes": list(ledger.pending_control_writes),
+            "workflow_contract": workflow_terminal_receipt,
             "artifact_contract": artifact_contract_receipt,
             "egress_receipt": receipt,
         }
@@ -399,6 +527,7 @@ def _terminal_error(
     egress_receipt: dict[str, Any],
     pending_plan_task_count: int,
     pending_native_task_count: int,
+    workflow_contract_passed: bool = True,
     artifact_contract_passed: bool = True,
 ) -> str | None:
     """Choose the most specific trusted failure signal for one Turn."""
@@ -415,6 +544,8 @@ def _terminal_error(
     # They are useful diagnostics, but they are not machine-owned receipts for
     # work completion.  Native process/sub-agent receipts and compiled
     # artifact contracts remain authoritative terminal gates.
+    if not workflow_contract_passed:
+        return "workflow_contract_failed"
     if not artifact_contract_passed:
         return "artifact_contract_failed"
     if ledger.native_api_error_status is not None:
@@ -444,6 +575,8 @@ def _terminal_error_stage(error_code: str | None) -> str | None:
         return "native_checkpoint_audit"
     if error_code == "native_subtasks_pending":
         return "native_task_audit"
+    if error_code == "workflow_contract_failed":
+        return "workflow_contract_audit"
     if error_code == "artifact_contract_failed":
         return "artifact_contract_audit"
     if error_code == "egress_budget_exhausted":
@@ -465,15 +598,25 @@ class EventLedger:
         self._native_result_count = 0
         self._native_api_error_status: int | None = None
         self._native_tasks: dict[str, dict[str, Any]] = {}
+        self._native_agent_tool_types: dict[str, str] = {}
+        self._native_projects_root: Path | None = None
+        self._native_projects_anchor: tuple[Path, int, int] | None = None
+        self._bound_native_session_id: str | None = None
+        self._workflow_contract: dict[str, Any] | None = None
+        self._workflow_receipt_path: Path | None = None
+        self._workflow_receipt_gid: int | None = None
+        self._workflow_violations: list[dict[str, Any]] = []
         self._task_output_calls: dict[str, str] = {}
         self._schedule_control_calls: dict[str, dict[str, Any]] = {}
-        self._schedule_tool_aliases: dict[str, str | None] | None = None
+        self._schedule_capability_aliases: dict[str, str] = {}
         self._pending_control_writes: list[dict[str, Any]] = []
         self._settled_control_tool_calls: set[str] = set()
         self._invoked_skill_names: set[str] = set()
         self._native_task_reconciliations = {
             "native_notification": 0,
+            "task_updated": 0,
             "task_output": 0,
+            "native_transcript_queue": 0,
             "controller_process_reap": 0,
         }
         if path.exists():
@@ -493,6 +636,8 @@ class EventLedger:
             native = json.loads(text)
         except json.JSONDecodeError:
             return self._append({"channel": channel, "text": text})
+        if channel == "stdout" and isinstance(native, dict):
+            self.reconcile_workflow_subagent_checkpoints(final=False)
         # Only Claude's stdout stream is part of the native stream-json
         # protocol. Stderr is untrusted diagnostic text and must never be able
         # to forge the commit candidate by printing result-shaped JSON.
@@ -527,17 +672,59 @@ class EventLedger:
                 if task_type not in SAFE_NATIVE_TASK_TYPES:
                     task_type = "unknown"
                 if SAFE_NATIVE_TASK_ID.fullmatch(task_id):
+                    tool_use_id = str(native.get("tool_use_id") or "")
+                    native_session_id = str(native.get("session_id") or "")
+                    native_agent_type = str(
+                        native.get("subagent_type")
+                        or self._native_agent_tool_types.get(tool_use_id)
+                        or ""
+                    )
+                    if re.fullmatch(
+                        r"[A-Za-z0-9._:-]{1,512}", native_agent_type
+                    ) is None:
+                        native_agent_type = ""
                     existing = self._native_tasks.get(task_id)
                     if existing is None:
+                        if native_agent_type:
+                            self._record_workflow_start_violation(
+                                native_agent_type=native_agent_type
+                            )
                         self._native_tasks[task_id] = {
                             "task_id": task_id,
                             "task_type": task_type,
+                            "tool_use_id": (
+                                tool_use_id
+                                if SAFE_NATIVE_TOOL_USE_ID.fullmatch(tool_use_id)
+                                else None
+                            ),
+                            "native_session_id": (
+                                native_session_id
+                                if _canonical_native_session_id(
+                                    native_session_id
+                                )
+                                else None
+                            ),
+                            "native_agent_type": native_agent_type or None,
                             "status": "running",
                             "terminal_source": None,
                         }
                     elif existing.get("status") != "running":
                         existing["status"] = "running"
                         existing["terminal_source"] = None
+                    self._publish_workflow_receipt()
+            elif subtype == "task_updated" and task_id:
+                patch = native.get("patch")
+                raw_status = (
+                    str(patch.get("status") or "")
+                    if isinstance(patch, dict)
+                    else ""
+                )
+                if raw_status in {"completed", "failed", "killed"}:
+                    self._settle_native_task(
+                        task_id,
+                        status=raw_status,
+                        source="task_updated",
+                    )
             elif subtype in {
                 "task_notification",
                 "task_completed",
@@ -617,16 +804,78 @@ class EventLedger:
     def pending_control_writes(self) -> tuple[dict[str, Any], ...]:
         return tuple(dict(row) for row in self._pending_control_writes)
 
-    def bind_schedule_tool_aliases(self, value: object) -> None:
-        """Bind the immutable controller vocabulary before native output.
+    @property
+    def workflow_receipt(self) -> dict[str, Any] | None:
+        if self._workflow_contract is None:
+            return None
+        return build_workflow_receipt(
+            self._workflow_contract,
+            self._native_tasks.values(),
+            self._workflow_violations,
+        )
 
-        ``None`` preserves rolling compatibility for views compiled before
-        the vocabulary became part of the Skill-view identity. New views
-        always provide an exact map shared with their schedule MCP process.
-        """
+    @property
+    def workflow_terminal_receipt(self) -> dict[str, Any] | None:
+        receipt = self.workflow_receipt
+        if self._workflow_contract is None or receipt is None:
+            return None
+        return terminal_workflow_receipt(self._workflow_contract, receipt)
 
-        self._schedule_tool_aliases = (
-            None if value is None else normalize_schedule_tool_aliases(value)
+    def bind_native_task_state(
+        self,
+        *,
+        projects_root: Path,
+        native_session_id: str,
+    ) -> None:
+        """Bind mandatory-worker evidence to one native Session checkpoint."""
+
+        anchor = _native_state_directory_anchor(projects_root)
+        if (
+            self._native_projects_root is not None
+            or not _canonical_native_session_id(native_session_id)
+            or anchor is None
+        ):
+            raise RuntimeError("native_task_state_invalid")
+        self._native_projects_root = projects_root
+        self._native_projects_anchor = anchor
+        self._bound_native_session_id = native_session_id
+
+    def bind_workflow_contract(
+        self,
+        *,
+        contract: object,
+        receipt_path: Path,
+        worker_gid: int | None = None,
+    ) -> None:
+        """Publish the root-owned receipt consumed by native Claude hooks."""
+
+        if (
+            self._workflow_contract is not None
+            or self._native_projects_root is None
+            or self._bound_native_session_id is None
+            or not receipt_path.is_absolute()
+            or receipt_path.exists()
+            or not receipt_path.parent.is_dir()
+            or receipt_path.parent.is_symlink()
+            or (
+                worker_gid is not None
+                and (type(worker_gid) is not int or worker_gid < 0)
+            )
+        ):
+            raise RuntimeError("workflow_contract_invalid")
+        try:
+            self._workflow_contract = validate_workflow_contract(contract)
+        except ValueError as exc:
+            raise RuntimeError("workflow_contract_invalid") from exc
+        self._workflow_receipt_path = receipt_path
+        self._workflow_receipt_gid = worker_gid
+        self._publish_workflow_receipt()
+
+    def bind_schedule_capability_aliases(self, value: object) -> None:
+        """Bind the immutable platform I/O vocabulary before native output."""
+
+        self._schedule_capability_aliases = (
+            normalize_schedule_capability_aliases(value)
         )
 
     def reconcile_worker_process_exit(self) -> int:
@@ -661,6 +910,101 @@ class EventLedger:
             }, channel="controller")
         return settled
 
+    def reconcile_native_transcript_queue(
+        self,
+        *,
+        projects_root: Path,
+        native_session_id: str,
+        watermark: dict[str, Any],
+    ) -> int:
+        """Recover exact native terminal envelopes omitted from SDK stdout.
+
+        Claude persists queue operations before its headless SDK projection
+        drains them.  A successful native result can therefore race with the
+        final ``task_notification`` event even though the exact terminal
+        envelope is already durable.  After PID 1 has reaped the Turn, accept
+        only queue entries appended after the controller's pre-Turn watermark
+        and bound to the exact task, tool-use, and native Session identities
+        observed on stdout.  Assistant prose and sidechain content are never
+        inspected or interpreted as lifecycle state.
+        """
+
+        if (
+            not self._native_result_succeeded
+            or self._native_result_count != 1
+            or not any(
+                row.get("status") == "running"
+                and row.get("task_type") != "local_bash"
+                for row in self._native_tasks.values()
+            )
+        ):
+            return 0
+        try:
+            lines = _native_transcript_delta_lines(
+                projects_root=projects_root,
+                native_session_id=native_session_id,
+                watermark=watermark,
+            )
+            candidates: dict[str, set[str]] = {}
+            candidate_count = 0
+            for raw_line in lines:
+                if len(raw_line) > MAX_NATIVE_LINE_BYTES:
+                    raise RuntimeError("native_task_state_invalid")
+                try:
+                    record = json.loads(raw_line)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                receipt = _native_queue_terminal_receipt(
+                    record,
+                    native_session_id=native_session_id,
+                )
+                if receipt is None:
+                    continue
+                task_id, tool_use_id, status = receipt
+                row = self._native_tasks.get(task_id)
+                if (
+                    row is None
+                    or row.get("status") != "running"
+                    or row.get("task_type") == "local_bash"
+                    or row.get("tool_use_id") != tool_use_id
+                    or row.get("native_session_id") != native_session_id
+                ):
+                    continue
+                candidate_count += 1
+                if candidate_count > MAX_NATIVE_RECEIPT_COUNT:
+                    raise RuntimeError("native_task_state_invalid")
+                candidates.setdefault(task_id, set()).add(status)
+        except (OSError, RuntimeError, ValueError):
+            self.append_event({
+                "type": "chatds.native-task.recovery",
+                "status": "unavailable",
+                "code": "native_task_state_invalid",
+            }, channel="controller")
+            return 0
+
+        settled = 0
+        status_counts: dict[str, int] = {}
+        for task_id in sorted(candidates):
+            statuses = candidates[task_id]
+            if len(statuses) != 1:
+                continue
+            status = next(iter(statuses))
+            self._settle_native_task(
+                task_id,
+                status=status,
+                source="native_transcript_queue",
+            )
+            settled += 1
+            status_counts[status] = status_counts.get(status, 0) + 1
+        if settled:
+            self.append_event({
+                "type": "chatds.native-task.reconciled",
+                "source": "native_transcript_queue",
+                "count": settled,
+                "terminal_by_status": dict(sorted(status_counts.items())),
+            }, channel="controller")
+        return settled
+
     def _settle_native_task(
         self,
         task_id: str,
@@ -671,6 +1015,7 @@ class EventLedger:
         if SAFE_NATIVE_TASK_ID.fullmatch(task_id) is None:
             return
         row = self._native_tasks.get(task_id)
+        native_terminal_source = source
         if row is None:
             row = {
                 "task_id": task_id,
@@ -680,12 +1025,198 @@ class EventLedger:
             }
             self._native_tasks[task_id] = row
         elif row.get("status") == "running":
+            if (
+                status == "completed"
+                and row.get("task_type") == "local_agent"
+                and self._is_mandatory_workflow_worker(
+                    str(row.get("native_agent_type") or "")
+                )
+            ):
+                status, source = self._classify_bound_subagent(row)
+                if (
+                    status == "failed"
+                    and source in TRANSIENT_NATIVE_SUBAGENT_OUTCOMES
+                ):
+                    row["terminal_claim_status"] = "completed"
+                    row["terminal_claim_source"] = native_terminal_source
+                    row["checkpoint_source"] = source
+                    if (
+                        native_terminal_source
+                        in self._native_task_reconciliations
+                        and not row.get("terminal_claim_counted")
+                    ):
+                        self._native_task_reconciliations[
+                            native_terminal_source
+                        ] += 1
+                        row["terminal_claim_counted"] = True
+                    self._publish_workflow_receipt()
+                    return
             row["status"] = status
             row["terminal_source"] = source
+            row["native_terminal_source"] = native_terminal_source
+            row.pop("terminal_claim_status", None)
+            row.pop("terminal_claim_source", None)
+            row.pop("checkpoint_source", None)
         else:
             return
-        if source in self._native_task_reconciliations:
-            self._native_task_reconciliations[source] += 1
+        if (
+            native_terminal_source in self._native_task_reconciliations
+            and not row.get("terminal_claim_counted")
+        ):
+            self._native_task_reconciliations[native_terminal_source] += 1
+        self._publish_workflow_receipt()
+        if self._is_mandatory_workflow_worker(
+            str(row.get("native_agent_type") or "")
+        ):
+            self.append_event({
+                "type": "chatds.workflow.worker-settled",
+                "task_id": task_id,
+                "native_agent_type": row.get("native_agent_type"),
+                "status": row.get("status"),
+                "terminal_source": row.get("terminal_source"),
+            }, channel="controller")
+
+    def reconcile_workflow_subagent_checkpoints(
+        self, *, final: bool
+    ) -> int:
+        """Settle native terminal claims once their async writes are durable."""
+
+        settled = 0
+        for task_id in sorted(self._native_tasks):
+            row = self._native_tasks[task_id]
+            if (
+                row.get("status") != "running"
+                or row.get("terminal_claim_status") != "completed"
+                or not self._is_mandatory_workflow_worker(
+                    str(row.get("native_agent_type") or "")
+                )
+            ):
+                continue
+            status, source = self._classify_bound_subagent(row)
+            if (
+                status != "completed"
+                and source in TRANSIENT_NATIVE_SUBAGENT_OUTCOMES
+                and not final
+            ):
+                row["checkpoint_source"] = source
+                continue
+            row["status"] = status
+            row["terminal_source"] = source
+            row["native_terminal_source"] = row.get(
+                "terminal_claim_source"
+            )
+            row.pop("terminal_claim_status", None)
+            row.pop("terminal_claim_source", None)
+            row.pop("checkpoint_source", None)
+            settled += 1
+            self.append_event({
+                "type": "chatds.workflow.worker-settled",
+                "task_id": task_id,
+                "native_agent_type": row.get("native_agent_type"),
+                "status": row.get("status"),
+                "terminal_source": row.get("terminal_source"),
+            }, channel="controller")
+        if settled:
+            self._publish_workflow_receipt()
+        return settled
+
+    def _classify_bound_subagent(
+        self, row: dict[str, Any]
+    ) -> tuple[str, str]:
+        if (
+            self._native_projects_root is None
+            or not self._bound_native_projects_root_ready()
+            or self._bound_native_session_id is None
+        ):
+            return "failed", "native_subagent_checkpoint_missing"
+        return classify_native_subagent_outcome(
+            projects_root=self._native_projects_root,
+            native_session_id=self._bound_native_session_id,
+            task=row,
+        )
+
+    def _bound_native_projects_root_ready(self) -> bool:
+        if (
+            self._native_projects_root is None
+            or self._native_projects_anchor is None
+        ):
+            return False
+        anchor, expected_device, expected_inode = self._native_projects_anchor
+        try:
+            anchor_info = os.lstat(anchor)
+            if (
+                not stat.S_ISDIR(anchor_info.st_mode)
+                or anchor.is_symlink()
+                or anchor_info.st_dev != expected_device
+                or anchor_info.st_ino != expected_inode
+            ):
+                return False
+            relative = self._native_projects_root.relative_to(anchor)
+            current = anchor
+            for part in relative.parts:
+                current = current / part
+                info = os.lstat(current)
+                if not stat.S_ISDIR(info.st_mode) or current.is_symlink():
+                    return False
+        except (OSError, ValueError):
+            return False
+        return True
+
+    def _record_workflow_start_violation(
+        self, *, native_agent_type: str
+    ) -> None:
+        receipt = self.workflow_receipt
+        if self._workflow_contract is None or receipt is None:
+            return
+        try:
+            violation = workflow_start_violation(
+                self._workflow_contract,
+                receipt,
+                native_agent_type=native_agent_type,
+            )
+        except ValueError as exc:
+            raise RuntimeError("workflow_contract_invalid") from exc
+        if violation is None or violation in self._workflow_violations:
+            return
+        if len(self._workflow_violations) >= 256:
+            raise RuntimeError("workflow_contract_invalid")
+        self._workflow_violations.append(violation)
+        self.append_event({
+            "type": "chatds.workflow.violation",
+            **violation,
+        }, channel="controller")
+
+    def _is_mandatory_workflow_worker(
+        self, native_agent_type: str
+    ) -> bool:
+        if self._workflow_contract is None or not native_agent_type:
+            return False
+        return any(
+            worker.get("native_agent_type") == native_agent_type
+            for phase in self._workflow_contract["phases"]
+            for worker in phase["workers"]
+        )
+
+    def _publish_workflow_receipt(self) -> None:
+        if (
+            self._workflow_contract is None
+            or self._workflow_receipt_path is None
+        ):
+            return
+        receipt = build_workflow_receipt(
+            self._workflow_contract,
+            self._native_tasks.values(),
+            self._workflow_violations,
+        )
+        try:
+            write_workflow_receipt(
+                self._workflow_receipt_path,
+                receipt,
+                owner_uid=0 if os.geteuid() == 0 else None,
+                group_gid=self._workflow_receipt_gid,
+            )
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("workflow_contract_invalid") from exc
 
     def _observe_assistant_tool_calls(self, native: dict[str, Any]) -> None:
         message = native.get("message")
@@ -712,6 +1243,17 @@ class EventLedger:
                     and len(tool_use_id) <= 256
                 ):
                     self._task_output_calls[tool_use_id] = task_id
+            elif name in {"Agent", "Task"}:
+                native_agent_type = str(arguments.get("subagent_type") or "")
+                if (
+                    SAFE_NATIVE_TOOL_USE_ID.fullmatch(tool_use_id)
+                    and re.fullmatch(
+                        r"[A-Za-z0-9._:-]{1,512}", native_agent_type
+                    )
+                ):
+                    self._native_agent_tool_types[
+                        tool_use_id
+                    ] = native_agent_type
             elif name == "Skill":
                 raw_skill = str(
                     arguments.get("skill")
@@ -730,7 +1272,9 @@ class EventLedger:
                 try:
                     normalized = normalize_schedule_create(
                         arguments,
-                        tool_aliases=self._schedule_tool_aliases,
+                        capability_aliases=(
+                            self._schedule_capability_aliases
+                        ),
                     )
                 except (TypeError, ValueError):
                     continue
@@ -870,26 +1414,207 @@ def _load_config(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _native_checkpoint_exists(projects_root: Path, native_session_id: str) -> bool:
-    """Require one regular transcript for the transaction-local Session ID."""
-
+def _canonical_native_session_id(native_session_id: str) -> bool:
     try:
         uuid_value = uuid.UUID(native_session_id)
     except (ValueError, TypeError, AttributeError):
         return False
-    if str(uuid_value) != native_session_id:
-        return False
+    return str(uuid_value) == native_session_id
+
+
+def _native_state_directory_anchor(
+    path: Path,
+) -> tuple[Path, int, int] | None:
+    """Freeze the nearest real ancestor without creating native state."""
+
+    if not path.is_absolute():
+        return None
+    current = path
+    missing_components = 0
+    while True:
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            missing_components += 1
+            if missing_components > 8 or current.parent == current:
+                return None
+            current = current.parent
+            continue
+        except OSError:
+            return None
+        if (
+            current.parent == current
+            or not stat.S_ISDIR(info.st_mode)
+            or current.is_symlink()
+        ):
+            return None
+        return current, info.st_dev, info.st_ino
+
+
+def _native_checkpoint_path(
+    projects_root: Path,
+    native_session_id: str,
+) -> Path | None:
+    if not _canonical_native_session_id(native_session_id):
+        return None
     if not projects_root.is_dir() or projects_root.is_symlink():
-        return False
+        return None
     matches = list(projects_root.glob(f"*/{native_session_id}.jsonl"))
     if len(matches) != 1:
-        return False
+        return None
     path = matches[0]
     try:
+        parent_info = os.lstat(path.parent)
         info = os.lstat(path)
     except OSError:
+        return None
+    if (
+        not stat.S_ISDIR(parent_info.st_mode)
+        or path.parent.is_symlink()
+        or not stat.S_ISREG(info.st_mode)
+        or path.is_symlink()
+    ):
+        return None
+    try:
+        relative = path.relative_to(projects_root)
+    except ValueError:
+        return None
+    if len(relative.parts) != 2:
+        return None
+    return path
+
+
+def _native_checkpoint_exists(projects_root: Path, native_session_id: str) -> bool:
+    """Require one regular transcript for the transaction-local Session ID."""
+
+    path = _native_checkpoint_path(projects_root, native_session_id)
+    if path is None:
         return False
-    return stat.S_ISREG(info.st_mode) and not path.is_symlink() and info.st_size > 0
+    try:
+        return os.lstat(path).st_size > 0
+    except OSError:
+        return False
+
+
+def _native_transcript_watermark(
+    projects_root: Path,
+    native_session_id: str,
+) -> dict[str, Any]:
+    """Freeze the append boundary for one native Session transcript."""
+
+    if not _canonical_native_session_id(native_session_id):
+        return {"state": "invalid"}
+    if not projects_root.exists():
+        return {"state": "absent"}
+    if not projects_root.is_dir() or projects_root.is_symlink():
+        return {"state": "invalid"}
+    matches = list(projects_root.glob(f"*/{native_session_id}.jsonl"))
+    if not matches:
+        return {"state": "absent"}
+    path = _native_checkpoint_path(projects_root, native_session_id)
+    if path is None:
+        return {"state": "invalid"}
+    try:
+        info = os.lstat(path)
+        relative = path.relative_to(projects_root).as_posix()
+    except (OSError, ValueError):
+        return {"state": "invalid"}
+    return {
+        "state": "present",
+        "relative_path": relative,
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "size": info.st_size,
+    }
+
+
+def _native_transcript_delta_lines(
+    *,
+    projects_root: Path,
+    native_session_id: str,
+    watermark: dict[str, Any],
+) -> Iterator[bytes]:
+    """Yield only transcript records appended during the current Turn."""
+
+    if watermark.get("state") not in {"absent", "present"}:
+        raise RuntimeError("native_task_state_invalid")
+    path = _native_checkpoint_path(projects_root, native_session_id)
+    if path is None:
+        raise RuntimeError("native_task_state_invalid")
+    try:
+        info = os.lstat(path)
+        relative = path.relative_to(projects_root).as_posix()
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("native_task_state_invalid") from exc
+
+    offset = 0
+    if watermark.get("state") == "present":
+        if (
+            watermark.get("relative_path") != relative
+            or watermark.get("device") != info.st_dev
+            or watermark.get("inode") != info.st_ino
+            or type(watermark.get("size")) is not int
+        ):
+            raise RuntimeError("native_task_state_invalid")
+        offset = int(watermark["size"])
+    if (
+        offset < 0
+        or info.st_size < offset
+        or info.st_size - offset > MAX_NATIVE_RECEIPT_DELTA_BYTES
+    ):
+        raise RuntimeError("native_task_state_invalid")
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            opened.st_dev != info.st_dev
+            or opened.st_ino != info.st_ino
+            or opened.st_size != info.st_size
+        ):
+            raise RuntimeError("native_task_state_invalid")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            if offset:
+                stream.seek(offset - 1)
+                if stream.read(1) != b"\n":
+                    raise RuntimeError("native_task_state_invalid")
+            stream.seek(offset)
+            observed = 0
+            for line in stream:
+                observed += len(line)
+                if observed > MAX_NATIVE_RECEIPT_DELTA_BYTES:
+                    raise RuntimeError("native_task_state_invalid")
+                yield line
+            if stream.tell() != info.st_size:
+                raise RuntimeError("native_task_state_invalid")
+    finally:
+        os.close(descriptor)
+
+
+def _native_queue_terminal_receipt(
+    record: object,
+    *,
+    native_session_id: str,
+) -> tuple[str, str, str] | None:
+    """Parse the machine header of one persisted native queue terminal."""
+
+    if (
+        not isinstance(record, dict)
+        or record.get("type") != "queue-operation"
+        or record.get("operation") != "enqueue"
+        or record.get("sessionId") != native_session_id
+    ):
+        return None
+    content = record.get("content")
+    if not isinstance(content, str) or len(content.encode("utf-8")) > MAX_NATIVE_LINE_BYTES:
+        return None
+    if not content.rstrip().endswith("</task-notification>"):
+        return None
+    match = NATIVE_TASK_NOTIFICATION_PREFIX.match(content)
+    if match is None:
+        return None
+    return match.group(1), match.group(2), match.group(3)
 
 
 def _workspace_snapshot(workspace_root: Path) -> dict[str, tuple[int, ...]]:
@@ -1034,6 +1759,156 @@ def _workspace_contract_pattern(value: object) -> str:
     return pattern
 
 
+def _materialize_bound_artifact_stop_contract(
+    *,
+    config: dict[str, Any],
+    turn_skill_binding: tuple[str, str] | None,
+    workspace_before: dict[str, tuple[int, ...]],
+    runtime_root: Path,
+    controller_uid: int,
+    worker_gid: int,
+) -> Path | None:
+    """Publish one worker-readable contract for Claude's native Stop hook."""
+
+    if turn_skill_binding is None:
+        return None
+    rows = config.get("artifact_contracts")
+    if rows is None:
+        rows = []
+    if not isinstance(rows, list) or len(rows) > MAX_ARTIFACT_CONTRACTS:
+        raise RuntimeError("artifact_contract_invalid")
+    skill_name = turn_skill_binding[0]
+    active: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise RuntimeError("artifact_contract_invalid")
+        if str(row.get("skill_name") or "") == skill_name:
+            active.append(dict(row))
+    if not active:
+        return None
+    root_info = os.lstat(runtime_root)
+    if (
+        not stat.S_ISDIR(root_info.st_mode)
+        or runtime_root.is_symlink()
+        or root_info.st_uid != controller_uid
+        or root_info.st_mode & 0o022
+    ):
+        raise RuntimeError("artifact_contract_runtime_root_invalid")
+    payload = {
+        "schema": "chatds.artifact-stop-contract.v1",
+        "skill_name": skill_name,
+        "contracts": active,
+        # Preserve the same pre-execution frontier used by the authoritative
+        # terminal audit.  Existing attachments or prior Session artifacts
+        # must never satisfy a fresh Turn merely because the hook runs later.
+        "workspace_before": workspace_before,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+    if len(encoded) > 4 * 1024 * 1024:
+        raise RuntimeError("artifact_contract_invalid")
+    path = runtime_root / "artifact-stop-contract.json"
+    with path.open("xb", buffering=0) as stream:
+        stream.write(encoded)
+        os.fsync(stream.fileno())
+    os.chown(path, controller_uid, worker_gid)
+    os.chmod(path, 0o440)
+    return path
+
+
+def _materialize_bound_native_lifecycle_contract(
+    *,
+    config: dict[str, Any],
+    turn_skill_binding: tuple[str, str] | None,
+    workspace_before: dict[str, tuple[int, ...]],
+    runtime_root: Path,
+    controller_uid: int,
+    worker_gid: int,
+) -> Path | None:
+    """Publish one immutable contract for native workflow/artifact hooks."""
+
+    rows = config.get("artifact_contracts")
+    if rows is None:
+        rows = []
+    if not isinstance(rows, list) or len(rows) > MAX_ARTIFACT_CONTRACTS:
+        raise RuntimeError("artifact_contract_invalid")
+    bound_skill_name = (
+        turn_skill_binding[0] if turn_skill_binding is not None else None
+    )
+    for row in rows:
+        if not isinstance(row, dict):
+            raise RuntimeError("artifact_contract_invalid")
+
+    raw_workflow = config.get("workflow_contract")
+    workflow: dict[str, Any] | None = None
+    if raw_workflow is not None:
+        try:
+            workflow = validate_workflow_contract(raw_workflow)
+        except ValueError as exc:
+            raise RuntimeError("workflow_contract_invalid") from exc
+        workflow_skill_name = str(workflow["skill_name"])
+        if (
+            bound_skill_name is not None
+            and workflow_skill_name != bound_skill_name
+        ):
+            raise RuntimeError("workflow_contract_invalid")
+        bound_skill_name = workflow_skill_name
+    active_artifacts = [
+        dict(row)
+        for row in rows
+        if (
+            bound_skill_name is not None
+            and str(row.get("skill_name") or "") == bound_skill_name
+        )
+    ]
+    if not active_artifacts and workflow is None:
+        return None
+    if bound_skill_name is None:
+        raise RuntimeError("workflow_contract_invalid")
+
+    root_info = os.lstat(runtime_root)
+    if (
+        not stat.S_ISDIR(root_info.st_mode)
+        or runtime_root.is_symlink()
+        or root_info.st_uid != controller_uid
+        or root_info.st_mode & 0o022
+    ):
+        raise RuntimeError("artifact_contract_runtime_root_invalid")
+    payload = {
+        "schema": "chatds.native-lifecycle-contract.v1",
+        "skill_name": bound_skill_name,
+        "artifact_contracts": active_artifacts,
+        "workspace_before": workspace_before,
+        "workflow_contract": workflow,
+        "workflow_receipt_path": (
+            "/runtime/workflow-receipt.json"
+            if workflow is not None
+            else None
+        ),
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+    if len(encoded) > 8 * 1024 * 1024:
+        raise RuntimeError("workflow_contract_invalid")
+    path = runtime_root / "native-lifecycle-contract.json"
+    with path.open("xb", buffering=0) as stream:
+        stream.write(encoded)
+        os.fsync(stream.fileno())
+    os.chown(path, controller_uid, worker_gid)
+    os.chmod(path, 0o440)
+    return path
+
+
 def _artifact_text_stats(path: Path) -> tuple[int, int]:
     """Count lines and H1/H2 headings without buffering unbounded lines."""
 
@@ -1075,6 +1950,7 @@ def _validate_artifact_contracts(
     before: dict[str, tuple[int, ...]],
     after: dict[str, tuple[int, ...]],
     workspace_root: Path,
+    bound_skill_name: str | None = None,
 ) -> dict[str, Any]:
     """Validate only contracts for Skills actually invoked this Turn.
 
@@ -1091,6 +1967,11 @@ def _validate_artifact_contracts(
         rows = contracts
     else:
         raise RuntimeError("artifact_contract_invalid")
+    active_skill_names = set(invoked_skill_names)
+    if bound_skill_name is not None:
+        if re.fullmatch(r"[A-Za-z0-9._-]{1,128}", bound_skill_name) is None:
+            raise RuntimeError("artifact_contract_invalid")
+        active_skill_names.add(bound_skill_name)
     active: list[dict[str, Any]] = []
     for row in rows:
         if not isinstance(row, dict):
@@ -1098,7 +1979,7 @@ def _validate_artifact_contracts(
         skill_name = str(row.get("skill_name") or "")
         if re.fullmatch(r"[A-Za-z0-9._-]{1,128}", skill_name) is None:
             raise RuntimeError("artifact_contract_invalid")
-        if skill_name in invoked_skill_names:
+        if skill_name in active_skill_names:
             active.append(row)
     if not active:
         return {
@@ -1238,15 +2119,25 @@ def _validate_artifact_contracts(
             or len(declared_modules) > MAX_ARTIFACT_CONTRACT_FINDINGS
         ):
             raise RuntimeError("artifact_contract_invalid")
+        final_parent = PurePosixPath(relative).parent
         for declared in declared_modules:
             module_pattern = _workspace_contract_pattern(declared)
+            resolved_module_pattern = (
+                module_pattern
+                if str(final_parent) == "."
+                else (final_parent / module_pattern).as_posix()
+            )
             if not any(
-                fnmatch.fnmatchcase(path, module_pattern) for path in after
+                fnmatch.fnmatchcase(path, resolved_module_pattern)
+                for path in after
             ):
                 finding(
                     "artifact_declared_module_missing",
                     skill_name=skill_name,
                     pattern=module_pattern,
+                    final_parent=(
+                        "" if str(final_parent) == "." else str(final_parent)
+                    ),
                 )
         validated.append({
             "skill_name": skill_name,
@@ -1358,6 +2249,8 @@ def _claude_command(
     config: dict[str, Any],
     *,
     workspace_root: Path = Path("/workspace"),
+    artifact_stop_contract_path: Path | None = None,
+    native_lifecycle_contract_path: Path | None = None,
 ) -> tuple[list[str], bytes]:
     native_session_id = str(config["native_session_id"])
     api_model = str(config["api_model"])
@@ -1388,6 +2281,13 @@ def _claude_command(
         "--thinking", "enabled",
         "--setting-sources", "",
         "--plugin-dir", "/skill-view/plugin",
+        # The plugin loader can discover Skills and agents outside cwd, but
+        # Claude's native filesystem permission layer separately asks before
+        # their resources may be read. Register only the immutable Skill
+        # resource subtree as an additional native working directory. The
+        # container mount remains read-only in every permission tier, while
+        # Claude retains its own path/symlink and read-only command checks.
+        "--add-dir", "/skill-view/plugin/skills",
         "--mcp-config", "/skill-view/plugin/.mcp.json",
         "--strict-mcp-config",
         "--model", claude_model,
@@ -1400,24 +2300,109 @@ def _claude_command(
         # the authority boundary without a version-fragile tool-name list.
         "--tools", "default",
     ]
-    permission_preset = str(config.get("permission_preset") or "session_full")
+    permission_preset = str(config.get("permission_preset") or "workspace_write")
     if permission_preset == "session_full":
         command.extend([
             "--permission-mode", "bypassPermissions",
             "--dangerously-skip-permissions",
         ])
     elif permission_preset == "workspace_write":
-        command.extend(["--permission-mode", "default", "--permission-prompt-tool", "stdio"])
+        command.extend(["--permission-mode", "default"])
     elif permission_preset == "read_only":
         command.extend(["--permission-mode", "plan"])
     else:
         raise RuntimeError("permission_preset_invalid")
-    command.extend([
-        "--append-system-prompt",
-        render_runtime_capability_prompt(
-            config.get("runtime_capability_contract")
-        ),
-    ])
+    # Permission tiers govern action authority, while native user-interaction
+    # tools remain browser I/O in every tier.  Claude Code's own structured
+    # stdio transport emits the exact can_use_tool request without introducing
+    # a second tool loop or reconstructing native tool input.
+    command.extend(["--permission-prompt-tool", "stdio"])
+    if (
+        artifact_stop_contract_path is not None
+        and native_lifecycle_contract_path is not None
+    ):
+        raise RuntimeError("artifact_contract_invalid")
+    if native_lifecycle_contract_path is not None:
+        if (
+            not native_lifecycle_contract_path.is_absolute()
+            or native_lifecycle_contract_path.as_posix()
+            != "/runtime/native-lifecycle-contract.json"
+        ):
+            raise RuntimeError("workflow_contract_invalid")
+        hook_command = (
+            "/usr/local/bin/python -I -m "
+            "claude_runner.native_lifecycle_hook "
+            "/runtime/native-lifecycle-contract.json"
+        )
+        command.extend([
+            "--settings",
+            json.dumps(
+                {
+                    "hooks": {
+                        "PreToolUse": [{
+                            "matcher": (
+                                "Agent|Task|Write|Edit|MultiEdit|"
+                                "NotebookEdit|Bash"
+                            ),
+                            "hooks": [{
+                                "type": "command",
+                                "command": hook_command,
+                                "timeout": 120,
+                            }],
+                        }],
+                        "Stop": [{
+                            "hooks": [{
+                                "type": "command",
+                                "command": hook_command,
+                                "timeout": 120,
+                            }],
+                        }],
+                    },
+                },
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        ])
+    elif artifact_stop_contract_path is not None:
+        if (
+            not artifact_stop_contract_path.is_absolute()
+            or artifact_stop_contract_path.as_posix()
+            != "/runtime/artifact-stop-contract.json"
+        ):
+            raise RuntimeError("artifact_contract_invalid")
+        native_settings = {
+            "hooks": {
+                "Stop": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": (
+                            "/usr/local/bin/python -I -m "
+                            "claude_runner.artifact_stop_hook "
+                            "/runtime/artifact-stop-contract.json"
+                        ),
+                        "timeout": 120,
+                    }],
+                }],
+            },
+        }
+        command.extend([
+            "--settings",
+            json.dumps(
+                native_settings,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        ])
+    # Validate the controller receipt at the worker boundary, but do not turn
+    # it into a parallel ChatDS system prompt. Claude's own native tool graph,
+    # installed Skills and MCP schemas are the model-facing capability plane.
+    validate_runtime_capability_contract(
+        config.get("runtime_capability_contract")
+    )
     disallowed_tools = ["CronCreate", "CronDelete", "CronList"]
     if not bool(config.get("native_web_tools")):
         # WebSearch/WebFetch are provider-hosted server tools, not ordinary
@@ -1458,6 +2443,16 @@ def _native_stream_json_input(
         )
     content: list[dict[str, Any]] = []
     prompt = str(config.get("prompt") or "")
+    turn_skill_binding = _turn_skill_binding(config)
+    if turn_skill_binding is not None:
+        skill_name, _source = turn_skill_binding
+        native_command = f"/chatds-session-skills:{skill_name}"
+        if not (
+            prompt == native_command
+            or prompt.startswith(native_command + " ")
+            or prompt.startswith(native_command + "\n")
+        ):
+            prompt = f"{native_command} {prompt}".rstrip()
     if prompt:
         content.append({"type": "text", "text": prompt})
     for receipt in attachments:
@@ -1487,6 +2482,29 @@ def _native_stream_json_input(
     if len(encoded) > MAX_NATIVE_INPUT_BYTES:
         raise RuntimeError("native_input_size_limit")
     return encoded
+
+
+def _turn_skill_binding(
+    config: dict[str, Any],
+) -> tuple[str, str] | None:
+    value = config.get("turn_skill_binding")
+    if value is None:
+        return None
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"skill_name", "source"}
+    ):
+        raise RuntimeError("turn_skill_binding_invalid")
+    skill_name = value.get("skill_name")
+    source = value.get("source")
+    if (
+        not isinstance(skill_name, str)
+        or re.fullmatch(r"[A-Za-z0-9._-]{1,128}", skill_name) is None
+        or source != "fresh_session_primary"
+        or config.get("resume_from_native_session_id") is not None
+    ):
+        raise RuntimeError("turn_skill_binding_invalid")
+    return skill_name, source
 
 
 def _worker_environment(
@@ -1750,8 +2768,10 @@ def _run_child(
     )
     assert _child.stdin is not None and _child.stdout is not None and _child.stderr is not None
     input_lock = threading.Lock()
-    interactive = permission_preset == "workspace_write"
-    keep_stdin_open = permission_preset in {"read_only", "workspace_write"}
+    # Native user-interaction tools can surface in every permission tier. Keep
+    # structured stdin available until Claude publishes its native result;
+    # `_close_stdin_after_native_result` then closes it deterministically.
+    keep_stdin_open = True
 
     def write_input(value: bytes) -> bool:
         try:
@@ -1810,12 +2830,24 @@ def _run_child(
             return
         pending_approvals.setdefault(request_id, (native, native_seq))
 
-    def send_decision(request_id: str, native: dict[str, Any], decision: str) -> bool:
+    def send_decision(
+        request_id: str,
+        native: dict[str, Any],
+        decision: str,
+        *,
+        updated_input: dict[str, Any] | None = None,
+    ) -> bool:
         inner = native["request"]
         response_payload = {
             "behavior": decision,
             **(
-                {"updatedInput": dict(inner.get("input") or {})}
+                {
+                    "updatedInput": (
+                        updated_input
+                        if updated_input is not None
+                        else dict(inner.get("input") or {})
+                    )
+                }
                 if decision == "allow"
                 else {"message": "Denied by ChatDS Session permission policy or user"}
             ),
@@ -1844,6 +2876,12 @@ def _run_child(
                 "request_id": request_id,
                 "decision": decision,
                 "tool_name": str(inner.get("tool_name") or "tool")[:512],
+                "interaction_kind": (
+                    native_user_interaction_kind(
+                        inner.get("tool_name"), inner.get("input")
+                    )
+                    or "approval"
+                ),
             }, channel="controller")
         return delivered
 
@@ -1852,12 +2890,28 @@ def _run_child(
             native, native_seq = pending
             if request_id in resolved_approvals:
                 continue
-            if permission_preset == "read_only":
+            inner = native["request"]
+            tool_name = str(inner.get("tool_name") or "")
+            interaction_kind = native_user_interaction_kind(
+                tool_name, inner.get("input")
+            )
+            if is_native_user_interaction(tool_name) and interaction_kind is None:
+                # A malformed intrinsic interaction must not hang a confined
+                # Turn or be auto-allowed by the full-access tier.
                 if send_decision(request_id, native, "deny"):
                     resolved_approvals.add(request_id)
                     pending_approvals.pop(request_id, None)
                 continue
-            if not interactive:
+            user_interaction = interaction_kind is not None
+            if permission_preset == "read_only" and not user_interaction:
+                if send_decision(request_id, native, "deny"):
+                    resolved_approvals.add(request_id)
+                    pending_approvals.pop(request_id, None)
+                continue
+            if permission_preset == "session_full" and not user_interaction:
+                if send_decision(request_id, native, "allow"):
+                    resolved_approvals.add(request_id)
+                    pending_approvals.pop(request_id, None)
                 continue
             response_path = approval_root / (
                 hashlib.sha256(request_id.encode()).hexdigest() + ".json"
@@ -1878,7 +2932,15 @@ def _run_child(
                 or decision not in {"allow", "deny"}
             ):
                 continue
-            if send_decision(request_id, native, decision):
+            updated_input = value.get("updated_input")
+            if updated_input is not None and not isinstance(updated_input, dict):
+                continue
+            if send_decision(
+                request_id,
+                native,
+                decision,
+                updated_input=updated_input,
+            ):
                 resolved_approvals.add(request_id)
                 pending_approvals.pop(request_id, None)
     leader_exited_at: float | None = None

@@ -17,55 +17,10 @@ import {
   getMcpServers, addMcpServer, deleteMcpServer,
   forkConversation,
 } from '../api'
-
-const CHATDS_TOOL_GROUPS = {
-  '文件与执行': ['read_file', 'write_file', 'patch_file', 'search_files', 'execute_code'],
-  '网络与浏览器': ['web_search', 'web_extract', 'market_quote', 'browser_navigate', 'browser_snapshot', 'browser_click', 'browser_type', 'browser_scroll', 'browser_back'],
-  '知识与会话': ['memory', 'session_search', 'sessions_list', 'sessions_history', 'sessions_send', 'sessions_fork', 'session_status', 'skills_list', 'skill_view', 'skill_manage'],
-  '协作与自动化': ['todo', 'clarify', 'delegate_task', 'cronjob', 'get_goal', 'create_goal', 'update_goal'],
-  '多模态与扩展': ['image_generate', 'vision_analyze', 'mcp_server_list', 'mcp_server_status'],
-}
-
-const DEEPSEEK_NATIVE_TOOL_GROUPS = {
-  'Shell / Jobs': ['bash', 'job_output', 'job_list', 'job_kill'],
-  'Files': ['read', 'write', 'edit', 'glob', 'grep'],
-  'Skills': ['skill', 'skills_list', 'skill_view', 'skill_copy_resource'],
-  'Subagents': ['subagent', 'send_message', 'interrupt_agent', 'list_agents'],
-  'Goals / Todo': ['todo_write', 'get_goal', 'create_goal', 'update_goal'],
-  'Web': ['web_search'],
-}
-
-const TOOL_POLICY_BADGES = {
-  read_file: ['read-only'],
-  read: ['read-only'],
-  search_files: ['read-only'],
-  glob: ['read-only'],
-  grep: ['read-only'],
-  web_search: ['read-only'],
-  web_extract: ['read-only'],
-  market_quote: ['read-only', 'typed-egress'],
-  browser_snapshot: ['read-only'],
-  write_file: ['workspace', 'parallel-child-off'],
-  write: ['workspace', 'parallel-child-off'],
-  patch_file: ['workspace', 'parallel-child-off'],
-  edit: ['workspace', 'parallel-child-off'],
-  merge_files: ['workspace', 'parallel-child-off'],
-  execute_code: ['sandbox'],
-  bash: ['sandbox'],
-  skill_manage: ['workspace', 'parallel-child-off'],
-  skill: ['workspace', 'parallel-child-off'],
-  clarify: ['child-off', 'user-visible'],
-  memory: ['child-off', 'global-state'],
-  sessions_fork: ['child-off', 'global-state'],
-  sessions_send: ['child-off', 'global-state'],
-  delegate_task: ['child-off'],
-  subagent: ['child-off'],
-  cronjob: ['child-off', 'global-state'],
-  todo: ['child-off', 'global-state'],
-  todo_write: ['child-off', 'global-state'],
-  create_goal: ['child-off', 'global-state'],
-  update_goal: ['child-off', 'global-state'],
-}
+import {
+  DEFAULT_PERMISSION_PRESET,
+  normalizePermissionPreset,
+} from '../utils/permissionPresets'
 
 function isMarkdownFile(path) {
   if (!path) return false
@@ -226,8 +181,6 @@ export default function SessionWorkspace({
       const next = await updateConversationSettings(convId, {
         engine_id: settings.engine_id,
         model_id: settings.model_id,
-        enabled_tools: settings.enabled_tools,
-        fallback_model_ids: settings.fallback_model_ids,
         permission_preset: settings.permission_preset,
       })
       setSettings(next)
@@ -424,7 +377,7 @@ export default function SessionWorkspace({
             <div className="space-y-5">
               <Section title="执行引擎">
                 <select
-                  value={settings.engine_id || 'legacy'}
+                  value={settings.engine_id || ''}
                   disabled={settings.engine_locked}
                   onChange={(e) => {
                     const engineId = e.target.value
@@ -442,6 +395,9 @@ export default function SessionWorkspace({
                   }}
                   className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm disabled:bg-stone-100 disabled:text-stone-500"
                 >
+                  {settings.engine_id === 'legacy' && (
+                    <option value="legacy" disabled>旧 ChatDS Harness（已退役）</option>
+                  )}
                   {(settings.engine_options || []).map((engine) => (
                     <option key={engine.id} value={engine.id} disabled={!engine.available}>
                       {engine.name}{engine.available ? '' : '（不可用）'}
@@ -474,7 +430,7 @@ export default function SessionWorkspace({
                 )}
               </Section>
               <Section title="主模型">
-                <select value={settings.model_id} onChange={(e) => setSettings({ ...settings, model_id: e.target.value })} className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm">
+                <select disabled={settings.engine_id === 'legacy'} value={settings.model_id} onChange={(e) => setSettings({ ...settings, model_id: e.target.value })} className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm disabled:bg-stone-100 disabled:text-stone-500">
                   {models
                     .filter((model) => {
                       const active = (settings.engine_options || []).find(
@@ -486,7 +442,14 @@ export default function SessionWorkspace({
                     .map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
                 </select>
               </Section>
-              <Section title="Session 权限">
+              {settings.engine_id === 'legacy' ? (
+                <Section title="Session 权限">
+                  <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs leading-relaxed text-amber-800">
+                    旧执行引擎已退役。请 Fork 并切换到 Claude Code 或 DeepSeek Harness 后选择只读、可写需授权或 Session 内完整权限。
+                  </div>
+                </Section>
+              ) : (
+                <Section title="Session 权限">
                   <div className="grid grid-cols-1 gap-2">
                     {[
                       ['read_only', 'Read only / 只读', '仅允许读取当前 Session 工作区和只读信息源；写入、执行、调度等权限请求会被策略拒绝。'],
@@ -495,17 +458,17 @@ export default function SessionWorkspace({
                         'Write but need allow / 可写但需授权',
                         settings.engine_id === 'claude_code'
                           ? '可读写当前 Session 工作区；Claude 原生权限请求由页面逐次确认后执行。'
-                          : '可读写当前 Session 工作区；需要授权的操作走引擎原生策略，越界操作自动拒绝。',
+                          : '以只读沙箱起步；写入由 DeepSeek Harness 原生升级请求逐次授权，越界操作自动拒绝。',
                       ],
                       ['session_full', 'Full access / Session 内完整权限', '在当前 Session 的工作区、沙箱和出网边界内免逐次确认；仍不能访问其他 Session、宿主机目录或 Docker Socket。'],
                     ].map(([value, title, description]) => (
-                      <label key={value} className={`cursor-pointer rounded-xl border p-3 ${settings.permission_preset === value ? 'border-indigo-400 bg-indigo-50' : 'border-stone-200 bg-white'}`}>
+                      <label key={value} className={`cursor-pointer rounded-xl border p-3 ${normalizePermissionPreset(settings.permission_preset) === value ? 'border-indigo-400 bg-indigo-50' : 'border-stone-200 bg-white'}`}>
                         <div className="flex items-center gap-2 text-sm font-medium text-slate-800">
                           <input
                             type="radio"
                             name="permission-preset"
                             value={value}
-                            checked={(settings.permission_preset || 'session_full') === value}
+                            checked={(settings.permission_preset || DEFAULT_PERMISSION_PRESET) === value}
                             onChange={() => setSettings({ ...settings, permission_preset: value })}
                           />
                           {title}
@@ -518,48 +481,23 @@ export default function SessionWorkspace({
                     所有级别始终只挂载当前用户的当前 Session 工作区；无法访问其他用户、其他 Session、宿主机目录或 Docker Socket。
                   </div>
                 </Section>
-              {settings.engine_id === 'legacy' && <Section title="模型回退链">
-                <div className="grid grid-cols-2 gap-2">
-                  {models.filter((m) => m.id !== settings.model_id).map((m) => (
-                    <Check key={m.id} label={m.name} checked={settings.fallback_model_ids.includes(m.id)} onChange={(checked) => setSettings({
-                      ...settings,
-                      fallback_model_ids: checked ? [...settings.fallback_model_ids, m.id] : settings.fallback_model_ids.filter((id) => id !== m.id),
-                    })} />
-                  ))}
-                </div>
-              </Section>}
-              <Section title="ChatDS 能力视图">
-                <div className="space-y-3">
-                  {Object.entries(CHATDS_TOOL_GROUPS).map(([group, tools]) => (
-                    <div key={group} className="rounded-xl border border-stone-200 bg-white p-3">
-                      <div className="mb-2 text-xs font-medium text-slate-700">{group}</div>
-                      <div className="grid grid-cols-2 gap-2">
-                        {tools.map((tool) => <Check key={tool} label={tool} checked={settings.enabled_tools.includes(tool)} onChange={(checked) => setSettings({
-                          ...settings,
-                          enabled_tools: checked ? [...settings.enabled_tools, tool] : settings.enabled_tools.filter((name) => name !== tool),
-                        })} />)}
-                      </div>
+              )}
+              {settings.engine_id === 'deepseek_harness' && (
+                <Section title="DeepSeek 原生视图（只读）">
+                  <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                    <div className="flex flex-wrap gap-2">
+                      {(settings.tool_surface?.deepseek_native_tools || []).map((tool) => (
+                        <span key={tool} className="inline-flex items-center rounded-full border border-slate-200 bg-white px-2 py-1 text-[11px] text-slate-600">{tool}</span>
+                      ))}
                     </div>
-                  ))}
-                </div>
-              </Section>
-              <Section title="DeepSeek 原生视图">
-                <div className="space-y-3">
-                  {Object.entries(DEEPSEEK_NATIVE_TOOL_GROUPS).map(([group, tools]) => (
-                    <div key={group} className="rounded-xl border border-slate-200 bg-slate-50 p-3">
-                      <div className="mb-2 text-xs font-medium text-slate-700">{group}</div>
-                      <div className="flex flex-wrap gap-2">
-                        {tools.map((tool) => (
-                          <span key={tool} className="inline-flex items-center rounded-full border border-slate-200 bg-white px-2 py-1 text-[11px] text-slate-600">{tool}</span>
-                        ))}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </Section>
-              <div className="text-xs text-slate-500">ChatDS capability 仍是保存与审计主键；DeepSeek 原生名仅用于说明 runner 内部闭环的实际工具面。</div>
+                    <div className="mt-2 text-xs text-slate-500">这是固定于当前部署镜像的上游原生工具图，仅用于观察；网页不对它做二次编排。权限由上面的 Session 预设、单 Workspace 挂载和原生审批共同约束。</div>
+                  </div>
+                </Section>
+              )}
               <div className="text-xs text-slate-500">累计 Token：{settings.usage.total_tokens.toLocaleString()}（输入 {settings.usage.input_tokens.toLocaleString()} / 输出 {settings.usage.output_tokens.toLocaleString()}）</div>
-              <button onClick={saveSettings} disabled={saving} className="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm flex items-center gap-2"><FiSave />保存运行配置</button>
+              {settings.engine_id !== 'legacy' && (
+                <button onClick={saveSettings} disabled={saving} className="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm flex items-center gap-2"><FiSave />保存运行配置</button>
+              )}
             </div>
           )}
 
@@ -779,7 +717,8 @@ export default function SessionWorkspace({
           {loadedConvId === convId && tab === 'mcp' && (
             <div className="space-y-5">
               <form onSubmit={addMcp} className="p-4 border border-stone-200 rounded-xl space-y-3">
-                <div className="font-medium text-sm">会话级 MCP Server</div>
+                <div className="font-medium text-sm">会话级原生 MCP Server</div>
+                <div className="text-[11px] leading-relaxed text-slate-500">声明由 Backend 持久化，并在每个 Claude Code / DeepSeek Harness Turn 中投影到隔离运行时；页面不维持常驻 MCP 进程。</div>
                 <div className="grid grid-cols-2 gap-3">
                   <Field label="名称"><input required value={mcpForm.name} onChange={(e) => setMcpForm({ ...mcpForm, name: e.target.value })} className="input" /></Field>
                   <Field label="传输"><select value={mcpForm.transport} onChange={(e) => setMcpForm({ ...mcpForm, transport: e.target.value })} className="input"><option value="http">HTTP</option><option value="sse">SSE</option><option value="stdio">stdio</option></select></Field>
@@ -793,7 +732,7 @@ export default function SessionWorkspace({
               </form>
               <div className="space-y-2">
                 {mcpServers.map((server) => <div key={server.name} className="p-3 border border-stone-200 rounded-xl flex gap-3 items-center">
-                  <div className="flex-1"><div className="text-sm font-medium">{server.name}</div><div className="text-xs text-slate-500">{server.transport || 'auto'} · {server.connected ? 'connected' : 'disconnected'} · {server.tool_count || 0} tools</div></div>
+                  <div className="flex-1"><div className="text-sm font-medium">{server.name}</div><div className="text-xs text-slate-500">{server.transport || 'auto'} · {server.scope === 'user' ? '用户级' : '会话级'} · Turn 内隔离绑定</div></div>
                   <button onClick={async () => { await deleteMcpServer(server.name, convId); const data = await getMcpServers(convId); setMcpServers(data.servers || []) }} className="p-1.5 rounded hover:bg-stone-100 text-red-500"><FiTrash2 size={14} /></button>
                 </div>)}
               </div>
@@ -874,19 +813,6 @@ function FileFallback({ fileBlobUrl, selectedFile, label }) {
 
 function Section({ title, children }) {
   return <div><div className="text-xs font-semibold text-slate-600 mb-2">{title}</div>{children}</div>
-}
-
-function Check({ label, checked, onChange }) {
-  const badges = TOOL_POLICY_BADGES[label] || []
-  return (
-    <label className="flex items-center gap-2 text-xs text-slate-700">
-      <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} />
-      <span>{label}</span>
-      {badges.map((badge) => (
-        <span key={badge} className="px-1.5 py-0.5 rounded bg-stone-100 text-[10px] text-slate-500">{badge}</span>
-      ))}
-    </label>
-  )
 }
 
 function Field({ label, children }) {

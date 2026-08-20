@@ -16,9 +16,9 @@ class RunnerConfigurationError(RuntimeError):
 @dataclass(frozen=True, slots=True)
 class ProviderProfile:
     id: str
-    # These two fields attest the model row received from ChatDS. They may
-    # describe the Legacy engine's OpenAI-compatible route; Claude Code itself
-    # always uses ``claude_base_url`` through Anthropic Messages.
+    # These two fields attest the Backend-owned model route received from
+    # ChatDS. Claude Code itself always uses ``claude_base_url`` through
+    # Anthropic Messages; no retired execution runtime participates here.
     backend_base_url: str
     backend_protocol: str
     claude_base_url: str

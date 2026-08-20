@@ -73,10 +73,9 @@ def test_unknown_and_binary_extensions_are_preserved_as_inert_resources(tmp_path
 
     with (
         patch.object(skill_router, "SKILLS_DATA_DIR", tmp_path),
-        patch.object(skill_router, "_invalidate_skills_cache"),
         patch.object(
             skill_router,
-            "_auto_register_mcp",
+            "_project_skill_mcp",
             new=AsyncMock(return_value=empty_mcp),
         ),
     ):
@@ -112,10 +111,9 @@ def test_nested_reference_skill_without_frontmatter_stays_in_parent_upload(tmp_p
 
     with (
         patch.object(skill_router, "SKILLS_DATA_DIR", tmp_path),
-        patch.object(skill_router, "_invalidate_skills_cache"),
         patch.object(
             skill_router,
-            "_auto_register_mcp",
+            "_project_skill_mcp",
             new=AsyncMock(return_value={
                 "registered": [], "skipped": [], "errors": [], "runtime": None,
             }),
@@ -154,10 +152,9 @@ def test_nested_reference_skill_with_frontmatter_is_not_split_from_parent(tmp_pa
 
     with (
         patch.object(skill_router, "SKILLS_DATA_DIR", tmp_path),
-        patch.object(skill_router, "_invalidate_skills_cache"),
         patch.object(
             skill_router,
-            "_auto_register_mcp",
+            "_project_skill_mcp",
             new=AsyncMock(return_value={
                 "registered": [], "skipped": [], "errors": [], "runtime": None,
             }),
@@ -198,10 +195,9 @@ def test_multi_skill_zip_persists_stable_primary_and_supporting_identity(
 
     with (
         patch.object(skill_router, "SKILLS_DATA_DIR", tmp_path),
-        patch.object(skill_router, "_invalidate_skills_cache"),
         patch.object(
             skill_router,
-            "_auto_register_mcp",
+            "_project_skill_mcp",
             new=AsyncMock(return_value={
                 "registered": [], "skipped": [], "errors": [], "runtime": None,
             }),

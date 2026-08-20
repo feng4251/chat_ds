@@ -118,6 +118,24 @@ HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
 ENTRYPOINT ["/usr/bin/dumb-init", "--"]
 CMD ["/usr/local/bin/chatds-browser-runtime-health"]
 
+# Neutral dependency substrate for native Agent Engine Turn images. It
+# intentionally contains no executor server, request protocol, socket, or
+# retired request-kind configuration. Claude Code and DeepSeek Harness add
+# only their pinned native runtime and the Web/Session boundary adapter.
+FROM browser-runtime AS native-session-runtime
+
+LABEL org.opencontainers.image.title="ChatDS native Session runtime" \
+      org.opencontainers.image.description="Neutral Python, Node, Bash and browser dependencies for isolated native Agent Engine Turns" \
+      org.opencontainers.image.chatds.profile="native-session-runtime-v1"
+
+USER 0:0
+RUN chown root:root /workspace \
+    && chmod 0755 /workspace
+
+HEALTHCHECK NONE
+ENTRYPOINT ["/usr/bin/dumb-init", "--"]
+CMD ["/usr/local/bin/chatds-browser-runtime-health"]
+
 # Single fixed-size production sandbox target. The process protocol
 # implementation serves one serialized worker identity across one-shot code,
 # declared commands, exact Skill scripts, and persistent leases. No

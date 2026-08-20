@@ -113,11 +113,108 @@ function WorkflowNode({ node }) {
   )
 }
 
-function ApprovalNode({ node, onApproval }) {
+function QuestionNode({ node, onApproval }) {
+  const [selected, setSelected] = useState({})
+  const [custom, setCustom] = useState({})
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState('')
+  const value = node.payload || {}
+  const questions = value.questions || []
+  const pending = value.status === 'pending'
+
+  function choose(question, label) {
+    setCustom((current) => ({ ...current, [question.question]: '' }))
+    setSelected((current) => {
+      if (!question.multi_select) return { ...current, [question.question]: label }
+      const previous = Array.isArray(current[question.question]) ? current[question.question] : []
+      const next = previous.includes(label)
+        ? previous.filter((item) => item !== label)
+        : [...previous, label]
+      return { ...current, [question.question]: next }
+    })
+  }
+
+  async function submit(decision) {
+    if (!pending || !onApproval || submitting) return
+    const answers = {}
+    if (decision === 'allow') {
+      for (const question of questions) {
+        const freeText = (custom[question.question] || '').trim()
+        const choice = selected[question.question]
+        const answer = freeText || (Array.isArray(choice) ? choice.join(', ') : choice || '')
+        if (!answer) {
+          setError('请回答每一个问题')
+          return
+        }
+        answers[question.question] = answer
+      }
+    }
+    setSubmitting(true)
+    setError('')
+    try {
+      await onApproval(value, decision, decision === 'allow' ? answers : null)
+    } catch (reason) {
+      setError(reason?.message || '回答提交失败')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <div className="rounded-xl border border-sky-200 bg-sky-50 px-3 py-3 text-xs">
+      <div className="flex items-center gap-2 font-semibold text-slate-800">
+        <FiUsers className="text-sky-600" size={13} />原生引擎需要你的输入
+        {!pending && <span className={value.status === 'denied' ? 'ml-auto text-red-600' : 'ml-auto text-emerald-600'}>{value.status === 'denied' ? '未回答' : '已回答'}</span>}
+      </div>
+      {pending && <div className="mt-3 space-y-4">
+        {questions.map((question) => {
+          const current = selected[question.question]
+          return <fieldset key={question.question} className="space-y-2">
+            <legend className="font-medium text-slate-700">{question.header ? `${question.header} · ` : ''}{question.question}</legend>
+            {question.options.map((option) => {
+              const checked = question.multi_select
+                ? Array.isArray(current) && current.includes(option.label)
+                : current === option.label
+              return <label key={option.label} className="flex cursor-pointer items-start gap-2 rounded-lg border border-sky-100 bg-white px-2.5 py-2">
+                <input
+                  type={question.multi_select ? 'checkbox' : 'radio'}
+                  name={`question-${node.nodeId}-${question.question}`}
+                  checked={checked}
+                  onChange={() => choose(question, option.label)}
+                  className="mt-0.5"
+                />
+                <span><span className="font-medium text-slate-700">{option.label}</span>{option.description && <span className="ml-1 text-slate-500">{option.description}</span>}</span>
+              </label>
+            })}
+            <input
+              value={custom[question.question] || ''}
+              onChange={(event) => {
+                setCustom((currentCustom) => ({ ...currentCustom, [question.question]: event.target.value }))
+                setSelected((currentSelected) => ({ ...currentSelected, [question.question]: question.multi_select ? [] : '' }))
+              }}
+              placeholder="其他答案（可直接输入）"
+              maxLength={4000}
+              className="w-full rounded-lg border border-sky-200 bg-white px-2.5 py-2 outline-none focus:border-sky-400"
+            />
+          </fieldset>
+        })}
+        <div className="flex gap-2">
+          <button disabled={submitting} onClick={() => submit('allow')} className="rounded-lg bg-indigo-600 px-3 py-1.5 text-white disabled:opacity-50">提交回答</button>
+          <button disabled={submitting} onClick={() => submit('deny')} className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-slate-700 disabled:opacity-50">不回答</button>
+          {submitting && <Spinner />}
+        </div>
+      </div>}
+      {error && <div className="mt-2 text-red-600">{error}</div>}
+    </div>
+  )
+}
+
+function PermissionApprovalNode({ node, onApproval }) {
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
   const value = node.payload || {}
   const pending = value.status === 'pending'
+  const isUserAction = value.interaction_kind === 'user_action'
   const view = statusView(value.status)
   async function decide(decision) {
     if (!pending || !onApproval || submitting) return
@@ -135,14 +232,21 @@ function ApprovalNode({ node, onApproval }) {
     <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs">
       <div className="flex flex-wrap items-center gap-2">
         <FiShield className="text-amber-600" size={13} />
-        <span className="font-semibold text-slate-800">权限请求 · {value.tool_name || '工具'}</span>
+        <span className="font-semibold text-slate-800">{isUserAction ? '原生引擎请求确认' : `权限请求 · ${value.tool_name || '工具'}`}</span>
         {!pending && <span className={`ml-auto flex items-center gap-1 ${view.tone}`}>{view.icon}{view.label}</span>}
       </div>
       {(value.title || value.description || value.decision_reason) && <div className="mt-1.5 whitespace-pre-wrap text-slate-600">{value.title || value.description || value.decision_reason}</div>}
-      {pending && <div className="mt-2 flex gap-2"><button disabled={submitting} onClick={() => decide('allow')} className="rounded-lg bg-indigo-600 px-3 py-1.5 text-white disabled:opacity-50">仅本次允许</button><button disabled={submitting} onClick={() => decide('deny')} className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-slate-700 disabled:opacity-50">拒绝</button>{submitting && <Spinner />}</div>}
+      {pending && <div className="mt-2 flex gap-2"><button disabled={submitting} onClick={() => decide('allow')} className="rounded-lg bg-indigo-600 px-3 py-1.5 text-white disabled:opacity-50">{isUserAction ? '确认' : '仅本次允许'}</button><button disabled={submitting} onClick={() => decide('deny')} className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-slate-700 disabled:opacity-50">{isUserAction ? '返回修改' : '拒绝'}</button>{submitting && <Spinner />}</div>}
       {error && <div className="mt-2 text-red-600">{error}</div>}
     </div>
   )
+}
+
+function ApprovalNode({ node, onApproval }) {
+  if (node.payload?.interaction_kind === 'question') {
+    return <QuestionNode node={node} onApproval={onApproval} />
+  }
+  return <PermissionApprovalNode node={node} onApproval={onApproval} />
 }
 
 export default function TurnTimeline({ nodes = [], streaming = false, onApproval }) {

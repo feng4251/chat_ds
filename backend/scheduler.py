@@ -10,28 +10,26 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-import httpx
 from sqlalchemy import select
 
-from agent_engines.base import ENGINE_ID_CLAUDE_CODE, ENGINE_ID_LEGACY
+from agent_engines.base import (
+    ENGINE_ID_CLAUDE_CODE,
+    ENGINE_ID_DEEPSEEK_HARNESS,
+    ENGINE_ID_LEGACY,
+)
 from config import settings
 from database import async_session
 from hooks import emit_event
 from model_routing import (
     DEFAULT_AGENT_MODEL_ID,
-    canonical_agent_model_id,
-    filter_agentic_fallback_model_ids,
 )
 from native_tools import (
-    DEFAULT_NATIVE_TOOL_SET,
-    UNATTENDED_DEFAULT_NATIVE_TOOLS,
-    canonicalize_scheduled_tools,
+    PLATFORM_IO_CAPABILITY_SET,
+    canonicalize_scheduled_platform_capabilities,
 )
 from models import (
     AgentRun,
     Conversation,
-    CustomModelConfig,
-    Message,
     ScheduledJob,
     ScheduledJobRun,
     User,
@@ -120,81 +118,6 @@ def next_run_for(job: ScheduledJob, after: datetime | None = None) -> datetime |
     return None
 
 
-def _provider_payload(model_id: str, config: dict) -> dict:
-    return {
-        "id": model_id,
-        "base_url": config["base_url"],
-        "api_key": config["api_key"],
-        "api_model": config["api_model"],
-        "provider": config.get("provider", "openai"),
-        "protocol": config.get("protocol", "openai"),
-        "is_multimodal": config.get("is_multimodal", False),
-        "context_length": config.get("context_length", 262144),
-        "discover_runtime_metadata": bool(
-            config.get("discover_runtime_metadata", False)
-        ),
-        "agentic_auxiliary_only": config.get(
-            "agentic_auxiliary_only", False
-        ),
-        "supports_thinking_toggle": config.get(
-            "supports_thinking_toggle", False
-        ),
-        "thinking_enabled_by_default": config.get(
-            "thinking_enabled_by_default", True
-        ),
-        "thinking_request_format": config.get(
-            "thinking_request_format", ""
-        ),
-        "thinking_send_enabled_explicitly": bool(
-            config.get("thinking_send_enabled_explicitly", False)
-        ),
-    }
-
-
-async def _resolve_job_model(
-    db,
-    user_id: str,
-    model_id: str,
-) -> dict:
-    from routers.chat_router import BUILTIN
-    if model_id in BUILTIN:
-        return _provider_payload(model_id, BUILTIN[model_id])
-    custom = (await db.execute(
-        select(CustomModelConfig).where(
-            CustomModelConfig.user_id == user_id,
-            CustomModelConfig.model_id == model_id,
-        )
-    )).scalar_one_or_none()
-    if custom is None:
-        raise ValueError(f"Unknown model: {model_id}")
-    try:
-        extra_headers = json.loads(custom.extra_headers) if custom.extra_headers else {}
-    except (TypeError, json.JSONDecodeError):
-        extra_headers = {}
-    if not isinstance(extra_headers, dict):
-        extra_headers = {}
-    return {
-        "id": custom.model_id,
-        "base_url": custom.base_url.rstrip("/"),
-        "api_key": custom.api_key,
-        "api_model": custom.model_id,
-        "provider": custom.provider,
-        "protocol": "anthropic" if custom.provider == "anthropic" else "openai",
-        "is_multimodal": custom.is_multimodal,
-        "context_length": 128000,
-        "discover_runtime_metadata": True,
-        "extra_headers": extra_headers,
-    }
-
-
-def _harness_client() -> httpx.AsyncClient:
-    """Create the scheduler client with the shared long-run Harness deadline."""
-
-    return httpx.AsyncClient(
-        timeout=settings.harness_stream_timeout_seconds
-    )
-
-
 def enqueue_job_execution(
     job_id: str,
     *,
@@ -266,12 +189,18 @@ def _job_may_run(job: ScheduledJob | None, flight: _JobExecutionFlight) -> bool:
     )
 
 
-def _scheduled_job_tools(job: ScheduledJob) -> list[str]:
-    """Resolve the persisted three-state tool contract without widening it."""
+def _scheduled_job_platform_capabilities(job: ScheduledJob) -> list[str]:
+    """Resolve the persisted three-state platform I/O contract exactly."""
 
-    if job.enabled_tools is None:
-        return list(UNATTENDED_DEFAULT_NATIVE_TOOLS)
-    return serialize_json_list(job.enabled_tools, [])
+    raw = (
+        None
+        if job.enabled_tools is None
+        else serialize_json_list(job.enabled_tools, [])
+    )
+    return list(canonicalize_scheduled_platform_capabilities(
+        raw,
+        allowed_capabilities=PLATFORM_IO_CAPABILITY_SET,
+    ))
 
 
 async def stage_schedule_control_writes(
@@ -282,7 +211,7 @@ async def stage_schedule_control_writes(
     root_run_id: str,
     model_id: str,
     writes: object,
-    allowed_tools: set[str] | frozenset[str] | None = None,
+    allowed_platform_capabilities: set[str] | frozenset[str] | None = None,
 ) -> tuple[str, ...]:
     """Stage validated, idempotent schedule rows in the root projection txn.
 
@@ -296,10 +225,10 @@ async def stage_schedule_control_writes(
         raise ValueError("schedule_control_writes_invalid")
     created: list[str] = []
     observed_tool_calls: set[str] = set()
-    bound_allowed_tools = (
-        DEFAULT_NATIVE_TOOL_SET
-        if allowed_tools is None
-        else frozenset(allowed_tools)
+    bound_platform_capabilities = (
+        PLATFORM_IO_CAPABILITY_SET
+        if allowed_platform_capabilities is None
+        else frozenset(allowed_platform_capabilities)
     )
 
     for row in writes:
@@ -319,9 +248,9 @@ async def stage_schedule_control_writes(
             raise ValueError("schedule_control_tool_call_invalid")
         observed_tool_calls.add(tool_call_id)
         request = _normalize_schedule_control_request(row.get("request"))
-        tools = canonicalize_scheduled_tools(
-            request.get("enabled_tools"),
-            allowed_tools=bound_allowed_tools,
+        platform_capabilities = canonicalize_scheduled_platform_capabilities(
+            request.get("platform_capabilities"),
+            allowed_capabilities=bound_platform_capabilities,
         )
         threat = scan_cron_prompt(request["prompt"])
         if threat:
@@ -370,9 +299,12 @@ async def stage_schedule_control_writes(
             timezone=request["timezone"],
             model_id=model_id,
             # Persist the exact bound subset, including an explicit empty
-            # set. ``NULL`` remains reserved for legacy/direct jobs whose
-            # controller omitted a tool contract.
-            enabled_tools=json.dumps(list(tools), ensure_ascii=False),
+            # set. ``NULL`` represents historical/controller-created rows that
+            # omitted an explicit platform I/O contract.
+            enabled_tools=json.dumps(
+                list(platform_capabilities),
+                ensure_ascii=False,
+            ),
             enabled=True,
             delete_after_run=request["delete_after_run"],
             max_runs=request.get("max_runs"),
@@ -387,7 +319,7 @@ async def stage_schedule_control_writes(
 def _normalize_schedule_control_request(value: object) -> dict:
     allowed = {
         "name", "prompt", "schedule", "timezone", "max_runs",
-        "expires_at", "enabled_tools", "delete_after_run",
+        "expires_at", "platform_capabilities", "delete_after_run",
     }
     if not isinstance(value, dict) or set(value) - allowed:
         raise ValueError("schedule_control_request_invalid")
@@ -404,7 +336,7 @@ def _normalize_schedule_control_request(value: object) -> dict:
         "timezone": payload.timezone.strip(),
         "max_runs": payload.max_runs,
         "expires_at": payload.expires_at,
-        "enabled_tools": payload.enabled_tools,
+        "platform_capabilities": payload.platform_capabilities,
         "delete_after_run": payload.delete_after_run,
     }
 
@@ -512,8 +444,8 @@ async def _execute_job_once(
                 # non-reentrant per-Conversation lock.
                 await _execute_job_bound(job_id, flight=flight)
             else:
-                # The direct Legacy path does not acquire the chat lease, so
-                # compose one here to preserve turn/delete serialization.
+                # A historical retired-engine row is terminalized without
+                # dispatch; retain serialization while disabling its job.
                 async with conversation_maintenance_lease(conversation_id):
                     await _execute_job_bound(job_id, flight=flight)
     except asyncio.CancelledError:
@@ -626,6 +558,30 @@ async def _execute_job_bound(
         )
         await db.refresh(run)
         await emit_event(job.user_id, "cron.started", {"job_id": job.id, "run_id": run.id}, job.conversation_id)
+        if conv.engine_id == ENGINE_ID_LEGACY:
+            error = (
+                "The retired ChatDS Harness cannot execute scheduled Turns; "
+                "fork this Conversation to a native Agent Engine"
+            )
+            run.status = "failed"
+            run.error = error
+            run.ended_at = _utcnow()
+            job.last_status = "failed"
+            job.consecutive_errors += 1
+            job.enabled = False
+            job.next_run_at = None
+            await _commit_scheduled_session_state(
+                db,
+                user_id=str(job.user_id),
+                conversation_id=str(conv.id),
+            )
+            await emit_event(
+                job.user_id,
+                "cron.failed",
+                {"job_id": job.id, "run_id": run.id, "error": error},
+                job.conversation_id,
+            )
+            return
         threat = scan_cron_prompt(job.prompt)
         if threat:
             error = f"Unsafe unattended prompt blocked at runtime: {threat}"
@@ -650,191 +606,31 @@ async def _execute_job_bound(
             return
 
         await ensure_workspace_async(job.user_id, conv.id)
-        model_id = canonical_agent_model_id(
-            job.model_id or conv.model_id or DEFAULT_AGENT_MODEL_ID
-        )
-        tools = _scheduled_job_tools(job)
+        platform_capabilities = _scheduled_job_platform_capabilities(job)
 
-        if conv.engine_id != ENGINE_ID_LEGACY:
-            native_executor = (
-                _execute_claude_scheduled_turn
-                if conv.engine_id == ENGINE_ID_CLAUDE_CODE
-                else _execute_native_scheduled_turn
-            )
-            await native_executor(
-                db,
-                job=job,
-                conv=conv,
-                scheduled_run=run,
-                tools=tools,
-            )
-            return
-
-        provider_config = await _resolve_job_model(db, job.user_id, model_id)
-        fallback_configs: list[dict] = []
-        fallback_ids, removed_fallback_ids = filter_agentic_fallback_model_ids(
-            serialize_json_list(conv.fallback_model_ids, []),
-            requested_model_id=model_id,
-        )
-        if removed_fallback_ids:
-            logger.info(
-                "Filtered auxiliary/duplicate agentic fallbacks job=%s "
-                "requested_model=%s removed=%s",
-                job.id,
-                model_id,
-                removed_fallback_ids,
-            )
-        for fallback_id in fallback_ids:
-            try:
-                fallback_configs.append(
-                    await _resolve_job_model(db, job.user_id, fallback_id)
-                )
-            except ValueError:
-                logger.warning(
-                    "Ignoring unknown fallback model job=%s model=%s",
-                    job.id,
-                    fallback_id,
-                )
-        user_message = Message(
-            conversation_id=conv.id,
-            role="user",
-            content=job.prompt,
-            model_id=model_id,
-            source="cron",
-        )
-        db.add(user_message)
-        await _commit_scheduled_session_state(
-            db,
-            user_id=str(job.user_id),
-            conversation_id=str(conv.id),
-        )
-        await emit_event(
-            job.user_id,
-            "message.created",
-            {
-                "conversation_id": conv.id,
-                "message_id": user_message.id,
-                "role": "user",
-                "model_id": model_id,
-                "source": "cron",
-            },
-            conv.id,
-        )
-
-        history_rows = (await db.execute(
-            select(Message)
-            .where(Message.conversation_id == conv.id)
-            .order_by(Message.created_at)
-        )).scalars().all()
-        messages = [
-            {"role": row.role, "content": row.content or ""}
-            for row in history_rows[-40:]
-        ]
-
-        full_content = ""
-        usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-        resolved_model = model_id
-        error = None
-        try:
-            async with _harness_client() as client:
-                response = await client.post(
-                    f"{settings.harness_url}/v1/chat/completions",
-                    headers={
-                        "X-Internal-Token": settings.internal_api_token,
-                    },
-                    json={
-                        "model": model_id,
-                        "messages": messages,
-                        "stream": False,
-                        "tools": tools,
-                        "session_id": conv.id,
-                        "user": job.user_id,
-                        "provider_config": provider_config,
-                        "fallback_configs": fallback_configs,
-                        "source": "cron",
-                    },
-                )
-            data = response.json()
-            if response.status_code >= 400 or data.get("error"):
-                raise RuntimeError(data.get("error", {}).get("message") or response.text[:500])
-            choice = data["choices"][0]
-            full_content = choice["message"].get("content") or ""
-            usage.update(data.get("usage") or {})
-            resolved_model = data.get("model") or model_id
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-
-        run.ended_at = _utcnow()
-        assistant_message = None
-        if error:
-            run.status = "failed"
-            run.error = error
-            job.last_status = "failed"
-            job.consecutive_errors += 1
+        if conv.engine_id == ENGINE_ID_CLAUDE_CODE:
+            native_executor = _execute_claude_scheduled_turn
+        elif conv.engine_id == ENGINE_ID_DEEPSEEK_HARNESS:
+            native_executor = _execute_native_scheduled_turn
         else:
-            run.status = "succeeded"
-            run.output = full_content
-            run.model_id = resolved_model
-            run.input_tokens = usage["input_tokens"]
-            run.output_tokens = usage["output_tokens"]
-            run.total_tokens = usage["total_tokens"]
-            job.last_status = "succeeded"
-            job.consecutive_errors = 0
-            assistant_message = Message(
-                conversation_id=conv.id,
-                role="assistant",
-                content=full_content,
-                model_id=resolved_model,
-                source="cron",
-                input_tokens=usage["input_tokens"],
-                output_tokens=usage["output_tokens"],
-                total_tokens=usage["total_tokens"],
+            raise RuntimeError(
+                f"Unsupported native Agent Engine: {conv.engine_id}"
             )
-            db.add(assistant_message)
-            conv.input_tokens += usage["input_tokens"]
-            conv.output_tokens += usage["output_tokens"]
-            conv.total_tokens += usage["total_tokens"]
-
-        if job.schedule_kind == "once":
-            job.enabled = False
-        await _commit_scheduled_session_state(
+        await native_executor(
             db,
-            user_id=str(job.user_id),
-            conversation_id=str(conv.id),
+            job=job,
+            conv=conv,
+            scheduled_run=run,
+            platform_capabilities=platform_capabilities,
         )
-        await emit_event(
-            job.user_id,
-            "cron.failed" if error else "cron.completed",
-            {
-                "job_id": job.id,
-                "run_id": run.id,
-                "conversation_id": conv.id,
-                "error": error,
-            },
-            conv.id,
-        )
-        if assistant_message is not None:
-            await emit_event(
-                job.user_id,
-                "message.created",
-                {
-                    "conversation_id": conv.id,
-                    "message_id": assistant_message.id,
-                    "role": "assistant",
-                    "model_id": resolved_model,
-                    "source": "cron",
-                },
-                conv.id,
-            )
-
-
+        return
 async def _execute_native_scheduled_turn(
     db,
     *,
     job: ScheduledJob,
     conv: Conversation,
     scheduled_run: ScheduledJobRun,
-    tools: list[str],
+    platform_capabilities: list[str],
     _engine_id_override: str | None = None,
 ) -> None:
     """Execute unattended work through the Conversation's native engine.
@@ -860,7 +656,7 @@ async def _execute_native_scheduled_turn(
         user,
         db,
         source="cron",
-        enabled_tools_override=tuple(tools),
+        platform_capabilities_override=tuple(platform_capabilities),
     )
     agent_run_id: str | None = None
     output_parts: list[str] = []
@@ -951,7 +747,7 @@ async def _execute_claude_scheduled_turn(
     job: ScheduledJob,
     conv: Conversation,
     scheduled_run: ScheduledJobRun,
-    tools: list[str],
+    platform_capabilities: list[str],
 ) -> None:
     """Backward-compatible name for the shared native-engine transaction."""
 
@@ -960,7 +756,7 @@ async def _execute_claude_scheduled_turn(
         job=job,
         conv=conv,
         scheduled_run=scheduled_run,
-        tools=tools,
+        platform_capabilities=platform_capabilities,
         _engine_id_override=ENGINE_ID_CLAUDE_CODE,
     )
 

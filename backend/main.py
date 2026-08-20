@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import httpx
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,10 +30,7 @@ from workspace_reconciler import (
     periodic_workspace_reconciler,
     reconcile_orphan_session_workspaces,
 )
-from storage_attestation import (
-    storage_attestations_match,
-    storage_root_attestation,
-)
+from storage_attestation import storage_root_attestation
 from agent_engines.lifecycle import revoke_stale_native_runs_on_backend_startup
 
 
@@ -160,36 +156,6 @@ async def health():
                 "status": "error",
                 "title": settings.app_title,
                 "code": "storage_root_unavailable",
-                "storage": local_storage,
-            },
-        )
-    try:
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            response = await client.get(f"{settings.harness_url}/health")
-        response.raise_for_status()
-        harness_health = response.json()
-    except (httpx.HTTPError, ValueError, TypeError):
-        return JSONResponse(
-            status_code=503,
-            content={
-                "status": "error",
-                "title": settings.app_title,
-                "code": "harness_health_unavailable",
-                "storage": local_storage,
-            },
-        )
-    remote_storage = (
-        harness_health.get("storage")
-        if isinstance(harness_health, dict)
-        else None
-    )
-    if not storage_attestations_match(local_storage, remote_storage):
-        return JSONResponse(
-            status_code=503,
-            content={
-                "status": "error",
-                "title": settings.app_title,
-                "code": "shared_storage_identity_mismatch",
                 "storage": local_storage,
             },
         )

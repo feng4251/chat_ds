@@ -7,6 +7,7 @@ import {
 import { MessageBubble } from './MessageBubble'
 import ModelSelector from './ModelSelector'
 import HarnessSelector from './HarnessSelector'
+import PermissionSelector from './PermissionSelector'
 import SessionWorkspace from './SessionWorkspace'
 import SkillBar from './SkillBar'
 import {
@@ -35,6 +36,10 @@ import {
   shouldFollowMessageUpdate,
 } from '../utils/sessionProjectionSync'
 import { compatibleModelsForEngine, modelForEngine } from '../utils/engineSelection'
+import {
+  DEFAULT_PERMISSION_PRESET,
+  normalizePermissionPreset,
+} from '../utils/permissionPresets'
 import {
   applyTurnActivity,
   attachTurnActivities,
@@ -273,6 +278,7 @@ export default function ChatArea({
   const [routedModel, setRoutedModel] = useState('')
   const [selectedModel, setSelectedModel] = useState('')
   const [selectedEngine, setSelectedEngine] = useState('')
+  const [selectedPermission, setSelectedPermission] = useState(DEFAULT_PERMISSION_PRESET)
   const [engineOptions, setEngineOptions] = useState([])
   const [engineLocked, setEngineLocked] = useState(false)
   const [settings, setSettings] = useState(null)
@@ -304,12 +310,6 @@ export default function ChatArea({
       || durableRunUnknown
     )
   )
-  const permissionSummary = (() => {
-    const preset = settings?.permission_preset || 'session_full'
-    if (preset === 'read_only') return '只读'
-    if (preset === 'workspace_write') return selectedEngine === 'claude_code' ? '可写但需授权' : '可写但受引擎策略限制'
-    return 'Session 完整权限'
-  })()
   const toolSurface = settings?.tool_surface || {}
   const compatibleModels = compatibleModelsForEngine(models, selectedEngine)
 
@@ -381,6 +381,7 @@ export default function ChatArea({
       setDurableRunUnknown(false)
       setDurableRunConversation(null)
       setEngineLocked(false)
+      setSelectedPermission(DEFAULT_PERMISSION_PRESET)
       const defaultModel = models.find((m) => m.is_default)?.id || models[0]?.id || ''
       setSelectedModel(defaultModel)
       runCardMessageRevisionRef.current = ''
@@ -445,6 +446,7 @@ export default function ChatArea({
         setSelectedEngine(settings.engine_id || '')
         setEngineOptions(settings.engine_options || [])
         setEngineLocked(Boolean(settings.engine_locked))
+        setSelectedPermission(normalizePermissionPreset(settings.permission_preset))
         setSettings(settings)
         getSkills(activeConv, settings.enabled_user_skills || [])
           .then((list) => {
@@ -723,13 +725,13 @@ export default function ChatArea({
 
   const createConfiguredConversation = useCallback(async () => {
     const conv = await createConversation()
-    if (!selectedEngine && !selectedModel) return conv
     await updateConversationSettings(conv.id, {
       ...(selectedEngine ? { engine_id: selectedEngine } : {}),
       ...(selectedModel ? { model_id: selectedModel } : {}),
+      permission_preset: selectedPermission,
     })
     return conv
-  }, [selectedEngine, selectedModel])
+  }, [selectedEngine, selectedModel, selectedPermission])
 
   // Auto-dismiss "已安装 Skill" success chips after 4 seconds so the chat
   // area doesn't accumulate stale installation notices.
@@ -1165,7 +1167,12 @@ export default function ChatArea({
     || durableRunActive
     || effectiveDurableRunUnknown
   )
-  const canSend = (inp.trim().length > 0 || images.length > 0) && !interactionBusy
+  const retiredEngine = selectedEngine === 'legacy'
+  const canSend = (
+    (inp.trim().length > 0 || images.length > 0)
+    && !interactionBusy
+    && !retiredEngine
+  )
 
   function scrollToBottom() {
     shouldStickToBottomRef.current = true
@@ -1244,7 +1251,29 @@ export default function ChatArea({
     }
   }
 
-  async function handleApproval(message, approval, decision) {
+  async function changePermission(permissionPreset) {
+    const normalized = normalizePermissionPreset(permissionPreset)
+    const previous = selectedPermission
+    setSelectedPermission(normalized)
+    if (!activeConv) return
+    try {
+      const next = await updateConversationSettings(activeConv, {
+        permission_preset: normalized,
+      })
+      setSettings(next)
+      setSelectedPermission(normalizePermissionPreset(next.permission_preset))
+      onConvRefresh()
+    } catch (err) {
+      setSelectedPermission(previous)
+      setUploads((current) => [...current, {
+        name: 'permission',
+        label: `Session 权限切换失败: ${err.message}`,
+        error: true,
+      }])
+    }
+  }
+
+  async function handleApproval(message, approval, decision, answers = null) {
     const runId = message.rootRunId || message.run_id
     if (
       !activeConv
@@ -1258,6 +1287,7 @@ export default function ChatArea({
       approval.request_id,
       approval.request_seq,
       decision,
+      answers,
     )
   }
 
@@ -1338,8 +1368,8 @@ export default function ChatArea({
                   <MessageBubble
                     msg={m}
                     onRegenerate={isLastAssistant ? regenerateLast : undefined}
-                    onApproval={(approval, decision) => (
-                      handleApproval(m, approval, decision)
+                    onApproval={(approval, decision, answers) => (
+                      handleApproval(m, approval, decision, answers)
                     )}
                   />
                   {m.role === 'assistant' && !m.activityNodes?.length && (
@@ -1456,12 +1486,23 @@ export default function ChatArea({
               任务仍在后台执行，页面会自动同步持久化进度；完成后即可继续发送。
             </div>
           )}
+          {retiredEngine && (
+            <div className="mb-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+              这是旧 ChatDS Harness 的历史会话，已停止执行。历史消息和产物仍可读取；请在工作区中 Fork 到 Claude Code 或 DeepSeek Harness 后继续。
+            </div>
+          )}
 
           <div className="mb-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-[11px] text-slate-600 flex items-center justify-between gap-3">
-            <div>
-              <span className="font-medium text-slate-700">权限：</span>{permissionSummary}
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="font-medium text-slate-700">Session 权限</span>
+              <PermissionSelector
+                value={selectedPermission}
+                busy={interactionBusy}
+                supported={selectedEngine === 'claude_code' || selectedEngine === 'deepseek_harness'}
+                onChange={changePermission}
+              />
               {toolSurface.deepseek_native_tools ? (
-                <span className="ml-3 text-slate-400">DeepSeek 原生工具 {toolSurface.deepseek_native_tools.length} 个</span>
+                <span className="text-slate-400">DeepSeek 原生工具 {toolSurface.deepseek_native_tools.length} 个</span>
               ) : null}
             </div>
             <button onClick={openWorkspace} className="text-indigo-600 hover:text-indigo-700 font-medium">打开工作区</button>
@@ -1499,9 +1540,10 @@ export default function ChatArea({
               value={inp}
               onChange={(e) => setInp(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder="输入消息……"
+              disabled={retiredEngine}
+              placeholder={retiredEngine ? '旧执行引擎已退役，请先 Fork 到原生引擎' : '输入消息……'}
               rows={1}
-              className="flex-1 bg-transparent text-slate-800 resize-none outline-none text-[14px] placeholder-slate-400 py-2 px-1 max-h-[200px] leading-relaxed"
+              className="flex-1 bg-transparent text-slate-800 resize-none outline-none text-[14px] placeholder-slate-400 py-2 px-1 max-h-[200px] leading-relaxed disabled:cursor-not-allowed disabled:text-slate-400"
             />
 
             <HarnessSelector
@@ -1551,6 +1593,7 @@ export default function ChatArea({
           setSelectedEngine(settings.engine_id)
           setEngineOptions(settings.engine_options || [])
           setEngineLocked(Boolean(settings.engine_locked))
+          setSelectedPermission(normalizePermissionPreset(settings.permission_preset))
           setSettings(settings)
           onConvRefresh()
         }}

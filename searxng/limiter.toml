@@ -5,9 +5,7 @@ ipv6_prefix = 48
 
 trusted_proxies = [
   '127.0.0.0/8',
-  '10.0.0.0/8',
-  '172.16.0.0/12',
-  '192.168.0.0/16',
+  '172.29.250.0/24',
   '::1',
 ]
 
@@ -18,9 +16,12 @@ link_token = false
 [botdetection.ip_lists]
 block_ip = []
 pass_ip = [
-  '10.0.0.0/8',
-  '172.16.0.0/12',
-  '192.168.0.0/16',
   '127.0.0.0/8',
+  # Fixed application-owned search network. This covers only SearXNG,
+  # Valkey, and the trusted typed egress gateways declared by Compose.
+  '172.29.250.0/24',
+  # Exact deployment hosts retained for direct operator smoke checks.
+  '10.10.130.178/32',
+  '10.10.132.126/32',
 ]
-pass_searxng_org = true
+pass_searxng_org = false

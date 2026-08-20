@@ -15,7 +15,6 @@ from models import Conversation, Message
 from session_lifecycle import session_control_plane_mutation
 from workspace import (
     require_session_workspace_active,
-    serialize_json_list,
 )
 
 router = APIRouter(prefix="/internal/sessions", tags=["internal"])
@@ -142,8 +141,8 @@ async def session_status(
         "title": conv.title,
         "model_id": conv.model_id,
         "message_count": count,
-        "enabled_tools": serialize_json_list(conv.enabled_tools, []),
-        "fallback_model_ids": serialize_json_list(conv.fallback_model_ids, []),
+        "engine_id": conv.engine_id,
+        "permission_preset": conv.permission_preset,
         "goal": {
             "objective": conv.goal_objective,
             "status": conv.goal_status,

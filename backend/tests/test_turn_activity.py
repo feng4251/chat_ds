@@ -73,6 +73,58 @@ class TurnActivityProtocolTests(unittest.TestCase):
         self.assertEqual(asked["node_id"], decided["node_id"])
         self.assertEqual(asked["payload"]["request_seq"], 42)
 
+    def test_native_question_projection_is_bounded_and_rename_invariant(self):
+        builder = TurnActivityBuilder("6" * 32, "7" * 32)
+        question = builder.approval(
+            request_id="museum-question",
+            status="pending",
+            details={
+                "interaction_kind": "question",
+                "request_seq": 91,
+                "questions": [{
+                    "question": "Which gallery should be reviewed?",
+                    "header": "Gallery",
+                    "multi_select": False,
+                    "options": [
+                        {
+                            "label": "East",
+                            "description": "Review the east gallery",
+                            "preview": "must not cross the I/O boundary",
+                        },
+                        {
+                            "label": "West",
+                            "description": "Review the west gallery",
+                        },
+                    ],
+                }],
+                "input": {"credential": "must-not-project"},
+            },
+        )
+        self.assertEqual(question["payload"]["interaction_kind"], "question")
+        self.assertEqual(question["payload"]["request_seq"], 91)
+        self.assertNotIn(
+            "preview", question["payload"]["questions"][0]["options"][0]
+        )
+        self.assertNotIn("must-not-project", str(question))
+
+        mutated = builder.approval(
+            request_id="factory-question",
+            status="pending",
+            details={
+                "interaction_kind": "question",
+                "questions": [{
+                    "question": "Which line should be reviewed?",
+                    "header": "Line",
+                    "options": [
+                        {"label": "A", "description": "First"},
+                        {"label": "A", "description": "Duplicate"},
+                    ],
+                }],
+            },
+        )
+        self.assertNotIn("interaction_kind", mutated["payload"])
+        self.assertNotIn("questions", mutated["payload"])
+
     def test_projection_commit_is_last_and_non_content(self):
         builder = TurnActivityBuilder("1" * 32, "2" * 32)
         content = builder.stream_text("content", "done")

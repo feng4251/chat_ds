@@ -29,6 +29,7 @@ from models import (
     Artifact,
     Conversation,
     CustomModelConfig,
+    MCPServerRegistration,
     Message,
     ScheduledJob,
     ScheduledJobRun,
@@ -54,11 +55,9 @@ from workspace import (
     workspace_file_metadata,
 )
 from hooks import emit_event
-from native_tools import DEFAULT_NATIVE_TOOL_SET, DEFAULT_NATIVE_TOOLS
 from model_routing import (
     DEFAULT_AGENT_MODEL_ID,
     canonical_agent_model_id,
-    filter_agentic_fallback_model_ids,
 )
 from workspace_lock import (
     WORKSPACE_MUTATION_LOCK_FILENAME,
@@ -102,8 +101,8 @@ async def _engine_options_for_user(
     """Return non-secret engine/model compatibility for safe UI switching.
 
     Compatibility is derived from the same provider resolver used at Turn
-    dispatch.  The browser therefore never guesses that a Legacy model can be
-    sent through a deployment-owned Claude provider profile.
+    dispatch. The browser never guesses native-engine compatibility from a
+    model name alone.
     """
 
     from routers.chat_router import (
@@ -139,24 +138,7 @@ async def _engine_options_for_user(
             deepseek_model_ids.append(model_id)
 
     canonical_current = canonical_agent_model_id(current_model_id)
-    legacy_default = (
-        canonical_current
-        if canonical_current in model_ids
-        else DEFAULT_AGENT_MODEL_ID
-    )
-    options = [{
-        "id": "legacy",
-        "name": "ChatDS Legacy Harness",
-        "available": settings.legacy_engine_new_runs_enabled,
-        "unavailable_reason": (
-            None
-            if settings.legacy_engine_new_runs_enabled
-            else "Legacy Harness is retained for history only"
-        ),
-        "compatible_model_ids": model_ids,
-        "default_model_id": legacy_default,
-        "capabilities": ["skills", "multi_agent", "mcp", "sandbox"],
-    }]
+    options = []
     if settings.claude_code_engine_enabled:
         claude_default = (
             canonical_current
@@ -355,17 +337,10 @@ async def get_conversation_settings(
     db=Depends(get_db),
 ):
     conv = await _conversation(cid, user.id, db)
-    fallback_model_ids, _ = filter_agentic_fallback_model_ids(
-        serialize_json_list(conv.fallback_model_ids, []),
-        requested_model_id=conv.model_id,
-    )
-    enabled_tools = serialize_json_list(conv.enabled_tools, DEFAULT_NATIVE_TOOLS)
-    tool_surface = {"chatds_capabilities": enabled_tools}
+    tool_surface: dict[str, list[str]] = {}
     if conv.engine_id == "deepseek_harness":
         from native_tools import deepseek_harness_native_tools
-        tool_surface["deepseek_native_tools"] = list(
-            deepseek_harness_native_tools(enabled_tools)
-        )
+        tool_surface["deepseek_native_tools"] = list(deepseek_harness_native_tools())
     return {
         "engine_id": conv.engine_id,
         "engine_locked": bool((await db.execute(
@@ -379,8 +354,6 @@ async def get_conversation_settings(
             db=db,
         ),
         "model_id": canonical_agent_model_id(conv.model_id),
-        "enabled_tools": enabled_tools,
-        "fallback_model_ids": fallback_model_ids,
         "enabled_user_skills": serialize_json_list(conv.enabled_user_skills, []),
         "permission_preset": conv.permission_preset,
         "tool_surface": tool_surface,
@@ -403,11 +376,8 @@ async def update_conversation_settings(
     if payload.engine_id is not None and payload.engine_id != conv.engine_id:
         from agent_engines.registry import build_agent_engine_registry
 
-        if (
-            payload.engine_id == "legacy"
-            and not settings.legacy_engine_new_runs_enabled
-        ):
-            raise HTTPException(400, "Legacy Harness execution is disabled")
+        if payload.engine_id == "legacy":
+            raise HTTPException(410, "The ChatDS Legacy Harness is retired")
         try:
             build_agent_engine_registry().get(payload.engine_id)
         except LookupError as exc:
@@ -429,20 +399,6 @@ async def update_conversation_settings(
         if not await _model_exists(canonical_model_id, user.id, db):
             raise HTTPException(400, f"Unknown model: {payload.model_id}")
         conv.model_id = canonical_model_id
-    if payload.enabled_tools is not None:
-        unknown_tools = set(payload.enabled_tools) - DEFAULT_NATIVE_TOOL_SET
-        if unknown_tools:
-            raise HTTPException(400, f"Unknown tools: {sorted(unknown_tools)}")
-        conv.enabled_tools = json.dumps(list(dict.fromkeys(payload.enabled_tools)))
-    if payload.fallback_model_ids is not None:
-        for model_id in payload.fallback_model_ids:
-            if not await _model_exists(model_id, user.id, db):
-                raise HTTPException(400, f"Unknown fallback model: {model_id}")
-        allowed_fallbacks, _ = filter_agentic_fallback_model_ids(
-            payload.fallback_model_ids,
-            requested_model_id=conv.model_id,
-        )
-        conv.fallback_model_ids = json.dumps(allowed_fallbacks)
     if payload.enabled_user_skills is not None:
         existing_names = (await db.execute(
             select(SkillPackage.name).where(
@@ -575,6 +531,7 @@ def _fork_snapshot_sha256(
     source: Conversation,
     messages: list[Message],
     skills: list[SkillPackage],
+    mcp_servers: list[MCPServerRegistration],
     title: str,
     include_messages: bool,
     workspace_digest: str,
@@ -587,8 +544,6 @@ def _fork_snapshot_sha256(
             "title": source.title,
             "model_id": source.model_id,
             "engine_id": source.engine_id,
-            "enabled_tools": source.enabled_tools,
-            "fallback_model_ids": source.fallback_model_ids,
             "enabled_user_skills": source.enabled_user_skills,
             "goal_objective": source.goal_objective,
             "goal_status": source.goal_status,
@@ -623,6 +578,13 @@ def _fork_snapshot_sha256(
                 "bundle_source_path": skill.bundle_source_path,
             }
             for skill in skills
+        ],
+        "mcp_servers": [
+            {
+                "name": server.name,
+                "config_json": server.config_json,
+            }
+            for server in mcp_servers
         ],
         "workspace_digest": workspace_digest,
         "skills_digest": skills_digest,
@@ -671,6 +633,7 @@ def _prepare_fork_skill_snapshot(
     source: Conversation,
     messages: list[Message],
     source_skills: list[SkillPackage],
+    source_mcp_servers: list[MCPServerRegistration],
     expected_title: str,
     include_messages: bool,
     user_id: str,
@@ -737,6 +700,7 @@ def _prepare_fork_skill_snapshot(
             source=source,
             messages=messages,
             skills=source_skills,
+            mcp_servers=source_mcp_servers,
             title=expected_title,
             include_messages=include_messages,
             workspace_digest=workspace_digest,
@@ -1143,13 +1107,10 @@ async def _fork_conversation_impl(
                 ENGINE_ID_DEEPSEEK_HARNESS,
             )
             from agent_engines.registry import build_agent_engine_registry
-            if (
-                effective_target_engine == "legacy"
-                and not settings.legacy_engine_new_runs_enabled
-            ):
+            if effective_target_engine == "legacy":
                 raise HTTPException(
-                    400,
-                    "Legacy Harness execution is disabled for target Conversations",
+                    410,
+                    "The ChatDS Legacy Harness is retired for target Conversations",
                 )
             try:
                 build_agent_engine_registry().get(effective_target_engine)
@@ -1208,6 +1169,15 @@ async def _fork_conversation_impl(
                     SkillPackage.user_id == user.id,
                     SkillPackage.session_id == cid,
                 ).order_by(SkillPackage.name, SkillPackage.id)
+            )).scalars().all())
+            source_mcp_servers = list((await db.execute(
+                select(MCPServerRegistration).where(
+                    MCPServerRegistration.user_id == user.id,
+                    MCPServerRegistration.session_id == cid,
+                ).order_by(
+                    MCPServerRegistration.name,
+                    MCPServerRegistration.id,
+                )
             )).scalars().all())
 
             journal = await run_sync_cancellation_safe(
@@ -1339,6 +1309,7 @@ async def _fork_conversation_impl(
                             source=source,
                             messages=messages,
                             source_skills=source_skills,
+                            source_mcp_servers=source_mcp_servers,
                             expected_title=expected_title,
                             include_messages=include_messages,
                             user_id=user.id,
@@ -1382,6 +1353,7 @@ async def _fork_conversation_impl(
                         source=source,
                         messages=messages,
                         skills=source_skills,
+                        mcp_servers=source_mcp_servers,
                         title=expected_title,
                         include_messages=include_messages,
                         workspace_digest=str(
@@ -1447,8 +1419,11 @@ async def _fork_conversation_impl(
                         model_id=effective_target_model,
                         engine_id=effective_target_engine,
                         permission_preset=source.permission_preset,
-                        enabled_tools=source.enabled_tools,
-                        fallback_model_ids=source.fallback_model_ids,
+                        # These columns survive only to decode archived rows.
+                        # A native fork must never inherit retired Harness
+                        # orchestration or provider-fallback state.
+                        enabled_tools=None,
+                        fallback_model_ids=None,
                         enabled_user_skills=source.enabled_user_skills,
                         forked_from_conversation_id=cid,
                         fork_snapshot_sha256=str(
@@ -1493,6 +1468,13 @@ async def _fork_conversation_impl(
                             bundle_role=skill.bundle_role,
                             bundle_root_name=skill.bundle_root_name,
                             bundle_source_path=skill.bundle_source_path,
+                        ))
+                    for server in source_mcp_servers:
+                        db.add(MCPServerRegistration(
+                            user_id=user.id,
+                            session_id=target_id,
+                            name=server.name,
+                            config_json=server.config_json,
                         ))
                     if not await run_sync_cancellation_safe(
                         lambda: workspace_store.session_pending_fence_matches(
@@ -3220,11 +3202,6 @@ async def decide_turn_approval(
     )).scalar_one_or_none()
     if run is None:
         raise HTTPException(404, "Run not found")
-    if conv.permission_preset != "workspace_write":
-        raise HTTPException(
-            409,
-            "This Session permission preset does not accept interactive decisions",
-        )
     rows = (await db.execute(
         select(TurnActivityEvent).where(
             TurnActivityEvent.conversation_id == cid,
@@ -3243,12 +3220,35 @@ async def decide_turn_approval(
         elif value.get("status") in {"allowed", "denied"}:
             terminal_status = value.get("status")
     expected_status = "allowed" if payload.decision == "allow" else "denied"
+    interaction_kind = str(
+        (requested or {}).get("interaction_kind") or "approval"
+    )
     if terminal_status is not None:
+        if interaction_kind == "question":
+            raise HTTPException(
+                409,
+                "Native question is already resolved",
+            )
         if terminal_status != expected_status:
             raise HTTPException(409, "Approval request already has another decision")
         return {"accepted": True, "idempotent": True, "status": terminal_status}
     if requested is None or requested.get("request_seq") != payload.request_seq:
         raise HTTPException(409, "Approval request is stale or not durable")
+    if (
+        conv.permission_preset != "workspace_write"
+        and interaction_kind not in {"question", "user_action"}
+    ):
+        raise HTTPException(
+            409,
+            "This Session permission preset does not accept that decision",
+        )
+    if interaction_kind == "question":
+        if payload.decision == "allow" and payload.answers is None:
+            raise HTTPException(400, "Question answers are required")
+        if payload.decision == "deny" and payload.answers is not None:
+            raise HTTPException(400, "Denied questions cannot include answers")
+    elif payload.answers is not None:
+        raise HTTPException(400, "Answers are accepted only for native questions")
     if run.status not in {"queued", "running", "committing"}:
         raise HTTPException(409, "Run is no longer active")
     from agent_engines.base import AgentEngineError
@@ -3266,6 +3266,7 @@ async def decide_turn_approval(
             request_id=request_id,
             request_seq=payload.request_seq,
             decision=payload.decision,
+            answers=payload.answers,
         )
     except AgentEngineError as exc:
         raise HTTPException(503, str(exc)) from exc
@@ -3306,8 +3307,12 @@ async def export_trajectory(
             "updated_at": str(conv.updated_at),
         },
         "settings": {
-            "enabled_tools": serialize_json_list(conv.enabled_tools, DEFAULT_NATIVE_TOOLS),
-            "fallback_model_ids": serialize_json_list(conv.fallback_model_ids, []),
+            "engine_id": conv.engine_id,
+            "permission_preset": conv.permission_preset,
+            "enabled_user_skills": serialize_json_list(
+                conv.enabled_user_skills,
+                [],
+            ),
         },
         "goal": await get_goal(cid, user, db),
         "messages": [{

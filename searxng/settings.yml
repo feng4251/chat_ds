@@ -96,10 +96,10 @@ server:
   bind_address: "0.0.0.0"
   port: 8080
   secret_key: "${SEARXNG_SECRET:-chat-ds-local-searxng-change-me}"
-  # The built-in limiter protects this instance from inbound clients; it does
-  # not rate-limit requests per upstream engine. Compose enables it and the
-  # production Harness is explicitly pass-listed in limiter.toml.
-  limiter: false
+  # The built-in limiter protects the published LAN endpoint. The fixed
+  # application search network is explicitly pass-listed in limiter.toml, so
+  # Harness JSON requests are not throttled.
+  limiter: true
   public_instance: false
   image_proxy: false
   method: "GET"
@@ -145,9 +145,7 @@ botdetection:
   ipv6_prefix: 48
   trusted_proxies:
     - 127.0.0.1/32
-    - 10.10.0.0/16
-    - 172.16.0.0/12
-    - 192.168.0.0/16
+    - 172.29.250.0/24
 
 valkey:
   url: false

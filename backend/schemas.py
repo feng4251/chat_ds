@@ -45,7 +45,7 @@ class ConversationOut(BaseModel):
     id: str
     title: Optional[str]
     model_id: str
-    engine_id: str = "legacy"
+    engine_id: str = "claude_code"
     created_at: datetime
     updated_at: datetime
     last_message: Optional[str] = None
@@ -63,17 +63,15 @@ class ChatRequest(BaseModel):
     image_urls: Optional[list[str]] = None
     model_id: Optional[str] = None
     engine_id: Optional[
-        Literal["legacy", "claude_code", "deepseek_harness"]
+        Literal["claude_code", "deepseek_harness"]
     ] = None
 
 
 class ConversationSettingsUpdate(BaseModel):
     engine_id: Optional[
-        Literal["legacy", "claude_code", "deepseek_harness"]
+        Literal["claude_code", "deepseek_harness"]
     ] = None
     model_id: Optional[str] = None
-    enabled_tools: Optional[list[str]] = None
-    fallback_model_ids: Optional[list[str]] = None
     enabled_user_skills: Optional[list[str]] = None
     permission_preset: Optional[
         Literal["read_only", "workspace_write", "session_full"]
@@ -81,8 +79,31 @@ class ConversationSettingsUpdate(BaseModel):
 
 
 class ApprovalDecision(BaseModel):
+    model_config = {"extra": "forbid"}
+
     decision: Literal["allow", "deny"]
     request_seq: int = Field(ge=1)
+    answers: Optional[dict[str, str]] = None
+
+    @field_validator("answers")
+    @classmethod
+    def validate_answers(cls, value):
+        if value is None:
+            return None
+        if (
+            not 1 <= len(value) <= 4
+            or any(
+                not key
+                or len(key) > 4_000
+                or not answer.strip()
+                or len(answer) > 4_000
+                or "\x00" in key
+                or "\x00" in answer
+                for key, answer in value.items()
+            )
+        ):
+            raise ValueError("Native question answers are invalid")
+        return value
 
 
 class GoalUpdate(BaseModel):
@@ -99,25 +120,29 @@ class WorkspaceFileWrite(BaseModel):
 
 
 class ScheduledJobCreate(BaseModel):
+    model_config = {"extra": "forbid"}
+
     name: str = Field(min_length=1, max_length=128)
     prompt: str = Field(min_length=1, max_length=40_000)
     schedule: str = Field(min_length=1, max_length=256)
     conversation_id: Optional[str] = None
     timezone: str = Field(default="UTC", max_length=64)
     model_id: Optional[str] = None
-    enabled_tools: Optional[list[str]] = None
+    platform_capabilities: Optional[list[str]] = None
     delete_after_run: bool = False
     max_runs: Optional[int] = Field(default=None, ge=1, le=10_000)
     expires_at: Optional[datetime] = None
 
 
 class ScheduledJobUpdate(BaseModel):
+    model_config = {"extra": "forbid"}
+
     name: Optional[str] = Field(default=None, min_length=1, max_length=128)
     prompt: Optional[str] = Field(default=None, min_length=1, max_length=40_000)
     schedule: Optional[str] = Field(default=None, min_length=1, max_length=256)
     timezone: Optional[str] = Field(default=None, max_length=64)
     model_id: Optional[str] = None
-    enabled_tools: Optional[list[str]] = None
+    platform_capabilities: Optional[list[str]] = None
     enabled: Optional[bool] = None
     delete_after_run: Optional[bool] = None
     max_runs: Optional[int] = Field(default=None, ge=1, le=10_000)

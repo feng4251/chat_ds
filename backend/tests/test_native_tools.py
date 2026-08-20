@@ -1,96 +1,103 @@
 import unittest
 
 from native_tools import (
-    canonicalize_scheduled_tools,
-    DEFAULT_NATIVE_TOOL_SET,
-    DEFAULT_NATIVE_TOOLS,
-    deepseek_harness_native_tool_groups,
+    canonicalize_scheduled_platform_capabilities,
+    DEEPSEEK_HARNESS_NATIVE_TOOLS,
     deepseek_harness_native_tools,
-    UNATTENDED_DEFAULT_NATIVE_TOOLS,
+    PLATFORM_IO_CAPABILITIES,
+    PLATFORM_IO_CAPABILITY_SET,
+    UNATTENDED_DEFAULT_PLATFORM_IO_CAPABILITIES,
 )
 
 
 class NativeToolCatalogTests(unittest.TestCase):
-    def test_default_catalog_is_unique_and_includes_atomic_merge(self):
-        self.assertEqual(len(DEFAULT_NATIVE_TOOLS), len(DEFAULT_NATIVE_TOOL_SET))
-        self.assertIn("merge_files", DEFAULT_NATIVE_TOOL_SET)
-        self.assertIn("run_skill_script", DEFAULT_NATIVE_TOOL_SET)
-        self.assertIn("run_declared_command", DEFAULT_NATIVE_TOOL_SET)
-        self.assertIn("skill_http_post_json", DEFAULT_NATIVE_TOOL_SET)
-        self.assertIn("skill_copy_resource", DEFAULT_NATIVE_TOOL_SET)
-        self.assertIn("market_quote", DEFAULT_NATIVE_TOOL_SET)
-        self.assertIn(
-            "submit_knowledge_gate_decisions",
-            DEFAULT_NATIVE_TOOL_SET,
+    def test_platform_catalog_contains_only_controller_owned_io(self):
+        self.assertEqual(
+            len(PLATFORM_IO_CAPABILITIES),
+            len(PLATFORM_IO_CAPABILITY_SET),
         )
+        self.assertEqual(
+            ("web_search", "market_quote", "cronjob"),
+            PLATFORM_IO_CAPABILITIES,
+        )
+        self.assertFalse({
+            "read_file",
+            "write_file",
+            "execute_code",
+            "delegate_task",
+            "skill_view",
+        } & PLATFORM_IO_CAPABILITY_SET)
 
-    def test_unattended_catalog_is_a_safe_ordered_subset(self):
-        self.assertTrue(set(UNATTENDED_DEFAULT_NATIVE_TOOLS) < DEFAULT_NATIVE_TOOL_SET)
-        self.assertFalse(
-            {"cronjob", "clarify", "delegate_task"}
-            & set(UNATTENDED_DEFAULT_NATIVE_TOOLS)
+    def test_unattended_platform_default_excludes_recursive_scheduling(self):
+        self.assertEqual(
+            ("web_search", "market_quote"),
+            UNATTENDED_DEFAULT_PLATFORM_IO_CAPABILITIES,
         )
 
     def test_scheduled_tool_compiler_binds_visible_aliases_to_authority(self):
         self.assertEqual(
-            canonicalize_scheduled_tools(
+            canonicalize_scheduled_platform_capabilities(
                 [
-                    "Bash",
                     "mcp__chatds-market-data__market_quote",
                     "market_quote",
                 ],
-                allowed_tools=frozenset({"market_quote", "cronjob"}),
+                allowed_capabilities=frozenset({"market_quote", "cronjob"}),
             ),
             ("market_quote",),
         )
         with self.assertRaisesRegex(ValueError, "unauthorized"):
-            canonicalize_scheduled_tools(
+            canonicalize_scheduled_platform_capabilities(
                 ["web_search"],
-                allowed_tools=frozenset({"market_quote"}),
+                allowed_capabilities=frozenset({"market_quote"}),
             )
         with self.assertRaisesRegex(ValueError, "unknown"):
-            canonicalize_scheduled_tools(
-                ["mcp__foreign__market_quote"],
-                allowed_tools=frozenset({"market_quote"}),
+            canonicalize_scheduled_platform_capabilities(
+                ["Bash"],
+                allowed_capabilities=PLATFORM_IO_CAPABILITY_SET,
             )
 
-    def test_deepseek_native_tool_groups_compile_from_chatds_capabilities(self):
+    def test_scheduled_tool_defaults_do_not_widen_explicit_empty_set(self):
+        allowed = frozenset({"market_quote", "web_search", "cronjob"})
         self.assertEqual(
-            deepseek_harness_native_tool_groups([
-                "web_search",
-                "execute_code",
-                "read_file",
-                "delegate_task",
-                "market_quote",
-            ]),
-            ("web", "shell", "files", "subagents"),
+            canonicalize_scheduled_platform_capabilities(
+                [],
+                allowed_capabilities=allowed,
+            ),
+            (),
         )
         self.assertEqual(
-            deepseek_harness_native_tools([
-                "web_search",
-                "execute_code",
-                "read_file",
-                "delegate_task",
-            ]),
-            (
-                "web_search",
-                "bash",
-                "job_output",
-                "job_list",
-                "job_kill",
-                "read",
-                "write",
-                "edit",
-                "glob",
-                "grep",
-                "subagent",
-                "send_message",
-                "interrupt_agent",
-                "list_agents",
+            canonicalize_scheduled_platform_capabilities(
+                None,
+                allowed_capabilities=allowed,
             ),
+            ("web_search", "market_quote"),
         )
         with self.assertRaisesRegex(ValueError, "unknown"):
-            deepseek_harness_native_tool_groups(["nonexistent_capability"])
+            canonicalize_scheduled_platform_capabilities(
+                ["mcp__foreign__market_quote"],
+                allowed_capabilities=frozenset({"market_quote"}),
+            )
+
+    def test_deepseek_uses_one_complete_engine_owned_native_tool_graph(self):
+        tools = deepseek_harness_native_tools()
+        self.assertIs(tools, DEEPSEEK_HARNESS_NATIVE_TOOLS)
+        self.assertEqual(len(tools), len(set(tools)))
+        self.assertTrue({
+            "bash",
+            "read",
+            "write",
+            "skill",
+            "subagent",
+            "subagent_fork",
+            "workflow",
+            "ralph",
+            "ask_user_question",
+            "todo_write",
+            "create_goal",
+            "web_search",
+        }.issubset(tools))
+        self.assertNotIn("read_file", tools)
+        self.assertNotIn("delegate_task", tools)
 
 
 if __name__ == "__main__":

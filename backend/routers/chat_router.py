@@ -43,14 +43,12 @@ from workspace import (
 )
 from hooks import emit_event
 from native_tools import (
-    DEFAULT_NATIVE_TOOLS,
-    DEEPSEEK_HARNESS_TOOL_CAPABILITIES,
+    PLATFORM_IO_CAPABILITIES,
     deepseek_harness_native_tools,
 )
 from model_routing import (
     DEFAULT_AGENT_MODEL_ID,
     canonical_agent_model_id,
-    filter_agentic_fallback_model_ids,
 )
 from auth import get_current_user
 from skill_bundles import (
@@ -105,7 +103,7 @@ _RAW_ENGINE_EVENT_INLINE_BYTES = 1024 * 1024
 
 
 class _NormalizedEngineResponse:
-    """Expose normalized AgentEngine events through the legacy SSE parser."""
+    """Expose normalized AgentEngine events through the browser SSE envelope."""
 
     status_code = 200
 
@@ -163,28 +161,13 @@ async def _open_agent_engine_stream(
     *,
     engine_id: str,
     request: AgentEngineRequest,
-    legacy_payload: dict,
 ):
     if engine_id == ENGINE_ID_LEGACY:
-        if not settings.legacy_engine_new_runs_enabled:
-            raise HTTPException(
-                409,
-                "Legacy Harness execution is disabled for new Turns",
-            )
-        async with httpx.AsyncClient(
-            timeout=settings.harness_stream_timeout_seconds
-        ) as client:
-            async with client.stream(
-                "POST",
-                f"{settings.harness_url}/v1/chat/completions",
-                headers={
-                    "Content-Type": "application/json",
-                    "X-Internal-Token": settings.internal_api_token,
-                },
-                json=legacy_payload,
-            ) as response:
-                yield response
-        return
+        raise HTTPException(
+            410,
+            "The retired ChatDS Harness cannot execute Turns; fork this "
+            "Conversation to a native Agent Engine",
+        )
     from agent_engines.registry import build_agent_engine_registry
 
     engine = build_agent_engine_registry().get(engine_id)
@@ -2524,10 +2507,9 @@ async def _persist_stream_projection_once(
                     root_run_id=run_id,
                     model_id=resolved_model_id or model_id,
                     writes=pending_control_writes,
-                    allowed_tools=frozenset(serialize_json_list(
-                        conv.enabled_tools,
-                        DEFAULT_NATIVE_TOOLS,
-                    )),
+                    allowed_platform_capabilities=frozenset(
+                        PLATFORM_IO_CAPABILITIES
+                    ),
                 )
             elif pending_control_writes:
                 # Failed/cancelled Turns never commit unattended effects.
@@ -3223,8 +3205,8 @@ BUILTIN = {
         "api_key": settings.shaiengine_api_key,
         "is_multimodal": False,
         "max_tokens": 86400,
-        "display_name": "GLM-5.2 (Shaiengine · 默认测试)",
-        "is_default": True,
+        "display_name": "GLM-5.2 (Shaiengine)",
+        "is_default": False,
         "agentic_auxiliary_only": False,
         "supports_thinking_toggle": True,
         "thinking_enabled_by_default": True,
@@ -3236,7 +3218,6 @@ BUILTIN = {
         "deepseek_harness_provider_profile": "shaiengine",
         "protocol": "openai",
         "context_length": 1000000,
-        "discover_runtime_metadata": True,
     },
     "shaiengine_deepseek_v4_pro": {
         "api_model": "deepseek-v4-pro",
@@ -3257,7 +3238,6 @@ BUILTIN = {
         "deepseek_harness_provider_profile": "shaiengine",
         "protocol": "openai",
         "context_length": 200000,
-        "discover_runtime_metadata": True,
     },
     "shaiengine_kimi_k3": {
         "api_model": "kimi-k3",
@@ -3281,17 +3261,20 @@ BUILTIN = {
         # capacity fields.  Kimi's first-party K3 specification is therefore
         # the deployment-owned authority for this 1M-token bound.
         "context_length": 1000000,
-        "discover_runtime_metadata": True,
     },
-    # 10.10.132.2 local GLM-5.2 (918528 ctx) — retained for existing sessions
+    # 10.10.132.2 local GLM-5.2. The deployment profile is a conservative
+    # ceiling and must match the live provider's exact /v1/models contract.
     "deepseek_v4_pro": {
         "api_model": "AgentModel",
         "base_url": settings.deepseek_pro_base_url,
         "api_key": settings.deepseek_pro_api_key,
         "is_multimodal": False,
-        "max_tokens": 262144,
+        # Reserve most of the live 303,872-token window for native Session
+        # history, tool results and compaction. A completion ceiling near the
+        # full context would make valid long-running prompts fail admission.
+        "max_tokens": 65536,
         "display_name": "GLM-5.2 (本地 AgentModel)",
-        "is_default": False,
+        "is_default": True,
         "agentic_auxiliary_only": False,
         "supports_thinking_toggle": True,
         "thinking_enabled_by_default": True,
@@ -3301,8 +3284,7 @@ BUILTIN = {
         "claude_provider_profile": "local_agentmodel",
         "deepseek_harness_provider_profile": "local_agentmodel",
         "protocol": "openai",
-        "context_length": 918528,
-        "discover_runtime_metadata": True,
+        "context_length": 303872,
     },
     # 10.10.132.126 local DeepSeek-V4-Flash.  It shares the wire-level
     # ``AgentModel`` name with the GLM deployment, so the user-facing route id
@@ -3325,7 +3307,6 @@ BUILTIN = {
         "deepseek_harness_provider_profile": "local_deepseek_v4_flash",
         "protocol": "openai",
         "context_length": 1048576,
-        "discover_runtime_metadata": True,
     },
     # 10.10.132.128 Qwen3-5 (397B, multimodal) — 多模态识别
     "qwen3_5": {
@@ -3346,7 +3327,6 @@ BUILTIN = {
         "deepseek_harness_provider_profile": "local_qwen",
         "protocol": "openai",
         "context_length": 262144,
-        "discover_runtime_metadata": True,
     },
 }
 
@@ -3390,25 +3370,6 @@ def deepseek_harness_model_compatible(provider_config: dict) -> bool:
         and bool(profile)
         and profile in settings.deepseek_harness_provider_profiles
     )
-
-
-_DEEPSEEK_HARNESS_TOOL_CAPABILITIES = frozenset(DEEPSEEK_HARNESS_TOOL_CAPABILITIES)
-
-
-def _effective_engine_tools(engine_id: str, requested: list[str]) -> list[str]:
-    """Compile canonical ChatDS grants onto one engine-owned capability surface.
-
-    DeepSeek Harness receives ChatDS capability names as policy metadata.  The
-    runner translates those grants into the upstream DSH plugin graph; it must
-    never receive a ChatDS-only MCP name as a native DSH tool name.
-    """
-
-    if engine_id != ENGINE_ID_DEEPSEEK_HARNESS:
-        return list(requested)
-    return [
-        name for name in requested
-        if name in _DEEPSEEK_HARNESS_TOOL_CAPABILITIES
-    ]
 
 
 def _require_turn_input_capabilities(
@@ -3478,9 +3439,6 @@ async def resolve_model_config(model_id: str, cur_user: User, db: AsyncSession) 
             # aligned with Harness provider metadata rather than exposing the
             # Backend's historical request-field name (``max_tokens``).
             "max_output_tokens": cfg.get("max_tokens"),
-            "discover_runtime_metadata": bool(
-                cfg.get("discover_runtime_metadata", False)
-            ),
             "agentic_auxiliary_only": cfg.get(
                 "agentic_auxiliary_only", False
             ),
@@ -3518,7 +3476,6 @@ async def resolve_model_config(model_id: str, cur_user: User, db: AsyncSession) 
         "protocol": "anthropic" if custom.provider == "anthropic" else "openai",
         "is_multimodal": custom.is_multimodal,
         "context_length": 128000,
-        "discover_runtime_metadata": True,
         "extra_headers": extra_headers,
     }
 
@@ -3526,20 +3483,7 @@ async def resolve_model_config(model_id: str, cur_user: User, db: AsyncSession) 
 @router.get("/models")
 async def get_models(cur_user=Depends(get_current_user), db=Depends(get_db)):
     # Backend provider profiles are the execution authority. Harness discovery
-    # may enrich availability/name data, but it must never make configured
-    # models disappear merely because another engine reports a partial list.
-    discovered: dict[str, dict] = {}
-    if settings.legacy_engine_new_runs_enabled:
-        try:
-            async with httpx.AsyncClient(timeout=5) as c:
-                r = await c.get(f"{settings.harness_url}/v1/models")
-                if r.status_code == 200:
-                    data = r.json()
-                    for m in data.get("data", []):
-                        if isinstance(m, dict) and m.get("id"):
-                            discovered[canonical_agent_model_id(m["id"])] = m
-        except Exception:
-            pass
+    # must never depend on discovery from the retired ChatDS Harness.
     models = [
         {
             "id": mid,
@@ -3548,13 +3492,7 @@ async def get_models(cur_user=Depends(get_current_user), db=Depends(get_db)):
             "is_multimodal": cfg["is_multimodal"],
             "is_default": cfg.get("is_default", False),
             "capabilities": cfg.get("capabilities", ["text"]),
-            "legacy_discovered": mid in discovered,
             "compatible_engines": [
-                *(
-                    ["legacy"]
-                    if settings.legacy_engine_new_runs_enabled
-                    else []
-                ),
                 *(["claude_code"] if claude_code_model_compatible(cfg) else []),
                 *(
                     ["deepseek_harness"]
@@ -3577,11 +3515,7 @@ async def get_models(cur_user=Depends(get_current_user), db=Depends(get_db)):
             "provider": cm.provider, "is_multimodal": cm.is_multimodal,
             "is_default": False,
             "capabilities": ["vision"] if cm.is_multimodal else ["text"],
-            "compatible_engines": (
-                ["legacy"]
-                if settings.legacy_engine_new_runs_enabled
-                else []
-            ),
+            "compatible_engines": [],
         })
     return {"models": models}
 
@@ -3600,23 +3534,10 @@ async def get_agent_engines(cur_user=Depends(get_current_user)):
                 "id": item.id,
                 "name": item.display_name,
                 "is_default": item.id == settings.default_agent_engine_id,
-                "available": (
-                    item.available
-                    and not (
-                        item.id == ENGINE_ID_LEGACY
-                        and not settings.legacy_engine_new_runs_enabled
-                    )
-                ),
+                "available": item.available,
                 "version": item.version,
                 "capabilities": list(item.capabilities),
-                "unavailable_reason": (
-                    "Legacy Harness is retained for history only"
-                    if (
-                        item.id == ENGINE_ID_LEGACY
-                        and not settings.legacy_engine_new_runs_enabled
-                    )
-                    else item.unavailable_reason
-                ),
+                "unavailable_reason": item.unavailable_reason,
             }
             for item in descriptors
         ]
@@ -3718,7 +3639,7 @@ async def _chat_stream(
     *,
     ingress_request_id: str | None = None,
     source: str = "chat",
-    enabled_tools_override: tuple[str, ...] | None = None,
+    platform_capabilities_override: tuple[str, ...] | None = None,
 ):
     if source not in {"chat", "cron"}:
         raise ValueError("Unsupported internal chat source")
@@ -3742,13 +3663,11 @@ async def _chat_stream(
                     409,
                     "Agent Engine is fixed for this Conversation; fork it to change engines",
                 )
-            if (
-                conv.engine_id == ENGINE_ID_LEGACY
-                and not settings.legacy_engine_new_runs_enabled
-            ):
+            if conv.engine_id == ENGINE_ID_LEGACY:
                 raise HTTPException(
-                    409,
-                    "Legacy Harness execution is disabled; fork this Conversation to Claude Code",
+                    410,
+                    "The retired ChatDS Harness cannot execute Turns; fork "
+                    "this Conversation to a native Agent Engine",
                 )
             if conv.engine_id != ENGINE_ID_LEGACY:
                 from agent_engines.registry import build_agent_engine_registry
@@ -3776,13 +3695,10 @@ async def _chat_stream(
                 await _detect_model(req, str(cur_user.id))
             )
             requested_engine = req.engine_id or settings.default_agent_engine_id
-            if (
-                requested_engine == ENGINE_ID_LEGACY
-                and not settings.legacy_engine_new_runs_enabled
-            ):
+            if requested_engine == ENGINE_ID_LEGACY:
                 raise HTTPException(
-                    400,
-                    "Legacy Harness execution is disabled for new Conversations",
+                    410,
+                    "The retired ChatDS Harness cannot create Conversations",
                 )
             from agent_engines.registry import build_agent_engine_registry
             try:
@@ -3817,7 +3733,7 @@ async def _chat_stream(
             turn_lease=turn_lease,
             ingress_request_id=ingress_request_id,
             source=source,
-            enabled_tools_override=enabled_tools_override,
+            platform_capabilities_override=platform_capabilities_override,
         )
     except _ConversationProjectionBarrierError as exc:
         if turn_lease is not None:
@@ -3846,7 +3762,7 @@ async def _chat_stream_with_turn(
     turn_lease: _ConversationTurnLease,
     ingress_request_id: str | None = None,
     source: str = "chat",
-    enabled_tools_override: tuple[str, ...] | None = None,
+    platform_capabilities_override: tuple[str, ...] | None = None,
 ):
     await _assert_no_unprojected_primary_turn(db, conv_id)
 
@@ -3876,12 +3792,14 @@ async def _chat_stream_with_turn(
         BUILTIN.get(model_id, {}).get("max_tokens")
         if model_id in BUILTIN else DEFAULT_CUSTOM_MAX_TOKENS
     ) or DEFAULT_CUSTOM_MAX_TOKENS
-    requested_tools = (
-        list(enabled_tools_override)
-        if enabled_tools_override is not None
-        else serialize_json_list(conv.enabled_tools, DEFAULT_NATIVE_TOOLS)
+    platform_capabilities = (
+        list(platform_capabilities_override)
+        if platform_capabilities_override is not None
+        else list(PLATFORM_IO_CAPABILITIES)
     )
-    enabled_tools = _effective_engine_tools(conv.engine_id, requested_tools)
+    requested_platform_capabilities = list(
+        platform_capabilities_override or ()
+    )
     enabled_user_skills = serialize_json_list(conv.enabled_user_skills, [])
     skill_registry_query = select(SkillPackage).where(
         SkillPackage.user_id == cur_user.id,
@@ -3909,30 +3827,8 @@ async def _chat_stream_with_turn(
             skill_registry_rows,
             SKILLS_DATA_DIR,
         )
-    fallback_ids, removed_fallback_ids = filter_agentic_fallback_model_ids(
-        serialize_json_list(conv.fallback_model_ids, []),
-        requested_model_id=model_id,
-    )
-    if removed_fallback_ids:
-        logger.info(
-            "Filtered auxiliary/duplicate agentic fallbacks conversation=%s "
-            "requested_model=%s removed=%s",
-            conv_id,
-            model_id,
-            removed_fallback_ids,
-        )
-    fallback_configs = []
-    for fallback_id in fallback_ids:
-        if fallback_id == model_id:
-            continue
-        try:
-            fallback_configs.append(
-                await resolve_model_config(fallback_id, cur_user, db)
-            )
-        except HTTPException:
-            continue
-
     native_skill_view = None
+    session_mcp_servers: dict[str, dict] = {}
     engine_session: AgentEngineSession | None = None
     resume_from_native_session_id: str | None = None
     candidate_native_session_id: str | None = None
@@ -3942,6 +3838,7 @@ async def _chat_stream_with_turn(
             materialize_claude_skill_view,
         )
         from routers import skill_router as skill_api
+        from native_mcp import effective_mcp_servers
 
         # Freeze both Skill scopes while copying the DB-authorized closure.
         # The resulting plugin tree is content-addressed and read-only, so the
@@ -3954,6 +3851,11 @@ async def _chat_stream_with_turn(
                 skill_api._skill_install_lock(cur_user.id, conv_id)
             )
             fresh_rows = (await db.execute(skill_registry_query)).scalars().all()
+            session_mcp_servers = await effective_mcp_servers(
+                db,
+                user_id=str(cur_user.id),
+                session_id=conv_id,
+            )
             sources = authorized_skill_sources(
                 user_id=str(cur_user.id),
                 session_id=conv_id,
@@ -3964,7 +3866,8 @@ async def _chat_stream_with_turn(
                 materialize_claude_skill_view,
                 session_root=workspace_store.session_root(cur_user.id, conv_id),
                 sources=sources,
-                enabled_tools=enabled_tools,
+                platform_capabilities=platform_capabilities,
+                session_mcp_servers=session_mcp_servers,
                 web_search_url=settings.claude_web_search_url,
                 market_data_url=settings.claude_market_data_url,
             )
@@ -4003,10 +3906,14 @@ async def _chat_stream_with_turn(
         # Every Turn writes a fresh native checkpoint.  It is promoted into
         # AgentEngineSession only after the authoritative root terminal and
         # assistant projection are durable. A controller-rejected Turn may
-        # still publish this candidate as a transcript-only boundary when the
         # raw native result and checkpoint are both complete; its failed
         # receipts remain authoritative for the business outcome.
         candidate_native_session_id = str(uuid.uuid4())
+    elif conv.engine_id == ENGINE_ID_DEEPSEEK_HARNESS:
+        # DSH persistence lives inside this Conversation's isolated state
+        # mount. A deterministic identity lets the upstream registry resume
+        # its own checkpoints instead of replaying ChatDS history every Turn.
+        candidate_native_session_id = f"chatds-{conv_id}"
 
     # Load history before saving the new user message
     history_msgs = (await db.execute(
@@ -4048,11 +3955,7 @@ async def _chat_stream_with_turn(
         root_run_id=run_id,
         source=source,
         engine_id=conv.engine_id,
-        native_session_id=(
-            candidate_native_session_id
-            if engine_session is not None
-            else None
-        ),
+        native_session_id=candidate_native_session_id,
         requested_model_id=model_id,
         resolved_model_id=model_id,
         status="running",
@@ -4060,8 +3963,16 @@ async def _chat_stream_with_turn(
         agent_name="primary",
         depth=0,
         workspace_scope="shared_session",
-        requested_tools=json.dumps(requested_tools, ensure_ascii=False),
-        effective_tools=json.dumps(enabled_tools, ensure_ascii=False),
+        requested_tools=json.dumps(
+            requested_platform_capabilities,
+            ensure_ascii=False,
+        ),
+        effective_tools=json.dumps(
+            list(deepseek_harness_native_tools())
+            if conv.engine_id == ENGINE_ID_DEEPSEEK_HARNESS
+            else [],
+            ensure_ascii=False,
+        ),
         started_at=user_created_at,
     )
     db.add(run)
@@ -4131,14 +4042,10 @@ async def _chat_stream_with_turn(
                 "run_id": run.id,
             })
 
-            # Build messages: system prompt + history + user message.
-            # Images are passed as proper image_url content parts. The harness
-            # handles image routing: for text-only models (deepseek_v4_pro), it
-            # pre-analyzes images with qwen3_5 and enriches the message with
-            # text descriptions. The agent still has vision_analyze as a tool
-            # for deeper inspection, and session skills/MCP tools are
-            # discovered via skills_list/skill_view.
-            final = [{"role": "system", "content": "You are a helpful AI assistant."}]
+            # Build only browser-authored history and this user Turn. Native
+            # engines own their system prompt, Skill discovery, planning,
+            # tool loop, compaction, and provider lifecycle.
+            final = []
             # Convert history messages with image_urls to multimodal format
             for h in history:
                 if h.get("image_urls"):
@@ -4163,7 +4070,8 @@ async def _chat_stream_with_turn(
             else:
                 final.append({"role": "user", "content": req.content})
 
-            # Stream from harness — agent loop with full tool set
+            # Stream from the selected native engine. Its upstream runtime
+            # owns the agent loop and complete built-in tool graph.
             try:
                 stream_observation.upstream_state = "connecting"
                 engine_messages = tuple(final)
@@ -4199,35 +4107,6 @@ async def _chat_stream_with_turn(
                             ) from exc
                         engine_messages = projection.messages
                         input_attachments = projection.attachments
-                deepseek_native_tools = (
-                    deepseek_harness_native_tools(tuple(enabled_tools))
-                    if conv.engine_id == ENGINE_ID_DEEPSEEK_HARNESS
-                    else tuple(enabled_tools)
-                )
-                legacy_payload = {
-                    "model": model_id,
-                    "messages": final,
-                    "max_tokens": max_tokens,
-                    "temperature": 0.6,
-                    "stream": True,
-                    "tools": enabled_tools,
-                    "session_id": conv_id,
-                    "user": cur_user.id,
-                    "provider_config": provider_config,
-                    "fallback_configs": fallback_configs,
-                    "source": source,
-                    "enabled_user_skills": enabled_user_skills,
-                    "session_skill_registry": session_skill_registry,
-                    "event_schema": "chatds.agent.v2",
-                    "run_metadata": {
-                        "run_id": run.id,
-                        "root_run_id": run.id,
-                        "agent_kind": "primary",
-                        "agent_name": "primary",
-                        "depth": 0,
-                        "workspace_scope": "shared_session",
-                    },
-                }
                 engine_request = AgentEngineRequest(
                     run_id=run.id,
                     root_run_id=run.id,
@@ -4240,8 +4119,6 @@ async def _chat_stream_with_turn(
                     max_output_tokens=max_tokens,
                     temperature=0.6,
                     provider_config=provider_config,
-                    fallback_configs=tuple(fallback_configs),
-                    tools=tuple(deepseek_native_tools),
                     enabled_user_skills=tuple(enabled_user_skills),
                     session_skill_registry=tuple(session_skill_registry),
                     skill_view_path=(
@@ -4254,11 +4131,7 @@ async def _chat_stream_with_turn(
                         if native_skill_view is not None
                         else None
                     ),
-                    native_session_id=(
-                        candidate_native_session_id
-                        if engine_session is not None
-                        else None
-                    ),
+                    native_session_id=candidate_native_session_id,
                     resume_from_native_session_id=resume_from_native_session_id,
                     source=source,
                     metadata={
@@ -4267,21 +4140,17 @@ async def _chat_stream_with_turn(
                         ),
                         "user_turn_text": req.content,
                         "permission_preset": conv.permission_preset,
-                        "chatds_requested_tools": list(requested_tools),
-                        "chatds_effective_tools": list(enabled_tools),
-                        "deepseek_native_tools": list(deepseek_native_tools),
                     },
                 )
                 async with _open_agent_engine_stream(
                     engine_id=conv.engine_id,
                     request=engine_request,
-                    legacy_payload=legacy_payload,
                 ) as response:
                         stream_observation.upstream_state = "connected"
                         if response.status_code >= 400:
                             body = (await response.aread()).decode("utf-8", "ignore")[:300]
-                            stream_error_message = f"Harness 返回 HTTP {response.status_code}:{body}"
-                            upstream_failure_kind = "upstream_harness_http_error"
+                            stream_error_message = f"Agent Engine 返回 HTTP {response.status_code}:{body}"
+                            upstream_failure_kind = "upstream_agent_engine_http_error"
                             stream_observation.upstream_state = "http_error"
                         else:
                             async for line in response.aiter_lines():
@@ -4455,17 +4324,17 @@ async def _chat_stream_with_turn(
                 stream_observation.upstream_state = "engine_error"
                 stream_error_message = str(exc)
             except httpx.ConnectError as exc:
-                upstream_failure_kind = "upstream_harness_connect_error"
+                upstream_failure_kind = "upstream_agent_engine_connect_error"
                 upstream_exception_class = type(exc).__name__
                 stream_observation.upstream_state = "connect_error"
-                stream_error_message = f"无法连接到 Legacy Harness 服务 {settings.harness_url}。请检查 harness 容器是否在运行。"
+                stream_error_message = "无法连接到所选原生 Agent Engine。"
             except httpx.TimeoutException as exc:
-                upstream_failure_kind = "upstream_harness_timeout"
+                upstream_failure_kind = "upstream_agent_engine_timeout"
                 upstream_exception_class = type(exc).__name__
                 stream_observation.upstream_state = "timeout"
-                stream_error_message = "Legacy Harness 服务响应超时。"
+                stream_error_message = "原生 Agent Engine 响应超时。"
             except Exception as e:
-                upstream_failure_kind = "upstream_harness_exception"
+                upstream_failure_kind = "upstream_agent_engine_exception"
                 upstream_exception_class = type(e).__name__
                 stream_observation.upstream_state = "exception"
                 stream_error_message = f"调用 Agent Engine 时出错:{type(e).__name__}: {e}"
@@ -4511,11 +4380,7 @@ async def _chat_stream_with_turn(
                 agent_events,
                 run_id=run.id,
             )
-            engine_source = (
-                conv.engine_id
-                if conv.engine_id != ENGINE_ID_LEGACY
-                else "harness"
-            )
+            engine_source = conv.engine_id
             if root_terminal_status == "succeeded":
                 termination_source = f"upstream_{engine_source}_completed"
             elif root_terminal_status == "failed":

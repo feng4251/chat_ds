@@ -271,12 +271,17 @@ export async function decideTurnApproval(
   requestId,
   requestSeq,
   decision,
+  answers = null,
 ) {
   const res = await request(
     `/conversations/${convId}/runs/${runId}/approvals/${encodeURIComponent(requestId)}`,
     {
       method: 'POST',
-      body: JSON.stringify({ decision, request_seq: requestSeq }),
+      body: JSON.stringify({
+        decision,
+        request_seq: requestSeq,
+        ...(answers ? { answers } : {}),
+      }),
     },
   )
   return await res.json()

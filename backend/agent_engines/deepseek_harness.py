@@ -268,22 +268,15 @@ class DeepSeekEventProjector:
                 session_id=session_id,
             ))
         elif native_type == "approval/asked":
-            request_id = str(data.get("id") or "")
-            tool_name = str(data.get("toolName") or "")
-            reason = str(data.get("reason") or "")
-            if request_id and depth <= 0:
-                projected.append(EngineStreamEvent(
-                    "approval",
-                    {
-                        "request_id": request_id,
-                        "request_seq": sub_seq,
-                        "status": "pending",
-                        "tool_name": tool_name,
-                        "title": f"Approve {tool_name}",
-                        "description": reason or f"The agent needs permission to use {tool_name}",
-                    },
-                    raw=dict(envelope)
-                ))
+            # The native event is the immutable audit record. The control
+            # bridge republishes the same id as `chatds/approval/requested`
+            # only after it has installed an answerable Web I/O waiter. Do
+            # not expose two pending cards for the same native decision.
+            projected.append(EngineStreamEvent(
+                "diagnostic",
+                {"code": "deepseek_native_approval_audited"},
+                raw=dict(envelope),
+            ))
         elif native_type == "approval/decided":
             request_id = str(data.get("id") or "")
             outcome = str(data.get("outcome") or "")
@@ -319,7 +312,13 @@ class DeepSeekEventProjector:
             request_id = str(data.get("request_id") or "")
             intent_kind = data.get("intent_kind")
             intent_approve = data.get("intent_approve")
-            if request_id and depth <= 0 and intent_kind == "plan" and intent_approve is True:
+            if (
+                request_id
+                and depth <= 0
+                and intent_kind == "plan-review"
+                and isinstance(intent_approve, str)
+                and bool(intent_approve)
+            ):
                 question = str(data.get("question") or "Review the plan")
                 detail = data.get("detail")
                 projected.append(EngineStreamEvent(
@@ -329,11 +328,70 @@ class DeepSeekEventProjector:
                         "request_seq": sub_seq,
                         "status": "pending",
                         "tool_name": "exit_plan_mode",
+                        "interaction_kind": "user_action",
                         "title": question,
                         "description": str(detail) if detail else "Review and approve the implementation plan",
                         "decision_reason": None,
                     },
                     raw=dict(envelope)
+                ))
+            elif request_id and depth <= 0:
+                question = str(data.get("question") or "")[:4_000]
+                raw_options = data.get("options")
+                options = [
+                    {
+                        "label": str(row.get("label") or "")[:256],
+                        "description": str(
+                            row.get("description") or ""
+                        )[:2_000],
+                    }
+                    for row in raw_options
+                    if isinstance(row, Mapping) and row.get("label")
+                ] if isinstance(raw_options, list) else []
+                labels = [row["label"] for row in options]
+                if (
+                    question
+                    and 2 <= len(options) <= 4
+                    and len(labels) == len(set(labels))
+                ):
+                    projected.append(EngineStreamEvent(
+                        "approval",
+                        {
+                            "request_id": request_id,
+                            "request_seq": sub_seq,
+                            "status": "pending",
+                            "tool_name": "ask_user_question",
+                            "interaction_kind": "question",
+                            "questions": [{
+                                "question": question,
+                                "header": str(data.get("header") or "")[:256],
+                                "multi_select": data.get("multi_select") is True,
+                                "options": options,
+                            }],
+                        },
+                        raw=dict(envelope),
+                    ))
+        elif native_type == "chatds/question/decided":
+            request_id = str(data.get("request_id") or "")
+            if request_id and depth <= 0:
+                projected.append(EngineStreamEvent(
+                    "approval",
+                    {
+                        "request_id": request_id,
+                        "request_seq": sub_seq,
+                        "status": (
+                            "allowed"
+                            if data.get("decision") == "allow"
+                            else "denied"
+                        ),
+                        "tool_name": str(
+                            data.get("tool_name") or "ask_user_question"
+                        )[:512],
+                        "interaction_kind": str(
+                            data.get("interaction_kind") or "question"
+                        )[:32],
+                    },
+                    raw=dict(envelope),
                 ))
         elif native_type == "llm/retry":
             failure = data.get("failure")
@@ -432,6 +490,12 @@ class DeepSeekHarnessEngine:
 
     def _start_payload(self, request: AgentEngineRequest) -> dict[str, Any]:
         provider = request.provider_config
+        expected_native_session_id = f"chatds-{request.conversation_id}"
+        if request.native_session_id != expected_native_session_id:
+            raise AgentEngineError(
+                "The DeepSeek Harness native Session identity is not bound to this Conversation.",
+                code="deepseek_native_session_identity_invalid",
+            )
         context_window_tokens = provider.get("context_length")
         if (
             type(context_window_tokens) is not int
@@ -447,13 +511,13 @@ class DeepSeekHarnessEngine:
             "root_run_id": request.root_run_id,
             "user_id": request.user_id,
             "conversation_id": request.conversation_id,
+            "native_session_id": expected_native_session_id,
             "model_id": request.model_id,
             "api_model": request.api_model,
             "provider_profile": str(provider.get("deepseek_harness_provider_profile") or ""),
             "provider_base_url": str(provider.get("base_url") or ""),
             "provider_protocol": str(provider.get("protocol") or ""),
             "messages": [dict(item) for item in request.messages],
-            "tools": list(request.tools),
             "max_output_tokens": request.max_output_tokens,
             "context_window_tokens": context_window_tokens,
             "workspace_path": str(request.metadata.get("workspace_path") or ""),
@@ -584,6 +648,7 @@ class DeepSeekHarnessEngine:
         request_id: str,
         request_seq: int,
         decision: str,
+        answers: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         timeout = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
         async with self._client_factory(timeout=timeout) as client:
@@ -595,6 +660,11 @@ class DeepSeekHarnessEngine:
                     "conversation_id": conversation_id,
                     "decision": decision,
                     "request_seq": request_seq,
+                    **(
+                        {"answers": dict(answers)}
+                        if answers is not None
+                        else {}
+                    ),
                 },
             )
         if response.status_code >= 400:

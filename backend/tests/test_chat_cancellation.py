@@ -1,6 +1,7 @@
 import asyncio
 import json
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from sqlalchemy import select
@@ -18,6 +19,7 @@ from models import (
 from routers import chat_router
 from routers.hook_router import ALLOWED_EVENTS
 from schemas import ChatRequest
+from agent_engines.base import EngineStreamEvent
 
 
 def _terminal(event_type: str, run_id: str, seq: int) -> dict:
@@ -190,12 +192,6 @@ class ChatStreamFailureClassificationTests(unittest.TestCase):
         self.assertFalse(fallback["sealed_contract_snapshot"])
         self.assertNotIn("calls", fallback)
 
-    def test_default_backend_timeout_exceeds_harness_provider_deadline(self):
-        self.assertGreater(
-            chat_router.settings.harness_stream_timeout_seconds,
-            14400,
-        )
-
     def test_lifecycle_persistence_does_not_depend_on_debug_mode(self):
         with (
             patch.object(
@@ -321,6 +317,7 @@ class ChatCancellationProjectionTests(unittest.IsolatedAsyncioTestCase):
                 id="conversation",
                 user_id="user",
                 model_id="model",
+                engine_id="claude_code",
             ))
             session.add(AgentRun(
                 id="root",
@@ -700,16 +697,9 @@ class ChatCancellationProjectionTests(unittest.IsolatedAsyncioTestCase):
         release_harness = asyncio.Event()
         persist_finished = asyncio.Event()
         persisted_calls: list[dict] = []
-        observed_client_timeout = None
-
-        class FakeHarnessResponse:
-            status_code = 200
-
-            def __init__(self, request_json: dict):
-                self.request_json = request_json
-
-            async def aiter_lines(self):
-                run_id = self.request_json["run_metadata"]["run_id"]
+        class FakeNativeEngine:
+            async def stream(self, request):
+                run_id = request.run_id
                 event = _terminal("run.started", run_id, 1)
                 event["root_run_id"] = run_id
                 event["parent_run_id"] = None
@@ -717,55 +707,21 @@ class ChatCancellationProjectionTests(unittest.IsolatedAsyncioTestCase):
                 event["agent_name"] = "primary"
                 event["depth"] = 0
                 event["payload"] = {"model_id": "deepseek_v4_pro"}
-                chunk = {
-                    "choices": [{
-                        "delta": {"agent_event": event},
-                        "index": 0,
-                    }]
-                }
-                yield "data: " + json.dumps(chunk)
-                yield "data: " + json.dumps({
-                    "choices": [{
-                        "delta": {"content": "partial draft"},
-                        "index": 0,
-                    }],
-                })
-                await release_harness.wait()
-                completed = _terminal("run.completed", run_id, 2)
-                completed["root_run_id"] = run_id
-                completed["payload"]["authoritative"] = True
-                yield "data: " + json.dumps({
-                    "choices": [{
-                        "delta": {"agent_event": completed},
-                        "index": 0,
-                        "finish_reason": "stop",
-                    }],
-                })
-                yield "data: [DONE]"
-
-        class FakeStreamContext:
-            def __init__(self, request_json: dict):
-                self.response = FakeHarnessResponse(request_json)
-
-            async def __aenter__(self):
-                return self.response
-
-            async def __aexit__(self, exc_type, exc, traceback):
-                harness_stream_closed.set()
-
-        class FakeClient:
-            def __init__(self, *args, **kwargs):
-                nonlocal observed_client_timeout
-                observed_client_timeout = kwargs.get("timeout")
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, exc_type, exc, traceback):
-                return False
-
-            def stream(self, method, url, **kwargs):
-                return FakeStreamContext(kwargs["json"])
+                try:
+                    yield EngineStreamEvent("agent_event", event)
+                    yield EngineStreamEvent(
+                        "content", {"text": "partial draft"}
+                    )
+                    await release_harness.wait()
+                    completed = _terminal("run.completed", run_id, 2)
+                    completed["root_run_id"] = run_id
+                    completed["payload"]["authoritative"] = True
+                    yield EngineStreamEvent("agent_event", completed)
+                    yield EngineStreamEvent(
+                        "finish", {"finish_reason": "stop"}
+                    )
+                finally:
+                    harness_stream_closed.set()
 
         def capture_persist(**kwargs):
             persisted_calls.append(kwargs)
@@ -790,6 +746,8 @@ class ChatCancellationProjectionTests(unittest.IsolatedAsyncioTestCase):
                         "id": "deepseek_v4_pro",
                         "base_url": "http://provider/v1",
                         "api_model": "AgentModel",
+                        "context_length": 303872,
+                        "claude_provider_profile": "shaiengine",
                     }),
                 ),
                 patch.object(
@@ -799,7 +757,19 @@ class ChatCancellationProjectionTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 patch.object(chat_router, "emit_event", new=AsyncMock()),
                 patch.object(chat_router, "async_session", self.sessions),
-                patch.object(chat_router.httpx, "AsyncClient", FakeClient),
+                patch(
+                    "agent_engines.registry.build_agent_engine_registry",
+                    return_value=SimpleNamespace(
+                        get=lambda _engine_id: FakeNativeEngine()
+                    ),
+                ),
+                patch(
+                    "agent_engines.skill_view.materialize_claude_skill_view",
+                    return_value=SimpleNamespace(
+                        root="/skill-view",
+                        sha256="a" * 64,
+                    ),
+                ),
                 patch.object(
                     chat_router,
                     "_append_backend_stream_debug_file",
@@ -852,10 +822,6 @@ class ChatCancellationProjectionTests(unittest.IsolatedAsyncioTestCase):
                     )
 
         self.assertTrue(harness_stream_closed.is_set())
-        self.assertEqual(
-            observed_client_timeout,
-            chat_router.settings.harness_stream_timeout_seconds,
-        )
         self.assertEqual(len(persisted_calls), 1)
         persisted = persisted_calls[0]
         root_run_id = persisted["run_id"]
@@ -877,7 +843,7 @@ class ChatCancellationProjectionTests(unittest.IsolatedAsyncioTestCase):
         debug_payload = root_events[2]["payload"]
         self.assertEqual(
             debug_payload["termination_source"],
-            "upstream_harness_completed",
+            "upstream_claude_code_completed",
         )
         self.assertEqual(debug_payload["last_root_event_type"], "run.completed")
         self.assertEqual(debug_payload["root_phase"], "terminal")

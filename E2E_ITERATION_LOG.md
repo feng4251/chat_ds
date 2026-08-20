@@ -1991,3 +1991,92 @@ Round 16 从生产 `86609068` 开始，仍须先 V2.3、后肺癌 MDT，使用�
 
 Round 16 至此闭环。Round 17 从生产 `8097db3c` 开始，仍须先 V2.3、后肺癌 MDT，使用两个全新
 conversation/root；当前用户授权硬上限为 Round 18。
+
+## Round 17：原生双引擎迁移后的 V2.3 新鲜生产验收（通过）
+
+### 冻结输入、三源证据与完整时间线
+
+- 本轮不是重放或解释旧 run，而是独立新建生产 conversation
+  `00e4881af558441595ab4e0bdba05992` 和 root `2d0a6b1cef46411f87b1c60bed8053b7`。
+  Engine 为未修改 Claude Code 2.1.152，模型从 `deepseek_v4_pro` 精确绑定到 API `AgentModel`，
+  permission preset 为 `session_full`。持久 user message 为 64 字符，SHA-256
+  `2f042f8dec9eaf2f79994e634a81da9ab11408e53dbd42952a41be049f43787c`；assistant message 为
+  2,839 字符并精确关联 root run。
+- 输入包为 `skills_and_refs/xClinicalTrial-Design-V2.3.zip`，SHA-256
+  `78b890eab57ff516c20a39a565631caa5d784f839b42f6ad9efbdbdd951eb0a0`。transactional install
+  得到 19 个 Skill，primary 为 `healthsim-trialsim`。不可变 Skill view digest 为
+  `9aee2a0596eff2e78c48c615332e70ed3d82abc9539b701663ea7076af96d7b8`，manifest 编译出 9 个
+  worker、17 条 route、1 个 artifact contract，compiler diagnostic 为 0。对应设计参考
+  `xClinicalTrial_Design_V2.3.html` 的 SHA-256 为 `2d4c772b...`。
+- compiler 从声明数据选择 `composite_full_protocol_design`，route SHA-256
+  `b7ff3beb155882eebe6b34381c3af540e515d35867f9458f9a3682132e2fd921`。phase 0 启动 7 个并行
+  mandatory worker：PICO、safety extraction、termination、AE adjudication、target biology、
+  competitive landscape、literature synthesis；phase 1 在前序 fan-in 后启动 I/E criteria worker。
+  8 个 worker 都收到原生 task notification 与 `native_subagent_end_turn` checkpoint，并在数据库形成
+  8 个 depth=1、`succeeded/stop` AgentRun；root 为 `succeeded/end_turn`。
+- root 从 `2026-08-20 19:32:35.708210` 运行至 `2026-08-20 21:19:51.430514`，耗时约 1 小时
+  47 分。lossless native ledger 是 31,685 条合法 JSON：31,087 `stream_event`、253 `system`、
+  160 `assistant`、154 `user`、8 `chatds.workflow.worker-settled`、17 artifact、各 1 条 workflow contract、
+  artifact contract、native result 和 supervisor terminal。后台 debug stream 另有精确的 terminated 与
+  downstream-final 两条投影证据。
+- 原生工具层共有 145 次 started、133 次 completed、12 次 failed。12 次 failed 均为 Bash 的可选检索/
+  分析尝试：7 timeout、3 command nonzero、1 missing file、1 script runtime error；没有
+  `content_omitted/code_omitted` placeholder、malformed JSON、write retry storm、重复审批或 controller
+  synthesized result。它们没有满足也没有替代任何 mandatory receipt；8 个声明 worker 仍全部完成，
+  mandatory frontier 精确推进到 2。
+
+### Artifact fan-in、终态与 ground truth 对照
+
+- durable workspace 位于
+  `/nfs/temp/chat_ds/7f44dcdcc18445779ec23dd6d8302c01/00e4881af558441595ab4e0bdba05992/workspace/gal3_ad_cdp`。
+  交付合同的 14 个 Markdown 文件全部存在：11 个顺序模块、README、`_checklist.md` 和
+  `GAL3_AD_FULL_REPORT.md`；另有 3 个 simulation source artifact。canonical full report 是 11 个模块
+  的 byte-for-byte 顺序 concat，168,549 bytes、2,735 lines，SHA-256
+  `7f305bd828e47a7ce1cf4ed4569f6d05acf0d389ad813b9f15c4590947557507`。
+- workflow receipt 为 `passed`、frontier 2、finding 0；artifact receipt 为 `passed`、activated contract 1、
+  finding 0。Supervisor seq 31,685 记录唯一 authoritative terminal：`succeeded`、exit 0、result count 1、
+  pending plan/native task 都为 0、`error/error_code/error_stage` 均为空，termination source 为
+  `upstream_claude_code_completed`。因此本轮完整 durable result，而不是仅凭模型结束语判定成功。
+- 与顶层 GLM-5.2 ground truth（200,094 bytes/3,383 lines，SHA-256 `0b7a30eb...`）相比，新鲜报告
+  byte ratio 0.842349、line ratio 0.808454、normalized char-trigram cosine 0.819621、token cosine
+  0.907600。与 modular Claude Code ground truth（193,110 bytes/2,360 lines，SHA-256
+  `7cfed42c...`）相比，byte ratio 0.872813、line ratio 1.158898、char-trigram cosine 0.761083、
+  token cosine 0.888361。三者均有相同 11 个核心 H1 业务模块与 14 文件合同，但措辞、标题细化和试验参数
+  并非逐字相同；两份 ground truth 相互之间同样不是同一文本。
+- 接受标准据此保持为 Skill-declared workflow、mandatory evidence、结构、文件、顺序 merge、规模和
+  artifact validation 的业务等价；不把随机模型输出的 byte equality 嵌入 Harness。需要逐字复刻时应另建
+  确定性 template/reference-copy 产品合同，否则会违反通用 Skill 执行和禁止 fixture overfit 的约束。
+
+### 成熟实现对照、修复问题链与本轮决策
+
+- 成熟源码参考精确冻结为 `claude-code/` commit
+  `6f6f12b37f529488b10e53928dd5508bb93535c7` 和 `deepseek-harness-clean/` commit
+  `47f943859bef60e4160492346772ded9b24f765a`，均为本地独立、未修改仓库，无需 Web 搜索。
+- Claude `src/cli/print.ts` 在原生 query 内流式发出 task progress、在 background local agent/workflow 未结算
+  时 hold back result，并在最终 result 前 drain pending SDK events；`structuredIO.ts` 与
+  `controlSchemas.ts` 维护 typed request/response 和 pending identity。ChatDS **adopt/adapt** 这些原生
+  event/permission/result 语义到 authenticated Web receipt、workspace artifact audit 和 exactly-one outer
+  terminal 后，不复制 query loop。
+- DSH `packages/jobs/jobs/src/types.ts` 声明 session owner fencing、`running -> stopping -> exactly one
+  terminal`、idempotent cancel、settled resource cleanup 和 read-only snapshot；Session event log 与 sandbox
+  package提供原生 session/workspace 边界。ChatDS **adapt** 为经 peer-credential 校验的 event socket、exact
+  tool identity、controller receipt 和 terminal projection；**reject** 粗粒度 plugin group 扩权、第二套
+  agent loop、从 prose 推断 terminal，以及修改任一上游内核。
+- 本轮终态为通过，故自动 repair question chain 的结论是：没有新的 mandatory workflow、artifact、authority、
+  recovery 或 lifecycle defect需要生产修复。12 个 optional tool failure 已被正确隔离且未污染 mandatory
+  frontier；不得为了让 acceptance round“看起来有修复”而制造 fixture-specific change。Round 17 记录为
+  passing acceptance round，不计作新的 repair iteration。
+
+### 部署与最终回归
+
+- 本轮前已从当前源码重建并切换 Backend `sha256:862dd156...`、Frontend `sha256:5f1dd9bd...`、
+  Claude Supervisor `sha256:e70054b3...`、DeepSeek Supervisor `sha256:f24a9ab...`、egress proxy
+  `sha256:b434765...`；生产没有 Legacy 容器。SearXNG/Valkey healthy，limiter 恢复精确规则；Claude 三档
+  permission E2E、DSH real AgentModel turn 和 exact-one-call Web search E2E 都通过。
+- 最终回归为 Backend `371 passed, 116 warnings, 2 subtests`；Claude/DeepSeek Runner/Supervisor 与
+  browser topology `131 passed, 6 skipped, 19 subtests`；DeepSeek Node `15/15`；Frontend `49/49`；
+  Vite production build、Python `compileall`、`git diff --check` 均通过。warnings 是既有 passlib/
+  `datetime.utcnow()` deprecation，不是断言失败。
+
+Round 17 至此闭环。下一轮不应重复消费 V2.3 来证明同一事实；只有新的用户驱动独立 E2E 或新的通用不变量
+失败，才进入 Round 18 repair loop。

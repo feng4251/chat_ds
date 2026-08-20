@@ -15,10 +15,273 @@ MAX_CONTRACT_YAML_BYTES = 8 * 1024 * 1024
 MAX_SKILL_INSTRUCTION_BYTES = 8 * 1024 * 1024
 MAX_CONTRACT_ITEMS = 128
 MAX_CONTRACT_DEPTH = 64
+MAX_SKILL_WORKERS = 128
+MAX_SKILL_WORKER_BYTES = 2 * 1024 * 1024
+MAX_SKILL_WORKER_DESCRIPTION_BYTES = 8 * 1024
+MAX_SKILL_WORKFLOW_ROUTES = 128
+MAX_SKILL_WORKFLOW_PATTERNS = 128
+MAX_SKILL_WORKFLOW_PATTERN_BYTES = 8 * 1024
+
+
+_WORKER_ID_PATTERN = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+)
+_WORKFLOW_ROUTE_ID_PATTERN = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+)
 
 
 class SkillContractError(RuntimeError):
     pass
+
+
+def compile_skill_workers(
+    *,
+    skill_name: str,
+    root: Path,
+    relative_files: Iterable[PurePosixPath],
+) -> list[dict[str, str]]:
+    """Compile conventional structured workers for a native agent surface.
+
+    A worker file remains the authoritative instruction source. This compiler
+    extracts only the bounded identity and routing description required to
+    expose it as an engine-native subagent; it does not interpret or execute
+    worker instructions itself.
+    """
+
+    candidates = sorted(
+        (
+            relative
+            for relative in relative_files
+            if _is_structured_worker_yaml(relative)
+        ),
+        key=lambda value: (value.as_posix().casefold(), value.as_posix()),
+    )
+    if len(candidates) > MAX_SKILL_WORKERS:
+        raise SkillContractError("skill_worker_file_limit")
+
+    workers: list[dict[str, str]] = []
+    identities: set[str] = set()
+    for relative in candidates:
+        path = root / relative
+        try:
+            if path.stat().st_size > MAX_SKILL_WORKER_BYTES:
+                raise SkillContractError("skill_worker_file_size_limit")
+            document = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except SkillContractError:
+            raise
+        except (OSError, UnicodeError, yaml.YAMLError) as exc:
+            raise SkillContractError("skill_worker_yaml_invalid") from exc
+        if not isinstance(document, dict):
+            raise SkillContractError("skill_worker_document_invalid")
+        _validate_yaml_shape(document)
+
+        raw_identity = (
+            document.get("worker_id")
+            if document.get("worker_id") is not None
+            else document.get("id")
+        )
+        if (
+            not isinstance(raw_identity, str)
+            or _WORKER_ID_PATTERN.fullmatch(raw_identity) is None
+        ):
+            raise SkillContractError("skill_worker_identity_invalid")
+        folded_identity = raw_identity.casefold()
+        if folded_identity in identities:
+            raise SkillContractError("skill_worker_identity_duplicate")
+        identities.add(folded_identity)
+
+        raw_description = document.get("description")
+        if raw_description is None:
+            raw_description = document.get("name")
+        workers.append({
+            "skill_name": skill_name,
+            "worker_id": raw_identity,
+            "description": _normalize_worker_description(raw_description),
+            "source_path": relative.as_posix(),
+        })
+    return workers
+
+
+def compile_skill_workflows(
+    *,
+    skill_name: str,
+    root: Path,
+    relative_files: Iterable[PurePosixPath],
+    workers: Iterable[dict[str, str]],
+) -> list[dict[str, Any]]:
+    """Compile declarative worker routing into ordered mandatory phases.
+
+    The compiler interprets only the conventional routing vocabulary needed
+    to preserve parallel barriers and sequential dependencies. Worker prompts
+    remain in their immutable YAML files and execution remains engine-native.
+    """
+
+    worker_ids = {
+        str(worker.get("worker_id") or "")
+        for worker in workers
+        if isinstance(worker, dict)
+    }
+    candidates = sorted(
+        (
+            relative
+            for relative in relative_files
+            if _is_contract_yaml(relative)
+        ),
+        key=lambda value: (value.as_posix().casefold(), value.as_posix()),
+    )
+    if len(candidates) > MAX_CONTRACT_YAML_FILES:
+        raise SkillContractError("skill_contract_file_limit")
+
+    routes: list[dict[str, Any]] = []
+    identities: set[str] = set()
+    for relative in candidates:
+        path = root / relative
+        try:
+            if path.stat().st_size > MAX_CONTRACT_YAML_BYTES:
+                raise SkillContractError("skill_contract_file_size_limit")
+            document = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except SkillContractError:
+            raise
+        except (OSError, UnicodeError, yaml.YAMLError) as exc:
+            raise SkillContractError("skill_workflow_yaml_invalid") from exc
+        if not isinstance(document, dict):
+            continue
+        _validate_yaml_shape(document)
+        raw_routes = document.get("routing_rules")
+        if raw_routes is None:
+            continue
+        if not isinstance(raw_routes, dict):
+            raise SkillContractError("skill_workflow_routes_invalid")
+        for route_id, raw_route in raw_routes.items():
+            if len(routes) >= MAX_SKILL_WORKFLOW_ROUTES:
+                raise SkillContractError("skill_workflow_route_limit")
+            if (
+                not isinstance(route_id, str)
+                or _WORKFLOW_ROUTE_ID_PATTERN.fullmatch(route_id) is None
+            ):
+                raise SkillContractError("skill_workflow_route_identity_invalid")
+            folded_route_id = route_id.casefold()
+            if folded_route_id in identities:
+                raise SkillContractError("skill_workflow_route_identity_duplicate")
+            identities.add(folded_route_id)
+            if not isinstance(raw_route, dict):
+                raise SkillContractError("skill_workflow_route_invalid")
+
+            patterns = _normalize_workflow_patterns(raw_route.get("patterns"))
+            priority = raw_route.get("priority", 0)
+            if (
+                isinstance(priority, bool)
+                or not isinstance(priority, int)
+                or not -100_000 <= priority <= 100_000
+            ):
+                raise SkillContractError("skill_workflow_priority_invalid")
+
+            direct_worker = raw_route.get("worker")
+            listed_workers = raw_route.get("workers")
+            if direct_worker is not None:
+                if listed_workers is not None:
+                    raise SkillContractError("skill_workflow_workers_invalid")
+                initial_workers = _normalize_workflow_worker_ids(
+                    [direct_worker], worker_ids=worker_ids
+                )
+                default_mode = "direct"
+            else:
+                initial_workers = _normalize_workflow_worker_ids(
+                    listed_workers, worker_ids=worker_ids
+                )
+                default_mode = (
+                    "direct" if len(initial_workers) == 1 else "parallel"
+                )
+            spawn_mode = raw_route.get("spawn_mode", default_mode)
+            if spawn_mode not in {"direct", "parallel", "sequential"}:
+                raise SkillContractError("skill_workflow_spawn_mode_invalid")
+            if spawn_mode == "direct" and len(initial_workers) != 1:
+                raise SkillContractError("skill_workflow_spawn_mode_invalid")
+
+            sequential_workers = _normalize_workflow_worker_ids(
+                raw_route.get("sequential_workers", []),
+                worker_ids=worker_ids,
+                allow_empty=True,
+            )
+            ordered_workers = initial_workers + sequential_workers
+            if len(set(ordered_workers)) != len(ordered_workers):
+                raise SkillContractError("skill_workflow_worker_duplicate")
+
+            phases: list[dict[str, Any]] = []
+            if spawn_mode == "parallel":
+                phases.append({
+                    "mode": "parallel",
+                    "worker_ids": initial_workers,
+                })
+            else:
+                phases.extend(
+                    {"mode": "sequential", "worker_ids": [worker_id]}
+                    for worker_id in initial_workers
+                )
+            phases.extend(
+                {"mode": "sequential", "worker_ids": [worker_id]}
+                for worker_id in sequential_workers
+            )
+            routes.append({
+                "skill_name": skill_name,
+                "route_id": route_id,
+                "source_path": relative.as_posix(),
+                "priority": priority,
+                "patterns": patterns,
+                "phases": phases,
+            })
+    return routes
+
+
+def _normalize_workflow_patterns(value: object) -> list[str]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or len(value) > MAX_SKILL_WORKFLOW_PATTERNS
+    ):
+        raise SkillContractError("skill_workflow_patterns_invalid")
+    patterns: list[str] = []
+    for pattern in value:
+        if (
+            not isinstance(pattern, str)
+            or not pattern
+            or len(pattern.encode("utf-8")) > MAX_SKILL_WORKFLOW_PATTERN_BYTES
+            or any(ord(character) < 0x20 or ord(character) == 0x7F
+                   for character in pattern)
+        ):
+            raise SkillContractError("skill_workflow_pattern_invalid")
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise SkillContractError("skill_workflow_pattern_invalid") from exc
+        patterns.append(pattern)
+    return patterns
+
+
+def _normalize_workflow_worker_ids(
+    value: object,
+    *,
+    worker_ids: set[str],
+    allow_empty: bool = False,
+) -> list[str]:
+    if (
+        not isinstance(value, list)
+        or (not value and not allow_empty)
+        or len(value) > MAX_SKILL_WORKERS
+    ):
+        raise SkillContractError("skill_workflow_workers_invalid")
+    normalized: list[str] = []
+    for worker_id in value:
+        if (
+            not isinstance(worker_id, str)
+            or _WORKER_ID_PATTERN.fullmatch(worker_id) is None
+        ):
+            raise SkillContractError("skill_workflow_worker_identity_invalid")
+        if worker_id not in worker_ids:
+            raise SkillContractError("skill_workflow_worker_unknown")
+        normalized.append(worker_id)
+    return normalized
 
 
 def compile_skill_contract(
@@ -128,6 +391,33 @@ def _is_contract_yaml(relative: PurePosixPath) -> bool:
         len(parts) == 1
         and relative.stem.casefold().startswith("orchestrat")
     )
+
+
+def _is_structured_worker_yaml(relative: PurePosixPath) -> bool:
+    parts = relative.parts
+    return (
+        len(parts) == 3
+        and parts[0].casefold() == "orchestration"
+        and parts[1].casefold() == "workers"
+        and relative.suffix.casefold() in {".yaml", ".yml"}
+    )
+
+
+def _normalize_worker_description(value: object) -> str:
+    if not isinstance(value, str):
+        raise SkillContractError("skill_worker_description_invalid")
+    description = " ".join(value.split())
+    if (
+        not description
+        or len(description.encode("utf-8"))
+        > MAX_SKILL_WORKER_DESCRIPTION_BYTES
+        or any(
+            ord(character) < 0x20 or ord(character) == 0x7F
+            for character in description
+        )
+    ):
+        raise SkillContractError("skill_worker_description_invalid")
+    return description
 
 
 def _validate_yaml_shape(value: object) -> None:

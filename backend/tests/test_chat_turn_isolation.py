@@ -2,8 +2,10 @@ import asyncio
 import json
 import tempfile
 import unittest
+from contextlib import ExitStack, asynccontextmanager
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException
@@ -57,6 +59,7 @@ class ChatTurnIsolationTests(unittest.IsolatedAsyncioTestCase):
                 id="conversation",
                 user_id="user",
                 model_id="deepseek_v4_pro",
+                engine_id="deepseek_harness",
             ))
             await session.commit()
 
@@ -111,29 +114,18 @@ class ChatTurnIsolationTests(unittest.IsolatedAsyncioTestCase):
                 })
                 yield "data: [DONE]"
 
-        class FakeStreamContext:
-            def __init__(self, request_json: dict):
-                self.response = FakeHarnessResponse(request_json)
-
-            async def __aenter__(self):
-                return self.response
-
-            async def __aexit__(self, exc_type, exc, traceback):
-                return False
-
-        class FakeClient:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, exc_type, exc, traceback):
-                return False
-
-            def stream(self, method, url, **kwargs):
-                requests.append(kwargs["json"])
-                return FakeStreamContext(kwargs["json"])
+        @asynccontextmanager
+        async def fake_engine_stream(*, engine_id, request):
+            self.assertEqual(engine_id, "deepseek_harness")
+            request_json = {
+                "messages": [dict(message) for message in request.messages],
+                "session_skill_registry": [
+                    dict(row) for row in request.session_skill_registry
+                ],
+                "run_metadata": {"run_id": request.run_id},
+            }
+            requests.append(request_json)
+            yield FakeHarnessResponse(request_json)
 
         async def delayed_persist(*args, **kwargs):
             projection_started.set()
@@ -152,6 +144,7 @@ class ChatTurnIsolationTests(unittest.IsolatedAsyncioTestCase):
                     "id": "deepseek_v4_pro",
                     "base_url": "http://provider/v1",
                     "api_model": "AgentModel",
+                    "protocol": "openai",
                 }),
             ),
             patch.object(
@@ -170,7 +163,35 @@ class ChatTurnIsolationTests(unittest.IsolatedAsyncioTestCase):
                 "skill_bundle_registry_rows",
                 return_value=expected_skill_registry,
             ),
-            patch.object(chat_router.httpx, "AsyncClient", FakeClient),
+            patch.object(
+                chat_router,
+                "_open_agent_engine_stream",
+                fake_engine_stream,
+            ),
+            patch.object(
+                chat_router,
+                "deepseek_harness_model_compatible",
+                return_value=True,
+            ),
+            patch.object(
+                chat_router,
+                "content_address_skill_bundle_registry_rows",
+                return_value=[{
+                    **expected_skill_registry[0],
+                    "skill_md_sha256": None,
+                }],
+            ),
+            patch(
+                "agent_engines.skill_view.materialize_claude_skill_view",
+                return_value=SimpleNamespace(
+                    root=Path(self.temp_dir.name) / "skill-view",
+                    sha256="b" * 64,
+                ),
+            ),
+            patch(
+                "agent_engines.registry.build_agent_engine_registry",
+                return_value=SimpleNamespace(get=lambda _engine_id: object()),
+            ),
             patch.object(
                 chat_router.settings,
                 "agent_event_immediate_persist",
@@ -183,10 +204,9 @@ class ChatTurnIsolationTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        with common_patches[0], common_patches[1], common_patches[2], \
-                common_patches[3], common_patches[4], common_patches[5], \
-                common_patches[6], common_patches[7], common_patches[8], \
-                common_patches[9]:
+        with ExitStack() as stack:
+            for context in common_patches:
+                stack.enter_context(context)
             async with self.sessions() as first_session:
                 user = await first_session.get(User, "user")
                 first_response = await chat_router._chat_stream(
@@ -236,7 +256,6 @@ class ChatTurnIsolationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [(item["role"], item["content"]) for item in second_messages],
             [
-                ("system", "You are a helpful AI assistant."),
                 ("user", "user-one"),
                 ("assistant", "assistant-one"),
                 ("user", "user-two"),

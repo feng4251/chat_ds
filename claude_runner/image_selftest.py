@@ -6,10 +6,17 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 from typing import Any
 
+from claude_runner.artifact_stop_hook import evaluate_stop_hook
+from claude_runner.native_lifecycle_hook import evaluate_lifecycle_hook
+from claude_runner.native_workflow import build_workflow_receipt
 from claude_runner.runner_entrypoint import _claude_command
-from claude_runner.runtime_capabilities import render_runtime_capability_prompt
+from claude_runner.runtime_capabilities import (
+    validate_runtime_capability_contract,
+)
 
 
 SELF_TEST_SCHEMA = "chatds.claude-runner-image-self-test.v1"
@@ -75,10 +82,9 @@ def _result() -> dict[str, Any]:
             "ports": [80, 443],
         },
     }
-    prompt = render_runtime_capability_prompt(contract)
-    if "renamed_holdout_lookup" not in prompt:
+    if validate_runtime_capability_contract(contract) != contract:
         raise RuntimeError("runtime_capability_self_test_failed")
-    command, user_prompt = _claude_command({
+    runner_config = {
         "native_session_id": "11111111-1111-4111-8111-111111111111",
         "resume_from_native_session_id": None,
         "api_model": "renamed-model-holdout",
@@ -87,15 +93,116 @@ def _result() -> dict[str, Any]:
         "native_web_tools": False,
         "prompt": "entrypoint holdout",
         "runtime_capability_contract": contract,
-    })
+    }
+    command, user_prompt = _claude_command(runner_config)
     if (
         command[:2] != ["/usr/local/bin/claude", "--print"]
         or command[command.index("--input-format") + 1] != "stream-json"
-        or "--append-system-prompt" not in command
+        or "--append-system-prompt" in command
         or json.loads(user_prompt)["message"]["content"]
         != [{"type": "text", "text": "entrypoint holdout"}]
     ):
         raise RuntimeError("controller_entrypoint_self_test_failed")
+    hook_command, _ = _claude_command(
+        runner_config,
+        artifact_stop_contract_path=Path(
+            "/runtime/artifact-stop-contract.json"
+        ),
+    )
+    hook_settings = json.loads(
+        hook_command[hook_command.index("--settings") + 1]
+    )
+    try:
+        native_hook = hook_settings["hooks"]["Stop"][0]["hooks"][0]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError("artifact_stop_hook_self_test_failed") from exc
+    if (
+        native_hook.get("type") != "command"
+        or "claude_runner.artifact_stop_hook"
+        not in str(native_hook.get("command") or "")
+    ):
+        raise RuntimeError("artifact_stop_hook_self_test_failed")
+    lifecycle_command, _ = _claude_command(
+        runner_config,
+        native_lifecycle_contract_path=Path(
+            "/runtime/native-lifecycle-contract.json"
+        ),
+    )
+    lifecycle_settings = json.loads(
+        lifecycle_command[lifecycle_command.index("--settings") + 1]
+    )
+    try:
+        lifecycle_hooks = lifecycle_settings["hooks"]
+        pre_tool_hook = lifecycle_hooks["PreToolUse"][0]["hooks"][0]
+        stop_hook = lifecycle_hooks["Stop"][0]["hooks"][0]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError("native_lifecycle_hook_self_test_failed") from exc
+    if (
+        pre_tool_hook != stop_hook
+        or "claude_runner.native_lifecycle_hook"
+        not in str(pre_tool_hook.get("command") or "")
+    ):
+        raise RuntimeError("native_lifecycle_hook_self_test_failed")
+    with tempfile.TemporaryDirectory() as temporary:
+        workspace = Path(temporary)
+        (workspace / "RENAMED_RECEIPT.md").write_text(
+            "# Receipt\n", encoding="utf-8"
+        )
+        if evaluate_stop_hook(
+            hook_input={
+                "hook_event_name": "Stop",
+                "stop_hook_active": False,
+            },
+            contract={
+                "schema": "chatds.artifact-stop-contract.v1",
+                "skill_name": "renamed-holdout",
+                "workspace_before": {},
+                "contracts": [{
+                    "skill_name": "renamed-holdout",
+                    "declared_final_artifact": "{NAME}_RECEIPT.md",
+                    "declared_section_count": 1,
+                }],
+            },
+            workspace_root=workspace,
+        ) != {}:
+            raise RuntimeError("artifact_stop_hook_self_test_failed")
+        workflow = {
+            "schema": "chatds.skill-workflow-contract.v1",
+            "skill_name": "renamed-holdout",
+            "route_id": "receipt_review",
+            "route_sha256": "d" * 64,
+            "phases": [{
+                "mode": "sequential",
+                "workers": [{
+                    "worker_id": "reviewer",
+                    "native_agent_type": (
+                        "chatds-session-skills:renamed-holdout:reviewer"
+                    ),
+                }],
+            }],
+        }
+        lifecycle_contract = {
+            "schema": "chatds.native-lifecycle-contract.v1",
+            "skill_name": "renamed-holdout",
+            "artifact_contracts": [],
+            "workspace_before": {},
+            "workflow_contract": workflow,
+            "workflow_receipt_path": "/runtime/workflow-receipt.json",
+        }
+        blocked = evaluate_lifecycle_hook(
+            hook_input={
+                "hook_event_name": "Stop",
+                "stop_hook_active": False,
+            },
+            contract=lifecycle_contract,
+            workflow_receipt=build_workflow_receipt(workflow, []),
+            workspace_root=workspace,
+        )
+        if (
+            blocked.get("decision") != "block"
+            or "workflow_worker_missing" not in str(blocked.get("reason"))
+        ):
+            raise RuntimeError("native_lifecycle_hook_self_test_failed")
     for module, expected in _MCP_MODULES.items():
         if _mcp_tools(["-m", module]) != expected:
             raise RuntimeError("mcp_entrypoint_self_test_failed")

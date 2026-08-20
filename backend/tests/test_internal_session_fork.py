@@ -104,6 +104,14 @@ class InternalSessionForkTransactionTests(unittest.IsolatedAsyncioTestCase):
                 "emit_event",
                 new=AsyncMock(return_value=None),
             ),
+            # Transaction tests exercise the fork/journal boundary, not model
+            # catalog admission. Bind the renamed local wire model to the
+            # same deployment-owned native profile used in production.
+            patch.object(
+                settings,
+                "claude_code_provider_profiles",
+                ["shaiengine", "local_agentmodel"],
+            ),
             patch.object(
                 session_lifecycle,
                 "async_session",

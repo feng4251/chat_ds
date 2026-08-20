@@ -39,14 +39,22 @@ from pydantic import BaseModel, Field, model_validator
 from .config import ProviderProfile, RunnerSettings, load_settings
 from .policy import compile_turn_egress_policy, verify_skill_view
 from .runtime_capabilities import compile_runtime_capability_contract
+from .native_control import (
+    build_native_updated_input,
+    is_native_user_interaction,
+    native_user_interaction_kind,
+)
 from .input_attachments import (
     INPUT_ATTACHMENT_DIRECTORY,
     INPUT_ATTACHMENT_PATH,
     MAX_INPUT_ATTACHMENTS,
     verify_input_attachments as _verify_input_attachments,
 )
-from .mcp_schedule_control import normalize_schedule_tool_aliases
+from .mcp_schedule_control import normalize_schedule_capability_aliases
 from workspace_lock import workspace_mutation_guard
+from native_security.workflow_contract import (
+    compile_turn_workflow_contract as compile_native_workflow_contract,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -63,7 +71,6 @@ EXPECTED_RUNNER_RUNTIME = "installed-isolated-package-v1"
 RUNNER_IMAGE_SELF_TEST_ARGUMENT = "--chatds-image-self-test"
 RUNNER_IMAGE_SELF_TEST_SCHEMA = "chatds.claude-runner-image-self-test.v1"
 EXPECTED_SKILL_PLUGIN_NAME = "chatds-session-skills"
-EXPECTED_SKILL_ENTRYPOINT_NAME = "chatds-harness-session-entry"
 _STATUS_UPDATE_LOCK = threading.RLock()
 
 
@@ -112,7 +119,7 @@ class StartRunRequest(BaseModel):
     user_turn_text: str = Field(default="", max_length=2_000_000)
     permission_preset: Literal[
         "read_only", "workspace_write", "session_full"
-    ] = "session_full"
+    ] = "workspace_write"
 
     @model_validator(mode="after")
     def bounded_payload(self):
@@ -130,8 +137,28 @@ class RunIdentityRequest(BaseModel):
 
 
 class ApprovalDecisionRequest(RunIdentityRequest):
+    model_config = {"extra": "forbid"}
+
     request_seq: int = Field(ge=1)
     decision: Literal["allow", "deny"]
+    answers: dict[str, str] | None = None
+
+    @model_validator(mode="after")
+    def bounded_answers(self):
+        if self.answers is not None and (
+            not 1 <= len(self.answers) <= 4
+            or any(
+                not key
+                or len(key) > 4_000
+                or not value.strip()
+                or len(value) > 4_000
+                or "\x00" in key
+                or "\x00" in value
+                for key, value in self.answers.items()
+            )
+        ):
+            raise ValueError("Native question answers are invalid")
+        return self
 
 
 class SessionIdentityRequest(BaseModel):
@@ -219,9 +246,7 @@ class RunManager:
         )
         if self._admission_cancelled(request.run_id):
             raise _PreflightCancelled
-        skill_entrypoint = _manifest_skill_entrypoint(
-            skill_view_receipt.manifest
-        )
+        _validate_native_skill_manifest(skill_view_receipt.manifest)
         _verify_input_attachments(
             messages=request.messages,
             attachments=request.input_attachments,
@@ -230,11 +255,19 @@ class RunManager:
         prompt = _build_prompt(
             request.messages,
             resume=resume_from_native_session_id is not None,
-            skill_entrypoint=skill_entrypoint,
         )
-        prompt = _attach_runtime_contract(
-            prompt,
-            skill_view_receipt.manifest.get("runtime_requirements", []),
+        turn_skill_binding = _fresh_session_skill_binding(
+            skill_view_receipt.manifest,
+            resume=resume_from_native_session_id is not None,
+        )
+        workflow_contract = _compile_turn_workflow_contract(
+            manifest=skill_view_receipt.manifest,
+            user_turn_text=request.user_turn_text,
+            bound_skill_name=(
+                turn_skill_binding["skill_name"]
+                if turn_skill_binding is not None
+                else None
+            ),
         )
         policy = compile_turn_egress_policy(
             skill_view_root=skill_view,
@@ -256,13 +289,14 @@ class RunManager:
             manifest=skill_view_receipt.manifest,
             egress_policy=policy,
         )
-        raw_schedule_tool_aliases = skill_view_receipt.manifest.get(
-            "schedule_tool_aliases"
+        raw_schedule_capability_aliases = skill_view_receipt.manifest.get(
+            "schedule_capability_aliases",
+            {},
         )
-        schedule_tool_aliases = (
-            None
-            if raw_schedule_tool_aliases is None
-            else normalize_schedule_tool_aliases(raw_schedule_tool_aliases)
+        schedule_capability_aliases = (
+            normalize_schedule_capability_aliases(
+                raw_schedule_capability_aliases
+            )
         )
         if self._admission_cancelled(request.run_id):
             raise _PreflightCancelled
@@ -288,17 +322,24 @@ class RunManager:
             "workspace_path": str(workspace),
             "skill_view_path": str(skill_view),
             "skill_view_sha256": request.skill_view_sha256,
+            # A Session upload is an explicit native capability attachment.
+            # On a fresh native Session, one unambiguous Session-level primary
+            # is lowered to Claude Code's own slash-command path.  Ambient
+            # user Skills, multiple primaries and resumed Turns remain under
+            # Claude's native relevance router, avoiding stale reinjection.
+            "turn_skill_binding": turn_skill_binding,
             # These compiler-owned values are part of the immutable Skill-view
             # digest.  The worker consumes them as control-plane data rather
             # than asking model prose to attest its own workflow/artifacts.
             "artifact_contracts": skill_view_receipt.manifest.get(
                 "artifact_contracts", []
             ),
+            "workflow_contract": workflow_contract,
             "runtime_requirements": skill_view_receipt.manifest.get(
                 "runtime_requirements", []
             ),
             "runtime_capability_contract": runtime_capability_contract,
-            "schedule_tool_aliases": schedule_tool_aliases,
+            "schedule_capability_aliases": schedule_capability_aliases,
             "skill_diagnostics": skill_view_receipt.manifest.get(
                 "skill_diagnostics", []
             ),
@@ -1319,8 +1360,6 @@ class RunManager:
             decision.user_id, decision.conversation_id, run_id
         )
         request = _read_json(run_dir / "request.json")
-        if request.get("permission_preset") != "workspace_write":
-            raise HTTPException(409, "Run does not accept interactive approvals")
         if _terminal_status(run_dir / "events.jsonl") is not None:
             raise HTTPException(409, "Run is no longer active")
         native_request: dict[str, Any] | None = None
@@ -1346,6 +1385,35 @@ class RunManager:
         if native_request is None:
             raise HTTPException(409, "Approval request is stale or not durable")
         inner = native_request["request"]
+        tool_name = str(inner.get("tool_name") or "")
+        interaction_kind = native_user_interaction_kind(
+            tool_name, inner.get("input")
+        )
+        if is_native_user_interaction(tool_name) and interaction_kind is None:
+            raise HTTPException(409, "Native interaction request is invalid")
+        permission_preset = str(request.get("permission_preset") or "")
+        if (
+            permission_preset != "workspace_write"
+            and interaction_kind is None
+        ):
+            raise HTTPException(
+                409,
+                "This permission tier does not accept that interactive decision",
+            )
+        if decision.decision == "deny" and decision.answers is not None:
+            raise HTTPException(400, "Denied interactions cannot include answers")
+        try:
+            updated_input = (
+                build_native_updated_input(
+                    tool_name=tool_name,
+                    native_input=inner.get("input"),
+                    answers=decision.answers,
+                )
+                if decision.decision == "allow"
+                else None
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
         mailbox = run_dir / "approvals"
         mailbox.mkdir(mode=0o700, exist_ok=True)
         response_path = mailbox / (
@@ -1357,7 +1425,12 @@ class RunManager:
             "request_id": request_id,
             "request_seq": decision.request_seq,
             "decision": decision.decision,
-            "tool_name": str(inner.get("tool_name") or "tool")[:512],
+            "tool_name": (tool_name or "tool")[:512],
+            **(
+                {"updated_input": updated_input}
+                if updated_input is not None
+                else {}
+            ),
         }
         if response_path.exists():
             existing = _read_json(response_path)
@@ -1597,114 +1670,114 @@ def _build_prompt(
     messages: list[dict[str, Any]],
     *,
     resume: bool,
-    skill_entrypoint: str | None = None,
 ) -> str:
     if resume:
         for message in reversed(messages):
             if message.get("role") == "user":
-                rendered = _message_text(message.get("content"))
-                return _activate_skill_entrypoint(
-                    rendered,
-                    skill_entrypoint=skill_entrypoint,
-                )
+                return _message_text(message.get("content"))
         raise HTTPException(400, "A resumed Claude Turn requires a user message")
+    transcript = [
+        message for message in messages
+        if str(message.get("role") or "user").lower() != "system"
+    ]
+    if (
+        len(transcript) == 1
+        and str(transcript[0].get("role") or "user").lower() == "user"
+    ):
+        prompt = _message_text(transcript[0].get("content"))
+        if prompt.strip():
+            return prompt
+        raise HTTPException(400, "A Claude Turn requires a non-empty user message")
     rendered = []
-    for message in messages:
+    for message in transcript:
         role = str(message.get("role") or "user").upper()
         rendered.append(f"<{role}>\n{_message_text(message.get('content'))}\n</{role}>")
-    return _activate_skill_entrypoint(
-        "\n\n".join(rendered),
-        skill_entrypoint=skill_entrypoint,
-    )
+    prompt = "\n\n".join(rendered)
+    if not prompt.strip():
+        raise HTTPException(400, "A Claude Turn requires a non-empty user message")
+    return prompt
 
 
-def _manifest_skill_entrypoint(manifest: dict[str, Any]) -> str | None:
+def _validate_native_skill_manifest(manifest: dict[str, Any]) -> None:
+    """Verify native discovery inputs without injecting a synthetic command."""
+
     plugin_name = manifest.get("plugin_name")
     entrypoint_name = manifest.get("entrypoint_skill_name")
     selected = manifest.get("selected_primary_skill_names")
-    if entrypoint_name is None:
-        # Backward-compatible immutable views created before selected root
-        # identity was added had neither field and never forced a command.
-        if selected is None:
-            return None
-        if not isinstance(selected, list) or any(
-            not isinstance(name, str) or not name for name in selected
-        ):
-            raise RuntimeError("skill_entrypoint_manifest_invalid")
-        skills = manifest.get("skills")
-        if not isinstance(skills, list):
-            raise RuntimeError("skill_entrypoint_manifest_invalid")
-        available = {
-            str(row.get("name") or "")
-            for row in skills
-            if isinstance(row, dict)
-        }
-        if any(name not in available for name in selected):
-            raise RuntimeError("skill_entrypoint_manifest_invalid")
-        return None
     if (
         plugin_name != EXPECTED_SKILL_PLUGIN_NAME
-        or entrypoint_name != EXPECTED_SKILL_ENTRYPOINT_NAME
+        or entrypoint_name is not None
         or not isinstance(selected, list)
-        or not selected
         or any(
             not isinstance(name, str)
             or not name
-            or name == EXPECTED_SKILL_ENTRYPOINT_NAME
             for name in selected
         )
+        or selected != list(dict.fromkeys(selected))
     ):
-        raise RuntimeError("skill_entrypoint_manifest_invalid")
+        raise RuntimeError("native_skill_manifest_invalid")
     skills = manifest.get("skills")
     if not isinstance(skills, list):
-        raise RuntimeError("skill_entrypoint_manifest_invalid")
-    rows = {
-        str(row.get("name") or ""): row
+        raise RuntimeError("native_skill_manifest_invalid")
+    available = {
+        str(row.get("name") or "")
         for row in skills
         if isinstance(row, dict)
     }
-    entrypoint = rows.get(EXPECTED_SKILL_ENTRYPOINT_NAME)
-    if (
-        not isinstance(entrypoint, dict)
-        or entrypoint.get("scope") != "harness"
-        or entrypoint.get("bundle_role") != "entrypoint"
-        or any(name not in rows for name in selected)
-    ):
-        raise RuntimeError("skill_entrypoint_manifest_invalid")
-    return f"{EXPECTED_SKILL_PLUGIN_NAME}:{EXPECTED_SKILL_ENTRYPOINT_NAME}"
+    if any(name not in available for name in selected):
+        raise RuntimeError("native_skill_manifest_invalid")
 
 
-def _activate_skill_entrypoint(
-    prompt: str,
+def _fresh_session_skill_binding(
+    manifest: dict[str, Any],
     *,
-    skill_entrypoint: str | None,
-) -> str:
-    if skill_entrypoint is None:
-        return prompt
-    return f"/{skill_entrypoint}\n\n{prompt}"
+    resume: bool,
+) -> dict[str, str] | None:
+    """Bind one explicitly attached primary through Claude's native parser.
 
+    Session-scoped Skills are uploaded or linked to this Conversation.  A
+    single primary therefore has an unambiguous fresh-Session entrypoint.
+    User-level Skills remain ambient, multiple Session primaries remain a
+    model-owned routing choice, and resume relies on Claude's durable invoked
+    Skill state instead of replaying an old command on every Turn.
+    """
 
-def _attach_runtime_contract(prompt: str, requirements: object) -> str:
-    """Describe compiled capabilities without making installed Skills mandatory."""
-
-    if not isinstance(requirements, list) or len(requirements) > 128:
-        raise RuntimeError("skill_runtime_requirements_invalid")
-    persistent = False
-    for row in requirements:
+    if resume:
+        return None
+    selected = manifest.get("selected_primary_skill_names")
+    skills = manifest.get("skills")
+    if not isinstance(selected, list) or not isinstance(skills, list):
+        raise RuntimeError("native_skill_manifest_invalid")
+    selected_names = set(selected)
+    candidates = []
+    for row in skills:
         if not isinstance(row, dict):
-            raise RuntimeError("skill_runtime_requirements_invalid")
-        if row.get("persistent_stdin_process") is True:
-            persistent = True
-    if not persistent:
-        return prompt
-    return (
-        prompt
-        + "\n\n<CHATDS_RUNTIME_CONTRACT>\n"
-        + "If an invoked Skill requires a persistent stdin-driven process, "
-        + "use the chatds-process MCP process_open/process_write/process_read/"
-        + "process_close tools. Do not emulate interactive stdin with a "
-        + "detached background Bash command. Close the exact managed process "
-        + "when finished.\n</CHATDS_RUNTIME_CONTRACT>"
+            raise RuntimeError("native_skill_manifest_invalid")
+        name = str(row.get("name") or "")
+        if (
+            name in selected_names
+            and row.get("scope") == "session"
+            and row.get("bundle_role") != "supporting"
+        ):
+            candidates.append(name)
+    if len(candidates) != 1:
+        return None
+    return {
+        "skill_name": candidates[0],
+        "source": "fresh_session_primary",
+    }
+
+
+def _compile_turn_workflow_contract(
+    *,
+    manifest: dict[str, Any],
+    user_turn_text: str,
+    bound_skill_name: str | None,
+) -> dict[str, Any] | None:
+    return compile_native_workflow_contract(
+        manifest=manifest,
+        user_turn_text=user_turn_text,
+        bound_skill_name=bound_skill_name,
     )
 
 
@@ -1742,7 +1815,7 @@ def _recover_start_request(path: Path) -> StartRunRequest:
         ),
         "source": value.get("source") or "chat",
         "user_turn_text": "",
-        "permission_preset": value.get("permission_preset") or "session_full",
+        "permission_preset": value.get("permission_preset") or "workspace_write",
     })
 
 

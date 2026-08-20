@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 from pathlib import Path
-import httpx
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy import delete, desc, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,6 +16,7 @@ from models import (
     Conversation,
     EventHook,
     Message,
+    MCPServerRegistration,
     ScheduledJob,
     ScheduledJobRun,
     SkillPackage,
@@ -419,6 +419,12 @@ async def _delete_conv_locked(cid: str, cur_user, db, skill_api):
                 )
             )
             await db.execute(
+                delete(MCPServerRegistration).where(
+                    MCPServerRegistration.user_id == cur_user.id,
+                    MCPServerRegistration.session_id == cid,
+                )
+            )
+            await db.execute(
                 delete(EventHook).where(
                     EventHook.conversation_id == cid
                 )
@@ -486,13 +492,6 @@ async def _delete_conv_locked(cid: str, cur_user, db, skill_api):
             else workspace_cleanup_outcome
         ),
     }
-    # Invalidate harness skills cache
-    try:
-        from skills.manager import get_manager
-        get_manager().invalidate(cur_user.id)
-    except Exception:
-        pass
-
     return {
         "ok": True,
         "backend_execution_cleanup": backend_execution_cleanup,
@@ -501,35 +500,9 @@ async def _delete_conv_locked(cid: str, cur_user, db, skill_api):
     }
 
 
-async def _cleanup_harness_session(user_id: str, session_id: str) -> dict:
-    """Teardown Legacy MCP/process/session state."""
-    try:
-        # Revocation can spend up to 30s draining fence-owned resources and
-        # persistent process cleanup has a bounded 60s close phase. Keep the
-        # Backend deadline strictly above the Harness transaction's bound.
-        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0)) as client:
-            response = await client.post(
-                f"{settings.harness_url}/internal/session/cleanup",
-                headers={
-                    "X-Internal-Token": settings.internal_api_token,
-                },
-                params={"user_id": user_id, "session_id": session_id},
-            )
-        if response.status_code < 400:
-            return response.json()
-        return {"success": False, "error": f"harness HTTP {response.status_code}"}
-    except Exception as exc:
-        logger.warning(
-            "Harness session cleanup failed for user=%s session=%s: %s",
-            user_id, session_id, exc,
-        )
-        return {"success": False, "error": str(exc)}
-
-
 async def _cleanup_agent_runtimes(user_id: str, session_id: str) -> dict:
     """Revoke every configured runtime before deleting Session authority."""
 
-    legacy = await _cleanup_harness_session(user_id, session_id)
     from agent_engines.base import (
         ENGINE_ID_CLAUDE_CODE,
         ENGINE_ID_DEEPSEEK_HARNESS,
@@ -560,11 +533,6 @@ async def _cleanup_agent_runtimes(user_id: str, session_id: str) -> dict:
                     "execution_revocation": {"success": False},
                 }
         native[engine_id] = result
-    legacy_revocation = legacy.get("execution_revocation")
-    legacy_revoked = bool(
-        isinstance(legacy_revocation, dict)
-        and legacy_revocation.get("success") is True
-    )
     native_revoked = {
         engine_id: result.get("execution_revocation")
         for engine_id, result in native.items()
@@ -574,15 +542,13 @@ async def _cleanup_agent_runtimes(user_id: str, session_id: str) -> dict:
         for value in native_revoked.values()
     )
     return {
-        "success": legacy.get("success") is True and all(
+        "success": all(
             result.get("success") is True for result in native.values()
         ),
         "execution_revocation": {
-            "success": legacy_revoked and native_revocation_success,
-            "legacy": legacy_revocation,
+            "success": native_revocation_success,
             **native_revoked,
         },
-        "legacy": legacy,
         **native,
     }
 

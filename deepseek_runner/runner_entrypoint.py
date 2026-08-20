@@ -8,7 +8,9 @@ import json
 import os
 import re
 import signal
+import socket
 import stat
+import struct
 import subprocess
 import sys
 import threading
@@ -17,6 +19,21 @@ import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+from deepseek_runner.native_workflow import (
+    build_deepseek_workflow_receipt,
+    validate_deepseek_workflow_projection,
+)
+from deepseek_runner.native_artifacts import (
+    MAX_ARTIFACT_PROJECTION_BYTES,
+    active_artifact_skill_names,
+    compile_deepseek_artifact_projection,
+    validate_deepseek_artifact_projection,
+)
+from native_security.artifact_contract import (
+    validate_artifact_contracts,
+    workspace_snapshot,
+)
 
 from chatds_browser_runtime.proxy_bridge import (
     EXPECTED_BRIDGE_GID,
@@ -31,9 +48,13 @@ from chatds_browser_runtime.proxy_bridge import (
 MAX_FILES = 200_000
 MAX_CHANGED_FILES = 8_192
 MAX_NATIVE_EVENT_LINE_BYTES = 16 * 1024 * 1024
+MAX_NATIVE_TURN_INPUT_BYTES = 64 * 1024 * 1024
+MAX_WORKFLOW_PROJECTION_BYTES = 40 * 1024 * 1024
+MAX_CONTROL_DECISION_LINE_BYTES = 64 * 1024
 MAX_MCP_SERVERS = 128
 WORKSPACE_LOCK_IDENTITY_DOMAIN = b"chatds-workspace-mutation-lock-v1\0"
 SAFE_SESSION_ID = re.compile(r"^[0-9a-f]{32}$")
+SAFE_NATIVE_SESSION_ID = re.compile(r"^chatds-[0-9a-f]{32}$")
 SAFE_MCP_SERVER_ID = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 _child: subprocess.Popen[bytes] | None = None
 _stop_reason: str | None = None
@@ -110,6 +131,7 @@ class ControlDecisionForwarder:
             daemon=True,
             name="control-decision-forwarder",
         )
+        self._error: str | None = None
 
     def start(self) -> None:
         self._thread.start()
@@ -117,6 +139,10 @@ class ControlDecisionForwarder:
     def stop(self) -> None:
         self._stop.set()
         self._thread.join(timeout=5)
+        if self._thread.is_alive():
+            raise RuntimeError("control_decision_forwarder_did_not_stop")
+        if self._error is not None:
+            raise RuntimeError(self._error)
 
     def _run(self) -> None:
         position = 0
@@ -140,16 +166,65 @@ class ControlDecisionForwarder:
                         line = bytes(pending[:boundary])
                         del pending[:boundary + 1]
                         if len(line) > 0:
+                            if len(line) > MAX_CONTROL_DECISION_LINE_BYTES:
+                                raise RuntimeError("control_decision_line_too_large")
+                            try:
+                                row = json.loads(line)
+                            except (UnicodeError, ValueError, TypeError) as exc:
+                                raise RuntimeError("control_decision_json_invalid") from exc
+                            if (
+                                not isinstance(row, dict)
+                                or re.fullmatch(
+                                    r"[A-Za-z0-9_.:-]{1,128}",
+                                    str(row.get("request_id") or ""),
+                                ) is None
+                                or type(row.get("request_seq")) is not int
+                                or row["request_seq"] < 1
+                                or row.get("decision") not in {"allow", "deny"}
+                                or bool(set(row) - {
+                                    "request_id", "request_seq", "decision",
+                                    "selected", "custom",
+                                })
+                                or row.get("selected") is not None
+                                and (
+                                    not isinstance(row.get("selected"), list)
+                                    or len(row["selected"]) > 4
+                                    or any(
+                                        not isinstance(value, str)
+                                        or len(value) > 4_000
+                                        for value in row["selected"]
+                                    )
+                                )
+                                or row.get("custom") is not None
+                                and (
+                                    not isinstance(row.get("custom"), str)
+                                    or len(row["custom"]) > 4_000
+                                )
+                            ):
+                                raise RuntimeError("control_decision_schema_invalid")
+                            encoded = json.dumps(
+                                row,
+                                ensure_ascii=False,
+                                allow_nan=False,
+                                separators=(",", ":"),
+                            ).encode() + b"\n"
                             with self.worker_path.open("ab") as out:
-                                out.write(line + b"\n")
+                                out.write(encoded)
                                 out.flush()
                                 os.fsync(out.fileno())
                     continue
+                if len(pending) > MAX_CONTROL_DECISION_LINE_BYTES:
+                    raise RuntimeError("control_decision_line_too_large")
                 if self._stop.is_set():
+                    if pending:
+                        raise RuntimeError("control_decision_line_incomplete")
                     break
                 time.sleep(0.05)
-        except Exception:
-            pass
+        except BaseException as exc:
+            self._error = (
+                str(exc) if isinstance(exc, RuntimeError) and str(exc)
+                else "control_decision_forwarder_failed"
+            )[:128]
 
 class Ledger:
     def __init__(self, path: Path) -> None:
@@ -190,49 +265,106 @@ class Ledger:
                 os.close(fd)
 
 
-class NativeEventForwarder:
-    """Move untrusted worker events into the controller-owned ledger.
+class NativeEventReceiver:
+    """Receive events only from the exact native Harness process.
 
-    The model process can append only to a tmpfs spool owned by its UID.  It
-    never receives write or traversal authority over the supervisor ledger.
-    This controller thread forwards complete, bounded JSONL records in order.
+    The endpoint lives below the root-owned controller directory. Linux peer
+    credentials bind every accepted stream to the PID launched by this PID 1,
+    so a same-UID model tool subprocess cannot forge workflow or terminal
+    evidence merely by discovering the endpoint path.
     """
 
-    def __init__(self, spool: Path, ledger: Ledger) -> None:
-        self.spool = spool
+    def __init__(self, endpoint: Path, ledger: Ledger, *, worker_gid: int) -> None:
+        self.endpoint = endpoint
         self.ledger = ledger
+        self.worker_gid = worker_gid
         self._stop = threading.Event()
+        self._authorized = threading.Event()
+        self._authorized_pid: int | None = None
+        self._listener: socket.socket | None = None
         self._thread = threading.Thread(
             target=self._run,
             daemon=True,
-            name="deepseek-native-event-forwarder",
+            name="deepseek-native-event-receiver",
         )
         self._error: str | None = None
 
     def start(self) -> None:
+        if self.endpoint.exists() or self.endpoint.is_symlink():
+            raise RuntimeError("native_event_socket_exists")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(str(self.endpoint))
+            os.chown(self.endpoint, os.geteuid(), self.worker_gid)
+            os.chmod(self.endpoint, 0o620)
+            listener.listen(1)
+            listener.settimeout(0.1)
+        except BaseException:
+            listener.close()
+            raise
+        self._listener = listener
         self._thread.start()
+
+    def authorize_pid(self, pid: int) -> None:
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise RuntimeError("native_event_peer_invalid")
+        if self._authorized_pid is not None:
+            raise RuntimeError("native_event_peer_already_authorized")
+        self._authorized_pid = pid
+        self._authorized.set()
 
     def stop(self) -> None:
         self._stop.set()
         self._thread.join(timeout=10)
+        listener = self._listener
+        if listener is not None:
+            listener.close()
+            self._listener = None
+        try:
+            self.endpoint.unlink(missing_ok=True)
+        except OSError:
+            pass
         if self._thread.is_alive():
-            raise RuntimeError("native_event_forwarder_did_not_stop")
+            raise RuntimeError("native_event_receiver_did_not_stop")
         if self._error is not None:
             raise RuntimeError(self._error)
 
     def _run(self) -> None:
-        position = 0
         pending = bytearray()
         try:
+            listener = self._listener
+            if listener is None:
+                raise RuntimeError("native_event_socket_unavailable")
             while True:
                 try:
-                    with self.spool.open("rb") as stream:
-                        stream.seek(position)
-                        block = stream.read(1024 * 1024)
-                except FileNotFoundError:
-                    block = b""
-                if block:
-                    position += len(block)
+                    connection, _ = listener.accept()
+                    break
+                except TimeoutError:
+                    if self._stop.is_set():
+                        return
+            if not self._authorized.wait(timeout=10):
+                raise RuntimeError("native_event_peer_unbound")
+            credentials = connection.getsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_PEERCRED,
+                struct.calcsize("3i"),
+            )
+            peer_pid, _peer_uid, _peer_gid = struct.unpack("3i", credentials)
+            if peer_pid != self._authorized_pid:
+                raise RuntimeError("native_event_peer_invalid")
+            connection.settimeout(0.1)
+            with connection:
+                while True:
+                    try:
+                        block = connection.recv(1024 * 1024)
+                    except TimeoutError:
+                        if self._stop.is_set():
+                            continue
+                        continue
+                    if not block:
+                        if pending:
+                            raise RuntimeError("native_event_line_incomplete")
+                        return
                     pending.extend(block)
                     while True:
                         boundary = pending.find(b"\n")
@@ -243,16 +375,10 @@ class NativeEventForwarder:
                         self._forward(line)
                     if len(pending) > MAX_NATIVE_EVENT_LINE_BYTES:
                         raise RuntimeError("native_event_line_too_large")
-                    continue
-                if self._stop.is_set():
-                    if pending:
-                        raise RuntimeError("native_event_line_incomplete")
-                    return
-                time.sleep(0.02)
         except BaseException as exc:
             self._error = (
                 str(exc) if isinstance(exc, RuntimeError) and str(exc)
-                else "native_event_forwarder_failed"
+                else "native_event_receiver_failed"
             )[:128]
 
     def _forward(self, line: bytes) -> None:
@@ -264,7 +390,7 @@ class NativeEventForwarder:
             envelope = json.loads(line)
         except (UnicodeError, ValueError, TypeError) as exc:
             raise RuntimeError("native_event_json_invalid") from exc
-        event = envelope.get("event") if isinstance(envelope, dict) else None
+        event = envelope if isinstance(envelope, dict) else None
         if not isinstance(event, dict) or event.get("type") != "deepseek.session.event":
             raise RuntimeError("native_event_schema_invalid")
         self.ledger.append(event, channel="deepseek-harness")
@@ -374,33 +500,198 @@ def _load_config() -> dict[str, Any]:
     return value
 
 
-def _snapshot(root: Path) -> dict[str, tuple[int, int]]:
-    result: dict[str, tuple[int, int]] = {}
-    count = 0
-    for walk_root, dirs, files in os.walk(root, followlinks=False):
-        dirs[:] = sorted(dirs)
-        for name in sorted(files):
-            count += 1
-            if count > MAX_FILES:
-                raise RuntimeError("workspace_entry_limit_exceeded")
-            path = Path(walk_root) / name
-            info = os.lstat(path)
-            if stat.S_ISLNK(info.st_mode):
-                continue
-            if not stat.S_ISREG(info.st_mode):
-                raise RuntimeError("workspace_contains_special_file")
-            result[path.relative_to(root).as_posix()] = (
-                int(info.st_size),
-                int(info.st_mtime_ns),
-            )
-    return result
+def _native_turn_payload(config: dict[str, Any]) -> bytes:
+    """Compile the exact model-readable native Turn input."""
+
+    native_session_id = config.get("native_session_id")
+    permission_preset = _native_permission_preset(config)
+    initial_prompt = config.get("initial_prompt")
+    turn_prompt = config.get("turn_prompt")
+    if (
+        not isinstance(native_session_id, str)
+        or SAFE_NATIVE_SESSION_ID.fullmatch(native_session_id) is None
+        or not isinstance(initial_prompt, str)
+        or not initial_prompt.strip()
+        or not isinstance(turn_prompt, str)
+        or not turn_prompt.strip()
+    ):
+        raise RuntimeError("native_turn_input_invalid")
+    payload = json.dumps(
+        {
+            "schema": "chatds.deepseek-native-turn.v1",
+            "native_session_id": native_session_id,
+            "permission_preset": permission_preset,
+            "initial_prompt": initial_prompt,
+            "turn_prompt": turn_prompt,
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if not payload or len(payload) > MAX_NATIVE_TURN_INPUT_BYTES:
+        raise RuntimeError("native_turn_input_size_invalid")
+    return payload
+
+
+def _native_permission_preset(config: dict[str, Any]) -> str:
+    """Compile one browser permission tier to its exact upstream baseline.
+
+    The middle Web tier means that writes require an explicit one-shot grant.
+    DSH expresses that natively as a read-only standing sandbox whose fs/shell
+    tools may request ``workspace-write`` escalation.  Mount authority still
+    distinguishes hard read-only (workspace mounted ro) from approvable write
+    (workspace mounted rw); full access keeps DSH's native bypass preset.
+    """
+
+    permission = config.get("permission_preset")
+    native = {
+        "read_only": "read-only",
+        "workspace_write": "read-only",
+        "session_full": "danger-full-access",
+    }.get(permission)
+    if native is None:
+        raise RuntimeError("deepseek_permission_preset_invalid")
+    return native
+
+
+def _write_native_turn_input(
+    config: dict[str, Any],
+    path: Path,
+    *,
+    worker_gid: int,
+) -> None:
+    """Materialize one bounded prompt outside argv/env and keep it immutable."""
+
+    if path.as_posix() != "/runtime/controller/native-turn.json":
+        raise RuntimeError("native_turn_input_path_invalid")
+    payload = _native_turn_payload(config)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o440)
+    try:
+        view = memoryview(payload)
+        offset = 0
+        while offset < len(view):
+            offset += os.write(descriptor, view[offset:])
+        os.fsync(descriptor)
+        os.fchown(descriptor, 0, worker_gid)
+        os.fchmod(descriptor, 0o440)
+    finally:
+        os.close(descriptor)
+
+
+def _workflow_projection_payload(config: dict[str, Any]) -> bytes | None:
+    value = config.get("workflow_projection")
+    if value is None:
+        return None
+    try:
+        projection = validate_deepseek_workflow_projection(value)
+    except ValueError as exc:
+        raise RuntimeError("deepseek_workflow_projection_invalid") from exc
+    payload = json.dumps(
+        projection,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if not payload or len(payload) > MAX_WORKFLOW_PROJECTION_BYTES:
+        raise RuntimeError("deepseek_workflow_projection_size_invalid")
+    return payload
+
+
+def _write_workflow_projection(
+    config: dict[str, Any],
+    path: Path,
+    *,
+    worker_gid: int,
+) -> bool:
+    if path.as_posix() != "/runtime/controller/native-workflow.json":
+        raise RuntimeError("deepseek_workflow_projection_path_invalid")
+    payload = _workflow_projection_payload(config)
+    if payload is None:
+        return False
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o440)
+    try:
+        view = memoryview(payload)
+        offset = 0
+        while offset < len(view):
+            offset += os.write(descriptor, view[offset:])
+        os.fsync(descriptor)
+        os.fchown(descriptor, 0, worker_gid)
+        os.fchmod(descriptor, 0o440)
+    finally:
+        os.close(descriptor)
+    return True
+
+
+def _artifact_projection_payload(
+    config: dict[str, Any],
+    before: dict[str, tuple[int, ...]],
+) -> bytes | None:
+    try:
+        projection = compile_deepseek_artifact_projection(
+            contracts=config.get("artifact_contracts", []),
+            bound_skill_name=config.get("bound_skill_name"),
+            workflow_projection=config.get("workflow_projection"),
+            native_session_id=str(config.get("native_session_id") or ""),
+            workspace_before=before,
+        )
+    except ValueError as exc:
+        raise RuntimeError("deepseek_artifact_projection_invalid") from exc
+    if projection is None:
+        return None
+    try:
+        normalized = validate_deepseek_artifact_projection(projection)
+        payload = json.dumps(
+            normalized,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise RuntimeError("deepseek_artifact_projection_invalid") from exc
+    if not payload or len(payload) > MAX_ARTIFACT_PROJECTION_BYTES:
+        raise RuntimeError("deepseek_artifact_projection_size_invalid")
+    return payload
+
+
+def _write_artifact_projection(
+    config: dict[str, Any],
+    before: dict[str, tuple[int, ...]],
+    path: Path,
+    *,
+    worker_gid: int,
+) -> bool:
+    if path.as_posix() != "/runtime/controller/native-artifacts.json":
+        raise RuntimeError("deepseek_artifact_projection_path_invalid")
+    payload = _artifact_projection_payload(config, before)
+    if payload is None:
+        return False
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o440)
+    try:
+        view = memoryview(payload)
+        offset = 0
+        while offset < len(view):
+            offset += os.write(descriptor, view[offset:])
+        os.fsync(descriptor)
+        os.fchown(descriptor, 0, worker_gid)
+        os.fchmod(descriptor, 0o440)
+    finally:
+        os.close(descriptor)
+    return True
 
 
 def _emit_artifacts(
     ledger: Ledger,
     root: Path,
-    before: dict[str, tuple[int, int]],
-    after: dict[str, tuple[int, int]],
+    before: dict[str, tuple[int, ...]],
+    after: dict[str, tuple[int, ...]],
 ) -> None:
     changed = [path for path, value in after.items() if before.get(path) != value]
     if len(changed) > MAX_CHANGED_FILES:
@@ -422,6 +713,28 @@ def _emit_artifacts(
         })
 
 
+def _terminal_outcome(
+    *,
+    exit_code: int,
+    stop_reason: str | None,
+    workflow_passed: bool,
+    artifact_passed: bool,
+) -> tuple[str, str | None]:
+    """Choose exactly one authoritative terminal from monotonic receipts."""
+
+    if stop_reason == "cancelled":
+        return "cancelled", "cancelled"
+    if stop_reason is not None:
+        return "failed", stop_reason
+    if not workflow_passed:
+        return "failed", "workflow_contract_failed"
+    if not artifact_passed:
+        return "failed", "artifact_contract_failed"
+    if exit_code != 0:
+        return "failed", "runner_exit_nonzero"
+    return "succeeded", None
+
+
 def _signal_handler(signum: int, _frame: object) -> None:
     global _stop_reason
     _stop_reason = "cancelled" if signum in {signal.SIGINT, signal.SIGTERM} else "hard_timeout"
@@ -441,33 +754,13 @@ def _environment(
     trust: dict[str, str],
     worker_tmp: Path,
 ) -> dict[str, str]:
-    permission = str(config.get("permission_preset") or "workspace_write")
-    sandbox_mode = {
-        "read_only": "read-only",
-        "workspace_write": "workspace-write",
-        "session_full": "danger-full-access",
-    }.get(permission)
-    if sandbox_mode is None:
+    sandbox_mode = _native_permission_preset(config)
+    web_permission_preset = str(config.get("permission_preset") or "")
+    if web_permission_preset not in {
+        "read_only", "workspace_write", "session_full",
+    }:
         raise RuntimeError("deepseek_permission_preset_invalid")
-    tools = {
-        str(value) for value in config.get("tools", [])
-        if isinstance(value, str)
-    }
-    shell_tools = {
-        "bash", "job_output", "job_list", "job_kill",
-        "execute_code", "run_skill_python", "run_skill_script",
-        "run_declared_command", "skill_http_get", "skill_http_post_json",
-        "web_extract",
-    }
-    file_tools = {
-        "read", "write", "edit", "glob", "grep",
-        "read_file", "write_file", "patch_file", "merge_files", "search_files",
-    }
-    skill_tools = {"skill", "skills_list", "skill_view", "skill_copy_resource"}
-    goal_tools = {"get_goal", "create_goal", "update_goal"}
-    subagent_tools = {"subagent", "send_message", "interrupt_agent", "list_agents", "delegate_task"}
-    todo_tools = {"todo_write", "todo"}
-    return {
+    environment = {
         "PATH": "/usr/local/bin:/usr/bin:/bin",
         "HOME": "/state/home",
         "DSH_HOME": "/state/dsh",
@@ -481,18 +774,14 @@ def _environment(
         "CHATDS_DSH_MODEL": str(config["api_model"]),
         "CHATDS_DSH_CONTEXT_WINDOW": str(config["context_window_tokens"]),
         "CHATDS_DSH_MAX_OUTPUT_TOKENS": str(config["max_output_tokens"]),
-        "CHATDS_DSH_WEB_SEARCH_ENABLED": "1" if config.get("web_search_enabled") else "0",
-        "CHATDS_DSH_SHELL_ENABLED": "1" if tools & shell_tools else "0",
-        "CHATDS_DSH_FILES_ENABLED": "1" if tools & file_tools else "0",
-        "CHATDS_DSH_SKILLS_ENABLED": "1" if tools & skill_tools else "0",
-        "CHATDS_DSH_SUBAGENTS_ENABLED": "1" if tools & subagent_tools else "0",
-        "CHATDS_DSH_TODO_ENABLED": "1" if tools & todo_tools else "0",
-        "CHATDS_DSH_GOALS_ENABLED": "1" if tools & goal_tools else "0",
         "CHATDS_SEARXNG_SEARCH_URL": str(config["searxng_search_url"]),
         "CHATDS_DSH_EVENT_PLUGIN": "/opt/chatds-deepseek-plugins/event_bridge.mjs",
         "CHATDS_DSH_SEARXNG_PLUGIN": "/opt/chatds-deepseek-plugins/searxng_provider.mjs",
-        "CHATDS_EVENT_LEDGER": "/runtime/worker/native-events.jsonl",
+        "CHATDS_EVENT_SOCKET": "/runtime/controller/native-events.sock",
+        "CHATDS_DSH_TURN_INPUT": "/runtime/controller/native-turn.json",
+        "DSH_TOOLS_MODE": "native",
         "DSH_PERMISSION_MODE": sandbox_mode,
+        "CHATDS_WEB_PERMISSION_PRESET": web_permission_preset,
         "DSH_TELEMETRY_DISABLED": "1",
         "HTTP_PROXY": proxy_url,
         "HTTPS_PROXY": proxy_url,
@@ -505,9 +794,36 @@ def _environment(
         "NODE_USE_ENV_PROXY": "1",
         **trust,
     }
+    if config.get("workflow_projection") is not None:
+        environment["CHATDS_DSH_WORKFLOW_PROJECTION"] = (
+            "/runtime/controller/native-workflow.json"
+        )
+    if config.get("artifact_contracts"):
+        environment["CHATDS_DSH_ARTIFACT_PROJECTION"] = (
+            "/runtime/controller/native-artifacts.json"
+        )
+    return environment
 
 
-def _native_command(config: dict[str, Any], mcp_patch: Path) -> list[str]:
+def _ledger_envelopes(path: Path):
+    observed = 0
+    with path.open("rb") as stream:
+        for line in stream:
+            observed += len(line)
+            if observed > 512 * 1024 * 1024:
+                raise RuntimeError("deepseek_event_ledger_size_limit")
+            if len(line) > MAX_NATIVE_EVENT_LINE_BYTES:
+                raise RuntimeError("native_event_line_too_large")
+            try:
+                value = json.loads(line)
+            except (UnicodeError, ValueError, TypeError) as exc:
+                raise RuntimeError("deepseek_event_ledger_invalid") from exc
+            if not isinstance(value, dict):
+                raise RuntimeError("deepseek_event_ledger_invalid")
+            yield value
+
+
+def _native_command(mcp_patch: Path) -> list[str]:
     """Build the immutable upstream CLI invocation for one isolated Turn."""
 
     return [
@@ -518,7 +834,7 @@ def _native_command(config: dict[str, Any], mcp_patch: Path) -> list[str]:
         "--profile", "headless",
         "--patch", "/opt/chatds-deepseek-plugins/chatds.patch.yml",
         "--patch", str(mcp_patch),
-        str(config["prompt"]),
+        "chatds-native-turn",
     ]
 
 
@@ -527,7 +843,8 @@ def main() -> int:
     stage = "load_config"
     bridge: LoopbackProxyBridge | None = None
     bridge_thread: threading.Thread | None = None
-    forwarder: NativeEventForwarder | None = None
+    event_receiver: NativeEventReceiver | None = None
+    control_forwarder: ControlDecisionForwarder | None = None
     try:
         if os.geteuid() != 0:
             raise RuntimeError("runner_controller_not_root")
@@ -537,17 +854,32 @@ def main() -> int:
         for path in (Path("/state/home"), Path("/state/dsh"), Path("/runtime/worker")):
             path.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chown(path, worker_uid, worker_gid)
+        controller_runtime = Path("/runtime/controller")
+        controller_runtime.mkdir(parents=True, exist_ok=True, mode=0o750)
+        os.chown(controller_runtime, 0, worker_gid)
+        os.chmod(controller_runtime, 0o750)
         worker_tmp = Path("/runtime/worker/tmp")
         worker_tmp.mkdir(exist_ok=True, mode=0o700)
         os.chown(worker_tmp, worker_uid, worker_gid)
-        native_spool = Path("/runtime/worker/native-events.jsonl")
-        native_spool.touch(mode=0o600, exist_ok=False)
-        os.chown(native_spool, worker_uid, worker_gid)
-        mcp_patch = Path("/runtime/worker/mcp.patch.json")
+        native_turn_input = Path("/runtime/controller/native-turn.json")
+        _write_native_turn_input(
+            config,
+            native_turn_input,
+            worker_gid=worker_gid,
+        )
+        native_workflow_projection = Path(
+            "/runtime/controller/native-workflow.json"
+        )
+        _write_workflow_projection(
+            config,
+            native_workflow_projection,
+            worker_gid=worker_gid,
+        )
+        mcp_patch = Path("/runtime/controller/mcp.patch.json")
         control_decisions = Path("/runtime/worker/control-decisions.jsonl")
         mcp_mapping = _compile_mcp_patch(Path("/skill-view"), mcp_patch)
-        os.chown(mcp_patch, worker_uid, worker_gid)
-        os.chmod(mcp_patch, 0o400)
+        os.chown(mcp_patch, 0, worker_gid)
+        os.chmod(mcp_patch, 0o440)
         control_decisions.touch(mode=0o600, exist_ok=False)
         os.chown(control_decisions, worker_uid, worker_gid)
         os.chmod(control_decisions, 0o600)
@@ -555,12 +887,21 @@ def main() -> int:
             "type": "chatds.deepseek.runtime.config",
             "context_window_tokens": config["context_window_tokens"],
             "max_output_tokens": config["max_output_tokens"],
+            "native_session_id": config["native_session_id"],
+            "permission_preset": config["permission_preset"],
+            "native_permission_preset": _native_permission_preset(config),
             "web_search_enabled": bool(config.get("web_search_enabled")),
             "mcp_server_mapping": mcp_mapping,
         })
         stage = "workspace_lock"
         with _session_workspace_lock(config):
-            before = _snapshot(Path("/workspace"))
+            before = workspace_snapshot(Path("/workspace"))
+            _write_artifact_projection(
+                config,
+                before,
+                Path("/runtime/controller/native-artifacts.json"),
+                worker_gid=worker_gid,
+            )
             stage = "egress_bridge_start"
             authority = ProxySocketAuthority(
                 PROXY_SOCKET_PATH,
@@ -602,15 +943,19 @@ def main() -> int:
                 config, proxy_url=proxy_url, trust=trust, worker_tmp=worker_tmp
             )
             environment["CHATDS_CONTROL_DECISIONS"] = "/runtime/worker/control-decisions.jsonl"
-            command = _native_command(config, mcp_patch)
+            command = _native_command(mcp_patch)
             stage = "native_execution"
             for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGUSR1):
                 signal.signal(signum, _signal_handler)
             global _child
             stdout_path = Path("/runtime/worker/stdout.log")
             stderr_path = Path("/runtime/worker/stderr.log")
-            forwarder = NativeEventForwarder(native_spool, ledger)
-            forwarder.start()
+            event_receiver = NativeEventReceiver(
+                Path("/runtime/controller/native-events.sock"),
+                ledger,
+                worker_gid=worker_gid,
+            )
+            event_receiver.start()
 
             # Forward supervisor control decisions into worker-readable tmpfs
             # Supervisor writes decisions to /run/chatds-control/control-decisions.jsonl
@@ -631,6 +976,7 @@ def main() -> int:
                     umask=0o077,
                     start_new_session=True,
                 )
+                event_receiver.authorize_pid(_child.pid)
                 exit_code = _child.wait()
                 stdout_file.flush()
                 stderr_file.flush()
@@ -639,8 +985,9 @@ def main() -> int:
                 stdout = stdout_file.read()
                 stderr = stderr_file.read()
             control_forwarder.stop()
-            forwarder.stop()
-            forwarder = None
+            control_forwarder = None
+            event_receiver.stop()
+            event_receiver = None
             if stdout:
                 ledger.append({
                     "type": "chatds.deepseek.stdout",
@@ -651,29 +998,78 @@ def main() -> int:
                     "type": "chatds.deepseek.stderr",
                     "text": stderr.decode("utf-8", errors="replace")[-64_000:],
                 }, channel="native-stderr")
+            workflow_passed = True
+            if config.get("workflow_projection") is not None:
+                stage = "workflow_contract_audit"
+                workflow_receipt = build_deepseek_workflow_receipt(
+                    config["workflow_projection"],
+                    _ledger_envelopes(ledger.path),
+                )
+                workflow_passed = workflow_receipt.get("status") == "passed"
+                ledger.append({
+                    "type": "chatds.deepseek.workflow_receipt",
+                    **workflow_receipt,
+                })
             stage = "egress_bridge_seal"
             bridge.shutdown_and_seal()
             bridge_thread.join(timeout=5)
             if bridge_thread.is_alive():
                 raise RuntimeError("egress_bridge_did_not_stop")
             bridge = None
-            after = _snapshot(Path("/workspace"))
+            after = workspace_snapshot(Path("/workspace"))
+            artifact_passed = True
+            if workflow_passed:
+                stage = "artifact_contract_audit"
+                active_skill_names = active_artifact_skill_names(
+                    contracts=config.get("artifact_contracts", []),
+                    workflow_projection=config.get("workflow_projection"),
+                    bound_skill_name=config.get("bound_skill_name"),
+                    envelopes=_ledger_envelopes(ledger.path),
+                    native_session_id=str(config["native_session_id"]),
+                )
+                artifact_receipt = validate_artifact_contracts(
+                    contracts=config.get("artifact_contracts", []),
+                    active_skill_name=None,
+                    active_skill_names=active_skill_names,
+                    before=before,
+                    after=after,
+                    workspace_root=Path("/workspace"),
+                )
+                artifact_passed = artifact_receipt.get("status") != "failed"
+            else:
+                artifact_receipt = {
+                    "schema": "chatds.native-artifact-receipt.v1",
+                    "status": "deferred",
+                    "reason": "workflow_contract_failed",
+                }
+            ledger.append({
+                "type": "chatds.deepseek.artifact_receipt",
+                **artifact_receipt,
+            })
             _emit_artifacts(ledger, Path("/workspace"), before, after)
-        status = "cancelled" if _stop_reason == "cancelled" else (
-            "succeeded" if exit_code == 0 else "failed"
+        status, terminal_error = _terminal_outcome(
+            exit_code=exit_code,
+            stop_reason=_stop_reason,
+            workflow_passed=workflow_passed,
+            artifact_passed=artifact_passed,
         )
         ledger.append({
             "type": "chatds.supervisor.terminal",
             "status": status,
             "exit_code": exit_code,
-            "error": None if status == "succeeded" else (_stop_reason or "runner_exit_nonzero"),
+            "error": terminal_error,
             "error_stage": None if status == "succeeded" else stage,
         })
         return 0 if status == "succeeded" else 1
     except BaseException as exc:
-        if forwarder is not None:
+        if control_forwarder is not None:
             try:
-                forwarder.stop()
+                control_forwarder.stop()
+            except Exception:
+                pass
+        if event_receiver is not None:
+            try:
+                event_receiver.stop()
             except Exception:
                 pass
         if bridge is not None:

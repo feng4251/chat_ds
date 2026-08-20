@@ -12,11 +12,11 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 from urllib.parse import urlsplit
 
-from skills.http_grants import (
+from native_security.http_grants import (
     compile_loaded_skill_sandbox_egress_rules,
     compile_user_sandbox_egress_urls,
 )
-from tools.session_sandbox_policy import (
+from native_security.session_sandbox_policy import (
     normalize_http_origin,
     normalize_http_url_prefix,
     normalize_session_sandbox_egress_rules,
@@ -27,7 +27,7 @@ class ClaudeEgressPolicyError(RuntimeError):
     pass
 
 
-_HARNESS_EGRESS_CAPABILITIES = {
+_PLATFORM_EGRESS_CAPABILITIES = {
     "web_search": ("GET",),
     "market_quote": ("GET",),
 }
@@ -77,7 +77,7 @@ def compile_turn_egress_policy(
     manifest = receipt.manifest
     verified_resources = receipt.policy_resources
     prefix_rows: list[dict[str, Any]] = []
-    harness_capability_origins: set[str] = set()
+    platform_capability_origins: set[str] = set()
     plugin_skills = Path(skill_view_root) / "plugin" / "skills"
     for skill in manifest.get("skills", []):
         if not isinstance(skill, dict):
@@ -113,12 +113,12 @@ def compile_turn_egress_policy(
         ):
             prefix_rows.append({"url_prefix": prefix, "methods": list(methods)})
 
-    harness_rules = manifest.get("harness_egress_rules", [])
-    if not isinstance(harness_rules, list):
-        raise ClaudeEgressPolicyError("Harness capability rules are malformed")
-    for row in harness_rules:
+    platform_rules = manifest.get("platform_egress_rules", [])
+    if not isinstance(platform_rules, list):
+        raise ClaudeEgressPolicyError("Platform I/O capability rules are malformed")
+    for row in platform_rules:
         capability = row.get("capability") if isinstance(row, dict) else None
-        expected_methods = _HARNESS_EGRESS_CAPABILITIES.get(capability)
+        expected_methods = _PLATFORM_EGRESS_CAPABILITIES.get(capability)
         if (
             not isinstance(row, dict)
             or set(row) != {"capability", "url_prefix", "methods"}
@@ -126,14 +126,14 @@ def compile_turn_egress_policy(
             or row.get("methods") != list(expected_methods)
         ):
             raise ClaudeEgressPolicyError(
-                "Harness capability rule is malformed"
+                "Platform I/O capability rule is malformed"
             )
         prefix = normalize_http_url_prefix(str(row.get("url_prefix") or ""))
         prefix_rows.append({
             "url_prefix": prefix,
             "methods": list(expected_methods),
         })
-        harness_capability_origins.add(normalize_http_origin(prefix))
+        platform_capability_origins.add(normalize_http_origin(prefix))
 
     # The Runner loads this generated MCP file explicitly and rejects ambient
     # MCP configuration. Remote transports are themselves an explicit Skill authority, but receive only
@@ -234,7 +234,7 @@ def compile_turn_egress_policy(
         and (
             origin in user_origins
             or origin == provider_origin
-            or origin in harness_capability_origins
+            or origin in platform_capability_origins
         )
     )
     return {

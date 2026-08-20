@@ -15,10 +15,10 @@ ENGINE_ID_LEGACY = "legacy"
 ENGINE_ID_CLAUDE_CODE = "claude_code"
 ENGINE_ID_DEEPSEEK_HARNESS = "deepseek_harness"
 SUPPORTED_ENGINE_IDS = frozenset({
-    ENGINE_ID_LEGACY,
     ENGINE_ID_CLAUDE_CODE,
     ENGINE_ID_DEEPSEEK_HARNESS,
 })
+RETIRED_ENGINE_IDS = frozenset({ENGINE_ID_LEGACY})
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,8 +48,6 @@ class AgentEngineRequest:
     # these receipts by value; raw attachment bytes never cross the engine
     # control plane.
     input_attachments: tuple[Mapping[str, Any], ...] = ()
-    fallback_configs: tuple[Mapping[str, Any], ...] = ()
-    tools: tuple[str, ...] = ()
     enabled_user_skills: tuple[str, ...] = ()
     session_skill_registry: tuple[Mapping[str, Any], ...] = ()
     skill_view_path: str | None = None

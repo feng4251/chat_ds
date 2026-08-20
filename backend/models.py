@@ -57,7 +57,7 @@ class Conversation(Base):
     # before the first durable turn; changing it later requires a fork so two
     # incompatible native transcript/checkpoint formats are never spliced.
     engine_id: Mapped[str] = mapped_column(
-        String(32), nullable=False, default="legacy", server_default=text("'legacy'")
+        String(32), nullable=False, default="claude_code", server_default=text("'claude_code'")
     )
     # The label describes authority inside this Session, never host access.
     permission_preset: Mapped[str] = mapped_column(
@@ -70,6 +70,8 @@ class Conversation(Base):
         # for rows that predate permission presets.
         server_default=text("'workspace_write'"),
     )
+    # Archived compatibility fields. Native execution and native forks never
+    # consult them; retaining the columns avoids destructive table rewrites.
     enabled_tools: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     fallback_model_ids: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     enabled_user_skills: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -183,6 +185,60 @@ class SkillPackage(Base):
     )
 
 
+class MCPServerRegistration(Base):
+    """User/session MCP authority compiled into each native Turn view.
+
+    There is deliberately no ambient connection state: Claude Code and
+    DeepSeek Harness start and stop MCP transports inside their isolated
+    per-Turn runtime from this durable, Backend-owned declaration.
+    """
+
+    __tablename__ = "mcp_server_registrations"
+    __table_args__ = (
+        Index(
+            "ux_mcp_registrations_user_session_name",
+            "user_id",
+            "session_id",
+            "name",
+            unique=True,
+            sqlite_where=text("session_id IS NOT NULL"),
+            postgresql_where=text("session_id IS NOT NULL"),
+        ),
+        Index(
+            "ux_mcp_registrations_user_name",
+            "user_id",
+            "name",
+            unique=True,
+            sqlite_where=text("session_id IS NULL"),
+            postgresql_where=text("session_id IS NULL"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(32), primary_key=True, default=generate_uuid
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    session_id: Mapped[Optional[str]] = mapped_column(
+        String(32),
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    config_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
 class CustomModelConfig(Base):
     __tablename__ = "custom_model_configs"
 
@@ -227,7 +283,7 @@ class AgentRun(Base):
     policy: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     source: Mapped[str] = mapped_column(String(24), nullable=False, default="chat")
     engine_id: Mapped[str] = mapped_column(
-        String(32), nullable=False, default="legacy", server_default=text("'legacy'"), index=True
+        String(32), nullable=False, default="claude_code", server_default=text("'claude_code'"), index=True
     )
     engine_version: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     native_session_id: Mapped[Optional[str]] = mapped_column(
@@ -463,6 +519,9 @@ class ScheduledJob(Base):
     schedule_value: Mapped[str] = mapped_column(String(256), nullable=False)
     timezone: Mapped[str] = mapped_column(String(64), nullable=False, default="UTC")
     model_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # Historical column name retained in SQLite. For native scheduled Turns it
+    # stores only the exact deployment-owned platform I/O capability subset;
+    # native file/shell/Skill/sub-agent tools never pass through this column.
     enabled_tools: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     delete_after_run: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

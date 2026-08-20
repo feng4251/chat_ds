@@ -7,11 +7,73 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from database import (
     _LIGHTWEIGHT_MIGRATIONS,
+    _backfill_retired_engine_identity,
+    _engine_identity_upgrade_targets,
     _ensure_skill_package_scope_identity,
 )
 
 
 class SkillBundleSchemaMigrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_engine_identity_upgrade_preserves_history_and_native_default(self):
+        """Old rows stay attributable while renamed-domain future rows are native."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = create_async_engine(
+                f"sqlite+aiosqlite:///{Path(temp_dir) / 'engines.db'}"
+            )
+            try:
+                async with engine.begin() as connection:
+                    await connection.execute(text(
+                        "CREATE TABLE conversations ("
+                        "id VARCHAR(32) PRIMARY KEY)"
+                    ))
+                    await connection.execute(text(
+                        "CREATE TABLE agent_runs ("
+                        "id VARCHAR(32) PRIMARY KEY)"
+                    ))
+                    await connection.execute(text(
+                        "INSERT INTO conversations (id) VALUES ('museum-history')"
+                    ))
+                    await connection.execute(text(
+                        "INSERT INTO agent_runs (id) VALUES ('warehouse-history')"
+                    ))
+
+                    targets = await _engine_identity_upgrade_targets(connection)
+                    self.assertEqual(
+                        frozenset({"conversations", "agent_runs"}),
+                        targets,
+                    )
+                    for sql in _LIGHTWEIGHT_MIGRATIONS:
+                        if (
+                            "conversations ADD COLUMN engine_id" in sql
+                            or "agent_runs ADD COLUMN engine_id" in sql
+                        ):
+                            await connection.execute(text(sql))
+                    await _backfill_retired_engine_identity(connection, targets)
+
+                    await connection.execute(text(
+                        "INSERT INTO conversations (id) VALUES ('lab-future')"
+                    ))
+                    await connection.execute(text(
+                        "INSERT INTO agent_runs (id) VALUES ('factory-future')"
+                    ))
+                    conversation_rows = dict((await connection.execute(text(
+                        "SELECT id, engine_id FROM conversations ORDER BY id"
+                    ))).all())
+                    run_rows = dict((await connection.execute(text(
+                        "SELECT id, engine_id FROM agent_runs ORDER BY id"
+                    ))).all())
+                    self.assertEqual("legacy", conversation_rows["museum-history"])
+                    self.assertEqual("claude_code", conversation_rows["lab-future"])
+                    self.assertEqual("legacy", run_rows["warehouse-history"])
+                    self.assertEqual("claude_code", run_rows["factory-future"])
+                    self.assertEqual(
+                        frozenset(),
+                        await _engine_identity_upgrade_targets(connection),
+                    )
+            finally:
+                await engine.dispose()
+
     async def test_legacy_skill_table_receives_bundle_identity_columns(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             engine = create_async_engine(

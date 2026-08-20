@@ -4,9 +4,16 @@
 - id: session-telemetry-otel
   disabled: true
 
+# The upstream headless runner deliberately creates a random one-shot Session.
+# ChatDS owns the Web/Session boundary, so replace only that direct driver with
+# a stable native-Session driver. The upstream agent loop, checkpoints,
+# compaction, tools, subagents, retries, and terminal semantics stay mounted.
+- id: headless-runner
+  disabled: true
+
 - id: approval
   config:
-    policy: ask
+    policy: !!js "process.env.DSH_PERMISSION_MODE === 'danger-full-access' ? 'never' : 'ask'"
 
 - id: user-questions
   config:
@@ -37,57 +44,10 @@
     mode: !!js process.env.DSH_PERMISSION_MODE
     workspaceRoot: !!js process.cwd()
 
-# Pin the same official preset selected by DSH_PERMISSION_MODE. The upstream
-# bundle owns the matching approval rule: confined modes ask (and fail closed
-# without an answerer), while danger-full-access uses never.
-- id: permission
-  config:
-    defaultPreset: !!js process.env.DSH_PERMISSION_MODE
-
-- id: tool-bash
-  disabled: !!js process.env.CHATDS_DSH_SHELL_ENABLED !== '1'
-
-- id: tool-jobs
-  disabled: !!js process.env.CHATDS_DSH_SHELL_ENABLED !== '1'
-
-- id: tool-fs
-  disabled: !!js process.env.CHATDS_DSH_FILES_ENABLED !== '1'
-
-- id: tool-fs-search
-  disabled: !!js process.env.CHATDS_DSH_FILES_ENABLED !== '1'
-
-- id: tool-str-replace-editor
-  disabled: !!js process.env.CHATDS_DSH_FILES_ENABLED !== '1'
-
-- id: tool-skill
-  disabled: !!js process.env.CHATDS_DSH_SKILLS_ENABLED !== '1'
-
-- id: tool-subagent-control
-  disabled: !!js process.env.CHATDS_DSH_SUBAGENTS_ENABLED !== '1'
-
-- id: tool-subagent-list-agents
-  disabled: !!js process.env.CHATDS_DSH_SUBAGENTS_ENABLED !== '1'
-
-- id: tool-subagent
-  disabled: !!js process.env.CHATDS_DSH_SUBAGENTS_ENABLED !== '1'
-
-- id: tool-subagent-fork
-  disabled: !!js process.env.CHATDS_DSH_SUBAGENTS_ENABLED !== '1'
-
-- id: tool-subagent-report
-  disabled: !!js process.env.CHATDS_DSH_SUBAGENTS_ENABLED !== '1'
-
-- id: tool-workflow
-  disabled: !!js process.env.CHATDS_DSH_SUBAGENTS_ENABLED !== '1'
-
-- id: tool-todo
-  disabled: !!js process.env.CHATDS_DSH_TODO_ENABLED !== '1'
-
-- id: tool-goal
-  disabled: !!js process.env.CHATDS_DSH_GOALS_ENABLED !== '1'
-
-- id: tool-ralph
-  disabled: true
+# Do not replace the upstream permission-presets config: patch configs replace
+# whole objects, and the native table includes the read-only preset. The
+# sandbox and approval defaults above let DSH infer and durably pin the exact
+# native preset for each new Session.
 
 - id: skill-filesystem
   config:
@@ -103,7 +63,6 @@
   disabled: true
 
 - id: tool-web
-  disabled: !!js process.env.CHATDS_DSH_WEB_SEARCH_ENABLED !== '1'
   config:
     search: true
     fetch: false
@@ -112,12 +71,37 @@
 - insert:
     - id: chatds-searxng-search
       name: /opt/chatds-deepseek-plugins/searxng_provider.mjs
-      disabled: !!js process.env.CHATDS_DSH_WEB_SEARCH_ENABLED !== '1'
       config:
         endpoint: !!js process.env.CHATDS_SEARXNG_SEARCH_URL
+
+    # Headless mounts the native question service but no model-facing question
+    # tool. The Web adapter supplies only the answer channel for this upstream
+    # tool; DSH still owns the request and continuation lifecycle.
+    - id: tool-ask-user
+      name: '@deepseek-ai/dsh-tool-ask-user'
 
     - id: chatds-event-bridge
       name: /opt/chatds-deepseek-plugins/event_bridge.mjs
 
+    # Provider-wire compatibility only. Agent planning, tool dispatch,
+    # retries, compaction, and termination remain upstream DSH-owned.
+    - id: chatds-provider-compat-bridge
+      name: /opt/chatds-deepseek-plugins/provider_compat_bridge.mjs
+
     - id: chatds-control-bridge
       name: /opt/chatds-deepseek-plugins/control_bridge.mjs
+
+    # A selected declarative Skill route is projected as one root-scoped tool.
+    # The tool executes through DSH's own workflow engine and native subagents;
+    # without a per-Turn projection this plugin is a no-op.
+    - id: chatds-native-skill-workflow
+      name: /opt/chatds-deepseek-plugins/native_workflow.mjs
+
+    # Artifact completion stays inside the same native Turn. The gate reads a
+    # root-owned pre-Turn frontier, allows one bounded native continuation,
+    # and leaves the authoritative terminal audit to PID 1.
+    - id: chatds-native-artifact-gate
+      name: /opt/chatds-deepseek-plugins/native_artifact_gate.mjs
+
+    - id: chatds-session-driver
+      name: /opt/chatds-deepseek-plugins/session_driver.mjs

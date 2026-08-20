@@ -1179,7 +1179,7 @@ async def _rebuild_mcp_for_skills(
     for skill in skills:
         skill_name = str(skill["name"])
         try:
-            skill_mcp = await _auto_register_mcp(
+            skill_mcp = await _project_skill_mcp(
                 str(target_dirs[skill_name]),
                 user_id,
                 session_id or "default",
@@ -1454,10 +1454,6 @@ async def _process_skill_zip(
             if staging_root is not None:
                 shutil.rmtree(staging_root, ignore_errors=True)
 
-    try:
-        _invalidate_skills_cache(user.id)
-    except Exception:
-        pass
 
     # Reacquiring an uncontended asyncio lock does not yield, so management
     # operations cannot interleave between the committed publish and its MCP
@@ -1934,7 +1930,7 @@ async def delete_skill(
         mcp_cleanups: dict[str, dict] = {}
         for member_name in deleted_names:
             cleanup, cleanup_cancellation = (
-                await _finish_awaitable_with_result(_remove_skill_mcp(
+                await _finish_awaitable_with_result(_release_skill_mcp_projection(
                     str(scope_root / member_name),
                     user.id,
                     session_id or "default",
@@ -1966,10 +1962,6 @@ async def delete_skill(
         _atomic_write_json(journal_path, journal)
 
     # Invalidate skills cache
-    try:
-        _invalidate_skills_cache(user.id)
-    except Exception:
-        pass
 
     if caller_cancellation is not None:
         raise caller_cancellation
@@ -2348,7 +2340,7 @@ async def promote_skill(
                     ignore_errors=True,
                 )
             session_mcp_cleanup, cleanup_cancellation = (
-                await _finish_awaitable_with_result(_remove_skill_mcp(
+                await _finish_awaitable_with_result(_release_skill_mcp_projection(
                     str(src_dir),
                     user.id,
                     session_id,
@@ -2396,10 +2388,6 @@ async def promote_skill(
             )
             _atomic_write_json(journal_path, journal)
 
-    try:
-        _invalidate_skills_cache(user.id)
-    except Exception:
-        pass
 
     if caller_cancellation is not None:
         raise caller_cancellation
@@ -2421,69 +2409,33 @@ async def list_optional_skills(user: User = Depends(get_current_user)):
     return {"skills": _scan_optional_skills()}
 
 
-async def _auto_register_mcp(
+async def _project_skill_mcp(
     skill_dir: str,
     user_id: str,
     session_id: str = "default",
 ) -> dict:
-    """Ask the harness control plane to discover, persist, and connect MCP."""
-    import httpx
+    """Record that Skill MCP is bound by each immutable native Turn view."""
 
-    try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            response = await client.post(
-                f"{settings.harness_url}/internal/mcp/auto-register",
-                headers={
-                    "X-Internal-Token": settings.internal_api_token,
-                },
-                params={
-                    "skill_dir": skill_dir,
-                    "user_id": user_id,
-                    "session_id": session_id,
-                },
-            )
-        if response.status_code >= 400:
-            return {
-                "registered": [],
-                "skipped": [],
-                "errors": [f"harness HTTP {response.status_code}: {response.text[:300]}"],
-            }
-        return response.json()
-    except Exception as exc:
-        return {"registered": [], "skipped": [], "errors": [str(exc)]}
+    del skill_dir, user_id, session_id
+    return {
+        "registered": [],
+        "skipped": [],
+        "errors": [],
+        "status": "compiled_into_native_turn_view",
+    }
 
 
 
-async def _remove_skill_mcp(
+async def _release_skill_mcp_projection(
     skill_dir: str,
     user_id: str,
     session_id: str = "default",
 ) -> dict:
-    import httpx
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(
-                f"{settings.harness_url}/internal/mcp/remove-skill",
-                headers={
-                    "X-Internal-Token": settings.internal_api_token,
-                },
-                params={
-                    "skill_dir": skill_dir,
-                    "user_id": user_id,
-                    "session_id": session_id,
-                },
-            )
-        return response.json() if response.status_code < 400 else {
-            "removed": [], "errors": [f"harness HTTP {response.status_code}"]
-        }
-    except Exception as exc:
-        return {"removed": [], "errors": [str(exc)]}
+    """No ambient MCP process survives a native Turn, so removal is local."""
 
-def _invalidate_skills_cache(user_id: str):
-    """Notify SkillsManager to invalidate its cache for this user."""
-    try:
-        from skills.manager import get_manager
-        mgr = get_manager()
-        mgr.invalidate(user_id)
-    except ImportError:
-        pass
+    del skill_dir, user_id, session_id
+    return {
+        "removed": [],
+        "errors": [],
+        "status": "native_turn_view_released",
+    }

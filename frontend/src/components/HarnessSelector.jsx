@@ -11,6 +11,7 @@ export default function HarnessSelector({
   const [open, setOpen] = useState(false)
   const ref = useRef(null)
   const selected = engines.find((engine) => engine.id === selectedEngine)
+  const retired = selectedEngine === 'legacy'
 
   useEffect(() => {
     if (!open) return undefined
@@ -33,14 +34,14 @@ export default function HarnessSelector({
       <button
         type="button"
         onClick={() => setOpen((value) => !value)}
-        disabled={busy || locked || engines.length === 0}
+        disabled={busy || locked || retired || engines.length === 0}
         className="flex items-center gap-1.5 bg-stone-50 border border-stone-200 rounded-xl pl-2.5 pr-2 py-1.5 text-[11px] text-slate-600 max-w-[190px] hover:border-indigo-300 disabled:opacity-50 transition"
-        title={locked ? '已有消息的会话请通过 Fork 切换 Harness' : '选择 Harness'}
+        title={retired ? '旧 ChatDS Harness 已退役，请通过工作区 Fork 到原生引擎' : locked ? '已有消息的会话请通过 Fork 切换 Harness' : '选择 Harness'}
         aria-haspopup="listbox"
         aria-expanded={open}
       >
         <FiLayers className="shrink-0 text-violet-500" size={12} />
-        <span className="truncate">{selected?.name || '选择 Harness'}</span>
+        <span className="truncate">{retired ? '旧引擎（已退役）' : selected?.name || '选择 Harness'}</span>
         <FiChevronDown
           className={`shrink-0 text-slate-400 transition-transform ${open ? 'rotate-180' : ''}`}
           size={11}

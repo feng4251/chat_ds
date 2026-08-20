@@ -12,7 +12,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import workspace
-from models import Base, Conversation, SkillPackage, User
+from models import (
+    Base,
+    Conversation,
+    MCPServerRegistration,
+    SkillPackage,
+    User,
+)
 from routers import skill_router, workspace_router
 
 
@@ -96,7 +102,7 @@ class SkillBundleManagementTests(unittest.IsolatedAsyncioTestCase):
                 id="source-session",
                 user_id="user-1",
                 title="Source",
-                model_id="AgentModel",
+                model_id="shaiengine_glm_5_2",
             ))
             await db.commit()
         self.user = SimpleNamespace(id="user-1")
@@ -110,9 +116,8 @@ class SkillBundleManagementTests(unittest.IsolatedAsyncioTestCase):
         self.patches = (
             patch.object(skill_router, "SKILLS_DATA_DIR", self.skills_root),
             patch.object(workspace, "WORKSPACE_ROOT", self.workspace_root),
-            patch.object(skill_router, "_auto_register_mcp", new=self.auto_mcp),
-            patch.object(skill_router, "_remove_skill_mcp", new=self.remove_mcp),
-            patch.object(skill_router, "_invalidate_skills_cache"),
+            patch.object(skill_router, "_project_skill_mcp", new=self.auto_mcp),
+            patch.object(skill_router, "_release_skill_mcp_projection", new=self.remove_mcp),
             patch.object(
                 workspace_router,
                 "emit_event",
@@ -329,6 +334,114 @@ class SkillBundleManagementTests(unittest.IsolatedAsyncioTestCase):
                 (self.skills_root / "user-1" / result["id"]
                  / row.name / "SKILL.md").is_file()
             )
+
+    async def test_fork_copies_only_exact_session_mcp_declarations(self):
+        """A fork freezes its source Session MCP view without scope bleed."""
+
+        workspace.ensure_workspace("user-1", "source-session")
+        async with self.sessions() as db:
+            db.add_all([
+                MCPServerRegistration(
+                    user_id="user-1",
+                    session_id="source-session",
+                    name="warehouse-ledger",
+                    config_json=(
+                        '{"command":"inventory-reader",'
+                        '"args":["--site","north"]}'
+                    ),
+                ),
+                MCPServerRegistration(
+                    user_id="user-1",
+                    session_id=None,
+                    name="user-catalog",
+                    config_json='{"command":"catalog-reader"}',
+                ),
+                MCPServerRegistration(
+                    user_id="user-1",
+                    session_id="other-session",
+                    name="laboratory-console",
+                    config_json='{"command":"assay-reader"}',
+                ),
+            ])
+            await db.commit()
+
+        async with self.sessions() as db:
+            result = await workspace_router.fork_conversation(
+                "source-session",
+                title="Renamed MCP Fork",
+                include_messages=False,
+                fork_id="d" * 32,
+                user=self.user,
+                db=db,
+            )
+
+        async with self.sessions() as db:
+            copied = list((await db.execute(
+                select(MCPServerRegistration).where(
+                    MCPServerRegistration.user_id == "user-1",
+                    MCPServerRegistration.session_id == result["id"],
+                ).order_by(MCPServerRegistration.name)
+            )).scalars().all())
+
+        self.assertEqual(
+            [
+                (
+                    "warehouse-ledger",
+                    '{"command":"inventory-reader",'
+                    '"args":["--site","north"]}',
+                )
+            ],
+            [(row.name, row.config_json) for row in copied],
+        )
+
+    async def test_native_fork_drops_archived_harness_routing_state(self):
+        """Renamed-domain stale executor settings cannot affect a new fork."""
+
+        workspace.ensure_workspace("user-1", "source-session")
+        async with self.sessions() as db:
+            source = await db.get(Conversation, "source-session")
+            source.enabled_tools = '["warehouse_only_fixture"]'
+            source.fallback_model_ids = '["museum_fallback_fixture"]'
+            await db.commit()
+
+        async with self.sessions() as db:
+            result = await workspace_router.fork_conversation(
+                "source-session",
+                title="Native laboratory fork",
+                include_messages=False,
+                fork_id="e" * 32,
+                user=self.user,
+                db=db,
+            )
+            fork = await db.get(Conversation, result["id"])
+            first_snapshot = fork.fork_snapshot_sha256
+
+        self.assertIsNone(fork.enabled_tools)
+        self.assertIsNone(fork.fallback_model_ids)
+
+        # Archived Harness columns are neither copied nor part of native fork
+        # identity. Renaming or mutating them cannot perturb the durable
+        # snapshot of data that the native target actually receives.
+        async with self.sessions() as db:
+            source = await db.get(Conversation, "source-session")
+            source.enabled_tools = '["geology_retired_fixture"]'
+            source.fallback_model_ids = '["archive_retired_fixture"]'
+            await db.commit()
+
+        async with self.sessions() as db:
+            repeated = await workspace_router.fork_conversation(
+                "source-session",
+                title="Native laboratory fork",
+                include_messages=False,
+                fork_id="f" * 32,
+                user=self.user,
+                db=db,
+            )
+            repeated_fork = await db.get(Conversation, repeated["id"])
+
+        self.assertEqual(first_snapshot, repeated_fork.fork_snapshot_sha256)
+        self.assertIsNone(repeated_fork.enabled_tools)
+        self.assertIsNone(repeated_fork.fallback_model_ids)
 
     async def test_bundle_runtime_is_content_addressed_and_removed_with_bundle(self):
         first = await self._install(

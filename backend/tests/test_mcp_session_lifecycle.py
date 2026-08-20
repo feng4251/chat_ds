@@ -3,19 +3,30 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 from fastapi import HTTPException
+from pydantic import ValidationError
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import session_lifecycle
 import workspace
-from models import Base, Conversation, User
+from models import Base, Conversation, MCPServerRegistration, User
 from routers import mcp_router, skill_router
 from workspace_lock import WorkspaceMutationLockError
 
 
 class MCPSessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def test_unsupported_timeout_is_rejected_instead_of_silently_ignored(self):
+        with self.assertRaises(ValidationError):
+            mcp_router.MCPServerConfig(
+                name="laboratory-reader",
+                url="https://laboratory.example.invalid/mcp",
+                transport="http",
+                timeout=7,
+            )
+
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -45,23 +56,16 @@ class MCPSessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     user_id="user-1",
                     title="MCP session",
                     model_id="AgentModel",
+                    engine_id="claude_code",
                 ),
             ])
             await db.commit()
-        self.harness_request = AsyncMock(
-            return_value={"success": True}
-        )
         self.patches = (
             patch.object(workspace, "WORKSPACE_ROOT", self.root / "workspace"),
             patch.object(
                 session_lifecycle,
                 "async_session",
                 self.sessions,
-            ),
-            patch.object(
-                mcp_router,
-                "_harness_request",
-                new=self.harness_request,
             ),
         )
         for active_patch in self.patches:
@@ -81,12 +85,11 @@ class MCPSessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
         return mcp_router.MCPServerConfig(
             name="fixture",
             session_id="session-1",
-            url="https://mcp.example.invalid",
+            url="https://warehouse.example.invalid/mcp",
+            transport="http",
         )
 
-    async def test_pending_session_blocks_all_user_mcp_control_plane_access(
-        self,
-    ):
+    async def test_pending_session_blocks_all_mcp_control_plane_access(self):
         operation_id = "a" * 64
         workspace.claim_session_pending_fence(
             "user-1",
@@ -94,65 +97,67 @@ class MCPSessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             operation_id,
         )
 
-        operations = (
-            mcp_router.list_servers(
-                session_id="session-1",
-                user=self.owner,
-            ),
-            mcp_router.add_server(
-                self._config(),
-                user=self.owner,
-            ),
-            mcp_router.delete_server(
-                "fixture",
-                session_id="session-1",
-                user=self.owner,
-            ),
-        )
-        for operation in operations:
-            with self.assertRaises(WorkspaceMutationLockError) as blocked:
-                await operation
-            self.assertEqual(
-                "workspace_session_pending",
-                blocked.exception.code,
+        async with self.sessions() as db:
+            operations = (
+                mcp_router.list_servers(
+                    session_id="session-1",
+                    user=self.owner,
+                    db=db,
+                ),
+                mcp_router.add_server(
+                    self._config(),
+                    user=self.owner,
+                    db=db,
+                ),
+                mcp_router.delete_server(
+                    "fixture",
+                    session_id="session-1",
+                    user=self.owner,
+                    db=db,
+                ),
             )
-        self.harness_request.assert_not_awaited()
+            for operation in operations:
+                with self.assertRaises(WorkspaceMutationLockError) as blocked:
+                    await operation
+                self.assertEqual(
+                    "workspace_session_pending",
+                    blocked.exception.code,
+                )
 
         workspace.clear_session_pending_fence(
             "user-1",
             "session-1",
             operation_id,
         )
-        listed = await mcp_router.list_servers(
-            session_id="session-1",
-            user=self.owner,
-        )
-        added = await mcp_router.add_server(
-            self._config(),
-            user=self.owner,
-        )
-        removed = await mcp_router.delete_server(
-            "fixture",
-            session_id="session-1",
-            user=self.owner,
-        )
-        self.assertTrue(listed["success"])
+        async with self.sessions() as db:
+            added = await mcp_router.add_server(
+                self._config(), user=self.owner, db=db
+            )
+        async with self.sessions() as db:
+            listed = await mcp_router.list_servers(
+                session_id="session-1", user=self.owner, db=db
+            )
+        async with self.sessions() as db:
+            removed = await mcp_router.delete_server(
+                "fixture", session_id="session-1", user=self.owner, db=db
+            )
         self.assertTrue(added["success"])
-        self.assertTrue(removed["success"])
-        self.assertEqual(3, self.harness_request.await_count)
+        self.assertEqual("isolated_per_turn", listed["servers"][0]["connection_lifecycle"])
+        self.assertTrue(removed["removed"])
 
-    async def test_wrong_owner_and_unknown_session_never_reach_harness(self):
+    async def test_wrong_owner_and_unknown_session_never_read_registry(self):
         for user, session_id in (
             (self.other, "session-1"),
             (self.owner, "missing-session"),
         ):
-            with self.assertRaises(HTTPException) as rejected:
-                await mcp_router.list_servers(
-                    session_id=session_id,
-                    user=user,
-                )
+            async with self.sessions() as db:
+                with self.assertRaises(HTTPException) as rejected:
+                    await mcp_router.list_servers(
+                        session_id=session_id,
+                        user=user,
+                        db=db,
+                    )
             self.assertEqual(404, rejected.exception.status_code)
-        self.harness_request.assert_not_awaited()
 
     async def test_deletion_fence_wins_before_mcp_mutation_admission(self):
         async with skill_router._skill_install_lock(
@@ -163,14 +168,16 @@ class MCPSessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 "user-1",
                 "session-1",
             )
-            mutation = asyncio.create_task(
-                mcp_router.add_server(
-                    self._config(),
-                    user=self.owner,
+            async with self.sessions() as db:
+                mutation = asyncio.create_task(
+                    mcp_router.add_server(
+                        self._config(),
+                        user=self.owner,
+                        db=db,
+                    )
                 )
-            )
-            await asyncio.sleep(0)
-            self.assertFalse(mutation.done())
+                await asyncio.sleep(0)
+                self.assertFalse(mutation.done())
 
         outcome = (await asyncio.gather(
             mutation,
@@ -178,18 +185,49 @@ class MCPSessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
         ))[0]
         self.assertIsInstance(outcome, WorkspaceMutationLockError)
         self.assertEqual("workspace_session_deleted", outcome.code)
-        self.harness_request.assert_not_awaited()
 
-    async def test_default_user_scope_remains_independent_of_conversations(self):
-        result = await mcp_router.add_server(
-            mcp_router.MCPServerConfig(
-                name="user-scope",
-                url="https://mcp.example.invalid",
-            ),
-            user=self.owner,
-        )
-        self.assertTrue(result["success"])
-        self.harness_request.assert_awaited_once()
+    async def test_user_scope_is_durable_and_session_override_is_exact(self):
+        async with self.sessions() as db:
+            await mcp_router.add_server(
+                mcp_router.MCPServerConfig(
+                    name="inventory",
+                    url="https://global.example.invalid/mcp",
+                ),
+                user=self.owner,
+                db=db,
+            )
+        async with self.sessions() as db:
+            await mcp_router.add_server(
+                mcp_router.MCPServerConfig(
+                    name="inventory",
+                    session_id="session-1",
+                    command="python",
+                    args=["/workspace/inventory.py"],
+                    transport="stdio",
+                ),
+                user=self.owner,
+                db=db,
+            )
+        async with self.sessions() as db:
+            listed = await mcp_router.list_servers(
+                session_id="session-1", user=self.owner, db=db
+            )
+            rows = list((await db.execute(
+                select(MCPServerRegistration).order_by(
+                    MCPServerRegistration.session_id
+                )
+            )).scalars().all())
+        self.assertEqual(2, len(rows))
+        self.assertEqual([
+            {
+                "name": "inventory",
+                "transport": "stdio",
+                "scope": "session",
+                "connected": False,
+                "connection_lifecycle": "isolated_per_turn",
+                "tool_count": None,
+            }
+        ], listed["servers"])
 
 
 if __name__ == "__main__":
