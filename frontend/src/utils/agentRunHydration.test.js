@@ -7,10 +7,12 @@ import {
   conversationRequestWasAccepted,
   createConversationRequestScope,
   hydrateAgentRunCards,
+  markAcceptedLiveRun,
   observeConversationRequestRoute,
   recordAcceptedRunReceipt,
   runStatusPresentation,
   semanticAgentName,
+  settleAcceptedLiveRun,
   updateAgentRuns,
 } from './agentRunHydration.js'
 
@@ -124,6 +126,25 @@ test('terminal hydration clears a prior active lifecycle notice', () => {
   )
   assert.equal(hydrated[0].runActive, false)
   assert.equal(hydrated[0].lifecycleNotice, undefined)
+})
+
+test('failed mapped assistant distinguishes task terminal from prior tool success', () => {
+  const hydrated = hydrateAgentRunCards(
+    [{
+      id: 'mapped-assistant', role: 'assistant', content: 'partial artifact',
+      rootRunId: 'root',
+    }],
+    { roots: [{
+      root_run_id: 'root',
+      assistant_message_id: 'mapped-assistant',
+      active: false,
+      status: 'failed',
+      runs: [{ id: 'root', lifecycle_status: 'failed' }],
+    }] },
+  )
+  assert.equal(hydrated[0].runStatus, 'failed')
+  assert.match(hydrated[0].lifecycleNotice, /任务执行失败/)
+  assert.equal(hydrated[0].content, 'partial artifact')
 })
 
 test('ordinary successful roots without a message mapping stay in the audit view', () => {
@@ -298,6 +319,21 @@ test('conversation identity is not a task-acceptance receipt', () => {
   // an already accepted turn in live UI state.
   recordAcceptedRunReceipt(scope, 'root-run-conflict')
   assert.equal(scope.acceptedRunId, 'root-run-1')
+})
+
+test('accepted live run is visibly provisional until authoritative stream settlement', () => {
+  const active = markAcceptedLiveRun(
+    { role: 'assistant', streaming: true, content: 'draft' },
+    'root-run-1',
+  )
+  assert.equal(active.runActive, true)
+  assert.equal(active.rootRunId, 'root-run-1')
+  assert.match(active.lifecycleNotice, /阶段性输出/)
+
+  const settled = settleAcceptedLiveRun(active)
+  assert.equal(settled.runActive, false)
+  assert.equal(settled.lifecycleNotice, undefined)
+  assert.equal(settled.content, 'draft')
 })
 
 test('live reducer ignores provisional terminals and freezes the first authoritative terminal', () => {

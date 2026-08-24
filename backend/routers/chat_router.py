@@ -100,6 +100,23 @@ _DETACHED_STREAM_MAX_BYTES = 4 * 1024 * 1024
 _DETACHED_STREAM_PUBLISH_WAIT_SECONDS = 5.0
 _AGENT_RUN_ERROR_STORAGE_LIMIT = 4000
 _RAW_ENGINE_EVENT_INLINE_BYTES = 1024 * 1024
+_RAW_ENGINE_EVENT_BATCH_EVENTS = 500
+_RAW_ENGINE_EVENT_BATCH_BYTES = 4 * 1024 * 1024
+
+
+def _should_flush_raw_engine_event_batch(
+    event_count: int,
+    encoded_bytes: int,
+    *,
+    terminal: bool,
+) -> bool:
+    """Bound audit writes without turning every native token into a commit."""
+
+    return bool(
+        terminal
+        or event_count >= _RAW_ENGINE_EVENT_BATCH_EVENTS
+        or encoded_bytes >= _RAW_ENGINE_EVENT_BATCH_BYTES
+    )
 
 
 class _NormalizedEngineResponse:
@@ -4013,7 +4030,8 @@ async def _chat_stream_with_turn(
         upstream_exception_class: str | None = None
         terminal_envelope_payload: dict | None = None
         raw_engine_event_batch: list[dict] = []
-        seen_raw_engine_event_seqs: set[int] = set()
+        raw_engine_event_batch_bytes = 0
+        last_raw_engine_event_seq = 0
         activity_builder = TurnActivityBuilder(run.id, conv_id)
         activity_event_batch: list[dict] = []
 
@@ -4176,20 +4194,31 @@ async def _chat_stream_with_turn(
                                         raw_seq = raw_engine_event.get("seq")
                                         if (
                                             isinstance(raw_seq, int)
-                                            and raw_seq > 0
-                                            and raw_seq not in seen_raw_engine_event_seqs
+                                            and raw_seq > last_raw_engine_event_seq
                                         ):
-                                            seen_raw_engine_event_seqs.add(raw_seq)
+                                            last_raw_engine_event_seq = raw_seq
                                             raw_engine_event_batch.append(raw_engine_event)
+                                            raw_engine_event_batch_bytes += len(
+                                                json.dumps(
+                                                    raw_engine_event,
+                                                    ensure_ascii=False,
+                                                    separators=(",", ":"),
+                                                ).encode("utf-8")
+                                            )
                                             native_payload = raw_engine_event.get("event")
                                             raw_is_terminal = bool(
                                                 isinstance(native_payload, dict)
                                                 and native_payload.get("type")
                                                 == "chatds.supervisor.terminal"
                                             )
-                                            if len(raw_engine_event_batch) >= 32 or raw_is_terminal:
+                                            if _should_flush_raw_engine_event_batch(
+                                                len(raw_engine_event_batch),
+                                                raw_engine_event_batch_bytes,
+                                                terminal=raw_is_terminal,
+                                            ):
                                                 pending_raw = list(raw_engine_event_batch)
                                                 raw_engine_event_batch.clear()
+                                                raw_engine_event_batch_bytes = 0
                                                 await _persist_engine_raw_events(
                                                     user_id=str(cur_user.id),
                                                     conversation_id=conv_id,
@@ -4223,7 +4252,11 @@ async def _chat_stream_with_turn(
                                                 )
                                             activity_event = await record_activity(
                                                 activity_builder.agent(agent_event),
-                                                force=True,
+                                                force=event_type in {
+                                                    "run.completed",
+                                                    "run.failed",
+                                                    "run.cancelled",
+                                                },
                                             )
                                             yield encode_sse({
                                                 "agent_event": agent_event,

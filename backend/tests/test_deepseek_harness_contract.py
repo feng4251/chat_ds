@@ -48,7 +48,11 @@ from deepseek_runner.config import (  # noqa: E402
     state_volume_host_root,
 )
 from deepseek_runner.event_stream import read_event_tail  # noqa: E402
-from deepseek_runner.native_session import native_turn_prompts  # noqa: E402
+from deepseek_runner.native_session import (  # noqa: E402
+    NativeSessionInputError,
+    bind_native_primary_skill,
+    native_turn_prompts,
+)
 from native_tools import deepseek_harness_native_tools  # noqa: E402
 from native_security.workflow_contract import (  # noqa: E402
     compile_turn_workflow_contract,
@@ -63,6 +67,7 @@ from deepseek_runner.native_artifacts import (  # noqa: E402
 )
 from routers.chat_router import (  # noqa: E402
     BUILTIN,
+    _should_flush_raw_engine_event_batch,
     resolve_model_config,
 )
 
@@ -83,6 +88,21 @@ def test_native_engine_default_budget_admits_long_context_provider_exchange():
     assert DEFAULT_EGRESS_LIMITS["max_outbound_bytes"] == 1024 * 1024 * 1024
 
 
+def test_native_audit_batch_is_bounded_without_per_token_commits():
+    assert not _should_flush_raw_engine_event_batch(
+        499, 1024, terminal=False,
+    )
+    assert _should_flush_raw_engine_event_batch(
+        500, 1024, terminal=False,
+    )
+    assert _should_flush_raw_engine_event_batch(
+        1, 4 * 1024 * 1024, terminal=False,
+    )
+    assert _should_flush_raw_engine_event_batch(
+        1, 1, terminal=True,
+    )
+
+
 def test_native_root_and_child_streams_preserve_authority_boundaries():
     root = "a" * 32
     projector = DeepSeekEventProjector(root)
@@ -90,26 +110,58 @@ def test_native_root_and_child_streams_preserve_authority_boundaries():
     assert started[0].data["event_type"] == "run.started"
     assert started[0].data["run_id"] == root
 
-    root_chunk = projector.project(_native(
+    root_delta = projector.project(_native(
         2, "assistant/chunk", {"chunk": {"type": "text-delta", "text": "answer"}}
     ))
-    assert [(event.kind, event.data.get("text")) for event in root_chunk] == [
-        ("content", "answer")
-    ]
+    assert root_delta == ()
 
-    root_reasoning = projector.project(_native(
+    root_reasoning_delta = projector.project(_native(
         3,
         "assistant/chunk",
         {"chunk": {"type": "reasoning-delta", "text": "inspect evidence"}},
+    ))
+    assert root_reasoning_delta == ()
+
+    root_reasoning = projector.project(_native(
+        4,
+        "assistant/chunk",
+        {"chunk": {
+            "type": "block-end",
+            "block": {"type": "reasoning", "text": "inspect evidence"},
+        }},
     ))
     assert [(event.kind, event.data.get("text")) for event in root_reasoning] == [
         ("reasoning", "inspect evidence")
     ]
 
-    child = projector.project(_native(
-        4,
+    root_text = projector.project(_native(
+        5,
+        "assistant/chunk",
+        {"chunk": {
+            "type": "block-end",
+            "block": {"type": "text", "text": "answer"},
+        }},
+    ))
+    assert [(event.kind, event.data.get("text")) for event in root_text] == [
+        ("content", "answer")
+    ]
+
+    child_delta = projector.project(_native(
+        6,
         "assistant/chunk",
         {"chunk": {"type": "text-delta", "text": "worker evidence"}},
+        session="renamed-worker-session",
+        depth=1,
+    ))
+    assert child_delta == ()
+
+    child = projector.project(_native(
+        7,
+        "assistant/message",
+        {"message": {"content": [
+            {"type": "reasoning", "text": "inspect records"},
+            {"type": "text", "text": "worker evidence"},
+        ]}},
         session="renamed-worker-session",
         depth=1,
     ))
@@ -119,18 +171,60 @@ def test_native_root_and_child_streams_preserve_authority_boundaries():
     assert child[0].data["parent_run_id"] == root
 
     native_end = projector.project(_native(
-        5, "turn/end", {"reason": {"kind": "completed"}}
+        8, "turn/end", {"reason": {"kind": "completed"}}
     ))
     assert native_end[0].data["event_type"] == "run.progress"
     assert native_end[0].data["payload"]["stage"] == "native_turn_settled"
 
     terminal = projector.project({
-        "seq": 6,
+        "seq": 9,
         "event": {"type": "chatds.supervisor.terminal", "status": "succeeded"},
     })
     assert [event.kind for event in terminal] == ["agent_event", "finish"]
     assert terminal[0].data["event_type"] == "run.completed"
     assert terminal[0].data["payload"]["authoritative"] is True
+
+
+def test_high_frequency_native_deltas_commit_only_complete_semantic_steps():
+    projector = DeepSeekEventProjector("c" * 32)
+    for seq in range(1, 5_001):
+        assert projector.project(_native(
+            seq,
+            "assistant/chunk",
+            {"chunk": {"type": "reasoning-delta", "text": "x"}},
+        )) == ()
+
+    committed = projector.project(_native(
+        5_001,
+        "assistant/chunk",
+        {"chunk": {
+            "type": "block-end",
+            "block": {"type": "reasoning", "text": "warehouse conclusion"},
+        }},
+    ))
+    assert [(event.kind, event.data["text"]) for event in committed] == [
+        ("reasoning", "warehouse conclusion")
+    ]
+
+    for seq in range(5_002, 10_002):
+        assert projector.project(_native(
+            seq,
+            "assistant/chunk",
+            {"chunk": {"type": "text-delta", "text": "y"}},
+            session="museum-worker",
+            depth=1,
+        )) == ()
+    child_step = projector.project(_native(
+        10_002,
+        "assistant/message",
+        {"message": {"content": [
+            {"type": "text", "text": "museum result"},
+        ]}},
+        session="museum-worker",
+        depth=1,
+    ))
+    assert len(child_step) == 1
+    assert child_step[0].data["payload"]["preview"] == "museum result"
 
 
 def test_native_approval_audit_is_not_a_second_actionable_card():
@@ -464,6 +558,20 @@ def test_native_session_inputs_import_once_then_preserve_exact_turn():
         [{"role": "user", "content": "Audit the factory line"}],
         "Audit the factory line",
     ) == ("Audit the factory line", "Audit the factory line")
+
+
+def test_fresh_primary_skill_is_lowered_to_native_invocation_and_rename_safe():
+    prompt = "Inspect the warehouse receipts"
+    bound = bind_native_primary_skill(prompt, "warehouse-audit")
+    assert bound == "/warehouse-audit\nInspect the warehouse receipts"
+    assert bind_native_primary_skill(bound, "warehouse-audit") == bound
+    assert bind_native_primary_skill(
+        "Review /museum-catalog before acting",
+        "museum-catalog",
+    ) == "Review /museum-catalog before acting"
+    assert bind_native_primary_skill(prompt, None) == prompt
+    with pytest.raises(NativeSessionInputError, match="Skill identity"):
+        bind_native_primary_skill(prompt, "unsafe skill")
 
 
 def test_native_turn_payload_is_exact_and_rejects_identity_mutation():

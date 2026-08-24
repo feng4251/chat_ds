@@ -3114,7 +3114,8 @@ async def get_turn_activity_events(
     root_run_id: str | None = Query(default=None, max_length=32),
     after: int = Query(default=0, ge=0),
     offset: int = Query(default=0, ge=0),
-    limit: int = Query(default=1000, ge=1, le=2000),
+    limit: int = Query(default=1000, ge=1, le=5000),
+    tail: bool = False,
     user=Depends(get_current_user),
     db=Depends(get_db),
 ):
@@ -3125,6 +3126,11 @@ async def get_turn_activity_events(
         raise HTTPException(
             400,
             "The after cursor is root-run scoped; use offset for a Session replay",
+        )
+    if tail and (root_run_id is not None or after or offset):
+        raise HTTPException(
+            400,
+            "Tail replay is a Session-wide initial window without cursors",
         )
     query = select(TurnActivityEvent).where(
         TurnActivityEvent.conversation_id == cid,
@@ -3144,16 +3150,25 @@ async def get_turn_activity_events(
             TurnActivityEvent.root_run_id == root_run_id,
             TurnActivityEvent.seq > after,
         )
+    chronological = (
+        TurnActivityEvent.event_time,
+        TurnActivityEvent.root_run_id,
+        TurnActivityEvent.seq,
+    )
     ordered = query.order_by(
-            TurnActivityEvent.event_time,
-            TurnActivityEvent.root_run_id,
-            TurnActivityEvent.seq,
-        )
-    if not root_run_id:
+        *(
+            tuple(column.desc() for column in chronological)
+            if tail else chronological
+        ),
+    )
+    if not root_run_id and not tail:
         ordered = ordered.offset(offset)
     rows = (await db.execute(ordered.limit(limit + 1))).scalars().all()
-    has_more = len(rows) > limit
+    window_exceeded = len(rows) > limit
     rows = rows[:limit]
+    if tail:
+        rows.reverse()
+    has_more = window_exceeded and not tail
     return {
         "events": [
             {
@@ -3172,9 +3187,11 @@ async def get_turn_activity_events(
             for row in rows
         ],
         "has_more": has_more,
+        "has_earlier": window_exceeded if tail else False,
         "next_after": rows[-1].seq if root_run_id and rows else None,
         "next_offset": (
-            offset + len(rows) if not root_run_id and rows else None
+            offset + len(rows)
+            if not root_run_id and not tail and rows else None
         ),
     }
 

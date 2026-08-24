@@ -21,9 +21,11 @@ import {
   conversationRequestWasAccepted,
   createConversationRequestScope,
   hydrateAgentRunCards,
+  markAcceptedLiveRun,
   observeConversationRequestRoute,
   recordAcceptedRunReceipt,
   runStatusPresentation,
+  settleAcceptedLiveRun,
   toolStatusPresentation,
   updateAgentRuns,
 } from '../utils/agentRunHydration'
@@ -87,7 +89,7 @@ function withClientStreamError(
       + (error?.message ? `\n连接信息：${error.message}` : '')
     )
     return {
-      ...message,
+      ...markAcceptedLiveRun(message, message?.rootRunId),
       content: current ? `${current}\n\n---\n${notice}` : notice,
       streaming: false,
     }
@@ -429,6 +431,7 @@ export default function ChatArea({
             : attachTurnActivities(
                 hydrateAgentRunCards(server, runCards),
                 activityResult.payload?.events || [],
+                { truncated: activityResult.payload?.truncated === true },
               )
         ))
         if (runCardResult.available) {
@@ -547,6 +550,7 @@ export default function ChatArea({
                 : attachTurnActivities(
                     hydrateAgentRunCards(server, runCards),
                     activities?.events || [],
+                    { truncated: activities?.truncated === true },
                   )
             ))
           }
@@ -569,6 +573,7 @@ export default function ChatArea({
                     : attachTurnActivities(
                         hydrateAgentRunCards(prev, runCards),
                         activities?.events || [],
+                        { truncated: activities?.truncated === true },
                       )
                 )
           ))
@@ -631,6 +636,7 @@ export default function ChatArea({
       setMsgs((prev) => attachTurnActivities(
         hydrateAgentRunCards(prev, runCards),
         activities.events || [],
+        { truncated: activities.truncated === true },
       ))
     } else {
       const server = await getMessages(convId)
@@ -646,6 +652,7 @@ export default function ChatArea({
           : attachTurnActivities(
               hydrateAgentRunCards(server, runCards),
               activities.events || [],
+              { truncated: activities.truncated === true },
             )
       ))
     }
@@ -930,8 +937,10 @@ export default function ChatArea({
             const u = [...p]
             const last = u[u.length - 1]
             if (!last || !last.streaming) return u
-            const updated = { ...last }
-            if (evt.run_id) updated.rootRunId = evt.run_id
+            let updated = { ...last }
+            if (evt.run_id) {
+              updated = markAcceptedLiveRun(updated, evt.run_id)
+            }
             if (evt.activity_event) {
               updated.activityNodes = applyTurnActivity(
                 updated.activityNodes || [],
@@ -968,7 +977,9 @@ export default function ChatArea({
       )
       if (requestOwnsCurrentView(requestScope)) {
         setMsgs((p) => p.map((m) => (
-          m.streaming ? { ...m, streaming: false } : m
+          m.streaming
+            ? settleAcceptedLiveRun({ ...m, streaming: false })
+            : m
         )))
       }
     } catch (err) {
@@ -1082,8 +1093,10 @@ export default function ChatArea({
             const u = [...p]
             const last = u[u.length - 1]
             if (!last || !last.streaming) return u
-            const updated = { ...last }
-            if (evt.run_id) updated.rootRunId = evt.run_id
+            let updated = { ...last }
+            if (evt.run_id) {
+              updated = markAcceptedLiveRun(updated, evt.run_id)
+            }
             if (evt.activity_event) {
               updated.activityNodes = applyTurnActivity(
                 updated.activityNodes || [],
@@ -1120,7 +1133,9 @@ export default function ChatArea({
       )
       if (requestOwnsCurrentView(requestScope)) {
         setMsgs((p) => p.map((m) => (
-          m.streaming ? { ...m, streaming: false } : m
+          m.streaming
+            ? settleAcceptedLiveRun({ ...m, streaming: false })
+            : m
         )))
       }
     } catch (err) {

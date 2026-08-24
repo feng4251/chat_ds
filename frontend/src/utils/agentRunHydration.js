@@ -4,6 +4,10 @@ const MAX_LIVE_RUN_PREVIEW_CHARS = 4000
 const MAX_LIVE_EVENT_KEYS = 256
 const MAX_LIVE_TOOL_ATTEMPTS = 24
 const MAX_LIVE_ARTIFACTS = 24
+export const LIVE_RUN_LIFECYCLE_NOTICE = (
+  '当前显示的是阶段性输出；原生任务与机器交付验收仍在执行。'
+  + '刷新页面不会中断后台任务。'
+)
 
 function bounded(value, limit = 128) {
   const text = String(value || '').trim()
@@ -124,6 +128,24 @@ export function recordAcceptedRunReceipt(scope, runId) {
   if (!scope || scope.cancelled || !runId) return scope
   if (!scope.acceptedRunId) scope.acceptedRunId = String(runId)
   return scope
+}
+
+export function markAcceptedLiveRun(message = {}, runId = '') {
+  if (!runId) return message
+  return {
+    ...message,
+    rootRunId: String(runId),
+    runActive: true,
+    lifecycleNotice: LIVE_RUN_LIFECYCLE_NOTICE,
+  }
+}
+
+export function settleAcceptedLiveRun(message = {}) {
+  return {
+    ...message,
+    runActive: false,
+    lifecycleNotice: undefined,
+  }
 }
 
 export function conversationRequestWasAccepted(scope) {
@@ -557,6 +579,7 @@ function durablePlaceholder(root, projectionTruncated = []) {
     reasoning: '',
     streaming: false,
     runActive: Boolean(root.active),
+    runStatus: root.status,
     lifecycleNotice: lifecycleNotice(root),
     durableRunPlaceholder: true,
     rootRunId: root.root_run_id,
@@ -607,7 +630,12 @@ export function hydrateAgentRunCards(messages = [], payload = {}) {
         ],
         rootRunId: root.root_run_id,
         runActive: Boolean(root.active),
-        lifecycleNotice: root.active ? lifecycleNotice(root) : undefined,
+        runStatus: root.status,
+        lifecycleNotice: (
+          root.active || root.status !== 'succeeded'
+            ? lifecycleNotice(root)
+            : undefined
+        ),
         projectionTruncated: projectionTruncated.length
           ? projectionTruncated
           : undefined,

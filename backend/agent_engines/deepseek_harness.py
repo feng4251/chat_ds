@@ -39,6 +39,20 @@ def _text_blocks(message: object) -> str:
     )
 
 
+def _reasoning_blocks(message: object) -> str:
+    if not isinstance(message, Mapping):
+        return ""
+    content = message.get("content")
+    if not isinstance(content, list):
+        return ""
+    return "".join(
+        str(block.get("text") or block.get("thinking") or "")
+        for block in content
+        if isinstance(block, Mapping)
+        and block.get("type") in {"reasoning", "thinking"}
+    )
+
+
 def deepseek_tool_result_call_id(message: object) -> str:
     """Extract DSH's stable call identity across native result shapes."""
 
@@ -234,34 +248,48 @@ class DeepSeekEventProjector:
             chunk = data.get("chunk")
             if isinstance(chunk, Mapping):
                 chunk_type = str(chunk.get("type") or "")
-                text = str(chunk.get("text") or "")
-                if text and chunk_type == "text-delta" and depth <= 0:
-                    projected.append(EngineStreamEvent(
-                        "content", {"text": text}, raw=dict(envelope)
-                    ))
-                elif text and chunk_type == "reasoning-delta" and depth <= 0:
-                    projected.append(EngineStreamEvent(
-                        "reasoning", {"text": text}, raw=dict(envelope)
-                    ))
-                elif text and depth > 0:
-                    # A child Session is observable workflow state, not a
-                    # second author of the root assistant message.  Preserve
-                    # a bounded preview on the child run card without
-                    # interleaving it into the user's final answer.
+                block = chunk.get("block")
+                if (
+                    chunk_type == "block-end"
+                    and depth <= 0
+                    and isinstance(block, Mapping)
+                ):
+                    block_type = str(block.get("type") or "")
+                    text = str(
+                        block.get("text") or block.get("thinking") or ""
+                    )
+                    if text and block_type == "text":
+                        projected.append(EngineStreamEvent(
+                            "content", {"text": text}, raw=dict(envelope)
+                        ))
+                    elif text and block_type in {"reasoning", "thinking"}:
+                        projected.append(EngineStreamEvent(
+                            "reasoning", {"text": text}, raw=dict(envelope)
+                        ))
+        elif native_type == "assistant/message":
+            message = data.get("message")
+            if depth > 0:
+                # Child output is workflow progress rather than a second root
+                # answer.  Project one complete native assistant step instead
+                # of persisting every provider token.
+                text = _text_blocks(message)
+                reasoning = _reasoning_blocks(message)
+                preview = text or reasoning
+                if preview:
                     projected.append(self._agent_event(
                         event_type="run.progress",
                         run_id=run_id,
                         seq=sub_seq,
                         payload={
-                            "stage": "assistant_reasoning"
-                            if chunk_type == "reasoning-delta"
-                            else "assistant_output",
-                            "preview": text[-2_000:],
+                            "stage": (
+                                "assistant_output"
+                                if text else "assistant_reasoning"
+                            ),
+                            "preview": preview[-2_000:],
                         },
                         depth=depth,
                         session_id=session_id,
                     ))
-        elif native_type == "assistant/message":
             usage = data.get("usage")
             if depth <= 0 and isinstance(usage, Mapping):
                 input_tokens = int(usage.get("inputTokens") or usage.get("input_tokens") or 0)

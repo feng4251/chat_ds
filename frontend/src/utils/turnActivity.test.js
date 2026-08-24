@@ -172,6 +172,42 @@ test('authoritative root terminal never leaves an unmatched tool executing', () 
   assert.equal(nodes.find((node) => node.kind === 'tool').status, 'failed')
 })
 
+test('later provider failure does not rewrite an already completed tool', () => {
+  const nodes = reduceTurnActivities([
+    event(1, 'tool:write', 'tool', {
+      event: {
+        event_type: 'tool.started',
+        run_id: 'root',
+        root_run_id: 'root',
+        tool_name: 'RenamedWarehouseWrite',
+        tool_call_id: 'write-call',
+      },
+    }),
+    event(2, 'tool:write', 'tool', {
+      event: {
+        event_type: 'tool.completed',
+        run_id: 'root',
+        root_run_id: 'root',
+        tool_name: 'RenamedWarehouseWrite',
+        tool_call_id: 'write-call',
+      },
+    }),
+    event(3, 'workflow:root', 'workflow', {
+      event: {
+        event_type: 'run.failed',
+        run_id: 'root',
+        root_run_id: 'root',
+        payload: {
+          authoritative: true,
+          error: 'provider_transport_reset',
+        },
+      },
+    }),
+  ])
+  assert.equal(nodes.find((node) => node.kind === 'tool').status, 'succeeded')
+  assert.equal(nodes.find((node) => node.kind === 'workflow').status, 'failed')
+})
+
 test('durable assistant joins activities only by exact root run identity', () => {
   const messages = [
     { id: 'a', role: 'assistant', run_id: 'root', content: 'fallback' },
@@ -183,6 +219,23 @@ test('durable assistant joins activities only by exact root run identity', () =>
   ])
   assert.equal(attached[0].activityNodes[0].text, 'exact')
   assert.equal(attached[1].activityNodes, undefined)
+})
+
+test('bounded tail replay marks only the exact attached assistant as truncated', () => {
+  const attached = attachTurnActivities([
+    {
+      role: 'assistant', durableRunPlaceholder: true,
+      rootRunId: 'root', runActive: true, content: '',
+    },
+    {
+      role: 'assistant', durableRunPlaceholder: true,
+      rootRunId: 'another', runActive: true, content: '',
+    },
+  ], [
+    event(8, 'content:tail', 'content', { text: 'newest window' }),
+  ], { truncated: true })
+  assert.equal(attached[0].activityTruncated, true)
+  assert.equal(attached[1].activityTruncated, undefined)
 })
 
 test('refresh ignores an unsealed terminal timeline but replays active exact placeholder', () => {

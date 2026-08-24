@@ -157,7 +157,7 @@ export function reduceTurnActivities(events = []) {
     .reduce(applyTurnActivity, [])
 }
 
-export function attachTurnActivities(messages = [], events = []) {
+export function attachTurnActivities(messages = [], events = [], options = {}) {
   const byRun = new Map()
   const committed = new Set(
     events
@@ -187,6 +187,7 @@ export function attachTurnActivities(messages = [], events = []) {
           ...message,
           rootRunId: key,
           activityNodes: byRun.get(key),
+          activityTruncated: options.truncated === true || undefined,
         }
       : message
     )

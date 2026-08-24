@@ -1494,16 +1494,21 @@ def test_startup_reconcile_failure_is_safely_wrapped(
 
     async def scenario() -> None:
         with (
-                patch.object(
-                    backend_main,
-                    "init_db",
-                    new=AsyncMock(),
-                ),
-                patch.object(
-                    backend_main,
-                    "revoke_stale_native_runs_on_backend_startup",
-                    new=AsyncMock(return_value=0),
-                ),
+            patch.object(
+                backend_main,
+                "init_db",
+                new=AsyncMock(),
+            ),
+            patch.object(
+                backend_main,
+                "revoke_stale_native_runs_on_backend_startup",
+                new=AsyncMock(return_value=0),
+            ),
+            patch.object(
+                backend_main,
+                "reconcile_deferred_native_agent_runs",
+                new=AsyncMock(return_value=0),
+            ),
             patch.object(
                 backend_main,
                 "reconcile_orphan_session_workspaces",

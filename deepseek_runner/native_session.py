@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
 class NativeSessionInputError(ValueError):
     """The current browser Turn cannot be bound to one native Session input."""
+
+
+SAFE_SKILL_NAME = re.compile(r"[A-Za-z0-9._-]{1,128}")
 
 
 def _message_text(content: Any) -> str:
@@ -57,3 +61,25 @@ def native_turn_prompts(
             "DeepSeek Harness initial Session input is empty"
         )
     return initial_prompt, requested_text
+
+
+def bind_native_primary_skill(
+    initial_prompt: str,
+    skill_name: str | None,
+) -> str:
+    """Lower one selected Skill to DSH's native fresh-Session gesture.
+
+    The native Session driver chooses ``initial_prompt`` only when no durable
+    Session state exists, so this binding is neither a control prompt nor a
+    replayed resume instruction.  DSH remains responsible for loading and
+    executing the Skill through its own tool graph.
+    """
+
+    if skill_name is None:
+        return initial_prompt
+    if SAFE_SKILL_NAME.fullmatch(skill_name) is None:
+        raise NativeSessionInputError("DeepSeek Harness Skill identity is invalid")
+    invocation = f"/{skill_name}"
+    if re.search(rf"(?<!\S){re.escape(invocation)}(?!\S)", initial_prompt):
+        return initial_prompt
+    return f"{invocation}\n{initial_prompt}"

@@ -33,7 +33,11 @@ from .control_decisions import (
     lower_native_question_answer,
 )
 from .event_stream import read_event_tail
-from .native_session import NativeSessionInputError, native_turn_prompts
+from .native_session import (
+    NativeSessionInputError,
+    bind_native_primary_skill,
+    native_turn_prompts,
+)
 from .native_workflow import compile_deepseek_workflow_projection
 from .terminal_receipts import append_terminal, terminal_receipt, terminal_status
 from native_security.workflow_contract import compile_turn_workflow_contract
@@ -334,6 +338,10 @@ class Manager:
                 if len(selected_primary) == 1
                 and isinstance(selected_primary[0], str)
                 else None
+            )
+            initial_prompt = bind_native_primary_skill(
+                initial_prompt,
+                bound_skill_name,
             )
             workflow_contract = compile_turn_workflow_contract(
                 manifest=receipt.manifest,

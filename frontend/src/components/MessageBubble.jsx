@@ -334,7 +334,11 @@ export function MessageBubble({ msg, onRegenerate, onApproval }) {
               'mb-2 rounded-xl border px-3 py-2 text-xs ' +
               (msg.runActive
                 ? 'border-indigo-200 bg-indigo-50 text-indigo-700'
-                : 'border-slate-200 bg-slate-50 text-slate-600')
+                : msg.runStatus === 'failed'
+                  ? 'border-red-200 bg-red-50 text-red-700'
+                  : ['cancelled', 'degraded'].includes(msg.runStatus)
+                    ? 'border-amber-200 bg-amber-50 text-amber-700'
+                    : 'border-slate-200 bg-slate-50 text-slate-600')
             }>
               {msg.lifecycleNotice}
               {msg.runActive && <span className="ml-1 animate-pulse">…</span>}
@@ -351,10 +355,17 @@ export function MessageBubble({ msg, onRegenerate, onApproval }) {
             </div>
           )}
 
+          {msg.activityTruncated && (
+            <div className="mb-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
+              本次执行记录很大，当前只恢复最近的有界时间窗口；更早的原生审计记录仍保存在后台，
+              任务终态以机器运行与交付验收结果为准。
+            </div>
+          )}
+
           {hasActivityTimeline ? (
             <TurnTimeline
               nodes={msg.activityNodes}
-              streaming={Boolean(msg.streaming)}
+              streaming={Boolean(msg.streaming || msg.runActive)}
               onApproval={onApproval}
             />
           ) : isError ? (

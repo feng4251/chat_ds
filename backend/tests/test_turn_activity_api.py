@@ -79,6 +79,41 @@ class TurnActivityIsolationTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(result["events"][0]["payload"]["text"], "cross-domain")
 
+    async def test_session_tail_replay_is_one_bounded_newest_window(self):
+        async with self.sessions() as db:
+            db.add_all([
+                TurnActivityEvent(
+                    id=f"{seq:032x}",
+                    user_id=self.owner.id,
+                    conversation_id=self.conversation_id,
+                    root_run_id=self.run_id,
+                    run_id=self.run_id,
+                    seq=seq,
+                    node_id=f"content:{seq}",
+                    kind="content",
+                    operation="append",
+                    payload=json.dumps({"text": f"window-{seq}"}),
+                )
+                for seq in range(2, 7)
+            ])
+            await db.commit()
+            result = await workspace_router.get_turn_activity_events(
+                self.conversation_id,
+                root_run_id=None,
+                after=0,
+                offset=0,
+                limit=2,
+                tail=True,
+                user=self.owner,
+                db=db,
+            )
+        self.assertEqual(
+            [event["seq"] for event in result["events"]],
+            [5, 6],
+        )
+        self.assertTrue(result["has_earlier"])
+        self.assertFalse(result["has_more"])
+
     async def test_other_user_cannot_read_or_infer_the_session(self):
         async with self.sessions() as db:
             with self.assertRaises(HTTPException) as raised:

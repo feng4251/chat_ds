@@ -243,10 +243,23 @@ export async function getRunEvents(convId, runId, params = {}) {
 }
 
 export async function getTurnActivities(convId, options = {}) {
-  const pageSize = Math.min(2000, Math.max(1, options.limit || 2000))
+  const pageSize = Math.min(5000, Math.max(1, options.limit || 5000))
   const maximum = Math.min(50000, Math.max(pageSize, options.maximum || 50000))
   const events = []
   const rootRunId = options.rootRunId || ''
+  if (!rootRunId && options.tail !== false) {
+    const search = new URLSearchParams({
+      limit: String(pageSize),
+      tail: 'true',
+    })
+    const res = await request(`/conversations/${convId}/activity-events?${search}`)
+    const page = await res.json()
+    return {
+      events: page.events || [],
+      truncated: Boolean(page.has_earlier),
+      hasEarlier: Boolean(page.has_earlier),
+    }
+  }
   let cursor = Math.max(0, options.after || 0)
   while (events.length < maximum) {
     const search = new URLSearchParams({
@@ -262,7 +275,11 @@ export async function getTurnActivities(convId, options = {}) {
     if (!page.has_more || next == null) break
     cursor = next
   }
-  return { events, truncated: events.length >= maximum }
+  return {
+    events,
+    truncated: events.length >= maximum,
+    hasEarlier: false,
+  }
 }
 
 export async function decideTurnApproval(

@@ -2147,3 +2147,79 @@ terminal、业务 fixture workaround。DeepSeek 上游仓库仅作为不可修�
   其中 191 succeeded、10 failed、0 running；workflow root failed、9 children cancelled。tool repair 首次修复
   519 条，terminal repair 首次修复 70 条，独立进程复查剩余 0。`3b92...` 保持 failed。该闭环计作通用
   compiler/lifecycle/evidence/UI repair iteration，但不消费 Round 18 的独立 E2E 名额。
+
+## 2026-08-24 四会话原生适配压力闭环（修复前冻结）
+
+本节以 `ce2348...`、`05bd42...` 两个已终止会话为主要失败样本，并以 `54bd48...`、`b58f7f...`
+两个仍在运行的会话作为传输与投影压力参照；不重放模型任务，不计作新的 V2.3 E2E round。四者绑定同一个
+不可变 Skill view `9aee2a0596eff2e78c48c615332e70ed3d82abc9539b701663ea7076af96d7b8`，因此归因同时冻结了
+持久对话、exact Skill/route、AgentRun/debug 与原生 runner ledger，而不是从网页错误字符串反推。
+
+### 通用不变量与确定性复现目标
+
+1. exactly-one selected primary Skill 必须在新鲜原生 Session 的第一条用户输入中通过上游公开的原生
+   invocation gesture 加载；resume 只能发送本轮原文，不能重放 gesture 或注入第二套控制 prompt。
+2. token delta 是高频瞬时传输，不是持久业务节点。ChatDS 保留 lossless native ledger，但安全网页投影只在
+   完整 semantic block、完整 child assistant step、稳定 tool call identity 和 authoritative terminal 处落盘；
+   中途断流不得把未闭合 block 伪装成 durable content。
+3. 模型结束语、成功 Write 或“自检通过”均不能结算整个任务；workflow/artifact machine receipt 与 supervisor
+   terminal 才是控制面事实。工具 started/completed 必须以同一 call identity 原位更新。
+4. 大型 Session 的首次网页恢复必须是一个有界的最新窗口，并明确标注更早记录被折叠；增量恢复继续使用
+   root-scoped high-water。不能从 offset 0 反复读取数万行而阻塞 terminal 投影。
+
+唯一成熟实现参考冻结为本地 `claude-code/` commit
+`6f6f12b37f529488b10e53928dd5508bb93535c7`。`src/services/api/claude.ts` 在
+`content_block_stop` 形成完整 AssistantMessage；`src/utils/sessionStorage.ts` 将 per-chunk Bash/MCP progress
+明确视为 ephemeral、排除出 durable parent chain；tool result 使用原 `tool_use_id`，terminal 前保留原生 drain。
+本轮 **adapt** 这些 semantic checkpoint、stable identity 和 bounded replay 模式到 ChatDS 既有 raw ledger、
+TurnActivity 与 receipt authority；**reject** 修改 Claude Code/DeepSeek Harness 原生 loop、复制重试/compaction、
+从模型 prose 推断 terminal 或加入任何 Skill/疾病/报告文件特判。
+
+### 四会话三源归因
+
+- `ce2348...` 的 Claude root `34b75d42792f44e9b14b7672f0e0a23d` 已唯一终止为
+  `failed/artifact_contract_failed`。最后一次 `Write(08_safety_risk_management.md)` 有原生成功 result；其后
+  SHAiEngine provider 请求连续 10 次 Claude-owned retry，最终 `ECONNRESET/Unable to connect to API`。
+  Workspace 只有 01–08 等草稿，缺 09–11、checklist 和 full report。首因是外部 provider transport reset，
+  artifact failure 是正确的后置 machine gate；没有 Write/Bash 沙箱拒绝、Skill 解析或 Claude core 缺陷。
+- `05bd42...` 的 DSH root `2c6a98c1aa204cfeac7701334bdde65e` 原生账本第 413,936 条已唯一 sealed
+  `failed/artifact_contract_failed`，原生容器已退出且 `container_id=null`。8 个声明 worker 均成功；但 fresh
+  root 输入只有 64 字符用户原文，没有选中 primary Skill 的原生 invocation，于是 root 先合成一个 59,582-byte
+  单文件并假称完成。artifact gate 拒绝后它才调用 `skill` 修复为 11 模块、README、checklist 和
+  `GAL3_AD_FULL_REPORT.md`；最终 131,589 bytes/2,006 lines，仍低于编译合同 153,600 bytes，receipt 精确报
+  `artifact_min_bytes_not_met`。模型自述“>100 KB PASS”不能覆盖 machine contract。
+- `54bd48...` 的运行中快照 root `fcc892d2ff814f7095b0273a2c0b9e45` 共有 12 个 child attempt：2 completed、
+  5 次 local AgentModel SSE transport error、2 次模型生成 malformed tool JSON，另 3 个 attempt 尚未结算；
+  child provider retry 49 次。`10.10.132.2:1025` 当时 3 个 engine running、0 waiting、0 preemption，说明 endpoint
+  可达但长流不稳定；不存在 ChatDS sandbox 或 native workflow loop 被拒绝的证据。
+- `b58f7f...` 的运行中快照 root `216cac379072486db9987f4fe9461987` 已启动 14 个 child attempt，13 个均因
+  `10.10.132.126:1025` stream transport error 结束，1 个仍在运行；child retry 97 次、root retry 1 次。
+  同期 vLLM 有 3 running、1 capacity waiting，累计 error 47，分类为 provider capacity/stream 边界而非 Skill、
+  Workspace 或 DSH core。
+- 压力缺陷是 ChatDS 派生面：`05bd42...` 的 lossless native ledger 413,936 条，而 DB index 在原生终止后仍仅约
+  7.8 万条并错误显示 running；`54bd48...`、`b58f7f...` 也分别存在约 1.2 万与 2.2 万条投影差距。旧 projector
+  把每个 child token delta 变成 `run.progress`，activity path 又 `force=True` 每条 commit，Frontend 首次打开再从
+  offset 0 分页最多 50,000 条；这三处共同造成网页碎片化、终态迟到和“像提前中断”。
+
+### 仅 ChatDS-owned 的通用修复
+
+- DeepSeek Supervisor adapter 对 exactly-one selected primary Skill 只在 `initial_prompt` 前 lowering 原生
+  `/{skill-name}` gesture；native Session driver 只在 fresh state 选择该字段，resume 的 `turn_prompt` 保持用户原文。
+  没有第二套 agent prompt/loop，也未修改 nested DSH。
+- DSH projector 忽略 presentation 层 token delta，在 native `block-end` 投影 root 完整 reasoning/text block，在
+  child `assistant/message` 投影一次 bounded step preview；raw envelope 仍全部进入 lossless ledger/index。raw index
+  改为 500-event/4-MiB 有界 batch，并以 monotonic native seq 去重；terminal 强制 barrier。activity 不再对每个
+  progress 强制 transaction，只对 authoritative terminal 等边界立即 flush。
+- Session-wide activity 初始恢复改为一次最多 5,000 条的 newest tail window，按原时间序恢复并返回
+  `has_earlier`；active root 的后续增量仍使用 exact root high-water。Frontend 明确提示历史窗口折叠。
+- Live run 一收到 `run_id` 就标明“阶段性输出/机器验收仍执行”；failed terminal 使用红色机器终态提示。
+  同一 tool call 的 completed 仍原位替换 started，后续 provider failure 不会把已成功 Write 改写为失败；但
+  root workflow 会独立显示失败。
+
+通用回归使用 warehouse/museum rename 和 10,000-token failure injection，不引用 V2.3、疾病、会话、route、
+worker 数或报告名：未闭合 delta 产生 0 个 durable presentation 节点，完整 block/assistant step 各产生 1 个；
+fresh Skill gesture 不重复，resume 不受影响；tail 只返回 newest bounded window；provider reset 后既有成功 tool
+保持 succeeded、root 独立 failed。完整 Backend 为 `387 passed, 119 warnings, 2 subtests`，完整 Frontend 为
+`56 passed`；Vite production build 成功，修改文件的 ESLint 全通过。warnings 是既有 passlib/
+`datetime.utcnow()` deprecation；完整 Frontend lint 仍只有既有 `ModelSelector.jsx`、`SkillLibrary.jsx` 两处
+effect 内同步 setState 错误，与本轮 diff 无关。尚未在两个参照 run 活动期间重启或切换生产服务。
