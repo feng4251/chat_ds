@@ -2223,3 +2223,25 @@ fresh Skill gesture 不重复，resume 不受影响；tail 只返回 newest boun
 `56 passed`；Vite production build 成功，修改文件的 ESLint 全通过。warnings 是既有 passlib/
 `datetime.utcnow()` deprecation；完整 Frontend lint 仍只有既有 `ModelSelector.jsx`、`SkillLibrary.jsx` 两处
 effect 内同步 setState 错误，与本轮 diff 无关。尚未在两个参照 run 活动期间重启或切换生产服务。
+
+### 生产部署与线上复验
+
+- 用户随后明确放弃等待两个参照 run，并授权立即部署。ChatDS 先经原生 Supervisor cancel API 收口：
+  `54bd48...` root `fcc892d2...` 在 seq 83,287 写入唯一 `cancelled` terminal，`b58f7f...` root
+  `216cac37...` 在 seq 37,722 写入唯一 `cancelled` terminal；两容器均退出，未强杀、未制造 success。
+- 切换前保留 Backend、Frontend、DeepSeek Supervisor 的
+  `rollback-pre-7d9f12f9` tags。生产只切换这三个 ChatDS-owned 组件；Claude Supervisor、Claude Turn
+  image、DeepSeek Harness Turn image、SearXNG、egress proxy、数据库卷和 Session workspace 均未重建。
+- 生产 Backend 为 `sha256:ac828fa2...`、Frontend 为 `sha256:6e9c1d45...`、DeepSeek Supervisor 为
+  `sha256:a5af4870...`；三者 revision 均为 `7d9f12f9`、restart 0，Backend/Supervisor healthy。
+  `127.0.0.1`、`10.10.132.126`、`172.30.100.126` 三入口 `/` 与 `/api/health` 均为 200，Frontend
+  build entry 均为 `/assets/index-l8V9nsyn.js`。
+- Backend startup 从 Supervisor receipts 恢复了旧投影：生产数据库 nonterminal AgentRun 为 0；
+  `ce2348...`、`05bd42...` 为 failed，`54bd48...`、`b58f7f...` 为 cancelled；SQLite
+  `quick_check=ok`、外键违规 0。四个 Session 的线上 activity tail 均以一个请求返回最新 10 条、
+  `has_earlier=true`、`has_more=false`，未再从 offset 0 扫描完整历史。
+- 项目内部网络的 SearXNG 实际 JSON 查询为 200/10 results。无头 Chromium 精确打开
+  `/chat/05bd42...`：`#root` 非空、未回登录页、0 Runtime exception、0 console error、0 个“执行中”标签；
+  新 Frontend 首屏与大历史 Session hydration 可用。没有自动启动新的模型重型 V2.3；用户将用新 Session
+  重新执行。外部 Provider reset/malformed output 仍可能发生，本轮保证的是正确恢复、终态和呈现，
+  不把上游可用性虚报成已被 Harness 消除。

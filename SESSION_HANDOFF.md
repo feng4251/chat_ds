@@ -3621,14 +3621,23 @@ Round 17 的两个全新 case。不得复用
   isolated import/config smoke. Neither `deepseek-harness-clean/` commit
   `47f943859bef60e4160492346772ded9b24f765a` nor `claude-code/` commit
   `6f6f12b37f529488b10e53928dd5508bb93535c7` was changed or rebuilt.
-- Deployment is intentionally pending: roots `fcc892d2...` (`54bd48...`) and
-  `216cac37...` (`b58f7f...`) still had live native Turn containers at the last
-  check. Restarting Backend before their authoritative terminal would execute
-  its safety cancellation path. After both drain, tag the three current images
-  as rollback points, switch only Backend/Frontend/DeepSeek Supervisor to the
-  three candidates, then verify health, frontend entry, bounded activity tail,
-  terminal recovery, restart counts, and exact image revisions. Do not rebuild
-  or switch either native Turn image.
+- Deployment completed after the user explicitly authorized abandoning the two
+  live reference Turns. Both were closed through the native Supervisor cancel
+  API and received exactly one `cancelled` terminal before their containers
+  exited. Backend, Frontend, and DeepSeek Supervisor now run the `7d9f12f9`
+  candidates (`sha256:ac828fa2...`, `sha256:6e9c1d45...`,
+  `sha256:a5af4870...`); all carry revision `7d9f12f9`, restart 0, and the two
+  health-checked services are healthy. Rollback tags are
+  `rollback-pre-7d9f12f9`. Neither native Turn image was rebuilt or switched.
+- Post-deployment proof: all three Frontend entry coordinates return `/` and
+  `/api/health` 200 with `/assets/index-l8V9nsyn.js`; SQLite quick-check is OK,
+  foreign-key violations and nonterminal AgentRuns are zero; the four diagnosed
+  roots reconcile to two failed and two cancelled terminals. Authenticated
+  production tail queries are bounded and expose `has_earlier`; internal
+  SearXNG returns real results. Headless Chromium loaded the large `05bd42...`
+  Session without a white screen, Runtime exception, console error, or stale
+  running tool label. A new user-driven model E2E remains the next acceptance
+  action; upstream transport availability is not claimed as repaired.
 - The two protected tracked deletions above remain unstaged. Existing
   untracked Session/runtime/reference directories are user/runtime state and
   must not be bulk-added or cleaned.
