@@ -3641,3 +3641,10 @@ Round 17 的两个全新 case。不得复用
 - The two protected tracked deletions above remain unstaged. Existing
   untracked Session/runtime/reference directories are user/runtime state and
   must not be bulk-added or cleaned.
+- GitHub synchronization is complete at
+  `https://github.com/feng4251/chat_ds`, branch
+  `fix/native-adapter-production-20260824`. The pushed tip was verified equal
+  to local HEAD. The pre-existing remote branch
+  `fix/generic-skill-harness-20260717` has an unrelated rewritten history (no
+  common merge-base), so it was deliberately neither force-pushed nor merged;
+  the local branch now tracks the new production branch.
