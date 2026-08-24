@@ -394,7 +394,13 @@ def evaluate_workflow_hook(
         native_agent_type = str(tool_input.get("subagent_type") or "")
         phase_index, worker = _required_worker(normalized, native_agent_type)
         if worker is None:
-            return {}
+            if current["status"] == "passed":
+                return {}
+            return _deny(_frontier_feedback(
+                current,
+                "Optional root subagents cannot start before the mandatory "
+                "workflow frontier passes.",
+            ))
         frontier = current["frontier_index"]
         worker_receipt = next(
             row
@@ -415,11 +421,41 @@ def evaluate_workflow_hook(
         return {}
     if tool_name in {"Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"}:
         if _tool_targets_declared_artifact(tool_name, tool_input, artifact_contracts):
-            return _deny(
+            return _deny(_frontier_feedback(
+                current,
                 "Declared artifact synthesis is gated until every mandatory "
-                f"workflow phase passes (frontier={current['frontier_index']})."
-            )
+                "workflow phase passes.",
+            ))
     return {}
+
+
+def _frontier_feedback(receipt: dict[str, Any], prefix: str) -> str:
+    frontier = int(receipt["frontier_index"])
+    phases = receipt["phases"]
+    workers: list[dict[str, str]] = []
+    if frontier < len(phases):
+        workers = [
+            {
+                "native_agent_type": str(worker["native_agent_type"]),
+                "status": str(worker["status"]),
+            }
+            for worker in phases[frontier]["workers"]
+        ]
+    rendered = json.dumps(
+        workers,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if len(rendered) > 24_000:
+        rendered = rendered[:24_000]
+    return (
+        f"{prefix} frontier={frontier}. Do not retry the blocked tool. "
+        "For each missing or failed entry, call the native Agent tool with "
+        "subagent_type exactly equal to native_agent_type; await entries "
+        f"already running. Current phase: {rendered}"
+    )
 
 
 def _required_worker(

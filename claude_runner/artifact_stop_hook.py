@@ -86,6 +86,7 @@ def evaluate_stop_hook(
     *,
     hook_input: object,
     contract: dict[str, Any],
+    before_content_sha256: dict[str, str] | None = None,
     workspace_root: Path,
 ) -> dict[str, Any]:
     """Return one native block decision, then defer to the terminal gate."""
@@ -109,6 +110,7 @@ def evaluate_stop_hook(
         invoked_skill_names=frozenset(),
         bound_skill_name=str(contract["skill_name"]),
         before=_workspace_before(contract),
+        before_content_sha256=before_content_sha256,
         after=_workspace_snapshot(workspace_root),
         workspace_root=workspace_root,
     )

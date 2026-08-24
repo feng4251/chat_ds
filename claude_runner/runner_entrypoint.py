@@ -67,6 +67,7 @@ MAX_WORKSPACE_ARTIFACT_TOTAL_BYTES = 8 * 1024 * 1024 * 1024
 MAX_WORKSPACE_RELATIVE_PATH_BYTES = 1024
 MAX_ARTIFACT_CONTRACTS = 64
 MAX_ARTIFACT_CONTRACT_FINDINGS = 128
+MAX_WORKFLOW_SYNTHESIS_BASELINE_BYTES = 96 * 1024 * 1024
 WORKSPACE_LOCK_IDENTITY_DOMAIN = b"chatds-workspace-mutation-lock-v1\0"
 SAFE_SESSION_ID = re.compile(r"^[0-9a-f]{32}$")
 SAFE_NATIVE_TASK_ID = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
@@ -108,6 +109,7 @@ SAFE_CONTROLLER_RUNTIME_CODES = frozenset({
     "artifact_contract_audit_failed",
     "artifact_contract_runtime_root_invalid",
     "workflow_contract_invalid",
+    "workflow_synthesis_baseline_invalid",
     "native_cron_state_invalid",
     "egress_bridge_did_not_stop",
     "input_attachment_count_invalid",
@@ -137,6 +139,8 @@ def main() -> int:
     pending_plan_task_count: int | None = None
     artifact_contract_receipt: dict[str, Any] | None = None
     workflow_terminal_receipt: dict[str, Any] | None = None
+    workflow_artifact_baseline_required = False
+    active_workflow_artifact_contracts: list[dict[str, Any]] = []
     if os.geteuid() != 0:
         return _fatal("runner_controller_not_root")
     try:
@@ -202,14 +206,44 @@ def main() -> int:
         native_lifecycle_contract_path: Path | None = None
         if config.get("workflow_contract") is not None:
             controller_stage = "workflow_contract_bind"
+            try:
+                normalized_workflow = validate_workflow_contract(
+                    config["workflow_contract"]
+                )
+            except ValueError as exc:
+                raise RuntimeError("workflow_contract_invalid") from exc
+            active_workflow_artifact_contracts = (
+                _active_artifact_contract_rows(
+                    config=config,
+                    skill_name=str(normalized_workflow["skill_name"]),
+                )
+            )
+            workflow_artifact_baseline_required = bool(
+                active_workflow_artifact_contracts
+            )
             ledger.bind_native_task_state(
                 projects_root=Path("/state/home/.claude/projects"),
                 native_session_id=str(config["native_session_id"]),
             )
             ledger.bind_workflow_contract(
-                contract=config["workflow_contract"],
+                contract=normalized_workflow,
                 receipt_path=Path("/runtime/workflow-receipt.json"),
                 worker_gid=worker_gid,
+                synthesis_baseline_path=(
+                    Path("/runtime/workflow-synthesis-baseline.json")
+                    if workflow_artifact_baseline_required
+                    else None
+                ),
+                workspace_root=(
+                    Path("/workspace")
+                    if workflow_artifact_baseline_required
+                    else None
+                ),
+                synthesis_artifact_contracts=(
+                    active_workflow_artifact_contracts
+                    if workflow_artifact_baseline_required
+                    else None
+                ),
             )
         worker_tmp = runtime_root / "tmp"
         worker_tmp.mkdir(mode=0o700)
@@ -357,6 +391,22 @@ def main() -> int:
             }, channel="controller")
             if workflow_contract_passed:
                 controller_stage = "artifact_contract_audit"
+                artifact_audit_before = workspace_before
+                artifact_content_before: dict[str, str] | None = None
+                if workflow_artifact_baseline_required:
+                    synthesis_baseline = ledger.workflow_synthesis_baseline
+                    synthesis_content = (
+                        ledger.workflow_synthesis_content_sha256
+                    )
+                    if (
+                        synthesis_baseline is None
+                        or synthesis_content is None
+                    ):
+                        raise RuntimeError(
+                            "workflow_synthesis_baseline_invalid"
+                        )
+                    artifact_audit_before = synthesis_baseline
+                    artifact_content_before = synthesis_content
                 artifact_contract_receipt = _validate_artifact_contracts(
                     contracts=config.get("artifact_contracts"),
                     invoked_skill_names=ledger.invoked_skill_names,
@@ -365,7 +415,8 @@ def main() -> int:
                         if turn_skill_binding is not None
                         else None
                     ),
-                    before=workspace_before,
+                    before=artifact_audit_before,
+                    before_content_sha256=artifact_content_before,
                     after=workspace_after,
                     workspace_root=Path("/workspace"),
                 )
@@ -605,6 +656,15 @@ class EventLedger:
         self._workflow_contract: dict[str, Any] | None = None
         self._workflow_receipt_path: Path | None = None
         self._workflow_receipt_gid: int | None = None
+        self._workflow_synthesis_baseline_path: Path | None = None
+        self._workflow_synthesis_workspace_root: Path | None = None
+        self._workflow_synthesis_artifact_contracts: (
+            list[dict[str, Any]] | None
+        ) = None
+        self._workflow_synthesis_baseline: (
+            dict[str, tuple[int, ...]] | None
+        ) = None
+        self._workflow_synthesis_content_sha256: dict[str, str] | None = None
         self._workflow_violations: list[dict[str, Any]] = []
         self._task_output_calls: dict[str, str] = {}
         self._schedule_control_calls: dict[str, dict[str, Any]] = {}
@@ -821,6 +881,22 @@ class EventLedger:
             return None
         return terminal_workflow_receipt(self._workflow_contract, receipt)
 
+    @property
+    def workflow_synthesis_baseline(
+        self,
+    ) -> dict[str, tuple[int, ...]] | None:
+        if self._workflow_synthesis_baseline is None:
+            return None
+        return dict(self._workflow_synthesis_baseline)
+
+    @property
+    def workflow_synthesis_content_sha256(
+        self,
+    ) -> dict[str, str] | None:
+        if self._workflow_synthesis_content_sha256 is None:
+            return None
+        return dict(self._workflow_synthesis_content_sha256)
+
     def bind_native_task_state(
         self,
         *,
@@ -846,6 +922,9 @@ class EventLedger:
         contract: object,
         receipt_path: Path,
         worker_gid: int | None = None,
+        synthesis_baseline_path: Path | None = None,
+        workspace_root: Path | None = None,
+        synthesis_artifact_contracts: list[dict[str, Any]] | None = None,
     ) -> None:
         """Publish the root-owned receipt consumed by native Claude hooks."""
 
@@ -858,6 +937,44 @@ class EventLedger:
             or not receipt_path.parent.is_dir()
             or receipt_path.parent.is_symlink()
             or (
+                (synthesis_baseline_path is None)
+                != (workspace_root is None)
+            )
+            or (
+                (synthesis_baseline_path is None)
+                != (synthesis_artifact_contracts is None)
+            )
+            or (
+                synthesis_baseline_path is not None
+                and (
+                    not synthesis_baseline_path.is_absolute()
+                    or synthesis_baseline_path == receipt_path
+                    or synthesis_baseline_path.exists()
+                    or not synthesis_baseline_path.parent.is_dir()
+                    or synthesis_baseline_path.parent.is_symlink()
+                )
+            )
+            or (
+                workspace_root is not None
+                and (
+                    not workspace_root.is_absolute()
+                    or not workspace_root.is_dir()
+                    or workspace_root.is_symlink()
+                )
+            )
+            or (
+                synthesis_artifact_contracts is not None
+                and (
+                    not synthesis_artifact_contracts
+                    or len(synthesis_artifact_contracts)
+                    > MAX_ARTIFACT_CONTRACTS
+                    or any(
+                        not isinstance(row, dict)
+                        for row in synthesis_artifact_contracts
+                    )
+                )
+            )
+            or (
                 worker_gid is not None
                 and (type(worker_gid) is not int or worker_gid < 0)
             )
@@ -869,6 +986,13 @@ class EventLedger:
             raise RuntimeError("workflow_contract_invalid") from exc
         self._workflow_receipt_path = receipt_path
         self._workflow_receipt_gid = worker_gid
+        self._workflow_synthesis_baseline_path = synthesis_baseline_path
+        self._workflow_synthesis_workspace_root = workspace_root
+        self._workflow_synthesis_artifact_contracts = (
+            [dict(row) for row in synthesis_artifact_contracts]
+            if synthesis_artifact_contracts is not None
+            else None
+        )
         self._publish_workflow_receipt()
 
     def bind_schedule_capability_aliases(self, value: object) -> None:
@@ -1209,6 +1333,41 @@ class EventLedger:
             self._workflow_violations,
         )
         try:
+            if (
+                receipt["status"] == "passed"
+                and self._workflow_synthesis_baseline_path is not None
+                and self._workflow_synthesis_workspace_root is not None
+                and self._workflow_synthesis_artifact_contracts is not None
+                and self._workflow_synthesis_baseline is None
+            ):
+                baseline = _workspace_snapshot(
+                    self._workflow_synthesis_workspace_root
+                )
+                content_sha256 = _workflow_final_content_sha256(
+                    workspace_root=self._workflow_synthesis_workspace_root,
+                    snapshot=baseline,
+                    artifact_contracts=(
+                        self._workflow_synthesis_artifact_contracts
+                    ),
+                )
+                _write_workflow_synthesis_baseline(
+                    path=self._workflow_synthesis_baseline_path,
+                    workflow=self._workflow_contract,
+                    workspace_before=baseline,
+                    final_content_sha256=content_sha256,
+                    group_gid=self._workflow_receipt_gid,
+                )
+                self._workflow_synthesis_baseline = baseline
+                self._workflow_synthesis_content_sha256 = content_sha256
+                self.append_event({
+                    "type": "chatds.workflow.synthesis-baseline",
+                    "status": "committed",
+                    "skill_name": self._workflow_contract["skill_name"],
+                    "route_id": self._workflow_contract["route_id"],
+                    "route_sha256": self._workflow_contract["route_sha256"],
+                    "file_count": len(baseline),
+                    "declared_final_count": len(content_sha256),
+                }, channel="controller")
             write_workflow_receipt(
                 self._workflow_receipt_path,
                 receipt,
@@ -1664,6 +1823,194 @@ def _workspace_snapshot(workspace_root: Path) -> dict[str, tuple[int, ...]]:
     return result
 
 
+def _write_workflow_synthesis_baseline(
+    *,
+    path: Path,
+    workflow: dict[str, Any],
+    workspace_before: dict[str, tuple[int, ...]],
+    final_content_sha256: dict[str, str],
+    group_gid: int | None,
+) -> None:
+    """Atomically publish the first passed-frontier workspace identity.
+
+    PreToolUse path recognition remains useful feedback, but arbitrary shell
+    languages and background processes make it unsuitable as the artifact
+    authority.  This root-owned checkpoint gives both the native Stop hook
+    and terminal controller the same monotonic synthesis epoch.
+    """
+
+    if (
+        not path.is_absolute()
+        or path.exists()
+        or not path.parent.is_dir()
+        or path.parent.is_symlink()
+        or (
+            group_gid is not None
+            and (type(group_gid) is not int or group_gid < 0)
+        )
+    ):
+        raise RuntimeError("workflow_synthesis_baseline_invalid")
+    payload = {
+        "schema": "chatds.workflow-synthesis-baseline.v1",
+        "skill_name": workflow["skill_name"],
+        "route_id": workflow["route_id"],
+        "route_sha256": workflow["route_sha256"],
+        "workspace_before": workspace_before,
+        "final_content_sha256": final_content_sha256,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+    if len(encoded) > MAX_WORKFLOW_SYNTHESIS_BASELINE_BYTES:
+        raise RuntimeError("workflow_synthesis_baseline_invalid")
+    temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0),
+            0o440,
+        )
+        view = memoryview(encoded)
+        offset = 0
+        while offset < len(view):
+            written = os.write(descriptor, view[offset:])
+            if written <= 0:
+                raise OSError("workflow_synthesis_baseline_short_write")
+            offset += written
+        if os.geteuid() == 0 or group_gid is not None:
+            os.fchown(
+                descriptor,
+                0 if os.geteuid() == 0 else -1,
+                -1 if group_gid is None else group_gid,
+            )
+        os.fchmod(descriptor, 0o440)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise RuntimeError(
+            "workflow_synthesis_baseline_invalid"
+        ) from exc
+
+
+def _workflow_final_content_sha256(
+    *,
+    workspace_root: Path,
+    snapshot: dict[str, tuple[int, ...]],
+    artifact_contracts: list[dict[str, Any]],
+) -> dict[str, str]:
+    """Hash only declared final candidates at the passed frontier."""
+
+    patterns = {
+        _workspace_contract_pattern(row.get("declared_final_artifact"))
+        for row in artifact_contracts
+    }
+    matches = sorted(
+        relative
+        for relative in snapshot
+        if any(fnmatch.fnmatchcase(relative, pattern) for pattern in patterns)
+    )
+    if len(matches) > MAX_WORKSPACE_ARTIFACTS:
+        raise RuntimeError("workflow_synthesis_baseline_invalid")
+    result: dict[str, str] = {}
+    total_bytes = 0
+    for relative in matches:
+        identity = snapshot[relative]
+        size = int(identity[3])
+        if size > MAX_WORKSPACE_ARTIFACT_FILE_BYTES:
+            raise RuntimeError("workspace_artifact_size_limit")
+        total_bytes += size
+        if total_bytes > MAX_WORKSPACE_ARTIFACT_TOTAL_BYTES:
+            raise RuntimeError("workspace_artifact_total_size_limit")
+        result[relative] = _stable_file_sha256(
+            workspace_root / relative,
+            expected_identity=identity,
+        )
+    return result
+
+
+def _stable_file_sha256(
+    path: Path,
+    *,
+    expected_identity: tuple[int, ...],
+) -> str:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(path, flags)
+    digest = hashlib.sha256()
+    try:
+        initial = os.fstat(descriptor)
+        initial_identity = (
+            initial.st_dev,
+            initial.st_ino,
+            initial.st_mode,
+            initial.st_size,
+            initial.st_mtime_ns,
+            initial.st_ctime_ns,
+        )
+        if (
+            not stat.S_ISREG(initial.st_mode)
+            or initial_identity != expected_identity
+        ):
+            raise RuntimeError("workspace_artifact_changed_during_audit")
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        final = os.fstat(descriptor)
+        final_identity = (
+            final.st_dev,
+            final.st_ino,
+            final.st_mode,
+            final.st_size,
+            final.st_mtime_ns,
+            final.st_ctime_ns,
+        )
+        if final_identity != expected_identity:
+            raise RuntimeError("workspace_artifact_changed_during_audit")
+    finally:
+        os.close(descriptor)
+    current = os.lstat(path)
+    current_identity = (
+        current.st_dev,
+        current.st_ino,
+        current.st_mode,
+        current.st_size,
+        current.st_mtime_ns,
+        current.st_ctime_ns,
+    )
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or current_identity != expected_identity
+    ):
+        raise RuntimeError("workspace_artifact_changed_during_audit")
+    return digest.hexdigest()
+
+
 def _emit_workspace_artifacts(
     *,
     ledger: "EventLedger",
@@ -1688,22 +2035,10 @@ def _emit_workspace_artifacts(
         if total_bytes > MAX_WORKSPACE_ARTIFACT_TOTAL_BYTES:
             raise RuntimeError("workspace_artifact_total_size_limit")
         path = workspace_root / relative
-        digest = hashlib.sha256()
-        with path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
-        current = os.lstat(path)
-        current_identity = (
-            current.st_dev,
-            current.st_ino,
-            current.st_mode,
-            current.st_size,
-            current.st_mtime_ns,
-            current.st_ctime_ns,
+        sha256 = _stable_file_sha256(
+            path,
+            expected_identity=after[relative],
         )
-        if not stat.S_ISREG(current.st_mode) or current_identity != after[relative]:
-            raise RuntimeError("workspace_artifact_changed_during_audit")
-        sha256 = digest.hexdigest()
         artifact_identity = hashlib.sha256(
             (
                 "chatds.claude.workspace-artifact.v1\0"
@@ -1757,6 +2092,31 @@ def _workspace_contract_pattern(value: object) -> str:
     if "{" in pattern or "}" in pattern:
         raise RuntimeError("artifact_contract_invalid")
     return pattern
+
+
+def _active_artifact_contract_rows(
+    *,
+    config: dict[str, Any],
+    skill_name: str,
+) -> list[dict[str, Any]]:
+    """Select immutable artifact declarations for one bound Skill."""
+
+    rows = config.get("artifact_contracts")
+    if rows is None:
+        rows = []
+    if (
+        re.fullmatch(r"[A-Za-z0-9._-]{1,128}", skill_name) is None
+        or not isinstance(rows, list)
+        or len(rows) > MAX_ARTIFACT_CONTRACTS
+    ):
+        raise RuntimeError("artifact_contract_invalid")
+    active: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise RuntimeError("artifact_contract_invalid")
+        if str(row.get("skill_name") or "") == skill_name:
+            active.append(dict(row))
+    return active
 
 
 def _materialize_bound_artifact_stop_contract(
@@ -1832,17 +2192,9 @@ def _materialize_bound_native_lifecycle_contract(
 ) -> Path | None:
     """Publish one immutable contract for native workflow/artifact hooks."""
 
-    rows = config.get("artifact_contracts")
-    if rows is None:
-        rows = []
-    if not isinstance(rows, list) or len(rows) > MAX_ARTIFACT_CONTRACTS:
-        raise RuntimeError("artifact_contract_invalid")
     bound_skill_name = (
         turn_skill_binding[0] if turn_skill_binding is not None else None
     )
-    for row in rows:
-        if not isinstance(row, dict):
-            raise RuntimeError("artifact_contract_invalid")
 
     raw_workflow = config.get("workflow_contract")
     workflow: dict[str, Any] | None = None
@@ -1858,14 +2210,14 @@ def _materialize_bound_native_lifecycle_contract(
         ):
             raise RuntimeError("workflow_contract_invalid")
         bound_skill_name = workflow_skill_name
-    active_artifacts = [
-        dict(row)
-        for row in rows
-        if (
-            bound_skill_name is not None
-            and str(row.get("skill_name") or "") == bound_skill_name
+    active_artifacts = (
+        _active_artifact_contract_rows(
+            config=config,
+            skill_name=bound_skill_name,
         )
-    ]
+        if bound_skill_name is not None
+        else []
+    )
     if not active_artifacts and workflow is None:
         return None
     if bound_skill_name is None:
@@ -1888,6 +2240,11 @@ def _materialize_bound_native_lifecycle_contract(
         "workflow_receipt_path": (
             "/runtime/workflow-receipt.json"
             if workflow is not None
+            else None
+        ),
+        "workflow_synthesis_baseline_path": (
+            "/runtime/workflow-synthesis-baseline.json"
+            if workflow is not None and active_artifacts
             else None
         ),
     }
@@ -1948,6 +2305,7 @@ def _validate_artifact_contracts(
     contracts: object,
     invoked_skill_names: frozenset[str],
     before: dict[str, tuple[int, ...]],
+    before_content_sha256: dict[str, str] | None = None,
     after: dict[str, tuple[int, ...]],
     workspace_root: Path,
     bound_skill_name: str | None = None,
@@ -1957,8 +2315,9 @@ def _validate_artifact_contracts(
     Installed Skills remain ambient capabilities and must not force unrelated
     turns to create artifacts.  A native ``Skill`` tool receipt activates the
     corresponding immutable contract.  Final deliverables must be created or
-    mutated in this Turn; declared supporting modules may come from an earlier
-    failed Turn in the same Session so continuation recovery remains possible.
+    content-mutated after the supplied authority baseline; declared supporting
+    modules may come from an earlier failed Turn in the same Session so
+    continuation recovery remains possible.
     """
 
     if contracts is None:
@@ -1992,6 +2351,22 @@ def _validate_artifact_contracts(
     changed = {
         path for path, identity in after.items() if before.get(path) != identity
     }
+    if before_content_sha256 is None:
+        content_baseline: dict[str, str] = {}
+    elif (
+        isinstance(before_content_sha256, dict)
+        and len(before_content_sha256) <= MAX_WORKSPACE_ARTIFACTS
+        and all(
+            isinstance(path, str)
+            and path in before
+            and isinstance(digest, str)
+            and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
+            for path, digest in before_content_sha256.items()
+        )
+    ):
+        content_baseline = dict(before_content_sha256)
+    else:
+        raise RuntimeError("workflow_synthesis_baseline_invalid")
     findings: list[dict[str, Any]] = []
     validated: list[dict[str, Any]] = []
 
@@ -2008,7 +2383,19 @@ def _validate_artifact_contracts(
             path for path in after
             if fnmatch.fnmatchcase(path, final_pattern)
         )
-        changed_matches = [path for path in matches if path in changed]
+        changed_matches: list[str] = []
+        for path in matches:
+            if path not in changed:
+                continue
+            prior_digest = content_baseline.get(path)
+            if prior_digest is not None:
+                current_digest = _stable_file_sha256(
+                    workspace_root / path,
+                    expected_identity=after[path],
+                )
+                if current_digest == prior_digest:
+                    continue
+            changed_matches.append(path)
         if not matches:
             finding(
                 "artifact_final_missing",
@@ -2018,7 +2405,11 @@ def _validate_artifact_contracts(
             continue
         if not changed_matches:
             finding(
-                "artifact_final_not_committed_this_turn",
+                (
+                    "artifact_final_not_committed_after_workflow"
+                    if before_content_sha256 is not None
+                    else "artifact_final_not_committed_this_turn"
+                ),
                 skill_name=skill_name,
                 pattern=final_pattern,
             )

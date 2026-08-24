@@ -188,6 +188,7 @@ def _result() -> dict[str, Any]:
             "workspace_before": {},
             "workflow_contract": workflow,
             "workflow_receipt_path": "/runtime/workflow-receipt.json",
+            "workflow_synthesis_baseline_path": None,
         }
         blocked = evaluate_lifecycle_hook(
             hook_input={

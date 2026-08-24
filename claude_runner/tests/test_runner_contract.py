@@ -780,6 +780,32 @@ class RunnerCommandContractTests(unittest.TestCase):
                 )["hookSpecificOutput"]["permissionDecision"],
                 "deny",
             )
+            optional_before_frontier = evaluate_workflow_hook(
+                hook_input={
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Agent",
+                    "tool_use_id": "optional-before-frontier",
+                    "tool_input": {"subagent_type": "general-purpose"},
+                },
+                contract=contract,
+                receipt=receipt,
+                artifact_contracts=[],
+            )
+            self.assertEqual(
+                optional_before_frontier["hookSpecificOutput"]
+                ["permissionDecision"],
+                "deny",
+            )
+            self.assertIn(
+                "chatds-session-skills:warehouse-audit:ledger-reviewer",
+                optional_before_frontier["hookSpecificOutput"]
+                ["permissionDecisionReason"],
+            )
+            self.assertIn(
+                "Do not retry the blocked tool",
+                optional_before_frontier["hookSpecificOutput"]
+                ["permissionDecisionReason"],
+            )
             self.assertEqual(
                 evaluate_workflow_hook(
                     hook_input={
@@ -1631,6 +1657,10 @@ class RunnerCommandContractTests(unittest.TestCase):
             self.assertEqual(
                 payload["schema"], "chatds.native-lifecycle-contract.v1"
             )
+            self.assertEqual(
+                payload["workflow_synthesis_baseline_path"],
+                "/runtime/workflow-synthesis-baseline.json",
+            )
             receipt = build_workflow_receipt(workflow, [])
             workspace = Path(temporary) / "workspace"
             workspace.mkdir()
@@ -1645,6 +1675,18 @@ class RunnerCommandContractTests(unittest.TestCase):
             )
             self.assertIn("workflow_worker_missing", stop["reason"])
             self.assertNotIn("artifact_final_missing", stop["reason"])
+            self.assertEqual(
+                evaluate_lifecycle_hook(
+                    hook_input={
+                        "hook_event_name": "Stop",
+                        "stop_hook_active": True,
+                    },
+                    contract=payload,
+                    workflow_receipt=receipt,
+                    workspace_root=workspace,
+                ),
+                {},
+            )
 
             passed = build_workflow_receipt(workflow, [{
                 "native_agent_type": (
@@ -1652,6 +1694,32 @@ class RunnerCommandContractTests(unittest.TestCase):
                 ),
                 "status": "completed",
             }])
+            synthesis_baseline = {
+                "schema": "chatds.workflow-synthesis-baseline.v1",
+                "skill_name": workflow["skill_name"],
+                "route_id": workflow["route_id"],
+                "route_sha256": workflow["route_sha256"],
+                "workspace_before": {},
+                "final_content_sha256": {},
+            }
+            invalid_baseline = dict(synthesis_baseline)
+            invalid_baseline["route_sha256"] = "0" * 64
+            invalid_pretool = evaluate_lifecycle_hook(
+                hook_input={
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "true"},
+                },
+                contract=payload,
+                workflow_receipt=passed,
+                workflow_synthesis_baseline=invalid_baseline,
+                workspace_root=workspace,
+            )
+            self.assertEqual(
+                invalid_pretool["hookSpecificOutput"]
+                ["permissionDecision"],
+                "deny",
+            )
             artifact_stop = evaluate_lifecycle_hook(
                 hook_input={
                     "hook_event_name": "Stop",
@@ -1659,9 +1727,259 @@ class RunnerCommandContractTests(unittest.TestCase):
                 },
                 contract=payload,
                 workflow_receipt=passed,
+                workflow_synthesis_baseline=synthesis_baseline,
                 workspace_root=workspace,
             )
             self.assertIn("artifact_final_missing", artifact_stop["reason"])
+
+    def test_workflow_pass_snapshot_rejects_pre_frontier_artifact_bypass(self):
+        """Arbitrary shell languages cannot define the synthesis epoch.
+
+        This renamed warehouse fixture reproduces the production class of
+        failure: a Bash command can hide a declared path inside interpreter
+        syntax that the best-effort PreToolUse recognizer cannot parse.  The
+        machine-owned workflow transition, rather than command spelling, must
+        therefore be the authoritative artifact baseline.
+        """
+
+        workflow = {
+            "schema": "chatds.skill-workflow-contract.v1",
+            "skill_name": "warehouse-reconciliation-renamed",
+            "route_id": "inventory_closeout",
+            "source_path": "orchestration/orchestrator.yml",
+            "priority": 2,
+            "matched_pattern_index": 0,
+            "route_sha256": "d" * 64,
+            "phases": [{
+                "mode": "sequential",
+                "workers": [{
+                    "worker_id": "stock-reviewer",
+                    "native_agent_type": (
+                        "chatds-session-skills:"
+                        "warehouse-reconciliation-renamed:stock-reviewer"
+                    ),
+                }],
+            }],
+        }
+        artifact = {
+            "skill_name": "warehouse-reconciliation-renamed",
+            "declared_final_artifact": "deliveries/{NAME}_CLOSEOUT.md",
+            "expected_min_lines": 2,
+        }
+        pending = build_workflow_receipt(workflow, [])
+        hidden_path_command = (
+            "python -c \"from pathlib import Path; "
+            "Path('/workspace/deliveries/WAREHOUSE_CLOSEOUT.md')"
+            ".write_text('early\\nartifact\\n')\""
+        )
+        self.assertEqual(
+            evaluate_workflow_hook(
+                hook_input={
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Bash",
+                    "tool_use_id": "interpreter-bypass",
+                    "tool_input": {"command": hidden_path_command},
+                },
+                contract=workflow,
+                receipt=pending,
+                artifact_contracts=[artifact],
+            ),
+            {},
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            deliveries = workspace / "deliveries"
+            deliveries.mkdir(parents=True)
+            final = deliveries / "WAREHOUSE_CLOSEOUT.md"
+            final.write_text("early\nartifact\n", encoding="utf-8")
+
+            native_session_id = str(uuid.uuid4())
+            projects = root / "projects"
+            project = projects / "fixture"
+            subagents = project / native_session_id / "subagents"
+            subagents.mkdir(parents=True)
+            (project / f"{native_session_id}.jsonl").write_text(
+                "{}\n", encoding="utf-8"
+            )
+
+            receipt_path = root / "workflow-receipt.json"
+            baseline_path = root / "workflow-synthesis-baseline.json"
+            ledger = EventLedger(root / "events.jsonl")
+            ledger.bind_native_task_state(
+                projects_root=projects,
+                native_session_id=native_session_id,
+            )
+            ledger.bind_workflow_contract(
+                contract=workflow,
+                receipt_path=receipt_path,
+                synthesis_baseline_path=baseline_path,
+                workspace_root=workspace,
+                synthesis_artifact_contracts=[artifact],
+            )
+
+            agent_type = workflow["phases"][0]["workers"][0][
+                "native_agent_type"
+            ]
+            task_id = "agent-stock-review"
+            tool_id = "tool-stock-review"
+            ledger.append_line(json.dumps({
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": task_id,
+                "task_type": "local_agent",
+                "tool_use_id": tool_id,
+                "session_id": native_session_id,
+                "subagent_type": agent_type,
+            }).encode(), channel="stdout")
+            (subagents / f"agent-{task_id}.meta.json").write_text(
+                json.dumps({
+                    "agentType": agent_type,
+                    "description": "renamed holdout fixture",
+                    "toolUseId": tool_id,
+                }),
+                encoding="utf-8",
+            )
+            (subagents / f"agent-{task_id}.jsonl").write_text(
+                json.dumps({
+                    "type": "assistant",
+                    "agentId": task_id,
+                    "sessionId": native_session_id,
+                    "message": {
+                        "stop_reason": "end_turn",
+                        "content": [{
+                            "type": "text",
+                            "text": "Inventory evidence complete.",
+                        }],
+                    },
+                }) + "\n",
+                encoding="utf-8",
+            )
+            ledger.append_line(json.dumps({
+                "type": "system",
+                "subtype": "task_updated",
+                "task_id": task_id,
+                "patch": {"status": "completed"},
+            }).encode(), channel="stdout")
+
+            self.assertEqual(
+                json.loads(receipt_path.read_text())["status"], "passed"
+            )
+            baseline = ledger.workflow_synthesis_baseline
+            content_baseline = ledger.workflow_synthesis_content_sha256
+            self.assertIsNotNone(baseline)
+            self.assertIsNotNone(content_baseline)
+            assert baseline is not None
+            assert content_baseline is not None
+            self.assertIn(
+                "deliveries/WAREHOUSE_CLOSEOUT.md", baseline
+            )
+            stored = json.loads(baseline_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                stat.S_IMODE(os.lstat(baseline_path).st_mode), 0o440
+            )
+            self.assertEqual(
+                stored["schema"],
+                "chatds.workflow-synthesis-baseline.v1",
+            )
+            self.assertEqual(
+                stored["final_content_sha256"], content_baseline
+            )
+            passed_receipt = json.loads(
+                receipt_path.read_text(encoding="utf-8")
+            )
+            lifecycle_contract = {
+                "schema": "chatds.native-lifecycle-contract.v1",
+                "skill_name": workflow["skill_name"],
+                "artifact_contracts": [artifact],
+                "workspace_before": {},
+                "workflow_contract": workflow,
+                "workflow_receipt_path": "/runtime/workflow-receipt.json",
+                "workflow_synthesis_baseline_path": (
+                    "/runtime/workflow-synthesis-baseline.json"
+                ),
+            }
+            early_stop = evaluate_lifecycle_hook(
+                hook_input={
+                    "hook_event_name": "Stop",
+                    "stop_hook_active": False,
+                },
+                contract=lifecycle_contract,
+                workflow_receipt=passed_receipt,
+                workflow_synthesis_baseline=stored,
+                workspace_root=workspace,
+            )
+            self.assertIn(
+                "artifact_final_not_committed_after_workflow",
+                early_stop["reason"],
+            )
+
+            early = _validate_artifact_contracts(
+                contracts=[artifact],
+                invoked_skill_names=frozenset(),
+                bound_skill_name=workflow["skill_name"],
+                before=baseline,
+                before_content_sha256=content_baseline,
+                after=_workspace_snapshot(workspace),
+                workspace_root=workspace,
+            )
+            self.assertEqual(early["status"], "failed")
+            self.assertEqual(
+                early["findings"][0]["code"],
+                "artifact_final_not_committed_after_workflow",
+            )
+
+            original_mtime = baseline[
+                "deliveries/WAREHOUSE_CLOSEOUT.md"
+            ][4]
+            os.utime(
+                final,
+                ns=(original_mtime + 1_000_000_000,) * 2,
+            )
+            touched_after = _workspace_snapshot(workspace)
+            self.assertNotEqual(
+                touched_after["deliveries/WAREHOUSE_CLOSEOUT.md"],
+                baseline["deliveries/WAREHOUSE_CLOSEOUT.md"],
+            )
+            touched = _validate_artifact_contracts(
+                contracts=[artifact],
+                invoked_skill_names=frozenset(),
+                bound_skill_name=workflow["skill_name"],
+                before=baseline,
+                before_content_sha256=content_baseline,
+                after=touched_after,
+                workspace_root=workspace,
+            )
+            self.assertEqual(touched["status"], "failed")
+
+            final.write_text(
+                "post-frontier\ncloseout artifact\n", encoding="utf-8"
+            )
+            committed = _validate_artifact_contracts(
+                contracts=[artifact],
+                invoked_skill_names=frozenset(),
+                bound_skill_name=workflow["skill_name"],
+                before=baseline,
+                before_content_sha256=content_baseline,
+                after=_workspace_snapshot(workspace),
+                workspace_root=workspace,
+            )
+            self.assertEqual(committed["status"], "passed")
+            self.assertEqual(
+                evaluate_lifecycle_hook(
+                    hook_input={
+                        "hook_event_name": "Stop",
+                        "stop_hook_active": False,
+                    },
+                    contract=lifecycle_contract,
+                    workflow_receipt=passed_receipt,
+                    workflow_synthesis_baseline=stored,
+                    workspace_root=workspace,
+                ),
+                {},
+            )
+            ledger.close()
 
     def test_native_stop_feedback_is_bounded_and_cross_domain(self):
         with tempfile.TemporaryDirectory() as temporary:

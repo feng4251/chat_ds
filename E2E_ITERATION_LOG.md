@@ -2245,3 +2245,88 @@ effect 内同步 setState 错误，与本轮 diff 无关。尚未在两个参照
   新 Frontend 首屏与大历史 Session hydration 可用。没有自动启动新的模型重型 V2.3；用户将用新 Session
   重新执行。外部 Provider reset/malformed output 仍可能发生，本轮保证的是正确恢复、终态和呈现，
   不把上游可用性虚报成已被 Harness 消除。
+
+## 2026-08-24 Round 18：同输入原生双引擎新鲜 E2E 与 Claude lifecycle 修复
+
+本轮是用户新建的两个独立生产 E2E，不是重放旧 run：Claude Code conversation
+`db051b53fe7b4824a92eb27dc3d52f95`、root `db8fd6a7be1e45f7ad7eb1fc695769b5`；DeepSeek Harness
+conversation `681e814526b54e2295c009207508f2b8`、root `0417d05f48b14ef4a68444d2666b601f`。两者使用同一用户、
+同一 64 字符业务输入（SHA-256 `2f042f8dec9eaf2f79994e634a81da9ab11408e53dbd42952a41be049f43787c`）、
+`session_full`、同一 immutable Skill view
+`9aee2a0596eff2e78c48c615332e70ed3d82abc9539b701663ea7076af96d7b8` 与同一 manifest
+`5b536a43b336d17007c8f38dd898165506475da756895fd71aaa22da9653bbae`。编译后 primary Skill 是
+`healthsim-trialsim`，route 是 `composite_full_protocol_design`，route SHA-256
+`b7ff3beb155882eebe6b34381c3af540e515d35867f9458f9a3682132e2fd921`；workflow 为 phase 0 的 7 个并行
+mandatory worker，再串行 1 个 I/E worker。Artifact 合同要求 11 个模块、20 节、final 至少 153,600 bytes/
+2,000 lines。三源冻结同时包含持久 conversation、完整 Skill/worker/orchestration 资源和原生 ledger/AgentRun，
+没有从页面文案反推结论。
+
+### DeepSeek Harness：权威成功
+
+- Engine/model 为 `deepseek_harness + shaiengine_deepseek_v4_pro`，fresh root 输入正确 lower 为原生
+  `/healthsim-trialsim` gesture 加用户原文。8 个声明 worker 都是 attempt 1 `succeeded/completed`，phase barrier
+  顺序正确；6 次 provider retry 全部恢复，没有 mandatory tool failure。
+- lossless ledger terminal seq 405,163；workflow receipt `passed/frontier=2/finding=0`，artifact receipt
+  `passed/activated=1/finding=0`，Supervisor 唯一 terminal 为 `succeeded/stop`、exit 0。最终产物
+  `gal301_cdp_report/GAL301_FULL_REPORT.md` 为 153,967 bytes/2,627 lines、SHA-256
+  `237c13179cf98cee354cd84c0797a1b7656f4e315443b3e3c241a85d9b778a53`，与 11 模块按声明顺序 concat
+  byte-for-byte 相同。模型第一次仅生成 121,437 bytes 并按自拟 100 KB 阈值声称通过；machine artifact gate
+  返回精确 `artifact_min_bytes_not_met expected=153600` 后，原生 loop 扩写并重新 merge，证明控制面反馈可恢复。
+- 对 GLM ground truth 的 byte/line ratio 为 0.769473/0.776530，normalized char-trigram cosine 0.662161、
+  token cosine 0.876885；对 modular Claude ground truth 分别为 0.797302/1.113136、0.703700、0.912254。
+  最终报告有相同 11 个核心 H1 业务模块，但标题更描述化；继续采用结构、workflow、evidence、artifact 合同与
+  业务覆盖等价，不制造随机文本 byte equality。
+
+### Claude Code：准确失败与完整故障链
+
+- Engine/model 为 `claude_code + shaiengine_glm_5_2`，fresh native command lowering 正确。模型先启动一个
+  `general-purpose` agent，随后在 mandatory receipts 之前直接编写 11 模块和 final。旧 PreToolUse 门禁共拒绝
+  69 次 frontier 0 artifact synthesis；模型最终一次原生 response 并行调用精确 7 个 phase 0 agent，7 个 receipt
+  全部成功。OpenAlex 持续 429 使 competitive worker 自行执行长重试，最终明确以 PubMed 证据降级完成；这是
+  upstream/model 收敛问题，不是 workspace、网络策略或 adapter 断流。
+- 模型把早期 generic agent 的内容保存成 `worker_D_ie_criteria.md`，但从未调用 phase 1 声明的精确
+  `chatds-session-skills:healthsim-trialsim:worker-ie-criteria`。机器回执正确保持 frontier 1，并又拒绝 8 次 final
+  synthesis；然而旧反馈只返回 `frontier=1`，没有把当前阶段精确 `native_agent_type/status` 带回模型。
+- 模型随后通过“先写临时 `G_full.md`，再在多行 Python 中 remove/rename”的方式绕过基于 Bash 文本的静态
+  final-path 识别，提前替换 final。它最终在 prose 中声称所有 phases 成功，但原生 ledger 只有 8 个 Agent 调用：
+  1 个 generic + 7 个 phase 0，phase 1 attempt count 精确为 0。`result/success` 不能覆盖控制面事实。
+- ledger 共 127,793 条/45,358,103 bytes，与数据库 raw index 在 terminal barrier 完全一致；8 次 Claude-owned
+  provider retry 均恢复，egress `budget_rejections=0/exhausted=false`。Supervisor seq 127,793 写入唯一 terminal：
+  `failed/workflow_contract_failed`、stage `workflow_contract_audit`，finding 仅
+  `workflow_worker_missing phase_index=1 worker-ie-criteria`；artifact audit 正确 deferred。草稿 final 为
+  147,529 bytes/2,520 lines、11 个 H1、SHA-256
+  `d1cf1025d788633634fc95e6894a11c2244da88ad11e2671961035ecb89e6615`，等于 11 模块 concat，但同时低于
+  153,600-byte 硬合同，不能作为成功交付。
+
+### 跨 Skill 不变量、成熟实现对照与通用修复
+
+本轮缺陷先重述为两个与 fixture 无关的不变量：
+
+1. mandatory frontier 未通过时，root 不得用 optional/generic subagent 替代声明 worker；任何被阻止的 fan-in
+   操作都必须反馈当前 phase 每个 worker 的精确原生类型和机器状态，并要求调用精确 `subagent_type` 或等待
+   running receipt，不能只给无动作信息的 phase 编号。
+2. shell/path 文本识别只能提供早期反馈，不能证明副作用时序。workflow 首次 `passed` 必须形成 controller-owned、
+   durable synthesis checkpoint；declared final 必须在该 checkpoint 后发生内容变化，预生成、rename、原地 touch、
+   metadata mutation 或任意脚本语言绕过都不能冒充 post-frontier fan-in。Workflow、artifact 与唯一 terminal 仍按
+   单调顺序结算。
+
+唯一成熟参考冻结为 clean 的本地 `claude-code/` commit
+`6f6f12b37f529488b10e53928dd5508bb93535c7`。其
+`src/services/tools/toolExecution.ts` 在副作用前运行 PreToolUse，在完成后运行 PostToolUse；
+`toolHooks.ts` 的 Post feedback 不能回滚已发生的文件写入。本轮 **adopt** 原生 PreToolUse 精确可执行反馈，
+**adapt** durable passed-frontier checkpoint 到 ChatDS 已有 workflow/artifact authority 与 receipt，**reject**
+依赖 Post hook 回滚、修改 Claude binary/core、复制第二套 tool loop 或从模型 prose 推导状态。DeepSeek 上游边界
+继续 clean 于 `47f943859bef60e4160492346772ded9b24f765a`，本轮没有修改。
+
+实现只落在 ChatDS Claude adapter：mandatory phase 前拒绝非声明 root Agent；frontier feedback 以有界 JSON
+携带精确 `native_agent_type/status`；workflow 首次通过时以 root ownership、atomic replace、directory fsync 写入
+workspace identity 与 declared-final SHA-256；Stop hook 和 terminal audit 共同验证该 checkpoint。文件哈希使用
+`O_NOFOLLOW + fstat/lstat` 的稳定 identity，损坏、缺失或身份不匹配一律 fail closed。Stop 的 native bounded
+correction 仍只允许一次，未增加 agent/retry/compaction loop。
+
+确定性 failure injection 使用非医疗 warehouse/museum rename：inline Python 先绕过静态 recognizer 生成 final，
+workflow pass 后不改内容或只 touch metadata 都必须报 `artifact_final_not_committed_after_workflow`，真正 rewrite
+才通过；另有 optional generic agent pre-frontier、精确反馈、corrupt checkpoint 的回归。当前源码的 Runner
+contract `56/56`、Supervisor lifecycle `38/38` 通过，`git diff --check`、Python AST 与上游仓库 clean 检查通过。
+Round 18 因此计作一次通用 lifecycle/control-plane repair iteration；DeepSeek 的 passing E2E 是同轮 acceptance，
+不制造额外代码变化。
