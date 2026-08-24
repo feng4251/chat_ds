@@ -3581,3 +3581,54 @@ Round 17 的两个全新 case。不得复用
   restored or committed:
   `XGAL-101_Galectin-3_AD_Comprehensive_Development_Plan_v1.0_claudecode执行参考.md`
   and `xClinicalTrial-Design-V2.2.zip`.
+
+# 2026-08-24 Native-engine recovery and four-Session adapter repair
+
+- The work continued in Claude Session `59903124-d548-48c5-bf38-f069322cd5e3`
+  is present in this branch as commits `341df61c`, `ecbfdfc5`, `a3a2a487`, and
+  `1d72515c`. The last commit restores the missing `compatibleModels` and
+  `workspaceOpen` declarations. The source build passed; the earlier one-off
+  container copy was not treated as an immutable deployment receipt.
+- Follow-on generic native workflow/activity recovery is in `e5657ed0` and
+  `f1310cdd`. The current local-only HEAD is `7d9f12f9` (`fix: compact native
+  activity and bind fresh skills`), six commits ahead of the configured
+  remote-tracking branch. No remote push was performed.
+- `ce2348...`, `05bd42...`, `54bd48...`, and `b58f7f...` were diagnosed from
+  persisted conversation, exact immutable Skill/route, and native/debug
+  receipts. Detailed frozen timelines and classifications are in
+  `E2E_ITERATION_LOG.md`. No defect was found in either pinned native core.
+  The terminal Claude run was interrupted by provider `ECONNRESET`; the
+  terminal DSH run missed the fresh native Skill invocation and later failed
+  the machine artifact byte contract. The two reference DSH runs exposed
+  provider stream/capacity errors plus a ChatDS token-level projection backlog.
+- `7d9f12f9` changes only ChatDS-owned boundaries: fresh DSH Sessions lower the
+  exactly-one selected primary Skill to the public native slash invocation;
+  resume turns remain exact user text. DSH token deltas remain in the lossless
+  native/raw ledger but Web presentation persists complete semantic blocks and
+  stable tool/run events. Raw writes are bounded batches with a terminal
+  barrier; Session hydration uses one newest 5,000-event tail window. Frontend
+  now distinguishes successful tools from a later failed workflow, keeps one
+  tool card per call identity, and marks partial output as non-terminal.
+- Generic warehouse/museum rename and 10,000-delta failure-injection
+  regressions were added. Final verification: Backend `387 passed, 119
+  warnings, 2 subtests`; Frontend `56 passed`; Vite production build emits
+  `/assets/index-l8V9nsyn.js`; modified-file ESLint, Python compile, and diff
+  checks pass. The two full-repo ESLint findings outside this diff remain the
+  pre-existing effect/setState cases documented in `E2E_ITERATION_LOG.md`.
+- Clean archive `/tmp/chat_ds_deploy_7d9f12f9.ANGN44` produced candidates:
+  Backend `sha256:ac828fa2...`, Frontend `sha256:6e9c1d45...`, and DeepSeek
+  Supervisor `sha256:a5af4870...`; all carry revision `7d9f12f9` and passed
+  isolated import/config smoke. Neither `deepseek-harness-clean/` commit
+  `47f943859bef60e4160492346772ded9b24f765a` nor `claude-code/` commit
+  `6f6f12b37f529488b10e53928dd5508bb93535c7` was changed or rebuilt.
+- Deployment is intentionally pending: roots `fcc892d2...` (`54bd48...`) and
+  `216cac37...` (`b58f7f...`) still had live native Turn containers at the last
+  check. Restarting Backend before their authoritative terminal would execute
+  its safety cancellation path. After both drain, tag the three current images
+  as rollback points, switch only Backend/Frontend/DeepSeek Supervisor to the
+  three candidates, then verify health, frontend entry, bounded activity tail,
+  terminal recovery, restart counts, and exact image revisions. Do not rebuild
+  or switch either native Turn image.
+- The two protected tracked deletions above remain unstaged. Existing
+  untracked Session/runtime/reference directories are user/runtime state and
+  must not be bulk-added or cleaned.
