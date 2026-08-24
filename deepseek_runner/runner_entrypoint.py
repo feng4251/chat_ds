@@ -735,6 +735,27 @@ def _terminal_outcome(
     return "succeeded", None
 
 
+def _terminal_error_stage(
+    *,
+    status: str,
+    terminal_error: str | None,
+    current_stage: str,
+) -> str | None:
+    """Attribute a failed outcome to its authoritative monotonic frontier."""
+
+    if status == "succeeded":
+        return None
+    if terminal_error == "workflow_contract_failed":
+        return "workflow_contract_audit"
+    if terminal_error == "artifact_contract_failed":
+        return "artifact_contract_audit"
+    if terminal_error in {
+        "runner_exit_nonzero", "hard_timeout", "cancelled",
+    }:
+        return "native_execution"
+    return current_stage
+
+
 def _signal_handler(signum: int, _frame: object) -> None:
     global _stop_reason
     _stop_reason = "cancelled" if signum in {signal.SIGINT, signal.SIGTERM} else "hard_timeout"
@@ -1058,7 +1079,11 @@ def main() -> int:
             "status": status,
             "exit_code": exit_code,
             "error": terminal_error,
-            "error_stage": None if status == "succeeded" else stage,
+            "error_stage": _terminal_error_stage(
+                status=status,
+                terminal_error=terminal_error,
+                current_stage=stage,
+            ),
         })
         return 0 if status == "succeeded" else 1
     except BaseException as exc:

@@ -180,7 +180,7 @@ MAX_REQUESTS_PER_SCOPE: Final[int] = _bounded_positive_env_int(
 )
 MAX_OUTBOUND_BYTES_PER_SCOPE: Final[int] = _bounded_positive_env_int(
     "SKILL_EGRESS_MAX_OUTBOUND_BYTES",
-    64 * 1024 * 1024,
+    1024 * 1024 * 1024,
     _ABSOLUTE_MAX_OUTBOUND_BYTES_PER_SCOPE,
 )
 MAX_RESPONSE_WIRE_BYTES_PER_SCOPE: Final[int] = _bounded_positive_env_int(

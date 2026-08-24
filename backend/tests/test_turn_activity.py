@@ -73,6 +73,50 @@ class TurnActivityProtocolTests(unittest.TestCase):
         self.assertEqual(asked["node_id"], decided["node_id"])
         self.assertEqual(asked["payload"]["request_seq"], 42)
 
+    def test_payload_tool_identity_and_invisible_workflow_updates_are_stable(self):
+        builder = TurnActivityBuilder("8" * 32, "9" * 32)
+        first = builder.stream_text("reasoning", "inspect ")
+        workflow = builder.agent({
+            "event_type": "run.progress",
+            "run_id": "8" * 32,
+            "payload": {"workflow_stage": "renamed-museum-audit"},
+        })
+        second = builder.stream_text("reasoning", "receipts")
+        started = builder.agent({
+            "event_type": "tool.started",
+            "run_id": "8" * 32,
+            "payload": {
+                "tool_name": "RenamedCatalogLookup",
+                "tool_call_id": "catalog-call",
+            },
+        })
+        completed = builder.agent({
+            "event_type": "tool.completed",
+            "run_id": "8" * 32,
+            "payload": {
+                "tool_name": "RenamedCatalogLookup",
+                "tool_call_id": "catalog-call",
+            },
+        })
+        after_tool = builder.stream_text("reasoning", "summarize")
+
+        self.assertEqual(workflow["kind"], "workflow")
+        self.assertEqual(first["node_id"], second["node_id"])
+        self.assertEqual(started["node_id"], completed["node_id"])
+        self.assertNotEqual(second["node_id"], after_tool["node_id"])
+        self.assertEqual(
+            started["payload"]["event"]["payload"]["tool_call_id"],
+            "catalog-call",
+        )
+        self.assertEqual(
+            started["payload"]["event"]["tool_call_id"],
+            "catalog-call",
+        )
+        self.assertEqual(
+            completed["payload"]["event"]["tool_name"],
+            "RenamedCatalogLookup",
+        )
+
     def test_native_question_projection_is_bounded_and_rename_invariant(self):
         builder = TurnActivityBuilder("6" * 32, "7" * 32)
         question = builder.approval(

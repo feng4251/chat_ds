@@ -209,10 +209,10 @@ const workerPrompt = (worker, attempt) => [
   'Skill: ' + args.skillName,
   'Worker: ' + worker.workerId,
   'Attempt: ' + attempt + ' of ' + args.maxAttempts,
-  'Current user task (verbatim):\n' + args.userTurnText,
-  'Completed predecessor handoffs (machine ordered):\n' + priorHandoffs(),
-  'Authoritative worker instruction source:\n' + worker.instructions,
-].join('\n\n')
+  'Current user task (verbatim):\\n' + args.userTurnText,
+  'Completed predecessor handoffs (machine ordered):\\n' + priorHandoffs(),
+  'Authoritative worker instruction source:\\n' + worker.instructions,
+].join('\\n\\n')
 for (const phaseSpec of args.phases) {
   phase(phaseSpec.phaseId)
   let pending = [...phaseSpec.workers]

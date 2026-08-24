@@ -233,6 +233,24 @@ class AgentEventPersistenceTests(unittest.IsolatedAsyncioTestCase):
             )).scalar_one()
             self.assertEqual(duplicate_count, len(events))
 
+    async def test_child_run_inherits_the_selected_native_engine(self):
+        async with self.sessions() as session:
+            root = await session.get(AgentRun, "root")
+            root.engine_id = "deepseek_harness"
+            await session.commit()
+        with patch.object(chat_router, "async_session", self.sessions):
+            await chat_router._persist_agent_event_immediate(
+                conv_id="conversation",
+                user_id="user",
+                root_run_id="root",
+                requested_model_id="renamed-model",
+                resolved_model_id="renamed-model",
+                event=_event("run.started", 1, run_id="renamed-worker"),
+            )
+        async with self.sessions() as session:
+            child = await session.get(AgentRun, "renamed-worker")
+        self.assertEqual(child.engine_id, "deepseek_harness")
+
     async def test_internal_reducer_attempts_rehydrate_as_closed_nested_runs(self):
         def reducer_event(
             run_id: str,

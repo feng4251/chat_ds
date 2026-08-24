@@ -1844,6 +1844,12 @@ async def _persist_agent_events(
             )
         )).scalars().all()
     }
+    root_run = existing_runs.get(root_run_id)
+    root_engine_id = (
+        str(root_run.engine_id)
+        if root_run is not None and root_run.engine_id
+        else ENGINE_ID_CLAUDE_CODE
+    )
     for event in events:
         run_id = str(event.get("run_id") or "")
         if not run_id:
@@ -1937,6 +1943,7 @@ async def _persist_agent_events(
                 depth=int(event.get("depth") or 0),
                 workspace_scope=str(event.get("workspace_scope") or "shared_session"),
                 source="delegate" if nested_agent else "chat",
+                engine_id=root_engine_id,
                 requested_model_id=str(payload.get("model_id") or requested_model_id),
                 resolved_model_id=resolved_model_id,
                 status="running",

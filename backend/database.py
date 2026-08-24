@@ -1,4 +1,5 @@
 import json
+import hashlib
 import logging
 import uuid
 
@@ -655,7 +656,9 @@ async def _ensure_agent_run_event_identity(conn) -> None:
     ))
 
 
-async def _reconcile_orphaned_descendant_runs(conn) -> None:
+async def _reconcile_orphaned_descendant_runs(
+    conn, *, defer_native_roots: bool = False,
+) -> None:
     """Cancel runs still active from a previous single Backend process.
 
     This deployment uses one Uvicorn worker and one Backend container against
@@ -678,6 +681,15 @@ async def _reconcile_orphaned_descendant_runs(conn) -> None:
         "running",
         "committing",
     )
+    native_deferral = (
+        "AND NOT EXISTS ("
+        "SELECT 1 FROM agent_runs AS native_root "
+        "WHERE native_root.id = COALESCE(child.root_run_id, child.id) "
+        "AND native_root.engine_id IN ('claude_code', 'deepseek_harness')"
+        ") "
+        if defer_native_roots
+        else ""
+    )
     rows = (
         await conn.execute(
             text(
@@ -690,6 +702,8 @@ async def _reconcile_orphaned_descendant_runs(conn) -> None:
                 "ON root.id = child.root_run_id "
                 "WHERE child.status IN "
                 "('pending', 'planned', 'queued', 'running', 'committing') "
+                + native_deferral
+                +
                 "ORDER BY CASE "
                 "WHEN child.parent_run_id IS NULL "
                 "OR child.id = child.root_run_id THEN 0 ELSE 1 END, "
@@ -1047,6 +1061,258 @@ async def _reconcile_orphaned_scheduled_job_runs(conn) -> int:
     return stale_count
 
 
+async def _repair_deepseek_tool_activity_identity(conn) -> int:
+    """Repair derived tool cards from the immutable native event ledger.
+
+    Early DeepSeek adapter projections preserved the raw envelope but omitted
+    call identities nested in native result messages.  That made one tool
+    lifecycle render as separate running/completed cards.  Only the safe,
+    derived browser projection is rewritten; native receipts and run outcome
+    authority remain immutable.
+    """
+
+    from agent_engines.deepseek_harness import deepseek_native_tool_identity
+
+    rows = (await conn.execute(text(
+        "SELECT activity.id, activity.root_run_id, activity.run_id, "
+        "activity.node_id, activity.payload "
+        "FROM turn_activity_events AS activity "
+        "JOIN agent_runs AS root ON root.id = activity.root_run_id "
+        "WHERE activity.kind = 'tool' "
+        "AND root.engine_id = 'deepseek_harness' "
+        "AND (activity.payload NOT LIKE '%\"tool_call_id\"%' "
+        "OR activity.payload LIKE '%\"tool_call_id\":\"\"%' "
+        "OR activity.payload LIKE '%\"tool_call_id\": \"\"%') "
+        "ORDER BY activity.root_run_id, activity.seq"
+    ))).mappings().all()
+    if not rows:
+        return 0
+
+    tool_names: dict[tuple[str, str, str], str] = {}
+    repaired = 0
+    for row in rows:
+        try:
+            activity_payload = json.loads(str(row["payload"]))
+            safe_event = activity_payload.get("event")
+            if not isinstance(safe_event, dict):
+                continue
+            projected_seq = int(safe_event.get("seq") or 0)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if projected_seq < 1 or projected_seq % 1_000_000:
+            continue
+        raw_payload = (await conn.execute(
+            text(
+                "SELECT payload FROM agent_engine_raw_events "
+                "WHERE run_id = :run_id AND seq = :seq LIMIT 1"
+            ),
+            {
+                "run_id": str(row["root_run_id"]),
+                "seq": projected_seq // 1_000_000,
+            },
+        )).scalar_one_or_none()
+        if raw_payload is None:
+            continue
+        try:
+            raw_envelope = json.loads(str(raw_payload))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(raw_envelope, dict):
+            continue
+        identity = deepseek_native_tool_identity(raw_envelope)
+        if identity is None:
+            continue
+        native_type, raw_call_id, raw_tool_name = identity
+        call_id = raw_call_id or str(safe_event.get("tool_call_id") or "")
+        if not call_id:
+            continue
+        key = (
+            str(row["root_run_id"]),
+            str(row["run_id"]),
+            call_id,
+        )
+        if native_type == "tool/call" and raw_tool_name:
+            tool_names[key] = raw_tool_name
+        tool_name = (
+            raw_tool_name
+            or tool_names.get(key, "")
+            or str(safe_event.get("tool_name") or "")
+        )
+        safe_event["tool_call_id"] = call_id
+        if tool_name:
+            safe_event["tool_name"] = tool_name
+        activity_payload["event"] = safe_event
+        node_id = (
+            "tool:"
+            + hashlib.sha256(call_id.encode("utf-8")).hexdigest()[:24]
+        )
+        serialized = json.dumps(
+            activity_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        if node_id == row["node_id"] and serialized == row["payload"]:
+            continue
+        await conn.execute(
+            text(
+                "UPDATE turn_activity_events "
+                "SET node_id = :node_id, payload = :payload "
+                "WHERE id = :activity_id"
+            ),
+            {
+                "activity_id": str(row["id"]),
+                "node_id": node_id,
+                "payload": serialized,
+            },
+        )
+        repaired += 1
+    return repaired
+
+
+async def _reconcile_terminal_turn_activity(conn) -> int:
+    """Make derived workflow cards agree with durable run terminals.
+
+    A Backend process can stop after a native Supervisor has sealed its
+    terminal but before the corresponding browser activity is committed. The
+    AgentRun/AgentRunEvent receipt is authoritative; a stale or missing UI
+    terminal must not leave the root or descendants visibly running forever.
+    """
+
+    from turn_activity import safe_agent_event
+
+    terminal_runs = (await conn.execute(text(
+        "SELECT run.id, run.user_id, run.conversation_id, "
+        "COALESCE(run.root_run_id, run.id) AS root_run_id, "
+        "run.parent_run_id, run.agent_kind, run.agent_name, run.depth, "
+        "run.workspace_scope, run.status "
+        "FROM agent_runs AS run "
+        "WHERE run.status IN ('succeeded', 'failed', 'cancelled') "
+        "AND EXISTS ("
+        "SELECT 1 FROM turn_activity_events AS activity "
+        "WHERE activity.root_run_id = COALESCE(run.root_run_id, run.id)"
+        ") "
+        "ORDER BY COALESCE(run.root_run_id, run.id), run.depth, run.id"
+    ))).mappings().all()
+    if not terminal_runs:
+        return 0
+
+    expected_types = {
+        "succeeded": "run.completed",
+        "failed": "run.failed",
+        "cancelled": "run.cancelled",
+    }
+    repaired = 0
+    next_activity_seq: dict[str, int] = {}
+    for run in terminal_runs:
+        event_type = expected_types[str(run["status"])]
+        terminal = (await conn.execute(
+            text(
+                "SELECT seq, payload FROM agent_run_events "
+                "WHERE conversation_id = :conversation_id "
+                "AND run_id = :run_id AND event_type = :event_type "
+                "ORDER BY seq DESC, event_time DESC, id DESC LIMIT 1"
+            ),
+            {
+                "conversation_id": str(run["conversation_id"]),
+                "run_id": str(run["id"]),
+                "event_type": event_type,
+            },
+        )).mappings().one_or_none()
+        if terminal is None:
+            continue
+        try:
+            terminal_payload = json.loads(str(terminal["payload"] or "{}"))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(terminal_payload, dict):
+            continue
+        safe = safe_agent_event({
+            "event_type": event_type,
+            "run_id": str(run["id"]),
+            "root_run_id": str(run["root_run_id"]),
+            "parent_run_id": run["parent_run_id"],
+            "agent_kind": str(run["agent_kind"] or "agent"),
+            "agent_name": run["agent_name"],
+            "display_name": run["agent_name"],
+            "depth": int(run["depth"] or 0),
+            "workspace_scope": str(
+                run["workspace_scope"] or "shared_session"
+            ),
+            "seq": int(terminal["seq"]),
+            "payload": terminal_payload,
+        })
+        serialized = json.dumps(
+            {"event": safe},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        existing = (await conn.execute(
+            text(
+                "SELECT id, payload FROM turn_activity_events "
+                "WHERE root_run_id = :root_run_id AND kind = 'workflow' "
+                "AND json_extract(payload, '$.event.run_id') = :run_id "
+                "AND json_extract(payload, '$.event.event_type') IN "
+                "('run.completed', 'run.failed', 'run.cancelled') "
+                "ORDER BY seq, event_time, id LIMIT 1"
+            ),
+            {
+                "root_run_id": str(run["root_run_id"]),
+                "run_id": str(run["id"]),
+            },
+        )).mappings().one_or_none()
+        if existing is not None:
+            if str(existing["payload"]) == serialized:
+                continue
+            await conn.execute(
+                text(
+                    "UPDATE turn_activity_events SET payload = :payload "
+                    "WHERE id = :activity_id"
+                ),
+                {
+                    "activity_id": str(existing["id"]),
+                    "payload": serialized,
+                },
+            )
+            repaired += 1
+            continue
+
+        root_run_id = str(run["root_run_id"])
+        if root_run_id not in next_activity_seq:
+            next_activity_seq[root_run_id] = int((await conn.execute(
+                text(
+                    "SELECT COALESCE(MAX(seq), 0) + 1 "
+                    "FROM turn_activity_events WHERE root_run_id = :root_run_id"
+                ),
+                {"root_run_id": root_run_id},
+            )).scalar_one())
+        activity_seq = next_activity_seq[root_run_id]
+        next_activity_seq[root_run_id] += 1
+        await conn.execute(
+            text(
+                "INSERT INTO turn_activity_events ("
+                "id, user_id, conversation_id, root_run_id, run_id, seq, "
+                "node_id, kind, operation, payload, event_time"
+                ") VALUES ("
+                ":id, :user_id, :conversation_id, :root_run_id, :run_id, "
+                ":seq, :node_id, 'workflow', 'merge', :payload, "
+                "CURRENT_TIMESTAMP)"
+            ),
+            {
+                "id": uuid.uuid4().hex,
+                "user_id": str(run["user_id"]),
+                "conversation_id": str(run["conversation_id"]),
+                "root_run_id": root_run_id,
+                "run_id": str(run["id"]),
+                "seq": activity_seq,
+                "node_id": f"workflow:{root_run_id}",
+                "payload": serialized,
+            },
+        )
+        repaired += 1
+    return repaired
+
+
 async def init_db():
     from models import Base as ModelBase  # noqa: F811
     async with engine.begin() as conn:
@@ -1074,6 +1340,15 @@ async def init_db():
         await _repair_legacy_foreign_key_orphans(conn)
         await _ensure_skill_package_scope_identity(conn)
         await _ensure_agent_run_event_identity(conn)
+        repaired_tool_activities = await _repair_deepseek_tool_activity_identity(
+            conn
+        )
+        if repaired_tool_activities:
+            logger.warning(
+                "Repaired %s derived DeepSeek tool activity event(s) from "
+                "native receipts during startup",
+                repaired_tool_activities,
+            )
         repaired_scheduled_runs = (
             await _reconcile_orphaned_scheduled_job_runs(conn)
         )
@@ -1082,5 +1357,26 @@ async def init_db():
                 "Cancelled %s orphaned scheduled run(s) during startup",
                 repaired_scheduled_runs,
             )
-        await _reconcile_orphaned_descendant_runs(conn)
+        await _reconcile_orphaned_descendant_runs(
+            conn, defer_native_roots=True,
+        )
+        await _assert_sqlite_foreign_key_integrity(conn)
+
+
+async def reconcile_deferred_native_agent_runs() -> None:
+    """Close native descendants after supervisor terminal recovery/revocation."""
+
+    async with engine.begin() as conn:
+        await _reconcile_orphaned_descendant_runs(
+            conn, defer_native_roots=False,
+        )
+        repaired_terminal_activities = await _reconcile_terminal_turn_activity(
+            conn
+        )
+        if repaired_terminal_activities:
+            logger.warning(
+                "Reconciled %s derived workflow terminal activity event(s) "
+                "from durable run receipts during startup",
+                repaired_terminal_activities,
+            )
         await _assert_sqlite_foreign_key_integrity(conn)

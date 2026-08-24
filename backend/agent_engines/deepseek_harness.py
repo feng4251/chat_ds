@@ -39,6 +39,63 @@ def _text_blocks(message: object) -> str:
     )
 
 
+def deepseek_tool_result_call_id(message: object) -> str:
+    """Extract DSH's stable call identity across native result shapes."""
+
+    if not isinstance(message, Mapping):
+        return ""
+    direct = message.get("toolCallId") or message.get("tool_call_id")
+    if direct:
+        return str(direct)
+    source = message.get("source")
+    if isinstance(source, Mapping):
+        nested = source.get("callId") or source.get("call_id")
+        if nested:
+            return str(nested)
+    content = message.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, Mapping):
+                continue
+            nested = block.get("toolCallId") or block.get("tool_call_id")
+            if nested:
+                return str(nested)
+    return ""
+
+
+def deepseek_native_tool_identity(
+    envelope: Mapping[str, Any],
+) -> tuple[str, str, str] | None:
+    """Return ``(native_type, call_id, tool_name)`` from a raw DSH event.
+
+    This pure decoder is shared by live projection and repair of derived UI
+    rows.  The lossless native ledger remains authoritative and untouched.
+    """
+
+    event = envelope.get("event")
+    if not isinstance(event, Mapping) or event.get("type") != "deepseek.session.event":
+        return None
+    native = event.get("session_event")
+    if not isinstance(native, Mapping):
+        return None
+    native_type = str(native.get("type") or "")
+    data = native.get("data")
+    data = data if isinstance(data, Mapping) else {}
+    if native_type == "tool/call":
+        return (
+            native_type,
+            str(data.get("callId") or data.get("call_id") or ""),
+            str(data.get("name") or ""),
+        )
+    if native_type == "tool/result":
+        return (
+            native_type,
+            deepseek_tool_result_call_id(data.get("message")),
+            "",
+        )
+    return None
+
+
 class DeepSeekEventProjector:
     """Losslessly project native DSH Session events into ChatDS events."""
 
@@ -47,6 +104,7 @@ class DeepSeekEventProjector:
         self._root_session_id: str | None = None
         self._labels: dict[str, str] = {}
         self._started: set[str] = set()
+        self._tool_names: dict[tuple[str, str], str] = {}
 
     def _run_id(self, session_id: str, depth: int) -> str:
         if depth <= 0:
@@ -231,6 +289,7 @@ class DeepSeekEventProjector:
                     session_id=session_id,
                 ))
             else:
+                self._tool_names[(run_id, tool_call_id)] = tool_name
                 projected.append(self._agent_event(
                     event_type="tool.started",
                     run_id=run_id,
@@ -246,15 +305,15 @@ class DeepSeekEventProjector:
         elif native_type == "tool/result":
             message = data.get("message")
             error = data.get("error")
+            tool_call_id = deepseek_tool_result_call_id(message)
+            tool_name = self._tool_names.get((run_id, tool_call_id), "")
             projected.append(self._agent_event(
                 event_type="tool.failed" if isinstance(error, Mapping) else "tool.completed",
                 run_id=run_id,
                 seq=sub_seq,
                 payload={
-                    "tool_call_id": (
-                        str(message.get("toolCallId") or message.get("tool_call_id") or "")
-                        if isinstance(message, Mapping) else ""
-                    ),
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name or None,
                     "detail": (
                         str(error.get("code") or error.get("name") or "tool_failed")
                         if isinstance(error, Mapping) else _text_blocks(message)[:2000]
@@ -685,6 +744,39 @@ class DeepSeekHarnessEngine:
                 json={"user_id": user_id, "conversation_id": conversation_id},
             )
         return response.status_code < 400 and bool(response.json().get("success"))
+
+    async def recover_terminal(
+        self, *, user_id: str, conversation_id: str, run_id: str
+    ) -> Mapping[str, Any] | None:
+        """Read the supervisor-owned terminal after a Backend stream loss."""
+
+        async with self._client_factory(timeout=120.0) as client:
+            response = await client.post(
+                f"{self._base_url}/v1/runs/{run_id}/terminal",
+                headers=self._headers,
+                json={
+                    "user_id": user_id,
+                    "conversation_id": conversation_id,
+                },
+            )
+        if response.status_code == 404:
+            return None
+        if response.status_code >= 400:
+            raise AgentEngineError(
+                "DeepSeek Runner terminal recovery failed.",
+                code="deepseek_runner_terminal_recovery_failed",
+                retryable=response.status_code >= 500,
+            )
+        payload = response.json()
+        terminal = payload.get("terminal") if isinstance(payload, Mapping) else None
+        if terminal is None:
+            return None
+        if not isinstance(terminal, Mapping):
+            raise AgentEngineError(
+                "DeepSeek Runner returned an invalid terminal receipt.",
+                code="deepseek_runner_terminal_receipt_invalid",
+            )
+        return dict(terminal)
 
     async def cleanup_session(
         self, *, user_id: str, conversation_id: str

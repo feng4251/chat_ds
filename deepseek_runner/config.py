@@ -45,7 +45,7 @@ class Settings:
 
 DEFAULT_EGRESS_LIMITS = {
     "max_requests": 8_192,
-    "max_outbound_bytes": 64 * 1024 * 1024,
+    "max_outbound_bytes": 1024 * 1024 * 1024,
     "max_response_wire_bytes": 2 * 1024 * 1024 * 1024,
 }
 

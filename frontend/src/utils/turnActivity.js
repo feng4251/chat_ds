@@ -12,13 +12,71 @@ function toolStatus(eventType) {
   return 'running'
 }
 
+function mergeLifecycleEvent(previous = {}, incoming = {}) {
+  const merged = { ...previous, ...incoming }
+  if (previous.payload || incoming.payload) {
+    merged.payload = {
+      ...(previous.payload || {}),
+      ...(incoming.payload || {}),
+    }
+  }
+  return merged
+}
+
+function compactAdjacentStreamNodes(nodes = []) {
+  const compacted = []
+  for (const node of nodes) {
+    const previous = compacted[compacted.length - 1]
+    if (
+      previous
+      && (node.kind === 'content' || node.kind === 'reasoning')
+      && previous.kind === node.kind
+    ) {
+      compacted[compacted.length - 1] = {
+        ...previous,
+        lastSeq: Math.max(
+          Number(previous.lastSeq || 0),
+          Number(node.lastSeq || 0),
+        ),
+        eventIds: [...new Set([
+          ...(previous.eventIds || []),
+          ...(node.eventIds || []),
+        ])].slice(-256),
+        text: `${previous.text || ''}${node.text || ''}`,
+        status: node.status || previous.status,
+        payload: { ...(previous.payload || {}), ...(node.payload || {}) },
+      }
+      continue
+    }
+    compacted.push(node)
+  }
+  return compacted
+}
+
+function settleOpenToolsAtRootTerminal(nodes = []) {
+  const workflow = nodes.find((node) => node.kind === 'workflow')
+  const rootStatus = workflow?.status
+  if (!['succeeded', 'success', 'completed', 'failed', 'cancelled'].includes(rootStatus)) {
+    return nodes
+  }
+  const interruptedStatus = rootStatus === 'failed' ? 'failed' : 'cancelled'
+  return nodes.map((node) => (
+    node.kind === 'tool' && node.status === 'running'
+      ? { ...node, status: interruptedStatus }
+      : node
+  ))
+}
+
 export function applyTurnActivity(nodes, event) {
   if (!event?.node_id || !Number.isSafeInteger(Number(event.seq))) {
     return nodes || []
   }
   const next = [...(nodes || [])]
-  let index = next.findIndex((node) => node.nodeId === event.node_id)
   const identity = activityIdentity(event)
+  if (next.some((node) => (node.eventIds || []).includes(identity))) {
+    return nodes || []
+  }
+  let index = next.findIndex((node) => node.nodeId === event.node_id)
   if (index < 0) {
     next.push({
       nodeId: event.node_id,
@@ -56,7 +114,10 @@ export function applyTurnActivity(nodes, event) {
     const root = node.runs.find((run) => run.id === event.root_run_id)
     node.status = root?.lifecycle_status || root?.status || 'running'
   } else if (event.kind === 'tool') {
-    const lifecycle = payload.event || {}
+    const lifecycle = mergeLifecycleEvent(
+      current.payload?.event || {},
+      payload.event || {},
+    )
     node.payload = { ...current.payload, event: lifecycle }
     node.status = toolStatus(lifecycle.event_type)
     // The tool card is the chronological surface, while the workflow card is
@@ -84,8 +145,9 @@ export function applyTurnActivity(nodes, event) {
     node.status = payload.status || current.status
   }
   next[index] = node
-  return next
-    .sort((a, b) => a.anchorSeq - b.anchorSeq)
+  return settleOpenToolsAtRootTerminal(compactAdjacentStreamNodes(
+    next.sort((a, b) => a.anchorSeq - b.anchorSeq),
+  ))
     .slice(-MAX_NODES)
 }
 

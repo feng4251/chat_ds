@@ -6,6 +6,7 @@ import sys
 import time
 from pathlib import Path
 
+import httpx
 import pytest
 
 
@@ -18,6 +19,8 @@ from agent_engines.base import AgentEngineRequest  # noqa: E402
 from agent_engines.deepseek_harness import (  # noqa: E402
     DeepSeekEventProjector,
     DeepSeekHarnessEngine,
+    deepseek_native_tool_identity,
+    deepseek_tool_result_call_id,
 )
 from deepseek_runner.runner_entrypoint import (  # noqa: E402
     ControlDecisionForwarder,
@@ -26,9 +29,13 @@ from deepseek_runner.runner_entrypoint import (  # noqa: E402
     _environment,
     _native_command,
     _native_turn_payload,
+    _terminal_error_stage,
     _terminal_outcome,
 )
-from deepseek_runner.terminal_receipts import append_terminal  # noqa: E402
+from deepseek_runner.terminal_receipts import (  # noqa: E402
+    append_terminal,
+    terminal_status,
+)
 from deepseek_runner.control_decisions import (  # noqa: E402
     answerable_control_request,
     append_control_decision,
@@ -36,7 +43,11 @@ from deepseek_runner.control_decisions import (  # noqa: E402
     existing_control_decision,
     lower_native_question_answer,
 )
-from deepseek_runner.config import state_volume_host_root  # noqa: E402
+from deepseek_runner.config import (  # noqa: E402
+    DEFAULT_EGRESS_LIMITS,
+    state_volume_host_root,
+)
+from deepseek_runner.event_stream import read_event_tail  # noqa: E402
 from deepseek_runner.native_session import native_turn_prompts  # noqa: E402
 from native_tools import deepseek_harness_native_tools  # noqa: E402
 from native_security.workflow_contract import (  # noqa: E402
@@ -66,6 +77,10 @@ def _native(seq, native_type, data=None, *, session="root-native", depth=0):
             "session_event": {"type": native_type, "data": data or {}},
         },
     }
+
+
+def test_native_engine_default_budget_admits_long_context_provider_exchange():
+    assert DEFAULT_EGRESS_LIMITS["max_outbound_bytes"] == 1024 * 1024 * 1024
 
 
 def test_native_root_and_child_streams_preserve_authority_boundaries():
@@ -151,6 +166,42 @@ def test_native_approval_audit_is_not_a_second_actionable_card():
         "request_seq": 9_000_000,
         "status": "allowed",
     }
+
+
+def test_native_tool_result_reuses_call_identity_across_upstream_shapes():
+    projector = DeepSeekEventProjector("f" * 32)
+    started = projector.project(_native(
+        20,
+        "tool/call",
+        {"callId": "museum-call", "name": "RenamedMuseumLookup"},
+    ))
+    completed_envelope = _native(
+        21,
+        "tool/result",
+        {
+            "message": {
+                "content": [{
+                    "type": "tool-result",
+                    "toolCallId": "museum-call",
+                    "text": "indexed",
+                }],
+                "source": {"callId": "museum-call"},
+            },
+        },
+    )
+    completed = projector.project(completed_envelope)
+
+    assert started[0].data["payload"]["tool_call_id"] == "museum-call"
+    assert completed[0].data["payload"]["tool_call_id"] == "museum-call"
+    assert completed[0].data["payload"]["tool_name"] == "RenamedMuseumLookup"
+    assert deepseek_tool_result_call_id(
+        {"source": {"callId": "museum-call"}}
+    ) == "museum-call"
+    assert deepseek_native_tool_identity(completed_envelope) == (
+        "tool/result",
+        "museum-call",
+        "",
+    )
 
 
 def test_native_plan_review_projects_one_binary_web_decision():
@@ -322,6 +373,43 @@ def test_engine_payload_binds_only_exact_session_workspace_and_profile():
     assert payload["native_session_id"] == f"chatds-{'3' * 32}"
     assert "tools" not in payload
     assert "api_key" not in payload
+
+
+@pytest.mark.asyncio
+async def test_engine_recovers_only_the_supervisor_owned_terminal_receipt():
+    terminal = {
+        "seq": 91,
+        "channel": "supervisor",
+        "event": {
+            "type": "chatds.supervisor.terminal",
+            "status": "failed",
+            "error": "renamed_workflow_failure",
+        },
+    }
+
+    async def handler(request):
+        assert request.url.path.endswith(f"/v1/runs/{'1' * 32}/terminal")
+        assert json.loads(request.content) == {
+            "user_id": "2" * 32,
+            "conversation_id": "3" * 32,
+        }
+        return httpx.Response(200, json={"terminal": terminal, "last_seq": 91})
+
+    transport = httpx.MockTransport(handler)
+    engine = DeepSeekHarnessEngine(
+        base_url="http://runner.internal",
+        internal_token="internal-authority",
+        timeout_seconds=60,
+        client_factory=lambda **kwargs: httpx.AsyncClient(
+            transport=transport, **kwargs
+        ),
+    )
+    recovered = await engine.recover_terminal(
+        user_id="2" * 32,
+        conversation_id="3" * 32,
+        run_id="1" * 32,
+    )
+    assert recovered == terminal
 
 
 def test_daemon_volume_mountpoint_is_used_for_dynamic_run_bind(tmp_path):
@@ -555,6 +643,63 @@ def test_supervisor_fallback_terminal_preserves_failure_stage(tmp_path):
         "error": "renamed_preflight_failure",
         "error_stage": "skill_attestation",
     }
+
+
+def test_terminal_receipts_scan_large_renamed_ledger_without_read_text(
+    tmp_path, monkeypatch,
+):
+    events = tmp_path / "warehouse-events.jsonl"
+    with events.open("wb") as stream:
+        for seq in range(1, 20_001):
+            stream.write(json.dumps({
+                "seq": seq,
+                "event": {"type": "warehouse.inventory", "row": seq},
+            }, separators=(",", ":")).encode() + b"\n")
+
+    def forbidden_read_text(*_args, **_kwargs):
+        raise AssertionError("durable ledgers must be scanned incrementally")
+
+    monkeypatch.setattr(Path, "read_text", forbidden_read_text)
+    assert terminal_status(events) is None
+    append_terminal(
+        events,
+        "failed",
+        "renamed_reconciliation_failure",
+        error_stage="terminal_reconciliation",
+    )
+    append_terminal(events, "cancelled", None)
+    assert terminal_status(events) == "failed"
+    with events.open("rb") as stream:
+        rows = [json.loads(line) for line in stream]
+    terminals = [
+        row for row in rows
+        if row.get("event", {}).get("type") == "chatds.supervisor.terminal"
+    ]
+    assert len(terminals) == 1
+    assert terminals[0]["seq"] == 20_001
+
+
+def test_event_replay_reads_a_large_ledger_in_bounded_batches(tmp_path):
+    events = tmp_path / "renamed-replay.jsonl"
+    payload = "inventory-" + ("x" * 480)
+    with events.open("wb") as stream:
+        for seq in range(1, 5_001):
+            stream.write(json.dumps({
+                "seq": seq,
+                "event": {"type": "warehouse.inventory", "payload": payload},
+            }, separators=(",", ":")).encode() + b"\n")
+    file_size = events.stat().st_size
+    position, first = read_event_tail(events, 0)
+    assert first
+    assert position < file_size
+    rows = list(first)
+    while position < file_size:
+        next_position, batch = read_event_tail(events, position)
+        assert next_position > position
+        position = next_position
+        rows.extend(batch)
+    assert len(rows) == 5_000
+    assert json.loads(rows[-1])["seq"] == 5_000
 
 
 def test_control_decision_forwarder_is_complete_validated_and_lossless(tmp_path):
@@ -900,6 +1045,29 @@ def test_terminal_outcome_fails_closed_on_artifact_receipt():
         workflow_passed=True,
         artifact_passed=True,
     ) == ("succeeded", None)
+
+
+def test_terminal_failure_stage_names_the_failed_receipt_not_later_cleanup():
+    assert _terminal_error_stage(
+        status="failed",
+        terminal_error="workflow_contract_failed",
+        current_stage="egress_bridge_seal",
+    ) == "workflow_contract_audit"
+    assert _terminal_error_stage(
+        status="failed",
+        terminal_error="artifact_contract_failed",
+        current_stage="artifact_contract_audit",
+    ) == "artifact_contract_audit"
+    assert _terminal_error_stage(
+        status="failed",
+        terminal_error="runner_exit_nonzero",
+        current_stage="egress_bridge_seal",
+    ) == "native_execution"
+    assert _terminal_error_stage(
+        status="succeeded",
+        terminal_error=None,
+        current_stage="artifact_contract_audit",
+    ) is None
 
 
 def test_deepseek_workflow_projection_survives_cross_domain_rename():

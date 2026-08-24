@@ -2,6 +2,94 @@
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
+## 2026-08-24 DeepSeek workflow、原生终态恢复与 Turn 时间线修复
+
+### 恢复基线与不可变边界
+
+- 本轮从 `e5657ed0b8d0bdd80b9325fc0688ce297668d968` 继续；该提交已经包含 Claude 会话
+  `59903124-d548-48c5-bf38-f069322cd5e3` 的可验证工作链
+  `341df61c -> ecbfdfc5 -> a3a2a487 -> 1d72515c`，以及后续原生双引擎/通用 Skill 合同提交。
+  本轮没有修改上游原生内核：成熟实现对照 `claude-code/` 固定且 clean 于
+  `6f6f12b37f529488b10e53928dd5508bb93535c7`；DeepSeek 上游边界仓库
+  `deepseek-harness-clean/` 固定且 clean 于
+  `47f943859bef60e4160492346772ded9b24f765a`。所有改动都在 ChatDS adapter、control plane、
+  lifecycle、派生活动协议、网络策略与 Web UI 内。
+- 生产不再有 Legacy Harness。Claude Code/DeepSeek Harness 继续原生拥有 planning、tool loop、
+  sub-agent、compaction/retry 和 Session 行为；ChatDS 没有增加第二套 agent loop、控制 prompt 或
+  V2.3/session/model 特判。
+
+### 两个故障 Session 的三源结论
+
+- `a36e8cfb770143fea0c726abf9ccac1b`：持久化 Conversation 是
+  `deepseek_harness + shaiengine_glm_5_2 + session_full`，root
+  `73cbb06140824813948d14bf7a1a6b68`。冻结的 V2.3 包/Skill view 与 Round 17 相同；模型确实只调用
+  一次无参数原生 `execute_skill_workflow`，不是“模型没调用工具”。原生 tool result 明确返回
+  `SCRIPT_PARSE / SyntaxError: Invalid or unexpected token`；根因是 ChatDS 编译的通用 workflow
+  JavaScript 把模板中的 `\n` 变成单引号字符串内的真实换行。Supervisor 不可变 terminal 位于 ledger
+  seq `243577`，为 `failed/workflow_contract_failed`；历史 `error_stage=egress_bridge_seal` 是旧 adapter
+  误归因，不能改写该原生账本。
+- 同一 run 的 native ledger 为约 117 MiB/243,577 行。旧 Supervisor 用
+  `Path.read_text().splitlines()` 扫全文件而 OOM；Backend 又没有 DeepSeek terminal recovery，所以数据库
+  root/children 长期显示 running。工具开始事件把 call ID 放在 payload，而 safe TurnActivity 只读取顶层；
+  工具结果的 ID 又位于 DSH `message.content[].toolCallId`/`message.source.callId`，旧 projector 没有解析，
+  因而前端把同一次调用显示成一张“执行中”和另一张“完成”。不可见 workflow 聚合事件还错误切断
+  reasoning/content stream，形成 90 个正文节点和 856 个思考节点。
+- `3b92e02e644c41e3a705940c199a7b0f`：持久化 Conversation 是
+  `claude_code + shaiengine_glm_5_2 + session_full`，root
+  `a4cb1266b41142bf9c117d99383a3537`。Claude 原生请求收到了 ChatDS egress proxy 的
+  `403 policy_outbound_budget_exceeded`；64 MiB Session 累计预算在长上下文 provider exchange 中被代理
+  开销先行越过。这是 adapter/policy 配额，不是 Claude Code、GLM-5.2 或 V2.3 内容问题。历史 root 保持
+  `failed/workflow_contract_failed`，没有伪造成功或重放副作用。
+
+### 通用不变量与实现
+
+- 编译器不变量：Skill 声明生成的通用 workflow program 必须在交给原生引擎前可解析。修正仅转义程序模板
+  内部换行；新增 museum/warehouse rename holdout 验证 phase barrier 和 only-failed-member retry，未嵌入
+  疾病、报告名、固定 worker 数或 V2.3 route。
+- 账本/生命周期不变量：大 JSONL ledger 必须有界流式扫描和有界 replay；Supervisor terminal 由 exact
+  user/conversation/run identity 读取，Backend 重启先恢复原生 terminal，再撤销无 terminal 的 run；root
+  terminal 后所有 descendant 必须终态化。DeepSeek child 继承 root engine identity，不再落入 ORM 的
+  Claude 默认值。恢复出的 AgentRun terminal 还会幂等校正安全的派生 workflow card，避免根失败但 Web
+  仍显示取消/child running；原生 ledger 不被修改。
+- 活动/UI 不变量：一个 call ID 对应一张 card；start/completed/failed 在原 node 原位 merge，并保留 start
+  metadata。DSH live projector 支持顶层、`message.source` 与 `message.content[]` 三种结果身份形态；启动
+  migration 只从 immutable raw receipt 重建缺失的派生 call ID/node。不可见 workflow 更新不切断文本；
+  前端对历史相邻同类流节点再做安全 compact，真实 tool/reasoning/content boundary 保留。权威 root terminal
+  后没有 receipt 的 open tool 显示失败/取消，不再永远“执行中”。
+- 网络不变量：保留 exact origin/path/method、response、request-count、deadline 和 Session scope 控制，
+  只把 Claude/DeepSeek/provider policy proxy 的默认累计出站预算从 64 MiB 提升到现有绝对上限 1 GiB，
+  避免正常长上下文交换被误拒绝；不是去掉网络策略。
+- 成熟实现对照仅使用本地 `claude-code/`：其原生 query 在 result 前 drain pending SDK/task events，
+  structured I/O 保留稳定 request identity，Session state 与 terminal 由原生 loop 持有。ChatDS **adapt**
+  稳定身份、pending/terminal replay 和 one-workspace boundary 到已有 authority/receipt 合同；**reject**
+  复制 query loop、从 prose 推断 terminal 或对业务 fixture 特判。
+
+### 验证、部署与当前生产状态
+
+- 确定性回归：Backend 相关套件 `135 passed, 52 warnings, 2 subtests`；Claude config
+  `6 passed, 3 subtests`；DeepSeek 通用 workflow Node `4/4`；Frontend `52/52`；Vite production build、
+  Python compile、Node syntax、`git diff --check` 均通过。warnings 仍是既有 passlib/
+  `datetime.utcnow()` deprecation。全量 ESLint 仍有两个既有、未触碰文件的
+  `react-hooks/set-state-in-effect`：`ModelSelector.jsx:70`、`SkillLibrary.jsx:36`；不影响 build，不能记为
+  本轮回归。
+- 候选 DeepSeek runner image 在 `network=none + read-only + tmpfs` 下执行非医疗
+  `native_workflow_plugin.image.mjs` 通过，证明生产镜像内 `execute_skill_workflow` 可注册、解析、执行并发出
+  完整 `tool-workflow/*` 事件。按约束没有自动发起新的模型重型 V2.3 E2E；下一次仍应由用户创建全新
+  conversation/root。
+- 生产当前 Backend `sha256:0054251e...`、Frontend `sha256:498c5326...`、Claude Supervisor
+  `sha256:11952220...`、DeepSeek Supervisor `sha256:e69a056b...`、egress proxy
+  `sha256:8bfa4a42...`，均 restart 0；有 healthcheck 的组件 healthy。Frontend build entry 是
+  `/assets/index-BoKpCOIW.js`。三处运行环境的累计出站预算均回读 `1073741824`。
+- SearXNG 曾因从临时 Compose CLI 的 `/repo` 工作目录部署而误挂宿主 `/repo/searxng` 默认配置，表现为
+  health 通过但 `/search` 429。已用宿主同路径挂载
+  `/nfs/yangbb/codes/chat_ds:/nfs/yangbb/codes/chat_ds` 重新应用 `chat_ds` 项目；当前 config mount 精确为
+  项目 `searxng/`，从唯一联网的 egress proxy 查询 `OpenAI` 返回 24 条结果。误建且无容器引用的
+  `/repo/searxng` 已精确清理；后续所有 nested Compose 命令必须保持该绝对同路径挂载。
+- 启动时从 raw receipts 修复 519 个历史 DeepSeek tool activity，并从 durable AgentRun receipts 校正 70 个
+  workflow terminal activity；独立新进程再次运行 terminal migration 返回 0。生产 `a36...` 用与前端相同
+  reducer 回放后为：12 个正文块、41 个思考块、201 张工具卡（191 完成、10 失败、0 执行中）、root failed、
+  9 children cancelled。`3b92...` 仍为真实 failed，未重写业务结果。
+
 ## 2026-08-21 原生双引擎、通用 Skill 执行与 V2.3 新鲜验收闭环
 
 - 已恢复并审计 Claude 会话 `59903124-d548-48c5-bf38-f069322cd5e3` 的工作。恢复基线提交链为

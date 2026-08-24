@@ -32,14 +32,14 @@ from .control_decisions import (
     existing_control_decision,
     lower_native_question_answer,
 )
+from .event_stream import read_event_tail
 from .native_session import NativeSessionInputError, native_turn_prompts
 from .native_workflow import compile_deepseek_workflow_projection
-from .terminal_receipts import append_terminal
+from .terminal_receipts import append_terminal, terminal_receipt, terminal_status
 from native_security.workflow_contract import compile_turn_workflow_contract
 
 
 SAFE_ID = re.compile(r"^[0-9a-f]{32}$")
-TERMINAL = frozenset({"succeeded", "failed", "cancelled"})
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
 MAX_WORKSPACE_ENTRIES = 200_000
 
@@ -157,21 +157,7 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _terminal(path: Path) -> str | None:
-    if not path.exists():
-        return None
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return None
-    for line in reversed(lines):
-        try:
-            event = json.loads(line).get("event", {})
-        except (ValueError, TypeError):
-            continue
-        if event.get("type") == "chatds.supervisor.terminal":
-            value = str(event.get("status") or "")
-            return value if value in TERMINAL else None
-    return None
+    return terminal_status(path)
 
 
 def _exact_directory(value: str, expected: Path) -> Path:
@@ -663,19 +649,22 @@ class Manager:
         locator = self._locate(run)
         return self._control(locator["user_id"], locator["conversation_id"], run) / "events.jsonl"
 
+    def terminal(self, run: str, identity: RunIdentity) -> dict[str, Any]:
+        locator = self._locate(run)
+        if (
+            locator["user_id"] != identity.user_id
+            or locator["conversation_id"] != identity.conversation_id
+        ):
+            raise HTTPException(404, "Run not found")
+        envelope, last_sequence = terminal_receipt(
+            self._control(identity.user_id, identity.conversation_id, run)
+            / "events.jsonl"
+        )
+        return {"terminal": envelope, "last_seq": last_sequence}
+
 
 def _read_event_tail(path: Path, position: int) -> tuple[int, tuple[bytes, ...]]:
-    try:
-        with path.open("rb") as stream:
-            stream.seek(position)
-            payload = stream.read()
-    except OSError:
-        return position, ()
-    boundary = payload.rfind(b"\n")
-    if boundary < 0:
-        return position, ()
-    complete = payload[:boundary + 1]
-    return position + len(complete), tuple(complete.splitlines())
+    return read_event_tail(path, position)
 
 
 async def _stream(path: Path, after: int) -> AsyncIterator[str]:
@@ -841,6 +830,16 @@ async def run_events(run_id: str, after: int = Query(default=0, ge=0), _=Depends
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.post("/v1/runs/{run_id}/terminal")
+async def run_terminal(
+    run_id: str,
+    payload: RunIdentity,
+    _=Depends(_auth),
+):
+    assert manager is not None
+    return await asyncio.to_thread(manager.terminal, run_id, payload)
 
 
 @app.post("/v1/runs/{run_id}/approvals/{request_id}")

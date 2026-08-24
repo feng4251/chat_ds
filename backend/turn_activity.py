@@ -26,6 +26,7 @@ _SAFE_AGENT_PAYLOAD_FIELDS = frozenset({
     "content", "role_hint", "artifact_id", "id", "size", "detail",
     "outcome", "actual_dispatch_attempted", "actual_dispatch", "recovered",
     "recovery_count", "runtime_finish_reason", "runtime_warning",
+    "tool_name", "tool_call_id",
 })
 _SAFE_AGENT_FIELDS = frozenset({
     "event_type", "run_id", "root_run_id", "parent_run_id", "agent_kind",
@@ -126,6 +127,9 @@ def safe_agent_event(value: Mapping[str, Any]) -> dict[str, Any]:
                 safe_payload[key] = _bounded(candidate, 4_000)
         if safe_payload:
             result["payload"] = safe_payload
+            for identity_key in ("tool_name", "tool_call_id"):
+                if identity_key not in result and safe_payload.get(identity_key):
+                    result[identity_key] = safe_payload[identity_key]
     return result
 
 
@@ -206,13 +210,21 @@ class TurnActivityBuilder:
         )
 
     def agent(self, event: Mapping[str, Any]) -> dict[str, Any]:
-        self._last_stream_kind = None
-        self._last_stream_node = None
         safe = safe_agent_event(event)
         run_id = str(safe.get("run_id") or self.root_run_id)
         event_type = str(safe.get("event_type") or "unknown")
-        tool_call_id = str(safe.get("tool_call_id") or "")
+        safe_payload = safe.get("payload")
+        safe_payload = safe_payload if isinstance(safe_payload, Mapping) else {}
+        tool_call_id = str(
+            safe.get("tool_call_id") or safe_payload.get("tool_call_id") or ""
+        )
         if event_type.startswith("tool."):
+            # A chronological tool card is a visible stream boundary. Aggregate
+            # workflow updates are not; breaking on every worker/progress event
+            # fragments one native reasoning or content stream into thousands
+            # of artificial blocks.
+            self._last_stream_kind = None
+            self._last_stream_node = None
             identity = tool_call_id or f"{run_id}:{self._seq + 1}"
             node_id = self._tool_nodes.setdefault(
                 identity, f"tool:{hashlib.sha256(identity.encode()).hexdigest()[:24]}"

@@ -16,6 +16,52 @@ from models import AgentRunEvent, Base
 
 
 class AgentEventSchemaContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_native_root_reconciliation_waits_for_supervisor_replay(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = create_async_engine(
+                f"sqlite+aiosqlite:///{Path(temp_dir) / 'native-defer.db'}"
+            )
+            try:
+                async with engine.begin() as connection:
+                    await connection.run_sync(Base.metadata.create_all)
+                    await connection.execute(text(
+                        "INSERT INTO agent_runs "
+                        "(id, user_id, conversation_id, parent_run_id, "
+                        "root_run_id, agent_kind, depth, workspace_scope, "
+                        "source, engine_id, requested_model_id, status, "
+                        "input_tokens, output_tokens, total_tokens) VALUES "
+                        "('native-root', 'user', 'conversation', NULL, "
+                        "'native-root', 'primary', 0, 'shared_session', "
+                        "'chat', 'deepseek_harness', 'renamed-model', "
+                        "'running', 0, 0, 0), "
+                        "('native-child', 'user', 'conversation', "
+                        "'native-root', 'native-root', 'delegate', 1, "
+                        "'shared_session', 'delegate', 'deepseek_harness', "
+                        "'renamed-model', 'running', 0, 0, 0)"
+                    ))
+                    await _reconcile_orphaned_descendant_runs(
+                        connection, defer_native_roots=True,
+                    )
+                    deferred = (await connection.execute(text(
+                        "SELECT id, status FROM agent_runs ORDER BY id"
+                    ))).all()
+                    self.assertEqual(
+                        [("native-child", "running"), ("native-root", "running")],
+                        [tuple(row) for row in deferred],
+                    )
+                    await _reconcile_orphaned_descendant_runs(
+                        connection, defer_native_roots=False,
+                    )
+                    reconciled = (await connection.execute(text(
+                        "SELECT id, status FROM agent_runs ORDER BY id"
+                    ))).all()
+                    self.assertEqual(
+                        [("native-child", "cancelled"), ("native-root", "cancelled")],
+                        [tuple(row) for row in reconciled],
+                    )
+            finally:
+                await engine.dispose()
+
     def test_model_uses_full_tool_name_width_and_unique_event_identity(self):
         self.assertEqual(512, AgentRunEvent.__table__.c.tool_name.type.length)
         identity_index = next(

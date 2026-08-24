@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from config import settings
-from database import init_db
+from database import init_db, reconcile_deferred_native_agent_runs
 
 from routers.auth_router import router as auth_router
 from routers.chat_router import (
@@ -46,6 +46,7 @@ async def lifespan(app: FastAPI):
             "Revoked %s stale native Agent Engine run(s) during startup",
             revoked_native_runs,
         )
+    await reconcile_deferred_native_agent_runs()
     try:
         workspace_reconcile = await reconcile_orphan_session_workspaces(
             clear_live_tombstones=True,

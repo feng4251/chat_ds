@@ -28,6 +28,7 @@ from models import (
     AgentEngineRawEvent,
     AgentEngineSession,
     AgentRun,
+    AgentRunEvent,
     Base,
     Conversation,
     Message,
@@ -2103,6 +2104,89 @@ class NativeCheckpointCommitBarrierTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(run.finish_reason, "native_audit_incomplete")
         self.assertEqual(state.status, "failed")
         self.assertIsNone(state.native_session_id)
+
+    async def test_startup_replays_deepseek_terminal_after_stream_loss(self):
+        run_id = "8" * 32
+        async with self.sessions() as db:
+            db.add(Message(
+                id="9" * 32,
+                conversation_id=self.conversation_id,
+                role="user",
+                content="audit the renamed warehouse",
+                model_id="renamed-cross-domain-model",
+            ))
+            db.add(AgentRun(
+                id=run_id,
+                user_id=self.user_id,
+                conversation_id=self.conversation_id,
+                root_run_id=run_id,
+                engine_id="deepseek_harness",
+                native_session_id=f"chatds-{self.conversation_id}",
+                requested_model_id="renamed-cross-domain-model",
+                resolved_model_id="renamed-cross-domain-model",
+                status="running",
+            ))
+            await db.commit()
+        terminal = {
+            "seq": 73,
+            "channel": "supervisor",
+            "event": {
+                "type": "chatds.supervisor.terminal",
+                "status": "failed",
+                "error": "renamed_workflow_contract_failed",
+                "error_stage": "workflow_contract_audit",
+            },
+        }
+        deepseek = SimpleNamespace(
+            recover_terminal=AsyncMock(return_value=terminal),
+            cancel_run=AsyncMock(return_value=True),
+        )
+        claude = SimpleNamespace(cancel_run=AsyncMock(return_value=True))
+        registry = SimpleNamespace(get=lambda engine_id: (
+            deepseek if engine_id == "deepseek_harness" else claude
+        ))
+        with (
+            patch.object(engine_lifecycle, "async_session", self.sessions),
+            patch.object(
+                engine_lifecycle.settings,
+                "claude_code_engine_enabled",
+                True,
+            ),
+            patch.object(
+                engine_lifecycle.settings,
+                "deepseek_harness_engine_enabled",
+                True,
+            ),
+            patch.object(
+                engine_lifecycle,
+                "build_agent_engine_registry",
+                return_value=registry,
+            ),
+        ):
+            recovered = (
+                await engine_lifecycle
+                .revoke_stale_native_runs_on_backend_startup()
+            )
+        self.assertEqual(recovered, 1)
+        deepseek.cancel_run.assert_not_awaited()
+        async with self.sessions() as db:
+            run = await db.get(AgentRun, run_id)
+            raw = (await db.execute(select(AgentEngineRawEvent).where(
+                AgentEngineRawEvent.run_id == run_id,
+            ))).scalar_one()
+            event = (await db.execute(select(AgentRunEvent).where(
+                AgentRunEvent.run_id == run_id,
+            ))).scalar_one()
+            messages = (await db.execute(select(Message).where(
+                Message.conversation_id == self.conversation_id,
+            ).order_by(Message.created_at, Message.id))).scalars().all()
+        self.assertEqual(run.status, "failed")
+        self.assertEqual(run.error, "renamed_workflow_contract_failed")
+        self.assertEqual(raw.native_event_type, "chatds.supervisor.terminal")
+        self.assertEqual(event.event_type, "run.failed")
+        self.assertTrue(json.loads(event.payload)["authoritative"])
+        self.assertEqual(messages[-1].role, "assistant")
+        self.assertIn("原生终态已从会话账本恢复", messages[-1].content)
 
     async def test_raw_native_ledger_is_idempotent_and_rejects_conflicts(self):
         run_id, _candidate = await self._seed_success(with_raw_terminal=False)

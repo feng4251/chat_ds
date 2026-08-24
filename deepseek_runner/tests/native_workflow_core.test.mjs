@@ -6,6 +6,8 @@ import {
   validateWorkflowProjection,
 } from '../native_workflow_core.mjs'
 
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
+
 const projection = (overrides = {}) => ({
   schema: 'chatds.deepseek-skill-workflow.v1',
   native_session_id: `chatds-${'7'.repeat(32)}`,
@@ -64,6 +66,56 @@ test('the projected program keeps business data in args and topology in generic 
     compiled.args.phases.map((phase) => phase.workers.map((worker) => worker.workerId)),
     [['east-curator', 'west-curator'], ['catalog-fanin']],
   )
+})
+
+test('the generic workflow body parses before native execution', () => {
+  const compiled = compileWorkflowProgram(validateWorkflowProjection(projection()), new Map([
+    ['east-curator', 'east instructions'],
+    ['west-curator', 'west instructions'],
+    ['catalog-fanin', 'fanin instructions'],
+  ]))
+  assert.doesNotThrow(() => new AsyncFunction(
+    'args', 'agent', 'parallel', 'phase', compiled.script,
+  ))
+})
+
+test('the generic program preserves barriers and retries only failed members', async () => {
+  const compiled = compileWorkflowProgram(validateWorkflowProjection(projection()), new Map([
+    ['east-curator', 'east instructions'],
+    ['west-curator', 'west instructions'],
+    ['catalog-fanin', 'fanin instructions'],
+  ]))
+  const execute = new AsyncFunction(
+    'args', 'agent', 'parallel', 'phase', compiled.script,
+  )
+  const calls = []
+  const attempts = new Map()
+  const result = await execute(
+    compiled.args,
+    async (prompt, options) => {
+      calls.push({ prompt, ...options })
+      const attempt = (attempts.get(options.label) ?? 0) + 1
+      attempts.set(options.label, attempt)
+      if (options.label === 'east-curator' && attempt === 1) return null
+      return `${options.label} handoff`
+    },
+    async (thunks) => Promise.all(thunks.map((thunk) => thunk())),
+    (title) => calls.push({ barrier: title }),
+  )
+  assert.deepEqual([...attempts], [
+    ['east-curator', 2],
+    ['west-curator', 1],
+    ['catalog-fanin', 1],
+  ])
+  assert.deepEqual(calls.filter((row) => row.barrier).map((row) => row.barrier), [
+    'phase-0', 'phase-1',
+  ])
+  const fanin = calls.find((row) => row.label === 'catalog-fanin')
+  assert.match(fanin.prompt, /east-curator handoff/)
+  assert.match(fanin.prompt, /west-curator handoff/)
+  assert.deepEqual(result.results.map((row) => row.workerId), [
+    'west-curator', 'east-curator', 'catalog-fanin',
+  ])
 })
 
 test('projection validation rejects path traversal and phase renames', () => {

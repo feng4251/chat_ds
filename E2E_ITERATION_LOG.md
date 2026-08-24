@@ -2080,3 +2080,70 @@ conversation/root；当前用户授权硬上限为 Round 18。
 
 Round 17 至此闭环。下一轮不应重复消费 V2.3 来证明同一事实；只有新的用户驱动独立 E2E 或新的通用不变量
 失败，才进入 Round 18 repair loop。
+
+## 2026-08-24 既有原生双引擎 Session 缺陷闭环（不计 Round 18）
+
+本节是对既有 `a36e8cfb770143fea0c726abf9ccac1b`（DeepSeek Harness）与
+`3b92e02e644c41e3a705940c199a7b0f`（Claude Code）的三源诊断和通用修复，不是一次新的独立模型
+E2E。没有新 conversation/root、没有重放同一 run、也没有把派生数据修复解释成新 round；Round 18 仍保留
+给用户驱动的全新验收。
+
+### 冻结证据、准确分类与终态
+
+- `a36...` root `73cbb06140824813948d14bf7a1a6b68` 的持久对话、冻结 V2.3 Skill view 与
+  243,577 行 native/debug ledger 已逐项相关。模型调用了一次原生 `execute_skill_workflow({})`；参数为空是
+  工具 schema 的正确形态。工具返回 `SCRIPT_PARSE`，因为 ChatDS workflow program 的单引号 JavaScript
+  字符串包含未转义真实换行。Supervisor seq 243577 已唯一 sealed
+  `failed/workflow_contract_failed`；旧 `error_stage=egress_bridge_seal` 是 adapter 误归因。117 MiB ledger 的
+  whole-file read 导致 Supervisor OOM，Backend 又缺 DSH terminal recovery，使数据库/前端长期失真。
+- `3b92...` root `a4cb1266b41142bf9c117d99383a3537` 的持久对话、同一 Skill snapshot 与 Claude
+  native/debug receipt 显示首个 403 来自 ChatDS egress proxy 的 64 MiB cumulative budget，而 Claude bridge
+  自身统计尚略低于阈值。分类为 policy/adapter，不是 Claude Code/模型/Skill 内容。两条旧 root 最终都保留
+ 真实 failed；没有补写模型正文、重试外部副作用或制造 success。
+
+### 先定义的不变量、成熟实现对照与决策
+
+1. 任意 Skill 编译出的原生 workflow program 必须预先可解析；数据与通用 topology code 分离，修复不得引用
+   Skill/session/route/worker/file fixture。
+2. native terminal 与大型 ledger 必须有界、可恢复且 exactly identified；Backend 重启后的派生 AgentRun、child、
+   TurnActivity 必须最终与 Supervisor receipt 一致。
+3. 一个原生 tool call identity 只能对应一张 Web card；不可见聚合事件不能切断 streamed reasoning/content；
+   root terminal 后不能留下视觉上的 running child/tool。
+4. 长 provider exchange 的默认预算应容纳声明的长上下文，但 exact egress authority、method/path/origin、次数、
+   单响应与 deadline 仍必须 fail closed。
+
+唯一成熟参考冻结为本地 `claude-code/` commit
+`6f6f12b37f529488b10e53928dd5508bb93535c7`。原生 query 在 result 前 drain pending events、stdio
+structured I/O 保持 request identity、Session/terminal 留在原生 loop；本轮 **adapt** 其 durable pending/
+identity/terminal pattern 到 ChatDS 现有 receipt 和 UI projection，**reject** 第二套 agent loop、模型 prose
+terminal、业务 fixture workaround。DeepSeek 上游仓库仅作为不可修改边界固定在
+`47f943859bef60e4160492346772ded9b24f765a`；没有以推测补全其私有行为，也没有修改 native harness。
+
+### 通用修复与可重复证明
+
+- workflow program 换行转义修复配有 museum/warehouse rename 测试：程序必须通过 `AsyncFunction` parse，
+  sequential/parallel barrier 正确，恢复只重试失败 member。错误阶段现在由失败 frontier 归因，不再总落到
+  egress seal。
+- DSH Supervisor 改为有界 JSONL terminal scan/replay，并提供 exact identity terminal recovery；Backend 启动
+  先恢复 Supervisor terminal，随后终态化 descendants，child engine identity 继承 root。安全派生 migration
+  从 immutable raw event 恢复嵌套 tool call ID，并从 durable AgentRunEvent 校正 stale/missing workflow
+  terminal；两者幂等且不改 raw ledger。
+- live projector 支持 DSH 顶层、`message.source`、`message.content[]` 三种 result identity；TurnActivity 在
+  payload/top-level 安全提升 ID/name。Frontend 合并相邻历史 text stream、同 ID 生命周期原位替换，并在 root
+  terminal 时收口无 result 的 open card。
+- Claude/DeepSeek/egress proxy 默认 cumulative outbound budget 调到 1 GiB 绝对上限，其他签名策略不变。
+- 确定性证明为 Backend `135 passed, 52 warnings, 2 subtests`、Claude config `6 passed, 3 subtests`、
+  DSH workflow Node `4/4`、Frontend `52/52`、生产 build/syntax/diff 全通过；runner candidate image 在
+  `network=none/read-only/tmpfs` 的 warehouse workflow integration 通过。未启动模型重型 V2.3。
+
+### 生产验收
+
+- 当前生产核心镜像为 Backend `sha256:0054251e...`、Frontend `sha256:498c5326...`、Claude Supervisor
+  `sha256:11952220...`、DeepSeek Supervisor `sha256:e69a056b...`、proxy `sha256:8bfa4a42...`；restart 均为
+  0，health 正常，Frontend entry `/assets/index-BoKpCOIW.js`。
+- SearXNG 已恢复项目 limiter/config mount；从 egress proxy 实际查询返回 24 条结果。部署时必须用宿主同一
+  绝对路径运行 nested Compose，不能把 relative bind 解析成 daemon `/repo/*`。
+- `a36...` 的生产 durable activity 用实际 frontend reducer 回放为 12 content、41 reasoning、201 tool card，
+  其中 191 succeeded、10 failed、0 running；workflow root failed、9 children cancelled。tool repair 首次修复
+  519 条，terminal repair 首次修复 70 条，独立进程复查剩余 0。`3b92...` 保持 failed。该闭环计作通用
+  compiler/lifecycle/evidence/UI repair iteration，但不消费 Round 18 的独立 E2E 名额。

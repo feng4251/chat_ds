@@ -46,6 +46,35 @@ test('duplicate replay is idempotent and contiguous chunks merge in place', () =
   assert.equal(nodes[0].text, 'hello world')
 })
 
+test('historical adjacent stream fragments compact without crossing a tool boundary', () => {
+  const nodes = reduceTurnActivities([
+    event(1, 'reasoning:legacy-1', 'reasoning', { text: 'inspect ' }),
+    event(2, 'reasoning:legacy-2', 'reasoning', { text: 'museum ' }),
+    event(3, 'reasoning:legacy-3', 'reasoning', { text: 'receipts' }),
+    event(4, 'tool:catalog', 'tool', {
+      event: {
+        event_type: 'tool.started',
+        tool_name: 'RenamedCatalogLookup',
+        tool_call_id: 'catalog',
+      },
+    }),
+    event(5, 'reasoning:legacy-4', 'reasoning', { text: 'summarize' }),
+  ])
+  assert.deepEqual(nodes.map((node) => node.kind), [
+    'reasoning', 'tool', 'reasoning',
+  ])
+  assert.equal(nodes[0].text, 'inspect museum receipts')
+  assert.equal(nodes[2].text, 'summarize')
+
+  const duplicate = applyTurnActivity(nodes, event(
+    2,
+    'reasoning:legacy-2',
+    'reasoning',
+    { text: 'museum ' },
+  ))
+  assert.equal(duplicate[0].text, 'inspect museum receipts')
+})
+
 test('workflow node preserves semantic renamed child and terminal status', () => {
   const nodes = reduceTurnActivities([
     event(1, 'workflow:root', 'workflow', {
@@ -94,6 +123,53 @@ test('one tool lifecycle updates both chronological card and child aggregate', (
   assert.equal(nodes[0].runs[0].tools[0].status, 'success')
   assert.equal(nodes[1].kind, 'tool')
   assert.equal(nodes[1].status, 'succeeded')
+})
+
+test('tool completion replaces the running card and retains start metadata', () => {
+  const nodes = reduceTurnActivities([
+    event(1, 'tool:stable', 'tool', {
+      event: {
+        event_type: 'tool.started',
+        tool_name: 'RenamedWarehouseLookup',
+        tool_call_id: 'stable-call',
+        payload: { detail: 'running' },
+      },
+    }),
+    event(2, 'tool:stable', 'tool', {
+      event: {
+        event_type: 'tool.completed',
+        payload: { detail: 'complete' },
+      },
+    }),
+  ])
+  assert.equal(nodes.length, 1)
+  assert.equal(nodes[0].status, 'succeeded')
+  assert.equal(nodes[0].payload.event.tool_name, 'RenamedWarehouseLookup')
+  assert.equal(nodes[0].payload.event.tool_call_id, 'stable-call')
+  assert.equal(nodes[0].payload.event.payload.detail, 'complete')
+})
+
+test('authoritative root terminal never leaves an unmatched tool executing', () => {
+  const nodes = reduceTurnActivities([
+    event(1, 'tool:interrupted', 'tool', {
+      event: {
+        event_type: 'tool.started',
+        run_id: 'root',
+        root_run_id: 'root',
+        tool_name: 'RenamedFactoryLookup',
+        tool_call_id: 'interrupted-call',
+      },
+    }),
+    event(2, 'workflow:root', 'workflow', {
+      event: {
+        event_type: 'run.failed',
+        run_id: 'root',
+        root_run_id: 'root',
+        payload: { authoritative: true, error: 'provider_interrupted' },
+      },
+    }),
+  ])
+  assert.equal(nodes.find((node) => node.kind === 'tool').status, 'failed')
 })
 
 test('durable assistant joins activities only by exact root run identity', () => {
