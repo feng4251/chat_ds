@@ -2330,3 +2330,18 @@ workflow pass 后不改内容或只 touch metadata 都必须报 `artifact_final_
 contract `56/56`、Supervisor lifecycle `38/38` 通过，`git diff --check`、Python AST 与上游仓库 clean 检查通过。
 Round 18 因此计作一次通用 lifecycle/control-plane repair iteration；DeepSeek 的 passing E2E 是同轮 acceptance，
 不制造额外代码变化。
+
+### 提交、部署与生产复验
+
+- 功能与证据提交为 `fbc87906`（`fix: enforce post-workflow artifact synthesis`）。镜像从该提交的 clean
+  `git archive` 构建，不包含 dirty worktree、runtime 目录或两项用户自有删除；构建期与切换后均通过真实
+  `chatds.claude-runner-image-self-test.v1`，4 个 MCP entrypoint 和 4 个 compatibility entrypoint 全部正常。
+- 生产 `chat_ds-claude-runner:2.1.152` 当前解析到
+  `sha256:c67c9faccf0272617622e21671901b97edafcc30e91b928d6c70e535b6e59602`，OCI revision 为
+  `fbc87906`；旧镜像 `sha256:c2a6d2dd...` 保留为 `rollback-pre-fbc87906`。只重建 inert、network-none
+  `claude-runner-image` anchor；Claude Supervisor、Backend、Frontend、DeepSeek、原生 CLI 与任何 workspace
+  均未重启。Anchor 为 read-only、network none、pids 16、64 MiB、restart 0；Supervisor healthy/restart 0，
+  仍以 `CLAUDE_RUNNER_IMAGE=chat_ds-claude-runner:2.1.152` 动态创建后续 Turn。
+- `127.0.0.1`、`10.10.132.126`、`172.30.100.126` 三入口 `/api/health` 均为 200 且 storage identity 一致；
+  Backend、Frontend、两个 Supervisor、SearXNG 与 egress proxy 状态不变。没有自动再发起模型重型 V2.3；
+  DeepSeek 本轮已完成 acceptance，Claude 修复后的业务 E2E 由用户下一次新建 Session 验收。

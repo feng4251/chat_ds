@@ -1,6 +1,63 @@
-# ChatDS 当前会话交接（2026-08-13）
+# ChatDS 当前会话交接（2026-08-24）
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
+
+## 2026-08-24 Round 18 原生双引擎 E2E、passed-frontier fan-in 与生产切换
+
+### 新鲜 Session 终态与不可变输入
+
+- 用户新建的同输入 E2E 已全部进入权威终态。DeepSeek Harness conversation
+  `681e814526b54e2295c009207508f2b8`、root `0417d05f48b14ef4a68444d2666b601f` 为
+  `succeeded/stop`；Claude Code conversation `db051b53fe7b4824a92eb27dc3d52f95`、root
+  `db8fd6a7be1e45f7ad7eb1fc695769b5` 为 `failed/workflow_contract_failed`。两者绑定同一 input SHA-256
+  `2f042f8dec9eaf2f79994e634a81da9ab11408e53dbd42952a41be049f43787c`、同一 immutable Skill view
+  `9aee2a0596eff2e78c48c615332e70ed3d82abc9539b701663ea7076af96d7b8`、同一 manifest 和
+  `composite_full_protocol_design` route。route 声明 7 个并行 mandatory worker，再串行 1 个 I/E worker；
+  final 硬合同至少 153,600 bytes/2,000 lines。
+- DeepSeek 8 个声明 worker 均 attempt 1 succeeded；workflow/artifact receipt 都 passed、0 finding，ledger
+  terminal seq 405,163。`GAL301_FULL_REPORT.md` 为 153,967 bytes/2,627 lines、SHA-256
+  `237c13179cf98cee354cd84c0797a1b7656f4e315443b3e3c241a85d9b778a53`，与 11 模块顺序 concat 完全相同。
+  首稿低于 byte 合同后，模型按 machine `artifact_min_bytes_not_met` 反馈在原生 loop 内扩写并通过；本轮可作为
+  DeepSeek V2.3 business acceptance。
+- Claude fresh skill invocation、workspace、ledger 与投影都正确，7 个 phase 0 worker 全成功；但模型先启动
+  1 个 generic agent，随后把其输出当作 phase 1 草稿，从未调用声明的精确 I/E agent。它在 prose/result 中
+  声称所有 phase 成功，机器 receipt 仍准确记录 phase 1 attempt 0/missing。Supervisor seq 127,793 唯一终止为
+  failed，artifact audit deferred；8 次 provider retry 均恢复，egress 无 budget rejection，因此不是网络、沙箱、
+  Claude binary/core 或 workspace isolation 故障。失败草稿 final 为 147,529 bytes/2,520 lines，虽等于 11 模块
+  concat，仍低于硬性 byte 合同，不能作为交付成功。
+
+### 本轮通用缺陷与修复边界
+
+- 旧 ChatDS PreToolUse 只反馈 `frontier=N`，Claude 在本轮产生 69 次 frontier 0 和 8 次 frontier 1 的重复
+  artifact 尝试；mandatory frontier 前还允许 optional/generic root agent。模型又用临时文件加多行 Python
+  remove/rename 绕过静态 Bash path recognizer。若它之后补齐 worker，旧 turn-start snapshot 可能把 workflow
+  前已生成的 final 误判为合法 fan-in。这两个缺陷都在 ChatDS adapter/control plane，不在原生 Claude Code。
+- 功能提交 `fbc87906` 只修改 ChatDS Claude adapter/test：mandatory frontier 前拒绝未声明 root Agent；每次
+  blocked fan-in 返回当前 phase 精确 `native_agent_type/status` 和可执行动作；workflow 首次 passed 时原子写入
+  root-owned synthesis checkpoint，保存 workspace identity 与 declared-final SHA-256。Stop hook 和 terminal
+  audit 都要求 final 在该 checkpoint 后真实内容变化；预生成、rename、touch、metadata-only 与损坏 checkpoint
+  全部 fail closed。没有新增 control prompt、第二套 loop、provider retry/compaction 或 fixture/model/session 特判。
+- 成熟参考仍唯一冻结为 clean `claude-code/` commit
+  `6f6f12b37f529488b10e53928dd5508bb93535c7`：adopt native PreToolUse actionable feedback，adapt durable
+  passed-frontier checkpoint 到现有 authority/receipt，reject PostToolUse rollback 与 core patch。DeepSeek 上游
+  `deepseek-harness-clean/` 仍 clean 于 `47f943859bef60e4160492346772ded9b24f765a`。
+- 非医疗 warehouse/museum failure injection 覆盖 inline Python 静态绕过、pre-frontier final、metadata touch、
+  post-frontier rewrite、optional agent、精确反馈和 corrupt checkpoint。最终 Runner contract `56/56`、
+  Supervisor lifecycle `38/38`、image self-test、AST、genericity scan、`git diff --check` 全通过。
+
+### 当前生产与下一步
+
+- 从 `fbc87906` clean archive 构建的生产 Claude Turn image 为
+  `sha256:c67c9faccf0272617622e21671901b97edafcc30e91b928d6c70e535b6e59602`，OCI revision `fbc87906`；
+  旧 `sha256:c2a6d2dd...` 保留为 `rollback-pre-fbc87906`。只重建了 inert Claude runner image anchor；它为
+  read-only/network-none、restart 0。Claude Supervisor 未重启且 healthy/restart 0，仍通过 tag
+  `chat_ds-claude-runner:2.1.152` 创建后续 Turn。Backend、Frontend、DeepSeek、SearXNG、egress、原生 harness
+  与所有 Session workspace 均未重建。
+- 三个入口 `/api/health` 均 200、storage identity 一致。不要自动再次运行模型重型 V2.3；DeepSeek 已通过，
+  Claude 的修复后 acceptance 等用户新建 Session。下一次必须继续做三源终态闭环，不能把模型 prose 当 receipt。
+- 两项用户自有 tracked deletion 仍必须保持 unstaged：
+  `XGAL-101_Galectin-3_AD_Comprehensive_Development_Plan_v1.0_claudecode执行参考.md` 与
+  `xClinicalTrial-Design-V2.2.zip`；大量既有 untracked runtime/reference 目录也不应加入 Git。
 
 ## 2026-08-24 DeepSeek workflow、原生终态恢复与 Turn 时间线修复
 
