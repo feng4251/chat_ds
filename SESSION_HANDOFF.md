@@ -3705,3 +3705,36 @@ Round 17 的两个全新 case。不得复用
   `fix/generic-skill-harness-20260717` has an unrelated rewritten history (no
   common merge-base), so it was deliberately neither force-pushed nor merged;
   the local branch now tracks the new production branch.
+
+# 2026-08-25 Shaiengine recovery, GLM-5.3 and stable native Web projection
+
+- Claude conversation `57211a178c9640c5a9cf8edaa4a9967f`/root
+  `7fbe534e82954d34be3e5fabda00f72d` and DeepSeek conversation
+  `25b87a66246a4e3795b2fa1f6e2f66c3`/root `3fe9779303184b5693c090262d192e2e` were correlated from persisted
+  conversation, exact immutable Skill/route and native/debug receipts. Both failed because the production Shaiengine credential
+  returned structured 401; Claude's old `native_result_duplicated` and DeepSeek's old `workflow_contract_failed` hid that causal
+  receipt. Full evidence, worker/barrier detail and mature-source comparison are in `E2E_ITERATION_LOG.md`.
+- The replacement credential is active only through restricted ignored deployment files; never copy it into Git, logs or commands.
+  It was disclosed in chat, so recommend another controlled rotation after current verification. OpenAI and Anthropic probes for
+  `glm-5.3` are 200.
+- Commit `be8850a5` adds generic structured-provider precedence, stale-retry protection, stable task progress identity, one tool card
+  per `tool_use_id`, terminal settlement of progress, less fragmented reasoning/content projection and the current
+  `shaiengine_glm_5_3` route. Historical `shaiengine_glm_5_2` remains exact and visible; new native Sessions default to GLM-5.3.
+  No Skill/session/domain literals occur in production logic.
+- Local native references remain untouched: `claude-code/` is clean at
+  `6f6f12b37f529488b10e53928dd5508bb93535c7`; `deepseek-harness-clean/` is clean at
+  `47f943859bef60e4160492346772ded9b24f765a`. ChatDS still owns only IO/session/workspace/policy/projection boundaries.
+- clean-archive verification: Backend `394 passed`; Claude Runner `125 passed, 1 skipped`; Frontend `59 passed`; Vite build,
+  targeted ESLint, Compose, AST/diff/genericity and both native-image self-tests pass. Production runs revision `be8850a5` images:
+  Backend `cf6446c4...`, Frontend `62b9a5c4...`, Claude Supervisor `fbd37c39...`, Claude Turn `73c32a6b...`, DeepSeek
+  Supervisor `031e03d0...`, DeepSeek Turn `ab0ad450...`; all prior images have `rollback-pre-be8850a5` tags.
+- Production smoke is complete: six switched components restart 0; Backend and both Supervisors healthy; three Web/API entries 200
+  on `/assets/index-FoxG4oKM.js`; SQLite quick-check OK/foreign-key violations 0; SearXNG returns real results. Fresh Claude
+  `700997...`/`dcc3890b...` and DeepSeek `9f5257...`/`4dd6a0...` GLM-5.3 smokes both succeeded. Headless Chromium saw no
+  white screen, login redirect, stale running label or Runtime/console/Log error.
+- Do not rerun either old failed root or rewrite its terminal. The next complex Skill/V2.3 acceptance remains user-driven. Keep the
+  two protected tracked deletions unstaged and preserve all untracked Session/runtime/reference data.
+- GitHub push for this Aug-25 closure is still pending authentication. Remote
+  `fix/native-adapter-production-20260824` had no concurrent commits and was exactly two commits behind before the attempt, but this
+  Codex environment has no HTTPS credential, SSH key/agent or connected GitHub plugin. Both push transports failed before any write.
+  Keep the local commits; request a non-interactive GitHub authorization, then push `HEAD` explicitly to that branch without force.

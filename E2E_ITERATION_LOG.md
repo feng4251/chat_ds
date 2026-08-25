@@ -2345,3 +2345,89 @@ Round 18 因此计作一次通用 lifecycle/control-plane repair iteration；Dee
 - `127.0.0.1`、`10.10.132.126`、`172.30.100.126` 三入口 `/api/health` 均为 200 且 storage identity 一致；
   Backend、Frontend、两个 Supervisor、SearXNG 与 egress proxy 状态不变。没有自动再发起模型重型 V2.3；
   DeepSeek 本轮已完成 acceptance，Claude 修复后的业务 E2E 由用户下一次新建 Session 验收。
+
+## 2026-08-25 Shaiengine 401、GLM-5.3 与原生活动投影闭环
+
+本节诊断用户新建的 Claude Code conversation `57211a178c9640c5a9cf8edaa4a9967f`、root
+`7fbe534e82954d34be3e5fabda00f72d`，以及 DeepSeek Harness conversation
+`25b87a66246a4e3795b2fa1f6e2f66c3`、root `3fe9779303184b5693c090262d192e2e`。两者已经各自到唯一
+durable failed terminal，不重放原任务，也不计作新的 V2.3 round。诊断同时冻结持久 conversation、exact
+Skill/package/resource 和 debug/AgentRun/native ledger：共同用户输入 SHA-256 为
+`2f042f8dec9eaf2f79994e634a81da9ab11408e53dbd42952a41be049f43787c`，Skill view 为
+`9aee2a0596eff2e78c48c615332e70ed3d82abc9539b701663ea7076af96d7b8`，manifest 为
+`5b536a43b336d17007c8f38dd898165506475da756895fd71aaa22da9653bbae`，route 是
+`composite_full_protocol_design`，route SHA-256 为
+`b7ff3beb155882eebe6b34381c3af540e515d35867f9458f9a3682132e2fd921`。声明 workflow 仍为 phase 0
+七个 mandatory 并行 worker，再串行精确 I/E worker；交付合同是 11 模块和至少 153,600 bytes/2,000 lines。
+
+### 三源故障链与分类
+
+- Claude 的六个 phase-0 worker 已成功；target worker 在 Claude 原生 10 次 provider retry 后以 401 结束，期间
+  混有一次 502。原生 stdout 随 task-notification queue drain 产生两个不同 UUID 的 error result，二者都携带
+  `api_error_status=401`。旧 controller 先按 result count 选择 `native_result_duplicated`，遮蔽了更早且更强的
+  provider receipt。phase 1 未启动，workflow/artifact 失败是后置结果，不是首因。
+- DeepSeek 的四个 worker 已完成；target、competitive 和 literature worker 首次与一次 Harness-owned retry 均在
+  第一条模型请求收到结构化 `turn/end reason.kind=error/status=401`，原生进程 exit 1，phase barrier 正确阻止后续
+  I/E worker。旧唯一 terminal 是 `workflow_contract_failed`，同样把 provider 首因误显示成后置 gate。
+- 同输入、同 Skill、同 route、同 provider 的历史 DeepSeek conversation `681e814526b54e2295c009207508f2b8`
+  曾完整成功，排除固定 Skill/compiler/workspace 缺陷。生产旧 credential 的 `/v1/models`、OpenAI chat 与
+  Anthropic messages 三条无泄漏探针均为 401“令牌状态不可用”；替换 credential 后 `/v1/models`、OpenAI
+  `deepseek-v4-pro`、Anthropic `glm-5.2`、OpenAI/Anthropic `glm-5.3` 都返回 200。分类是 provider credential/
+  upstream availability 加 ChatDS terminal/UI 投影缺陷；没有 Claude Code 或 DeepSeek Harness 原生核心缺陷。
+- Claude 页面碎片化来自 ChatDS Web 投影：同一 `task_id/tool_use_id` 的 358 个 task-progress、32 个 status 和
+  20 个 retry 更新曾各自产生新 activity node；同一个原生 tool start 又同时生成 progress row 与 tool card。
+  这解释“乱跳”和完成时另起一张卡，不能归因于模型思考本身。
+
+### 跨 Skill 不变量、成熟实现对照与修复
+
+1. machine-owned provider HTTP terminal 必须优先于 result multiplicity、workflow 和 artifact 等后置失败；模型正文和
+   stderr 文本不得成为 lifecycle authority。DeepSeek 仅在 native exit 非零时用结构化 provider error 精化首因，
+   已被后续重试恢复的历史 429 不能推翻 clean exit。
+2. 一个原生 task/tool identity 只能拥有一个稳定 Web node；progress 必须原位 merge，root terminal 后不能残留
+   running。带 `tool_use_id` 的原生 progress 合并进同一 tool card，completed/failed 继续用原 ID 结算；缺 ID 的
+   状态才作为独立有界 progress surface。
+3. progress 是 ephemeral presentation update，不应人为切碎连续 reasoning/content；raw native ledger 仍完整保留。
+   子任务 `<details>` 的用户展开状态也不能因 lifecycle rerender 被强制折叠。
+4. 新模型 route 必须新增 identity；历史 `shaiengine_glm_5_2` 永久绑定 wire `glm-5.2`，新 Session 默认选择
+   `shaiengine_glm_5_3 -> glm-5.3`，不得静默重绑旧 conversation。
+
+唯一成熟参考再次冻结为 clean 的本地 `claude-code/` commit
+`6f6f12b37f529488b10e53928dd5508bb93535c7`。其 `src/QueryEngine.ts`/SDK schema 为 tool progress 保留
+`tool_use_id`，`src/cli/print.ts` 在 background task-notification drain 期间允许多个原生 result/notification 边界，
+`src/query.ts` 继续由原生 loop 持有 pending task 与 retry。这里 **adopt** stable native identity，**adapt** provider
+receipt precedence 和 bounded projection 到 ChatDS 既有 terminal/activity ledger，**reject** 修改 Claude binary、
+复制 agent/retry/compaction loop，或按 Skill/session/model prose 特判。DeepSeek 上游仍 clean 固定为
+`47f943859bef60e4160492346772ded9b24f765a`。
+
+实现提交 `be8850a5` 只改 ChatDS adapter、Backend model binding 和 Frontend。确定性回归使用
+warehouse/museum/factory rename、两个不同 task identity、10,000 次同 ID progress、结构化 429 与 malformed status；
+生产代码不含临床、V2.3、session、route、worker 数或报告名。clean archive 回归为 Backend `394 passed,
+119 warnings, 2 subtests`，Claude Runner `125 passed, 1 skipped, 19 subtests`，Frontend `59 passed`；Vite build、
+修改文件 ESLint、Compose、AST/diff/genericity 与两个 native image self-test 全通过。skip 是既有环境条件测试；warnings
+仍是 passlib/`datetime.utcnow()` deprecation。
+
+### Credential、部署与线上证明
+
+- replacement credential 仅写入权限受限、Git ignored 的部署 secret 文件和 `.env`，未进入源码、文档、日志或
+  image layer；因为 credential 曾在对话中明文暴露，当前可用不等于长期安全，后续仍应再次轮换。
+- 六个镜像均从 clean commit `be8850a5421ed68405aaa47d9b49ed0c973466eb` 构建：Backend
+  `sha256:cf6446c4...`、Frontend `sha256:62b9a5c4...`、Claude Supervisor `sha256:fbd37c39...`、Claude Turn
+  `sha256:73c32a6b...`、DeepSeek Supervisor `sha256:031e03d0...`、DeepSeek Turn
+  `sha256:ab0ad450...`。六个旧镜像均保留 `rollback-pre-be8850a5`；DeepSeek image 的 upstream revision label
+  仍为 `47f943...`，另用 ChatDS revision label 记录本提交。
+- 切换前 active AgentRun 和动态 Turn container 都为 0，SQLite `quick_check=ok`、外键违规 0。部署只重建六个
+  ChatDS 组件/anchor；数据库卷、所有 Session workspace、SearXNG、Valkey、egress proxy 与 native source 未动。
+  切换后六组件 restart 0，Backend/两个 Supervisor healthy；三个 Frontend 入口 `/` 与 `/api/health` 均为 200，
+  entry 一致为 `/assets/index-FoxG4oKM.js`，storage identity 一致。SearXNG 容器内真实查询返回 7 条结果。
+- 实际旧账本在候选 wrapper 中离线重放分别得到 Claude `provider_http_401`（两个 result）和 DeepSeek
+  `provider_http_401`，证明新 causal attribution 精确命中本次故障。生产专用测试账户随后创建 Claude conversation
+  `700997619a0c44fe95486c84081a63f1`/root `dcc3890b23a74fc08180018e8c130ea9` 和 DeepSeek conversation
+  `9f525785eff0487d90b439cf21a4ab17`/root `4dd6a0680af140f8933286a7c627c43c`；两者均用
+  `shaiengine_glm_5_3` 权威 succeeded，分别 `end_turn` 与 `stop`，无 error。无头 Chromium 打开前者时
+  `#root` 有内容、GLM-5.3/SMOKE_OK 可见、未跳登录、0 Runtime/console/Log error、0 个残留“执行中”。
+- 本次只运行两条低成本无 Skill smoke，没有自动启动模型重型 V2.3。新的复杂业务 E2E 仍由用户创建新 Session
+  验收；旧 failed conversation 的历史 terminal 不会被篡改成 success。
+- GitHub 目标分支在 push 前回读为远端落后本地两个提交且无并发更新；但当前 Codex 环境没有 HTTPS credential、
+  SSH key/agent 或已连接 GitHub plugin，生产主机也没有可复用认证。HTTPS、SSH 22/443 均在写入前安全退出，
+  因此 `be8850a5` 与本节文档提交当前只在本地，待用户提供非交互 GitHub 授权后再 push；绝不把 token 放进
+  remote URL、命令行、Git 配置或仓库。
