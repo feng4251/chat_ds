@@ -1,6 +1,69 @@
-# ChatDS 当前会话交接（2026-08-24）
+# ChatDS 当前会话交接（2026-08-25）
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
+
+## 2026-08-25 Qwen xhigh provider 方言、原生角色保持与生产验收
+
+### 三源诊断与两阶段确定性复现
+
+- 历史 conversation `96a9db2a07bf474880f24a79f934da28` 是
+  `deepseek_harness + qwen3_5 + workspace_write`，用户输入仅为“你好”。持久化 root
+  `97dd37bb0094416e805fe045022d03c2` 在约 3 秒内以 `provider_http_400` 失败、0 token；原始 DSH
+  event 明确是供应商拒绝 `reasoningEffort=max`，其可接受值为 `xhigh`、`medium`、`low`。该 Session
+  的 immutable Skill view 为
+  `7333785203fbd3bb3695c75aaf01399b9e8af5770d251879089fb636ec1dae45`，selected Skill、worker、route、
+  artifact contract 与 diagnostic 均为 0。因此不是 Skill、sandbox、工具、模型判断或前端问题，而是 ChatDS
+  provider profile 没有把 canonical `max` 绑定到该端点的 wire spelling `xhigh`。
+- 首次通用实现 `d7c917b6` 将 per-model wire effort 声明加入 Supervisor profile，并尝试使用 DSH 已有的
+  generic pi-ai route。纯 provider 测试可把 `max` 发成 `xhigh`，但生产最小复现 conversation
+  `ff9ce9c20c6b43ec8a53945f9d1069f9`、root `29b18a3c808748c9880a28bd1d78b8c5`
+  证明完整 turn 随后被端点以 `Unexpected message role` 拒绝。三源再次一致：同一空 Skill view、持久化输入只含
+  一条普通 user message、runtime receipt 已显示 `xhigh`；raw request/header event 表明 generic adapter 的
+  URL 自动探测使用了供应商不接受的 developer role。这说明“推理别名”不能通过换序列化器实现。
+- 通用不变量因此收敛为：deployment 可以把一个 canonical reasoning level 映射成 endpoint wire spelling，
+  但必须保留原生 adapter 的 system/user/assistant/tool 角色、工具形状、stream/retry 与 Session 行为；映射还必须
+  同时精确绑定 endpoint、model 和字段，未声明的模型完全不变。非医疗 `warehouse-planner` 与
+  `museum-curator` 镜像回归分别验证 `max -> xhigh`、`max -> ultra`，并验证非目标模型、非目标 endpoint 仍发
+  `max`，原生消息 roles 始终为 `system,user`。
+
+### 最终实现边界与成熟实现对照
+
+- 收敛提交 `31384089` 保留上游 `llm-deepseek` 作为所有模型的唯一 DSH provider route；只有 profile 显式声明
+  非 `max` spelling 时，ChatDS-owned runner invocation 才通过 Node `--import` 加载
+  `provider_wire_profile.mjs`。该模块只在 exact base URL + `/chat/completions`、exact model、POST JSON、
+  `reasoning_effort=max` 同时匹配时改写该字段；它不读取或改写 messages、tools、headers、response、retry、
+  planning 或 terminal。没有 Qwen/Session/Skill/业务词进入生产模块；生产 Compose 的唯一非默认 profile 数据是
+  `qwen3_5: xhigh`，其他模型继续使用原生 `max` 且命令行不加载此模块。
+- 成熟实现对照仍冻结为 clean `claude-code/` commit
+  `6f6f12b37f529488b10e53928dd5508bb93535c7`：其 `src/utils/effort.ts` 先按模型能力解析规范档位，
+  `src/services/api/claude.ts` 再序列化 wire value。ChatDS **adapt** 这个 resolve-then-serialize 分层到已有 provider
+  profile/runner boundary；**reject** 复制 agent loop、改消息角色或 patch provider body after response。
+  `deepseek-harness-clean/` 仍 clean 于
+  `47f943859bef60e4160492346772ded9b24f765a`，Claude Code 与 DeepSeek Harness 原生仓库均未修改、重建或 fork。
+
+### 验证、生产切换与当前状态
+
+- 确定性验证：Backend DeepSeek/engine contract `108 passed, 4 warnings, 2 subtests`；相关 DSH Node
+  `17/17`；Compose config、Python compile、Node syntax、`git diff --check` 均通过。clean Git archive 构建时的
+  candidate-image integration 真实调用原生 `llm-deepseek` serializer 并通过两组 rename holdout；runner OCI
+  label 仍为 `upstream-unmodified=true`、revision
+  `47f943859bef60e4160492346772ded9b24f765a`。
+- 生产仅重建 DeepSeek runner anchor 与 Supervisor。当前 runner image 为
+  `sha256:7ae3d760238048b02f9e733f9e3cb256423a9d55206dc40b18376d361fece491`，Supervisor 为
+  `sha256:736f47c79b08f857319ea38c6d5daf5d074ec0b1d0e09108e0b84fd5f2308a14`；均 restart 0，
+  Supervisor healthy。切换前镜像分别保留为 `rollback-pre-31384089`。Backend、Frontend、Claude Supervisor
+  的启动时间未变化，Claude 没有重启或改动。
+- 第一个最终候选生产 smoke conversation `10f63438d38745fbb7028e4f051abbf0` 已越过两个 400，但供应商先返回
+  HTTP 502，随后原生 retries 收到 TRANSPORT，故真实失败且未伪造成功。同端点、同 system/user、
+  `thinking.enabled + xhigh` 立即直连返回 200/stop/usage；再次运行的完整 ChatDS conversation
+  `730ce419c1e24a25bab47d0747be4a2c`、root `3c4abfac473446eba7c547d9c945d44e`
+  成功，assistant 精确包含 `QWEN_XHIGH_SMOKE_OK`。持久化 AgentRun 为 `succeeded/stop`、8,210 input +
+  51 output token；runtime receipt 为 `deepseek-official + xhigh`，provider error 0，artifact receipt
+  `not_applicable`，Supervisor 唯一 terminal 为 exit 0/succeeded，派生 root event 唯一 `run.completed`。
+  这把前一轮归类为上游瞬态，不制造额外代码修复。
+- 功能提交为本地 `d7c917b6` 与 `31384089`；本节文档提交仍按当前 local-only 规则处理，未因本轮自动 push。
+  历史失败 Session 保持原终态，新 turn 使用修复后的 profile。两项用户自有 tracked deletion 继续保持 unstaged，
+  大量既有 runtime/reference untracked 目录不得加入 Git。
 
 ## 2026-08-24 Round 18 原生双引擎 E2E、passed-frontier fan-in 与生产切换
 
