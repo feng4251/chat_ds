@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -20,6 +21,7 @@ class ProviderProfile:
     api_key: str
     models: frozenset[str]
     context_windows: dict[str, int]
+    reasoning_wire_efforts: dict[str, str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +50,9 @@ DEFAULT_EGRESS_LIMITS = {
     "max_outbound_bytes": 1024 * 1024 * 1024,
     "max_response_wire_bytes": 2 * 1024 * 1024 * 1024,
 }
+
+DEFAULT_REASONING_WIRE_EFFORT = "max"
+SAFE_REASONING_WIRE_EFFORT = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
 def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -132,6 +137,7 @@ def _profiles() -> dict[str, ProviderProfile]:
         credential = os.environ.get(credential_name, "") if credential_name else ""
         models = row.get("models")
         windows = row.get("context_windows")
+        reasoning_wire_efforts = row.get("reasoning_wire_efforts", {})
         if (
             not credential
             or not isinstance(models, list)
@@ -143,6 +149,13 @@ def _profiles() -> dict[str, ProviderProfile]:
                 type(value) is not int or value < 32_000 or value > 4_000_000
                 for value in windows.values()
             )
+            or not isinstance(reasoning_wire_efforts, dict)
+            or not set(reasoning_wire_efforts).issubset(set(models))
+            or any(
+                not isinstance(value, str)
+                or SAFE_REASONING_WIRE_EFFORT.fullmatch(value) is None
+                for value in reasoning_wire_efforts.values()
+            )
         ):
             raise DeepSeekRunnerConfigurationError(
                 f"DeepSeek Harness profile {profile_id} is incomplete"
@@ -153,6 +166,12 @@ def _profiles() -> dict[str, ProviderProfile]:
             api_key=credential,
             models=frozenset(models),
             context_windows=dict(windows),
+            reasoning_wire_efforts={
+                model: reasoning_wire_efforts.get(
+                    model, DEFAULT_REASONING_WIRE_EFFORT
+                )
+                for model in models
+            },
         )
     return result
 

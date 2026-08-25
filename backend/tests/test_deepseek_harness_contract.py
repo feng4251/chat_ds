@@ -30,6 +30,7 @@ from deepseek_runner.runner_entrypoint import (  # noqa: E402
     _native_command,
     _native_provider_failure_code,
     _native_turn_payload,
+    _provider_reasoning_binding,
     _terminal_error_stage,
     _terminal_outcome,
 )
@@ -46,6 +47,8 @@ from deepseek_runner.control_decisions import (  # noqa: E402
 )
 from deepseek_runner.config import (  # noqa: E402
     DEFAULT_EGRESS_LIMITS,
+    DeepSeekRunnerConfigurationError,
+    _profiles,
     state_volume_host_root,
 )
 from deepseek_runner.event_stream import read_event_tail  # noqa: E402
@@ -413,6 +416,11 @@ def test_native_tool_graph_is_not_compiled_from_chatds_capability_names():
         "policy: !!js \"process.env.DSH_PERMISSION_MODE === "
         "'danger-full-access' ? 'never' : 'ask'\""
     ) in patch_text
+    assert "provider: !!js process.env.CHATDS_DSH_PROVIDER_ROUTE" in patch_text
+    assert "\n- id: llm-pi-ai\n" in patch_text
+    assert "chatds-openai-compatible:" in patch_text
+    assert "reasoning: max" in patch_text
+    assert "max: !!js process.env.CHATDS_DSH_REASONING_WIRE_EFFORT" in patch_text
 
 
 @pytest.mark.asyncio
@@ -605,6 +613,7 @@ def test_native_worker_environment_is_explicit_and_session_scoped(monkeypatch, t
             "tools": ["read_file", "web_search"],
             "provider_base_url": "https://provider.invalid/v1",
             "api_model": "renamed-model",
+            "provider_reasoning_wire_effort": "max",
             "context_window_tokens": 128_000,
             "max_output_tokens": 8_192,
             "web_search_enabled": True,
@@ -620,6 +629,8 @@ def test_native_worker_environment_is_explicit_and_session_scoped(monkeypatch, t
     assert environment["CHATDS_WEB_PERMISSION_PRESET"] == "workspace_write"
     assert environment["DSH_TOOLS_MODE"] == "native"
     assert environment["CHATDS_DSH_MODEL"] == "renamed-model"
+    assert environment["CHATDS_DSH_PROVIDER_ROUTE"] == "deepseek-official"
+    assert environment["CHATDS_DSH_REASONING_WIRE_EFFORT"] == "max"
     assert environment["DEEPSEEK_API_KEY"] == "test-only-provider-key"
     assert environment["CHATDS_DSH_TURN_INPUT"] == (
         "/runtime/controller/native-turn.json"
@@ -647,6 +658,7 @@ def test_web_permission_tiers_map_to_native_baselines_and_exact_browser_policy(
             "permission_preset": preset,
             "provider_base_url": "https://provider.invalid/v1",
             "api_model": "renamed-model",
+            "provider_reasoning_wire_effort": "max",
             "context_window_tokens": 128_000,
             "max_output_tokens": 8_192,
             "searxng_search_url": "http://search.invalid/search",
@@ -668,6 +680,7 @@ def test_native_immutable_inputs_are_separated_from_worker_mailboxes(
             "permission_preset": "workspace_write",
             "provider_base_url": "https://provider.invalid/v1",
             "api_model": "renamed-model",
+            "provider_reasoning_wire_effort": "max",
             "context_window_tokens": 128_000,
             "max_output_tokens": 8_192,
             "searxng_search_url": "http://search.invalid/search",
@@ -689,6 +702,91 @@ def test_native_immutable_inputs_are_separated_from_worker_mailboxes(
     )
     assert environment["CHATDS_EVENT_SOCKET"].startswith("/runtime/controller/")
     assert "CHATDS_EVENT_LEDGER" not in environment
+
+
+def test_provider_reasoning_profiles_are_declarative_and_rename_safe(monkeypatch):
+    monkeypatch.setenv("MUSEUM_PROVIDER_KEY", "test-only-provider-key")
+    monkeypatch.setenv(
+        "DEEPSEEK_HARNESS_PROVIDER_PROFILES_JSON",
+        json.dumps({
+            "renamed-gateway": {
+                "base_url": "https://provider.invalid/v1",
+                "api_key_env": "MUSEUM_PROVIDER_KEY",
+                "protocol": "openai",
+                "models": ["warehouse-planner", "museum-curator"],
+                "context_windows": {
+                    "warehouse-planner": 128_000,
+                    "museum-curator": 262_144,
+                },
+                "reasoning_wire_efforts": {"museum-curator": "ultra"},
+            },
+        }),
+    )
+
+    profile = _profiles()["renamed-gateway"]
+    assert profile.reasoning_wire_efforts == {
+        "warehouse-planner": "max",
+        "museum-curator": "ultra",
+    }
+    assert _provider_reasoning_binding({
+        "provider_reasoning_wire_effort": "max",
+    }) == ("deepseek-official", "max")
+    assert _provider_reasoning_binding({
+        "provider_reasoning_wire_effort": "ultra",
+    }) == ("chatds-openai-compatible", "ultra")
+
+
+@pytest.mark.parametrize("wire_effort", [None, "", "contains space", "x/high"])
+def test_provider_reasoning_wire_effort_rejects_unsafe_values(wire_effort):
+    with pytest.raises(RuntimeError, match="deepseek_provider_reasoning_effort_invalid"):
+        _provider_reasoning_binding({
+            "provider_reasoning_wire_effort": wire_effort,
+        })
+
+
+@pytest.mark.parametrize(
+    "reasoning_wire_efforts",
+    [
+        {"unknown-model": "xhigh"},
+        {"museum-curator": "contains space"},
+    ],
+)
+def test_provider_reasoning_profile_rejects_unbound_or_unsafe_aliases(
+    monkeypatch,
+    reasoning_wire_efforts,
+):
+    monkeypatch.setenv("MUSEUM_PROVIDER_KEY", "test-only-provider-key")
+    monkeypatch.setenv(
+        "DEEPSEEK_HARNESS_PROVIDER_PROFILES_JSON",
+        json.dumps({
+            "renamed-gateway": {
+                "base_url": "https://provider.invalid/v1",
+                "api_key_env": "MUSEUM_PROVIDER_KEY",
+                "protocol": "openai",
+                "models": ["museum-curator"],
+                "context_windows": {"museum-curator": 128_000},
+                "reasoning_wire_efforts": reasoning_wire_efforts,
+            },
+        }),
+    )
+
+    with pytest.raises(
+        DeepSeekRunnerConfigurationError,
+        match="renamed-gateway is incomplete",
+    ):
+        _profiles()
+
+
+def test_only_qwen_deployment_profile_overrides_max_wire_spelling():
+    compose_text = (REPOSITORY_ROOT / "docker-compose.yml").read_text(
+        encoding="utf-8"
+    )
+    assert compose_text.count('"reasoning_wire_efforts"') == 1
+    assert (
+        '"local_qwen":{"base_url":'
+        in compose_text
+    )
+    assert '"reasoning_wire_efforts":{"qwen3_5":"xhigh"}' in compose_text
 
 
 class _RecordingLedger:

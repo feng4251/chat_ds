@@ -56,6 +56,9 @@ WORKSPACE_LOCK_IDENTITY_DOMAIN = b"chatds-workspace-mutation-lock-v1\0"
 SAFE_SESSION_ID = re.compile(r"^[0-9a-f]{32}$")
 SAFE_NATIVE_SESSION_ID = re.compile(r"^chatds-[0-9a-f]{32}$")
 SAFE_MCP_SERVER_ID = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+SAFE_REASONING_WIRE_EFFORT = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+NATIVE_DEEPSEEK_PROVIDER_ROUTE = "deepseek-official"
+GENERIC_OPENAI_PROVIDER_ROUTE = "chatds-openai-compatible"
 _child: subprocess.Popen[bytes] | None = None
 _stop_reason: str | None = None
 
@@ -814,6 +817,7 @@ def _environment(
     worker_tmp: Path,
 ) -> dict[str, str]:
     sandbox_mode = _native_permission_preset(config)
+    provider_route, reasoning_wire_effort = _provider_reasoning_binding(config)
     web_permission_preset = str(config.get("permission_preset") or "")
     if web_permission_preset not in {
         "read_only", "workspace_write", "session_full",
@@ -831,6 +835,8 @@ def _environment(
         "DEEPSEEK_API_KEY": os.environ["DEEPSEEK_HARNESS_PROVIDER_API_KEY"],
         "DEEPSEEK_BASE_URL": str(config["provider_base_url"]),
         "CHATDS_DSH_MODEL": str(config["api_model"]),
+        "CHATDS_DSH_PROVIDER_ROUTE": provider_route,
+        "CHATDS_DSH_REASONING_WIRE_EFFORT": reasoning_wire_effort,
         "CHATDS_DSH_CONTEXT_WINDOW": str(config["context_window_tokens"]),
         "CHATDS_DSH_MAX_OUTPUT_TOKENS": str(config["max_output_tokens"]),
         "CHATDS_SEARXNG_SEARCH_URL": str(config["searxng_search_url"]),
@@ -862,6 +868,30 @@ def _environment(
             "/runtime/controller/native-artifacts.json"
         )
     return environment
+
+
+def _provider_reasoning_binding(config: dict[str, Any]) -> tuple[str, str]:
+    """Bind native max effort to one provider's declared wire spelling.
+
+    The specialized upstream DeepSeek adapter remains the exact path for its
+    native ``max`` dialect. A provider that spells that same deployment-owned
+    effort differently uses DSH's own generic OpenAI-compatible adapter, whose
+    per-model reasoning map carries the wire alias without changing the native
+    agent loop.
+    """
+
+    wire_effort = config.get("provider_reasoning_wire_effort")
+    if (
+        not isinstance(wire_effort, str)
+        or SAFE_REASONING_WIRE_EFFORT.fullmatch(wire_effort) is None
+    ):
+        raise RuntimeError("deepseek_provider_reasoning_effort_invalid")
+    route = (
+        NATIVE_DEEPSEEK_PROVIDER_ROUTE
+        if wire_effort == "max"
+        else GENERIC_OPENAI_PROVIDER_ROUTE
+    )
+    return route, wire_effort
 
 
 def _ledger_envelopes(path: Path):
@@ -942,6 +972,7 @@ def main() -> int:
         control_decisions.touch(mode=0o600, exist_ok=False)
         os.chown(control_decisions, worker_uid, worker_gid)
         os.chmod(control_decisions, 0o600)
+        provider_route, reasoning_wire_effort = _provider_reasoning_binding(config)
         ledger.append({
             "type": "chatds.deepseek.runtime.config",
             "context_window_tokens": config["context_window_tokens"],
@@ -949,6 +980,8 @@ def main() -> int:
             "native_session_id": config["native_session_id"],
             "permission_preset": config["permission_preset"],
             "native_permission_preset": _native_permission_preset(config),
+            "provider_adapter_route": provider_route,
+            "provider_reasoning_wire_effort": reasoning_wire_effort,
             "web_search_enabled": bool(config.get("web_search_enabled")),
             "mcp_server_mapping": mcp_mapping,
         })

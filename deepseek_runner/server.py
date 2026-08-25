@@ -364,6 +364,9 @@ class Manager:
                 "initial_prompt": initial_prompt,
                 "turn_prompt": turn_prompt,
                 "provider_base_url": profile.base_url,
+                "provider_reasoning_wire_effort": (
+                    profile.reasoning_wire_efforts[request.api_model]
+                ),
                 "searxng_search_url": self.settings.searxng_search_url,
                 "web_search_enabled": web_enabled,
                 "egress_policy": policy,

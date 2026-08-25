@@ -21,7 +21,7 @@
 
 - id: agent-default-model
   config:
-    provider: deepseek-official
+    provider: !!js process.env.CHATDS_DSH_PROVIDER_ROUTE
     model: !!js process.env.CHATDS_DSH_MODEL
 
 - id: llm-deepseek
@@ -38,6 +38,33 @@
         name: !!js process.env.CHATDS_DSH_MODEL
         contextWindow: !!js Number(process.env.CHATDS_DSH_CONTEXT_WINDOW)
         maxTokens: !!js Number(process.env.CHATDS_DSH_MAX_OUTPUT_TOKENS)
+
+# A provider whose maximum-reasoning level has a non-DeepSeek wire spelling
+# uses DSH's native generic OpenAI-compatible adapter. The agent still selects
+# canonical `max`; only the exact provider spelling is translated as profile
+# data. Providers using the native `max` dialect stay on llm-deepseek above.
+- id: llm-pi-ai
+  config:
+    providers:
+      chatds-openai-compatible:
+        displayName: ChatDS OpenAI-Compatible
+        apiKeyEnv: DEEPSEEK_API_KEY
+        api: openai-completions
+        baseURL: !!js process.env.DEEPSEEK_BASE_URL
+        compat:
+          thinkingFormat: deepseek
+          supportsReasoningEffort: true
+        reasoning: max
+        defaultContextWindow: !!js Number(process.env.CHATDS_DSH_CONTEXT_WINDOW)
+        defaultMaxTokens: !!js Number(process.env.CHATDS_DSH_MAX_OUTPUT_TOKENS)
+        streamIdleTimeoutMs: 7200000
+        models:
+          - id: !!js process.env.CHATDS_DSH_MODEL
+            name: !!js process.env.CHATDS_DSH_MODEL
+            contextWindow: !!js Number(process.env.CHATDS_DSH_CONTEXT_WINDOW)
+            maxTokens: !!js Number(process.env.CHATDS_DSH_MAX_OUTPUT_TOKENS)
+            reasoningEfforts:
+              max: !!js process.env.CHATDS_DSH_REASONING_WIRE_EFFORT
 
 - id: sandbox-policy
   config:

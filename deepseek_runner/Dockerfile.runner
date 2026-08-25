@@ -51,6 +51,8 @@ COPY claude_runner/__init__.py \
      claude_runner/mcp_market_data.py \
      claude_runner/mcp_process.py \
      /opt/chatds-deepseek-runner/python/claude_runner/
+COPY deepseek_runner/tests/provider_reasoning_profile.image.mjs \
+     /opt/deepseek-harness/chatds-tests/provider_reasoning_profile.image.mjs
 
 RUN mkdir -p /run/chatds-control /runtime /state /skill-view \
         /opt/chatds-deepseek-plugins/node_modules/@deepseek-ai \
@@ -80,9 +82,10 @@ RUN mkdir -p /run/chatds-control /runtime /state /skill-view \
     && test -z "$(getcap -r / 2>/dev/null)" \
     && cd /opt/deepseek-harness/vendor/loader \
     && node --input-type=module -e \
-         "await import('@deepseek-ai/dsh-llm-deepseek'); await import('@deepseek-ai/dsh-headless'); await import('@deepseek-ai/dsh-mcp-client')" \
+         "await import('@deepseek-ai/dsh-llm-deepseek'); await import('@deepseek-ai/dsh-llm-pi-ai'); await import('@deepseek-ai/dsh-headless'); await import('@deepseek-ai/dsh-mcp-client')" \
     && node --input-type=module -e \
          "await import('/opt/chatds-deepseek-plugins/native_event_transport.mjs'); await import('/opt/chatds-deepseek-plugins/event_bridge.mjs'); await import('/opt/chatds-deepseek-plugins/provider_compat_bridge.mjs'); await import('/opt/chatds-deepseek-plugins/searxng_provider.mjs'); await import('/opt/chatds-deepseek-plugins/control_bridge.mjs'); await import('/opt/chatds-deepseek-plugins/native_workflow_core.mjs'); await import('/opt/chatds-deepseek-plugins/native_workflow.mjs'); await import('/opt/chatds-deepseek-plugins/native_artifact_gate.mjs'); await import('/opt/chatds-deepseek-plugins/session_driver_core.mjs'); await import('/opt/chatds-deepseek-plugins/session_driver.mjs')" \
+    && node /opt/deepseek-harness/chatds-tests/provider_reasoning_profile.image.mjs \
     && node /opt/deepseek-harness/apps/cli/lib/bin.js --version | grep -F '0.1.0-rc.5'
 
 USER 0:0
