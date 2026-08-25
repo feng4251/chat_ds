@@ -58,7 +58,9 @@ SAFE_NATIVE_SESSION_ID = re.compile(r"^chatds-[0-9a-f]{32}$")
 SAFE_MCP_SERVER_ID = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 SAFE_REASONING_WIRE_EFFORT = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 NATIVE_DEEPSEEK_PROVIDER_ROUTE = "deepseek-official"
-GENERIC_OPENAI_PROVIDER_ROUTE = "chatds-openai-compatible"
+PROVIDER_WIRE_PROFILE_MODULE = (
+    "/opt/chatds-deepseek-plugins/provider_wire_profile.mjs"
+)
 _child: subprocess.Popen[bytes] | None = None
 _stop_reason: str | None = None
 
@@ -817,7 +819,7 @@ def _environment(
     worker_tmp: Path,
 ) -> dict[str, str]:
     sandbox_mode = _native_permission_preset(config)
-    provider_route, reasoning_wire_effort = _provider_reasoning_binding(config)
+    _provider_route, reasoning_wire_effort = _provider_reasoning_binding(config)
     web_permission_preset = str(config.get("permission_preset") or "")
     if web_permission_preset not in {
         "read_only", "workspace_write", "session_full",
@@ -835,7 +837,6 @@ def _environment(
         "DEEPSEEK_API_KEY": os.environ["DEEPSEEK_HARNESS_PROVIDER_API_KEY"],
         "DEEPSEEK_BASE_URL": str(config["provider_base_url"]),
         "CHATDS_DSH_MODEL": str(config["api_model"]),
-        "CHATDS_DSH_PROVIDER_ROUTE": provider_route,
         "CHATDS_DSH_REASONING_WIRE_EFFORT": reasoning_wire_effort,
         "CHATDS_DSH_CONTEXT_WINDOW": str(config["context_window_tokens"]),
         "CHATDS_DSH_MAX_OUTPUT_TOKENS": str(config["max_output_tokens"]),
@@ -873,11 +874,10 @@ def _environment(
 def _provider_reasoning_binding(config: dict[str, Any]) -> tuple[str, str]:
     """Bind native max effort to one provider's declared wire spelling.
 
-    The specialized upstream DeepSeek adapter remains the exact path for its
-    native ``max`` dialect. A provider that spells that same deployment-owned
-    effort differently uses DSH's own generic OpenAI-compatible adapter, whose
-    per-model reasoning map carries the wire alias without changing the native
-    agent loop.
+    The specialized upstream DeepSeek adapter remains the exact path for every
+    model. A deployment-owned preloaded wire profile may rename only its
+    serialized ``reasoning_effort`` value after the native adapter has built
+    the request, preserving native roles, tools, retries, and streaming.
     """
 
     wire_effort = config.get("provider_reasoning_wire_effort")
@@ -886,12 +886,7 @@ def _provider_reasoning_binding(config: dict[str, Any]) -> tuple[str, str]:
         or SAFE_REASONING_WIRE_EFFORT.fullmatch(wire_effort) is None
     ):
         raise RuntimeError("deepseek_provider_reasoning_effort_invalid")
-    route = (
-        NATIVE_DEEPSEEK_PROVIDER_ROUTE
-        if wire_effort == "max"
-        else GENERIC_OPENAI_PROVIDER_ROUTE
-    )
-    return route, wire_effort
+    return NATIVE_DEEPSEEK_PROVIDER_ROUTE, wire_effort
 
 
 def _ledger_envelopes(path: Path):
@@ -912,19 +907,30 @@ def _ledger_envelopes(path: Path):
             yield value
 
 
-def _native_command(mcp_patch: Path) -> list[str]:
+def _native_command(
+    mcp_patch: Path,
+    *,
+    reasoning_wire_effort: str = "max",
+) -> list[str]:
     """Build the immutable upstream CLI invocation for one isolated Turn."""
 
-    return [
+    if SAFE_REASONING_WIRE_EFFORT.fullmatch(reasoning_wire_effort) is None:
+        raise RuntimeError("deepseek_provider_reasoning_effort_invalid")
+    command = [
         "/usr/local/bin/node",
         "--expose-internals",
         "--use-env-proxy",
+    ]
+    if reasoning_wire_effort != "max":
+        command.extend(["--import", PROVIDER_WIRE_PROFILE_MODULE])
+    command.extend([
         "/opt/deepseek-harness/apps/cli/lib/bin.js",
         "--profile", "headless",
         "--patch", "/opt/chatds-deepseek-plugins/chatds.patch.yml",
         "--patch", str(mcp_patch),
         "chatds-native-turn",
-    ]
+    ])
+    return command
 
 
 def main() -> int:
@@ -1035,7 +1041,10 @@ def main() -> int:
                 config, proxy_url=proxy_url, trust=trust, worker_tmp=worker_tmp
             )
             environment["CHATDS_CONTROL_DECISIONS"] = "/runtime/worker/control-decisions.jsonl"
-            command = _native_command(mcp_patch)
+            command = _native_command(
+                mcp_patch,
+                reasoning_wire_effort=reasoning_wire_effort,
+            )
             stage = "native_execution"
             for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGUSR1):
                 signal.signal(signum, _signal_handler)

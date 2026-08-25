@@ -416,11 +416,9 @@ def test_native_tool_graph_is_not_compiled_from_chatds_capability_names():
         "policy: !!js \"process.env.DSH_PERMISSION_MODE === "
         "'danger-full-access' ? 'never' : 'ask'\""
     ) in patch_text
-    assert "provider: !!js process.env.CHATDS_DSH_PROVIDER_ROUTE" in patch_text
-    assert "\n- id: llm-pi-ai\n" in patch_text
-    assert "chatds-openai-compatible:" in patch_text
-    assert "reasoning: max" in patch_text
-    assert "max: !!js process.env.CHATDS_DSH_REASONING_WIRE_EFFORT" in patch_text
+    assert "provider: deepseek-official" in patch_text
+    assert "\n- id: llm-pi-ai\n" not in patch_text
+    assert "chatds-openai-compatible:" not in patch_text
 
 
 @pytest.mark.asyncio
@@ -629,7 +627,7 @@ def test_native_worker_environment_is_explicit_and_session_scoped(monkeypatch, t
     assert environment["CHATDS_WEB_PERMISSION_PRESET"] == "workspace_write"
     assert environment["DSH_TOOLS_MODE"] == "native"
     assert environment["CHATDS_DSH_MODEL"] == "renamed-model"
-    assert environment["CHATDS_DSH_PROVIDER_ROUTE"] == "deepseek-official"
+    assert "CHATDS_DSH_PROVIDER_ROUTE" not in environment
     assert environment["CHATDS_DSH_REASONING_WIRE_EFFORT"] == "max"
     assert environment["DEEPSEEK_API_KEY"] == "test-only-provider-key"
     assert environment["CHATDS_DSH_TURN_INPUT"] == (
@@ -733,7 +731,18 @@ def test_provider_reasoning_profiles_are_declarative_and_rename_safe(monkeypatch
     }) == ("deepseek-official", "max")
     assert _provider_reasoning_binding({
         "provider_reasoning_wire_effort": "ultra",
-    }) == ("chatds-openai-compatible", "ultra")
+    }) == ("deepseek-official", "ultra")
+    native = _native_command(Path("/runtime/controller/native.patch.json"))
+    aliased = _native_command(
+        Path("/runtime/controller/native.patch.json"),
+        reasoning_wire_effort="ultra",
+    )
+    assert "--import" not in native
+    assert "--import" in aliased
+    assert (
+        "/opt/chatds-deepseek-plugins/provider_wire_profile.mjs"
+        in aliased
+    )
 
 
 @pytest.mark.parametrize("wire_effort", [None, "", "contains space", "x/high"])
