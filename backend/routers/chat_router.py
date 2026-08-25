@@ -142,6 +142,18 @@ class _NormalizedEngineResponse:
                 delta["reasoning"] = str(event.data.get("text") or "")
             elif event.kind == "tool_progress":
                 delta["tool_progress"] = str(event.data.get("text") or "")
+                if event.data.get("progress_id"):
+                    delta["tool_progress_id"] = str(
+                        event.data["progress_id"]
+                    )[:256]
+                if event.data.get("category"):
+                    delta["tool_progress_category"] = str(
+                        event.data["category"]
+                    )[:32]
+                if event.data.get("status"):
+                    delta["tool_progress_status"] = str(
+                        event.data["status"]
+                    )[:32]
             elif event.kind == "agent_event":
                 delta["agent_event"] = dict(event.data)
             elif event.kind == "approval":
@@ -3223,13 +3235,39 @@ BUILTIN = {
     # Anthropic Messages facade, but its OpenAI stream preserves
     # ``reasoning_content`` and native tool-call deltas, so that is the
     # authoritative Harness transport.
+    "shaiengine_glm_5_3": {
+        "api_model": "glm-5.3",
+        "base_url": settings.shaiengine_base_url,
+        "api_key": settings.shaiengine_api_key,
+        "is_multimodal": False,
+        "max_tokens": 86400,
+        "display_name": "GLM-5.3 (Shaiengine)",
+        "is_default": False,
+        "agentic_auxiliary_only": False,
+        "supports_thinking_toggle": True,
+        "thinking_enabled_by_default": True,
+        "thinking_request_format": "thinking_object",
+        "thinking_send_enabled_explicitly": True,
+        "capabilities": ["text", "tools", "reasoning"],
+        "provider": "shaiengine",
+        "claude_provider_profile": "shaiengine",
+        "deepseek_harness_provider_profile": "shaiengine",
+        "protocol": "openai",
+        # Shaiengine advertises this route without capacity fields. Keep the
+        # existing deployment-owned long-context admission bound explicit;
+        # provider metadata can replace it once that API becomes authoritative.
+        "context_length": 1000000,
+    },
+    # Retain the old route identity for already-persisted Sessions. New native
+    # Sessions select the preceding current route by deterministic catalog
+    # order rather than silently rebinding historical model identifiers.
     "shaiengine_glm_5_2": {
         "api_model": "glm-5.2",
         "base_url": settings.shaiengine_base_url,
         "api_key": settings.shaiengine_api_key,
         "is_multimodal": False,
         "max_tokens": 86400,
-        "display_name": "GLM-5.2 (Shaiengine)",
+        "display_name": "GLM-5.2 (Shaiengine · 历史兼容)",
         "is_default": False,
         "agentic_auxiliary_only": False,
         "supports_thinking_toggle": True,
@@ -4286,7 +4324,24 @@ async def _chat_stream_with_turn(
                                     if tp:
                                         full_tool_progress += (full_tool_progress and "\n" or "") + tp
                                         activity_event = await record_activity(
-                                            activity_builder.progress(tp)
+                                            activity_builder.progress(
+                                                tp,
+                                                identity=delta.get(
+                                                    "tool_progress_id"
+                                                ),
+                                                category=str(
+                                                    delta.get(
+                                                        "tool_progress_category"
+                                                    )
+                                                    or "tool"
+                                                ),
+                                                status=str(
+                                                    delta.get(
+                                                        "tool_progress_status"
+                                                    )
+                                                    or "running"
+                                                ),
+                                            )
                                         )
                                         yield encode_sse({
                                             "tool_progress": tp,
@@ -4312,7 +4367,9 @@ async def _chat_stream_with_turn(
                                         full_tool_progress += (full_tool_progress and "\n" or "") + msg
                                         activity_event = await record_activity(
                                             activity_builder.progress(
-                                                msg, category="model_switch"
+                                                msg,
+                                                category="model_switch",
+                                                identity="model-switch",
                                             )
                                         )
                                         yield encode_sse({

@@ -183,6 +183,25 @@ class TurnActivityProtocolTests(unittest.TestCase):
         event = builder.stream_text("content", content)
         self.assertEqual(event["payload"]["text"], content)
 
+    def test_same_native_task_progress_merges_without_fragmenting_reasoning(self):
+        builder = TurnActivityBuilder("5" * 32, "6" * 32)
+        first_reasoning = builder.stream_text("reasoning", "inspect ")
+        first_progress = builder.progress(
+            "warehouse worker started",
+            identity="task:renamed-warehouse-worker",
+        )
+        second_reasoning = builder.stream_text("reasoning", "receipts")
+        second_progress = builder.progress(
+            "warehouse worker updated",
+            identity="task:renamed-warehouse-worker",
+        )
+
+        self.assertEqual(
+            first_reasoning["node_id"], second_reasoning["node_id"]
+        )
+        self.assertEqual(first_progress["node_id"], second_progress["node_id"])
+        self.assertEqual(first_progress["operation"], "merge")
+
 
 if __name__ == "__main__":
     unittest.main()

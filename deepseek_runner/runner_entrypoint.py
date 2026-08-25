@@ -18,7 +18,7 @@ import time
 import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Mapping
 
 from deepseek_runner.native_workflow import (
     build_deepseek_workflow_receipt,
@@ -719,6 +719,7 @@ def _terminal_outcome(
     stop_reason: str | None,
     workflow_passed: bool,
     artifact_passed: bool,
+    native_failure: str | None = None,
 ) -> tuple[str, str | None]:
     """Choose exactly one authoritative terminal from monotonic receipts."""
 
@@ -726,6 +727,12 @@ def _terminal_outcome(
         return "cancelled", "cancelled"
     if stop_reason is not None:
         return "failed", stop_reason
+    # Native logs may retain a provider error from an attempt that the
+    # upstream Harness subsequently recovered.  A structured error may refine
+    # a non-zero native exit, but it must never overturn a clean native exit
+    # and otherwise-passing receipts.
+    if native_failure is not None and exit_code != 0:
+        return "failed", native_failure
     if not workflow_passed:
         return "failed", "workflow_contract_failed"
     if not artifact_passed:
@@ -733,6 +740,35 @@ def _terminal_outcome(
     if exit_code != 0:
         return "failed", "runner_exit_nonzero"
     return "succeeded", None
+
+
+def _native_provider_failure_code(
+    envelopes: Iterable[Mapping[str, Any]],
+) -> str | None:
+    """Extract the last structured provider HTTP failure from native events.
+
+    DeepSeek Harness owns provider retries and emits typed ``turn/end``
+    reasons.  ChatDS reads only that machine shape; assistant text and error
+    messages are never interpreted as lifecycle authority.
+    """
+
+    status: int | None = None
+    for envelope in envelopes:
+        event = envelope.get("event")
+        if not isinstance(event, Mapping) or event.get("type") != "deepseek.session.event":
+            continue
+        native = event.get("session_event")
+        if not isinstance(native, Mapping) or native.get("type") != "turn/end":
+            continue
+        data = native.get("data")
+        reason = data.get("reason") if isinstance(data, Mapping) else None
+        if not isinstance(reason, Mapping) or reason.get("kind") != "error":
+            continue
+        error = reason.get("error")
+        candidate = error.get("status") if isinstance(error, Mapping) else None
+        if type(candidate) is int and 400 <= candidate <= 599:
+            status = candidate
+    return f"provider_http_{status}" if status is not None else None
 
 
 def _terminal_error_stage(
@@ -749,6 +785,8 @@ def _terminal_error_stage(
         return "workflow_contract_audit"
     if terminal_error == "artifact_contract_failed":
         return "artifact_contract_audit"
+    if isinstance(terminal_error, str) and terminal_error.startswith("provider_http_"):
+        return "native_execution"
     if terminal_error in {
         "runner_exit_nonzero", "hard_timeout", "cancelled",
     }:
@@ -1068,11 +1106,15 @@ def main() -> int:
                 **artifact_receipt,
             })
             _emit_artifacts(ledger, Path("/workspace"), before, after)
+        native_failure = _native_provider_failure_code(
+            _ledger_envelopes(ledger.path)
+        )
         status, terminal_error = _terminal_outcome(
             exit_code=exit_code,
             stop_reason=_stop_reason,
             workflow_passed=workflow_passed,
             artifact_passed=artifact_passed,
+            native_failure=native_failure,
         )
         ledger.append({
             "type": "chatds.supervisor.terminal",

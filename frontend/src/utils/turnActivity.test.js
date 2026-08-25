@@ -137,6 +137,14 @@ test('tool completion replaces the running card and retains start metadata', () 
     }),
     event(2, 'tool:stable', 'tool', {
       event: {
+        event_type: 'tool.progress',
+        tool_name: 'RenamedWarehouseLookup',
+        tool_call_id: 'stable-call',
+        payload: { detail: 'checkpoint' },
+      },
+    }),
+    event(3, 'tool:stable', 'tool', {
+      event: {
         event_type: 'tool.completed',
         payload: { detail: 'complete' },
       },
@@ -310,4 +318,55 @@ test('root-scoped incremental replay advances without replacing prior nodes', ()
     'reasoning', 'content', 'tool',
   ])
   assert.equal(turnActivityHighWater(merged, 'root'), 3)
+})
+
+test('ten thousand progress updates for one renamed task stay in one row', () => {
+  const updates = Array.from({ length: 10_000 }, (_, index) => event(
+    index + 1,
+    'progress:renamed-warehouse-worker',
+    'progress',
+    { text: `checkpoint ${index + 1}`, category: 'native-task' },
+  ))
+  const nodes = reduceTurnActivities(updates)
+  assert.equal(nodes.length, 1)
+  assert.equal(nodes[0].text, 'checkpoint 10000')
+  assert.equal(nodes[0].lastSeq, 10_000)
+})
+
+test('root terminal settles the existing progress row in place', () => {
+  const nodes = reduceTurnActivities([
+    event(1, 'progress:renamed-museum-worker', 'progress', {
+      text: 'worker running', category: 'native-task', status: 'running',
+    }),
+    event(2, 'progress:renamed-museum-worker', 'progress', {
+      text: 'worker finished', category: 'native-task', status: 'succeeded',
+    }),
+    event(3, 'workflow:root', 'workflow', {
+      event: {
+        event_type: 'run.completed', run_id: 'root', root_run_id: 'root',
+        payload: { authoritative: true },
+      },
+    }),
+  ])
+  const progress = nodes.filter((node) => node.kind === 'progress')
+  assert.equal(progress.length, 1)
+  assert.equal(progress[0].text, 'worker finished')
+  assert.equal(progress[0].status, 'succeeded')
+})
+
+test('failed root settles an unmatched progress row without creating a second row', () => {
+  const nodes = reduceTurnActivities([
+    event(1, 'progress:renamed-factory-worker', 'progress', {
+      text: 'worker running', category: 'native-task', status: 'running',
+    }),
+    event(2, 'workflow:root', 'workflow', {
+      event: {
+        event_type: 'run.failed', run_id: 'root', root_run_id: 'root',
+        payload: { authoritative: true, error: 'provider_http_429' },
+      },
+    }),
+  ])
+  const progress = nodes.filter((node) => node.kind === 'progress')
+  assert.equal(progress.length, 1)
+  assert.equal(progress[0].status, 'failed')
 })

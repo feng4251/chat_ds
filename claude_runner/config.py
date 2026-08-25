@@ -192,8 +192,11 @@ def _provider_profiles() -> dict[str, ProviderProfile]:
                 ),
                 "api_key_env": "SHAIENGINE_API_KEY",
                 "backend_protocol": "openai",
-                "models": ["glm-5.2", "deepseek-v4-pro", "kimi-k3"],
+                "models": [
+                    "glm-5.3", "glm-5.2", "deepseek-v4-pro", "kimi-k3",
+                ],
                 "context_windows": {
+                    "glm-5.3": 1_000_000,
                     "glm-5.2": 1_000_000,
                     "deepseek-v4-pro": 200_000,
                     "kimi-k3": 1_000_000,

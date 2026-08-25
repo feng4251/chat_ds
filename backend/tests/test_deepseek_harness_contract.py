@@ -28,6 +28,7 @@ from deepseek_runner.runner_entrypoint import (  # noqa: E402
     _compile_mcp_patch,
     _environment,
     _native_command,
+    _native_provider_failure_code,
     _native_turn_payload,
     _terminal_error_stage,
     _terminal_outcome,
@@ -1152,6 +1153,76 @@ def test_terminal_outcome_fails_closed_on_artifact_receipt():
         stop_reason=None,
         workflow_passed=True,
         artifact_passed=True,
+    ) == ("succeeded", None)
+
+
+def test_structured_native_provider_failure_precedes_workflow_consequence():
+    """Use machine turn receipts, never model prose, for causal attribution."""
+
+    envelopes = [{
+        "seq": 91,
+        "channel": "deepseek-harness",
+        "event": {
+            "type": "deepseek.session.event",
+            "session_event": {
+                "type": "turn/end",
+                "data": {
+                    "reason": {
+                        "kind": "error",
+                        "error": {
+                            "code": "RATE_LIMITED",
+                            "status": 429,
+                            "message": "cross-domain provider fixture",
+                        },
+                    },
+                },
+            },
+        },
+    }]
+    provider_failure = _native_provider_failure_code(envelopes)
+    assert provider_failure == "provider_http_429"
+    assert _terminal_outcome(
+        exit_code=1,
+        stop_reason=None,
+        workflow_passed=False,
+        artifact_passed=False,
+        native_failure=provider_failure,
+    ) == ("failed", "provider_http_429")
+
+
+def test_native_provider_failure_rejects_model_prose_and_malformed_status():
+    assert _native_provider_failure_code([{
+        "event": {
+            "type": "deepseek.session.event",
+            "session_event": {
+                "type": "assistant/message",
+                "data": {"message": "provider HTTP 401"},
+            },
+        },
+    }]) is None
+    assert _native_provider_failure_code([{
+        "event": {
+            "type": "deepseek.session.event",
+            "session_event": {
+                "type": "turn/end",
+                "data": {
+                    "reason": {
+                        "kind": "error",
+                        "error": {"status": "401"},
+                    },
+                },
+            },
+        },
+    }]) is None
+
+
+def test_recovered_provider_attempt_cannot_overturn_a_clean_native_exit():
+    assert _terminal_outcome(
+        exit_code=0,
+        stop_reason=None,
+        workflow_passed=True,
+        artifact_passed=True,
+        native_failure="provider_http_429",
     ) == ("succeeded", None)
 
 

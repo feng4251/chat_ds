@@ -523,6 +523,39 @@ class RunnerCommandContractTests(unittest.TestCase):
             self.assertEqual(ledger.native_api_error_status, 403)
             ledger.close()
 
+    def test_structured_provider_failure_precedes_result_multiplicity(self):
+        """A causal provider receipt must not be hidden by drain-turn results."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = EventLedger(Path(temporary) / "events.jsonl")
+            for result_id in (
+                "11111111-1111-4111-8111-111111111111",
+                "22222222-2222-4222-8222-222222222222",
+            ):
+                ledger.append_line(json.dumps({
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": True,
+                    "api_error_status": 429,
+                    "uuid": result_id,
+                    "origin": {"kind": "task-notification"},
+                }).encode(), channel="stdout")
+            self.assertEqual(
+                _terminal_error(
+                    termination_reason=None,
+                    exit_code=1,
+                    ledger=ledger,
+                    checkpoint_ready=True,
+                    egress_receipt={"exhausted": False},
+                    pending_plan_task_count=0,
+                    pending_native_task_count=0,
+                    workflow_contract_passed=False,
+                    artifact_contract_passed=False,
+                ),
+                "provider_http_429",
+            )
+            ledger.close()
+
     def test_exhausted_egress_receipt_beats_opaque_native_exit(self):
         with tempfile.TemporaryDirectory() as temporary:
             ledger = EventLedger(Path(temporary) / "events.jsonl")

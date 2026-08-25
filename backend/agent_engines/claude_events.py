@@ -109,13 +109,56 @@ class ClaudeEventProjector:
         if event_type == "system":
             return tuple(self._project_system(native, envelope))
         if event_type == "tool_progress":
-            return (EngineStreamEvent(
-                "tool_progress", {"text": _tool_progress_text(native)}, envelope
-            ),)
-        if event_type == "tool_use_summary":
+            tool_id = str(native.get("tool_use_id") or "") or None
+            tool_name = str(
+                native.get("tool_name")
+                or native.get("name")
+                or self._tool_name_by_id.get(tool_id or "")
+                or "tool"
+            )
+            if tool_id:
+                self._tool_name_by_id[tool_id] = tool_name
+                return (EngineStreamEvent(
+                    "agent_event",
+                    {
+                        "event_type": "tool.progress",
+                        "run_id": self._native_run_id(native),
+                        "root_run_id": self.root_run_id,
+                        "tool_name": tool_name,
+                        "tool_call_id": tool_id,
+                        "payload": {"detail": _tool_progress_text(native)},
+                    },
+                    envelope,
+                    native_event_id=tool_id,
+                ),)
             return (EngineStreamEvent(
                 "tool_progress",
-                {"text": str(native.get("summary") or "Tool completed")},
+                {
+                    "text": _tool_progress_text(native),
+                    "progress_id": _progress_identity("tool", tool_name),
+                    "category": "tool",
+                },
+                envelope,
+            ),)
+        if event_type == "tool_use_summary":
+            preceding = native.get("preceding_tool_use_ids")
+            summary_coordinate = (
+                "|".join(str(value) for value in preceding if value)
+                if isinstance(preceding, (list, tuple))
+                else ""
+            )
+            return (EngineStreamEvent(
+                "tool_progress",
+                {
+                    "text": str(native.get("summary") or "Tool completed"),
+                    "progress_id": _progress_identity(
+                        "tool-summary",
+                        summary_coordinate,
+                        native.get("uuid"),
+                    ),
+                    "category": "tool",
+                    "status": "succeeded",
+                },
                 envelope,
             ),)
         if event_type == "result":
@@ -299,21 +342,18 @@ class ClaudeEventProjector:
                     return ()
                 if tool_id:
                     self._started_tools.add(tool_id)
-                return (
-                    EngineStreamEvent("tool_progress", {"text": f"🔧 {name} started"}, envelope),
-                    EngineStreamEvent(
-                        "agent_event",
-                        {
-                            "event_type": "tool.started",
-                            "run_id": run_id,
-                            "root_run_id": self.root_run_id,
-                            "tool_name": name,
-                            "tool_call_id": tool_id,
-                        },
-                        envelope,
-                        native_event_id=tool_id,
-                    ),
-                )
+                return (EngineStreamEvent(
+                    "agent_event",
+                    {
+                        "event_type": "tool.started",
+                        "run_id": run_id,
+                        "root_run_id": self.root_run_id,
+                        "tool_name": name,
+                        "tool_call_id": tool_id,
+                    },
+                    envelope,
+                    native_event_id=tool_id,
+                ),)
         if nested_type == "message_start":
             message = _mapping(event.get("message"))
             native_message_id = str(message.get("id") or "")
@@ -499,7 +539,11 @@ class ClaudeEventProjector:
             if task_type == "local_bash":
                 return (EngineStreamEvent(
                     "tool_progress",
-                    {"text": f"Background command started: {description}"},
+                    {
+                        "text": f"Background command started: {description}",
+                        "progress_id": _progress_identity("task", task_id),
+                        "category": "native-task",
+                    },
                     envelope,
                 ),)
             child = _child_run_id(self.root_run_id, task_id)
@@ -550,13 +594,23 @@ class ClaudeEventProjector:
             )
             task_status = str(native.get("status") or "")
             if task_type == "local_bash":
+                progress_status = (
+                    "failed"
+                    if task_status == "failed"
+                    else "cancelled"
+                    if task_status in {"stopped", "killed"}
+                    else "succeeded"
+                )
                 return (EngineStreamEvent(
                     "tool_progress",
                     {
                         "text": (
                             "Background command "
                             + (task_status or "completed")
-                        )
+                        ),
+                        "progress_id": _progress_identity("task", task_id),
+                        "category": "native-task",
+                        "status": progress_status,
                     },
                     envelope,
                 ),)
@@ -596,8 +650,31 @@ class ClaudeEventProjector:
                 native_event_id=task_id or None,
             ),)
         if subtype in {"task_progress", "status", "api_retry"}:
+            progress_scope = (
+                "task"
+                if subtype == "task_progress"
+                else "provider-retry"
+                if subtype == "api_retry"
+                else "native-status"
+            )
             return (EngineStreamEvent(
-                "tool_progress", {"text": _system_progress_text(native, subtype)}, envelope
+                "tool_progress",
+                {
+                    "text": _system_progress_text(native, subtype),
+                    "progress_id": _progress_identity(
+                        progress_scope,
+                        native.get("task_id"),
+                        native.get("tool_use_id"),
+                    ),
+                    "category": (
+                        "provider"
+                        if subtype == "api_retry"
+                        else "native-task"
+                        if subtype == "task_progress"
+                        else "native-status"
+                    ),
+                },
+                envelope,
             ),)
         return (EngineStreamEvent(
             "diagnostic", {"code": "claude_system_event", "subtype": subtype}, envelope
@@ -775,6 +852,16 @@ def _tool_progress_text(native: Mapping[str, Any]) -> str:
     elapsed = native.get("elapsed_time_seconds")
     suffix = f" ({elapsed}s)" if isinstance(elapsed, (int, float)) else ""
     return f"🔧 {name} running{suffix}"
+
+
+def _progress_identity(scope: str, *values: object) -> str:
+    """Return a bounded opaque identity for one native progress surface."""
+
+    coordinate = next((str(value) for value in values if value), "root")
+    digest = hashlib.sha256(
+        f"chatds.claude.progress.v1\0{scope}\0{coordinate}".encode()
+    ).hexdigest()[:24]
+    return f"{scope}:{digest}"
 
 
 def _system_progress_text(native: Mapping[str, Any], subtype: str) -> str:

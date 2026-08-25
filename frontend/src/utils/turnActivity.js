@@ -53,18 +53,22 @@ function compactAdjacentStreamNodes(nodes = []) {
   return compacted
 }
 
-function settleOpenToolsAtRootTerminal(nodes = []) {
+function settleOpenActivityAtRootTerminal(nodes = []) {
   const workflow = nodes.find((node) => node.kind === 'workflow')
   const rootStatus = workflow?.status
   if (!['succeeded', 'success', 'completed', 'failed', 'cancelled'].includes(rootStatus)) {
     return nodes
   }
   const interruptedStatus = rootStatus === 'failed' ? 'failed' : 'cancelled'
-  return nodes.map((node) => (
-    node.kind === 'tool' && node.status === 'running'
-      ? { ...node, status: interruptedStatus }
-      : node
-  ))
+  return nodes.map((node) => {
+    if (!['tool', 'progress'].includes(node.kind) || node.status !== 'running') {
+      return node
+    }
+    if (node.kind === 'progress' && rootStatus === 'succeeded') {
+      return { ...node, status: 'succeeded' }
+    }
+    return { ...node, status: interruptedStatus }
+  })
 }
 
 export function applyTurnActivity(nodes, event) {
@@ -108,7 +112,7 @@ export function applyTurnActivity(nodes, event) {
   } else if (event.kind === 'progress') {
     node.text = String(payload.text || '')
     node.payload = { ...current.payload, ...payload }
-    node.status = 'succeeded'
+    node.status = payload.status || 'running'
   } else if (event.kind === 'workflow') {
     node.runs = updateAgentRuns(current.runs || [], payload.event || {})
     const root = node.runs.find((run) => run.id === event.root_run_id)
@@ -145,7 +149,7 @@ export function applyTurnActivity(nodes, event) {
     node.status = payload.status || current.status
   }
   next[index] = node
-  return settleOpenToolsAtRootTerminal(compactAdjacentStreamNodes(
+  return settleOpenActivityAtRootTerminal(compactAdjacentStreamNodes(
     next.sort((a, b) => a.anchorSeq - b.anchorSeq),
   ))
     .slice(-MAX_NODES)

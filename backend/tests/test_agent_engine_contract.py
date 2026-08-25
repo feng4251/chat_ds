@@ -354,6 +354,7 @@ class ClaudeEventProjectionTests(unittest.TestCase):
             sum(event.data.get("event_type") == "tool.started" for event in partial),
             1,
         )
+        self.assertEqual([event.kind for event in partial], ["agent_event"])
         self.assertFalse(any(
             event.data.get("event_type") == "tool.started" for event in full
         ))
@@ -374,6 +375,38 @@ class ClaudeEventProjectionTests(unittest.TestCase):
             if event.data.get("event_type") == "tool.failed"
         )
         self.assertEqual(completed.data["tool_name"], "Bash")
+
+    def test_native_tool_progress_updates_the_original_tool_identity(self):
+        projector = ClaudeEventProjector("4" * 32)
+        started = projector.project({
+            "event": {
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_start",
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "renamed-tool-call",
+                        "name": "RenamedWarehouseLookup",
+                    },
+                },
+            },
+        })[0]
+        progress = projector.project({
+            "event": {
+                "type": "tool_progress",
+                "tool_use_id": "renamed-tool-call",
+                "tool_name": "RenamedWarehouseLookup",
+                "elapsed_time_seconds": 7,
+            },
+        })[0]
+
+        self.assertEqual(started.kind, "agent_event")
+        self.assertEqual(progress.kind, "agent_event")
+        self.assertEqual(progress.data["event_type"], "tool.progress")
+        self.assertEqual(
+            started.data["tool_call_id"], progress.data["tool_call_id"]
+        )
+        self.assertIn("7s", progress.data["payload"]["detail"])
 
     def test_native_task_identity_routes_child_tools_and_stopped_terminal(self):
         root = "f" * 32
@@ -454,6 +487,43 @@ class ClaudeEventProjectionTests(unittest.TestCase):
             },
         })
         self.assertEqual([event.kind for event in completed], ["tool_progress"])
+
+    def test_native_progress_identity_is_stable_per_task_and_separates_tasks(self):
+        projector = ClaudeEventProjector("5" * 32)
+
+        first = projector.project({
+            "event": {
+                "type": "system",
+                "subtype": "task_progress",
+                "task_id": "renamed-warehouse-worker",
+                "tool_use_id": "renamed-warehouse-tool",
+                "description": "first checkpoint",
+            },
+        })[0]
+        updated = projector.project({
+            "event": {
+                "type": "system",
+                "subtype": "task_progress",
+                "task_id": "renamed-warehouse-worker",
+                "tool_use_id": "renamed-warehouse-tool",
+                "description": "later checkpoint",
+            },
+        })[0]
+        another = projector.project({
+            "event": {
+                "type": "system",
+                "subtype": "task_progress",
+                "task_id": "renamed-museum-worker",
+                "tool_use_id": "renamed-museum-tool",
+                "description": "independent checkpoint",
+            },
+        })[0]
+
+        self.assertEqual(first.kind, "tool_progress")
+        self.assertEqual(first.data["progress_id"], updated.data["progress_id"])
+        self.assertNotEqual(first.data["progress_id"], another.data["progress_id"])
+        self.assertEqual(first.data["category"], "native-task")
+        self.assertNotIn("renamed-warehouse-worker", first.data["progress_id"])
 
     def test_controller_terminal_exposes_safe_stage_and_code(self):
         projector = ClaudeEventProjector("6" * 32)
@@ -1442,12 +1512,13 @@ class EngineModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             claude["compatible_model_ids"],
             [
+                "shaiengine_glm_5_3",
                 "shaiengine_glm_5_2",
                 "shaiengine_deepseek_v4_pro",
                 "shaiengine_kimi_k3",
             ],
         )
-        self.assertEqual(claude["default_model_id"], "shaiengine_glm_5_2")
+        self.assertEqual(claude["default_model_id"], "shaiengine_glm_5_3")
         self.assertNotIn("deepseek_v4_pro", claude["compatible_model_ids"])
         self.assertIn("vision", claude["capabilities"])
 
@@ -1470,6 +1541,7 @@ class EngineModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                 )
         claude = next(item for item in options if item["id"] == "claude_code")
         self.assertEqual(claude["compatible_model_ids"], [
+            "shaiengine_glm_5_3",
             "shaiengine_glm_5_2",
             "shaiengine_deepseek_v4_pro",
             "shaiengine_kimi_k3",
@@ -1746,10 +1818,25 @@ class EngineModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             async with self.sessions() as db:
                 result = await chat_router.get_models(cur_user=self.user, db=db)
         identifiers = {item["id"] for item in result["models"]}
+        self.assertIn("shaiengine_glm_5_3", identifiers)
         self.assertIn("shaiengine_glm_5_2", identifiers)
         self.assertIn("shaiengine_deepseek_v4_pro", identifiers)
         self.assertIn("shaiengine_kimi_k3", identifiers)
         self.assertIn("deepseek_v4_pro", identifiers)
+
+    def test_new_glm_route_does_not_rebind_the_historical_identifier(self):
+        current = chat_router.BUILTIN["shaiengine_glm_5_3"]
+        historical = chat_router.BUILTIN["shaiengine_glm_5_2"]
+        self.assertEqual(current["api_model"], "glm-5.3")
+        self.assertEqual(historical["api_model"], "glm-5.2")
+        self.assertEqual(
+            current["claude_provider_profile"],
+            historical["claude_provider_profile"],
+        )
+        self.assertEqual(
+            current["deepseek_harness_provider_profile"],
+            historical["deepseek_harness_provider_profile"],
+        )
 
     async def test_claude_chat_entry_materializes_session_skill_before_run(self):
         conversation_id = "6" * 32

@@ -66,6 +66,14 @@ class DeploymentTopologyTests(unittest.TestCase):
                 profile_name,
             )
 
+        shaiengine = claude_profiles["shaiengine"]
+        self.assertEqual(shaiengine["models"][0], "glm-5.3")
+        self.assertIn("glm-5.2", shaiengine["models"])
+        self.assertEqual(
+            shaiengine["context_windows"]["glm-5.3"],
+            1_000_000,
+        )
+
     def test_active_compose_graph_contains_only_native_agent_runtimes(self):
         compose = yaml.safe_load(
             (REPOSITORY_ROOT / "docker-compose.yml").read_text(

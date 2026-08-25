@@ -585,10 +585,16 @@ def _terminal_error(
 
     if termination_reason == "hard_timeout":
         return "run_hard_timeout"
-    if ledger.native_result_count > 1:
-        return "native_result_duplicated"
     if bool(egress_receipt.get("exhausted")):
         return "egress_budget_exhausted"
+    # A native command may emit more than one result envelope while Claude's
+    # own headless queue drains background-task notifications.  Keep result
+    # multiplicity fail-closed, but never let that downstream shape hide a
+    # machine-owned provider HTTP receipt carried by the native result.
+    if ledger.native_api_error_status is not None:
+        return f"provider_http_{ledger.native_api_error_status}"
+    if ledger.native_result_count > 1:
+        return "native_result_duplicated"
     if pending_native_task_count:
         return "native_subtasks_pending"
     # Claude's TaskCreate/TaskUpdate files are model-owned planning/UI state.
@@ -599,8 +605,6 @@ def _terminal_error(
         return "workflow_contract_failed"
     if not artifact_contract_passed:
         return "artifact_contract_failed"
-    if ledger.native_api_error_status is not None:
-        return f"provider_http_{ledger.native_api_error_status}"
     if exit_code == 0 and not ledger.saw_native_result:
         return "runner_exited_without_result"
     if exit_code == 0 and not ledger.native_result_succeeded:

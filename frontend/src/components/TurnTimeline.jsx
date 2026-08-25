@@ -94,7 +94,7 @@ function WorkflowNode({ node }) {
           {children.map((run) => {
             const childView = statusView(run.lifecycle_status || run.status)
             return (
-              <details key={run.id} open={(run.lifecycle_status || run.status) === 'running'} className="rounded-xl border border-white bg-white/80 px-3 py-2 text-xs">
+              <details key={run.id} defaultOpen={(run.lifecycle_status || run.status) === 'running'} className="rounded-xl border border-white bg-white/80 px-3 py-2 text-xs">
                 <summary className="flex cursor-pointer list-none items-center gap-2">
                   <FiCpu className="text-indigo-500" size={12} />
                   <span className="min-w-0 flex-1 truncate font-medium text-slate-700">{run.display_name || run.agent_name || '子代理'}</span>
@@ -255,7 +255,10 @@ export default function TurnTimeline({ nodes = [], streaming = false, onApproval
       {nodes.map((node, index) => {
         if (node.kind === 'content') return <div key={node.nodeId} className="text-[14px] text-slate-800 break-words"><Markdown>{node.text}</Markdown>{streaming && index === nodes.length - 1 && <span className="inline-block h-[1em] w-[2px] animate-pulse bg-indigo-500" />}</div>
         if (node.kind === 'reasoning') return <ReasoningNode key={node.nodeId} node={node} streaming={streaming && index === nodes.length - 1} />
-        if (node.kind === 'progress') return <div key={node.nodeId} className="flex items-start gap-2 border-l-2 border-slate-200 py-1 pl-3 text-xs text-slate-500"><FiLoader className={streaming && index === nodes.length - 1 ? 'mt-0.5 animate-spin' : 'mt-0.5'} size={11} /><span className="whitespace-pre-wrap">{node.text}</span></div>
+        if (node.kind === 'progress') {
+          const view = statusView(node.status)
+          return <div key={node.nodeId} className="flex items-start gap-2 border-l-2 border-slate-200 py-1 pl-3 text-xs text-slate-500"><span className={`mt-0.5 ${view.tone}`}>{view.icon}</span><span className="whitespace-pre-wrap">{node.text}</span></div>
+        }
         if (node.kind === 'tool') return <ToolNode key={node.nodeId} node={node} />
         if (node.kind === 'workflow') return <WorkflowNode key={node.nodeId} node={node} />
         if (node.kind === 'approval') return <ApprovalNode key={node.nodeId} node={node} onApproval={onApproval} />

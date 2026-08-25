@@ -148,6 +148,7 @@ class TurnActivityBuilder:
     _last_stream_kind: str | None = None
     _last_stream_node: str | None = None
     _tool_nodes: dict[str, str] = field(default_factory=dict)
+    _progress_nodes: dict[str, str] = field(default_factory=dict)
     _approval_nodes: dict[str, str] = field(default_factory=dict)
 
     def _base(
@@ -194,19 +195,43 @@ class TurnActivityBuilder:
             payload={"text": bounded},
         )
 
-    def progress(self, text: object, *, category: str = "tool") -> dict[str, Any] | None:
+    def progress(
+        self,
+        text: object,
+        *,
+        category: str = "tool",
+        identity: object | None = None,
+        status: str = "running",
+    ) -> dict[str, Any] | None:
         bounded = _bounded(text, 4_000)
         if not bounded:
             return None
-        self._last_stream_kind = None
-        self._last_stream_node = None
-        next_seq = self._seq + 1
+        safe_identity = _bounded(identity, 512) if identity is not None else ""
+        if safe_identity:
+            node_id = self._progress_nodes.setdefault(
+                safe_identity,
+                "progress:"
+                + hashlib.sha256(safe_identity.encode()).hexdigest()[:24],
+            )
+            operation = "merge"
+        else:
+            node_id = f"progress:{self._seq + 1}"
+            operation = "append"
+        safe_status = (
+            status
+            if status in {"running", "succeeded", "failed", "cancelled"}
+            else "running"
+        )
         return self._base(
             kind="progress",
-            node_id=f"progress:{next_seq}",
-            operation="append",
+            node_id=node_id,
+            operation=operation,
             run_id=self.root_run_id,
-            payload={"text": bounded, "category": _bounded(category, 32)},
+            payload={
+                "text": bounded,
+                "category": _bounded(category, 32),
+                "status": safe_status,
+            },
         )
 
     def agent(self, event: Mapping[str, Any]) -> dict[str, Any]:
