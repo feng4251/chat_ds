@@ -48,7 +48,7 @@ from urllib.parse import urlsplit, urlunsplit
 LISTEN_HOST: Final[str] = os.environ.get("SKILL_EGRESS_LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT: Final[int] = int(os.environ.get("SKILL_EGRESS_LISTEN_PORT", "8080"))
 LISTEN_SOCKET: Final[str] = os.environ.get("SKILL_EGRESS_SOCKET_PATH", "").strip()
-EGRESS_POLICY_RUNTIME_VERSION: Final[str] = "signed-public-read-v1"
+EGRESS_POLICY_RUNTIME_VERSION: Final[str] = "signed-route-idle-v2"
 CONNECT_TIMEOUT_SECONDS: Final[float] = float(
     os.environ.get("SKILL_EGRESS_CONNECT_TIMEOUT_SECONDS", "10")
 )
@@ -58,6 +58,19 @@ IDLE_TIMEOUT_SECONDS: Final[float] = float(
 MAX_TUNNEL_SECONDS: Final[float] = float(
     os.environ.get("SKILL_EGRESS_MAX_TUNNEL_SECONDS", "14400")
 )
+MAX_SIGNED_RESPONSE_IDLE_TIMEOUT_SECONDS: Final[int] = int(
+    os.environ.get(
+        "SKILL_EGRESS_MAX_SIGNED_RESPONSE_IDLE_TIMEOUT_SECONDS",
+        "14400",
+    )
+)
+if (
+    not 1 <= MAX_SIGNED_RESPONSE_IDLE_TIMEOUT_SECONDS
+    <= MAX_TUNNEL_SECONDS
+):
+    raise RuntimeError(
+        "invalid_skill_egress_max_signed_response_idle_timeout_seconds"
+    )
 MAX_HEADER_BYTES: Final[int] = 64 * 1024
 MAX_BUFFER_BYTES: Final[int] = 256 * 1024
 COPY_CHUNK_BYTES: Final[int] = 64 * 1024
@@ -239,6 +252,7 @@ class ExactEgressRule:
     path_prefix: str
     query_prefix: str
     query_exact: bool = False
+    response_idle_timeout_seconds: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -635,10 +649,13 @@ def _validated_signed_egress_policy(
         keys = set(raw_rule) if isinstance(raw_rule, dict) else set()
         if (
             not isinstance(raw_rule, dict)
-            or keys not in (
-                {"methods", "url_prefix"},
-                {"methods", "url_prefix", "query_exact"},
-            )
+            or not {"methods", "url_prefix"}.issubset(keys)
+            or not keys.issubset({
+                "methods",
+                "url_prefix",
+                "query_exact",
+                "response_idle_timeout_seconds",
+            })
             or not isinstance(raw_rule.get("methods"), list)
             or type(raw_rule.get("query_exact", False)) is not bool
         ):
@@ -664,6 +681,21 @@ def _validated_signed_egress_policy(
             raw_rule.get("url_prefix")
         )
         query_exact = bool(raw_rule.get("query_exact", False))
+        response_idle_timeout = raw_rule.get(
+            "response_idle_timeout_seconds"
+        )
+        if (
+            response_idle_timeout is not None
+            and (
+                version != 3
+                or type(response_idle_timeout) is not int
+                or not 1 <= response_idle_timeout
+                <= MAX_SIGNED_RESPONSE_IDLE_TIMEOUT_SECONDS
+                or canonical_methods != ("POST",)
+                or not query_exact
+            )
+        ):
+            raise ProxyPolicyError("invalid_policy_preface")
         coordinate = (prefix, canonical_methods, query_exact)
         if (
             methods_raw != list(canonical_methods)
@@ -683,6 +715,7 @@ def _validated_signed_egress_policy(
             path_prefix=parsed.path or "/",
             query_prefix=parsed.query,
             query_exact=query_exact,
+            response_idle_timeout_seconds=response_idle_timeout,
         ))
 
     if (
@@ -921,7 +954,7 @@ def _authorize_exact_request(
     policy: SignedEgressPolicy,
     origin: Origin,
     forwarded: bytes,
-) -> None:
+) -> ExactEgressRule:
     """Require a method/path/query match before any upstream connection."""
 
     method, path, query = _request_policy_coordinate(
@@ -946,8 +979,22 @@ def _authorize_exact_request(
             and not query.startswith(rule.query_prefix)
         ):
             continue
-        return
+        return rule
     raise ProxyPolicyError("request_url_not_allowed")
+
+
+def _authorized_response_idle_timeout(
+    policy: SignedEgressPolicy,
+    origin: Origin,
+    forwarded: bytes,
+    authority_mode: str,
+) -> float:
+    if authority_mode != "exact":
+        return IDLE_TIMEOUT_SECONDS
+    rule = _authorize_exact_request(policy, origin, forwarded)
+    return float(
+        rule.response_idle_timeout_seconds or IDLE_TIMEOUT_SECONDS
+    )
 
 
 def _authorize_request(
@@ -3183,15 +3230,23 @@ def _relay_response_only(
     client: socket.socket,
     upstream: socket.socket,
     budget: PolicyBudgetReservation | None = None,
+    *,
+    idle_timeout_seconds: float = IDLE_TIMEOUT_SECONDS,
+    clock=time.monotonic,
 ) -> None:
     """Relay one HTTP response without accepting a second client request."""
 
-    started = last_activity = time.monotonic()
+    # Signed rule values are bounded while parsing the authority document.
+    # The relay also serves the deployment-owned short default, which must not
+    # become invalid merely because an operator chooses a smaller signed cap.
+    if not 0 < idle_timeout_seconds <= MAX_TUNNEL_SECONDS:
+        raise ProxyPolicyError("invalid_response_idle_timeout")
+    started = last_activity = clock()
     while True:
-        now = time.monotonic()
+        now = clock()
         if now - started >= MAX_TUNNEL_SECONDS:
             return
-        idle_remaining = IDLE_TIMEOUT_SECONDS - (now - last_activity)
+        idle_remaining = idle_timeout_seconds - (now - last_activity)
         if idle_remaining <= 0:
             return
         upstream.settimeout(min(idle_remaining, 1.0))
@@ -3216,7 +3271,7 @@ def _relay_response_only(
             client.sendall(chunk)
         except (socket.timeout, ConnectionError, OSError):
             return
-        last_activity = time.monotonic()
+        last_activity = clock()
 
 
 def _safe_error(connection: socket.socket, status: int, reason: str) -> None:
@@ -3367,11 +3422,20 @@ class ProxyHandler(socketserver.BaseRequestHandler):
             )
             framing: _RequestBodyFraming | None = None
             authority_mode: str | None = None
+            response_idle_timeout_seconds = IDLE_TIMEOUT_SECONDS
             if forwarded:
                 authority_mode = _authorize_request(
                     signed_policy,
                     requested_origin,
                     forwarded,
+                )
+                response_idle_timeout_seconds = (
+                    _authorized_response_idle_timeout(
+                        signed_policy,
+                        requested_origin,
+                        forwarded,
+                        authority_mode,
+                    )
                 )
             if forwarded and signed_policy.version == 3:
                 framing = _validated_request_body_framing(
@@ -3454,7 +3518,14 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                 # TCP FIN before the response: several compliant production
                 # servers treat an early write-half close as a client abort
                 # and close without returning the response.
-                _relay_response_only(self.request, upstream, budget)
+                _relay_response_only(
+                    self.request,
+                    upstream,
+                    budget,
+                    idle_timeout_seconds=(
+                        response_idle_timeout_seconds
+                    ),
+                )
                 return
             if requested_origin.scheme == "http":
                 self.request.sendall(
@@ -3475,6 +3546,14 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                         signed_policy,
                         requested_origin,
                         forwarded_http,
+                    )
+                    response_idle_timeout_seconds = (
+                        _authorized_response_idle_timeout(
+                            signed_policy,
+                            requested_origin,
+                            forwarded_http,
+                            authority_mode,
+                        )
                     )
                     if authority_mode == "public_read":
                         forwarded_http = _sanitize_public_read_request(
@@ -3546,7 +3625,14 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                 # Preserve the request side until the one-response relay is
                 # complete.  HTTP framing, not an early TCP half-close, owns
                 # the transaction boundary here.
-                _relay_response_only(self.request, upstream, budget)
+                _relay_response_only(
+                    self.request,
+                    upstream,
+                    budget,
+                    idle_timeout_seconds=(
+                        response_idle_timeout_seconds
+                    ),
+                )
                 return
             authority = self.certificate_authority
             if authority is None:
@@ -3591,6 +3677,14 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                     signed_policy,
                     exact_origin,
                     forwarded_https,
+                )
+                response_idle_timeout_seconds = (
+                    _authorized_response_idle_timeout(
+                        signed_policy,
+                        exact_origin,
+                        forwarded_https,
+                        authority_mode,
+                    )
                 )
                 if authority_mode == "public_read":
                     forwarded_https = _sanitize_public_read_request(
@@ -3648,7 +3742,14 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                 # bypasses TLS close semantics and can expose encrypted records
                 # through subsequent recv calls. Connection: close and the
                 # one-request response-only relay provide the framing boundary.
-                _relay_response_only(client_tls, upstream, budget)
+                _relay_response_only(
+                    client_tls,
+                    upstream,
+                    budget,
+                    idle_timeout_seconds=(
+                        response_idle_timeout_seconds
+                    ),
+                )
             except ProxyTransportError as exc:
                 _safe_error(
                     client_tls,

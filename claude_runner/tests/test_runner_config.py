@@ -40,6 +40,7 @@ class RunnerProviderConfigurationTests(unittest.TestCase):
             "CLAUDE_EGRESS_PROXY_VOLUME_NAME": "fixture-egress",
             "CLAUDE_WORKSPACE_LOCK_VOLUME_NAME": "fixture-locks",
             "CLAUDE_PROVIDER_PROFILES_JSON": json.dumps(profiles),
+            "CLAUDE_PROVIDER_RESPONSE_IDLE_TIMEOUT_SECONDS": "7260",
             "PUBLIC_PROVIDER_KEY": "public-fixture-key",
             "LOCAL_PROVIDER_KEY": "EMPTY",
             "BROWSER_PRIVATE_ORIGIN_ALLOWLIST": (
@@ -75,6 +76,11 @@ class RunnerProviderConfigurationTests(unittest.TestCase):
         self.assertEqual(
             settings.provider_profiles["local_agentmodel"].claude_base_url,
             "http://10.10.132.2:1025",
+        )
+        self.assertEqual(
+            settings.provider_profiles["local_agentmodel"]
+            .response_idle_timeout_seconds,
+            7260,
         )
         self.assertEqual(settings.private_origin_allowlist, (
             "https://10.10.132.126:18443",
@@ -158,6 +164,34 @@ class RunnerProviderConfigurationTests(unittest.TestCase):
                         "context-window map",
                     ):
                         load_settings()
+
+    def test_provider_can_narrow_but_not_escape_idle_timeout_bound(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = self._environment(root)
+            profiles = json.loads(environment["CLAUDE_PROVIDER_PROFILES_JSON"])
+            profiles["local_agentmodel"][
+                "response_idle_timeout_seconds"
+            ] = 600
+            environment["CLAUDE_PROVIDER_PROFILES_JSON"] = json.dumps(profiles)
+            with patch.dict(os.environ, environment, clear=True):
+                settings = load_settings()
+            self.assertEqual(
+                settings.provider_profiles["local_agentmodel"]
+                .response_idle_timeout_seconds,
+                600,
+            )
+
+            profiles["local_agentmodel"][
+                "response_idle_timeout_seconds"
+            ] = 14_401
+            environment["CLAUDE_PROVIDER_PROFILES_JSON"] = json.dumps(profiles)
+            with patch.dict(os.environ, environment, clear=True):
+                with self.assertRaisesRegex(
+                    RunnerConfigurationError,
+                    "response idle timeout",
+                ):
+                    load_settings()
 
 
 if __name__ == "__main__":

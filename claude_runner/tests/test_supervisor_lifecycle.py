@@ -254,7 +254,7 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         image = SimpleNamespace(labels={
             "org.opencontainers.image.chatds.setid-stripped": "true",
             "org.opencontainers.image.chatds.egress-policy": (
-                "signed-public-read-v1"
+                "signed-route-idle-v2"
             ),
             "org.opencontainers.image.chatds.runner-runtime": (
                 "installed-isolated-package-v1"
@@ -267,7 +267,7 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
             _validate_runner_image_security(image, "seccomp_stripped_setid")
 
         image.labels["org.opencontainers.image.chatds.egress-policy"] = (
-            "signed-public-read-v1"
+            "signed-route-idle-v2"
         )
         image.labels.pop("org.opencontainers.image.chatds.runner-runtime")
         with self.assertRaisesRegex(RuntimeError, "runtime_attestation"):

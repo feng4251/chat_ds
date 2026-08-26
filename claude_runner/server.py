@@ -66,7 +66,7 @@ SECCOMP_PROFILE_PATH = Path("/app/claude_runner/seccomp_profile.json")
 SETID_STRIPPED_LABEL = "org.opencontainers.image.chatds.setid-stripped"
 EGRESS_POLICY_LABEL = "org.opencontainers.image.chatds.egress-policy"
 RUNNER_RUNTIME_LABEL = "org.opencontainers.image.chatds.runner-runtime"
-EXPECTED_EGRESS_POLICY_RUNTIME = "signed-public-read-v1"
+EXPECTED_EGRESS_POLICY_RUNTIME = "signed-route-idle-v2"
 EXPECTED_RUNNER_RUNTIME = "installed-isolated-package-v1"
 RUNNER_IMAGE_SELF_TEST_ARGUMENT = "--chatds-image-self-test"
 RUNNER_IMAGE_SELF_TEST_SCHEMA = "chatds.claude-runner-image-self-test.v1"
@@ -281,6 +281,9 @@ class RunManager:
             ),
             call_id_sha256=_scope_digest("call", request.root_run_id, request.run_id),
             limits=dict(self.settings.egress_limits),
+            provider_response_idle_timeout_seconds=(
+                profile.response_idle_timeout_seconds
+            ),
             public_read_enabled=(
                 self.settings.public_read_egress_enabled
             ),

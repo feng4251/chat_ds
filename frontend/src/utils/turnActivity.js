@@ -174,7 +174,9 @@ export function attachTurnActivities(messages = [], events = [], options = {}) {
   for (const event of events) {
     const key = event.root_run_id
     if (!key || event.kind === 'projection') continue
-    byRun.set(key, applyTurnActivity(byRun.get(key) || [], event))
+    const bucket = byRun.get(key) || []
+    bucket.push(event)
+    byRun.set(key, bucket)
   }
   return messages.map((message) => {
     const key = message.run_id || (
@@ -185,13 +187,30 @@ export function attachTurnActivities(messages = [], events = [], options = {}) {
       && byRun.has(key)
       && (committed.has(key) || message.runActive)
     )
+    const priorMessage = key
+      ? (options.priorMessages || []).find((candidate) => (
+          candidate.role === 'assistant'
+          && messageActivityRoot(candidate) === key
+        ))
+      : null
+    const baseNodes = (
+      message.activityNodes?.length
+        ? message.activityNodes
+        : priorMessage?.activityNodes || []
+    )
     return (
     message.role === 'assistant' && replayable
       ? {
           ...message,
           rootRunId: key,
-          activityNodes: byRun.get(key),
-          activityTruncated: options.truncated === true || undefined,
+          activityNodes: [...byRun.get(key)]
+            .sort((a, b) => Number(a.seq || 0) - Number(b.seq || 0))
+            .reduce(applyTurnActivity, baseNodes),
+          activityTruncated: (
+            message.activityTruncated === true
+            || priorMessage?.activityTruncated === true
+            || options.truncated === true
+          ) || undefined,
         }
       : message
     )

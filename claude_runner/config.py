@@ -28,6 +28,9 @@ class ProviderProfile:
     # start request so the Supervisor can reject catalog/profile drift before
     # granting a Turn any Docker or Provider authority.
     context_windows: dict[str, int]
+    # Signed only onto the selected Provider's exact POST route. The native
+    # engine retains authority over provider stream stall/retry semantics.
+    response_idle_timeout_seconds: int = 14_400
     # Anthropic-hosted server tools are not part of the generic Messages
     # compatibility contract. Third-party facades must explicitly attest that
     # they implement Claude Code's native WebSearch/WebFetch semantics.
@@ -176,6 +179,12 @@ def _strict_bool(name: str, default: bool) -> bool:
 
 
 def _provider_profiles() -> dict[str, ProviderProfile]:
+    default_response_idle_timeout = _bounded_int(
+        "CLAUDE_PROVIDER_RESPONSE_IDLE_TIMEOUT_SECONDS",
+        14_400,
+        1,
+        14_400,
+    )
     raw = os.environ.get("CLAUDE_PROVIDER_PROFILES_JSON", "").strip()
     if raw:
         try:
@@ -242,9 +251,20 @@ def _provider_profiles() -> dict[str, ProviderProfile]:
                 f"Provider context-window map is invalid for {profile_id}"
             )
         native_web_tools = value.get("native_web_tools", False)
+        response_idle_timeout_seconds = value.get(
+            "response_idle_timeout_seconds",
+            default_response_idle_timeout,
+        )
         if type(native_web_tools) is not bool:
             raise RunnerConfigurationError(
                 f"Provider native web-tool capability is invalid for {profile_id}"
+            )
+        if (
+            type(response_idle_timeout_seconds) is not int
+            or not 1 <= response_idle_timeout_seconds <= 14_400
+        ):
+            raise RunnerConfigurationError(
+                f"Provider response idle timeout is invalid for {profile_id}"
             )
         profiles[profile_id] = ProviderProfile(
             id=profile_id,
@@ -254,6 +274,7 @@ def _provider_profiles() -> dict[str, ProviderProfile]:
             api_key=api_key,
             models=frozenset(models),
             context_windows=dict(context_windows),
+            response_idle_timeout_seconds=response_idle_timeout_seconds,
             native_web_tools=native_web_tools,
         )
     return profiles

@@ -4,7 +4,9 @@ import test from 'node:test'
 import {
   createSessionRefreshCoordinator,
   createSessionRefreshLoop,
+  messageUpdateScrollBehavior,
   runCardMessageRevision,
+  sessionProjectionHasDelta,
   shouldFollowMessageUpdate,
 } from './sessionProjectionSync.js'
 
@@ -139,4 +141,17 @@ test('message following uses the pre-append pin state', () => {
   assert.equal(shouldFollowMessageUpdate(true, false), true)
   assert.equal(shouldFollowMessageUpdate(false, true), true)
   assert.equal(shouldFollowMessageUpdate(false, false), false)
+})
+
+test('durable live updates never animate the document through moving cards', () => {
+  assert.equal(messageUpdateScrollBehavior(false, true), 'auto')
+  assert.equal(messageUpdateScrollBehavior(true, false), 'auto')
+  assert.equal(messageUpdateScrollBehavior(false, false), 'smooth')
+})
+
+test('empty activity polls are no-ops unless the durable projection changed', () => {
+  assert.equal(sessionProjectionHasDelta({ events: [] }, false), false)
+  assert.equal(sessionProjectionHasDelta(null, false), false)
+  assert.equal(sessionProjectionHasDelta({ events: [{ seq: 1 }] }, false), true)
+  assert.equal(sessionProjectionHasDelta({ events: [] }, true), true)
 })

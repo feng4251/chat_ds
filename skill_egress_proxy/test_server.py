@@ -130,6 +130,24 @@ class _FragmentedReader:
         return result
 
 
+class _DelayedReader:
+    def __init__(self, clock: list[float], payload: bytes) -> None:
+        self.clock = clock
+        self.payload = payload
+        self.delayed = False
+
+    def settimeout(self, _value: float) -> None:
+        return
+
+    def recv(self, _size: int) -> bytes:
+        if not self.delayed:
+            self.delayed = True
+            self.clock[0] += 31.0
+            raise socket.timeout
+        payload, self.payload = self.payload, b""
+        return payload
+
+
 class _CollectingWriter:
     def __init__(self) -> None:
         self.payload = bytearray()
@@ -1055,6 +1073,30 @@ class PolicyScopeLedgerTests(unittest.TestCase):
         self.assertEqual(b"abcde", bytes(client.payload))
         reservation.release()
 
+    def test_exact_provider_idle_budget_defers_to_native_stream_watchdog(self):
+        short_clock = [0.0]
+        short_client = _CollectingWriter()
+        server._relay_response_only(
+            short_client,
+            _DelayedReader(short_clock, b"late-provider-byte"),
+            idle_timeout_seconds=30,
+            clock=lambda: short_clock[0],
+        )
+        self.assertEqual(bytes(short_client.payload), b"")
+
+        native_clock = [0.0]
+        native_client = _CollectingWriter()
+        server._relay_response_only(
+            native_client,
+            _DelayedReader(native_clock, b"late-provider-byte"),
+            idle_timeout_seconds=60,
+            clock=lambda: native_clock[0],
+        )
+        self.assertEqual(
+            bytes(native_client.payload),
+            b"late-provider-byte",
+        )
+
 
 class ExactEgressPolicyTests(unittest.TestCase):
     def setUp(self):
@@ -1100,6 +1142,67 @@ class ExactEgressPolicyTests(unittest.TestCase):
             f"{method} {target} HTTP/1.1\r\n"
             "Host: example.com\r\n\r\n"
         ).encode("ascii")
+
+    def test_long_idle_budget_is_signed_exact_post_authority_only(self):
+        policy = server._validated_signed_egress_policy(
+            ["https://provider.example:443"],
+            [{
+                "methods": ["POST"],
+                "url_prefix": (
+                    "https://provider.example:443/v1/chat/completions"
+                ),
+                "query_exact": True,
+                "response_idle_timeout_seconds": 7_260,
+            }],
+            [],
+            version=3,
+            budget_scope_sha256="a" * 64,
+            call_id_sha256="b" * 64,
+            limits_raw={
+                "max_requests": 8,
+                "max_outbound_bytes": 4096,
+                "max_response_wire_bytes": 65_536,
+            },
+        )
+        origin = server.Origin("https", "provider.example", 443)
+        rule = server._authorize_exact_request(
+            policy,
+            origin,
+            b"POST /v1/chat/completions HTTP/1.1\r\n"
+            b"Host: provider.example\r\n\r\n",
+        )
+        self.assertEqual(rule.response_idle_timeout_seconds, 7_260)
+
+        invalid_rules = (
+            {
+                "methods": ["GET"],
+                "url_prefix": "https://provider.example:443/document",
+                "query_exact": True,
+                "response_idle_timeout_seconds": 7_260,
+            },
+            {
+                "methods": ["POST"],
+                "url_prefix": "https://provider.example:443/v1/",
+                "response_idle_timeout_seconds": 7_260,
+            },
+        )
+        for invalid in invalid_rules:
+            with self.subTest(rule=invalid), self.assertRaises(
+                server.ProxyPolicyError,
+            ):
+                server._validated_signed_egress_policy(
+                    ["https://provider.example:443"],
+                    [invalid],
+                    [],
+                    version=3,
+                    budget_scope_sha256="a" * 64,
+                    call_id_sha256="b" * 64,
+                    limits_raw={
+                        "max_requests": 8,
+                        "max_outbound_bytes": 4096,
+                        "max_response_wire_bytes": 65_536,
+                    },
+                )
 
     def test_path_boundary_method_and_query_prefix_are_exact(self):
         allowed = (

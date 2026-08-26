@@ -32,8 +32,10 @@ from browser_runtime.chatds_browser_runtime.proxy_bridge import (
     DEFAULT_MAX_OUTBOUND_BYTES,
     DEFAULT_MAX_REQUESTS,
     DEFAULT_MAX_RESPONSE_WIRE_BYTES,
+    IDLE_TIMEOUT_SECONDS,
     LoopbackProxyBridge,
     MAX_CONNECTIONS,
+    MAX_SIGNED_RESPONSE_IDLE_TIMEOUT_SECONDS,
     ProxySocketAuthority,
     ProxyTrustAuthority,
     _canonical_origin,
@@ -41,6 +43,7 @@ from browser_runtime.chatds_browser_runtime.proxy_bridge import (
     _policy_auth_key,
     _policy_preface,
     _relay,
+    _validated_exact_policy,
     main,
 )
 from browser_runtime.chatds_browser_runtime import policy as runtime_policy
@@ -186,6 +189,45 @@ class BrowserRuntimeBridgeTests(unittest.TestCase):
             response,
         )
         self.assertIn(b"destination_origin_not_allowed", response)
+
+    def test_signed_long_idle_budget_is_limited_to_exact_post_rules(self):
+        self.assertGreaterEqual(
+            IDLE_TIMEOUT_SECONDS,
+            MAX_SIGNED_RESPONSE_IDLE_TIMEOUT_SECONDS,
+        )
+        origin = "https://provider.example:443"
+        accepted = _validated_exact_policy(
+            (origin,),
+            ({
+                "methods": ["POST"],
+                "url_prefix": origin + "/v1/chat/completions",
+                "query_exact": True,
+                "response_idle_timeout_seconds": 7_260,
+            },),
+            (),
+        )
+        self.assertEqual(
+            accepted[1][0]["response_idle_timeout_seconds"],
+            7_260,
+        )
+
+        for invalid in (
+            {
+                "methods": ["GET"],
+                "url_prefix": origin + "/documents",
+                "query_exact": True,
+                "response_idle_timeout_seconds": 7_260,
+            },
+            {
+                "methods": ["POST"],
+                "url_prefix": origin + "/v1/",
+                "response_idle_timeout_seconds": 7_260,
+            },
+        ):
+            with self.subTest(rule=invalid), self.assertRaises(
+                BridgeConfigurationError,
+            ):
+                _validated_exact_policy((origin,), (invalid,), ())
 
     def test_stale_execution_generation_is_rejected_by_proxy(self):
         port = self._start_proxy_and_bridge(

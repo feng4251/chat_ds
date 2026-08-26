@@ -148,3 +148,19 @@ export function createSessionRefreshLoop({
 export function shouldFollowMessageUpdate(wasPinnedToBottom, isStreaming) {
   return Boolean(wasPinnedToBottom || isStreaming)
 }
+
+/** Live transcript movement must not trigger repeated animated page travel. */
+export function messageUpdateScrollBehavior(isStreaming, runActive) {
+  return isStreaming || runActive ? 'auto' : 'smooth'
+}
+
+/** Empty active-run polls are not state updates. */
+export function sessionProjectionHasDelta(
+  activities,
+  runProjectionChanged,
+) {
+  return Boolean(
+    runProjectionChanged
+    || (Array.isArray(activities?.events) && activities.events.length > 0)
+  )
+}

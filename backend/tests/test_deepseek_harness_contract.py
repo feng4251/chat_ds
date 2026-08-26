@@ -189,6 +189,71 @@ def test_native_root_and_child_streams_preserve_authority_boundaries():
     assert terminal[0].data["payload"]["authoritative"] is True
 
 
+@pytest.mark.parametrize(
+    ("child_id", "label", "phase"),
+    [
+        ("warehouse-child", "inventory-reconciler", "collection"),
+        ("power-grid-child", "outage-evidence-reviewer", "validation"),
+    ],
+)
+def test_late_native_workflow_identity_backfills_started_child(
+    child_id,
+    label,
+    phase,
+):
+    projector = DeepSeekEventProjector("d" * 32)
+    started = projector.project(_native(
+        1,
+        "turn/start",
+        session=child_id,
+        depth=1,
+    ))
+    child_run_id = started[0].data["run_id"]
+    assert started[0].data["display_name"].startswith("DeepSeek worker ")
+
+    backfill = projector.project(_native(
+        2,
+        "tool-workflow/agent-start",
+        {
+            "runId": "renamed-workflow-run",
+            "seq": 1,
+            "childId": child_id,
+            "label": label,
+            "phase": phase,
+        },
+    ))
+
+    assert len(backfill) == 1
+    event = backfill[0].data
+    assert event["event_type"] == "run.progress"
+    assert event["run_id"] == child_run_id
+    assert event["display_name"] == label
+    assert event["payload"] == {
+        "stage": "worker_identity_bound",
+        "worker_id": label,
+        "workflow_stage": phase,
+        "native_session_id": child_id,
+    }
+
+
+def test_provider_terminal_keeps_machine_code_and_exposes_safe_action_detail():
+    projector = DeepSeekEventProjector("e" * 32)
+    terminal = projector.project({
+        "seq": 9,
+        "event": {
+            "type": "chatds.supervisor.terminal",
+            "status": "failed",
+            "error": "provider_http_403",
+        },
+    })
+
+    payload = terminal[0].data["payload"]
+    assert payload["terminal_reason"] == "provider_http_403"
+    assert payload["error_code"] == "provider_http_403"
+    assert "HTTP 403" in payload["error"]
+    assert "余额" in payload["error"]
+
+
 def test_high_frequency_native_deltas_commit_only_complete_semantic_steps():
     projector = DeepSeekEventProjector("c" * 32)
     for seq in range(1, 5_001):
@@ -705,6 +770,10 @@ def test_native_immutable_inputs_are_separated_from_worker_mailboxes(
 def test_provider_reasoning_profiles_are_declarative_and_rename_safe(monkeypatch):
     monkeypatch.setenv("MUSEUM_PROVIDER_KEY", "test-only-provider-key")
     monkeypatch.setenv(
+        "DEEPSEEK_HARNESS_PROVIDER_RESPONSE_IDLE_TIMEOUT_SECONDS",
+        "7260",
+    )
+    monkeypatch.setenv(
         "DEEPSEEK_HARNESS_PROVIDER_PROFILES_JSON",
         json.dumps({
             "renamed-gateway": {
@@ -726,6 +795,7 @@ def test_provider_reasoning_profiles_are_declarative_and_rename_safe(monkeypatch
         "warehouse-planner": "max",
         "museum-curator": "ultra",
     }
+    assert profile.response_idle_timeout_seconds == 7260
     assert _provider_reasoning_binding({
         "provider_reasoning_wire_effort": "max",
     }) == ("deepseek-official", "max")

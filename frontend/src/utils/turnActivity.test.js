@@ -46,6 +46,45 @@ test('duplicate replay is idempotent and contiguous chunks merge in place', () =
   assert.equal(nodes[0].text, 'hello world')
 })
 
+test('truncated reconciliation tail never deletes known earlier activity', () => {
+  const priorNodes = reduceTurnActivities([
+    event(1, 'reasoning:warehouse', 'reasoning', {
+      text: 'Inspect historical receipts. ',
+    }),
+    event(2, 'tool:inventory', 'tool', {
+      event: {
+        event_type: 'tool.started',
+        tool_name: 'InventoryLookup',
+        tool_call_id: 'inventory',
+      },
+    }),
+  ])
+  const attached = attachTurnActivities([{
+    role: 'assistant',
+    rootRunId: 'root',
+    durableRunPlaceholder: true,
+    runActive: true,
+    activityNodes: priorNodes,
+  }], [
+    event(5_001, 'tool:inventory', 'tool', {
+      event: {
+        event_type: 'tool.completed',
+        tool_name: 'InventoryLookup',
+        tool_call_id: 'inventory',
+      },
+    }),
+    event(5_002, 'content:warehouse', 'content', {
+      text: 'Inventory reconciled.',
+    }),
+  ], { truncated: true })
+
+  assert.deepEqual(attached[0].activityNodes.map((node) => node.kind), [
+    'reasoning', 'tool', 'content',
+  ])
+  assert.equal(attached[0].activityNodes[1].status, 'succeeded')
+  assert.equal(attached[0].activityTruncated, true)
+})
+
 test('historical adjacent stream fragments compact without crossing a tool boundary', () => {
   const nodes = reduceTurnActivities([
     event(1, 'reasoning:legacy-1', 'reasoning', { text: 'inspect ' }),

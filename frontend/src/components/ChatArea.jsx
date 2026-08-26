@@ -32,9 +32,11 @@ import {
 import {
   createSessionRefreshCoordinator,
   createSessionRefreshLoop,
+  messageUpdateScrollBehavior,
   messageProjectionRevision,
   runCardMessageRevision,
   runCardProjectionRevision,
+  sessionProjectionHasDelta,
   shouldFollowMessageUpdate,
 } from '../utils/sessionProjectionSync'
 import { compatibleModelsForEngine, modelForEngine } from '../utils/engineSelection'
@@ -431,7 +433,10 @@ export default function ChatArea({
             : attachTurnActivities(
                 hydrateAgentRunCards(server, runCards),
                 activityResult.payload?.events || [],
-                { truncated: activityResult.payload?.truncated === true },
+                {
+                  truncated: activityResult.payload?.truncated === true,
+                  priorMessages: prev,
+                },
               )
         ))
         if (runCardResult.available) {
@@ -502,6 +507,9 @@ export default function ChatArea({
         const now = Date.now()
         const messageBoundary = runCardMessageRevision(runCards)
         const runProjection = runCardProjectionRevision(runCards)
+        const runProjectionChanged = (
+          runProjection !== runCardProjectionRevisionRef.current
+        )
         const needsFullReconcile = (
           forceFull
           || messageBoundary !== runCardMessageRevisionRef.current
@@ -542,7 +550,7 @@ export default function ChatArea({
           )
           if (
             messageChanged
-            || runProjection !== runCardProjectionRevisionRef.current
+            || runProjectionChanged
           ) {
             setMsgs((prev) => (
               prev.some((message) => message.streaming)
@@ -550,17 +558,20 @@ export default function ChatArea({
                 : attachTurnActivities(
                     hydrateAgentRunCards(server, runCards),
                     activities?.events || [],
-                    { truncated: activities?.truncated === true },
+                    {
+                      truncated: activities?.truncated === true,
+                      priorMessages: prev,
+                    },
                   )
             ))
           }
           messageProjectionRevisionRef.current = messageRevision
           lastFullSessionSyncRef.current = now
           if (messageChanged) onConvRefreshRef.current?.()
-        } else if (
-          activities
-          || runProjection !== runCardProjectionRevisionRef.current
-        ) {
+        } else if (sessionProjectionHasDelta(
+          activities,
+          runProjectionChanged,
+        )) {
           setMsgs((prev) => (
             prev.some((message) => message.streaming)
               ? prev
@@ -652,7 +663,10 @@ export default function ChatArea({
           : attachTurnActivities(
               hydrateAgentRunCards(server, runCards),
               activities.events || [],
-              { truncated: activities.truncated === true },
+              {
+                truncated: activities.truncated === true,
+                priorMessages: prev,
+              },
             )
       ))
     }
@@ -693,18 +707,24 @@ export default function ChatArea({
   // and hides the new durable message below the fold.
   const lastMsg = msgs[msgs.length - 1]
   const isStreaming = lastMsg?.streaming
+  const isDurableRunActive = Boolean(lastMsg?.runActive)
   useLayoutEffect(() => {
     const el = scrollContainerRef.current
     if (!el) return
     if (shouldFollowMessageUpdate(shouldStickToBottomRef.current, isStreaming)) {
-      endRef.current?.scrollIntoView({ behavior: isStreaming ? 'auto' : 'smooth' })
+      endRef.current?.scrollIntoView({
+        behavior: messageUpdateScrollBehavior(
+          isStreaming,
+          isDurableRunActive,
+        ),
+      })
       shouldStickToBottomRef.current = true
       setShowScrollBtn(false)
       return
     }
     const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
     setShowScrollBtn(distanceFromBottom > 200)
-  }, [msgs, isStreaming])
+  }, [msgs, isStreaming, isDurableRunActive])
 
   useEffect(() => {
     const ta = inpRef.current

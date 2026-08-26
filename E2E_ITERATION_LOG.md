@@ -2431,3 +2431,51 @@ warehouse/museum/factory rename、两个不同 task identity、10,000 次同 ID 
   SSH key/agent 或已连接 GitHub plugin，生产主机也没有可复用认证。HTTPS、SSH 22/443 均在写入前安全退出，
   因此 `be8850a5` 与本节文档提交当前只在本地，待用户提供非交互 GitHub 授权后再 push；绝不把 token 放进
   remote URL、命令行、Git 配置或仓库。
+
+## 2026-08-26 原生双引擎长响应与 Web 增量投影修复
+
+本节关联三个独立生产 Session：Claude Code `6d3b593d2722473cb17cbaa14a79146d`、DeepSeek Harness
+`ae7d9ad9499147f2863637a7cb4d9003` 和 `dceefaa22243421da40dfc6e9496b75c`。三者的持久 conversation、
+AgentRun/debug/native event ledger 与 immutable Skill view 已分别冻结并交叉核对：用户输入、Skill view
+`9aee2a0596eff2e78c48c615332e70ed3d82abc9539b701663ea7076af96d7b8`、19 个 Skills、9 个 agents、17 条
+compiled routes 和交付合同一致，因而不能把不同终态归因于 Skill/compiler 漂移。
+
+- Claude root `4b3a44f33ee840fcbee44bf80619b073` 已权威 succeeded，8 个声明 worker 全部 succeeded。
+- Shaiengine DeepSeek root `53a71fcd142d457cb048824b2e501b3a` 的 8 个 worker 和 workflow 均成功，最终 Provider 返回结构化
+  HTTP 403 precharge 拒绝；机器终态是 `provider_http_403`。当时草稿 142,676 bytes，尚未满足 153,600-byte
+  artifact 合同。首因是外部账户余额/额度/模型权限，artifact 不足只是未获后续模型回合的结果。
+- 本地 DeepSeek root `30839b09578045f588e0e3c1296ebb98` 在本节初次冻结时仍为 running。14 个 child attempt 已因
+  transport 失败结算；native engine 的 stream idle watchdog 为 7,200 秒，但 ChatDS 共享 egress response relay
+  仍使用全局 30 秒 idle，且 session loopback bridge 为 660 秒。Provider 在负载下超过 30 秒无下一字节时由
+  ChatDS 边界提前关闭连接，DSH 只负责把该 transport 失败按其原生流程重试。该旧 run 的最终终态将在部署记录
+  中补记，不能作为修复后验收。
+
+页面“乱跳”另有独立、可确定复现的 ChatDS 投影原因：refresh hydration 每次丢弃 durable placeholder 的既有
+`activityNodes`，bounded tail 又用移动窗口替换完整时间线；空 activity poll 仍触发 state write，live durable
+update 反复执行 smooth scroll。原生事件 seq 自身单调。worker 显示匿名则是 child `turn/start` 可能先于 root
+`tool-workflow/agent-start`，旧 projector 没有在同一稳定 child run identity 上回填后到的原生 label。
+
+### 跨领域不变量、成熟实现对照与通用修复
+
+1. 共享传输层不得比 native engine 的 provider stream watchdog 更早结束合法的精确 Provider exchange；较长
+   idle budget 只能作为 v3 signed authority 的 exact-query POST rule 数据，不能扩大 Skill、MCP、public-read、
+   origin、method 或 path 权限。普通读取继续使用短全局 idle。
+2. Web projection 对同一 root/tool/worker identity 必须 append/merge-in-place。bounded replay 只能补充或结算已知
+   node，不能删除早期 reasoning/tool/content；空 poll 是 no-op，live follow 使用非动画滚动。
+3. 后到的机器身份元数据只能更新既有 child run，不得新建第二个 worker。机器 terminal code 保持权威，安全的
+   用户提示由结构化 HTTP code 映射，不能从模型 prose 猜测因果。
+
+唯一成熟参考冻结为 clean 的本地 `claude-code/` commit
+`6f6f12b37f529488b10e53928dd5508bb93535c7`。`src/services/api/claude.ts` 由 native stream watchdog 持有
+provider stall/retry；`src/cli/transports/ccrClient.ts`、`SerialBatchEventUploader.ts` 与 `HybridTransport.ts` 使用稳定
+identity、ordered pending、retry/flush 来保持增量顺序。本轮 **adopt** 精确路由 transport budget 与稳定 ID，
+**adapt** append-only hydration 到现有 ChatDS receipt/projection contract，**reject** 在 adapter 中复制 provider
+retry、compaction 或 agent loop。DeepSeek 上游仍 clean 固定于
+`47f943859bef60e4160492346772ded9b24f765a`；两个 native source tree 都没有修改。
+
+确定性回归使用 warehouse、power-grid、energy-grid 等非 V2.3 rename/mutation：31 秒 delayed byte 在普通 30 秒
+route 必须结束，在 exact Provider 60 秒 signed route 必须通过；GET 或 prefix POST 不得携带该字段；移动的 5,000-event
+tail 不得删除既有 reasoning/tool/content；10,000-update 既有稳定 ID 行为继续通过；child 先 start、descriptor 后到时
+run ID 不变。当前复验为 Frontend `63/63`、Vite production build、proxy `84/84`、runner/bridge `44/44`、
+Supervisor lifecycle `38/38`、Python AST 14 文件和 diff/Compose 静态检查通过。生产切换仍等待上述 active root
+落终态，未在本节记录时重启任何服务。

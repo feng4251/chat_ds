@@ -56,6 +56,8 @@ query 与 DNS 仍可能携带少量数据。因此 public-read 是“大幅压�
 - 每 Turn 最大连接/请求数；
 - client-to-proxy 总字节上限；
 - proxy-to-client 总字节上限；
+- 仅精确 Provider POST 规则可签名响应空闲预算，使原生引擎的 stream watchdog
+  保持权威；Skill、MCP 与公共读取仍使用代理的短空闲上限；
 - 超限立即拒绝，关闭时等待所有处理器排空；
 - 终端事件携带不可变、内容摘要化的 egress receipt。
 
@@ -74,7 +76,7 @@ query 与 DNS 仍可能携带少量数据。因此 public-read 是“大幅压�
 5. 仅在审计 receipt 可生成且终端状态可持久化后部署。
 
 Supervisor、Turn Runner、Session Sandbox 与 Egress Proxy 必须共同声明
-`signed-public-read-v1` 策略运行时版本。镜像构建会实际导入规则解析器验证该版本，
+`signed-route-idle-v2` 策略运行时版本。镜像构建会实际导入规则解析器验证该版本，
 Supervisor 启动时再次校验 Runner 镜像标签；不能用一个新版策略编译器搭配旧版执行镜像。
 
 紧急撤销通过删除部署 profile/private-origin 配置或禁用

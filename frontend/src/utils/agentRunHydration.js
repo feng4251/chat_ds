@@ -598,6 +598,14 @@ function durablePlaceholder(root, projectionTruncated = []) {
  * mapping is unavailable). This deliberately avoids timestamp-nearest guesses.
  */
 export function hydrateAgentRunCards(messages = [], payload = {}) {
+  const priorPlaceholders = new Map(
+    messages
+      .filter((message) => (
+        message.durableRunPlaceholder
+        && message.rootRunId
+      ))
+      .map((message) => [message.rootRunId, message]),
+  )
   const next = messages
     .filter((message) => !message.durableRunPlaceholder)
     .map((message) => ({ ...message }))
@@ -649,7 +657,20 @@ export function hydrateAgentRunCards(messages = [], payload = {}) {
     // exceptional terminals still need an in-conversation lifecycle marker.
     if (!root.active && root.status === 'succeeded') continue
 
-    const placeholder = durablePlaceholder(root, projectionTruncated)
+    const priorPlaceholder = priorPlaceholders.get(root.root_run_id)
+    const placeholder = {
+      ...durablePlaceholder(root, projectionTruncated),
+      ...(
+        priorPlaceholder?.activityNodes
+          ? { activityNodes: priorPlaceholder.activityNodes }
+          : {}
+      ),
+      ...(
+        priorPlaceholder?.activityTruncated
+          ? { activityTruncated: true }
+          : {}
+      ),
+    }
     const triggerIndex = root.trigger_message_id
       ? next.findIndex(
         (message) => message.id === root.trigger_message_id && message.role === 'user'

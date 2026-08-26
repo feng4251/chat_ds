@@ -72,6 +72,45 @@ test('active exact turn without assistant receives durable placeholder', () => {
   assert.match(hydrated[1].lifecycleNotice, /刷新页面不会丢失/)
 })
 
+test('active placeholder hydration preserves its append-only activity timeline', () => {
+  const prior = [{
+    id: 'durable-run-energy-root',
+    role: 'assistant',
+    content: '',
+    durableRunPlaceholder: true,
+    rootRunId: 'energy-root',
+    runActive: true,
+    activityNodes: [{
+      nodeId: 'reasoning:energy-audit',
+      kind: 'reasoning',
+      anchorSeq: 11,
+      lastSeq: 12,
+      eventIds: ['energy-event-11', 'energy-event-12'],
+      text: 'Inspect the grid receipts.',
+    }],
+    activityTruncated: true,
+  }]
+
+  const hydrated = hydrateAgentRunCards(prior, {
+    roots: [{
+      root_run_id: 'energy-root',
+      assistant_message_id: null,
+      trigger_message_id: 'energy-trigger',
+      mapping_status: 'exact_no_assistant',
+      active: true,
+      status: 'running',
+      runs: [{ id: 'energy-root', lifecycle_status: 'running' }],
+    }],
+  })
+
+  assert.equal(hydrated.length, 1)
+  assert.deepEqual(
+    hydrated[0].activityNodes.map((node) => node.nodeId),
+    ['reasoning:energy-audit'],
+  )
+  assert.equal(hydrated[0].activityTruncated, true)
+})
+
 test('live SSE root identity safely reuses the local partial assistant', () => {
   const hydrated = hydrateAgentRunCards(
     [

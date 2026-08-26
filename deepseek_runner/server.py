@@ -310,6 +310,9 @@ class Manager:
                 ),
                 call_id_sha256=_scope("call", request.root_run_id, request.run_id),
                 limits=dict(self.settings.egress_limits),
+                provider_response_idle_timeout_seconds=(
+                    profile.response_idle_timeout_seconds
+                ),
                 public_read_enabled=self.settings.public_read_egress_enabled,
             )
             if web_enabled and not any(

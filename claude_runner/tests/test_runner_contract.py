@@ -2339,6 +2339,7 @@ class RunnerEgressPolicyTests(unittest.TestCase):
             )
             policy = compile_turn_egress_policy(
                 provider_protocol="openai",
+                provider_response_idle_timeout_seconds=7_260,
                 **common,
             )
             with self.assertRaises(ClaudeEgressPolicyError):
@@ -2357,6 +2358,15 @@ class RunnerEgressPolicyTests(unittest.TestCase):
         )
         self.assertEqual(provider_rules[0]["methods"], ["POST"])
         self.assertIs(provider_rules[0]["query_exact"], True)
+        self.assertEqual(
+            provider_rules[0]["response_idle_timeout_seconds"],
+            7_260,
+        )
+        self.assertFalse(any(
+            "response_idle_timeout_seconds" in row
+            for row in policy["egress_rules"]
+            if row not in provider_rules
+        ))
 
     def test_public_read_profile_is_signed_data_not_wildcard_rules(self):
         with tempfile.TemporaryDirectory() as temporary:

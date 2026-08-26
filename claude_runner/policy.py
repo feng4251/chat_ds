@@ -55,6 +55,7 @@ def compile_turn_egress_policy(
     call_id_sha256: str,
     limits: dict[str, int],
     provider_protocol: str = "anthropic",
+    provider_response_idle_timeout_seconds: int | None = None,
     public_read_enabled: bool = False,
 ) -> dict[str, Any]:
     # The Supervisor attests the immutable view before compiling execution
@@ -195,6 +196,16 @@ def compile_turn_egress_policy(
         )
     else:
         raise ClaudeEgressPolicyError("Provider protocol is unsupported")
+    if (
+        provider_response_idle_timeout_seconds is not None
+        and (
+            type(provider_response_idle_timeout_seconds) is not int
+            or not 1 <= provider_response_idle_timeout_seconds <= 14_400
+        )
+    ):
+        raise ClaudeEgressPolicyError(
+            "Provider response idle timeout is outside its bound"
+        )
     exact_query_rows.extend(
         {"url_prefix": prefix, "methods": ["POST"]}
         for prefix in provider_prefixes
@@ -202,14 +213,27 @@ def compile_turn_egress_policy(
     prefix_rules = normalize_session_sandbox_egress_rules(prefix_rows)
     exact_query_rules = normalize_session_sandbox_egress_rules(exact_query_rows)
     rule_payloads = [rule.as_payload() for rule in prefix_rules]
-    rule_payloads.extend({
-        **rule.as_payload(),
-        # A model must not append a covert query string to a user-provided
-        # retrieval coordinate or to the deployment-owned Provider endpoint.
-        # Skill/MCP rules intentionally retain prefix semantics because their
-        # authored protocol may require query parameters.
-        "query_exact": True,
-    } for rule in exact_query_rules)
+    provider_prefix_set = set(provider_prefixes)
+    for rule in exact_query_rules:
+        payload = {
+            **rule.as_payload(),
+            # A model must not append a covert query string to a user-provided
+            # retrieval coordinate or to the deployment-owned Provider endpoint.
+            # Skill/MCP rules intentionally retain prefix semantics because their
+            # authored protocol may require query parameters.
+            "query_exact": True,
+        }
+        if (
+            provider_response_idle_timeout_seconds is not None
+            and payload["url_prefix"] in provider_prefix_set
+        ):
+            # This signed exact-route budget prevents the shared ChatDS relay
+            # from pre-empting an engine-native stream watchdog. It is not an
+            # ambient origin grant and does not widen Skill/Web/MCP traffic.
+            payload["response_idle_timeout_seconds"] = (
+                provider_response_idle_timeout_seconds
+            )
+        rule_payloads.append(payload)
     origins = tuple(dict.fromkeys(
         normalize_http_origin(str(rule["url_prefix"]))
         for rule in rule_payloads

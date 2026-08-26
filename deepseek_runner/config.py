@@ -22,6 +22,7 @@ class ProviderProfile:
     models: frozenset[str]
     context_windows: dict[str, int]
     reasoning_wire_efforts: dict[str, str]
+    response_idle_timeout_seconds: int = 14_400
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +115,12 @@ def state_volume_host_root(client, volume_name: str) -> Path:
 
 
 def _profiles() -> dict[str, ProviderProfile]:
+    default_response_idle_timeout = _bounded_int(
+        "DEEPSEEK_HARNESS_PROVIDER_RESPONSE_IDLE_TIMEOUT_SECONDS",
+        14_400,
+        1,
+        14_400,
+    )
     raw = os.environ.get("DEEPSEEK_HARNESS_PROVIDER_PROFILES_JSON", "").strip()
     if not raw:
         raise DeepSeekRunnerConfigurationError(
@@ -138,6 +145,10 @@ def _profiles() -> dict[str, ProviderProfile]:
         models = row.get("models")
         windows = row.get("context_windows")
         reasoning_wire_efforts = row.get("reasoning_wire_efforts", {})
+        response_idle_timeout_seconds = row.get(
+            "response_idle_timeout_seconds",
+            default_response_idle_timeout,
+        )
         if (
             not credential
             or not isinstance(models, list)
@@ -156,6 +167,8 @@ def _profiles() -> dict[str, ProviderProfile]:
                 or SAFE_REASONING_WIRE_EFFORT.fullmatch(value) is None
                 for value in reasoning_wire_efforts.values()
             )
+            or type(response_idle_timeout_seconds) is not int
+            or not 1 <= response_idle_timeout_seconds <= 14_400
         ):
             raise DeepSeekRunnerConfigurationError(
                 f"DeepSeek Harness profile {profile_id} is incomplete"
@@ -172,6 +185,9 @@ def _profiles() -> dict[str, ProviderProfile]:
                 )
                 for model in models
             },
+            response_idle_timeout_seconds=(
+                response_idle_timeout_seconds
+            ),
         )
     return result
 

@@ -37,7 +37,7 @@ LISTEN_PORT: Final[int] = 18080
 # Bump this whenever the signed rule schema or its matching semantics change.
 # Container builds assert the value so a stale sandbox base cannot silently
 # disagree with the Supervisor policy compiler.
-EGRESS_POLICY_RUNTIME_VERSION: Final[str] = "signed-public-read-v1"
+EGRESS_POLICY_RUNTIME_VERSION: Final[str] = "signed-route-idle-v2"
 PROXY_SOCKET_PATH: Final[Path] = Path(
     "/run/chatds-skill-egress/proxy.sock"
 )
@@ -54,7 +54,7 @@ EXPECTED_PROXY_UID: Final[int] = 65531
 EXPECTED_BRIDGE_GID: Final[int] = 65530
 MAX_CONNECTIONS: Final[int] = 8
 MAX_DIRECTION_BUFFER_BYTES: Final[int] = 1024 * 1024
-IDLE_TIMEOUT_SECONDS: Final[float] = 660.0
+IDLE_TIMEOUT_SECONDS: Final[float] = 14_400.0
 CONNECT_TIMEOUT_SECONDS: Final[float] = 5.0
 HANDLER_DRAIN_TIMEOUT_SECONDS: Final[float] = 10.0
 POLICY_PREFACE_PREFIX: Final[bytes] = b"CHATDS-EGRESS-POLICY-V1 "
@@ -65,6 +65,7 @@ POLICY_KEY_DERIVATION_LABEL: Final[bytes] = (
 )
 MAX_POLICY_ORIGINS: Final[int] = 128
 MAX_POLICY_RULES: Final[int] = 256
+MAX_SIGNED_RESPONSE_IDLE_TIMEOUT_SECONDS: Final[int] = 14_400
 BOUNDED_EXCHANGE_PROFILE: Final[str] = "bounded_controlled_exchange"
 AUDIT_RECEIPT_VERSION: Final[int] = 1
 DEFAULT_MAX_OUTBOUND_BYTES: Final[int] = 16 * 1024 * 1024
@@ -408,10 +409,13 @@ def _validated_exact_policy(
         keys = set(raw_rule) if isinstance(raw_rule, dict) else set()
         if (
             not isinstance(raw_rule, dict)
-            or keys not in (
-                {"methods", "url_prefix"},
-                {"methods", "url_prefix", "query_exact"},
-            )
+            or not {"methods", "url_prefix"}.issubset(keys)
+            or not keys.issubset({
+                "methods",
+                "url_prefix",
+                "query_exact",
+                "response_idle_timeout_seconds",
+            })
             or not isinstance(raw_rule.get("methods"), list)
             or type(raw_rule.get("query_exact", False)) is not bool
         ):
@@ -439,6 +443,22 @@ def _validated_exact_policy(
         )
         prefix = _canonical_url_prefix(raw_rule.get("url_prefix"))
         query_exact = bool(raw_rule.get("query_exact", False))
+        response_idle_timeout = raw_rule.get(
+            "response_idle_timeout_seconds"
+        )
+        if (
+            response_idle_timeout is not None
+            and (
+                type(response_idle_timeout) is not int
+                or not 1 <= response_idle_timeout
+                <= MAX_SIGNED_RESPONSE_IDLE_TIMEOUT_SECONDS
+                or canonical_methods != ("POST",)
+                or not query_exact
+            )
+        ):
+            raise BridgeConfigurationError(
+                "invalid exact egress response idle timeout"
+            )
         coordinate = (prefix, canonical_methods, query_exact)
         if (
             list(canonical_methods) != methods_raw
@@ -460,6 +480,10 @@ def _validated_exact_policy(
         }
         if query_exact:
             canonical_rule["query_exact"] = True
+        if response_idle_timeout is not None:
+            canonical_rule["response_idle_timeout_seconds"] = (
+                response_idle_timeout
+            )
         canonical_rules.append(canonical_rule)
     if tuple(derived_origins) != canonical_origins:
         raise BridgeConfigurationError(
@@ -533,6 +557,16 @@ def _policy_preface(
             limits,
         )
     )
+    if (
+        not v3_requested
+        and any(
+            "response_idle_timeout_seconds" in rule
+            for rule in egress_rules
+        )
+    ):
+        raise BridgeConfigurationError(
+            "signed response idle timeout requires bounded policy v3"
+        )
     normalized_limits: dict[str, int] | None = None
     if v3_requested:
         if (

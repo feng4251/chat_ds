@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from typing import Any
@@ -110,6 +111,28 @@ def deepseek_native_tool_identity(
     return None
 
 
+def _provider_failure_display(code: object) -> str | None:
+    match = re.fullmatch(r"provider_http_([4-5][0-9]{2})", str(code or ""))
+    if match is None:
+        return None
+    status = int(match.group(1))
+    if status == 401:
+        reason = "认证被拒绝，请检查 Provider 凭据状态"
+    elif status in {402, 403}:
+        reason = "请求被拒绝，请检查账户余额、额度及模型访问权限"
+    elif status == 404:
+        reason = "端点或模型不可用，请检查 Provider 路由"
+    elif status in {408, 504}:
+        reason = "Provider 响应超时"
+    elif status == 429:
+        reason = "Provider 触发限流或并发限制"
+    elif status >= 500:
+        reason = "Provider 上游暂时不可用"
+    else:
+        reason = "Provider 拒绝了本次请求"
+    return f"Provider 返回 HTTP {status}：{reason}。"
+
+
 class DeepSeekEventProjector:
     """Losslessly project native DSH Session events into ChatDS events."""
 
@@ -178,13 +201,16 @@ class DeepSeekEventProjector:
                 "succeeded": "run.completed",
                 "cancelled": "run.cancelled",
             }.get(status, "run.failed")
+            terminal_code = event.get("error") or status
+            display_error = _provider_failure_display(terminal_code)
             payload = {
                 "authoritative": True,
                 "finish_reason": (
                     "stop" if status == "succeeded" else status
                 ),
-                "terminal_reason": event.get("error") or status,
-                "error": event.get("error"),
+                "terminal_reason": terminal_code,
+                "error": display_error or event.get("error"),
+                "error_code": event.get("error"),
             }
             return (
                 self._agent_event(
@@ -230,6 +256,31 @@ class DeepSeekEventProjector:
         projected: list[EngineStreamEvent] = []
         sub_seq = seq * 1_000_000
 
+        if native_type == "tool-workflow/agent-start":
+            child_session_id = str(data.get("childId") or "").strip()
+            label = str(data.get("label") or "").strip()
+            phase = str(data.get("phase") or "").strip()
+            if child_session_id and label:
+                safe_label = label[:128]
+                self._labels[child_session_id] = safe_label
+                child_run_id = self._run_id(child_session_id, 1)
+                # Native DSH may publish the child Turn before its root
+                # workflow descriptor. Keep the stable child identity and
+                # backfill only display metadata on that same run.
+                if child_run_id in self._started:
+                    projected.append(self._agent_event(
+                        event_type="run.progress",
+                        run_id=child_run_id,
+                        seq=sub_seq,
+                        payload={
+                            "stage": "worker_identity_bound",
+                            "worker_id": safe_label,
+                            "workflow_stage": phase[:128],
+                            "native_session_id": child_session_id[:512],
+                        },
+                        depth=1,
+                        session_id=child_session_id,
+                    ))
         if native_type == "subagent/descriptor":
             label = str(data.get("label") or "").strip()
             if label:
