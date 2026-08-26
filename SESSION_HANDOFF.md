@@ -3801,3 +3801,29 @@ Round 17 的两个全新 case。不得复用
   `fix/native-adapter-production-20260824` had no concurrent commits and was exactly two commits behind before the attempt, but this
   Codex environment has no HTTPS credential, SSH key/agent or connected GitHub plugin. Both push transports failed before any write.
   Keep the local commits; request a non-interactive GitHub authorization, then push `HEAD` explicitly to that branch without force.
+
+# 2026-08-26 signed Provider idle and append-only Web projection
+
+- Commit `5a16eacd0245c2f1eb7acf74b452b22da5b4e7f1` fixes only ChatDS-owned boundaries: v3 signed exact-POST Provider
+  routes may carry a bounded response-idle budget; public-read/Skill/MCP retain the short default. Frontend hydration now preserves
+  earlier activity across bounded-tail refresh, ignores empty polls and avoids repeated smooth-scroll. DSH projection backfills a
+  late native worker label on the same run identity and preserves structured Provider codes with safe UI guidance.
+- Three same-Skill production Sessions were correlated from conversation, immutable Skill and debug/native/AgentRun evidence.
+  Claude `6d3b...` succeeded with 8 workers. Shaiengine DSH `dce...` completed 8 workers then received external
+  `provider_http_403` precharge rejection; balance/entitlement remains external. Local DSH `ae7...` ended failed at
+  `2026-08-26 03:44:29Z`: all 14 child attempts were transport errors under the old 30-second relay, and the final
+  `workflow_contract_failed` was downstream. No native-core or Skill/compiler defect was found.
+- Clean archive `/tmp/chat_ds_deploy_5a16eacd.SeBj3u` built and deployed eight revisioned candidates. Running image IDs are:
+  runtime `dc956576...`, proxy `da92eb53...`, Claude Turn `9ab8048d...`, DSH Turn `774db4fe...`, Claude Supervisor
+  `246ae4b9...`, DSH Supervisor `de4b4707...`, Backend `4d132cf1...`, Frontend `884542b1...`. All old images have
+  `rollback-pre-5a16eacd`. DSH upstream remains clean at `47f943859bef60e4160492346772ded9b24f765a`; local Claude
+  reference remains clean at `6f6f12b37f529488b10e53928dd5508bb93535c7`; Claude binary remains official `2.1.152`.
+- Production verification: all target containers running/restart 0; Backend, both Supervisors, proxy and SearXNG healthy;
+  three Web/API entries 200 on `/assets/index-Bbukj5_6.js`; SQLite quick-check OK, FK violations/nonterminal runs 0;
+  signed idle settings all 14,400 seconds; SearXNG real aggregate query returns 9 results; headless login root is nonempty with
+  no application ReferenceError. Compose also recreated the SearXNG container as a dependency, but all persistent volumes were
+  preserved. The inert image anchors intentionally have no healthcheck, so Compose `--wait` warns even though independent state
+  verification passes.
+- Regression evidence and exact terminal timeline are in `E2E_ITERATION_LOG.md`. No model-heavy V2.3 was launched. The next
+  acceptance must be a fresh user-driven Session; do not reinterpret old failed roots. Preserve the two protected tracked deletions
+  and all existing untracked runtime/reference state. This commit remains local-only unless the user explicitly requests a push.

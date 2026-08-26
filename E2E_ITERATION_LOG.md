@@ -2479,3 +2479,35 @@ tail 不得删除既有 reasoning/tool/content；10,000-update 既有稳定 ID �
 run ID 不变。当前复验为 Frontend `63/63`、Vite production build、proxy `84/84`、runner/bridge `44/44`、
 Supervisor lifecycle `38/38`、Python AST 14 文件和 diff/Compose 静态检查通过。生产切换仍等待上述 active root
 落终态，未在本节记录时重启任何服务。
+
+### 旧 run 终态、提交、部署与生产证明
+
+- 旧本地 DeepSeek root 于 `2026-08-26 03:44:29Z` 落下唯一 durable failed terminal。最终 native ledger 为
+  seq 50,934：14 个 depth-1 `turn/end error`、14 对 `tool-workflow/agent-start/end`，随后一个 root
+  `turn/end error` 和 `chatds.supervisor.terminal workflow_contract_failed`；没有 worker success。页面合同错误是
+  mandatory frontier 未满足的后置终态，首因仍是旧 ChatDS proxy 提前结束长 Provider idle。旧 run 未被重放、
+  取消或改写，也不计作修复后 acceptance。
+- 功能与初始证据提交为 `5a16eacd0245c2f1eb7acf74b452b22da5b4e7f1`。clean archive 位于
+  `/tmp/chat_ds_deploy_5a16eacd.SeBj3u`，显式排除了两项用户自有 tracked deletion，并从 clean upstream commit
+  补入 DeepSeek gitlink。完整 Backend 宿主回归为 `403 passed, 2 environment-only failed, 119 warnings,
+  2 subtests`；两项失败均是宿主未安装 requirements 已固定的 `croniter==6.2.4`，Backend candidate 内全部 4 项
+  schedule contract 通过。Claude Runner 宿主为 `123 passed, 3 同源环境失败, 1 skipped, 19 subtests`，3 项在
+  安装 croniter 的 Claude candidate 内通过。其余 Frontend `63/63`、proxy `84/84`、runner/bridge `44/44`、
+  Supervisor lifecycle `38/38` 与两个原生 image self-test 全通过。
+- 生产镜像为 native runtime `sha256:dc956576...`、egress proxy `sha256:da92eb53...`、Claude Turn
+  `sha256:9ab8048d...`、DeepSeek Turn `sha256:774db4fe...`、Claude Supervisor `sha256:246ae4b9...`、DeepSeek
+  Supervisor `sha256:de4b4707...`、Backend `sha256:4d132cf1...`、Frontend `sha256:884542b1...`。旧镜像均保留
+  `rollback-pre-5a16eacd`。DeepSeek image 的 upstream revision 仍是 `47f943...`，ChatDS revision 使用独立 label；
+  Claude binary 仍是官方 `2.1.152`。
+- 切换前动态 Turn、nonterminal AgentRun 和 5173 established connection 均为 0，外键违规为 0。Compose 因
+  DeepSeek dependency 同时重建了 SearXNG 容器，但其 data/Valkey volume 与 Session/database/workspace volume
+  均未删除或替换。`--wait` 最后只报告两个 inert runner anchor 没有 healthcheck；独立核验显示所有 8 个目标
+  container running/restart 0，Backend、两个 Supervisor 与 proxy healthy，三个 anchor 按设计无 healthcheck。
+- 新 proxy/runtime cohort 均为 `signed-route-idle-v2`；proxy signed max、Claude profile fallback 和 DeepSeek
+  profile fallback 都回读 14,400 秒，public-read 的短 idle 未扩大。三 Web 入口 `/`、`/api/health`、
+  `build-info.json` 全为 200，storage identity 一致，entry 为 `/assets/index-Bbukj5_6.js`。SQLite
+  `quick_check=ok`、foreign-key violation 0、nonterminal AgentRun 0；无头 Chromium 的生产 login root 非空，
+  未见 Uncaught/ReferenceError/TypeError。SearXNG synthetic query 返回 9 条结果；个别上游 engine 的 403、CAPTCHA
+  与 timeout 仍是预期动态外部降级，不影响 aggregate search。
+- 本轮没有自动发起新的模型重型 Skill/V2.3。`dce...` 的外部余额/额度 403 不能由 ChatDS 修复；新 signed-idle
+  transport 和 append-only Web projection 需由用户下一条独立 Session 验收，旧失败 run 不能充当通过证据。
