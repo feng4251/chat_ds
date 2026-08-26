@@ -2,6 +2,26 @@
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
+## 2026-08-26 单仓库快照整合
+
+- 用户明确要求在不改变当前源码版本的前提下，将项目目录内的嵌套 Git 边界整合到 ChatDS 根仓库。本次采用
+  snapshot vendoring，不导入第三方完整历史：`claude-code/` 固定来源 commit
+  `6f6f12b37f529488b10e53928dd5508bb93535c7`、tree
+  `ef7589945b3767ead85fc52f68d013f88094bd47`；`deepseek-harness/` 与
+  `deepseek-harness-clean/` 都固定来源 commit
+  `47f943859bef60e4160492346772ded9b24f765a`、tree
+  `f904efab9ef435201d6ba4da88a34d6366568272`；`hermes-agent/` 固定来源 commit
+  `6c73e8ffaa7b8df1e7b2f9d5792b4ee027e41637`、tree
+  `29759e962655e2ba1d8bd5b70ac1d356a22070c0`。
+- `deepseek-harness-clean/` 不再是 submodule/gitlink；普通 clone 已包含全部固定快照。Claude Code 与 DeepSeek
+  Harness 目录继续只读，ChatDS 原生边界约束不变。历史交接中“独立仓库/子模块”的描述是当时事实，本节从当前
+  提交起取代其仓库布局含义。
+- 整合前根 HEAD 为 `67ecafdc3d13cea86be4ab41aa2e537de4c8f0f1`，本地安全分支为
+  `backup/pre-monorepo-20260826`。嵌套 Git 元数据保存在项目目录外、权限 `0700` 的
+  `/nfs/yangbb/codes/chat_ds_nested_git_backup_20260826_snapshot/` 可回滚备份中；不得提交该备份。
+  两项用户自有 tracked deletion 始终保持 unstaged，既有 runtime/Session/reference 未跟踪数据没有被批量加入。
+- 本次只改变 Git 索引布局和对应维护文档，不修改产品/原生源码字节，不部署，也不远端 push。
+
 ## 2026-08-25 Qwen xhigh provider 方言、原生角色保持与生产验收
 
 ### 三源诊断与两阶段确定性复现

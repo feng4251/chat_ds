@@ -6,9 +6,10 @@ or patch the upstream agent loop.
 
 ## Runtime boundary
 
-- `deepseek-harness-clean/` is a Git submodule pinned to upstream commit
-  `47f943859bef60e4160492346772ded9b24f765a` (`0.1.0-rc.5`). Build it with
-  `git clone --recurse-submodules` or `git submodule update --init --recursive`.
+- `deepseek-harness-clean/` is a read-only vendored snapshot pinned to upstream
+  commit `47f943859bef60e4160492346772ded9b24f765a` (`0.1.0-rc.5`) with tree
+  `f904efab9ef435201d6ba4da88a34d6366568272`. A normal clone contains it;
+  no submodule initialization is required.
 - `Dockerfile.runner` follows the upstream source-build sequence (`pnpm
   install`, `pnpm run build`) and runs the built `apps/cli/lib/bin.js` entry.
 - The trusted supervisor owns Docker lifecycle and durable terminal state. A

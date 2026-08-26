@@ -4,7 +4,6 @@
 
 .claude/
 .deepseek/
-hermes-agent/
 
 __pycache__/
 *.py[cod]

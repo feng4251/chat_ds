@@ -97,7 +97,7 @@ compile/bind
 
 ### DeepSeek Harness
 
-- `deepseek-harness-clean/` 是独立 Git submodule，固定到经过验证的上游提交。
+- `deepseek-harness-clean/` 是只读 vendored snapshot，固定到经过验证的上游提交。
 - Runner 按上游源码构建并调用原生 CLI/Session/event/tool/permission 流程。
 - ChatDS adapter 只完成 provider binding、workspace/Skill projection、事件持久化与 Web DTO 投影。
 - 原生工具权限保持 exact tool identity，不通过粗粒度 plugin group 扩权。
@@ -154,7 +154,7 @@ Provider 请求本身仍可能携带信息；部署主机、模型供应商与�
 ## 环境要求
 
 - Linux x86-64，近期版本 Docker Engine 与 Docker Compose plugin；
-- Git（克隆时需要初始化 submodule）；
+- Git；
 - Python 3.12+ 和 Node.js 20+（仅宿主开发/测试需要）；
 - 首次构建镜像时可访问固定的基础镜像、Python/npm 依赖和上游包；
 - 至少一个与所选引擎协议兼容的模型 Provider；
@@ -168,9 +168,8 @@ Provider 请求本身仍可能携带信息；部署主机、模型供应商与�
 ### 1. 克隆与初始化
 
 ```bash
-git clone --recurse-submodules https://github.com/feng4251/chat_ds.git
+git clone https://github.com/feng4251/chat_ds.git
 cd chat_ds
-git submodule update --init --recursive
 cp .env.example .env
 mkdir -p data harness/data/memories /nfs/temp/chat_ds
 chmod 700 data harness/data/memories /nfs/temp/chat_ds
@@ -352,7 +351,10 @@ backend/                 FastAPI、数据库、engine adapters、Skill/control p
 frontend/                React/Vite UI 与 Nginx 配置
 claude_runner/           Claude Code Turn/Supervisor 边界适配与测试
 deepseek_runner/         DeepSeek Harness Turn/Supervisor 边界适配与测试
-deepseek-harness-clean/  固定上游 DeepSeek Harness submodule（不修改）
+claude-code/             固定 Claude Code 成熟实现参考快照（只读）
+deepseek-harness/        保留的 DeepSeek Harness 上游快照（只读）
+deepseek-harness-clean/  生产构建使用的固定 DeepSeek Harness 快照（只读）
+hermes-agent/            保留的第三方参考快照（非当前 Harness 设计依据）
 native_security/         两个原生 Runner 共用的安全边界
 executor/                中性 session runtime 构建底座
 skill_egress_proxy/      签名 HTTP(S) policy proxy 与 budget ledger
@@ -362,7 +364,7 @@ docker-compose.yml       完整部署拓扑与 profiles
 SESSION_HANDOFF.md       当前仓库的权威维护交接状态
 ```
 
-Runtime 数据、用户上传 Skills、生成 artifacts、密钥和本地参考仓库不应提交到 Git。
+Runtime 数据、用户上传 Skills、生成 artifacts、密钥和未声明的本地参考副本不应提交到 Git。
 
 ## 贡献约束
 

@@ -58,9 +58,12 @@ Key operating constraints:
   counts as an iteration.
 - Every E2E repair iteration must include a current comparison with mature
   session-wise Harness/workflow implementation. The sole current implementation
-  reference is the local, independent nested Git repository
-  `/nfs/yangbb/codes/chat_ds/claude-code/`; freeze and record its exact commit
-  for each comparison. Treat that source as the primary design evidence. Web
+  reference is the read-only vendored snapshot
+  `/nfs/yangbb/codes/chat_ds/claude-code/`, imported from upstream commit
+  `6f6f12b37f529488b10e53928dd5508bb93535c7` with tree
+  `ef7589945b3767ead85fc52f68d013f88094bd47`; freeze and record the root
+  repository commit and verify this subtree identity for each comparison.
+  Treat that source as the primary design evidence. Web
   search is allowed only when a relevant local code path is stubbed, broken,
   or genuinely ambiguous; record the exact uncertainty and distinguish local
   source evidence from the minimal Web corroboration. Do not resume routine
