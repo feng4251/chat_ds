@@ -3876,3 +3876,45 @@ Round 17 的两个全新 case。不得复用
 - Regression evidence and exact terminal timeline are in `E2E_ITERATION_LOG.md`. No model-heavy V2.3 was launched. The next
   acceptance must be a fresh user-driven Session; do not reinterpret old failed roots. Preserve the two protected tracked deletions
   and all existing untracked runtime/reference state. This commit remains local-only unless the user explicitly requests a push.
+
+# 2026-08-27 unbounded native Turns and Web-native runtime controls
+
+- Commit `48999f33ebd54c08082d9b02c6c7c98487352e90` removes the default total wall-clock deadline from both native Turn
+  Supervisors. Production now resolves `CLAUDE_RUNNER_MAX_RUN_SECONDS=0` and
+  `DEEPSEEK_HARNESS_RUNNER_MAX_RUN_SECONDS=0`; cancellation, resource ceilings and transport-liveness bounds remain distinct
+  deployment safety controls and are not total task-duration limits.
+- Commit `bb0b399b9952483f46d247253dd47952d8cd5e24` exposes three engine-neutral controls only through ChatDS-owned Web,
+  persistence, Supervisor and Turn-I/O adapters: queued follow-up, immediate steer and Esc-style interruption. Requests are
+  immutable and idempotent by control ID, persisted before transport, acknowledged only after the native public boundary accepts
+  them, and reattached from bounded durable receipts after refresh/reconnect. An interruption produces one authoritative cancelled
+  terminal while retaining the native Session, workspace and checkpoint for a later Turn.
+- Neither native implementation was modified. The vendored trees remain byte-identical to HEAD trees
+  `claude-code=ef7589945b3767ead85fc52f68d013f88094bd47` and
+  `deepseek-harness[-clean]=f904efab9ef435201d6ba4da88a34d6366568272`; the frozen source references remain Claude
+  `6f6f12b37f529488b10e53928dd5508bb93535c7` and DSH
+  `47f943859bef60e4160492346772ded9b24f765a`. Claude lowering is justified by
+  `claude-code/src/cli/print.ts` and its typed SDK schemas (`control_request/interrupt`, user priority `later`/`now`). DSH lowering
+  is justified by `packages/core/agent/src/runtime-types.ts`, `packages/core/agent-loop/src/agent.ts` and
+  `packages/host/apiproxy/src/api-proxy.ts` (`followup`, `steer`, and `cancel(..., {keepInbox:true})`). The adopted pattern is a thin
+  authenticated I/O projection plus durable receipts; a second agent loop, retry/compaction state machine or control prompt was
+  explicitly rejected.
+- Generic verification passed: Backend engine/persistence/rename holdouts `127 passed, 2 subtests`; Frontend utility/reconnect/
+  projection tests `69 passed`, targeted ESLint and Vite production build; all DSH adapter tests `18 passed`; shared/Claude/DSH
+  control tests and both Supervisor idempotency tests passed. Candidate-image smokes exercised the installed Claude stream-json
+  lowering and DSH Agent Host lowering, verified official Claude Code `2.1.152`, preserved DSH upstream revision, and confirmed the
+  production cron dependency. Host-only collection misses (`pytest`, browser runtime path) were not treated as product failures;
+  the same affected controls were executed in their actual Turn images. No V2.3/model-heavy E2E was launched.
+- Clean archive `/tmp/chat_ds_deploy_bb0b399b.ncGZOW` built six candidates. Running image IDs are Backend `3d2ffab9...`,
+  Frontend `295e5870...`, Claude Supervisor `0309f5ca...`, Claude Turn `f83ecb8a...`, DSH Supervisor `fe892c88...`, and DSH Turn
+  `047f963e...`. All prior six images retain `rollback-pre-bb0b399b`; candidates and `deploy-bb0b399b` tags point to the accepted
+  images. DSH keeps upstream revision in `org.opencontainers.image.revision` and the ChatDS packaging revision in
+  `org.opencontainers.image.chatds.revision`.
+- Production acceptance: Backend and both Supervisors are healthy; all six switched containers have restart count 0. The three
+  entry coordinates `127.0.0.1`, `172.30.100.126`, and `10.10.132.126` return root/API/hashed asset 200 on
+  `/assets/index-u6x97V7B.js`; containerized Chromium renders a nonempty login application without an application ReferenceError.
+  SQLite quick-check is OK, foreign-key violations and active runs are zero; SearXNG returns 10 real results. The production
+  Backend imports the native-control route and exact action schema. A fresh user-driven long/model execution remains the behavioral
+  acceptance for interrupt/follow-up/steer; do not manufacture a V2.3 run solely for this release.
+- Preserve the two protected tracked deletions and all untracked runtime/reference data. Only stage this handoff file for the
+  deployment-evidence commit. The user explicitly authorized pushing current `main` to `https://github.com/feng4251/chat_ds` after
+  verification; push without force and verify the remote tip.
