@@ -24,8 +24,34 @@ export function activeNativeRunFromCards(payload = {}) {
 
 export function nativeControlCapabilities(activeRun, engineOptions = []) {
   if (!activeRun) return new Set()
-  const engine = engineOptions.find((item) => item.id === activeRun.engineId)
+  return nativeControlCapabilitiesForEngine(activeRun.engineId, engineOptions)
+}
+
+export function nativeControlCapabilitiesForEngine(
+  engineId,
+  engineOptions = [],
+) {
+  const engine = engineOptions.find((item) => item.id === engineId)
   return new Set(Array.isArray(engine?.capabilities) ? engine.capabilities : [])
+}
+
+export function canAttemptNativeControl({
+  engineId,
+  engineOptions,
+  action,
+  text,
+  attachmentCount = 0,
+  sending = false,
+}) {
+  if (!engineId || sending) return false
+  const capability = NATIVE_CONTROL_CAPABILITY[action]
+  if (!capability) return false
+  if (!nativeControlCapabilitiesForEngine(
+    engineId,
+    engineOptions,
+  ).has(capability)) return false
+  if (action === 'interrupt') return true
+  return attachmentCount === 0 && typeof text === 'string' && text.trim() !== ''
 }
 
 export function canSubmitNativeControl({
@@ -38,13 +64,65 @@ export function canSubmitNativeControl({
   sending = false,
 }) {
   if (!activeRun || stateUnknown || sending) return false
-  const capability = NATIVE_CONTROL_CAPABILITY[action]
-  if (!capability) return false
-  if (!nativeControlCapabilities(activeRun, engineOptions).has(capability)) {
-    return false
+  return canAttemptNativeControl({
+    engineId: activeRun.engineId,
+    engineOptions,
+    action,
+    text,
+    attachmentCount,
+    sending,
+  })
+}
+
+/**
+ * Reconcile bounded durable cards without letting an older empty read erase
+ * the run identity just accepted by the live SSE request. A matching terminal
+ * card still wins, and ambiguous active roots always fail closed.
+ */
+export function reconcileActiveNativeRun({
+  currentRun = null,
+  runCards = {},
+  acceptedRunId = null,
+} = {}) {
+  const activeRoots = (runCards?.roots || []).filter((root) => root?.active)
+  const exact = activeNativeRunFromCards(runCards)
+  if (exact) return exact
+  if (activeRoots.length > 0) return null
+  if (
+    typeof acceptedRunId === 'string'
+    && /^[0-9a-f]{32}$/.test(acceptedRunId)
+    && currentRun?.runId === acceptedRunId
+  ) {
+    const acceptedCard = (runCards?.roots || []).find(
+      (root) => root?.root_run_id === acceptedRunId,
+    )
+    if (!acceptedCard) return currentRun
   }
-  if (action === 'interrupt') return true
-  return attachmentCount === 0 && typeof text === 'string' && text.trim() !== ''
+  return null
+}
+
+/** Resolve a missing/stale browser target from the one authoritative root. */
+export async function resolveNativeControlTarget({
+  activeRun = null,
+  stateUnknown = false,
+  acceptedRunId = null,
+  loadRunCards,
+} = {}) {
+  if (activeRun && !stateUnknown) {
+    return { activeRun, runCards: null }
+  }
+  if (typeof loadRunCards !== 'function') {
+    throw new Error('Native run-card loader is unavailable')
+  }
+  const runCards = await loadRunCards()
+  return {
+    activeRun: reconcileActiveNativeRun({
+      currentRun: activeRun,
+      runCards,
+      acceptedRunId,
+    }),
+    runCards,
+  }
 }
 
 export function createNativeControlId(cryptoObject = globalThis.crypto) {

@@ -6,6 +6,7 @@ import {
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
+import { liveDisclosureOpen } from '../utils/timelineDisclosure'
 
 function Markdown({ children }) {
   return (
@@ -45,14 +46,46 @@ function statusView(status) {
 }
 
 function ReasoningNode({ node, streaming }) {
-  const [open, setOpen] = useState(Boolean(streaming))
+  const [manualOpen, setManualOpen] = useState(null)
+  const open = liveDisclosureOpen(manualOpen, streaming)
   return (
     <div className="border-l-2 border-violet-200 pl-3 py-1">
-      <button onClick={() => setOpen((value) => !value)} className="flex items-center gap-1 text-xs font-medium text-violet-600">
+      <button onClick={() => setManualOpen(!open)} className="flex items-center gap-1 text-xs font-medium text-violet-600">
         {open ? <FiChevronDown size={12} /> : <FiChevronRight size={12} />}
         思考{streaming ? '中' : ''}
       </button>
       {open && <div className="mt-1 max-h-80 overflow-y-auto whitespace-pre-wrap rounded-lg bg-violet-50/60 px-3 py-2 text-xs leading-relaxed text-slate-500">{node.text}</div>}
+    </div>
+  )
+}
+
+function WorkflowRunNode({ run }) {
+  const status = run.lifecycle_status || run.status
+  const running = ['running', 'queued'].includes(status)
+  const [manualOpen, setManualOpen] = useState(null)
+  const open = liveDisclosureOpen(manualOpen, running)
+  const view = statusView(status)
+  return (
+    <div className="rounded-xl border border-white bg-white/80 px-3 py-2 text-xs">
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setManualOpen(!open)}
+        className="flex w-full items-center gap-2 text-left"
+      >
+        <FiCpu className="text-indigo-500" size={12} />
+        <span className="min-w-0 flex-1 truncate font-medium text-slate-700">{run.display_name || run.agent_name || '子代理'}</span>
+        <span className={`flex items-center gap-1 ${view.tone}`}>{view.icon}{view.label}</span>
+        {open ? <FiChevronDown size={12} /> : <FiChevronRight size={12} />}
+      </button>
+      {open && (
+        <div>
+          {run.preview && <div className="mt-2 max-h-28 overflow-y-auto whitespace-pre-wrap text-slate-600">{run.preview}</div>}
+          {run.tools?.length > 0 && <div className="mt-2 flex flex-wrap gap-1">{run.tools.map((tool) => <span key={tool.tool_call_id || `${tool.name}-${tool.attempt_index}`} className="rounded-full border border-slate-200 px-2 py-0.5 text-slate-500">{tool.name} · {statusView(tool.status).label}</span>)}</div>}
+          {run.artifacts?.length > 0 && <div className="mt-2 text-emerald-700">产物：{run.artifacts.map((item) => item.title || item.path).join('、')}</div>}
+          {run.error && <div className="mt-2 whitespace-pre-wrap text-red-600">{run.error}</div>}
+        </div>
+      )}
     </div>
   )
 }
@@ -91,22 +124,7 @@ function WorkflowNode({ node }) {
       {open && (
         <div className="space-y-2 border-t border-indigo-100 px-3 py-3">
           {children.length === 0 && <div className="text-xs text-slate-500">主代理正在规划或直接执行当前任务。</div>}
-          {children.map((run) => {
-            const childView = statusView(run.lifecycle_status || run.status)
-            return (
-              <details key={run.id} defaultOpen={(run.lifecycle_status || run.status) === 'running'} className="rounded-xl border border-white bg-white/80 px-3 py-2 text-xs">
-                <summary className="flex cursor-pointer list-none items-center gap-2">
-                  <FiCpu className="text-indigo-500" size={12} />
-                  <span className="min-w-0 flex-1 truncate font-medium text-slate-700">{run.display_name || run.agent_name || '子代理'}</span>
-                  <span className={`flex items-center gap-1 ${childView.tone}`}>{childView.icon}{childView.label}</span>
-                </summary>
-                {run.preview && <div className="mt-2 max-h-28 overflow-y-auto whitespace-pre-wrap text-slate-600">{run.preview}</div>}
-                {run.tools?.length > 0 && <div className="mt-2 flex flex-wrap gap-1">{run.tools.map((tool) => <span key={tool.tool_call_id || `${tool.name}-${tool.attempt_index}`} className="rounded-full border border-slate-200 px-2 py-0.5 text-slate-500">{tool.name} · {statusView(tool.status).label}</span>)}</div>}
-                {run.artifacts?.length > 0 && <div className="mt-2 text-emerald-700">产物：{run.artifacts.map((item) => item.title || item.path).join('、')}</div>}
-                {run.error && <div className="mt-2 whitespace-pre-wrap text-red-600">{run.error}</div>}
-              </details>
-            )
-          })}
+          {children.map((run) => <WorkflowRunNode key={run.id} run={run} />)}
         </div>
       )}
     </div>

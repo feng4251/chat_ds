@@ -2511,3 +2511,79 @@ Supervisor lifecycle `38/38`、Python AST 14 文件和 diff/Compose 静态检查
   与 timeout 仍是预期动态外部降级，不影响 aggregate search。
 - 本轮没有自动发起新的模型重型 Skill/V2.3。`dce...` 的外部余额/额度 403 不能由 ChatDS 修复；新 signed-idle
   transport 和 append-only Web projection 需由用户下一条独立 Session 验收，旧失败 run 不能充当通过证据。
+
+## 2026-08-27 三 Session 终态、原生控制恢复与精确查询策略
+
+本节把用户同时发起的 `426126a7b7d14e32868b162e9d85c9b7`、
+`70ec34ac09d94c23abcda61a54ada06c` 和 `63d9e53752704b6ab7fe516017b68d23` 作为三个独立
+E2E run 冻结，而不是重放或重新解释同一 run。三者的持久 conversation、AgentRun/debug/native/provider/tool/
+artifact ledger 与 exact immutable Skill 均已交叉核对。共同用户输入 SHA-256 为
+`2f042f8dec9eaf2f79994e634a81da9ab11408e53dbd42952a41be049f43787c`；V2.3 ZIP 为
+`78b890eab57ff516c20a39a565631caa5d784f839b42f6ad9efbdbdd951eb0a0`（829,621 bytes），
+Skill view 为 `9aee2a0596eff2e78c48c615332e70ed3d82abc9539b701663ea7076af96d7b8`，主 Skill
+`healthsim-trialsim` 的 `SKILL.md` 为
+`85ecc2fc48b290596c0cf2153b8268cc9f1a6b4f50ca75fb3989f477c8e7df1b`，orchestrator 为
+`6e8520593ebe68c5fb19c32dcae846f2525668f22d81701b9f201300d41939df`，route
+`composite_full_protocol_design` 为
+`b7ff3beb155882eebe6b34381c3af540e515d35867f9458f9a3682132e2fd921`。声明 workflow 是 phase 0 七个 mandatory worker 并行，
+随后精确 `worker-ie-criteria`；artifact contract 是 11 个模块、一个 final，153,600–256,000 bytes、至少
+2,000 lines 和 20 个声明 section。
+
+### 权威终态与根因分类
+
+- Claude Code / `deepseek_v4_pro` root `2dad218b05f940ab9aff65b561d3a3ed` 从
+  `05:47:08Z` 运行至 `10:10:09Z`，8/8 worker succeeded，218 个不同 tool identity 均按原 ID 结算；
+  20 次 Bash failure 都是可恢复的研究/运行时失败，没有 sandbox denial 或 compacted-placeholder 泄漏。
+  workflow 与 artifact receipt 都 passed；final `GAL3-AD_CDP/GAL3-AD-001_FULL_REPORT.md` 为
+  154,575 bytes、2,644 lines、103 headings，root 唯一 terminal 为 succeeded/end_turn。该 run 超过四小时，
+  直接证明无总时限 Turn 已生效且 Claude 原生核心/长任务边界正常。
+- DeepSeek Harness / `local_deepseek_v4_flash` root `8001f6719c9a4793b1821a36f3725da4`
+  从 `05:47:51Z` 运行至 `10:47:32Z`。11 个 child attempt 中 9 个成功；
+  `worker-termination-analysis` 的两次 attempt 分别以 transport error 和结构化 HTTP 400 结束。原始长上下文
+  显示模型先生成严重损坏、无法形成 JSON 的 Bash arguments，随后 provider compatibility facade 返回
+  `unterminated string` 400。phase-0 barrier 因 mandatory worker 缺失而正确失败，phase 1 未越过 barrier，
+  artifact 正确 deferred；唯一 terminal 是 `provider_http_400`。这是模型/兼容 Provider 在长上下文下的
+  tool-argument degeneration，不是 sandbox、scheduler、Skill compiler 或 DeepSeek Harness 原生流程缺陷；不应以
+  放松 barrier 或改原生 retry/agent loop 修复。
+- DeepSeek Harness / `qwen3_5` root `32cf1bed4d624c029331a23c259faa26` 从
+  `05:48:27Z` 运行至 `11:44:36Z`，8/8 worker 和两个 workflow phase 全部 passed。root 生成精确 11 个模块并
+  byte-concat 为 `GAL3-AD_I_II_III_FULL_REPORT.md`，153,800 bytes、1,681 lines、151 headings，SHA-256
+  `f890bbfe...`。模型 stdout 声称全部验收通过，但 controller-owned artifact receipt 唯一 finding 是
+  `artifact_min_lines_not_met`（1,681 < 2,000），因此 terminal `artifact_contract_failed` 正确 fail closed。
+  这是模型未遵循内容/长度要求而不是 Harness gate 缺陷；不能降低 Skill 数据声明的门槛或增加 V2.3 特判。
+
+`70...` 的持久 conversation 只有原 user 和 terminal assistant，没有 `native_control` message；对应入口日志共
+815 次请求而 `/controls` POST 为 0，且当前 Frontend image 生命周期内全局同样为 0。因而用户在运行中按 Enter
+或 Esc 无响应发生在 Web 边界，操作没有送达 Backend/Supervisor，更没有进入任一原生 Harness。`63...` 的五次
+可恢复 tool failure 中，一条 SearX 查询含文字 `%`；`URLSearchParams` 正确编码为 `%25`，但 ChatDS exact-egress
+policy 在 proxy 前把 query data 当成 path traversal 拒绝。相邻不含 `%` 的查询可到达 SearX，证明这是接入策略
+解析缺陷而不是 SearX 服务中断。
+
+### 跨领域不变量、成熟实现对照与通用修复
+
+本轮生产变更只针对四个与 fixture 无关的不变量：
+
+1. live SSE 独占 transcript 顺序，但 durable poll 必须继续刷新 run/control authority；较旧的空 hydration 不得抹掉
+   刚由 SSE 接受的 root identity，matching terminal 仍必须胜出。
+2. Web 可以依据 engine-declared capability 接受 Enter/Esc 意图，再从 durable cards 恢复**唯一** active root；
+   无目标、多目标或不同目标一律明确 fail closed，不能静默新建 Turn。control ID 和 receipt 仍保持原有幂等合同。
+3. live update 只能在用户更新前仍位于底部时 follow。历史 reasoning/worker 默认收起、只有当前 live block 自动
+   展开，用户手工开合选择跨 lifecycle update 保留；同一 tool completion 原位结算的既有 stable-ID 逻辑不变。
+4. egress path 与 query data 必须分别规范化。path 中 encoded slash/dot/backslash/percent/hash、query 中 control
+   character、非法 escape 和非精确 rule 继续拒绝；精确 signed query 中可打印的 `%25` 与 `%23` 是普通数据，
+   不能误报 traversal，也不能扩大 origin/method/path/query authority。
+
+唯一成熟参考冻结为当前 root tree 中 `claude-code/` 的精确 tree object
+`ef7589945b3767ead85fc52f68d013f88094bd47`，其记录的上游 source commit 仍为
+`6f6f12b37f529488b10e53928dd5508bb93535c7`。`src/cli/print.ts` 的 typed structured stdin 明确处理
+`control_request/interrupt` 以及 user priority `later/now`；`src/components/messages/AssistantThinkingMessage.tsx`
+默认折叠非 transcript/verbose thinking，并可隐藏历史 thinking；`src/cli/transports/ccrClient.ts` 用
+`new URL`/`url.searchParams.set` 把 query 当作数据。本轮 **adopt** typed control intent、current-only disclosure 与
+URL/query 分离，**adapt** durable target recovery 到 ChatDS 现有 authority/receipt contracts，**reject** 修改 Claude
+binary、DSH core、复制 agent/retry/compaction loop、从模型 prose 推断 workflow 状态或为 V2.3 放宽验收。
+
+确定性回归全部使用 renamed engine、harbor/inventory、factory-yield/release 等非医疗 holdout：旧空 hydration 保留
+accepted root，matching terminal 清除，多 active root 拒绝；live SSE 只读 control plane 而不替换 transcript；
+用户滚离底部后 streaming 不抢回视口；仅当前 block 自动展开；精确 `%25/%23` query 通过，而相同编码位于 path
+以及 encoded controls 仍拒绝。当前 pre-deploy 验证为 Frontend `74/74`、proxy/runtime `112/112`，目标 ESLint、
+`git diff --check` 和 Vite production build 全通过。没有自动重跑模型重型 V2.3，也没有修改三个历史 terminal。

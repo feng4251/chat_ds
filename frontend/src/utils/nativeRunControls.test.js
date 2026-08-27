@@ -3,11 +3,14 @@ import assert from 'node:assert/strict'
 
 import {
   activeNativeRunFromCards,
+  canAttemptNativeControl,
   canSubmitNativeControl,
   createNativeControlId,
   draftAfterNativeControlReceipt,
   isTerminalNativeControlStatus,
   pendingNativeControlId,
+  reconcileActiveNativeRun,
+  resolveNativeControlTarget,
 } from './nativeRunControls.js'
 
 test('runtime controls are enabled by declared capabilities, not engine names', () => {
@@ -51,6 +54,109 @@ test('ambiguous activity and attachments fail closed for message controls', () =
   assert.equal(canSubmitNativeControl({
     activeRun, engineOptions, action: 'followup', text: 'Continue', stateUnknown: true,
   }), false)
+})
+
+test('a declared native engine can recover controls before a run target is hydrated', () => {
+  const engineOptions = [{
+    id: 'renamed-harbor-engine',
+    capabilities: ['native_interrupt', 'native_followup'],
+  }]
+  assert.equal(canAttemptNativeControl({
+    engineId: 'renamed-harbor-engine',
+    engineOptions,
+    action: 'followup',
+    text: 'Inspect the inventory ledger.',
+  }), true)
+  assert.equal(canAttemptNativeControl({
+    engineId: 'renamed-harbor-engine',
+    engineOptions,
+    action: 'interrupt',
+    text: '',
+  }), true)
+  assert.equal(canAttemptNativeControl({
+    engineId: 'renamed-harbor-engine',
+    engineOptions,
+    action: 'followup',
+    text: 'Inspect the inventory ledger.',
+    attachmentCount: 1,
+  }), false)
+})
+
+test('a stale empty hydration cannot erase an SSE-accepted run identity', () => {
+  const acceptedRunId = '8'.repeat(32)
+  const currentRun = {
+    runId: acceptedRunId,
+    engineId: 'renamed-native-engine',
+    controls: [],
+    controlsTruncated: false,
+  }
+  assert.deepEqual(reconcileActiveNativeRun({
+    currentRun,
+    runCards: { roots: [], has_active_runs: false },
+    acceptedRunId,
+  }), currentRun)
+
+  assert.equal(reconcileActiveNativeRun({
+    currentRun,
+    runCards: {
+      roots: [{
+        root_run_id: acceptedRunId,
+        engine_id: 'renamed-native-engine',
+        active: false,
+        controls: [],
+      }],
+      has_active_runs: false,
+    },
+    acceptedRunId,
+  }), null)
+
+  assert.equal(reconcileActiveNativeRun({
+    currentRun,
+    runCards: {
+      roots: [
+        { root_run_id: 'a'.repeat(32), engine_id: 'one', active: true },
+        { root_run_id: 'b'.repeat(32), engine_id: 'two', active: true },
+      ],
+      has_active_runs: true,
+    },
+    acceptedRunId,
+  }), null)
+})
+
+test('missing native control target is recovered only from one exact active root', async () => {
+  const runId = '9'.repeat(32)
+  let loads = 0
+  const exact = await resolveNativeControlTarget({
+    activeRun: null,
+    stateUnknown: true,
+    loadRunCards: async () => {
+      loads += 1
+      return {
+        has_active_runs: true,
+        roots: [{
+          root_run_id: runId,
+          engine_id: 'renamed-native-engine',
+          active: true,
+          controls: [],
+        }],
+      }
+    },
+  })
+  assert.equal(loads, 1)
+  assert.equal(exact.activeRun.runId, runId)
+
+  const ambiguous = await resolveNativeControlTarget({
+    activeRun: null,
+    stateUnknown: true,
+    loadRunCards: async () => ({
+      has_active_runs: true,
+      roots: [
+        { root_run_id: 'a'.repeat(32), engine_id: 'one', active: true },
+        { root_run_id: 'b'.repeat(32), engine_id: 'two', active: true },
+      ],
+    }),
+  })
+  assert.equal(ambiguous.activeRun, null)
 })
 
 test('browser control ids lower UUIDs to the exact durable identity', () => {

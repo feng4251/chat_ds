@@ -1253,6 +1253,8 @@ class ExactEgressPolicyTests(unittest.TestCase):
             "/api//v1",
             "/api/../v1",
             "/api/%2Fv1",
+            "/api/%25v1",
+            "/api/%23v1",
             "/api/v1#fragment",
             "/api/v1?x=%0Aheader",
         ):
@@ -1265,6 +1267,28 @@ class ExactEgressPolicyTests(unittest.TestCase):
                     self.origin,
                     self._request("GET", target),
                 )
+
+    def test_printable_percent_encoded_query_data_is_not_path_traversal(self):
+        policy = server._validated_signed_egress_policy(
+            ["https://example.com:443"],
+            [{
+                "methods": ["GET"],
+                "url_prefix": (
+                    "https://example.com:443/search?"
+                    "q=factory+yield+99.9%25+%23release"
+                ),
+                "query_exact": True,
+            }],
+            [],
+        )
+        server._authorize_exact_request(
+            policy,
+            self.origin,
+            self._request(
+                "GET",
+                "/search?q=factory+yield+99.9%25+%23release",
+            ),
+        )
 
     def test_policy_rejects_origin_projection_and_private_mismatch(self):
         cases = (

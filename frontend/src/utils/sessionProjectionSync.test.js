@@ -6,6 +6,7 @@ import {
   createSessionRefreshLoop,
   messageUpdateScrollBehavior,
   runCardMessageRevision,
+  sessionProjectionRefreshPlan,
   sessionProjectionHasDelta,
   shouldFollowMessageUpdate,
 } from './sessionProjectionSync.js'
@@ -151,8 +152,31 @@ test('refresh loop wake cancels the stale timer and forces reconciliation', asyn
 
 test('message following uses the pre-append pin state', () => {
   assert.equal(shouldFollowMessageUpdate(true, false), true)
-  assert.equal(shouldFollowMessageUpdate(false, true), true)
+  assert.equal(shouldFollowMessageUpdate(false, true), false)
   assert.equal(shouldFollowMessageUpdate(false, false), false)
+})
+
+test('a live SSE turn refreshes control authority without replacing its transcript', () => {
+  assert.deepEqual(sessionProjectionRefreshPlan({
+    liveRequestActive: true,
+    needsFullReconcile: true,
+    hasActiveRuns: true,
+  }), {
+    readMessages: false,
+    readActivities: false,
+    incrementalActivities: false,
+    updateTimeline: false,
+  })
+  assert.deepEqual(sessionProjectionRefreshPlan({
+    liveRequestActive: false,
+    needsFullReconcile: false,
+    hasActiveRuns: true,
+  }), {
+    readMessages: false,
+    readActivities: true,
+    incrementalActivities: true,
+    updateTimeline: true,
+  })
 })
 
 test('durable live updates never animate the document through moving cards', () => {

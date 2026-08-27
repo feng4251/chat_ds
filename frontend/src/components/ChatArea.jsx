@@ -38,6 +38,7 @@ import {
   messageProjectionRevision,
   runCardMessageRevision,
   runCardProjectionRevision,
+  sessionProjectionRefreshPlan,
   sessionProjectionHasDelta,
   shouldFollowMessageUpdate,
 } from '../utils/sessionProjectionSync'
@@ -53,12 +54,16 @@ import {
   turnActivityHighWater,
 } from '../utils/turnActivity'
 import {
-  activeNativeRunFromCards,
+  NATIVE_CONTROL_CAPABILITY,
+  canAttemptNativeControl,
   canSubmitNativeControl,
   createNativeControlId,
   draftAfterNativeControlReceipt,
   isTerminalNativeControlStatus,
+  nativeControlCapabilitiesForEngine,
   pendingNativeControlId,
+  reconcileActiveNativeRun,
+  resolveNativeControlTarget,
 } from '../utils/nativeRunControls'
 
 const SAMPLE_PROMPTS = [
@@ -347,7 +352,19 @@ export default function ChatArea({
         nativeControlRetryRef.current = null
       }
     }
-    setActiveNativeRun(activeNativeRunFromCards(runCards))
+    const liveRequest = liveRequestRef.current
+    const acceptedRunId = (
+      liveRequest
+      && conversationRequestOwnsRoute(
+        liveRequest,
+        activeConvRef.current,
+      )
+    ) ? liveRequest.acceptedRunId : null
+    setActiveNativeRun((currentRun) => reconcileActiveNativeRun({
+      currentRun,
+      runCards,
+      acceptedRunId,
+    }))
   }, [])
 
   useEffect(() => {
@@ -478,7 +495,14 @@ export default function ChatArea({
         ))
         if (runCardResult.available) {
           observeRunCards(runCards)
-          setDurableRunActive(Boolean(runCards?.has_active_runs))
+          const liveRequest = liveRequestRef.current
+          const acceptedRunId = (
+            liveRequest
+            && conversationRequestOwnsRoute(liveRequest, activeConv)
+          ) ? liveRequest.acceptedRunId : null
+          setDurableRunActive(Boolean(
+            runCards?.has_active_runs || acceptedRunId,
+          ))
           setDurableRunUnknown(false)
           setDurableRunConversation(activeConv)
         } else {
@@ -539,7 +563,6 @@ export default function ChatArea({
       canRefresh: () => (
         !cancelled
         && activeConvRef.current === convId
-        && !liveRequestRef.current
       ),
       refresh: async ({ forceFull }) => {
         const runCards = await getRunCards(convId)
@@ -555,13 +578,22 @@ export default function ChatArea({
           || messageBoundary !== runCardMessageRevisionRef.current
           || now - lastFullSessionSyncRef.current >= FULL_SESSION_RECONCILE_MS
         )
+        const liveRequest = liveRequestRef.current
+        const liveRequestActive = Boolean(
+          liveRequest
+          && conversationRequestOwnsRoute(liveRequest, convId)
+        )
+        const refreshPlan = sessionProjectionRefreshPlan({
+          liveRequestActive,
+          needsFullReconcile,
+          hasActiveRuns: Boolean(runCards?.has_active_runs),
+        })
         let server = null
-        if (needsFullReconcile) server = await getMessages(convId)
+        if (refreshPlan.readMessages) server = await getMessages(convId)
         let activities = null
-        let incrementalActivities = false
-        if (needsFullReconcile) {
+        if (refreshPlan.readActivities && needsFullReconcile) {
           activities = await getTurnActivities(convId).catch(() => null)
-        } else if (runCards?.has_active_runs) {
+        } else if (refreshPlan.incrementalActivities) {
           const roots = (runCards.roots || []).filter((root) => root.active)
           const pages = await Promise.all(roots.map((root) => (
             getTurnActivities(convId, {
@@ -575,13 +607,30 @@ export default function ChatArea({
           activities = {
             events: pages.flatMap((page) => page.events || []),
           }
-          incrementalActivities = true
         }
-        if (
-          cancelled
-          || activeConvRef.current !== convId
-          || liveRequestRef.current
-        ) return
+        if (cancelled || activeConvRef.current !== convId) return
+
+        const currentLiveRequest = liveRequestRef.current
+        const currentLiveRequestActive = Boolean(
+          currentLiveRequest
+          && conversationRequestOwnsRoute(currentLiveRequest, convId)
+        )
+        if (!refreshPlan.updateTimeline || currentLiveRequestActive) {
+          const acceptedRunId = currentLiveRequestActive
+            ? currentLiveRequest.acceptedRunId
+            : null
+          observeRunCards(runCards)
+          setDurableRunActive(Boolean(
+            runCards?.has_active_runs || acceptedRunId,
+          ))
+          setDurableRunUnknown(false)
+          setDurableRunConversation(convId)
+          const projectionDelay = runCards.poll_after_ms || IDLE_SESSION_SYNC_MS
+          nextDelay = document.visibilityState === 'hidden'
+            ? Math.max(projectionDelay, HIDDEN_SESSION_SYNC_MS)
+            : projectionDelay
+          return
+        }
 
         if (server) {
           const messageRevision = messageProjectionRevision(server)
@@ -616,7 +665,7 @@ export default function ChatArea({
             prev.some((message) => message.streaming)
               ? prev
               : (
-                  incrementalActivities
+                  refreshPlan.incrementalActivities
                     ? mergeTurnActivities(
                         hydrateAgentRunCards(prev, runCards),
                         activities?.events || [],
@@ -942,54 +991,102 @@ export default function ChatArea({
   }, [handleFiles, hasNoMessages])
 
   async function doNativeControl(action, text = '') {
-    if (!activeConv || !activeNativeRun) return
-    if (!canSubmitNativeControl({
-      activeRun: activeNativeRun,
-      engineOptions,
-      action,
-      text,
-      attachmentCount: images.length,
-      stateUnknown: effectiveDurableRunUnknown,
-      sending: nativeControlSending,
-    })) {
-      if (images.length > 0 && action !== 'interrupt') {
-        setNativeControlNotice({
-          error: true,
-          text: '运行中追问暂只接受文本；文件和图片请在当前任务结束后发送。',
-        })
-      }
-      return
-    }
-    const normalizedText = action === 'interrupt' ? null : text.trim()
-    const prior = nativeControlRetryRef.current
-    const durablePendingId = pendingNativeControlId({
-      activeRun: activeNativeRun,
-      messages: msgs,
-      action,
-      text: normalizedText,
-    })
-    const controlId = (
-      prior?.runId === activeNativeRun.runId
-      && prior?.action === action
-      && prior?.text === normalizedText
-        ? prior.controlId
-        : durablePendingId || createNativeControlId()
-    )
-    nativeControlRetryRef.current = {
-      runId: activeNativeRun.runId,
-      action,
-      text: normalizedText,
-      controlId,
-    }
+    if (!activeConv || nativeControlSending) return
+    const convId = activeConv
+    let targetRun = activeNativeRun
+    let controlPrepared = false
     setNativeControlSending(true)
     setNativeControlNotice({
       error: false,
-      text: action === 'interrupt' ? '正在送达原生中断…' : '正在送达原生消息…',
+      text: targetRun && !effectiveDurableRunUnknown
+        ? action === 'interrupt' ? '正在送达原生中断…' : '正在送达原生消息…'
+        : '正在从持久化运行状态确认唯一原生任务…',
     })
     try {
+      if (!targetRun || effectiveDurableRunUnknown) {
+        const liveRequest = liveRequestRef.current
+        const acceptedRunId = (
+          liveRequest
+          && conversationRequestOwnsRoute(liveRequest, convId)
+        ) ? liveRequest.acceptedRunId : null
+        const recovered = await resolveNativeControlTarget({
+          activeRun: targetRun,
+          stateUnknown: effectiveDurableRunUnknown,
+          acceptedRunId,
+          loadRunCards: () => getRunCards(convId),
+        })
+        if (activeConvRef.current !== convId) return
+        targetRun = recovered.activeRun
+        const runCards = recovered.runCards
+        if (runCards) {
+          observeRunCards(runCards)
+          setDurableRunActive(Boolean(
+            runCards.has_active_runs || acceptedRunId,
+          ))
+          setDurableRunUnknown(false)
+          setDurableRunConversation(convId)
+        }
+        if (!targetRun) {
+          const activeCount = (runCards?.roots || []).filter(
+            (root) => root?.active,
+          ).length
+          setNativeControlNotice({
+            error: true,
+            text: activeCount > 1
+              ? '检测到多个活动根任务，无法安全猜测控制目标；请刷新 Session 后重试。'
+              : '未找到唯一活动的原生任务；后台状态已刷新，请再次发送作为新消息。',
+          })
+          return
+        }
+      }
+      if (!canSubmitNativeControl({
+        activeRun: targetRun,
+        engineOptions,
+        action,
+        text,
+        attachmentCount: images.length,
+        stateUnknown: false,
+        sending: false,
+      })) {
+        setNativeControlNotice({
+          error: true,
+          text: images.length > 0 && action !== 'interrupt'
+            ? '运行中追问暂只接受文本；文件和图片请在当前任务结束后发送。'
+            : action !== 'interrupt' && !text.trim()
+              ? '请输入要送达原生任务的文本。'
+              : '当前活动引擎未声明该原生控制能力。',
+        })
+        return
+      }
+      const normalizedText = action === 'interrupt' ? null : text.trim()
+      const prior = nativeControlRetryRef.current
+      const durablePendingId = pendingNativeControlId({
+        activeRun: targetRun,
+        messages: msgs,
+        action,
+        text: normalizedText,
+      })
+      const controlId = (
+        prior?.runId === targetRun.runId
+        && prior?.action === action
+        && prior?.text === normalizedText
+          ? prior.controlId
+          : durablePendingId || createNativeControlId()
+      )
+      nativeControlRetryRef.current = {
+        runId: targetRun.runId,
+        action,
+        text: normalizedText,
+        controlId,
+      }
+      controlPrepared = true
+      setNativeControlNotice({
+        error: false,
+        text: action === 'interrupt' ? '正在送达原生中断…' : '正在送达原生消息…',
+      })
       const receipt = await sendNativeRunControl(
-        activeConv,
-        activeNativeRun.runId,
+        convId,
+        targetRun.runId,
         { controlId, action, text: normalizedText },
       )
       const status = receipt.status || (receipt.accepted ? 'delivered' : 'pending')
@@ -997,7 +1094,7 @@ export default function ChatArea({
         nativeControlRetryRef.current = null
       }
       setActiveNativeRun((current) => {
-        if (!current || current.runId !== activeNativeRun.runId) return current
+        if (!current || current.runId !== targetRun.runId) return current
         const controls = (current.controls || []).filter(
           (item) => item.control_id !== controlId,
         )
@@ -1017,7 +1114,7 @@ export default function ChatArea({
           role: 'user',
           content: normalizedText,
           source: 'native_control',
-          run_id: activeNativeRun.runId,
+          run_id: targetRun.runId,
           nativeControlAction: action,
           nativeControlStatus: status,
         }
@@ -1042,12 +1139,19 @@ export default function ChatArea({
             ? `原生控制未送达${receipt.code ? `：${receipt.code}` : ''}`
             : '控制请求已持久化，正在等待原生送达回执。',
       })
-      const runCards = await getRunCards(activeConv).catch(() => null)
-      if (runCards && activeConvRef.current === activeConv) {
+      const runCards = await getRunCards(convId).catch(() => null)
+      if (runCards && activeConvRef.current === convId) {
+        const liveRequest = liveRequestRef.current
+        const acceptedRunId = (
+          liveRequest
+          && conversationRequestOwnsRoute(liveRequest, convId)
+        ) ? liveRequest.acceptedRunId : null
         observeRunCards(runCards)
-        setDurableRunActive(Boolean(runCards.has_active_runs))
+        setDurableRunActive(Boolean(
+          runCards.has_active_runs || acceptedRunId,
+        ))
         setDurableRunUnknown(false)
-        setDurableRunConversation(activeConv)
+        setDurableRunConversation(convId)
       }
       sessionSyncWakeRef.current?.()
     } catch (error) {
@@ -1055,7 +1159,9 @@ export default function ChatArea({
       // durable Supervisor request instead of inserting duplicate native work.
       setNativeControlNotice({
         error: true,
-        text: `控制回执暂不可用：${error.message}。再次发送会使用同一请求编号安全重试。`,
+        text: controlPrepared
+          ? `控制回执暂不可用：${error.message}。再次发送会使用同一请求编号安全重试。`
+          : `无法确认后台原生任务：${error.message}。请重试，系统不会静默创建新任务。`,
       })
       sessionSyncWakeRef.current?.()
     } finally {
@@ -1065,24 +1171,36 @@ export default function ChatArea({
 
   async function doSend(textOverride, nativeAction = 'followup') {
     const text = (textOverride ?? inp).trim()
-    if (
-      activeNativeRun
-      && !effectiveDurableRunUnknown
-      && (busy || durableRunActive)
-    ) {
-      await doNativeControl(nativeAction, text)
+    const interactionBlocked = (
+      busy || durableRunActive || effectiveDurableRunUnknown
+    )
+    if (interactionBlocked) {
+      const controlEngineId = activeNativeRun?.engineId || selectedEngine
+      if (canAttemptNativeControl({
+        engineId: controlEngineId,
+        engineOptions,
+        action: nativeAction,
+        text,
+        attachmentCount: images.length,
+        sending: nativeControlSending,
+      })) {
+        await doNativeControl(nativeAction, text)
+      } else if (text || images.length > 0) {
+        setNativeControlNotice({
+          error: true,
+          text: images.length > 0
+            ? '运行中的原生任务仅接受文本控制；附件请在任务结束后发送。'
+            : '后台任务仍在执行，但当前引擎未声明该控制能力。',
+        })
+      }
       return
     }
-    if (
-      (!text && images.length === 0)
-      || busy
-      || durableRunActive
-      || effectiveDurableRunUnknown
-    ) return
+    if (!text && images.length === 0) return
     const sentImages = images
     setInp('')
     setImages([])
     setBusy(true)
+    shouldStickToBottomRef.current = true
     const requestScope = createConversationRequestScope(activeConv)
     requestScope.controller = new AbortController()
     liveRequestRef.current = requestScope
@@ -1257,6 +1375,7 @@ export default function ChatArea({
     if (lastUserIdx < 0) return
     const userMsg = msgs[lastUserIdx]
 
+    shouldStickToBottomRef.current = true
     setMsgs((p) => {
       const next = [...p]
       next[lastAssistantIdx] = {
@@ -1400,20 +1519,25 @@ export default function ChatArea({
     || effectiveDurableRunUnknown
   )
   const retiredEngine = selectedEngine === 'legacy'
+  const controlEngineId = activeNativeRun?.engineId || selectedEngine
+  const declaredNativeControls = nativeControlCapabilitiesForEngine(
+    controlEngineId,
+    engineOptions,
+  )
   const nativeControlActive = Boolean(
-    activeNativeRun
-    && !effectiveDurableRunUnknown
-    && (busy || durableRunActive)
+    interactionBusy
+    && Object.values(NATIVE_CONTROL_CAPABILITY).some(
+      (capability) => declaredNativeControls.has(capability),
+    )
   )
   const canSend = !retiredEngine && (
     nativeControlActive
-      ? canSubmitNativeControl({
-          activeRun: activeNativeRun,
+      ? canAttemptNativeControl({
+          engineId: controlEngineId,
           engineOptions,
           action: 'followup',
           text: inp,
           attachmentCount: images.length,
-          stateUnknown: effectiveDurableRunUnknown,
           sending: nativeControlSending,
         })
       : (
@@ -1421,12 +1545,11 @@ export default function ChatArea({
           && !interactionBusy
         )
   )
-  const canInterrupt = canSubmitNativeControl({
-    activeRun: activeNativeRun,
+  const canInterrupt = nativeControlActive && canAttemptNativeControl({
+    engineId: controlEngineId,
     engineOptions,
     action: 'interrupt',
     text: '',
-    stateUnknown: effectiveDurableRunUnknown,
     sending: nativeControlSending,
   })
 
@@ -1734,7 +1857,9 @@ export default function ChatArea({
 
           {effectiveDurableRunUnknown && (
             <div className="mb-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
-              正在重新连接并确认后台任务状态；确认完成前暂不接受重复提交。
+              {nativeControlActive
+                ? '正在重新连接并确认后台任务状态；发送或 Esc 会先恢复唯一活动任务，不会静默创建新任务。'
+                : '正在重新连接并确认后台任务状态；确认完成前暂不接受重复提交。'}
             </div>
           )}
           {durableRunActive && !effectiveDurableRunUnknown && (

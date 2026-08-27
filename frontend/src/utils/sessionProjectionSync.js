@@ -155,8 +155,8 @@ export function createSessionRefreshLoop({
 }
 
 /** Keep the user's pre-update scroll intent, not the post-append distance. */
-export function shouldFollowMessageUpdate(wasPinnedToBottom, isStreaming) {
-  return Boolean(wasPinnedToBottom || isStreaming)
+export function shouldFollowMessageUpdate(wasPinnedToBottom) {
+  return Boolean(wasPinnedToBottom)
 }
 
 /** Live transcript movement must not trigger repeated animated page travel. */
@@ -173,4 +173,26 @@ export function sessionProjectionHasDelta(
     runProjectionChanged
     || (Array.isArray(activities?.events) && activities.events.length > 0)
   )
+}
+
+/**
+ * A live SSE request owns transcript order. Durable polling still refreshes
+ * run/control authority, but must not read or apply a competing timeline.
+ */
+export function sessionProjectionRefreshPlan({
+  liveRequestActive = false,
+  needsFullReconcile = false,
+  hasActiveRuns = false,
+} = {}) {
+  const updateTimeline = !liveRequestActive
+  return {
+    readMessages: updateTimeline && needsFullReconcile,
+    readActivities: updateTimeline && (
+      needsFullReconcile || hasActiveRuns
+    ),
+    incrementalActivities: updateTimeline
+      && !needsFullReconcile
+      && hasActiveRuns,
+    updateTimeline,
+  }
 }

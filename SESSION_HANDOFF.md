@@ -3918,3 +3918,38 @@ Round 17 的两个全新 case。不得复用
 - Preserve the two protected tracked deletions and all untracked runtime/reference data. Only stage this handoff file for the
   deployment-evidence commit. The user explicitly authorized pushing current `main` to `https://github.com/feng4251/chat_ds` after
   verification; push without force and verify the remote tip.
+
+# 2026-08-27 three-Session terminal audit and Web/egress boundary repair (pre-deployment)
+
+- Three independent user-driven V2.3 stress runs are terminal and frozen. Claude `426126...` root `2dad218b...` succeeded after
+  more than four hours: all 8 workers, workflow and artifact passed; final is 154,575 bytes/2,644 lines. DSH local DeepSeek
+  `70ec34...` root `8001f671...` failed after two attempts of one mandatory worker: raw native/provider evidence shows malformed
+  model-generated Bash JSON followed by compatibility-facade HTTP 400; the phase barrier correctly blocked later work. DSH qwen
+  `63d9e5...` root `32cf1bed...` completed all 8 workers and both phases, but its 153,800-byte final has only 1,681 lines versus the
+  immutable Skill's 2,000-line minimum; `artifact_contract_failed` is correct. Do not relax either machine-owned gate and do not
+  modify a native Harness for these two model/content failures.
+- All three used the same input SHA `2f042f...`, ZIP SHA `78b890...`, Skill view `9aee2a...`, exact
+  `composite_full_protocol_design` route SHA `b7ff3b...`, and declared 11-module artifact contract. The complete three-source
+  timelines, full immutable hashes, delegated attempts and classifications are in `E2E_ITERATION_LOG.md`.
+- A separate ChatDS Web defect explains Enter/Esc appearing inert during `70...`: the persisted conversation has no native-control
+  message and Nginx recorded zero `/controls` POSTs. A live SSE request disabled all durable run-card polling; a stale empty
+  hydration could erase the just-accepted root; controls required a hydrated target and silently returned otherwise. The repair
+  keeps SSE authority over transcript order while polling control authority, preserves only an accepted root across an older empty
+  read, and recovers a target only from exactly one durable active root. Missing, different or ambiguous roots fail visibly and do
+  not create another Turn. Existing idempotent control IDs/receipts and Supervisor/native lowering are unchanged.
+- Frontend presentation now follows streaming only while the user was already pinned to the bottom. Only the current reasoning or
+  worker block auto-opens; terminal/history blocks auto-collapse and explicit user disclosure survives lifecycle updates. Existing
+  stable tool-call identity continues to replace `执行中` in place; no second completion card path was added.
+- `63...` also exposed a generic exact-egress parser bug: printable `%`/`#` query data encoded as `%25/%23` was rejected before
+  SearX. Proxy and runtime bridge now distinguish query data from path traversal. Encoded controls and all dangerous encoded path
+  forms remain rejected; exact signed origin/method/path/query authority is unchanged.
+- Generic regressions use renamed engines plus harbor/inventory/factory cases, never V2.3 literals. Current verification is
+  Frontend `74/74`, proxy/runtime `112/112`, targeted ESLint, `git diff --check`, and Vite production build. The frozen mature
+  reference is root tree object `claude-code=ef7589945b3767ead85fc52f68d013f88094bd47` (documented upstream source commit
+  `6f6f12b37f529488b10e53928dd5508bb93535c7`); relevant patterns are typed stdin controls in `src/cli/print.ts`, historical
+  thinking disclosure in `AssistantThinkingMessage.tsx`, and URL/query data separation in `ccrClient.ts`. Neither native source
+  tree was edited. No additional model-heavy E2E was launched.
+- Modified production paths are limited to Frontend projection/control UI, shared exact-egress policy, browser-runtime bridge and
+  their tests/docs. Preserve the two protected tracked deletions and all untracked runtime/reference directories. Stage explicit
+  paths only. The user authorized production deployment and a non-force push of final `main` to
+  `https://github.com/feng4251/chat_ds`; append exact clean-archive image/deploy/health/remote receipts here after completion.

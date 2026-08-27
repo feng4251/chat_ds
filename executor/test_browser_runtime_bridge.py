@@ -559,6 +559,25 @@ class BrowserRuntimeBridgeTests(unittest.TestCase):
                     **policy,
                 )
 
+    def test_bridge_accepts_printable_percent_encoded_query_data(self):
+        origin = "https://inventory.example:443"
+        accepted = _validated_exact_policy(
+            (origin,),
+            ({
+                "methods": ["GET"],
+                "url_prefix": (
+                    origin
+                    + "/search?q=factory+yield+99.9%25+%23release"
+                ),
+                "query_exact": True,
+            },),
+            (),
+        )
+        self.assertEqual(
+            accepted[1][0]["url_prefix"],
+            origin + "/search?q=factory+yield+99.9%25+%23release",
+        )
+
     @staticmethod
     def _decoded_policy_preface(rendered: bytes) -> dict[str, object]:
         prefix = b"CHATDS-EGRESS-POLICY-V1 "

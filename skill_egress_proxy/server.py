@@ -525,7 +525,7 @@ def _canonical_egress_url_prefix(
         or ";" in query
         or _INVALID_EGRESS_PERCENT_ESCAPE.search(query)
         or re.search(
-            r"%(?:25|23|0[0-9A-F]|1[0-9A-F]|7F)",
+            r"%(?:0[0-9A-F]|1[0-9A-F]|7F)",
             query,
             re.IGNORECASE,
         )
