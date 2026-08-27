@@ -49,6 +49,7 @@ from deepseek_runner.config import (  # noqa: E402
     DEFAULT_EGRESS_LIMITS,
     DeepSeekRunnerConfigurationError,
     _profiles,
+    load_settings as load_deepseek_runner_settings,
     state_volume_host_root,
 )
 from deepseek_runner.event_stream import read_event_tail  # noqa: E402
@@ -866,6 +867,88 @@ def test_only_qwen_deployment_profile_overrides_max_wire_spelling():
         in compose_text
     )
     assert '"reasoning_wire_efforts":{"qwen3_5":"xhigh"}' in compose_text
+
+
+def _deepseek_runner_holdout_environment(root: Path) -> dict[str, str]:
+    return {
+        "INTERNAL_API_TOKEN": "i" * 32,
+        "SKILL_EGRESS_POLICY_TOKEN": "p" * 32,
+        "DEEPSEEK_HARNESS_WORKSPACE_HOST_ROOT": str(root),
+        "DEEPSEEK_HARNESS_RUNNER_STATE_ROOT": str(root / "state"),
+        "WORKSPACE_MUTATION_LOCK_ROOT": str(root / "locks"),
+        "DEEPSEEK_HARNESS_RUNNER_IMAGE": "fixture-runner:1",
+        "DEEPSEEK_HARNESS_EGRESS_PROXY_VOLUME_NAME": "fixture-egress",
+        "DEEPSEEK_HARNESS_WORKSPACE_LOCK_VOLUME_NAME": "fixture-locks",
+        "DEEPSEEK_HARNESS_RUNNER_STATE_VOLUME_NAME": "fixture-state",
+        "DEEPSEEK_HARNESS_PROVIDER_PROFILES_JSON": json.dumps({
+            "renamed-gateway": {
+                "base_url": "https://provider.invalid/v1",
+                "api_key_env": "WAREHOUSE_PROVIDER_KEY",
+                "protocol": "openai",
+                "models": ["warehouse-planner"],
+                "context_windows": {"warehouse-planner": 128_000},
+            },
+        }),
+        "WAREHOUSE_PROVIDER_KEY": "test-only-provider-key",
+    }
+
+
+def test_deepseek_total_turn_deadline_defaults_to_unbounded_holdout(
+    tmp_path,
+    monkeypatch,
+):
+    environment = _deepseek_runner_holdout_environment(tmp_path)
+    monkeypatch.setattr(os, "environ", environment)
+    settings = load_deepseek_runner_settings()
+    assert settings.max_run_seconds is None
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [("0", None), ("7200", 7200)],
+)
+def test_deepseek_total_turn_deadline_accepts_explicit_policy(
+    tmp_path,
+    monkeypatch,
+    configured,
+    expected,
+):
+    environment = _deepseek_runner_holdout_environment(tmp_path)
+    environment["DEEPSEEK_HARNESS_RUNNER_MAX_RUN_SECONDS"] = configured
+    monkeypatch.setattr(os, "environ", environment)
+    assert load_deepseek_runner_settings().max_run_seconds == expected
+
+
+@pytest.mark.parametrize("configured", ["-1", "59", "not-a-duration"])
+def test_deepseek_total_turn_deadline_rejects_invalid_policy(
+    tmp_path,
+    monkeypatch,
+    configured,
+):
+    environment = _deepseek_runner_holdout_environment(tmp_path)
+    environment["DEEPSEEK_HARNESS_RUNNER_MAX_RUN_SECONDS"] = configured
+    monkeypatch.setattr(os, "environ", environment)
+    with pytest.raises(
+        DeepSeekRunnerConfigurationError,
+        match="DEEPSEEK_HARNESS_RUNNER_MAX_RUN_SECONDS is invalid",
+    ):
+        load_deepseek_runner_settings()
+
+
+def test_native_turn_deadlines_are_unbounded_by_default_in_compose():
+    compose_text = (REPOSITORY_ROOT / "docker-compose.yml").read_text(
+        encoding="utf-8"
+    )
+    assert (
+        "CLAUDE_RUNNER_MAX_RUN_SECONDS: "
+        "${CLAUDE_RUNNER_MAX_RUN_SECONDS:-0}"
+    ) in compose_text
+    assert (
+        "DEEPSEEK_HARNESS_RUNNER_MAX_RUN_SECONDS: "
+        "${DEEPSEEK_HARNESS_RUNNER_MAX_RUN_SECONDS:-0}"
+    ) in compose_text
+
+
 
 
 class _RecordingLedger:

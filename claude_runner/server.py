@@ -55,6 +55,7 @@ from workspace_lock import workspace_mutation_guard
 from native_security.workflow_contract import (
     compile_turn_workflow_contract as compile_native_workflow_contract,
 )
+from native_security.run_deadline import remaining_run_deadline_seconds
 
 
 logger = logging.getLogger(__name__)
@@ -712,7 +713,10 @@ class RunManager:
             )
             created_ms = int(status.get("created_at_unix_ms") or int(time.time() * 1000))
             elapsed = max(0.0, time.time() - created_ms / 1000.0)
-            remaining = max(0.0, self.settings.max_run_seconds - elapsed)
+            remaining = remaining_run_deadline_seconds(
+                self.settings.max_run_seconds,
+                elapsed,
+            )
             task = asyncio.create_task(
                 self._adopt_existing_container(
                     container,
@@ -825,7 +829,7 @@ class RunManager:
         run_id: str,
         run_dir: Path,
         status_path: Path,
-        remaining_seconds: float,
+        remaining_seconds: float | None,
     ) -> None:
         try:
             await self._monitor_container(
@@ -923,7 +927,11 @@ class RunManager:
                     run_id=request.run_id,
                     run_dir=run_dir,
                     status_path=status_path,
-                    remaining_seconds=float(self.settings.max_run_seconds),
+                    remaining_seconds=(
+                        float(self.settings.max_run_seconds)
+                        if self.settings.max_run_seconds is not None
+                        else None
+                    ),
                 )
         except asyncio.CancelledError:
             if self._draining:
@@ -1108,14 +1116,18 @@ class RunManager:
         run_id: str,
         run_dir: Path,
         status_path: Path,
-        remaining_seconds: float,
+        remaining_seconds: float | None,
     ) -> None:
-        deadline = time.monotonic() + max(0.0, remaining_seconds)
+        deadline = (
+            time.monotonic() + max(0.0, remaining_seconds)
+            if remaining_seconds is not None
+            else None
+        )
         exit_code: int | None = None
         disappeared = False
         detach_for_restart = False
         try:
-            while time.monotonic() < deadline:
+            while deadline is None or time.monotonic() < deadline:
                 try:
                     await asyncio.to_thread(container.reload)
                 except NotFound:

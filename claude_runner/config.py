@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
+from native_security.run_deadline import parse_optional_run_deadline_seconds
+
 
 class RunnerConfigurationError(RuntimeError):
     pass
@@ -48,7 +50,7 @@ class RunnerSettings:
     workspace_lock_root: Path
     max_concurrent_runs: int
     preflight_timeout_seconds: float
-    max_run_seconds: int
+    max_run_seconds: int | None
     worker_uid: int
     worker_gid: int
     security_mode: str
@@ -90,7 +92,14 @@ def load_settings() -> RunnerSettings:
         must_exist=False,
     )
     max_concurrent = _bounded_int("CLAUDE_RUNNER_MAX_CONCURRENT", 4, 1, 64)
-    max_run_seconds = _bounded_int("CLAUDE_RUNNER_MAX_RUN_SECONDS", 14400, 60, 86400)
+    try:
+        max_run_seconds = parse_optional_run_deadline_seconds(
+            os.environ.get("CLAUDE_RUNNER_MAX_RUN_SECONDS")
+        )
+    except ValueError as exc:
+        raise RunnerConfigurationError(
+            "CLAUDE_RUNNER_MAX_RUN_SECONDS is invalid"
+        ) from exc
     image = os.environ.get("CLAUDE_RUNNER_IMAGE", "chat_ds-claude-runner:2.1.152").strip()
     volume = os.environ.get(
         "CLAUDE_EGRESS_PROXY_VOLUME_NAME", "chat_ds_skill_egress_proxy_socket"

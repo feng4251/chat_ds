@@ -1427,6 +1427,38 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_terminal_status(run_dir / "events.jsonl"), "failed")
         self.assertEqual(_read_json(status_path)["status"], "failed")
 
+    async def test_unbounded_warehouse_holdout_is_not_killed_by_wall_clock(self):
+        run_id = uuid.uuid4().hex
+        run_dir = self.manager._run_dir(
+            self.user_id, self.conversation_id, run_id
+        )
+        run_dir.mkdir(parents=True)
+        status_path = run_dir / "status.json"
+        status_path.write_text(json.dumps({
+            "run_id": run_id,
+            "user_id": self.user_id,
+            "conversation_id": self.conversation_id,
+            "status": "running",
+            "phase": "running",
+            "container_id": "container-" + run_id,
+        }))
+        container = _FakeContainer(self.client.containers, run_id)
+        self.client.containers.attach(container)
+        monitor = asyncio.create_task(self.manager._monitor_container(
+            container,
+            run_id=run_id,
+            run_dir=run_dir,
+            status_path=status_path,
+            remaining_seconds=None,
+        ))
+        await asyncio.sleep(0.05)
+        self.assertFalse(monitor.done())
+        self.assertEqual(container.kill_signals, [])
+
+        container.status = "exited"
+        await asyncio.wait_for(monitor, timeout=2)
+        self.assertEqual(container.kill_signals, [])
+
     async def test_early_process_exit_preserves_stage_and_exit_code(self):
         run_id = uuid.uuid4().hex
         run_dir = self.manager._run_dir(

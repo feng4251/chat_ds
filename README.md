@@ -163,6 +163,12 @@ Provider 请求本身仍可能携带信息；部署主机、模型供应商与�
 默认并发和资源上限面向长时复杂任务，不适合小内存机器。请根据硬件降低两个 Runner
 的并发、CPU 和内存限制。
 
+Claude Code 与 DeepSeek Harness 的整次原生 Turn 默认没有 wall-clock 总时长上限；
+显式设置 `CLAUDE_RUNNER_MAX_RUN_SECONDS` 或
+`DEEPSEEK_HARNESS_RUNNER_MAX_RUN_SECONDS` 为正数时才启用部署侧硬截止，`0` 表示无限。
+用户取消、Session 删除、Supervisor shutdown、provider response idle timeout、egress
+预算及容器 CPU/内存/PID 限制始终独立生效。
+
 ## 快速启动
 
 ### 1. 克隆与初始化

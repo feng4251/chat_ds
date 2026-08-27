@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
+from native_security.run_deadline import parse_optional_run_deadline_seconds
+
 
 class DeepSeekRunnerConfigurationError(RuntimeError):
     pass
@@ -36,7 +38,7 @@ class Settings:
     workspace_lock_volume: str
     workspace_lock_root: Path
     max_concurrent_runs: int
-    max_run_seconds: int
+    max_run_seconds: int | None
     worker_uid: int
     worker_gid: int
     egress_limits: dict[str, int]
@@ -266,9 +268,7 @@ def load_settings() -> Settings:
         max_concurrent_runs=_bounded_int(
             "DEEPSEEK_HARNESS_RUNNER_MAX_CONCURRENT", 4, 1, 64
         ),
-        max_run_seconds=_bounded_int(
-            "DEEPSEEK_HARNESS_RUNNER_MAX_RUN_SECONDS", 14_400, 60, 86_400
-        ),
+        max_run_seconds=_run_deadline_seconds(),
         worker_uid=_bounded_int(
             "DEEPSEEK_HARNESS_RUNNER_WORKER_UID", 65529, 1, 2**31 - 1
         ),
@@ -283,3 +283,14 @@ def load_settings() -> Settings:
         ),
         searxng_search_url=search_url,
     )
+
+
+def _run_deadline_seconds() -> int | None:
+    try:
+        return parse_optional_run_deadline_seconds(
+            os.environ.get("DEEPSEEK_HARNESS_RUNNER_MAX_RUN_SECONDS")
+        )
+    except ValueError as exc:
+        raise DeepSeekRunnerConfigurationError(
+            "DEEPSEEK_HARNESS_RUNNER_MAX_RUN_SECONDS is invalid"
+        ) from exc

@@ -91,6 +91,28 @@ class RunnerProviderConfigurationTests(unittest.TestCase):
             "max_outbound_bytes": 1024 * 1024 * 1024,
             "max_response_wire_bytes": 2 * 1024 * 1024 * 1024,
         })
+        self.assertIsNone(settings.max_run_seconds)
+
+    def test_total_turn_deadline_is_optional_and_zero_is_unbounded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = self._environment(root)
+            for configured, expected in (("0", None), ("7200", 7200)):
+                with self.subTest(configured=configured):
+                    environment["CLAUDE_RUNNER_MAX_RUN_SECONDS"] = configured
+                    with patch.dict(os.environ, environment, clear=True):
+                        settings = load_settings()
+                    self.assertEqual(settings.max_run_seconds, expected)
+
+            for configured in ("-1", "59", "not-a-duration"):
+                with self.subTest(configured=configured):
+                    environment["CLAUDE_RUNNER_MAX_RUN_SECONDS"] = configured
+                    with patch.dict(os.environ, environment, clear=True):
+                        with self.assertRaisesRegex(
+                            RunnerConfigurationError,
+                            "CLAUDE_RUNNER_MAX_RUN_SECONDS is invalid",
+                        ):
+                            load_settings()
 
     def test_turn_budget_cannot_exceed_proxy_policy_ceiling(self):
         with tempfile.TemporaryDirectory() as temporary:

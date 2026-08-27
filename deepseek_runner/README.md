@@ -47,7 +47,7 @@ commit credentials. The important non-secret switches are:
 
 ```text
 DEEPSEEK_HARNESS_ENGINE_ENABLED=true
-DEEPSEEK_HARNESS_RUNNER_MAX_RUN_SECONDS=14400
+DEEPSEEK_HARNESS_RUNNER_MAX_RUN_SECONDS=0  # 0 = no total Turn deadline
 DEEPSEEK_HARNESS_PUBLIC_READ_EGRESS_ENABLED=true
 ```
 

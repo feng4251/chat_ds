@@ -2,6 +2,35 @@
 
 > 本文件是本仓库唯一的权威续接入口。新 Codex/Claude Code 会话必须先完整阅读本文件，再查看 Git、测试和生产状态。旧 `_SESSION_*.md`、`_HARNESS_*.md`、`_REMOTE_OPS.md` 只用于历史追溯。
 
+## 2026-08-27 原生 Turn 默认取消四小时墙钟上限（候选，未部署）
+
+- 三源诊断已关联 conversation、immutable Skill 和 debug/AgentRun/tool 证据。Claude Session
+  `1aede04995a149ef9991489c198993c4` 的 root `c0e06...`、DeepSeek Session
+  `2184817c892446f9a195913f51aafb00` 的 root `b5a4...` 都在仍有原生 worker 活动时精确运行约
+  14,400 秒后分别以 `run_hard_timeout` / `hard_timeout` 终止；生产两个 Supervisor 环境也都为
+  14,400 秒。它们和成功续跑使用同一 `healthsim-trialsim` immutable Skill view、同一 route 和原始用户输入，
+  未发现 Skill drift，因此是 ChatDS-owned Supervisor 的绝对墙钟策略，不是 Skill、前端或原生 Harness 的
+  planning/tool-loop 行为。ShaIEngine 的可比任务只是没有越过四小时，并不绕过这条限制。
+- `218...` 与 Qwen Session `f1044e1682d4477484eed98e643f9268` 首轮同时出现的 `exit_137`
+  是另一类宿主/容器 SIGKILL：它发生在约 96--98 分钟，没有 native terminal，且当时的 Supervisor 没有持久化
+  Docker kill/OOM provenance。取消四小时上限不会掩盖或宣称修复该独立问题。
+- 通用不变量改为：原生 Turn 默认不设 ChatDS 总墙钟 deadline，由原生 Harness 决定何时结束；用户取消、Session
+  删除、Supervisor shutdown、provider/read-idle、egress 与资源边界继续有效。部署方仍可用正整数显式设置有限时长，
+  `0` 或未设置表示无限；非法、负数和小于 60 秒的正数 fail closed。Supervisor 重启接管运行中容器时保持同一语义。
+  实现只修改 `native_security/run_deadline.py`、两个 ChatDS Supervisor/config、Compose 默认值、文档与测试，
+  未修改 `claude-code/`、`deepseek-harness/` 或 `deepseek-harness-clean/` 的原生源码。
+- 成熟实现对照冻结于本地 `claude-code/` commit
+  `6f6f12b37f529488b10e53928dd5508bb93535c7`、tree
+  `ef7589945b3767ead85fc52f68d013f88094bd47`。其顶层 native Turn 以显式 cancellation/AbortController 收口，
+  timeout 用在具体操作边界而非整轮墙钟。这里选择 **adapt** 其生命周期边界到现有 Supervisor receipt/authority；
+  **reject** 复制原生 agent loop 或添加另一个 retry/compaction/terminal 状态机。
+- 确定性、跨域验证使用非医疗 `warehouse-planner` holdout：Claude config + lifecycle `47/47`、Backend
+  DeepSeek contract `58/58`、DeepSeek lifecycle `2/2`；Compose config、AST、`git diff --check` 均通过。
+  新建但未部署的候选镜像为 Claude Supervisor
+  `sha256:9a27cadf574c95e558c556503f1e4a1ea7f6387a28ae2d2c345e0eafaca0a597`、DeepSeek Supervisor
+  `sha256:1ac5089da6f3431f82d4c5f3672cb3fb97218f517c86402b22311f2e9a8ab89c`，镜像内回归同样通过。
+  当前生产容器尚未替换/重启，仍使用 14,400 秒环境值；部署前不得声称生产已取消限制。
+
 ## 2026-08-26 单仓库快照整合
 
 - 用户明确要求在不改变当前源码版本的前提下，将项目目录内的嵌套 Git 边界整合到 ChatDS 根仓库。本次采用

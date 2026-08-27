@@ -48,6 +48,16 @@ MAX_REQUEST_BYTES = 64 * 1024 * 1024
 MAX_WORKSPACE_ENTRIES = 200_000
 
 
+async def _wait_for_container_exit(
+    container,
+    max_run_seconds: int | None,
+) -> dict[str, Any]:
+    wait = asyncio.to_thread(container.wait)
+    if max_run_seconds is None:
+        return await wait
+    return await asyncio.wait_for(wait, timeout=max_run_seconds)
+
+
 class StartRunRequest(BaseModel):
     run_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     root_run_id: str = Field(pattern=r"^[0-9a-f]{32}$")
@@ -453,9 +463,9 @@ class Manager:
                 _atomic_json(status_path, status)
                 stage = "native_execution"
                 try:
-                    result = await asyncio.wait_for(
-                        asyncio.to_thread(container.wait),
-                        timeout=self.settings.max_run_seconds,
+                    result = await _wait_for_container_exit(
+                        container,
+                        self.settings.max_run_seconds,
                     )
                     exit_code = int(result.get("StatusCode", 1))
                 except asyncio.TimeoutError:
