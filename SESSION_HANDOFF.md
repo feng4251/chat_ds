@@ -3971,4 +3971,8 @@ Round 17 的两个全新 case。不得复用
   foreign-key violations/nonterminal runs/dynamic Turns are zero.
 - This release did not mutate any historical terminal or launch another model-heavy V2.3. The remaining behavioral acceptance is
   a user-driven active Turn exercising Enter/Esc/follow-up through the now-recoverable Web target; do not manufacture a model run
-  solely for deployment proof. Final documentation commit and verified non-force GitHub `main` push are the only remaining steps.
+  solely for deployment proof. A non-force GitHub push advanced `main` from
+  `bd5476f9156d572eb1f65a8a39a80d532d0649fb` to deployment-record commit
+  `f442213b7443ab05f7fe8437d0451ced8d6da395`, and an immediate `ls-remote` readback matched. The commit containing this canonical
+  closure record was then non-force pushed as the final tip; completion requires and records that remote `refs/heads/main` equals
+  the local `main` HEAD immediately after that push.
