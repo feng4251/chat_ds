@@ -1809,6 +1809,70 @@ class EngineModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.code, "claude_runner_start_timeout")
         self.assertTrue(raised.exception.retryable)
 
+    async def test_claude_runtime_control_is_a_thin_exact_adapter(self):
+        async def handler(request):
+            self.assertEqual(
+                request.url.path,
+                f"/v1/runs/{'1' * 32}/controls",
+            )
+            self.assertEqual(json.loads(request.content), {
+                "user_id": "2" * 32,
+                "conversation_id": "3" * 32,
+                "control_id": "4" * 32,
+                "action": "followup",
+                "text": "Inspect the renamed railway ledger.",
+            })
+            return httpx.Response(200, json={
+                "schema": "chatds.native-run-control-receipt.v1",
+                "control_id": "4" * 32,
+                "seq": 1,
+                "action": "followup",
+                "status": "delivered",
+                "accepted": True,
+            })
+
+        transport = httpx.MockTransport(handler)
+        engine = ClaudeCodeEngine(
+            base_url="http://runner.test",
+            internal_token="fixture-internal-token",
+            timeout_seconds=60,
+            client_factory=lambda **kwargs: httpx.AsyncClient(
+                transport=transport, **kwargs
+            ),
+        )
+        receipt = await engine.control_run(
+            user_id="2" * 32,
+            conversation_id="3" * 32,
+            run_id="1" * 32,
+            control_id="4" * 32,
+            action="followup",
+            text="Inspect the renamed railway ledger.",
+        )
+        self.assertEqual(receipt["status"], "delivered")
+
+    async def test_claude_runtime_control_preserves_definitive_rejection(self):
+        transport = httpx.MockTransport(
+            lambda _request: httpx.Response(409, json={"detail": "terminal"})
+        )
+        engine = ClaudeCodeEngine(
+            base_url="http://runner.test",
+            internal_token="fixture-internal-token",
+            timeout_seconds=60,
+            client_factory=lambda **kwargs: httpx.AsyncClient(
+                transport=transport, **kwargs
+            ),
+        )
+        receipt = await engine.control_run(
+            user_id="2" * 32,
+            conversation_id="3" * 32,
+            run_id="1" * 32,
+            control_id="4" * 32,
+            action="interrupt",
+            text=None,
+        )
+        self.assertEqual(receipt["status"], "rejected")
+        self.assertFalse(receipt["accepted"])
+
     async def test_backend_models_do_not_disappear_when_harness_is_unavailable(self):
         with patch.object(
             chat_router.httpx,
@@ -2133,6 +2197,62 @@ class NativeCheckpointCommitBarrierTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.native_session_id, candidate)
         self.assertEqual(state.generation, 1)
         self.assertEqual(state.last_event_seq, 9)
+
+    async def test_native_user_interrupt_keeps_resumable_checkpoint(self):
+        run_id = "6" * 32
+        candidate = "38c25fd9-a780-47f4-a8a2-8d233e5fd263"
+        envelope = {
+            "seq": 11,
+            "channel": "controller",
+            "event": {
+                "type": "chatds.supervisor.terminal",
+                "status": "cancelled",
+                "result_succeeded": False,
+                "checkpoint_observed": True,
+                "native_interruption_pending": True,
+            },
+        }
+        payload = json.dumps(envelope, separators=(",", ":"))
+        async with self.sessions() as db:
+            db.add(AgentRun(
+                id=run_id,
+                user_id=self.user_id,
+                conversation_id=self.conversation_id,
+                engine_id="claude_code",
+                native_session_id=candidate,
+                requested_model_id="renamed-cross-domain-model",
+                status="cancelled",
+                finish_reason="cancelled",
+            ))
+            db.add(AgentEngineSession(
+                user_id=self.user_id,
+                conversation_id=self.conversation_id,
+                engine_id="claude_code",
+                status="running",
+                active_run_id=run_id,
+            ))
+            db.add(AgentEngineRawEvent(
+                user_id=self.user_id,
+                conversation_id=self.conversation_id,
+                run_id=run_id,
+                engine_id="claude_code",
+                seq=11,
+                native_event_type="chatds.supervisor.terminal",
+                payload=payload,
+                payload_sha256=hashlib.sha256(payload.encode()).hexdigest(),
+            ))
+            await db.commit()
+        with patch.object(chat_router, "async_session", self.sessions):
+            await chat_router._finalize_native_engine_session(
+                run_id, self.conversation_id
+            )
+        async with self.sessions() as db:
+            state = (await db.execute(select(AgentEngineSession))).scalar_one()
+        self.assertEqual(state.status, "cancelled")
+        self.assertIsNone(state.active_run_id)
+        self.assertEqual(state.native_session_id, candidate)
+        self.assertEqual(state.generation, 1)
+        self.assertEqual(state.last_event_seq, 11)
 
     async def test_startup_promotes_only_unique_lossless_success(self):
         run_id, candidate = await self._seed_success(with_raw_terminal=True)

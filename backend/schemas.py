@@ -1,7 +1,7 @@
 import json
 from datetime import datetime
 from typing import Optional, Literal
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class UserCreate(BaseModel):
@@ -104,6 +104,32 @@ class ApprovalDecision(BaseModel):
         ):
             raise ValueError("Native question answers are invalid")
         return value
+
+
+class NativeRunControl(BaseModel):
+    """One idempotent user control for an already-running native Session."""
+
+    model_config = {"extra": "forbid"}
+
+    control_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    action: Literal["interrupt", "followup", "steer"]
+    text: Optional[str] = Field(default=None, max_length=2_000_000)
+
+    @field_validator("text")
+    @classmethod
+    def reject_nul(cls, value):
+        if value is not None and "\x00" in value:
+            raise ValueError("Native control text is invalid")
+        return value
+
+    @model_validator(mode="after")
+    def validate_shape(self):
+        if self.action == "interrupt":
+            if self.text is not None:
+                raise ValueError("Interrupt controls cannot contain text")
+        elif self.text is None or not self.text.strip():
+            raise ValueError("Native message controls require text")
+        return self
 
 
 class GoalUpdate(BaseModel):

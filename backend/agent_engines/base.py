@@ -116,6 +116,17 @@ class AgentEngine(Protocol):
         run_id: str,
     ) -> bool: ...
 
+    async def control_run(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        run_id: str,
+        control_id: str,
+        action: str,
+        text: str | None,
+    ) -> Mapping[str, Any]: ...
+
     async def cleanup_session(
         self,
         *,

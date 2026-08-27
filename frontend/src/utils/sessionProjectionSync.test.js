@@ -36,6 +36,18 @@ test('message revision changes only at durable message boundaries', () => {
     runCardMessageRevision(running),
     runCardMessageRevision(terminal),
   )
+
+  const withRunningFollowup = structuredClone(running)
+  withRunningFollowup.roots[0].controls = [{
+    control_id: 'followup-control',
+    message_id: 'followup-message',
+    action: 'followup',
+    status: 'pending',
+  }]
+  assert.notEqual(
+    runCardMessageRevision(running),
+    runCardMessageRevision(withRunningFollowup),
+  )
 })
 
 test('refresh coordinator coalesces overlap and preserves a forced reconciliation', async () => {

@@ -34,6 +34,15 @@ from native_security.artifact_contract import (
     validate_artifact_contracts,
     workspace_snapshot,
 )
+from native_security.run_control import (
+    RunControlError,
+    enqueue_run_control,
+    list_run_controls,
+    read_run_control_receipt,
+    receipt_path as run_control_receipt_path,
+    request_path as run_control_request_path,
+    write_run_control_receipt,
+)
 
 from chatds_browser_runtime.proxy_bridge import (
     EXPECTED_BRIDGE_GID,
@@ -229,6 +238,144 @@ class ControlDecisionForwarder:
             self._error = (
                 str(exc) if isinstance(exc, RuntimeError) and str(exc)
                 else "control_decision_forwarder_failed"
+            )[:128]
+
+
+class RunControlForwarder:
+    """Bridge the root-owned Web mailbox to the native DSH worker API.
+
+    Requests remain immutable and identity-bound in the Supervisor volume.
+    The unprivileged Session driver sees copies in its private tmpfs and the
+    durable Supervisor receipt is created only after the driver reports that
+    the pinned Agent Host API synchronously accepted the command.
+    """
+
+    def __init__(
+        self,
+        controller_root: Path,
+        worker_root: Path,
+        ledger: "Ledger",
+        *,
+        worker_uid: int,
+        worker_gid: int,
+    ) -> None:
+        self.controller_root = controller_root
+        self.worker_root = worker_root
+        self.ledger = ledger
+        self.worker_uid = worker_uid
+        self.worker_gid = worker_gid
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="run-control-forwarder",
+        )
+        self._error: str | None = None
+        self._interruption_pending = False
+
+    @property
+    def interruption_pending(self) -> bool:
+        return self._interruption_pending
+
+    def start(self) -> None:
+        controller_uid = os.geteuid()
+        for path in (self.worker_root, self.worker_root / "requests"):
+            path.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chown(path, controller_uid, self.worker_gid)
+            os.chmod(path, 0o750)
+        receipts = self.worker_root / "receipts"
+        receipts.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chown(receipts, self.worker_uid, self.worker_gid)
+        os.chmod(receipts, 0o700)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+        if self._thread.is_alive():
+            raise RuntimeError("run_control_forwarder_did_not_stop")
+        if self._error is not None:
+            raise RuntimeError(self._error)
+
+    def _copy_request(self, request: dict[str, Any]) -> None:
+        path = run_control_request_path(
+            self.worker_root, request["control_id"]
+        )
+        if not path.exists():
+            enqueue_run_control(
+                self.worker_root,
+                request,
+                mode=0o640,
+                parent_mode=0o750,
+                owner_uid=os.geteuid(),
+                owner_gid=self.worker_gid,
+            )
+        info = os.lstat(path)
+        if (
+            info.st_uid != os.geteuid()
+            or info.st_gid != self.worker_gid
+            or stat.S_IMODE(info.st_mode) != 0o640
+            or info.st_nlink != 1
+        ):
+            raise RunControlError("run_control_worker_request_unsafe")
+
+    def _copy_receipt(self, request: dict[str, Any]) -> bool:
+        worker_receipt = run_control_receipt_path(
+            self.worker_root, request["control_id"]
+        )
+        if not worker_receipt.exists():
+            return False
+        receipt = read_run_control_receipt(
+            worker_receipt, request=request
+        )
+        durable = write_run_control_receipt(
+            self.controller_root,
+            request,
+            status=receipt["status"],
+            code=receipt["code"],
+        )
+        if durable["status"] == "delivered":
+            if request["action"] == "interrupt":
+                self._interruption_pending = True
+            elif request["action"] in {"followup", "steer"}:
+                self._interruption_pending = False
+            self.ledger.append({
+                "type": "chatds.native-control.delivered",
+                "control_id": request["control_id"],
+                "control_seq": request["seq"],
+                "action": request["action"],
+                "content_sha256": (
+                    hashlib.sha256(
+                        str(request["text"]).encode("utf-8")
+                    ).hexdigest()
+                    if request["text"] is not None
+                    else None
+                ),
+                "native_transport": "deepseek_agent_host_api",
+            })
+        return True
+
+    def _synchronize(self) -> None:
+        for request in list_run_controls(self.controller_root):
+            durable_receipt = run_control_receipt_path(
+                self.controller_root, request["control_id"]
+            )
+            if durable_receipt.exists():
+                continue
+            self._copy_request(request)
+            self._copy_receipt(request)
+
+    def _run(self) -> None:
+        try:
+            while True:
+                self._synchronize()
+                if self._stop.is_set():
+                    self._synchronize()
+                    return
+                time.sleep(0.05)
+        except (RunControlError, OSError, ValueError, TypeError) as exc:
+            self._error = (
+                str(exc) if str(exc) else "run_control_forwarder_failed"
             )[:128]
 
 class Ledger:
@@ -940,6 +1087,8 @@ def main() -> int:
     bridge_thread: threading.Thread | None = None
     event_receiver: NativeEventReceiver | None = None
     control_forwarder: ControlDecisionForwarder | None = None
+    run_control_forwarder: RunControlForwarder | None = None
+    native_interruption_pending = False
     try:
         if os.geteuid() != 0:
             raise RuntimeError("runner_controller_not_root")
@@ -972,6 +1121,7 @@ def main() -> int:
         )
         mcp_patch = Path("/runtime/controller/mcp.patch.json")
         control_decisions = Path("/runtime/worker/control-decisions.jsonl")
+        run_controls = Path("/runtime/worker/run-controls")
         mcp_mapping = _compile_mcp_patch(Path("/skill-view"), mcp_patch)
         os.chown(mcp_patch, 0, worker_gid)
         os.chmod(mcp_patch, 0o440)
@@ -1041,6 +1191,7 @@ def main() -> int:
                 config, proxy_url=proxy_url, trust=trust, worker_tmp=worker_tmp
             )
             environment["CHATDS_CONTROL_DECISIONS"] = "/runtime/worker/control-decisions.jsonl"
+            environment["CHATDS_DSH_RUN_CONTROLS"] = "/runtime/worker/run-controls"
             command = _native_command(
                 mcp_patch,
                 reasoning_wire_effort=reasoning_wire_effort,
@@ -1063,6 +1214,14 @@ def main() -> int:
             control_mailbox = Path("/run/chatds-control/control-decisions.jsonl")
             control_forwarder = ControlDecisionForwarder(control_mailbox, control_decisions)
             control_forwarder.start()
+            run_control_forwarder = RunControlForwarder(
+                Path("/run/chatds-control/controls"),
+                run_controls,
+                ledger,
+                worker_uid=worker_uid,
+                worker_gid=worker_gid,
+            )
+            run_control_forwarder.start()
             with stdout_path.open("w+b") as stdout_file, stderr_path.open("w+b") as stderr_file:
                 _child = subprocess.Popen(
                     command,
@@ -1087,6 +1246,11 @@ def main() -> int:
                 stderr = stderr_file.read()
             control_forwarder.stop()
             control_forwarder = None
+            run_control_forwarder.stop()
+            native_interruption_pending = (
+                run_control_forwarder.interruption_pending
+            )
+            run_control_forwarder = None
             event_receiver.stop()
             event_receiver = None
             if stdout:
@@ -1153,7 +1317,11 @@ def main() -> int:
         )
         status, terminal_error = _terminal_outcome(
             exit_code=exit_code,
-            stop_reason=_stop_reason,
+            stop_reason=(
+                "cancelled"
+                if native_interruption_pending
+                else _stop_reason
+            ),
             workflow_passed=workflow_passed,
             artifact_passed=artifact_passed,
             native_failure=native_failure,
@@ -1171,6 +1339,11 @@ def main() -> int:
         })
         return 0 if status == "succeeded" else 1
     except BaseException as exc:
+        if run_control_forwarder is not None:
+            try:
+                run_control_forwarder.stop()
+            except Exception:
+                pass
         if control_forwarder is not None:
             try:
                 control_forwarder.stop()

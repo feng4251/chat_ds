@@ -53,6 +53,13 @@ from claude_runner.native_workflow import (
     workflow_start_violation,
     write_workflow_receipt,
 )
+from native_security.run_control import (
+    RunControlError,
+    list_run_controls,
+    receipt_path as run_control_receipt_path,
+    validate_run_control,
+    write_run_control_receipt,
+)
 
 
 MAX_NATIVE_LINE_BYTES = 64 * 1024 * 1024
@@ -121,6 +128,23 @@ SAFE_CONTROLLER_RUNTIME_CODES = frozenset({
     "input_attachment_transport_unlowered",
     "input_attachment_message_invalid",
     "turn_skill_binding_invalid",
+    "run_control_action_invalid",
+    "run_control_count_exceeded",
+    "run_control_filename_invalid",
+    "run_control_filename_mismatch",
+    "run_control_id_conflict",
+    "run_control_id_invalid",
+    "run_control_json_invalid",
+    "run_control_object_invalid",
+    "run_control_object_size_invalid",
+    "run_control_object_unsafe",
+    "run_control_receipt_conflict",
+    "run_control_receipt_mismatch",
+    "run_control_receipt_schema_invalid",
+    "run_control_schema_invalid",
+    "run_control_seq_conflict",
+    "run_control_text_invalid",
+    "run_control_too_large",
 })
 SAFE_RUNNER_FATAL_CODES = frozenset({
     "runner_controller_not_root",
@@ -457,13 +481,18 @@ def main() -> int:
         controller_stage = "terminal_commit"
         status = (
             "cancelled"
-            if _termination_reason == "cancelled"
+            if (
+                _termination_reason == "cancelled"
+                or ledger.native_interruption_pending
+            )
             else "failed"
             if _termination_reason == "hard_timeout"
             else "succeeded"
             if (
                 exit_code == 0
                 and ledger.native_result_succeeded
+                and ledger.native_result_count
+                == ledger.expected_native_result_count
                 and checkpoint_ready
                 and pending_native_task_count == 0
                 and workflow_contract_passed
@@ -489,6 +518,8 @@ def main() -> int:
             "result_observed": ledger.saw_native_result,
             "result_succeeded": ledger.native_result_succeeded,
             "result_count": ledger.native_result_count,
+            "expected_result_count": ledger.expected_native_result_count,
+            "native_interruption_pending": ledger.native_interruption_pending,
             "checkpoint_observed": checkpoint_ready,
             "pending_plan_task_count": pending_plan_task_count,
             "pending_native_task_count": pending_native_task_count,
@@ -585,6 +616,8 @@ def _terminal_error(
 
     if termination_reason == "hard_timeout":
         return "run_hard_timeout"
+    if ledger.native_interruption_pending:
+        return None
     if bool(egress_receipt.get("exhausted")):
         return "egress_budget_exhausted"
     # A native command may emit more than one result envelope while Claude's
@@ -593,8 +626,12 @@ def _terminal_error(
     # machine-owned provider HTTP receipt carried by the native result.
     if ledger.native_api_error_status is not None:
         return f"provider_http_{ledger.native_api_error_status}"
-    if ledger.native_result_count > 1:
-        return "native_result_duplicated"
+    if (
+        ledger.saw_native_result
+        and ledger.native_result_count
+        != ledger.expected_native_result_count
+    ):
+        return "native_result_count_mismatch"
     if pending_native_task_count:
         return "native_subtasks_pending"
     # Claude's TaskCreate/TaskUpdate files are model-owned planning/UI state.
@@ -622,7 +659,7 @@ def _terminal_error_stage(error_code: str | None) -> str | None:
     if error_code.startswith("provider_http_") or error_code in {
         "runner_exited_without_result",
         "native_result_failed",
-        "native_result_duplicated",
+        "native_result_count_mismatch",
         "runner_exit_nonzero",
     }:
         return "native_execution"
@@ -651,6 +688,8 @@ class EventLedger:
         self._saw_native_result = False
         self._native_result_succeeded = False
         self._native_result_count = 0
+        self._expected_native_result_count = 1
+        self._native_interruption_pending = False
         self._native_api_error_status: int | None = None
         self._native_tasks: dict[str, dict[str, Any]] = {}
         self._native_agent_tool_types: dict[str, str] = {}
@@ -713,9 +752,10 @@ class EventLedger:
             self._saw_native_result = True
             self._native_result_count += 1
             self._native_result_succeeded = (
-                self._native_result_count == 1
-                and native.get("subtype") == "success"
+                native.get("subtype") == "success"
                 and not bool(native.get("is_error"))
+                and self._native_result_count
+                <= self._expected_native_result_count
             )
             api_error_status = native.get("api_error_status")
             if (
@@ -824,6 +864,27 @@ class EventLedger:
     @property
     def native_result_count(self) -> int:
         return self._native_result_count
+
+    @property
+    def expected_native_result_count(self) -> int:
+        return self._expected_native_result_count
+
+    @property
+    def native_interruption_pending(self) -> bool:
+        return self._native_interruption_pending
+
+    def record_native_control_delivery(self, action: str) -> None:
+        if action == "interrupt":
+            self._native_interruption_pending = True
+            return
+        if action not in {"followup", "steer"}:
+            raise RuntimeError("run_control_action_invalid")
+        self._expected_native_result_count += 1
+        if self._expected_native_result_count > MAX_NATIVE_RECEIPT_COUNT:
+            raise RuntimeError("run_control_count_exceeded")
+        # A queued or immediate native user message continues the same
+        # Session after an Esc-style interruption.
+        self._native_interruption_pending = False
 
     @property
     def native_api_error_status(self) -> int | None:
@@ -1059,7 +1120,7 @@ class EventLedger:
 
         if (
             not self._native_result_succeeded
-            or self._native_result_count != 1
+            or self._native_result_count != self._expected_native_result_count
             or not any(
                 row.get("status") == "running"
                 and row.get("task_type") != "local_bash"
@@ -3126,7 +3187,11 @@ def _close_stdin_after_native_result(
     it.
     """
 
-    if not keep_stdin_open or not ledger.saw_native_result:
+    if (
+        not keep_stdin_open
+        or not ledger.saw_native_result
+        or ledger.native_result_count < ledger.expected_native_result_count
+    ):
         return False
     try:
         with input_lock:
@@ -3137,6 +3202,44 @@ def _close_stdin_after_native_result(
         return True
     except (BrokenPipeError, OSError, ValueError):
         return False
+
+
+def _native_run_control_input(request: dict[str, Any]) -> bytes:
+    """Lower one trusted generic control to Claude's public SDK protocol."""
+
+    try:
+        request = validate_run_control(request)
+    except RunControlError as exc:
+        raise RuntimeError(str(exc)) from exc
+    action = str(request["action"])
+    canonical_id = str(uuid.UUID(hex=request["control_id"]))
+    if action == "interrupt":
+        native = {
+            "type": "control_request",
+            "request_id": canonical_id,
+            "request": {"subtype": "interrupt"},
+        }
+    else:
+        native = {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": request["text"]}],
+            },
+            "parent_tool_use_id": None,
+            "session_id": "",
+            "uuid": canonical_id,
+            "priority": "now" if action == "steer" else "later",
+        }
+    encoded = json.dumps(
+        native,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+    if len(encoded) > MAX_NATIVE_INPUT_BYTES:
+        raise RuntimeError("native_input_size_limit")
+    return encoded
 
 
 def _run_child(
@@ -3167,6 +3270,7 @@ def _run_child(
     # structured stdin available until Claude publishes its native result;
     # `_close_stdin_after_native_result` then closes it deterministically.
     keep_stdin_open = True
+    initial_prompt_delivered = threading.Event()
 
     def write_input(value: bytes) -> bool:
         try:
@@ -3181,7 +3285,8 @@ def _run_child(
 
     def feed_prompt() -> None:
         try:
-            write_input(prompt)
+            if write_input(prompt):
+                initial_prompt_delivered.set()
         except (BrokenPipeError, OSError):
             pass
         finally:
@@ -3201,6 +3306,7 @@ def _run_child(
     pending_approvals: dict[str, tuple[dict[str, Any], int]] = {}
     resolved_approvals: set[str] = set()
     approval_root = Path("/state/control/runs") / run_id / "approvals"
+    run_control_root = Path("/state/control/runs") / run_id / "controls"
 
     def observe_control_request(
         line: bytes,
@@ -3338,6 +3444,43 @@ def _run_child(
             ):
                 resolved_approvals.add(request_id)
                 pending_approvals.pop(request_id, None)
+
+    def drain_run_control_mailbox() -> None:
+        try:
+            requests = list_run_controls(run_control_root)
+        except RunControlError as exc:
+            raise RuntimeError(str(exc)) from exc
+        for request in requests:
+            receipt_file = run_control_receipt_path(
+                run_control_root, request["control_id"]
+            )
+            if receipt_file.exists():
+                continue
+            action = str(request["action"])
+            encoded = _native_run_control_input(request)
+            if not write_input(encoded):
+                continue
+            ledger.record_native_control_delivery(action)
+            ledger.append_event({
+                "type": "chatds.native-control.delivered",
+                "control_id": request["control_id"],
+                "control_seq": request["seq"],
+                "action": action,
+                "content_sha256": (
+                    hashlib.sha256(str(request["text"]).encode("utf-8")).hexdigest()
+                    if request["text"] is not None
+                    else None
+                ),
+                "native_transport": "claude_stream_json_stdin",
+            }, channel="controller")
+            try:
+                write_run_control_receipt(
+                    run_control_root,
+                    request,
+                    status="delivered",
+                )
+            except RunControlError as exc:
+                raise RuntimeError(str(exc)) from exc
     leader_exited_at: float | None = None
     while selector.get_map():
         for key, _mask in selector.select(timeout=0.5):
@@ -3355,16 +3498,18 @@ def _run_child(
                 buffers[channel] = bytearray(rest)
                 native_seq = ledger.append_line(line, channel=channel)
                 observe_control_request(line, channel, native_seq)
-                _close_stdin_after_native_result(
-                    _child,
-                    input_lock,
-                    ledger,
-                    keep_stdin_open=keep_stdin_open,
-                )
             if len(buffers[channel]) > MAX_NATIVE_LINE_BYTES:
                 ledger.append_line(bytes(buffers[channel]), channel=channel)
                 buffers[channel].clear()
         drain_approval_mailbox()
+        if initial_prompt_delivered.is_set():
+            drain_run_control_mailbox()
+        _close_stdin_after_native_result(
+            _child,
+            input_lock,
+            ledger,
+            keep_stdin_open=keep_stdin_open,
+        )
         if _child.poll() is not None:
             if leader_exited_at is None:
                 leader_exited_at = time.monotonic()

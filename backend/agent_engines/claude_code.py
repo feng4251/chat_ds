@@ -60,6 +60,7 @@ class ClaudeCodeEngine:
                 available=False,
                 capabilities=(
                     "skills", "multi_agent", "sandbox", "native_resume", "vision",
+                    "native_interrupt", "native_followup", "native_steer",
                 ),
                 unavailable_reason=type(exc).__name__,
             )
@@ -71,6 +72,7 @@ class ClaudeCodeEngine:
             version=str(payload.get("claude_version") or "") or None,
             capabilities=(
                 "skills", "multi_agent", "sandbox", "native_resume", "vision",
+                "native_interrupt", "native_followup", "native_steer",
             ),
             unavailable_reason=None if available else str(payload.get("code") or "unhealthy"),
         )
@@ -384,6 +386,74 @@ class ClaudeCodeEngine:
                 json={"user_id": user_id, "conversation_id": conversation_id},
             )
         return response.status_code < 400 and bool(response.json().get("success"))
+
+    async def control_run(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        run_id: str,
+        control_id: str,
+        action: str,
+        text: str | None,
+    ) -> Mapping[str, Any]:
+        timeout = httpx.Timeout(connect=10.0, read=40.0, write=30.0, pool=10.0)
+        try:
+            async with self._client_factory(timeout=timeout) as client:
+                response = await client.post(
+                    f"{self._base_url}/v1/runs/{run_id}/controls",
+                    headers=self._headers,
+                    json={
+                        "user_id": user_id,
+                        "conversation_id": conversation_id,
+                        "control_id": control_id,
+                        "action": action,
+                        "text": text,
+                    },
+                )
+        except httpx.TimeoutException as exc:
+            raise AgentEngineError(
+                "Claude Runner native control receipt timed out.",
+                code="claude_native_control_timeout",
+                retryable=True,
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise AgentEngineError(
+                "Claude Runner native control transport failed.",
+                code="claude_native_control_transport_error",
+                retryable=True,
+            ) from exc
+        if 400 <= response.status_code < 500:
+            return {
+                "schema": "chatds.native-run-control-adapter-rejection.v1",
+                "accepted": False,
+                "idempotent": False,
+                "control_id": control_id,
+                "action": action,
+                "status": "rejected",
+                "code": "claude_native_control_rejected",
+            }
+        if response.status_code >= 500:
+            raise AgentEngineError(
+                "Claude Runner native control service is unavailable.",
+                code="claude_native_control_service_error",
+                retryable=True,
+            )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise AgentEngineError(
+                "Claude Runner returned an invalid native control receipt.",
+                code="claude_native_control_receipt_invalid",
+                retryable=True,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise AgentEngineError(
+                "Claude Runner returned an invalid native control receipt.",
+                code="claude_native_control_receipt_invalid",
+                retryable=True,
+            )
+        return payload
 
     async def cleanup_session(
         self,

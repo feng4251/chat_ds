@@ -3,6 +3,8 @@ import test from 'node:test'
 
 import {
   NATIVE_TURN_INPUT_SCHEMA,
+  NATIVE_RUN_CONTROL_SCHEMA,
+  applyNativeRunControl,
   selectNativeTurnPrompt,
   summarizeNativeInterval,
   synchronizeNativePermissionPreset,
@@ -81,4 +83,48 @@ test('the result summary cannot replay assistant text from an earlier Turn', () 
     text: 'current',
     reason: { kind: 'completed' },
   })
+})
+
+test('generic Web controls map only to the pinned native Agent Host API', () => {
+  const calls = []
+  const agent = {
+    cancel(cause, options) { calls.push(['cancel', cause, options]) },
+    followup(message) { calls.push(['followup', message]) },
+    steer(message) { calls.push(['steer', message]) },
+  }
+  const createMessage = (value) => ({ id: 'native-message', ...value })
+  applyNativeRunControl(agent, {
+    schema: NATIVE_RUN_CONTROL_SCHEMA,
+    control_id: '1'.repeat(32),
+    seq: 1,
+    action: 'interrupt',
+    text: null,
+  }, createMessage)
+  applyNativeRunControl(agent, {
+    schema: NATIVE_RUN_CONTROL_SCHEMA,
+    control_id: '2'.repeat(32),
+    seq: 2,
+    action: 'followup',
+    text: 'Inspect the renamed observatory log.',
+  }, createMessage)
+  applyNativeRunControl(agent, {
+    schema: NATIVE_RUN_CONTROL_SCHEMA,
+    control_id: '3'.repeat(32),
+    seq: 3,
+    action: 'steer',
+    text: 'Use the newest telescope reading first.',
+  }, createMessage)
+  assert.deepEqual(calls, [
+    ['cancel', { kind: 'user' }, { keepInbox: true }],
+    ['followup', {
+      id: 'native-message',
+      content: [{ type: 'text', text: 'Inspect the renamed observatory log.' }],
+      source: { kind: 'user' },
+    }],
+    ['steer', {
+      id: 'native-message',
+      content: [{ type: 'text', text: 'Use the newest telescope reading first.' }],
+      source: { kind: 'user' },
+    }],
+  ])
 })

@@ -3046,6 +3046,7 @@ async def _finalize_native_engine_session(run_id: str, conv_id: str) -> None:
             raw_terminal_status = None
             raw_result_succeeded = False
             raw_checkpoint_observed = False
+            raw_native_interruption_pending = False
             if len(raw_terminal_rows) == 1:
                 try:
                     raw_envelope = json.loads(raw_terminal_rows[0].payload)
@@ -3067,6 +3068,9 @@ async def _finalize_native_engine_session(run_id: str, conv_id: str) -> None:
                         )
                         raw_checkpoint_observed = (
                             raw_native.get("checkpoint_observed") is True
+                        )
+                        raw_native_interruption_pending = (
+                            raw_native.get("native_interruption_pending") is True
                         )
                 except (TypeError, ValueError, json.JSONDecodeError):
                     raw_terminal_status = None
@@ -3102,9 +3106,18 @@ async def _finalize_native_engine_session(run_id: str, conv_id: str) -> None:
             publish_transcript_checkpoint = bool(
                 persisted_run.native_session_id
                 and raw_checkpoint_observed
-                and raw_result_succeeded
-                and raw_terminal_status in {"succeeded", "failed"}
-                and terminal_status in {"succeeded", "failed"}
+                and (
+                    (
+                        raw_result_succeeded
+                        and raw_terminal_status in {"succeeded", "failed"}
+                        and terminal_status in {"succeeded", "failed"}
+                    )
+                    or (
+                        raw_native_interruption_pending
+                        and raw_terminal_status == "cancelled"
+                        and terminal_status == "cancelled"
+                    )
+                )
                 and persisted_run.finish_reason
                 not in {
                     "terminal_projection_failed",

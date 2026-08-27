@@ -3,6 +3,7 @@ import {
   FiSend, FiPaperclip, FiX, FiMessageSquare, FiFile,
   FiSliders, FiCode, FiBookOpen, FiImage, FiSearch,
   FiArrowDown, FiCpu,
+  FiSquare,
 } from 'react-icons/fi'
 import { MessageBubble } from './MessageBubble'
 import ModelSelector from './ModelSelector'
@@ -14,6 +15,7 @@ import {
   getMessages, chatCompletion, uploadSessionFile, createConversation, uploadSkill,
   getConversationSettings, updateConversationSettings, getEngines,
   getSkills, deleteSkill, getRunCards, getTurnActivities, decideTurnApproval,
+  sendNativeRunControl,
 } from '../api'
 import {
   bindConversationRequestScope,
@@ -50,6 +52,14 @@ import {
   mergeTurnActivities,
   turnActivityHighWater,
 } from '../utils/turnActivity'
+import {
+  activeNativeRunFromCards,
+  canSubmitNativeControl,
+  createNativeControlId,
+  draftAfterNativeControlReceipt,
+  isTerminalNativeControlStatus,
+  pendingNativeControlId,
+} from '../utils/nativeRunControls'
 
 const SAMPLE_PROMPTS = [
   { icon: FiCode,      text: '帮我写一个红黑树的 Python 实现' },
@@ -279,6 +289,9 @@ export default function ChatArea({
   const [durableRunActive, setDurableRunActive] = useState(false)
   const [durableRunUnknown, setDurableRunUnknown] = useState(false)
   const [durableRunConversation, setDurableRunConversation] = useState(null)
+  const [activeNativeRun, setActiveNativeRun] = useState(null)
+  const [nativeControlSending, setNativeControlSending] = useState(false)
+  const [nativeControlNotice, setNativeControlNotice] = useState(null)
   const [routedModel, setRoutedModel] = useState('')
   const [selectedModel, setSelectedModel] = useState('')
   const [selectedEngine, setSelectedEngine] = useState('')
@@ -297,6 +310,7 @@ export default function ChatArea({
   const activeConvRef = useRef(activeConv)
   const onConvRefreshRef = useRef(onConvRefresh)
   const liveRequestRef = useRef(null)
+  const nativeControlRetryRef = useRef(null)
   const runCardMessageRevisionRef = useRef('')
   const runCardProjectionRevisionRef = useRef('')
   const messageProjectionRevisionRef = useRef('')
@@ -316,6 +330,25 @@ export default function ChatArea({
   )
   const toolSurface = settings?.tool_surface || {}
   const compatibleModels = compatibleModelsForEngine(models, selectedEngine)
+
+  const observeRunCards = useCallback((runCards) => {
+    const retry = nativeControlRetryRef.current
+    if (retry) {
+      const root = (runCards?.roots || []).find(
+        (item) => item?.root_run_id === retry.runId,
+      )
+      const receipt = (root?.controls || []).find(
+        (item) => item?.control_id === retry.controlId,
+      )
+      if (receipt && isTerminalNativeControlStatus(receipt.status)) {
+        setInp((current) => draftAfterNativeControlReceipt(
+          current, retry, receipt,
+        ))
+        nativeControlRetryRef.current = null
+      }
+    }
+    setActiveNativeRun(activeNativeRunFromCards(runCards))
+  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -384,6 +417,8 @@ export default function ChatArea({
       setDurableRunActive(false)
       setDurableRunUnknown(false)
       setDurableRunConversation(null)
+      setActiveNativeRun(null)
+      setNativeControlNotice(null)
       setEngineLocked(false)
       setSelectedPermission(DEFAULT_PERMISSION_PRESET)
       const defaultModel = models.find((m) => m.is_default)?.id || models[0]?.id || ''
@@ -402,6 +437,8 @@ export default function ChatArea({
     setDurableRunActive(false)
     setDurableRunUnknown(true)
     setDurableRunConversation(activeConv)
+    setActiveNativeRun(null)
+    setNativeControlNotice(null)
     let aborted = false
     Promise.all([
       getMessages(activeConv),
@@ -440,6 +477,7 @@ export default function ChatArea({
               )
         ))
         if (runCardResult.available) {
+          observeRunCards(runCards)
           setDurableRunActive(Boolean(runCards?.has_active_runs))
           setDurableRunUnknown(false)
           setDurableRunConversation(activeConv)
@@ -449,6 +487,7 @@ export default function ChatArea({
           setDurableRunActive(false)
           setDurableRunUnknown(true)
           setDurableRunConversation(activeConv)
+          setActiveNativeRun(null)
         }
         setSelectedModel(settings.model_id || '')
         setSelectedEngine(settings.engine_id || '')
@@ -478,11 +517,12 @@ export default function ChatArea({
         setDurableRunActive(false)
         setDurableRunUnknown(true)
         setDurableRunConversation(activeConv)
+        setActiveNativeRun(null)
       })
     return () => {
       aborted = true
     }
-  }, [activeConv, models])
+  }, [activeConv, models, observeRunCards])
 
   // Keep the visible Session synchronized with durable Backend projections.
   // Notifications are not authority: timer/focus/online reconciliation reads
@@ -593,6 +633,7 @@ export default function ChatArea({
         runCardMessageRevisionRef.current = messageBoundary
         runCardProjectionRevisionRef.current = runProjection
         const stillActive = Boolean(runCards?.has_active_runs)
+        observeRunCards(runCards)
         setDurableRunActive(stillActive)
         setDurableRunUnknown(false)
         setDurableRunConversation(convId)
@@ -631,7 +672,7 @@ export default function ChatArea({
       window.removeEventListener('pageshow', forceReconcile)
       document.removeEventListener('visibilitychange', onVisibilityChange)
     }
-  }, [activeConv])
+  }, [activeConv, observeRunCards])
 
   async function reconcileDurableRuns(convId, requestScope) {
     if (!convId) return
@@ -642,6 +683,7 @@ export default function ChatArea({
         : activeConvRef.current !== convId
     ) return
     const stillActive = Boolean(runCards?.has_active_runs)
+    observeRunCards(runCards)
     if (stillActive) {
       const activities = await getTurnActivities(convId).catch(() => ({ events: [] }))
       setMsgs((prev) => attachTurnActivities(
@@ -899,8 +941,138 @@ export default function ChatArea({
     }
   }, [handleFiles, hasNoMessages])
 
-  async function doSend(textOverride) {
+  async function doNativeControl(action, text = '') {
+    if (!activeConv || !activeNativeRun) return
+    if (!canSubmitNativeControl({
+      activeRun: activeNativeRun,
+      engineOptions,
+      action,
+      text,
+      attachmentCount: images.length,
+      stateUnknown: effectiveDurableRunUnknown,
+      sending: nativeControlSending,
+    })) {
+      if (images.length > 0 && action !== 'interrupt') {
+        setNativeControlNotice({
+          error: true,
+          text: '运行中追问暂只接受文本；文件和图片请在当前任务结束后发送。',
+        })
+      }
+      return
+    }
+    const normalizedText = action === 'interrupt' ? null : text.trim()
+    const prior = nativeControlRetryRef.current
+    const durablePendingId = pendingNativeControlId({
+      activeRun: activeNativeRun,
+      messages: msgs,
+      action,
+      text: normalizedText,
+    })
+    const controlId = (
+      prior?.runId === activeNativeRun.runId
+      && prior?.action === action
+      && prior?.text === normalizedText
+        ? prior.controlId
+        : durablePendingId || createNativeControlId()
+    )
+    nativeControlRetryRef.current = {
+      runId: activeNativeRun.runId,
+      action,
+      text: normalizedText,
+      controlId,
+    }
+    setNativeControlSending(true)
+    setNativeControlNotice({
+      error: false,
+      text: action === 'interrupt' ? '正在送达原生中断…' : '正在送达原生消息…',
+    })
+    try {
+      const receipt = await sendNativeRunControl(
+        activeConv,
+        activeNativeRun.runId,
+        { controlId, action, text: normalizedText },
+      )
+      const status = receipt.status || (receipt.accepted ? 'delivered' : 'pending')
+      if (isTerminalNativeControlStatus(status)) {
+        nativeControlRetryRef.current = null
+      }
+      setActiveNativeRun((current) => {
+        if (!current || current.runId !== activeNativeRun.runId) return current
+        const controls = (current.controls || []).filter(
+          (item) => item.control_id !== controlId,
+        )
+        controls.push({
+          control_id: controlId,
+          action,
+          status,
+          message_id: receipt.message_id || null,
+          code: receipt.code || null,
+        })
+        return { ...current, controls }
+      })
+      if (action !== 'interrupt') {
+        if (status === 'delivered') setInp('')
+        const durableUser = {
+          id: receipt.message_id || `native-control-${controlId}`,
+          role: 'user',
+          content: normalizedText,
+          source: 'native_control',
+          run_id: activeNativeRun.runId,
+          nativeControlAction: action,
+          nativeControlStatus: status,
+        }
+        setMsgs((current) => {
+          if (current.some((message) => message.id === durableUser.id)) return current
+          const next = [...current]
+          const streamingIndex = next.findIndex((message) => message.streaming)
+          if (streamingIndex >= 0) next.splice(streamingIndex, 0, durableUser)
+          else next.push(durableUser)
+          return next
+        })
+      }
+      setNativeControlNotice({
+        error: status === 'rejected',
+        text: status === 'delivered'
+          ? action === 'interrupt'
+            ? '已在原生执行位置中断；Session 保留，可继续追问。'
+            : action === 'steer'
+              ? '插话已送达原生执行边界。'
+              : '追问已进入原生消息队列。'
+          : status === 'rejected'
+            ? `原生控制未送达${receipt.code ? `：${receipt.code}` : ''}`
+            : '控制请求已持久化，正在等待原生送达回执。',
+      })
+      const runCards = await getRunCards(activeConv).catch(() => null)
+      if (runCards && activeConvRef.current === activeConv) {
+        observeRunCards(runCards)
+        setDurableRunActive(Boolean(runCards.has_active_runs))
+        setDurableRunUnknown(false)
+        setDurableRunConversation(activeConv)
+      }
+      sessionSyncWakeRef.current?.()
+    } catch (error) {
+      // Retain the exact control id. Retrying the same text reconciles the
+      // durable Supervisor request instead of inserting duplicate native work.
+      setNativeControlNotice({
+        error: true,
+        text: `控制回执暂不可用：${error.message}。再次发送会使用同一请求编号安全重试。`,
+      })
+      sessionSyncWakeRef.current?.()
+    } finally {
+      setNativeControlSending(false)
+    }
+  }
+
+  async function doSend(textOverride, nativeAction = 'followup') {
     const text = (textOverride ?? inp).trim()
+    if (
+      activeNativeRun
+      && !effectiveDurableRunUnknown
+      && (busy || durableRunActive)
+    ) {
+      await doNativeControl(nativeAction, text)
+      return
+    }
     if (
       (!text && images.length === 0)
       || busy
@@ -942,6 +1114,16 @@ export default function ChatArea({
         (evt) => {
           if (evt.run_id) {
             recordAcceptedRunReceipt(requestScope, evt.run_id)
+            setActiveNativeRun((current) => (
+              current?.runId === evt.run_id
+                ? current
+                : {
+                    runId: evt.run_id,
+                    engineId: selectedEngine,
+                    controls: [],
+                    controlsTruncated: false,
+                  }
+            ))
           }
           if (evt.conversation_id) {
             streamConvId = evt.conversation_id
@@ -1044,9 +1226,14 @@ export default function ChatArea({
   }
 
   function handleKeyDown(e) {
+    if (e.key === 'Escape' && nativeControlActive && canInterrupt) {
+      e.preventDefault()
+      doNativeControl('interrupt')
+      return
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
-      doSend()
+      doSend(undefined, e.metaKey || e.ctrlKey ? 'steer' : 'followup')
     }
   }
 
@@ -1098,6 +1285,16 @@ export default function ChatArea({
         (evt) => {
           if (evt.run_id) {
             recordAcceptedRunReceipt(requestScope, evt.run_id)
+            setActiveNativeRun((current) => (
+              current?.runId === evt.run_id
+                ? current
+                : {
+                    runId: evt.run_id,
+                    engineId: selectedEngine,
+                    controls: [],
+                    controlsTruncated: false,
+                  }
+            ))
           }
           if (evt.conversation_id) {
             streamConvId = evt.conversation_id
@@ -1203,11 +1400,35 @@ export default function ChatArea({
     || effectiveDurableRunUnknown
   )
   const retiredEngine = selectedEngine === 'legacy'
-  const canSend = (
-    (inp.trim().length > 0 || images.length > 0)
-    && !interactionBusy
-    && !retiredEngine
+  const nativeControlActive = Boolean(
+    activeNativeRun
+    && !effectiveDurableRunUnknown
+    && (busy || durableRunActive)
   )
+  const canSend = !retiredEngine && (
+    nativeControlActive
+      ? canSubmitNativeControl({
+          activeRun: activeNativeRun,
+          engineOptions,
+          action: 'followup',
+          text: inp,
+          attachmentCount: images.length,
+          stateUnknown: effectiveDurableRunUnknown,
+          sending: nativeControlSending,
+        })
+      : (
+          (inp.trim().length > 0 || images.length > 0)
+          && !interactionBusy
+        )
+  )
+  const canInterrupt = canSubmitNativeControl({
+    activeRun: activeNativeRun,
+    engineOptions,
+    action: 'interrupt',
+    text: '',
+    stateUnknown: effectiveDurableRunUnknown,
+    sending: nativeControlSending,
+  })
 
   function scrollToBottom() {
     shouldStickToBottomRef.current = true
@@ -1511,14 +1732,39 @@ export default function ChatArea({
             />
           )}
 
-          {!busy && effectiveDurableRunUnknown && (
+          {effectiveDurableRunUnknown && (
             <div className="mb-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
               正在重新连接并确认后台任务状态；确认完成前暂不接受重复提交。
             </div>
           )}
-          {!busy && durableRunActive && !effectiveDurableRunUnknown && (
+          {durableRunActive && !effectiveDurableRunUnknown && (
             <div className="mb-2 rounded-xl border border-indigo-200 bg-indigo-50 px-3 py-2 text-xs text-indigo-700">
-              任务仍在后台执行，页面会自动同步持久化进度；完成后即可继续发送。
+              {nativeControlActive
+                ? '原生任务正在执行：Enter 排队追问，Ctrl/⌘+Enter 插话，Esc 或方形按钮原地中断。Session 与工作区会保留。'
+                : '任务仍在后台执行，页面会自动同步持久化进度。'}
+              {activeNativeRun?.controls?.length > 0 && (
+                <div className="mt-1.5 flex flex-wrap gap-1.5">
+                  {activeNativeRun.controls.slice(-6).map((control) => (
+                    <span
+                      key={control.control_id}
+                      className="rounded-full border border-indigo-200 bg-white px-2 py-0.5 text-[11px]"
+                    >
+                      {control.action === 'interrupt' ? '中断' : control.action === 'steer' ? '插话' : '追问'} · {' '}
+                      {control.status === 'delivered' ? '已送达' : control.status === 'rejected' ? '未送达' : '等待回执'}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+          {nativeControlNotice && (
+            <div className={
+              'mb-2 rounded-xl border px-3 py-2 text-xs ' +
+              (nativeControlNotice.error
+                ? 'border-red-200 bg-red-50 text-red-700'
+                : 'border-emerald-200 bg-emerald-50 text-emerald-700')
+            }>
+              {nativeControlNotice.text}
             </div>
           )}
           {retiredEngine && (
@@ -1546,8 +1792,9 @@ export default function ChatArea({
           <div className="flex items-end gap-1 bg-white rounded-3xl pl-2 pr-2 py-2 border border-stone-200 shadow-sm focus-within:border-indigo-300 focus-within:shadow-md transition">
             <button
               onClick={() => fileRef.current?.click()}
-              className="p-2 rounded-xl hover:bg-stone-100 text-slate-500 hover:text-indigo-600 transition"
-              title="附加文件"
+              disabled={nativeControlActive}
+              className="p-2 rounded-xl hover:bg-stone-100 text-slate-500 hover:text-indigo-600 transition disabled:cursor-not-allowed disabled:text-stone-300"
+              title={nativeControlActive ? '运行中追问暂只接受文本' : '附加文件'}
               aria-label="附加文件"
             >
               <FiPaperclip size={15} />
@@ -1576,7 +1823,13 @@ export default function ChatArea({
               onChange={(e) => setInp(e.target.value)}
               onKeyDown={handleKeyDown}
               disabled={retiredEngine}
-              placeholder={retiredEngine ? '旧执行引擎已退役，请先 Fork 到原生引擎' : '输入消息……'}
+              placeholder={
+                retiredEngine
+                  ? '旧执行引擎已退役，请先 Fork 到原生引擎'
+                  : nativeControlActive
+                    ? '运行中追问；Ctrl/⌘+Enter 插话……'
+                    : '输入消息……'
+              }
               rows={1}
               className="flex-1 bg-transparent text-slate-800 resize-none outline-none text-[14px] placeholder-slate-400 py-2 px-1 max-h-[200px] leading-relaxed disabled:cursor-not-allowed disabled:text-slate-400"
             />
@@ -1597,6 +1850,24 @@ export default function ChatArea({
               onChange={changeModel}
             />
 
+            {nativeControlActive && (
+              <button
+                onClick={() => doNativeControl('interrupt')}
+                disabled={!canInterrupt}
+                aria-label="中断当前原生执行"
+                aria-keyshortcuts="Escape"
+                title="原地中断当前执行，保留 Session 和工作区"
+                className={
+                  'p-2.5 rounded-xl text-white transition shadow-sm ' +
+                  (canInterrupt
+                    ? 'bg-red-500 hover:bg-red-600 active:scale-95'
+                    : 'bg-stone-300 cursor-not-allowed')
+                }
+              >
+                <FiSquare size={14} />
+              </button>
+            )}
+
             <button
               onClick={() => doSend()}
               disabled={!canSend}
@@ -1613,7 +1884,9 @@ export default function ChatArea({
           </div>
 
           <p className="text-[11px] text-slate-400 text-center mt-2.5">
-            Enter 发送 · Shift+Enter 换行 · 拖拽文件到聊天区上传
+            {nativeControlActive
+              ? 'Enter 排队追问 · Ctrl/⌘+Enter 插话 · Shift+Enter 换行 · Esc/方形按钮中断'
+              : 'Enter 发送 · Shift+Enter 换行 · 拖拽文件到聊天区上传'}
           </p>
         </div>
       </div>

@@ -41,6 +41,17 @@ from .native_session import (
 from .native_workflow import compile_deepseek_workflow_projection
 from .terminal_receipts import append_terminal, terminal_receipt, terminal_status
 from native_security.workflow_contract import compile_turn_workflow_contract
+from native_security.run_control import (
+    RunControlError,
+    build_run_control,
+    enqueue_run_control,
+    next_run_control_seq,
+    read_run_control,
+    read_run_control_receipt,
+    receipt_path as run_control_receipt_path,
+    request_path as run_control_request_path,
+    write_run_control_receipt,
+)
 
 
 SAFE_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -94,6 +105,23 @@ class StartRunRequest(BaseModel):
 class RunIdentity(BaseModel):
     user_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     conversation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+
+
+class RunControlRequest(RunIdentity):
+    model_config = {"extra": "forbid"}
+
+    control_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    action: Literal["interrupt", "followup", "steer"]
+    text: str | None = Field(default=None, max_length=2_000_000)
+
+    @model_validator(mode="after")
+    def exact_control(self):
+        if self.action == "interrupt":
+            if self.text is not None:
+                raise ValueError("Interrupt controls cannot contain text")
+        elif self.text is None or not self.text.strip() or "\x00" in self.text:
+            raise ValueError("Native message control text is invalid")
+        return self
 
 
 class ApprovalDecisionRequest(BaseModel):
@@ -549,6 +577,112 @@ class Manager:
         append_terminal(control / "events.jsonl", "cancelled", None)
         return True
 
+    async def control(
+        self,
+        run: str,
+        payload: RunControlRequest,
+    ) -> dict[str, Any]:
+        """Deliver one control through the pinned DSH Agent Host API."""
+
+        locator = self._locate(run)
+        if (
+            locator["user_id"] != payload.user_id
+            or locator["conversation_id"] != payload.conversation_id
+        ):
+            raise HTTPException(404, "Run not found")
+        control = self._control(payload.user_id, payload.conversation_id, run)
+        controls = control / "controls"
+        try:
+            async with self.guard:
+                status = await asyncio.to_thread(
+                    _read_json, control / "status.json"
+                )
+                terminal = await asyncio.to_thread(
+                    _terminal, control / "events.jsonl"
+                )
+                if terminal is not None or str(status.get("status") or "") not in {
+                    "starting", "running"
+                }:
+                    raise HTTPException(409, "Run is no longer accepting native controls")
+                request_path = run_control_request_path(
+                    controls, payload.control_id
+                )
+                if request_path.exists():
+                    request = await asyncio.to_thread(
+                        read_run_control, request_path
+                    )
+                    if (
+                        request.get("action") != payload.action
+                        or request.get("text") != payload.text
+                    ):
+                        raise HTTPException(409, "Control id already has different content")
+                    idempotent = True
+                else:
+                    seq = await asyncio.to_thread(
+                        next_run_control_seq, controls
+                    )
+                    request = build_run_control(
+                        control_id=payload.control_id,
+                        seq=seq,
+                        action=payload.action,
+                        text=payload.text,
+                    )
+                    idempotent = await asyncio.to_thread(
+                        enqueue_run_control, controls, request
+                    )
+        except RunControlError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+        receipt_path = run_control_receipt_path(
+            controls, payload.control_id
+        )
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            if receipt_path.exists():
+                try:
+                    receipt = await asyncio.to_thread(
+                        read_run_control_receipt,
+                        receipt_path,
+                        request=request,
+                    )
+                except RunControlError as exc:
+                    raise HTTPException(409, str(exc)) from exc
+                return {
+                    "accepted": receipt["status"] == "delivered",
+                    "idempotent": idempotent,
+                    **receipt,
+                }
+            terminal = await asyncio.to_thread(
+                _terminal, control / "events.jsonl"
+            )
+            if terminal is not None:
+                try:
+                    receipt = await asyncio.to_thread(
+                        write_run_control_receipt,
+                        controls,
+                        request,
+                        status="rejected",
+                        code="run_terminal_before_delivery",
+                    )
+                except RunControlError as exc:
+                    raise HTTPException(409, str(exc)) from exc
+                return {
+                    "accepted": False,
+                    "idempotent": idempotent,
+                    **receipt,
+                }
+            await asyncio.sleep(0.05)
+        return {
+            "accepted": False,
+            "idempotent": idempotent,
+            "schema": "chatds.native-run-control-pending.v1",
+            "control_id": request["control_id"],
+            "seq": request["seq"],
+            "action": request["action"],
+            "status": "pending",
+            "code": "delivery_pending",
+        }
+
     async def decide_approval(self, run: str, request_id: str, payload: ApprovalDecisionRequest) -> dict[str, Any]:
         if re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request_id) is None:
             raise HTTPException(400, "Invalid approval request id")
@@ -876,6 +1010,16 @@ async def decide_approval(run_id: str, request_id: str, payload: ApprovalDecisio
 async def cancel_run(run_id: str, payload: RunIdentity, _=Depends(_auth)):
     assert manager is not None
     return {"success": await manager.cancel(run_id, payload)}
+
+
+@app.post("/v1/runs/{run_id}/controls")
+async def control_run(
+    run_id: str,
+    payload: RunControlRequest,
+    _=Depends(_auth),
+):
+    assert manager is not None
+    return await manager.control(run_id, payload)
 
 
 @app.post("/v1/sessions/{conversation_id}/cleanup")

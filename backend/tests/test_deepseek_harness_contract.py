@@ -579,6 +579,71 @@ async def test_engine_recovers_only_the_supervisor_owned_terminal_receipt():
     assert recovered == terminal
 
 
+@pytest.mark.asyncio
+async def test_runtime_control_is_a_thin_exact_adapter():
+    async def handler(request):
+        assert request.url.path == f"/v1/runs/{'5' * 32}/controls"
+        assert json.loads(request.content) == {
+            "user_id": "6" * 32,
+            "conversation_id": "7" * 32,
+            "control_id": "8" * 32,
+            "action": "steer",
+            "text": "Prioritize the renamed observatory reading.",
+        }
+        return httpx.Response(200, json={
+            "schema": "chatds.native-run-control-receipt.v1",
+            "control_id": "8" * 32,
+            "seq": 1,
+            "action": "steer",
+            "status": "delivered",
+            "accepted": True,
+        })
+
+    transport = httpx.MockTransport(handler)
+    engine = DeepSeekHarnessEngine(
+        base_url="http://runner.internal",
+        internal_token="internal-authority",
+        timeout_seconds=60,
+        client_factory=lambda **kwargs: httpx.AsyncClient(
+            transport=transport, **kwargs
+        ),
+    )
+    receipt = await engine.control_run(
+        user_id="6" * 32,
+        conversation_id="7" * 32,
+        run_id="5" * 32,
+        control_id="8" * 32,
+        action="steer",
+        text="Prioritize the renamed observatory reading.",
+    )
+    assert receipt["status"] == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_runtime_control_preserves_definitive_rejection():
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(409, json={"detail": "terminal"})
+    )
+    engine = DeepSeekHarnessEngine(
+        base_url="http://runner.internal",
+        internal_token="internal-authority",
+        timeout_seconds=60,
+        client_factory=lambda **kwargs: httpx.AsyncClient(
+            transport=transport, **kwargs
+        ),
+    )
+    receipt = await engine.control_run(
+        user_id="6" * 32,
+        conversation_id="7" * 32,
+        run_id="5" * 32,
+        control_id="8" * 32,
+        action="interrupt",
+        text=None,
+    )
+    assert receipt["status"] == "rejected"
+    assert receipt["accepted"] is False
+
+
 def test_daemon_volume_mountpoint_is_used_for_dynamic_run_bind(tmp_path):
     class Volume:
         attrs = {

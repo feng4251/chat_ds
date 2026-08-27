@@ -7,6 +7,10 @@ export const NATIVE_PERMISSION_PRESETS = Object.freeze([
   'workspace-write',
   'danger-full-access',
 ])
+export const NATIVE_RUN_CONTROL_SCHEMA = 'chatds.native-run-control.v1'
+export const NATIVE_RUN_CONTROL_ACTIONS = Object.freeze([
+  'interrupt', 'followup', 'steer',
+])
 
 function exactKeys(value, keys) {
   return Object.keys(value).sort().join('\0') === [...keys].sort().join('\0')
@@ -95,6 +99,64 @@ export function selectNativeTurnPrompt(input, persisted) {
     throw new Error('chatds-session-driver: persistence state is invalid')
   }
   return persisted ? validated.turn_prompt : validated.initial_prompt
+}
+
+export function validateNativeRunControl(value) {
+  if (
+    value === null
+    || typeof value !== 'object'
+    || Array.isArray(value)
+    || !exactKeys(value, ['schema', 'control_id', 'seq', 'action', 'text'])
+    || value.schema !== NATIVE_RUN_CONTROL_SCHEMA
+    || typeof value.control_id !== 'string'
+    || !/^[0-9a-f]{32}$/.test(value.control_id)
+    || !Number.isSafeInteger(value.seq)
+    || value.seq < 1
+    || value.seq > 4096
+    || !NATIVE_RUN_CONTROL_ACTIONS.includes(value.action)
+    || (
+      value.action === 'interrupt'
+        ? value.text !== null
+        : typeof value.text !== 'string'
+          || value.text.trim() === ''
+          || value.text.length > 2_000_000
+          || value.text.includes('\0')
+    )
+  ) {
+    throw new Error('chatds-session-driver: native run control is invalid')
+  }
+  return Object.freeze({
+    schema: NATIVE_RUN_CONTROL_SCHEMA,
+    control_id: value.control_id,
+    seq: value.seq,
+    action: value.action,
+    text: value.text,
+  })
+}
+
+export function applyNativeRunControl(agent, value, createMessage) {
+  const control = validateNativeRunControl(value)
+  if (
+    agent === null
+    || typeof agent !== 'object'
+    || typeof agent.cancel !== 'function'
+    || typeof agent.followup !== 'function'
+    || typeof agent.steer !== 'function'
+    || typeof createMessage !== 'function'
+  ) {
+    throw new Error('chatds-session-driver: native run control boundary is invalid')
+  }
+  if (control.action === 'interrupt') {
+    agent.cancel({ kind: 'user' }, { keepInbox: true })
+    return control
+  }
+  const message = createMessage({
+    content: [{ type: 'text', text: control.text }],
+    source: { kind: 'user' },
+  })
+  if (control.action === 'followup') agent.followup(message)
+  else agent.steer(message)
+  return control
 }
 
 export function summarizeNativeInterval(events, firstSeq) {

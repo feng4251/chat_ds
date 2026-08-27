@@ -47,6 +47,7 @@ COPY deepseek_runner/__init__.py \
      /opt/chatds-deepseek-runner/python/deepseek_runner/
 COPY native_security/__init__.py \
      native_security/artifact_contract.py \
+     native_security/run_control.py \
      /opt/chatds-deepseek-runner/python/native_security/
 COPY claude_runner/__init__.py \
      claude_runner/mcp_market_data.py \

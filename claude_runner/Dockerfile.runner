@@ -62,12 +62,16 @@ COPY claude_runner/__init__.py \
      claude_runner/mcp_process.py \
      /opt/chatds-claude-runner/python/claude_runner/
 COPY backend/schedule_spec.py /opt/chatds-claude-runner/python/claude_runner/schedule_spec.py
+COPY native_security/__init__.py \
+     native_security/run_control.py \
+     /opt/chatds-claude-runner/python/native_security/
 
 RUN ln -s /opt/chatds-claude-code/node_modules/.bin/claude /usr/local/bin/claude \
     && mkdir -p /run/chatds /state /skill-view /runtime /app/claude-runner \
     && purelib="$(python -I -c 'import sysconfig; print(sysconfig.get_path("purelib"))')" \
     && test -d "${purelib}" \
     && ln -s /opt/chatds-claude-runner/python/claude_runner "${purelib}/claude_runner" \
+    && ln -s /opt/chatds-claude-runner/python/native_security "${purelib}/native_security" \
     # Compatibility aliases permit an old, already-frozen Skill view to run
     # during a rolling Backend/Runner transition. Newly compiled views use
     # the installed ``python -I -m claude_runner.*`` entrypoints.

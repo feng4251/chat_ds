@@ -598,6 +598,19 @@ function durablePlaceholder(root, projectionTruncated = []) {
  * mapping is unavailable). This deliberately avoids timestamp-nearest guesses.
  */
 export function hydrateAgentRunCards(messages = [], payload = {}) {
+  const controlsByMessage = new Map()
+  for (const root of payload.roots || []) {
+    for (const control of root?.controls || []) {
+      if (
+        typeof control?.message_id === 'string'
+        && control.message_id !== ''
+        && ['followup', 'steer'].includes(control.action)
+        && ['pending', 'delivered', 'rejected'].includes(control.status)
+      ) {
+        controlsByMessage.set(control.message_id, control)
+      }
+    }
+  }
   const priorPlaceholders = new Map(
     messages
       .filter((message) => (
@@ -608,7 +621,16 @@ export function hydrateAgentRunCards(messages = [], payload = {}) {
   )
   const next = messages
     .filter((message) => !message.durableRunPlaceholder)
-    .map((message) => ({ ...message }))
+    .map((message) => {
+      const control = controlsByMessage.get(message.id)
+      return {
+        ...message,
+        ...(control ? {
+          nativeControlAction: control.action,
+          nativeControlStatus: control.status,
+        } : {}),
+      }
+    })
   const roots = [...(payload.roots || [])].reverse()
   const projectionTruncated = projectionTruncationKeys(payload)
   const deferred = []

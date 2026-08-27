@@ -40,6 +40,7 @@ Session 级隔离工作区、受控网络出口和可审计的工作流/产物�
 - 结构化 capability authority、mandatory receipts、evidence gate 和 artifact contract。
 - 持久 AgentRun、子任务、工具生命周期、debug ledger、Token 与终态记录。
 - 后台长任务、断线重连、取消/清理与前端 durable reconciliation。
+- 运行中排队追问、即时插话和 Esc 风格原地中断；保留原生 Session 与当前工作区。
 - 通过本机 SearXNG 的 Web search，以及受控 market-data、MCP 和 schedule 能力。
 - 签名、限额、精确 origin/path/method 的网络出口策略。
 - 文本与 reasoning 流压缩展示；同一工具调用在原卡片内从“执行中”更新为完成/失败。
@@ -102,6 +103,22 @@ compile/bind
 - ChatDS adapter 只完成 provider binding、workspace/Skill projection、事件持久化与 Web DTO 投影。
 - 原生工具权限保持 exact tool identity，不通过粗粒度 plugin group 扩权。
 - ChatDS 不修改 DeepSeek Harness 的 planning、工具循环和 multi-agent 核心。
+
+### 运行中控制
+
+网页只把已认证的用户动作降低到两个引擎公开的原生 I/O 接口，不实现第二套调度器：
+
+- `Enter` 把文本作为下一条原生 follow-up 排队；
+- `Ctrl/Command + Enter` 通过原生 steer 在最近的安全步骤边界插话；
+- 输入框聚焦时按 `Esc`，或点击方形按钮，只中断当前原生执行，保留 Session、
+  workspace 和已写入的 checkpoint；任务终止后可正常发起下一 Turn；
+- 运行中消息暂只接收文本，附件在当前 Turn 结束后发送。
+
+Claude 路径使用原生 stream-json stdin 的 `priority=later/now` 与 typed interrupt；
+DeepSeek 路径只调用原生 Agent Host 的 `followup()`、`steer()` 和
+`cancel({kind: 'user'}, {keepInbox: true})`。每个控制请求先持久化，再在原生接口同步接收后
+写 delivery receipt；超时或断线使用同一 control ID 对账重试。刷新、换页或 SSE 断开后，
+页面从消息、AgentRun 和有界控制回执恢复，不从模型文字推断是否已送达。
 
 ## Skill 执行模型
 

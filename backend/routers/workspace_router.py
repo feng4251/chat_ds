@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import hashlib
 import re
 import shutil
 import uuid
 from collections import defaultdict
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 
 import workspace as workspace_store
@@ -41,6 +42,7 @@ from schemas import (
     ConversationSettingsUpdate,
     GoalUpdate,
     WorkspaceFileWrite,
+    NativeRunControl,
 )
 from workspace import (
     MAX_WORKSPACE_FILE_CHARS,
@@ -65,6 +67,31 @@ from workspace_lock import (
 )
 
 router = APIRouter(prefix="/api/conversations", tags=["workspace"])
+
+_native_control_locks: dict[str, tuple[asyncio.Lock, int]] = {}
+_native_control_locks_guard = asyncio.Lock()
+
+
+@asynccontextmanager
+async def _native_control_guard(run_id: str):
+    async with _native_control_locks_guard:
+        lock, users = _native_control_locks.get(
+            run_id, (asyncio.Lock(), 0)
+        )
+        _native_control_locks[run_id] = (lock, users + 1)
+    await lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+        async with _native_control_locks_guard:
+            current = _native_control_locks.get(run_id)
+            if current is not None and current[0] is lock:
+                remaining = current[1] - 1
+                if remaining <= 0:
+                    _native_control_locks.pop(run_id, None)
+                else:
+                    _native_control_locks[run_id] = (lock, remaining)
 
 
 async def _conversation(cid: str, user_id: str, db: AsyncSession) -> Conversation:
@@ -162,6 +189,7 @@ async def _engine_options_for_user(
             "default_model_id": claude_default,
             "capabilities": [
                 "skills", "multi_agent", "sandbox", "native_resume", "vision",
+                "native_interrupt", "native_followup", "native_steer",
             ],
         })
     if settings.deepseek_harness_engine_enabled:
@@ -187,6 +215,7 @@ async def _engine_options_for_user(
             "default_model_id": deepseek_default,
             "capabilities": [
                 "skills", "multi_agent", "sandbox", "web_search",
+                "native_interrupt", "native_followup", "native_steer",
             ],
         })
     return options
@@ -1895,6 +1924,9 @@ _RUN_CARD_EVENT_TYPES = frozenset({
     "verifier.requested",
     "verifier.completed",
     "verifier.failed",
+    "native.control.requested",
+    "native.control.delivered",
+    "native.control.rejected",
 })
 _RUN_CARD_TOOL_ATTEMPT_LIMIT = 24
 _RUN_CARD_ARTIFACT_LIMIT = 24
@@ -1908,6 +1940,56 @@ _DTO_JSON_MAX_DEPTH = 4
 _DTO_JSON_MAX_ITEMS = 64
 _DTO_JSON_STRING_LIMIT = 1000
 _RUN_DTO_ERROR_LIMIT = 4000
+_RUN_CARD_CONTROL_LIMIT = 64
+_RUN_CARD_CONTROL_EVENT_QUERY_LIMIT = (_RUN_CARD_CONTROL_LIMIT + 1) * 3
+
+
+def _native_control_summaries(
+    events: list[AgentRunEvent],
+) -> tuple[list[dict], int, bool]:
+    controls: dict[str, dict] = {}
+    for event in events:
+        if event.event_type not in {
+            "native.control.requested",
+            "native.control.delivered",
+            "native.control.rejected",
+        }:
+            continue
+        control_id = str(event.tool_call_id or "")
+        if re.fullmatch(r"[0-9a-f]{32}", control_id) is None:
+            continue
+        payload = _event_payload(event)
+        item = controls.setdefault(control_id, {
+            "control_id": control_id,
+            "seq": int(event.seq or 0),
+            "action": str(payload.get("action") or ""),
+            "message_id": payload.get("message_id"),
+            "status": "pending",
+            "code": None,
+            "event_time": str(event.event_time),
+        })
+        if event.event_type == "native.control.requested":
+            item.update({
+                "seq": int(event.seq or 0),
+                "action": str(payload.get("action") or item["action"]),
+                "message_id": payload.get("message_id") or item["message_id"],
+                "event_time": str(event.event_time),
+            })
+        elif event.event_type == "native.control.delivered":
+            item["status"] = "delivered"
+            item["code"] = None
+        else:
+            item["status"] = "rejected"
+            item["code"] = _bounded_text(payload.get("code"), 128) or None
+    ordered = sorted(
+        controls.values(), key=lambda item: (item["seq"], item["control_id"])
+    )
+    total = len(ordered)
+    return (
+        ordered[-_RUN_CARD_CONTROL_LIMIT:],
+        total,
+        total > _RUN_CARD_CONTROL_LIMIT,
+    )
 
 
 def _bounded_json_value(
@@ -2344,6 +2426,9 @@ def _run_card(
     tools, tool_attempt_count, tool_attempts_truncated = _tool_summaries(
         events
     )
+    controls, control_count, controls_truncated = (
+        _native_control_summaries(events)
+    )
     artifact_total = (
         max(0, int(artifact_count))
         if artifact_count is not None
@@ -2388,6 +2473,9 @@ def _run_card(
         "tools": tools,
         "tool_attempt_count": tool_attempt_count,
         "tool_attempts_truncated": tool_attempts_truncated,
+        "controls": controls,
+        "control_count": control_count,
+        "controls_truncated": controls_truncated,
         "artifacts": [
             _artifact_to_dict(artifact)
             for artifact in visible_artifacts
@@ -2451,7 +2539,7 @@ async def _run_turn_mappings(
         trigger_index, trigger = exact_users[0]
         assistants = []
         for row in message_rows[trigger_index + 1:]:
-            if row.role == "user":
+            if row.role == "user" and row.source == "chat":
                 break
             if row.role == "assistant" and row.source == "chat":
                 assistants.append(row)
@@ -2587,6 +2675,52 @@ async def _run_card_anchor_events(
         select(AgentRunEvent).where(
             AgentRunEvent.conversation_id == cid,
             AgentRunEvent.id.in_(anchor_ids),
+        )
+    )).scalars().all())
+
+
+async def _run_card_control_events(
+    db,
+    cid: str,
+    run_ids: set[str],
+) -> list[AgentRunEvent]:
+    """Load a bounded reconnect window of native controls per run.
+
+    The general run-card event page is intentionally capped across the whole
+    Conversation. A verbose native run must not crowd its own user controls
+    out of the reconnect projection, so controls receive an independent,
+    still-bounded per-run window. Each immutable control has one request and
+    at most one authoritative terminal receipt; the extra factor also keeps
+    malformed historical conflicts observable without an unbounded query.
+    """
+
+    if not run_ids:
+        return []
+    ranked = select(
+        AgentRunEvent.id.label("event_id"),
+        func.row_number().over(
+            partition_by=AgentRunEvent.run_id,
+            order_by=(
+                desc(AgentRunEvent.event_time),
+                desc(AgentRunEvent.id),
+            ),
+        ).label("event_rank"),
+    ).where(
+        AgentRunEvent.conversation_id == cid,
+        AgentRunEvent.run_id.in_(run_ids),
+        AgentRunEvent.event_type.in_((
+            "native.control.requested",
+            "native.control.delivered",
+            "native.control.rejected",
+        )),
+    ).subquery()
+    event_ids = select(ranked.c.event_id).where(
+        ranked.c.event_rank <= _RUN_CARD_CONTROL_EVENT_QUERY_LIMIT
+    )
+    return list((await db.execute(
+        select(AgentRunEvent).where(
+            AgentRunEvent.conversation_id == cid,
+            AgentRunEvent.id.in_(event_ids),
         )
     )).scalars().all())
 
@@ -2812,9 +2946,14 @@ async def list_run_cards(
         cid,
         run_ids,
     )
+    control_events = await _run_card_control_events(
+        db,
+        cid,
+        run_ids,
+    )
     events_by_id = {
         event.id: event
-        for event in [*latest_events, *anchor_events]
+        for event in [*latest_events, *anchor_events, *control_events]
     }
     events = list(events_by_id.values())
     tasks = (await db.execute(
@@ -2952,6 +3091,11 @@ async def list_run_cards(
             "started_at": str(root.started_at),
             "ended_at": str(root.ended_at) if root.ended_at else None,
             "orphaned_root": orphaned_root,
+            "engine_id": root.engine_id,
+            "controls": root_card.get("controls") or [],
+            "controls_truncated": bool(
+                root_card.get("controls_truncated")
+            ),
             **(
                 {
                     "trigger_message_id": None,
@@ -3194,6 +3338,234 @@ async def get_turn_activity_events(
             if not root_run_id and not tail and rows else None
         ),
     }
+
+
+@router.post("/{cid}/runs/{run_id}/controls")
+async def control_native_run(
+    cid: str,
+    run_id: str,
+    payload: NativeRunControl,
+    user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Persist and relay one idempotent native runtime control.
+
+    The requested row is committed before transport. A delivered row is
+    committed only after the isolated runner reports that the pinned native
+    input boundary synchronously accepted the command.
+    """
+
+    conv = await _conversation(cid, user.id, db)
+    from agent_engines.base import (
+        AgentEngineError,
+        SUPPORTED_ENGINE_IDS,
+    )
+    from agent_engines.registry import build_agent_engine_registry
+    from routers.chat_router import _next_message_created_at
+
+    if conv.engine_id not in SUPPORTED_ENGINE_IDS:
+        raise HTTPException(409, "Conversation engine has no native control channel")
+
+    async with _native_control_guard(run_id):
+        run = (await db.execute(
+            select(AgentRun).where(
+                AgentRun.id == run_id,
+                AgentRun.conversation_id == cid,
+                AgentRun.user_id == user.id,
+                AgentRun.parent_run_id.is_(None),
+            )
+        )).scalar_one_or_none()
+        if run is None:
+            raise HTTPException(404, "Root run not found")
+        if run.engine_id != conv.engine_id:
+            raise HTTPException(409, "Run engine no longer matches the Conversation")
+
+        rows = (await db.execute(
+            select(AgentRunEvent).where(
+                AgentRunEvent.conversation_id == cid,
+                AgentRunEvent.run_id == run_id,
+                AgentRunEvent.tool_call_id == payload.control_id,
+                AgentRunEvent.event_type.in_((
+                    "native.control.requested",
+                    "native.control.delivered",
+                    "native.control.rejected",
+                )),
+            ).order_by(AgentRunEvent.event_time, AgentRunEvent.id)
+        )).scalars().all()
+        requested = next(
+            (row for row in rows if row.event_type == "native.control.requested"),
+            None,
+        )
+        delivered = next(
+            (row for row in rows if row.event_type == "native.control.delivered"),
+            None,
+        )
+        rejected = next(
+            (row for row in rows if row.event_type == "native.control.rejected"),
+            None,
+        )
+        content_sha256 = (
+            hashlib.sha256(payload.text.encode("utf-8")).hexdigest()
+            if payload.text is not None
+            else None
+        )
+        message_id: str | None = None
+        if requested is not None:
+            request_value = _event_payload(requested)
+            if (
+                request_value.get("action") != payload.action
+                or request_value.get("content_sha256") != content_sha256
+            ):
+                raise HTTPException(409, "Control id already has different content")
+            control_seq = int(requested.seq)
+            message_id = (
+                str(request_value.get("message_id"))
+                if request_value.get("message_id")
+                else None
+            )
+            if delivered is not None:
+                return {
+                    "accepted": True,
+                    "idempotent": True,
+                    "status": "delivered",
+                    "control_id": payload.control_id,
+                    "seq": control_seq,
+                    "action": payload.action,
+                    "message_id": message_id,
+                }
+            if rejected is not None:
+                rejected_value = _event_payload(rejected)
+                return {
+                    "accepted": False,
+                    "idempotent": True,
+                    "status": "rejected",
+                    "code": rejected_value.get("code"),
+                    "control_id": payload.control_id,
+                    "seq": control_seq,
+                    "action": payload.action,
+                    "message_id": message_id,
+                }
+        else:
+            if run.status not in _ACTIVE_RUN_STATUSES:
+                raise HTTPException(409, "Run is no longer active")
+            maximum = (await db.execute(
+                select(func.max(AgentRunEvent.seq)).where(
+                    AgentRunEvent.conversation_id == cid,
+                    AgentRunEvent.run_id == run_id,
+                    AgentRunEvent.event_type == "native.control.requested",
+                )
+            )).scalar_one_or_none()
+            control_seq = int(maximum or 0) + 1
+            if control_seq > 4096:
+                raise HTTPException(409, "Native control count exceeded")
+            if payload.action in {"followup", "steer"}:
+                created_at = await _next_message_created_at(db, cid)
+                message = Message(
+                    conversation_id=cid,
+                    role="user",
+                    content=payload.text,
+                    model_id=run.requested_model_id,
+                    run_id=run_id,
+                    source="native_control",
+                    created_at=created_at,
+                )
+                db.add(message)
+                await db.flush()
+                message_id = message.id
+                conv.updated_at = created_at
+            request_value = {
+                "schema": "chatds.native-control-event.v1",
+                "control_id": payload.control_id,
+                "action": payload.action,
+                "content_sha256": content_sha256,
+                "message_id": message_id,
+                "status": "pending",
+            }
+            db.add(AgentRunEvent(
+                run_id=run_id,
+                conversation_id=cid,
+                user_id=user.id,
+                parent_run_id=None,
+                seq=control_seq,
+                event_type="native.control.requested",
+                payload=json.dumps(
+                    request_value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                tool_name="native_runtime_control",
+                tool_call_id=payload.control_id,
+            ))
+            await db.commit()
+
+        engine = build_agent_engine_registry().get(run.engine_id)
+        if not hasattr(engine, "control_run"):
+            raise HTTPException(409, "Run engine does not support native controls")
+        try:
+            receipt = await engine.control_run(
+                user_id=str(user.id),
+                conversation_id=cid,
+                run_id=run_id,
+                control_id=payload.control_id,
+                action=payload.action,
+                text=payload.text,
+            )
+        except AgentEngineError as exc:
+            # A transport failure after the immutable request was committed is
+            # not proof of rejection. Keep it pending so an exact-id retry can
+            # reconcile the Supervisor receipt without duplicating input.
+            raise HTTPException(
+                503,
+                "Native control delivery is temporarily unavailable; "
+                f"retry the same request ({exc.code}).",
+            ) from exc
+
+        if (
+            receipt.get("control_id") != payload.control_id
+            or receipt.get("action") != payload.action
+            or receipt.get("status") not in {"delivered", "rejected", "pending"}
+        ):
+            raise HTTPException(502, "Native control receipt is invalid")
+        status = str(receipt["status"])
+        if status in {"delivered", "rejected"}:
+            event_type = f"native.control.{status}"
+            existing_terminal = (await db.execute(
+                select(AgentRunEvent.id).where(
+                    AgentRunEvent.conversation_id == cid,
+                    AgentRunEvent.run_id == run_id,
+                    AgentRunEvent.event_type == event_type,
+                    AgentRunEvent.seq == control_seq,
+                )
+            )).scalar_one_or_none()
+            if existing_terminal is None:
+                db.add(AgentRunEvent(
+                    run_id=run_id,
+                    conversation_id=cid,
+                    user_id=user.id,
+                    parent_run_id=None,
+                    seq=control_seq,
+                    event_type=event_type,
+                    payload=json.dumps({
+                        "schema": "chatds.native-control-event.v1",
+                        "control_id": payload.control_id,
+                        "action": payload.action,
+                        "content_sha256": content_sha256,
+                        "message_id": message_id,
+                        "status": status,
+                        "code": receipt.get("code"),
+                        "native_seq": receipt.get("seq"),
+                        "native_receipt_schema": receipt.get("schema"),
+                    }, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    tool_name="native_runtime_control",
+                    tool_call_id=payload.control_id,
+                ))
+                await db.commit()
+        return {
+            **dict(receipt),
+            "seq": control_seq,
+            "message_id": message_id,
+        }
 
 
 @router.post("/{cid}/runs/{run_id}/approvals/{request_id}")

@@ -304,6 +304,25 @@ export async function decideTurnApproval(
   return await res.json()
 }
 
+export async function sendNativeRunControl(
+  convId,
+  runId,
+  { controlId, action, text = null },
+) {
+  const res = await request(
+    `/conversations/${convId}/runs/${runId}/controls`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        control_id: controlId,
+        action,
+        text,
+      }),
+    },
+  )
+  return await res.json()
+}
+
 export async function downloadTrajectory(convId) {
   const token = localStorage.getItem('token')
   const res = await fetch(`${API}/conversations/${convId}/trajectory`, {

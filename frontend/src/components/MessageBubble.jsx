@@ -250,10 +250,24 @@ export function MessageBubble({ msg, onRegenerate, onApproval }) {
   }
 
   if (msg.role === 'user') {
+    const nativeControlLabel = msg.source === 'native_control'
+      ? `${msg.nativeControlAction === 'steer' ? '运行中插话' : '运行中追问'}${
+        msg.nativeControlStatus === 'rejected'
+          ? ' · 未送达'
+          : msg.nativeControlStatus === 'pending'
+            ? ' · 等待回执'
+            : ''
+      }`
+      : null
     return (
       <>
         <div className="flex justify-end mb-5 fade-in-up">
           <div className="max-w-[78%]">
+            {nativeControlLabel && (
+              <div className="mb-1 text-right text-[10px] font-medium tracking-wide text-indigo-500">
+                {nativeControlLabel}
+              </div>
+            )}
             {msg.image_urls && msg.image_urls.length > 0 && (
               <div className="flex flex-wrap gap-2 mb-1.5 justify-end">
                 {msg.image_urls.map((u, i) => (

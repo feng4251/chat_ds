@@ -14,7 +14,17 @@ const MESSAGE_BOUNDARY_FIELDS = [
  */
 export function runCardMessageRevision(payload = {}) {
   return JSON.stringify((payload.roots || []).map((root) => (
-    MESSAGE_BOUNDARY_FIELDS.map((field) => root?.[field] ?? null)
+    [
+      ...MESSAGE_BOUNDARY_FIELDS.map((field) => root?.[field] ?? null),
+      (root?.controls || [])
+        .filter((control) => control?.message_id)
+        .map((control) => [
+          control.control_id,
+          control.message_id,
+          control.action,
+          control.status,
+        ]),
+    ]
   )))
 }
 

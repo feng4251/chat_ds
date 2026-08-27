@@ -551,6 +551,33 @@ test('refresh hydration exposes defensive projection truncation', () => {
   )
 })
 
+test('refresh reattaches an exact native control receipt to its user message', () => {
+  const messageId = 'control-message'
+  const hydrated = hydrateAgentRunCards([{
+    id: messageId,
+    role: 'user',
+    source: 'native_control',
+    content: 'Prioritize the renamed harbor manifest.',
+  }], {
+    roots: [{
+      root_run_id: 'c'.repeat(32),
+      status: 'running',
+      active: true,
+      controls: [{
+        control_id: 'd'.repeat(32),
+        message_id: messageId,
+        action: 'steer',
+        status: 'delivered',
+      }],
+      runs: [],
+      mapping_status: 'not_chat',
+    }],
+  })
+  const restored = hydrated.find((message) => message.id === messageId)
+  assert.equal(restored.nativeControlAction, 'steer')
+  assert.equal(restored.nativeControlStatus, 'delivered')
+})
+
 test('live delta state is bounded and does not retain redundant delta events', () => {
   let runs = updateAgentRuns([], {
     run_id: 'child',
