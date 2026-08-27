@@ -3953,3 +3953,22 @@ Round 17 的两个全新 case。不得复用
   their tests/docs. Preserve the two protected tracked deletions and all untracked runtime/reference directories. Stage explicit
   paths only. The user authorized production deployment and a non-force push of final `main` to
   `https://github.com/feng4251/chat_ds`; append exact clean-archive image/deploy/health/remote receipts here after completion.
+
+## Deployment closure
+
+- Functional commit is `507963d4817ddc265710990d04b220a33921222a`; exact archive is
+  `/tmp/chat_ds_deploy_507963d4.G3N0tv`. Running images are Frontend `d01d6d1397ea...`, proxy `39263285fd9f...`, native
+  runtime `2e1a8a4542f5...`, Claude Turn `618ceeb6a189...`, and DSH Turn `f06969830a0f...`. DSH retains upstream
+  `47f943...` and records the ChatDS revision separately; Claude remains official `2.1.152`. All five have immutable
+  `deploy-507963d4` tags. Their prior images have `rollback-pre-507963d4` tags.
+- Pre-switch dynamic Turns/nonterminal runs were zero and SQLite was healthy. The deployment recreated only the five named
+  Frontend/proxy/runtime/Turn-anchor containers with `--no-deps`; Backend, both Supervisors, SearXNG/Valkey and every persistent
+  volume remained in place. All five targets have restart 0; proxy, Backend and both Supervisors are healthy/restart 0.
+- Three Web coordinates serve `/`, `/api/health`, `build-info.json` and `/assets/index-C5pt4vvD.js` with HTTP 200; storage
+  identity is identical. A real signed v3 exact query containing printable `%25` reached production SearX and returned 10 results
+  with a non-exhausted receipt. Authenticated Chromium rendered terminal Session `70ec34...` with 1,313,271-byte `#root`, visible
+  Session content, no login fallback, no stale executing labels and no page/console errors. Post-switch SQLite quick-check is OK,
+  foreign-key violations/nonterminal runs/dynamic Turns are zero.
+- This release did not mutate any historical terminal or launch another model-heavy V2.3. The remaining behavioral acceptance is
+  a user-driven active Turn exercising Enter/Esc/follow-up through the now-recoverable Web target; do not manufacture a model run
+  solely for deployment proof. Final documentation commit and verified non-force GitHub `main` push are the only remaining steps.

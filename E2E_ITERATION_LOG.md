@@ -2587,3 +2587,27 @@ accepted root，matching terminal 清除，多 active root 拒绝；live SSE 只
 用户滚离底部后 streaming 不抢回视口；仅当前 block 自动展开；精确 `%25/%23` query 通过，而相同编码位于 path
 以及 encoded controls 仍拒绝。当前 pre-deploy 验证为 Frontend `74/74`、proxy/runtime `112/112`，目标 ESLint、
 `git diff --check` 和 Vite production build 全通过。没有自动重跑模型重型 V2.3，也没有修改三个历史 terminal。
+
+### 提交、部署与生产证明
+
+- 功能、回归与初始证据提交为 `507963d4817ddc265710990d04b220a33921222a`。候选全部来自 exact clean archive
+  `/tmp/chat_ds_deploy_507963d4.G3N0tv`，而不是 dirty worktree。镜像为 Frontend
+  `sha256:d01d6d1397ea...`、egress proxy `sha256:39263285fd9f...`、native runtime
+  `sha256:2e1a8a4542f5...`、Claude Turn `sha256:618ceeb6a189...`、DSH Turn
+  `sha256:f06969830a0f...`；前四者 OCI revision 为完整 `507963d4...`，DSH 保留 upstream revision
+  `47f943...` 并用 `org.opencontainers.image.chatds.revision` 记录完整 ChatDS commit。Claude image self-test
+  的 4 个 MCP/4 个 compatibility entrypoint 全通过且 CLI 仍为官方 `2.1.152`；DSH CLI 仍为
+  `0.1.0-rc.5`、upstream-unmodified=true。
+- 旧五镜像分别是 Frontend `295e5870...`、proxy `da92eb53...`、runtime `dc956576...`、Claude Turn
+  `f83ecb8a...`、DSH Turn `047f963e...`，均保留 `rollback-pre-507963d4`。切换前动态 Turn 与 nonterminal
+  AgentRun 为 0，SQLite `quick_check=ok`、foreign-key violation 0。只 `--no-deps --force-recreate` 五个目标
+  container；Backend、两个 Supervisor、SearXNG/Valkey、数据库/Session/workspace volume 与 native source 都未重启。
+- 切换后五目标 restart 0，proxy healthy；未切换的 Backend 和两个 Supervisor 仍 healthy/restart 0。
+  `127.0.0.1`、`172.30.100.126`、`10.10.132.126` 的 `/`、`/api/health`、`build-info.json` 和 hashed asset
+  均为 200，统一 entry `/assets/index-C5pt4vvD.js`、asset 741,861 bytes、storage identity 一致。生产签名 v3
+  socket 使用 literal-percent holdout `factory yield 99.9%` 穿过新 runtime/proxy 到达 SearX，HTTP 200、10 results、
+  non-exhausted receipt；个别 Yahoo engine SSL warning 是 SearX 聚合上游的动态降级，不影响该成功结果。
+- 容器化 Chromium 以真实用户登录并打开 `70ec34...`：HTTP 200、`#root` 1,313,271 bytes，终态 Session 可见、
+  未退回登录、残留“执行中”为 0、page/console error 为 0。复验后 SQLite 仍 `quick_check=ok`、外键 0、
+  nonterminal run 0，动态 Turn 0。没有制造新的原生 control 或模型重型 V2.3；Enter/Esc 的 live behavioral
+  acceptance 仍应由下一条用户驱动的活动 Turn 验收，旧 terminal 不会被改写。
