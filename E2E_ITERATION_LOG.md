@@ -2667,3 +2667,57 @@ Web Crypto fallback，**reject** 修改 Claude/DSH 原生代码、Backend 控制
 - GitHub `main` 已非强制从 `9e62064b2476d2196adadfc2e1c5ac271fd572a6` 推进到部署记录提交
   `8b6410dcb6bc2a65a084bce943d493e5abd99c18` 并读回一致；包含最终 canonical receipt 的后续文档提交同样必须
   非强制推送并以 remote/local tip 精确相等收口。
+
+## 2026-08-28 原生追问收敛、中档沙箱与首轮标题修复（部署前）
+
+生产 Session `1294a9daa5834a91a124b14e29a5bbc9` 的两次 root Turn 已冻结并按三源证据闭环。持久 conversation
+当前权限是 `session_full`、title 为 NULL；但 Nginx 与消息时间线证明首轮运行时权限是 `workspace_write`，直到首轮
+终止后的 `02:01:59Z` 才由用户改为 full。首轮 root `312bdfd575394c238b6e41b82d80ce24` 在
+`02:01:26Z` 接收 follow-up“简单回答下”，原生 DSH receipt 明确为 `target=next-turn`；浏览器约 20 秒后又提交独立
+interrupt，DSH 随后产生 `turn/end aborted/user`，pending inbox 最终出现 `removedCount=1/outcome=canceled`，root 唯一
+terminal 为 cancelled。第二次普通 Turn `05352d97264447b9bd7ce6fcedb79588` 成功。两个 debug stream 分别有
+2,865/462 个 upstream data chunk、0 parse error，没有 Provider、网络或模型失败。浏览器 interrupt 的具体 UI 来源只能
+限定为 Esc/中断按钮，日志不能反推用户意图，故不作更强归因。
+
+exact immutable view 为 `7333785203fbd3bb3695c75aaf01399b9e8af5770d251879089fb636ec1dae45`，manifest 文件
+SHA-256 为 `2afca2472cd50667ecdea27725ad7fba01c11900418bbc287131bd210cc06d76`；其中 Skills、primary Skills、workers、
+workflow routes 与 artifact contracts 全为空。因此本轮三个缺陷都与 Skill/compiler/workflow 无关：
+
+- Web `workspace_write` 被 ChatDS adapter 降成原生 `read-only`。同一 Turn 的 Bash 返回
+  `SANDBOX_UNAVAILABLE`，而 Glob/Read 可继续；这条错误没有终止任务。生产 Turn 镜像虽含 `bwrap`，在 cap-drop ALL、
+  no-new-privileges 的实际 profile 下因 namespace authority 被拒；原生 Landlock platform package 路径存在但 binary
+  未构建。临时加入 `SYS_ADMIN` 可使 bwrap probe 通过，仅作为因果证明，不能作为生产修复。
+- 标题触发以所有 Message 总数 `<=2` 为条件。首个 terminal 落库时已是普通 user + `native_control` user + assistant
+  三行，故 `_generate_title` 从未调用；后续 Turn 行数更多也无法补偿。
+- follow-up 在 interrupt 前已被 native inbox 接受，但 disposable Turn 退出时被清理。该队列丢失和 terminal 投影属于
+  ChatDS Turn-I/O 生命周期，不需要也不允许修改上游 agent loop。
+
+### 跨领域不变量、成熟实现对照与通用修复
+
+1. 已被原生 runtime 接受的 queued input 必须跨当前 activity 的 user interrupt 恰好一次地保留；若它开启后续原生
+   Turn，最新 typed `turn/end` 而非较早 interrupt receipt 决定 root 终态。ChatDS 只通过 pinned DSH 公开的
+   `Agent.cancel(...keepInbox)`, `Agent.send` 与 `Agent.inbox.remove` 重新武装 abort 后 wake latch，不复制 agent loop。
+2. Web 三档权限必须一一投影原生 preset。中档使用 DSH 自带 `workspace-write + ask`；Runner 镜像必须构建并携带经
+   功能探测的 static-musl Landlock launcher，使 bwrap 不可用时仍在现有 cap-dropped Session container 内 fail-closed
+   地执行。拒绝赋予 `SYS_ADMIN`、扩大 workspace mount 或绕过 approval。
+3. 标题来自首个普通 durable user/assistant exchange；typed `native_control` 不参与“首轮”计数。生成是异步
+   best-effort，但写入以 `title IS NULL/blank` 的条件更新首写者胜出，绝不覆盖人工标题或并发已生成标题。
+
+唯一成熟 Harness 参考冻结为 root tree object
+`claude-code=ef7589945b3767ead85fc52f68d013f88094bd47`，记录的 upstream source commit 为
+`6f6f12b37f529488b10e53928dd5508bb93535c7`。`src/cli/print.ts` 以同一 FIFO 保存 `later/now` 输入、在 interrupt 后
+自动恢复 interrupted prompt 且只重新入队一次；`src/bridge/remoteBridgeCore.ts` 把进入队列的 human prompt 仍视作
+title-worthy；`src/utils/sessionTitle.ts` 排除 meta/non-human message。对应决定是 **adopt** durable queue 与 typed
+human-origin title seed，**adapt** 到 ChatDS 既有 control receipt/SQLite title authority，**reject** 第二套 agent/retry
+loop。DSH 原生公开机制由冻结 source commit `47f943859bef60e4160492346772ded9b24f765a` 的
+`packages/core/agent-loop/src/agent.ts`、`packages/core/agent/src/inbox.ts` 和
+`packages/interaction/permission-presets/src/index.ts` 直接证明；其 root tree object
+`f904efab9ef435201d6ba4da88a34d6366568272` 保持未修改。
+
+确定性 rename/holdout 覆盖 museum、warehouse、harbor、municipal-archive，而不含本 Session、Skill 或业务 fixture
+常量：interrupt 前在 next-turn/next-step 排队的两个 identity 必须顺序与数量不变并唤醒；后续 completed/error
+reason 不得被旧 interrupt 误标 cancelled；三档 preset 必须精确映射；Dockerfile 必须构建原生 Landlock；
+`native_control` 插入首问和首答之间仍触发标题；两个并发/后续标题写入不能覆盖首写。当前验证为 Backend 生产依赖
+镜像 `431 passed, 2 subtests`，Frontend `76/76`、目标 ESLint 与 Vite build，DSH adapter Node `19/19`、
+Supervisor/control `4/4`，Python/Node syntax 与 `git diff --check` 全通过。尚未构建/切换生产镜像，也未自动发起
+模型或 V2.3 E2E；Landlock 的 exact production security-profile probe、历史 NULL title 补偿与部署证明待后续记录。

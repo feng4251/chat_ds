@@ -11,7 +11,7 @@ from typing import Awaitable, Callable, Optional, TypeVar
 import httpx
 import workspace as workspace_store
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import select, func
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from config import settings
@@ -2991,26 +2991,24 @@ async def _persist_after_stream(
             )
     async def generate_title_best_effort() -> None:
         async with async_session() as s:
-            cnt = (await s.execute(
-                select(func.count(Message.id)).where(
-                    Message.conversation_id == conv_id
-                )
-            )).scalar() or 0
-            logger.info(
-                "title check: conv=%s cnt=%s has_first=%s",
+            exchange = await _first_untitled_conversation_exchange(
                 conv_id,
-                cnt,
-                bool(first_user_content),
+                s,
             )
-            if cnt <= 2 and first_user_content:
+            logger.info(
+                "title check: conv=%s has_exchange=%s",
+                conv_id,
+                bool(exchange),
+            )
+            if exchange is not None:
                 await _generate_title(
                     conv_id,
-                    first_user_content,
-                    content,
+                    exchange[0],
+                    exchange[1],
                     s,
                 )
 
-    if first_user_content:
+    if assistant_message_id is not None:
         _track_best_effort_task(
             generate_title_best_effort(),
             description=f"title generation conv={conv_id}",
@@ -3699,12 +3697,70 @@ async def _generate_title(
             logger.info("using fallback title for %s: %r", conv_id, title)
     if not title or len(title) > 100:
         return
-    r = await db.execute(select(Conversation).where(Conversation.id == conv_id))
-    conv = r.scalar_one_or_none()
-    if conv:
-        conv.title = title
-        await db.commit()
+    if await _save_conversation_title_if_unset(conv_id, title, db):
         logger.info("title saved for %s: %r", conv_id, title)
+
+
+async def _first_untitled_conversation_exchange(
+    conv_id: str,
+    db: AsyncSession,
+) -> tuple[str, str] | None:
+    """Return the first ordinary durable user/assistant pair for a title.
+
+    Native controls are transport input attached to an active Turn, not a new
+    conversation-opening question.  Counting them as chat messages can suppress
+    title generation, so the seed is selected by typed role/source and durable
+    ordering instead of a total-row threshold.
+    """
+
+    conversation = await db.get(Conversation, conv_id)
+    if conversation is None or str(conversation.title or "").strip():
+        return None
+    first_user = (await db.execute(
+        select(Message).where(
+            Message.conversation_id == conv_id,
+            Message.role == "user",
+            Message.source != "native_control",
+        ).order_by(Message.created_at, Message.id).limit(1)
+    )).scalar_one_or_none()
+    if first_user is None or not str(first_user.content or "").strip():
+        return None
+    first_assistant = (await db.execute(
+        select(Message).where(
+            Message.conversation_id == conv_id,
+            Message.role == "assistant",
+            or_(
+                Message.created_at > first_user.created_at,
+                and_(
+                    Message.created_at == first_user.created_at,
+                    Message.id > first_user.id,
+                ),
+            ),
+        ).order_by(Message.created_at, Message.id).limit(1)
+    )).scalar_one_or_none()
+    if first_assistant is None:
+        return None
+    return str(first_user.content), str(first_assistant.content or "")
+
+
+async def _save_conversation_title_if_unset(
+    conv_id: str,
+    title: str,
+    db: AsyncSession,
+) -> bool:
+    """Commit one title only if no manual or concurrent writer won first."""
+
+    result = await db.execute(
+        update(Conversation).where(
+            Conversation.id == conv_id,
+            or_(
+                Conversation.title.is_(None),
+                func.trim(Conversation.title) == "",
+            ),
+        ).values(title=title)
+    )
+    await db.commit()
+    return result.rowcount == 1
 
 
 async def _chat_stream(

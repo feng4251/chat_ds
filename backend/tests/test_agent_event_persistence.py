@@ -1088,6 +1088,16 @@ class AgentEventPersistenceTests(unittest.IsolatedAsyncioTestCase):
             title_started.set()
             await release_title.wait()
 
+        async with self.sessions() as session:
+            session.add(Message(
+                id="durable-first-user",
+                conversation_id="conversation",
+                role="user",
+                content="first user request",
+                source="chat",
+            ))
+            await session.commit()
+
         events = [_event("run.completed", 2, run_id="root")]
         with (
             patch.object(chat_router, "async_session", self.sessions),
@@ -1126,6 +1136,73 @@ class AgentEventPersistenceTests(unittest.IsolatedAsyncioTestCase):
                 *list(chat_router._best_effort_tasks),
                 return_exceptions=True,
             )
+
+    async def test_native_control_does_not_suppress_first_exchange_title(self):
+        async with self.sessions() as session:
+            session.add_all([
+                Message(
+                    id="initial-user-message",
+                    conversation_id="conversation",
+                    role="user",
+                    content="Inspect the municipal archive index.",
+                    source="chat",
+                ),
+                Message(
+                    id="queued-native-control",
+                    conversation_id="conversation",
+                    role="user",
+                    content="Keep the answer concise.",
+                    source="native_control",
+                ),
+            ])
+            await session.commit()
+
+        generated_title = AsyncMock()
+        with (
+            patch.object(chat_router, "async_session", self.sessions),
+            patch.object(chat_router, "emit_event", new=AsyncMock()),
+            patch.object(chat_router, "_generate_title", generated_title),
+        ):
+            self.assertTrue(await chat_router._persist_after_stream(
+                "conversation",
+                "model",
+                "The archive index is ready.",
+                "",
+                "",
+                "transient caller text",
+                "root",
+                "model",
+                {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+                "stop",
+                None,
+                [_event("run.completed", 2, run_id="root")],
+            ))
+            await asyncio.gather(
+                *list(chat_router._best_effort_tasks),
+                return_exceptions=True,
+            )
+
+        generated_title.assert_awaited_once()
+        arguments = generated_title.await_args.args
+        self.assertEqual(arguments[0], "conversation")
+        self.assertEqual(arguments[1], "Inspect the municipal archive index.")
+        self.assertEqual(arguments[2], "The archive index is ready.")
+
+    async def test_title_save_is_first_writer_wins(self):
+        async with self.sessions() as session:
+            self.assertTrue(await chat_router._save_conversation_title_if_unset(
+                "conversation",
+                "Municipal Archive",
+                session,
+            ))
+        async with self.sessions() as session:
+            self.assertFalse(await chat_router._save_conversation_title_if_unset(
+                "conversation",
+                "Later Turn",
+                session,
+            ))
+            conversation = await session.get(Conversation, "conversation")
+            self.assertEqual(conversation.title, "Municipal Archive")
 
 
 if __name__ == "__main__":

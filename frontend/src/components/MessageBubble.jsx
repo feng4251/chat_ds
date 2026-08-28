@@ -256,7 +256,9 @@ export function MessageBubble({ msg, onRegenerate, onApproval }) {
           ? ' · 未送达'
           : msg.nativeControlStatus === 'pending'
             ? ' · 等待回执'
-            : ''
+            : msg.nativeControlAction === 'steer'
+              ? ' · 已插入'
+              : ' · 已排队'
       }`
       : null
     return (

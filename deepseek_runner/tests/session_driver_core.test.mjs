@@ -128,3 +128,70 @@ test('generic Web controls map only to the pinned native Agent Host API', () => 
     }],
   ])
 })
+
+test('interrupt preserves and wakes already queued native input without duplication', () => {
+  for (const target of ['next-turn', 'next-step']) {
+    const first = { id: `${target}-first`, content: [{ type: 'text', text: 'Audit the harbor ledger.' }] }
+    const queued = { id: `${target}-queued`, content: [{ type: 'text', text: 'Summarize the result.' }] }
+    const state = {
+      'next-turn': target === 'next-turn' ? [first, queued] : [],
+      'next-step': target === 'next-step' ? [first, queued] : [],
+    }
+    let aborted = false
+    let wakeLatched = false
+    const calls = []
+    const inbox = {
+      get nextTurn() { return state['next-turn'] },
+      get nextStep() { return state['next-step'] },
+      remove(messageId) {
+        for (const key of ['next-turn', 'next-step']) {
+          const index = state[key].findIndex((message) => message.id === messageId)
+          if (index >= 0) {
+            state[key].splice(index, 1)
+            calls.push(['remove', messageId])
+            return true
+          }
+        }
+        return false
+      },
+    }
+    const agent = {
+      status: 'running',
+      inbox,
+      cancel(cause, options) {
+        calls.push(['cancel', cause, options])
+        aborted = true
+      },
+      send(message, requestedTarget, wakeup) {
+        calls.push(['send', message.id, requestedTarget, wakeup])
+        const resolvedTarget = aborted && wakeup ? 'next-turn' : requestedTarget
+        state[resolvedTarget].push(message)
+        wakeLatched = aborted && wakeup
+      },
+      followup() {},
+      steer() {},
+    }
+
+    applyNativeRunControl(agent, {
+      schema: NATIVE_RUN_CONTROL_SCHEMA,
+      control_id: target === 'next-turn' ? '4'.repeat(32) : '5'.repeat(32),
+      seq: 4,
+      action: 'interrupt',
+      text: null,
+    }, (value) => value)
+
+    assert.equal(wakeLatched, true)
+    assert.deepEqual(
+      [...state['next-step'], ...state['next-turn']].map((message) => message.id).sort(),
+      [first.id, queued.id].sort(),
+    )
+    assert.equal(
+      [...state['next-step'], ...state['next-turn']].filter(
+        (message) => message.id === queued.id,
+      ).length,
+      1,
+    )
+    assert.deepEqual(calls[0], ['cancel', { kind: 'user' }, { keepInbox: true }])
+    assert.deepEqual(calls.at(-1), ['send', queued.id, 'next-turn', true])
+  }
+})

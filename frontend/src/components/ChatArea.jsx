@@ -1131,7 +1131,7 @@ export default function ChatArea({
         error: status === 'rejected',
         text: status === 'delivered'
           ? action === 'interrupt'
-            ? '已在原生执行位置中断；Session 保留，可继续追问。'
+            ? '已中断当前原生步骤；Session 与已排队追问均保留。'
             : action === 'steer'
               ? '插话已送达原生执行边界。'
               : '追问已进入原生消息队列。'

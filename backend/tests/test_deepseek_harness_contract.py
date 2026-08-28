@@ -29,6 +29,8 @@ from deepseek_runner.runner_entrypoint import (  # noqa: E402
     _environment,
     _native_command,
     _native_provider_failure_code,
+    _last_native_root_turn_reason,
+    _native_turn_stop_reason,
     _native_turn_payload,
     _provider_reasoning_binding,
     _terminal_error_stage,
@@ -724,7 +726,7 @@ def test_native_turn_payload_is_exact_and_rejects_identity_mutation():
     assert payload == {
         "schema": "chatds.deepseek-native-turn.v1",
         "native_session_id": f"chatds-{'7' * 32}",
-        "permission_preset": "read-only",
+        "permission_preset": "workspace-write",
         "initial_prompt": "Inspect a renamed warehouse",
         "turn_prompt": "Continue the audit",
     }
@@ -754,7 +756,7 @@ def test_native_worker_environment_is_explicit_and_session_scoped(monkeypatch, t
     )
     assert environment["HOME"] == "/state/home"
     assert environment["DSH_HOME"] == "/state/dsh"
-    assert environment["DSH_PERMISSION_MODE"] == "read-only"
+    assert environment["DSH_PERMISSION_MODE"] == "workspace-write"
     assert environment["CHATDS_WEB_PERMISSION_PRESET"] == "workspace_write"
     assert environment["DSH_TOOLS_MODE"] == "native"
     assert environment["CHATDS_DSH_MODEL"] == "renamed-model"
@@ -772,7 +774,7 @@ def test_native_worker_environment_is_explicit_and_session_scoped(monkeypatch, t
 
 @pytest.mark.parametrize(("preset", "native_mode"), [
     ("read_only", "read-only"),
-    ("workspace_write", "read-only"),
+    ("workspace_write", "workspace-write"),
     ("session_full", "danger-full-access"),
 ])
 def test_web_permission_tiers_map_to_native_baselines_and_exact_browser_policy(
@@ -798,6 +800,57 @@ def test_web_permission_tiers_map_to_native_baselines_and_exact_browser_policy(
     )
     assert environment["DSH_PERMISSION_MODE"] == native_mode
     assert environment["CHATDS_WEB_PERMISSION_PRESET"] == preset
+
+
+def test_runner_image_builds_the_native_landlock_fallback_without_patching_upstream():
+    dockerfile = (
+        REPOSITORY_ROOT / "deepseek_runner" / "Dockerfile.runner"
+    ).read_text(encoding="utf-8")
+    assert "musl-tools" in dockerfile
+    assert "pnpm --dir native/landlock-run build:native" in dockerfile
+    assert (
+        "native/landlock-run/packages/linux-x64/bin/landlock-run"
+        in dockerfile
+    )
+
+
+@pytest.mark.parametrize(
+    ("process_stop", "interrupt_pending", "exit_code", "reason", "expected"),
+    [
+        (None, True, 1, {"kind": "aborted", "reason": {"kind": "user"}}, "cancelled"),
+        (None, True, 0, {"kind": "completed"}, None),
+        (None, True, 1, {"kind": "error", "error": {"code": "RENAMED"}}, None),
+        (None, True, 1, None, "cancelled"),
+        (None, False, 0, {"kind": "completed"}, None),
+        ("hard_timeout", True, 0, {"kind": "completed"}, "hard_timeout"),
+    ],
+)
+def test_native_interrupt_terminal_uses_post_interrupt_convergence(
+    process_stop,
+    interrupt_pending,
+    exit_code,
+    reason,
+    expected,
+):
+    assert _native_turn_stop_reason(
+        process_stop_reason=process_stop,
+        interruption_pending=interrupt_pending,
+        exit_code=exit_code,
+        native_turn_reason=reason,
+    ) == expected
+
+
+def test_latest_root_turn_reason_ignores_worker_and_uses_typed_order():
+    envelopes = [
+        _native(1, "turn/end", {
+            "reason": {"kind": "aborted", "reason": {"kind": "user"}},
+        }),
+        _native(2, "turn/end", {
+            "reason": {"kind": "error", "error": {"code": "WORKER"}},
+        }, session="renamed-worker", depth=1),
+        _native(3, "turn/end", {"reason": {"kind": "completed"}}),
+    ]
+    assert _last_native_root_turn_reason(envelopes) == {"kind": "completed"}
 
 
 def test_native_immutable_inputs_are_separated_from_worker_mailboxes(

@@ -147,7 +147,36 @@ export function applyNativeRunControl(agent, value, createMessage) {
     throw new Error('chatds-session-driver: native run control boundary is invalid')
   }
   if (control.action === 'interrupt') {
+    const wasRunning = agent.status === 'running'
     agent.cancel({ kind: 'user' }, { keepInbox: true })
+    if (wasRunning && agent.inbox !== undefined) {
+      const inbox = agent.inbox
+      if (
+        inbox === null
+        || !Array.isArray(inbox.nextTurn)
+        || !Array.isArray(inbox.nextStep)
+        || typeof inbox.remove !== 'function'
+      ) {
+        throw new Error('chatds-session-driver: native inbox boundary is invalid')
+      }
+      // A follow-up queued before cancellation is already durable, but the
+      // upstream wake latch is armed only by input sent after the activity's
+      // AbortSignal changes state. Move one still-pending message through the
+      // public Inbox/Agent APIs after cancel: this preserves every identity
+      // and ordering edge while ensuring the native driver opens its next
+      // Turn instead of letting process teardown discard the queue.
+      const wakeMessage = inbox.nextTurn.at(-1) ?? inbox.nextStep.at(-1)
+      if (wakeMessage !== undefined) {
+        if (
+          typeof wakeMessage?.id !== 'string'
+          || typeof agent.send !== 'function'
+          || !inbox.remove(wakeMessage.id)
+        ) {
+          throw new Error('chatds-session-driver: native inbox wake failed')
+        }
+        agent.send(wakeMessage, 'next-turn', true)
+      }
+    }
     return control
   }
   const message = createMessage({

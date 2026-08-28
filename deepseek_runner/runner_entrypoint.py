@@ -686,19 +686,18 @@ def _native_turn_payload(config: dict[str, Any]) -> bytes:
 
 
 def _native_permission_preset(config: dict[str, Any]) -> str:
-    """Compile one browser permission tier to its exact upstream baseline.
+    """Compile one browser permission tier to the matching upstream preset.
 
-    The middle Web tier means that writes require an explicit one-shot grant.
-    DSH expresses that natively as a read-only standing sandbox whose fs/shell
-    tools may request ``workspace-write`` escalation.  Mount authority still
-    distinguishes hard read-only (workspace mounted ro) from approvable write
-    (workspace mounted rw); full access keeps DSH's native bypass preset.
+    The pinned DSH permission service already defines ``workspace-write`` as
+    workspace confinement plus ``ask`` approval.  ChatDS owns only the Web
+    label and mount boundary, so it must not silently narrow that native tier
+    to read-only or synthesize a parallel escalation policy.
     """
 
     permission = config.get("permission_preset")
     native = {
         "read_only": "read-only",
-        "workspace_write": "read-only",
+        "workspace_write": "workspace-write",
         "session_full": "danger-full-access",
     }.get(permission)
     if native is None:
@@ -892,6 +891,72 @@ def _terminal_outcome(
     if exit_code != 0:
         return "failed", "runner_exit_nonzero"
     return "succeeded", None
+
+
+def _native_turn_stop_reason(
+    *,
+    process_stop_reason: str | None,
+    interruption_pending: bool,
+    exit_code: int,
+    native_turn_reason: Mapping[str, Any] | None = None,
+) -> str | None:
+    """Resolve adapter cancellation without hiding recovered native work.
+
+    A delivered interrupt is terminal only when the latest typed native Turn
+    still ends as a user abort.  If preserved queued input opens a later Turn,
+    that Turn's completed/error reason owns convergence.  An external process
+    stop (shutdown, explicit Supervisor cancel, or timeout) remains
+    authoritative regardless of the child exit.
+    """
+
+    if process_stop_reason is not None:
+        return process_stop_reason
+    if not interruption_pending:
+        return None
+    if native_turn_reason is not None:
+        cause = native_turn_reason.get("reason")
+        if (
+            native_turn_reason.get("kind") == "aborted"
+            and isinstance(cause, Mapping)
+            and cause.get("kind") == "user"
+        ):
+            return "cancelled"
+        # A later completed/error Turn proves that preserved input crossed the
+        # interrupt boundary.  Its own native result, not the earlier control,
+        # owns the terminal classification.
+        return None
+    if exit_code != 0:
+        # Fail closed for an old or truncated native event stream that cannot
+        # prove convergence after a delivered interrupt.
+        return "cancelled"
+    return None
+
+
+def _last_native_root_turn_reason(
+    envelopes: Iterable[Mapping[str, Any]],
+) -> Mapping[str, Any] | None:
+    """Read the latest root Turn reason from typed native Session events."""
+
+    latest: Mapping[str, Any] | None = None
+    for envelope in envelopes:
+        event = envelope.get("event")
+        if (
+            not isinstance(event, Mapping)
+            or event.get("type") != "deepseek.session.event"
+            or event.get("delegation_depth") not in {0, None}
+        ):
+            continue
+        session_event = event.get("session_event")
+        if (
+            not isinstance(session_event, Mapping)
+            or session_event.get("type") != "turn/end"
+        ):
+            continue
+        data = session_event.get("data")
+        reason = data.get("reason") if isinstance(data, Mapping) else None
+        if isinstance(reason, Mapping):
+            latest = reason
+    return latest
 
 
 def _native_provider_failure_code(
@@ -1312,15 +1377,17 @@ def main() -> int:
                 **artifact_receipt,
             })
             _emit_artifacts(ledger, Path("/workspace"), before, after)
-        native_failure = _native_provider_failure_code(
-            _ledger_envelopes(ledger.path)
-        )
+        terminal_envelopes = _ledger_envelopes(ledger.path)
+        native_failure = _native_provider_failure_code(terminal_envelopes)
         status, terminal_error = _terminal_outcome(
             exit_code=exit_code,
-            stop_reason=(
-                "cancelled"
-                if native_interruption_pending
-                else _stop_reason
+            stop_reason=_native_turn_stop_reason(
+                process_stop_reason=_stop_reason,
+                interruption_pending=native_interruption_pending,
+                exit_code=exit_code,
+                native_turn_reason=_last_native_root_turn_reason(
+                    terminal_envelopes
+                ),
             ),
             workflow_passed=workflow_passed,
             artifact_passed=artifact_passed,
