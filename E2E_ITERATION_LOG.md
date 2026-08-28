@@ -2664,3 +2664,6 @@ Web Crypto fallback，**reject** 修改 Claude/DSH 原生代码、Backend 控制
   UUID-v4 ID（version `4`、variant `b`）。页面 HTTP 200、`#root` 非空、page error 为 0；唯一 console error 是
   未登录 API 的预期 401。该修复至此完成部署级验证；如用户还要对已完成 root 提问，应刷新页面后发起普通下一
   Turn，而不是把此前未送达的 follow-up 当成已执行。
+- GitHub `main` 已非强制从 `9e62064b2476d2196adadfc2e1c5ac271fd572a6` 推进到部署记录提交
+  `8b6410dcb6bc2a65a084bce943d493e5abd99c18` 并读回一致；包含最终 canonical receipt 的后续文档提交同样必须
+  非强制推送并以 remote/local tip 精确相等收口。

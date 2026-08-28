@@ -4004,3 +4004,6 @@ Round 17 的两个全新 case。不得复用
 - All three production coordinates return root/API/build-info/new asset 200. Actual Chromium on the insecure HTTP origin loaded
   the exact archived utility, observed no `randomUUID()` but a functioning `getRandomValues()`, and generated a valid 32-hex
   UUID-v4 control ID; the page had no runtime exception. Preserve the two protected deletions and all untracked runtime data.
+- A non-force GitHub push advanced `main` from `9e62064b2476d2196adadfc2e1c5ac271fd572a6` to deployment-record commit
+  `8b6410dcb6bc2a65a084bce943d493e5abd99c18`, and immediate SSH-443 readback matched. The canonical closure commit containing
+  this receipt must also be pushed without force; completion is proven only when remote `refs/heads/main` equals local `main`.
