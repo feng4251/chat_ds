@@ -4007,3 +4007,36 @@ Round 17 的两个全新 case。不得复用
 - A non-force GitHub push advanced `main` from `9e62064b2476d2196adadfc2e1c5ac271fd572a6` to deployment-record commit
   `8b6410dcb6bc2a65a084bce943d493e5abd99c18`, and immediate SSH-443 readback matched. The canonical closure commit containing
   this receipt must also be pushed without force; completion is proven only when remote `refs/heads/main` equals local `main`.
+
+# 2026-08-28 queued-control convergence, workspace-write sandbox and title repair
+
+- Functional commit `dd40071c1bf9854256f5f379dbf5ca20adbc657c` fixes three ChatDS-owned boundaries exposed by
+  Session `1294a9daa5834a91a124b14e29a5bbc9`: a native-accepted queued follow-up survives a later user interrupt exactly once;
+  `workspace_write` maps to DSH native `workspace-write + ask` and the Turn image now builds the pinned native Landlock launcher;
+  title generation selects the first ordinary durable user/assistant pair and atomically writes only a NULL/blank title. The complete
+  conversation/debug/immutable-Skill correlation, generic invariants, mature-reference mapping and regressions are in
+  `E2E_ITERATION_LOG.md`.
+- Neither native source was edited. Root tree objects remain
+  `claude-code=ef7589945b3767ead85fc52f68d013f88094bd47` and
+  `deepseek-harness-clean=f904efab9ef435201d6ba4da88a34d6366568272`; documented upstream commits remain Claude
+  `6f6f12b37f529488b10e53928dd5508bb93535c7` and DSH
+  `47f943859bef60e4160492346772ded9b24f765a`. ChatDS uses only pinned DSH public
+  `Agent.cancel(...keepInbox)`, `Agent.inbox.remove` and `Agent.send` plus typed native terminal receipts; there is no second agent
+  loop or native patch.
+- Verification before deployment: Backend production-dependency image `431 passed, 2 subtests`; Frontend `76/76`, targeted
+  ESLint and Vite build; DSH adapter Node `19/19`; Supervisor/control `4/4`; syntax and diff checks pass. Cross-domain holdouts use
+  harbor/museum/warehouse/municipal-archive identities. No model-heavy V2.3 was launched.
+- Exact clean archive `/tmp/chat_ds_deploy_dd40071c.7xAZwI` produced and deployed Backend
+  `sha256:9eb6e5031437...`, Frontend `sha256:8531897da6d8...` and DSH Turn
+  `sha256:07f1b10df20b...`. DSH keeps upstream revision `47f943...`, records full ChatDS revision separately and remains
+  `upstream-unmodified=true`. Previous images are retained as `rollback-pre-dd40071c`. Only Backend, Frontend and the inert DSH
+  image anchor were recreated; both Supervisors and every persistent volume stayed in place.
+- Exact production-profile Landlock proof reports partial enforcement on the host's older ABI but exits 0; authorized workspace
+  write succeeds and an equally writable, ungranted tmpfs path is denied. No `SYS_ADMIN`, broader mount or sandbox bypass was
+  introduced. All three Web/API coordinates and `/assets/index-B2jnkGYo.js` return 200; Chromium renders a nonempty root with no
+  application runtime error. Backend and both Supervisors are healthy/restart 0; all switched targets restart 0; post-deploy SQLite
+  quick-check is OK and FK violations, nonterminal runs and running schedules are zero.
+- The historical NULL title was backfilled through the new generic first-exchange/conditional-update code path and is now nonempty;
+  no message, terminal, Skill or workspace was changed. A new user-driven active Turn remains the behavioral acceptance for the
+  queued-follow-up + interrupt combination. Preserve the two protected tracked deletions and all untracked runtime/reference data.
+  This repair and its deployment-evidence commit are local-only unless the user explicitly requests another push.

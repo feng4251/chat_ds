@@ -2721,3 +2721,35 @@ reason 不得被旧 interrupt 误标 cancelled；三档 preset 必须精确映�
 镜像 `431 passed, 2 subtests`，Frontend `76/76`、目标 ESLint 与 Vite build，DSH adapter Node `19/19`、
 Supervisor/control `4/4`，Python/Node syntax 与 `git diff --check` 全通过。尚未构建/切换生产镜像，也未自动发起
 模型或 V2.3 E2E；Landlock 的 exact production security-profile probe、历史 NULL title 补偿与部署证明待后续记录。
+
+### 提交、部署与生产证明
+
+- 通用修复、非领域回归与部署前证据提交为
+  `dd40071c1bf9854256f5f379dbf5ca20adbc657c`，候选严格来自 clean Git archive
+  `/tmp/chat_ds_deploy_dd40071c.7xAZwI`。生产 Backend、Frontend、DSH Turn 镜像分别为
+  `sha256:9eb6e5031437...`、`sha256:8531897da6d8...`、`sha256:07f1b10df20b...`；前两者 OCI
+  revision 是完整 ChatDS commit，DSH 保留 upstream revision
+  `47f943859bef60e4160492346772ded9b24f765a`，并以
+  `org.opencontainers.image.chatds.revision` 记录完整 ChatDS commit、保持
+  `upstream-unmodified=true`。切换前镜像 `3d2ffab9412b...`、`0c15f03bc03d...`、
+  `f06969830a0f...` 均保留 `rollback-pre-dd40071c`。
+- exact 生产安全 profile（`network=none`、rootfs read-only、cap-drop ALL、
+  no-new-privileges、现有 seccomp）下，镜像内 npm resolver 返回 `probe=partial`；直接 launcher probe 退出 0，
+  提示当前宿主为较旧 Landlock ABI。进一步在两个底层均可写的 tmpfs 上运行原生 launcher：授权
+  `/workspace` 写入成功，未授权 `/outside` 写入被拒，证明中档 preset 可用且没有通过 `SYS_ADMIN` 或扩大 mount
+  绕过隔离。生产 tag 切换后重复同一拒绝试验仍通过。
+- 切换前两次确认动态 native Turn、nonterminal AgentRun 与 running schedule 都为 0；SQLite
+  `quick_check=ok`、外键 violation 0。部署只重建 Backend、Frontend 和 inert DSH Turn image anchor；Claude/DSH
+  Supervisor、Claude Turn image、SearXNG/Valkey、数据库与所有 Session/workspace volume 均未重启。三目标和两个
+  Supervisor 的 restart count 都为 0，Backend 与 Supervisors healthy。
+- `127.0.0.1`、`172.30.100.126`、`10.10.132.126` 的 `/`、`/api/health`、
+  `build-info.json` 与 `/assets/index-B2jnkGYo.js` 全部 HTTP 200。宿主 Chromium 在生产页面完成 JS 渲染，
+  `#root` 非空，日志中没有 application `ReferenceError`/`TypeError`/uncaught error。部署后 SQLite 再次
+  `quick_check=ok`、外键 violation/nonterminal AgentRun/running schedule 均为 0。
+- 历史目标 conversation 只在 title 仍为 NULL/blank 时，复用新代码的“首个普通 durable user/assistant exchange”
+  与原子 first-writer-wins 路径完成一次运维回填；回填后 title 非空（15 字符），没有改写消息、terminal、Skill 或
+  workspace。后续新会话将在首次 assistant durable commit 后自动走同一路径。
+- 本轮没有启动模型重型或 V2.3 E2E，也没有伪造 live control acceptance。确定性 adapter/sandbox/title 回归和生产
+  profile 已关闭代码与部署风险；follow-up + interrupt 的最终浏览器行为仍由用户下一次真实活动 Turn 验收。原生
+  tree object 仍为 Claude `ef7589945b3767ead85fc52f68d013f88094bd47`、DSH
+  `f904efab9ef435201d6ba4da88a34d6366568272`。
