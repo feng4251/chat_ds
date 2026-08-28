@@ -3991,3 +3991,16 @@ Round 17 的两个全新 case。不得复用
   compiler was changed. Targeted regression is `10/10`, complete Frontend tests are `76/76`, and targeted ESLint, Vite production
   build and diff checks pass. Deploy only the exact clean-archive Frontend candidate; do not recreate Backend, Supervisors or the
   active DSH Turn. Append immutable image, HTTP/browser, active-run continuity and Git receipts after deployment.
+
+## Deployment closure
+
+- Functional commit is `6a406ab00cabfc3752ea71e23d9c9f38b808d61b`; exact Frontend archive is
+  `/tmp/chat_ds_deploy_6a406ab0.0gYgQU`. Production runs `sha256:0c15f03bc03d...` with that full OCI revision and entry
+  `/assets/index-Cx6k6iOD.js`. The previous `sha256:d01d6d1397ea...` image is retained as
+  `rollback-pre-6a406ab0`.
+- Root `711c2a69e8b54882b77ed527bb9d6041` naturally succeeded before the switch with 21,084 native events and an exact
+  persisted assistant message. Only Frontend was recreated; Backend and both Supervisor identities/start times remained unchanged,
+  healthy and restart 0. No native Turn, terminal, database, Skill or workspace was mutated by deployment.
+- All three production coordinates return root/API/build-info/new asset 200. Actual Chromium on the insecure HTTP origin loaded
+  the exact archived utility, observed no `randomUUID()` but a functioning `getRandomValues()`, and generated a valid 32-hex
+  UUID-v4 control ID; the page had no runtime exception. Preserve the two protected deletions and all untracked runtime data.

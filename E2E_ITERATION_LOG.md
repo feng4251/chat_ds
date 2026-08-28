@@ -2646,3 +2646,21 @@ HTTP/IP origin 不提供 `randomUUID()` 就拒绝一个仍提供 `getRandomValue
 snapshot 没有对应 browser 文件，故按 unknown boundary 处理。本轮 **adopt** 安全 entropy，**adapt** 为 ChatDS
 Web Crypto fallback，**reject** 修改 Claude/DSH 原生代码、Backend 控制协议或引入伪随机兼容层。生产 closure、
 镜像与实际 HTTP 浏览器证明将在部署后补记。
+
+### 提交、部署与生产证明
+
+- 功能、回归和部署前证据提交为 `6a406ab00cabfc3752ea71e23d9c9f38b808d61b`；Frontend 候选严格来自
+  `git archive` 目录 `/tmp/chat_ds_deploy_6a406ab0.0gYgQU`。候选及当前生产镜像为
+  `sha256:0c15f03bc03d...`，OCI revision 等于完整提交；旧镜像 `sha256:d01d6d1397ea...` 保留为
+  `rollback-pre-6a406ab0`。候选在 application network 上通过 `nginx -t`，构建信息精确指向
+  `/assets/index-Cx6k6iOD.js`，742,353-byte asset 同时包含 secure fallback 与 fail-closed 路径。
+- 根任务在生产切换**之前**自然于 `2026-08-28 01:16:57` succeeded/stop，最终 ledger 21,084 events，最后一条
+  6,007-byte assistant message 精确关联该 root；动态 Turn 随后正常清理。部署只用 `--no-deps --no-build
+  --force-recreate frontend` 重建 Frontend。Backend 与两个 Supervisor 的容器 ID、启动时间均未改变，三者仍
+  healthy/restart 0；新 Frontend restart 0。没有发送控制请求、重放 Turn 或改写任何终态。
+- `127.0.0.1`、`172.30.100.126`、`10.10.132.126` 的 `/`、`/api/health`、`build-info.json` 和新 hashed
+  asset 全部 HTTP 200。真实 Chromium 在生产 HTTP origin 确认 `isSecureContext=false`、
+  `randomUUID=undefined`、`getRandomValues=function`，并动态加载 exact archived utility 后生成合法 32-hex
+  UUID-v4 ID（version `4`、variant `b`）。页面 HTTP 200、`#root` 非空、page error 为 0；唯一 console error 是
+  未登录 API 的预期 401。该修复至此完成部署级验证；如用户还要对已完成 root 提问，应刷新页面后发起普通下一
+  Turn，而不是把此前未送达的 follow-up 当成已执行。
