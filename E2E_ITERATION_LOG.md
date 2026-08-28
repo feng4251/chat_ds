@@ -2611,3 +2611,38 @@ accepted root，matching terminal 清除，多 active root 拒绝；live SSE 只
   未退回登录、残留“执行中”为 0、page/console error 为 0。复验后 SQLite 仍 `quick_check=ok`、外键 0、
   nonterminal run 0，动态 Turn 0。没有制造新的原生 control 或模型重型 V2.3；Enter/Esc 的 live behavioral
   acceptance 仍应由下一条用户驱动的活动 Turn 验收，旧 terminal 不会被改写。
+
+## 2026-08-28 HTTP 浏览器原生控制身份兼容修复（部署前）
+
+生产 Session `63d9e53752704b6ab7fe516017b68d23` 在 DSH/qwen 根任务
+`711c2a69e8b54882b77ed527bb9d6041` 运行时，用户输入“现在执行最终完成了吗”后，页面提示
+`Secure control identity generation is unavailable`。三源证据明确把失败限定在 ChatDS Web 边界：
+
+- 持久 conversation 中最后一条用户消息仍为“继续”，不存在该询问或 `native_control` message；同期 Nginx 对该
+  Session 以及全站的 `/controls` POST 都是 0。根任务仍为 running，冻结时 raw native ledger 已从 7,500
+  单调增长到 18,500，动态 DSH Turn 容器持续工作，因此页面错误没有中断、重启或改变原生任务。
+- exact immutable Skill view 仍为
+  `9aee2a0596eff2e78c48c615332e70ed3d82abc9539b701663ea7076af96d7b8`；manifest 文件 SHA-256 为
+  `5b536a43b336d17007c8f38dd898165506475da756895fd71aaa22da9653bbae`，主 Skill 和 orchestrator 分别为
+  `85ecc2fc48b290596c0cf2153b8268cc9f1a6b4f50ca75fb3989f477c8e7df1b`、
+  `6e8520593ebe68c5fb19c32dcae846f2525668f22d81701b9f201300d41939df`。Skill、workflow、provider/model 与该浏览器
+  异常没有因果关联。
+- 容器化真实 Chromium 打开 `http://172.30.100.126:5173` 后得到
+  `isSecureContext=false`、`crypto.randomUUID=undefined`、`crypto.getRandomValues=function`。旧实现把安全身份生成
+  错误地等同于只存在于 secure context 的 `randomUUID()`，所以在调用 Backend 之前同步抛错。
+
+通用不变量是：Web 原生控制必须使用密码学安全随机源生成满足 Backend `32-hex` 合同的持久幂等 ID；不能因为
+HTTP/IP origin 不提供 `randomUUID()` 就拒绝一个仍提供 `getRandomValues()` 的合规浏览器，也不能降级到
+`Math.random`、时间戳或 Session/Skill/engine 特判。若两个安全源都不存在则继续 fail closed。修复优先使用并严格
+校验 `randomUUID()`；否则从 `getRandomValues()` 读取 16 bytes、写入 UUID-v4 version/variant bits，并输出小写
+32-hex。确定性非领域回归覆盖 insecure-origin fallback、精确 ID 格式和无安全源拒绝；旧代码在该回归上复现原错误，
+新代码 targeted `10/10`、Frontend 全量 `76/76`、目标 ESLint、`git diff --check` 和 Vite production build
+全通过。
+
+成熟参考冻结为当前 root tree 中 `claude-code/` object
+`ef7589945b3767ead85fc52f68d013f88094bd47`（记录的 source commit
+`6f6f12b37f529488b10e53928dd5508bb93535c7`）。`src/Task.ts` 与 `src/utils/uuid.ts` 都从 Node
+`crypto.randomBytes` 创建不可预测身份；`src/utils/crypto.ts` 明确留下 browser replacement 边界，但该 vendored
+snapshot 没有对应 browser 文件，故按 unknown boundary 处理。本轮 **adopt** 安全 entropy，**adapt** 为 ChatDS
+Web Crypto fallback，**reject** 修改 Claude/DSH 原生代码、Backend 控制协议或引入伪随机兼容层。生产 closure、
+镜像与实际 HTTP 浏览器证明将在部署后补记。

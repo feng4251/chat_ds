@@ -126,10 +126,31 @@ export async function resolveNativeControlTarget({
 }
 
 export function createNativeControlId(cryptoObject = globalThis.crypto) {
-  if (typeof cryptoObject?.randomUUID !== 'function') {
+  if (typeof cryptoObject?.randomUUID === 'function') {
+    const controlId = String(cryptoObject.randomUUID())
+      .replaceAll('-', '')
+      .toLowerCase()
+    if (/^[0-9a-f]{32}$/.test(controlId)) return controlId
+    throw new Error('Secure control identity generation returned an invalid UUID')
+  }
+  if (typeof cryptoObject?.getRandomValues !== 'function') {
     throw new Error('Secure control identity generation is unavailable')
   }
-  return cryptoObject.randomUUID().replaceAll('-', '')
+  const bytes = new Uint8Array(16)
+  if (cryptoObject.getRandomValues(bytes) !== bytes) {
+    throw new Error('Secure control identity generation returned invalid bytes')
+  }
+  if (bytes.every((byte) => byte === 0)) {
+    throw new Error('Secure control identity generation returned empty entropy')
+  }
+  // Preserve UUID-v4 version/variant semantics before lowering to the
+  // Backend's opaque 32-hex idempotency key.
+  bytes[6] = (bytes[6] & 0x0f) | 0x40
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+  return Array.from(
+    bytes,
+    (byte) => byte.toString(16).padStart(2, '0'),
+  ).join('')
 }
 
 export function isTerminalNativeControlStatus(status) {

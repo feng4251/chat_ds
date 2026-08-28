@@ -3976,3 +3976,18 @@ Round 17 的两个全新 case。不得复用
   `f442213b7443ab05f7fe8437d0451ced8d6da395`, and an immediate `ls-remote` readback matched. The commit containing this canonical
   closure record was then non-force pushed as the final tip; completion requires and records that remote `refs/heads/main` equals
   the local `main` HEAD immediately after that push.
+
+# 2026-08-28 insecure-origin native control ID repair (pre-deployment)
+
+- Session `63d9e53752704b6ab7fe516017b68d23` exposed a Frontend-only compatibility defect while root
+  `711c2a69e8b54882b77ed527bb9d6041` kept running. The attempted follow-up never entered persisted conversation and generated
+  no `/controls` POST; native raw events continued increasing. Exact Skill view and instruction hashes are unchanged and recorded
+  in `E2E_ITERATION_LOG.md`.
+- Real Chromium on the production HTTP/IP origin has Web Crypto `getRandomValues()` but, because the context is not secure, no
+  `randomUUID()`. `createNativeControlId` now retains strict UUID validation when available and uses 16 secure random bytes with
+  UUID-v4 bits as the standards-compatible fallback. It still fails closed if no cryptographic source exists; no pseudo-random,
+  Skill-, Session-, engine- or model-specific behavior was added.
+- The change is restricted to Frontend utility/tests. Neither native Harness, Backend/Supervisor protocol, running Turn nor Skill
+  compiler was changed. Targeted regression is `10/10`, complete Frontend tests are `76/76`, and targeted ESLint, Vite production
+  build and diff checks pass. Deploy only the exact clean-archive Frontend candidate; do not recreate Backend, Supervisors or the
+  active DSH Turn. Append immutable image, HTTP/browser, active-run continuity and Git receipts after deployment.

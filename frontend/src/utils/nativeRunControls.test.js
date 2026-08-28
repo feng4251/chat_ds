@@ -165,6 +165,29 @@ test('browser control ids lower UUIDs to the exact durable identity', () => {
   }), '123456781234423482341234567890ab')
 })
 
+test('insecure-origin Web Crypto still creates a secure durable control id', () => {
+  let fills = 0
+  const controlId = createNativeControlId({
+    getRandomValues: (bytes) => {
+      fills += 1
+      for (let index = 0; index < bytes.length; index += 1) {
+        bytes[index] = index
+      }
+      return bytes
+    },
+  })
+
+  assert.equal(fills, 1)
+  assert.equal(controlId, '000102030405460788090a0b0c0d0e0f')
+})
+
+test('native controls fail closed without a cryptographic random source', () => {
+  assert.throws(
+    () => createNativeControlId({}),
+    /Secure control identity generation is unavailable/,
+  )
+})
+
 test('pending controls reuse their durable id after a reconnect', () => {
   const followupId = '4'.repeat(32)
   const interruptId = '5'.repeat(32)
